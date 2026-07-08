@@ -15,8 +15,21 @@ type Registry struct {
 	latency  []float64
 }
 
+var defaultCounters = []string{
+	"feed_messages_total",
+	"feed_transactions_total",
+	"feed_decode_errors_total",
+	"feed_reconnects_total",
+	"feed_sequence_gaps_total",
+	"feed_duplicates_total",
+}
+
 func NewRegistry() *Registry {
-	return &Registry{counters: make(map[string]uint64)}
+	r := &Registry{counters: make(map[string]uint64)}
+	for _, name := range defaultCounters {
+		r.counters[name] = 0
+	}
+	return r
 }
 
 func (r *Registry) Inc(name string) {
@@ -58,4 +71,66 @@ func (r *Registry) Render() string {
 		fmt.Fprintf(&b, "feed_ingest_latency_seconds %.9f\n", v)
 	}
 	return b.String()
+}
+
+type Readiness struct {
+	mu                sync.RWMutex
+	sourceInitialized bool
+	natsReachable     bool
+	fatal             string
+}
+
+func (r *Readiness) MarkSourceInitialized() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.sourceInitialized = true
+}
+
+func (r *Readiness) MarkNATSReachable() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.natsReachable = true
+}
+
+func (r *Readiness) MarkFatal(reason string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.fatal = reason
+}
+
+func (r *Readiness) Ready() (bool, string) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	if r.fatal != "" {
+		return false, r.fatal
+	}
+	if !r.sourceInitialized {
+		return false, "source not initialized"
+	}
+	if !r.natsReachable {
+		return false, "NATS not reachable"
+	}
+	return true, "ready"
+}
+
+func (r *Readiness) HealthHandler() http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/plain")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ok\n"))
+	})
+}
+
+func (r *Readiness) ReadyHandler() http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		ready, reason := r.Ready()
+		w.Header().Set("Content-Type", "text/plain")
+		if !ready {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_, _ = w.Write([]byte(reason + "\n"))
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(reason + "\n"))
+	})
 }
