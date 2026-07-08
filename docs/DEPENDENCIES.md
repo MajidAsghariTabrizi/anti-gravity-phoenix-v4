@@ -16,6 +16,8 @@ This file records protocol-critical source references and versions. Do not add a
 
 The live relay command still requires a Linux host and operator validation against current Arbitrum node flags. Phoenix does not let individual services connect independently to the upstream public feed.
 
+Current feed-ingestor status: official Nitro websocket parsing is not implemented in code. Production relay mode is blocked by startup guard until the official adapter is implemented and verified. See `docs/NITRO_FEED_INTEGRATION.md`.
+
 ## Uniswap V3 on Arbitrum One
 
 Official source: Uniswap developer deployment page for Arbitrum V3 deployments.
@@ -50,3 +52,16 @@ Phoenix includes Aave V3 `flashLoanSimple` interfaces only. No Arbitrum provider
 ## Message Encoding
 
 `proto/phoenix.proto` is the canonical typed message schema. The Go ingestor currently publishes canonical JSON matching that schema because `protoc` and generated Protobuf toolchains are not available in this workspace. This is an implementation constraint, not a protocol guess. The schema is ready for generated Protobuf bindings in the deployment toolchain.
+
+## PostgreSQL Migration Runner
+
+- Runner language: Go.
+- PostgreSQL driver: `github.com/lib/pq v1.10.9`.
+- Migration source: ordered SQL files in `migrations/`.
+- Production execution: `/usr/local/bin/migration-runner` bundled into the feed-ingestor image and invoked by `scripts/deploy-release.sh`.
+
+The runner records `schema_migrations`, migration version, SHA-256 checksum, and `applied_at`; it uses a PostgreSQL advisory lock and fails on checksum drift.
+
+## GitHub Actions
+
+Workflow actions are pinned to full commit SHAs in `.github/workflows/`. The dependency ledger and update process are in `docs/GITHUB_ACTIONS_DEPENDENCIES.md`.

@@ -1,5 +1,3 @@
-BEGIN;
-
 CREATE TABLE IF NOT EXISTS contract_events (
     id BIGSERIAL PRIMARY KEY,
     tx_hash TEXT NOT NULL,
@@ -15,6 +13,3 @@ CREATE TABLE IF NOT EXISTS contract_events (
 INSERT INTO gas_profiles (execution_shape, gas_used_p50, gas_used_p90, gas_used_p99, sample_count, ewma)
 VALUES ('FLASH_V3_V3_TWO_LEG', NULL, NULL, NULL, 0, NULL)
 ON CONFLICT (execution_shape) DO NOTHING;
-
-COMMIT;
-
