@@ -1,6 +1,6 @@
 # Deployment
 
-Target first deployment: one Linux VPS.
+Target first deployment: one Ubuntu 24.04 LTS x86_64 VPS.
 
 Minimum sizing is not measured in this workspace. Recommended first shadow host:
 
@@ -10,33 +10,43 @@ Minimum sizing is not measured in this workspace. Recommended first shadow host:
 - Docker Engine and Compose plugin
 - outbound access to Arbitrum feed and configured RPC providers
 
+Production host layout:
+
+```text
+/opt/phoenix/
+    deploy/
+        compose.prod.yml
+        current-release
+        previous-release
+        manifests/
+    data/
+        postgres/
+        prometheus/
+        feed/
+    logs/
+
+/etc/phoenix/
+    phoenix.env
+```
+
+The production host pulls prebuilt GHCR images. It does not build Phoenix application source.
+
 Do not expose internal services publicly:
 
-- Postgres: internal only
-- NATS: internal only
-- Nitro relay feed: internal only
-- RPC gateway: internal only
+- Postgres: internal Docker network only
+- NATS: internal Docker network only
+- Nitro relay feed: internal Docker network only
+- RPC gateway: internal Docker network only
 
-Explicitly exposed by default:
+Explicit loopback bindings:
 
-- Dashboard on localhost or operator-controlled interface
-- Prometheus metrics on localhost/operator network
+- Dashboard on `127.0.0.1:8501`
+- Prometheus on `127.0.0.1:9090`
 
-## VPS Bootstrap
+Production bootstrap, GHCR authentication, environment validation, release, and rollback are documented in:
 
-```bash
-git clone <repo-url>
-cd anti-gravity-phoenix-v4
-cp .env.example .env
-vi .env
-docker compose up --build -d
-```
+- `docs/PRODUCTION_BOOTSTRAP.md`
+- `docs/RELEASE_AND_ROLLBACK.md`
+- `docs/CI_CD.md`
 
-Before LIVE:
-
-```bash
-make verify
-make contract-test
-PHOENIX_MODE=SIMULATE ARBITRUM_RPC_URL=<url> make integration
-```
-
+Current blocker: real Nitro feed relay ingestion is not implemented or verified. Production feed readiness fails intentionally until `docs/NITRO_FEED_INTEGRATION.md` is resolved.

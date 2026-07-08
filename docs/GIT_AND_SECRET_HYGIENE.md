@@ -46,3 +46,11 @@ Both secret scanners report only file, line number when available, category, and
 6. Ask every clone owner to reclone or garbage-collect old history.
 
 Deleting a secret from the latest source file is not sufficient once it exists in Git history. Anyone with access to the repository history can still recover the old blob until history is rewritten and stale clones are cleaned up.
+
+## Line Endings
+
+`.gitattributes` stores production source, shell scripts, Dockerfiles, Compose/YAML, SQL, protobuf, JSON, and Markdown as LF in Git. PowerShell files are CRLF-friendly. Review line-ending normalization with `git status --short` and `git diff --check`; avoid broad churn unless the normalization diff is intentional.
+
+## Dependency Review
+
+Dependabot opens conservative grouped updates for Cargo, Go modules, pip, GitHub Actions, and Docker. There is no auto-merge. Major version updates are ignored by default and should be opened deliberately after reviewing release notes and Phoenix hot-path impact.
