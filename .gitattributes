@@ -1,0 +1,37 @@
+* text=auto
+
+# Production source and configuration use LF in Git.
+*.sh text eol=lf
+Makefile text eol=lf
+*.go text eol=lf
+go.mod text eol=lf
+go.sum text eol=lf
+*.rs text eol=lf
+Cargo.toml text eol=lf
+Cargo.lock text eol=lf
+*.sol text eol=lf
+*.toml text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+Dockerfile text eol=lf
+*.Dockerfile text eol=lf
+*.sql text eol=lf
+*.proto text eol=lf
+*.json text eol=lf
+*.md text eol=lf
+
+# Windows operator scripts remain CRLF-friendly for Windows PowerShell.
+*.ps1 text eol=crlf
+*.psm1 text eol=crlf
+*.psd1 text eol=crlf
+
+# Binary artifacts must not be normalized.
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.webp binary
+*.pdf binary
+*.zip binary
+*.gz binary
+*.zst binary
