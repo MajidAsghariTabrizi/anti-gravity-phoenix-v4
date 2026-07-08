@@ -1,0 +1,7 @@
+# This file is intentionally minimal because rpc-gateway has no external crates.
+version = 3
+
+[[package]]
+name = "rpc-gateway"
+version = "0.4.0"
+

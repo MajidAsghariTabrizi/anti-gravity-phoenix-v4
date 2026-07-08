@@ -1,0 +1,16 @@
+[package]
+name = "phoenix-engine"
+version = "0.4.0"
+edition = "2021"
+license = "MIT"
+
+[lib]
+name = "phoenix_engine"
+path = "src/lib.rs"
+
+[[bin]]
+name = "phoenix-engine"
+path = "src/main.rs"
+
+[dependencies]
+

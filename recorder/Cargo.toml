@@ -1,0 +1,16 @@
+[package]
+name = "phoenix-recorder"
+version = "0.4.0"
+edition = "2021"
+license = "MIT"
+
+[lib]
+name = "phoenix_recorder"
+path = "src/lib.rs"
+
+[[bin]]
+name = "phoenix-recorder"
+path = "src/main.rs"
+
+[dependencies]
+

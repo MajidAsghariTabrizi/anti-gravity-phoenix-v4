@@ -1,0 +1,7 @@
+# This file is intentionally minimal because phoenix-engine has no external crates.
+version = 3
+
+[[package]]
+name = "phoenix-engine"
+version = "0.4.0"
+

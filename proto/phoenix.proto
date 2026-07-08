@@ -1,0 +1,51 @@
+syntax = "proto3";
+
+package phoenix.v4;
+
+message NormalizedTx {
+  string schema_version = 1;
+  uint64 sequence = 2;
+  uint64 timestamp_unix_ms = 3;
+  string tx_hash = 4;
+  string tx_type = 5;
+  uint64 chain_id = 6;
+  string from = 7;
+  string to = 8;
+  uint64 nonce = 9;
+  string value = 10;
+  string calldata = 11;
+  string gas_limit = 12;
+  string max_fee_per_gas = 13;
+  string max_priority_fee_per_gas = 14;
+  bytes raw_tx = 15;
+  uint64 ingested_at_unix_ns = 16;
+}
+
+message OpportunityLeg {
+  string protocol = 1;
+  string pool = 2;
+  string token_in = 3;
+  string token_out = 4;
+  uint32 fee = 5;
+  string direction = 6;
+  string expected_amount_in = 7;
+  string expected_amount_out = 8;
+}
+
+message Opportunity {
+  string opportunity_id = 1;
+  string route_id = 2;
+  string origin_tx_hash = 3;
+  uint64 origin_sequence = 4;
+  string snapshot_id = 5;
+  string flash_asset = 6;
+  string optimized_amount = 7;
+  string expected_gross_profit = 8;
+  string expected_flash_premium = 9;
+  string expected_execution_cost = 10;
+  string expected_net_profit = 11;
+  repeated OpportunityLeg legs = 12;
+  uint64 expires_at_unix_ms = 13;
+  string min_profit = 14;
+}
+

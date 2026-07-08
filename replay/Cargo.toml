@@ -1,0 +1,17 @@
+[package]
+name = "phoenix-replay"
+version = "0.4.0"
+edition = "2021"
+license = "MIT"
+
+[lib]
+name = "phoenix_replay"
+path = "src/lib.rs"
+
+[[bin]]
+name = "phoenix-replay"
+path = "src/main.rs"
+
+[dependencies]
+phoenix-engine = { path = "../phoenix-engine" }
+

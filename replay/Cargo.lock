@@ -1,0 +1,13 @@
+version = 3
+
+[[package]]
+name = "phoenix-engine"
+version = "0.4.0"
+
+[[package]]
+name = "phoenix-replay"
+version = "0.4.0"
+dependencies = [
+ "phoenix-engine",
+]
+

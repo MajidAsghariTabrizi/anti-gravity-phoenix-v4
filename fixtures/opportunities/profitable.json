@@ -1,0 +1,10 @@
+{
+  "opportunity_id": "00000000-0000-0000-0000-000000000001",
+  "route_id": "usdc-weth-uni-sushi",
+  "origin_tx_hash": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "flash_asset": "0xaf88d065e77c8cc2239327c5edb3a432268e5831",
+  "optimized_amount": "500",
+  "expected_net_profit": "596",
+  "note": "Dynamic sizing fixture: best amount is centered at 500, not the first candidate."
+}
+

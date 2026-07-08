@@ -1,0 +1,16 @@
+[package]
+name = "rpc-gateway"
+version = "0.4.0"
+edition = "2021"
+license = "MIT"
+
+[lib]
+name = "rpc_gateway"
+path = "src/lib.rs"
+
+[[bin]]
+name = "rpc-gateway"
+path = "src/main.rs"
+
+[dependencies]
+

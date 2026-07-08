@@ -1,0 +1,6 @@
+version = 3
+
+[[package]]
+name = "phoenix-recorder"
+version = "0.4.0"
+

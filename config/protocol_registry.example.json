@@ -1,0 +1,32 @@
+{
+  "schema_version": "phoenix.protocol_registry.v1",
+  "chain_id": 42161,
+  "protocols": [
+    {
+      "protocol": "UniswapV3",
+      "version": "v3",
+      "factory": "0x1F98431c8aD98523631AE4a59f267346ea31F984",
+      "router": "0x68b3465833fb72A70ecDF485E0e4C7bD8665Fc45",
+      "universal_router": "0xa51afafe0263b40edaef0df8781ea9aa03e381a3",
+      "quoter_parity_only": "0x61fFE014bA17989E743c5F6cB21bF9697530B21e",
+      "callback_semantics": "uniswapV3SwapCallback with factory-verified pool sender",
+      "source_reference": "https://developers.uniswap.org/docs/protocols/v3/deployments/v3-arbitrum-deployments"
+    },
+    {
+      "protocol": "SushiSwapV3",
+      "version": "v3",
+      "factory": "${SUSHI_V3_FACTORY}",
+      "router": "${SUSHI_V3_ROUTER}",
+      "quoter_parity_only": "${SUSHI_V3_QUOTER}",
+      "init_code_hash": "${SUSHI_V3_INIT_CODE_HASH}",
+      "callback_semantics": "must be verified from official Sushi source before LIVE",
+      "source_reference": "official sushi/evm package source required"
+    }
+  ],
+  "validation": {
+    "chain_id_must_equal": 42161,
+    "eth_getCode_non_empty": true,
+    "v3_pool_immutables": ["token0", "token1", "fee", "factory"]
+  }
+}
+

@@ -1,0 +1,24 @@
+{
+  "chain_id": 42161,
+  "pools": [
+    {
+      "protocol": "UniswapV3",
+      "pool": "0x0000000000000000000000000000000000001001",
+      "token0": "0xaf88d065e77c8cc2239327c5edb3a432268e5831",
+      "token1": "0x82af49447d8a07e3bd95bd0d56f35241523fbab1",
+      "fee": 500,
+      "completeness_min_tick": -100,
+      "completeness_max_tick": 100
+    },
+    {
+      "protocol": "SushiSwapV3",
+      "pool": "0x0000000000000000000000000000000000002001",
+      "token0": "0x82af49447d8a07e3bd95bd0d56f35241523fbab1",
+      "token1": "0xaf88d065e77c8cc2239327c5edb3a432268e5831",
+      "fee": 500,
+      "completeness_min_tick": -100,
+      "completeness_max_tick": 100
+    }
+  ]
+}
+

@@ -1,0 +1,149 @@
+services:
+  nitro-feed-relay:
+    image: offchainlabs/nitro-node:v3.11.2-3599aca
+    profiles: ["relay"]
+    command:
+      - --chain.id=42161
+      - --parent-chain.connection.url=${PARENT_CHAIN_RPC_URL:-}
+      - --node.feed.input.require-chain-id=true
+      - --node.feed.input.require-feed-version=true
+      - --node.feed.output.enable=true
+      - --node.feed.output.addr=0.0.0.0
+      - --node.feed.output.port=9642
+      - --http.addr=127.0.0.1
+      - --ws.addr=127.0.0.1
+    networks: [phoenix-internal]
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "test -n \"$HOSTNAME\""]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  nats:
+    image: nats:2.10-alpine
+    command: ["-js=false", "-m", "8222"]
+    networks: [phoenix-internal]
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "-", "http://127.0.0.1:8222/healthz"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: phoenix
+      POSTGRES_PASSWORD: phoenix
+      POSTGRES_DB: phoenix
+    volumes:
+      - phoenix-postgres:/var/lib/postgresql/data
+      - ./migrations:/docker-entrypoint-initdb.d:ro
+    networks: [phoenix-internal]
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U phoenix -d phoenix"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  rpc-gateway:
+    build:
+      context: .
+      dockerfile: deploy/rust.Dockerfile
+      args:
+        CRATE: rpc-gateway
+    environment:
+      RPC_GATEWAY_ADDR: 0.0.0.0:9300
+      RPC_PROVIDER_URLS: ${RPC_PROVIDER_URLS:-}
+      RPC_PROVIDER_WEIGHTS: ${RPC_PROVIDER_WEIGHTS:-1}
+      RPC_GLOBAL_RPS: ${RPC_GLOBAL_RPS:-5}
+    networks: [phoenix-internal]
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "true"]
+      interval: 15s
+      timeout: 3s
+      retries: 5
+
+  feed-ingestor:
+    build:
+      context: .
+      dockerfile: deploy/feed-ingestor.Dockerfile
+    environment:
+      NATS_URL: nats://nats:4222
+      METRICS_ADDR: 0.0.0.0:9100
+      PHOENIX_FEED_FIXTURE: /app/fixtures/feed/profitable.ndjson
+    depends_on:
+      nats:
+        condition: service_healthy
+    networks: [phoenix-internal]
+    restart: unless-stopped
+
+  phoenix-engine:
+    build:
+      context: .
+      dockerfile: deploy/rust.Dockerfile
+      args:
+        CRATE: phoenix-engine
+    environment:
+      PHOENIX_MODE: ${PHOENIX_MODE:-SHADOW}
+      LIVE_EXECUTION: ${LIVE_EXECUTION:-false}
+      NATS_URL: nats://nats:4222
+      CHAIN_ID: 42161
+    depends_on:
+      nats:
+        condition: service_healthy
+      rpc-gateway:
+        condition: service_started
+    networks: [phoenix-internal]
+    restart: unless-stopped
+
+  recorder:
+    build:
+      context: .
+      dockerfile: deploy/rust.Dockerfile
+      args:
+        CRATE: recorder
+    entrypoint: ["/bin/sh", "-c"]
+    command: ["sleep infinity"]
+    networks: [phoenix-internal]
+    restart: unless-stopped
+
+  dashboard:
+    build:
+      context: .
+      dockerfile: deploy/dashboard.Dockerfile
+    environment:
+      POSTGRES_DSN: postgres://phoenix:phoenix@postgres:5432/phoenix
+      PROMETHEUS_METRICS_URL: http://prometheus:9090
+    ports:
+      - "127.0.0.1:8501:8501"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      prometheus:
+        condition: service_started
+    networks: [phoenix-internal]
+    restart: unless-stopped
+
+  prometheus:
+    image: prom/prometheus:v2.53.0
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.retention.time=7d
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    ports:
+      - "127.0.0.1:9090:9090"
+    networks: [phoenix-internal]
+    restart: unless-stopped
+
+networks:
+  phoenix-internal:
+    driver: bridge
+    internal: false
+
+volumes:
+  phoenix-postgres:

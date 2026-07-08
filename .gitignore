@@ -1,0 +1,95 @@
+# Environment and local secrets
+.env
+.env.local
+.env.*.local
+!.env.example
+*.pem
+*.key
+*.pfx
+*.p12
+*.jks
+*.keystore
+*.wallet
+*wallet-export*
+*private-key*
+keystore/
+keystores/
+wallets/
+
+# Python / Streamlit
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.ruff_cache/
+.streamlit/secrets.toml
+
+# Rust
+target/
+**/target/
+
+# Go
+bin/
+*.exe
+*.test
+*.out
+coverage.out
+
+# Solidity / Foundry
+out/
+cache/
+broadcast/
+contracts/out/
+contracts/cache/
+contracts/broadcast/
+
+# Node / generated packages
+node_modules/
+dist/
+build/
+
+# Docker / local runtime data
+.tmp/
+tmp/
+temp/
+postgres-data/
+postgres_data/
+pgdata/
+prometheus-data/
+prometheus_data/
+
+# Logs and local databases
+logs/
+*.log
+*.db
+*.sqlite
+*.sqlite3
+*.db-wal
+*.db-shm
+
+# Feed/replay/benchmark generated output
+recordings/
+feed-recordings/
+replay-output/
+benchmark-output/
+bench-output/
+*.ndjson.zst
+*.jsonl.zst
+*.prof
+*.pprof
+*.bench
+
+# Editors and OS metadata
+.idea/
+.vscode/*
+!.vscode/extensions.json
+!.vscode/settings.example.json
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+Desktop.ini
