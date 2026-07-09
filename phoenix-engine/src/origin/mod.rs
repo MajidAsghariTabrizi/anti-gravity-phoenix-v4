@@ -111,7 +111,9 @@ fn decode_exact_input_single(data: &str) -> Result<ExactInputSingle, DomainError
 }
 
 fn abi_slots(data: &str) -> Result<Vec<String>, DomainError> {
-    if data.len() % 64 != 0 || !data.chars().all(|c| c.is_ascii_hexdigit()) {
+    if !data.as_bytes().chunks_exact(64).remainder().is_empty()
+        || !data.chars().all(|c| c.is_ascii_hexdigit())
+    {
         return Err(DomainError::InvalidCalldata(
             "invalid abi slot data".to_string(),
         ));

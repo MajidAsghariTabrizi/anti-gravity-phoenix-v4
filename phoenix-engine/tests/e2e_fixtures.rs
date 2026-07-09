@@ -112,7 +112,8 @@ fn profitable_fixture_reaches_shadow_sink_and_dynamic_sizing() {
         },
         |amount| {
             let distance = amount.0.abs_diff(500);
-            let final_out = 1_100u128.saturating_sub(distance);
+            let synthetic_profit = 1_000u128.saturating_sub(distance.saturating_mul(2));
+            let final_out = amount.0.saturating_add(synthetic_profit);
             let breakdown = model.evaluate(ProfitInput {
                 final_route_output: Amount(final_out),
                 principal: amount,
