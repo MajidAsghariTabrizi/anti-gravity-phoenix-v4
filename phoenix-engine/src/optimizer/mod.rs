@@ -38,10 +38,7 @@ pub fn optimize<F>(
 where
     F: FnMut(Amount) -> Result<CandidateEvaluation, DomainError>,
 {
-    if cfg.min_amount.0 == 0
-        || cfg.max_amount.0 < cfg.min_amount.0
-        || cfg.max_evaluations == 0
-    {
+    if cfg.min_amount.0 == 0 || cfg.max_amount.0 < cfg.min_amount.0 || cfg.max_evaluations == 0 {
         return Ok(None);
     }
 
@@ -57,7 +54,14 @@ where
         if evaluated >= cfg.max_evaluations {
             break;
         }
-        let ev = evaluate(Amount(amount))?;
+        let ev = match evaluate(Amount(amount)) {
+            Ok(ev) => ev,
+            Err(DomainError::ArithmeticUnderflow) => {
+                evaluated += 1;
+                continue;
+            }
+            Err(err) => return Err(err),
+        };
         evaluated += 1;
         if ev.expected_net_profit >= cfg.min_profit
             && best
@@ -76,7 +80,15 @@ where
         let step = (width / 4).max(1);
         let mut amount = start;
         while amount <= end && evaluated < cfg.max_evaluations {
-            let ev = evaluate(Amount(amount))?;
+            let ev = match evaluate(Amount(amount)) {
+                Ok(ev) => ev,
+                Err(DomainError::ArithmeticUnderflow) => {
+                    evaluated += 1;
+                    amount = amount.saturating_add(step);
+                    continue;
+                }
+                Err(err) => return Err(err),
+            };
             evaluated += 1;
             if ev.expected_net_profit >= cfg.min_profit
                 && best
@@ -144,5 +156,45 @@ mod tests {
         .unwrap();
         assert_ne!(result.best_amount, Amount(100));
         assert_eq!(result.best_amount, Amount(500));
+    }
+
+    #[test]
+    fn skips_underflow_candidates_and_keeps_searching() {
+        let cfg = OptimizerConfig {
+            min_amount: Amount(100),
+            max_amount: Amount(300),
+            max_evaluations: 3,
+            min_profit: Amount(1),
+        };
+        let result = optimize(cfg, |amount| {
+            if amount == Amount(100) {
+                return Err(DomainError::ArithmeticUnderflow);
+            }
+            let net = if amount == Amount(200) { 50 } else { 0 };
+            Ok(CandidateEvaluation {
+                amount,
+                gross_profit: Amount(net + 10),
+                flash_premium: Amount(1),
+                expected_execution_cost: Amount(2),
+                expected_ordering_cost: Amount(0),
+                uncertainty_reserve: Amount(0),
+                expected_net_profit: Amount(net),
+            })
+        })
+        .unwrap()
+        .unwrap();
+        assert_eq!(result.best_amount, Amount(200));
+    }
+
+    #[test]
+    fn propagates_non_underflow_errors() {
+        let cfg = OptimizerConfig {
+            min_amount: Amount(100),
+            max_amount: Amount(300),
+            max_evaluations: 3,
+            min_profit: Amount(1),
+        };
+        let err = optimize(cfg, |_| Err(DomainError::ArithmeticOverflow)).unwrap_err();
+        assert_eq!(err, DomainError::ArithmeticOverflow);
     }
 }

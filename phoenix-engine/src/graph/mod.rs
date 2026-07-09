@@ -49,9 +49,8 @@ mod tests {
 
     #[test]
     fn returns_only_routes_affected_by_pool() {
-        let token = TokenAddress(
-            Address::parse("0x1111111111111111111111111111111111111111").unwrap(),
-        );
+        let token =
+            TokenAddress(Address::parse("0x1111111111111111111111111111111111111111").unwrap());
         let mut graph = PoolGraph::new();
         let route = Route {
             route_id: RouteId("r1".to_string()),

@@ -31,8 +31,7 @@ pub fn simulate_exact_input(
         .ok_or(DomainError::ArithmeticOverflow)?
         / fee_denominator;
 
-    let crossed =
-        ((amount_in.0 / pool.liquidity.0.max(1)) as u32).min(max_tick_crossings + 1);
+    let crossed = ((amount_in.0 / pool.liquidity.0.max(1)) as u32).min(max_tick_crossings + 1);
     if crossed > max_tick_crossings {
         return Err(DomainError::StateIncomplete);
     }

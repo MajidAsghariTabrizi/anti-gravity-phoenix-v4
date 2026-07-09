@@ -145,7 +145,10 @@ mod tests {
     use crate::messaging::NormalizedTx;
 
     fn slot_address(address: &str) -> String {
-        format!("000000000000000000000000{}", address.trim_start_matches("0x"))
+        format!(
+            "000000000000000000000000{}",
+            address.trim_start_matches("0x")
+        )
     }
 
     fn slot_u(value: u128) -> String {

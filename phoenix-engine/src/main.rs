@@ -25,7 +25,10 @@ fn main() {
     let health_addr =
         std::env::var("ENGINE_HEALTH_ADDR").unwrap_or_else(|_| "0.0.0.0:9200".to_string());
     start_health_server(health_addr, ready, detail.to_string());
-    if std::env::var("PHOENIX_ONESHOT").map(|v| v == "true").unwrap_or(false) {
+    if std::env::var("PHOENIX_ONESHOT")
+        .map(|v| v == "true")
+        .unwrap_or(false)
+    {
         return;
     }
     loop {

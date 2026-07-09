@@ -174,7 +174,10 @@ fn unsupported_router_fixture_is_measured_not_guessed() {
         "0xaf88d065e77c8cc2239327c5edb3a432268e5831",
         500,
     );
-    assert_eq!(detector.classify(&tx), OriginClassification::PossibleAggregator);
+    assert_eq!(
+        detector.classify(&tx),
+        OriginClassification::PossibleAggregator
+    );
 }
 
 #[test]
