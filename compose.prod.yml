@@ -1,0 +1,212 @@
+x-common-env: &common-env
+  env_file:
+    - ${PHOENIX_ENV_FILE:-/etc/phoenix/phoenix.env}
+
+x-logging: &bounded-logging
+  driver: json-file
+  options:
+    max-size: "50m"
+    max-file: "5"
+
+services:
+  nitro-feed-relay:
+    image: offchainlabs/nitro-node:v3.11.2-3599aca
+    command:
+      - --chain.id=42161
+      - --parent-chain.connection.url=${PARENT_CHAIN_RPC_URL:?PARENT_CHAIN_RPC_URL is required}
+      - --node.feed.input.url=${ARBITRUM_SEQUENCER_FEED_URL:-}
+      - --node.feed.input.require-chain-id=true
+      - --node.feed.input.require-feed-version=true
+      - --node.feed.output.enable=true
+      - --node.feed.output.addr=0.0.0.0
+      - --node.feed.output.port=9642
+      - --http.addr=127.0.0.1
+      - --http.port=8547
+      - --ws.addr=127.0.0.1
+    networks: [phoenix-internal]
+    restart: unless-stopped
+    logging: *bounded-logging
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O - http://127.0.0.1:8547/livenessprobe >/dev/null 2>&1"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  nats:
+    image: nats:2.10-alpine
+    command: ["-js=false", "-m", "8222"]
+    networks: [phoenix-internal]
+    restart: unless-stopped
+    logging: *bounded-logging
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "-", "http://127.0.0.1:8222/healthz"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  postgres:
+    image: postgres:16-alpine
+    <<: *common-env
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:?POSTGRES_USER is required}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
+      POSTGRES_DB: ${POSTGRES_DB:?POSTGRES_DB is required}
+    volumes:
+      - /opt/phoenix/data/postgres:/var/lib/postgresql/data
+    networks: [phoenix-internal]
+    restart: unless-stopped
+    logging: *bounded-logging
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U \"$${POSTGRES_USER}\" -d \"$${POSTGRES_DB}\""]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+
+  migration-runner:
+    image: ${FEED_INGESTOR_IMAGE:?FEED_INGESTOR_IMAGE is required}
+    <<: *common-env
+    entrypoint: ["/usr/local/bin/migration-runner"]
+    command: ["-migrations", "/app/migrations"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks: [phoenix-internal]
+    restart: "no"
+    logging: *bounded-logging
+
+  rpc-gateway:
+    image: ${RPC_GATEWAY_IMAGE:?RPC_GATEWAY_IMAGE is required}
+    <<: *common-env
+    environment:
+      PHOENIX_ENV: production
+      RPC_GATEWAY_ADDR: 0.0.0.0:9300
+      RPC_PROVIDER_URLS: ${RPC_PROVIDER_URLS:?RPC_PROVIDER_URLS is required}
+      RPC_PROVIDER_WEIGHTS: ${RPC_PROVIDER_WEIGHTS:-1}
+      RPC_GLOBAL_RPS: ${RPC_GLOBAL_RPS:-5}
+    networks: [phoenix-internal]
+    restart: unless-stopped
+    logging: *bounded-logging
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O - http://127.0.0.1:9300/readyz >/dev/null 2>&1"]
+      interval: 15s
+      timeout: 3s
+      retries: 5
+
+  feed-ingestor:
+    image: ${FEED_INGESTOR_IMAGE:?FEED_INGESTOR_IMAGE is required}
+    <<: *common-env
+    environment:
+      PHOENIX_ENV: production
+      PHOENIX_FEED_SOURCE: relay
+      PHOENIX_FEED_RELAY_URL: ${PHOENIX_FEED_RELAY_URL:?PHOENIX_FEED_RELAY_URL is required}
+      NATS_URL: nats://nats:4222
+      METRICS_ADDR: 0.0.0.0:9100
+    depends_on:
+      nats:
+        condition: service_healthy
+      nitro-feed-relay:
+        condition: service_healthy
+    networks: [phoenix-internal]
+    restart: unless-stopped
+    logging: *bounded-logging
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O - http://127.0.0.1:9100/readyz >/dev/null 2>&1"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  phoenix-engine:
+    image: ${PHOENIX_ENGINE_IMAGE:?PHOENIX_ENGINE_IMAGE is required}
+    <<: *common-env
+    environment:
+      PHOENIX_ENV: production
+      PHOENIX_MODE: SHADOW
+      LIVE_EXECUTION: "false"
+      NATS_URL: nats://nats:4222
+      CHAIN_ID: 42161
+      ENGINE_HEALTH_ADDR: 0.0.0.0:9200
+    depends_on:
+      nats:
+        condition: service_healthy
+      rpc-gateway:
+        condition: service_healthy
+      feed-ingestor:
+        condition: service_healthy
+    networks: [phoenix-internal]
+    restart: unless-stopped
+    logging: *bounded-logging
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O - http://127.0.0.1:9200/readyz >/dev/null 2>&1"]
+      interval: 15s
+      timeout: 3s
+      retries: 5
+
+  recorder:
+    image: ${RECORDER_IMAGE:?RECORDER_IMAGE is required}
+    <<: *common-env
+    environment:
+      PHOENIX_ENV: production
+      RECORDER_DAEMON: "true"
+      RECORDER_HEALTH_ADDR: 0.0.0.0:9400
+      POSTGRES_DSN: ${POSTGRES_DSN:?POSTGRES_DSN is required}
+      NATS_URL: nats://nats:4222
+    depends_on:
+      postgres:
+        condition: service_healthy
+      nats:
+        condition: service_healthy
+    networks: [phoenix-internal]
+    restart: unless-stopped
+    logging: *bounded-logging
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O - http://127.0.0.1:9400/readyz >/dev/null 2>&1"]
+      interval: 15s
+      timeout: 3s
+      retries: 5
+
+  dashboard:
+    image: ${DASHBOARD_IMAGE:?DASHBOARD_IMAGE is required}
+    <<: *common-env
+    environment:
+      POSTGRES_DSN: ${POSTGRES_DSN:?POSTGRES_DSN is required}
+      PROMETHEUS_METRICS_URL: http://prometheus:9090
+    ports:
+      - "127.0.0.1:8501:8501"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      prometheus:
+        condition: service_healthy
+    networks: [phoenix-internal]
+    restart: unless-stopped
+    logging: *bounded-logging
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8501/_stcore/health', timeout=2)\""]
+      interval: 15s
+      timeout: 3s
+      retries: 5
+
+  prometheus:
+    image: prom/prometheus:v2.53.0
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=30d
+    volumes:
+      - /opt/phoenix/deploy/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - /opt/phoenix/data/prometheus:/prometheus
+    ports:
+      - "127.0.0.1:9090:9090"
+    networks: [phoenix-internal]
+    restart: unless-stopped
+    logging: *bounded-logging
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O - http://127.0.0.1:9090/-/ready >/dev/null 2>&1"]
+      interval: 15s
+      timeout: 3s
+      retries: 5
+
+networks:
+  phoenix-internal:
+    driver: bridge

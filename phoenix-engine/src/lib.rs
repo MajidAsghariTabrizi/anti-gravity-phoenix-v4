@@ -11,4 +11,3 @@ pub mod profit;
 pub mod state;
 
 pub use domain::*;
-

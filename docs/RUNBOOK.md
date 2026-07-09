@@ -1,52 +1,139 @@
 # Runbook
 
-## Start Shadow Stack
+Production default:
 
-```bash
-cp .env.example .env
-docker compose up --build
-```
+- `PHOENIX_MODE=SHADOW`
+- `LIVE_EXECUTION=false`
+- no GitHub-held signer key
+- release by immutable manifest
 
-## Common Failures
+Production operations use `/opt/phoenix/deploy/deploy-release.sh <sha>`, `/opt/phoenix/deploy/rollback-release.sh`, and `/opt/phoenix/deploy/production-healthcheck.sh`.
 
-### Feed relay cannot connect
+## Incidents
 
-- Confirm outbound access from the VPS.
-- Confirm the pinned Nitro image can start.
-- Confirm the relay port is not exposed publicly.
-- Keep engine in SHADOW mode.
+### Nitro feed relay disconnected
 
-### Sequence gaps increase
+- Keep `LIVE_EXECUTION=false`.
+- Check `nitro-feed-relay` health and outbound connectivity.
+- Preserve relay logs and release SHA.
+- Do not switch feed-ingestor to fixtures in production.
+
+### Feed sequence gap
 
 - Stop LIVE attempts.
-- Keep recording feed events.
 - Inspect `feed_sequence_gaps_total`.
+- Preserve feed logs and recorder output.
 - Reconcile local state through `rpc-gateway`.
 
-### RPC budget exhausted
+### High feed decode errors
 
-- Dashboard remains usable from PostgreSQL and metrics.
-- Bootstrap/reconciliation slows down.
-- Hot path should continue from local state where complete.
+- Inspect `feed_decode_errors_total` and malformed payload categories.
+- Keep SHADOW only.
+- Compare against pinned Nitro release semantics before changing parser logic.
 
-### Database unavailable
+### NATS unavailable
 
-- Engine must not block the synchronous decision path.
-- Recorder retries with bounded queue behavior.
-- Dashboard shows degraded state.
+- Check NATS health endpoint and Docker network.
+- Expect feed-ingestor, engine, and recorder readiness to fail.
+- Restore NATS before restarting dependent services.
 
-### Executor paused
+### RPC gateway degraded
 
-- LIVE submission gate must fail closed.
-- Investigate owner action and latest security event.
+- Inspect provider budget and circuit breaker metrics.
+- Reduce cold-path pressure.
+- Hot path must not add direct public RPC reads.
+
+### All RPC providers circuit-open
+
+- Keep SHADOW.
+- Reconcile provider credentials and quotas.
+- Do not bypass `rpc-gateway` from engine or dashboard.
+
+### PostgreSQL unavailable
+
+- Check `pg_isready`, disk, and volume permissions.
+- Recorder/dashboard may degrade.
+- Hot decision path must not block on database recovery.
+
+### Migration failure
+
+- Deployment fails closed.
+- Preserve migration-runner logs.
+- Do not mark the release current.
+- Fix migration forward; there is no automatic down migration.
+
+### Phoenix engine unhealthy
+
+- Check `/readyz`.
+- In production, not-ready is expected until NATS subscription and state bootstrap are implemented.
+- Do not override health gates to force a deploy.
+
+### State incomplete spike
+
+- Inspect pool completeness metrics and `STATE_INCOMPLETE` miss reasons.
+- Reconcile pool state through `rpc-gateway`.
+- Reject candidates rather than extrapolating unknown ticks.
+
+### Supported origins drop unexpectedly
+
+- Inspect protocol registry changes and router configuration.
+- Confirm no ABI/address assumptions changed without documentation.
+
+### Zero profitable opportunities
+
+- Compare origin volume, state completeness, optimizer candidates, gas model, and uncertainty reserve.
+- Do not treat zero opportunities as a failure by itself.
+
+### Deployment failure
+
+- `deploy-release.sh` invokes rollback automatically.
+- Preserve failed release manifest, logs, and health output.
+- Do not write `current-release` manually for a failed release.
+
+### Automatic rollback
+
+- Verify `ROLLBACK_OK`.
+- Confirm `current-release` points to the restored SHA.
+- Open an incident note with failed and restored release SHAs.
+
+### Rollback failure
+
+- Treat as critical.
+- Preserve diagnostics.
+- Keep services in SHADOW.
+- Manually inspect `previous-release`, manifests, GHCR access, and Compose health.
+
+### GHCR pull failure
+
+- Check production host GHCR login and package permissions.
+- Verify manifest digest references exist.
+- Do not fall back to `latest`.
+
+### Production disk pressure
+
+- Check `/opt/phoenix/data`, Docker image cache, logs, and PostgreSQL volume.
+- Preserve critical database and release artifacts.
+- Prune only reviewed caches/images.
+
+### Prometheus unavailable
+
+- Dashboard metrics may degrade.
+- Health gate fails until Prometheus readiness recovers.
+- Inspect `/opt/phoenix/data/prometheus`.
+
+### Dashboard unavailable
+
+- Check Streamlit health on loopback.
+- Dashboard failure must not cause hot-path RPC reads or engine restarts.
 
 ## Recovery Order
 
-1. Preserve logs, metrics, recorder output, and database.
+1. Preserve logs, metrics, recorder output, release manifests, and database.
 2. Keep `LIVE_EXECUTION=false`.
-3. Restore NATS/PostgreSQL/metrics.
-4. Restore feed relay.
-5. Reconcile state through `rpc-gateway`.
-6. Resume SHADOW.
-7. Reconsider LIVE only after the release gate passes.
-
+3. Restore Docker, NATS, PostgreSQL, and internal networking.
+4. Restore Nitro relay.
+5. Restore feed-ingestor readiness.
+6. Restore rpc-gateway and state reconciliation.
+7. Restore engine/recorder readiness.
+8. Resume SHADOW.
+9. Reconsider LIVE only after every release gate passes.

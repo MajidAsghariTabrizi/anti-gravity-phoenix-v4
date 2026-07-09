@@ -1,0 +1,90 @@
+name: Live Readiness Report
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_sha:
+        description: Exact 40-character release Git SHA to review
+        required: true
+        type: string
+      executor_address:
+        description: PhoenixExecutor address proposed for later manual LIVE operations
+        required: true
+        type: string
+      acknowledgement:
+        description: Type the exact required acknowledgement
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: live-readiness-${{ inputs.release_sha }}
+  cancel-in-progress: false
+
+jobs:
+  live-readiness-report:
+    name: live-readiness-report
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+
+      - name: Validate LIVE readiness inputs
+        shell: bash
+        env:
+          RELEASE_SHA: ${{ inputs.release_sha }}
+          EXECUTOR_ADDRESS: ${{ inputs.executor_address }}
+          ACKNOWLEDGEMENT: ${{ inputs.acknowledgement }}
+        run: |
+          set -euo pipefail
+          if [ "$ACKNOWLEDGEMENT" != "I_UNDERSTAND_THIS_CAN_SEND_REAL_TRANSACTIONS" ]; then
+            echo "Acknowledgement did not match the required exact phrase"
+            exit 1
+          fi
+          case "$RELEASE_SHA" in
+            *[!0-9a-f]*|"") echo "release_sha must be lowercase hex"; exit 1 ;;
+          esac
+          if [ "${#RELEASE_SHA}" -ne 40 ]; then
+            echo "release_sha must be 40 characters"
+            exit 1
+          fi
+          if ! printf '%s' "$EXECUTOR_ADDRESS" | grep -Eq '^0x[0-9a-fA-F]{40}$'; then
+            echo "executor_address must be an Ethereum address"
+            exit 1
+          fi
+
+      - name: Generate report
+        shell: bash
+        env:
+          RELEASE_SHA: ${{ inputs.release_sha }}
+          EXECUTOR_ADDRESS: ${{ inputs.executor_address }}
+        run: |
+          set -euo pipefail
+          cat > live-readiness-report.md <<EOF
+          # Phoenix LIVE Readiness Report
+
+          release_sha: ${RELEASE_SHA}
+          executor_address: ${EXECUTOR_ADDRESS}
+
+          This workflow does not enable LIVE execution, does not receive SIGNER_PRIVATE_KEY,
+          does not edit /etc/phoenix/phoenix.env, and does not restart Phoenix in LIVE mode.
+
+          Required server-side evidence before a manual LIVE gate:
+          - SHADOW production health passed for this exact release.
+          - Release manifest exists and references immutable digest-backed images.
+          - CI required checks passed on the pull request merged to main.
+          - Nitro relay integration and feed stability gates are satisfied.
+          - PhoenixExecutor security tests and fork/parity tests passed.
+          - The operator manually verifies /etc/phoenix/phoenix.env on the production host.
+          EOF
+
+      - name: Upload report
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: live-readiness-report-${{ inputs.release_sha }}
+          path: live-readiness-report.md
+          if-no-files-found: error
+          retention-days: 90

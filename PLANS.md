@@ -38,3 +38,22 @@ Before any LIVE mode attempt:
 - Validate local simulator parity against verified V3 quoters.
 - Confirm PhoenixExecutor bytecode and registry through the cold RPC gateway.
 
+## Productionization Status
+
+- Git model: implemented GitHub Flow docs, branch patterns, Conventional Commit guidance, line-ending policy, and PR template.
+- CI: implemented split GitHub checks for hygiene, Go, Rust crates, Solidity, Python dashboard, Docker validation, and deterministic fixtures.
+- Image publishing: implemented GHCR workflow for immutable `sha-<full git sha>` images and release manifest artifacts.
+- SHADOW deploy: implemented workflow-run deployment over strict SSH using only production deploy secrets and exact release manifests.
+- LIVE gate: implemented manual readiness-report workflow that cannot enable LIVE or receive signer material.
+- Production Compose: implemented `compose.prod.yml` with GHCR image refs, `/etc/phoenix/phoenix.env`, loopback dashboard/Prometheus, log rotation, persistent storage, and defensive SHADOW defaults.
+- Health/readiness: implemented feed-ingestor health/readiness; added conservative Rust service readiness endpoints; production not-ready remains truthful where NATS/PostgreSQL wiring is incomplete.
+- Nitro feed: production relay ingestion is explicitly blocked until official Nitro adapter parsing is implemented and verified.
+- Migrations: implemented a small Go PostgreSQL migration runner with schema table, checksums, advisory lock, and transactional apply.
+- Deployment scripts: implemented bootstrap, env validation, release deploy, health gate, and rollback scripts.
+
+Current production release blockers:
+
+- Official Nitro relay adapter is not implemented or live-verified.
+- Phoenix engine production NATS subscription/state bootstrap is not implemented.
+- Recorder production PostgreSQL schema verification and NATS subscription are not implemented.
+- Rust, Foundry, Docker, and production Linux scripts still require validation on a host with those tools.

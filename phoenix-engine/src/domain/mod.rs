@@ -115,4 +115,3 @@ impl fmt::Display for DomainError {
 }
 
 impl std::error::Error for DomainError {}
-

@@ -51,4 +51,3 @@ mod tests {
         assert_eq!(buffer.len(), 1);
     }
 }
-

@@ -7,6 +7,8 @@ fn bench_decision_path() {
         acc = acc.saturating_add(amount * amount);
     }
     let elapsed = start.elapsed();
-    println!("25 optimizer evaluations fixture accumulator={acc} elapsed_ns={}", elapsed.as_nanos());
+    println!(
+        "25 optimizer evaluations fixture accumulator={acc} elapsed_ns={}",
+        elapsed.as_nanos()
+    );
 }
-

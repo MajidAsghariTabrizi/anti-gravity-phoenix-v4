@@ -56,4 +56,3 @@ mod tests {
         assert_eq!(result.expected_net_profit, Amount(10));
     }
 }
-

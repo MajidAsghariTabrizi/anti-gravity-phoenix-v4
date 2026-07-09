@@ -18,7 +18,12 @@ fn global_budget_rejects_after_capacity() {
 fn cache_honors_ttl() {
     let now = Instant::now();
     let mut cache = TtlCache::default();
-    cache.insert("eth_chainId".to_string(), "0xa4b1".to_string(), Duration::from_secs(1), now);
+    cache.insert(
+        "eth_chainId".to_string(),
+        "0xa4b1".to_string(),
+        Duration::from_secs(1),
+        now,
+    );
     assert_eq!(cache.get("eth_chainId", now), Some("0xa4b1".to_string()));
     assert_eq!(cache.get("eth_chainId", now + Duration::from_secs(2)), None);
 }
@@ -48,4 +53,3 @@ fn pool_selects_available_provider() {
     let mut pool = ProviderPool::new(vec![p]);
     assert!(pool.choose(now).is_some());
 }
-

@@ -15,4 +15,3 @@ pub struct NormalizedTx {
     pub max_fee_per_gas: String,
     pub max_priority_fee_per_gas: String,
 }
-

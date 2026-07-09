@@ -70,8 +70,12 @@ mod tests {
     fn pool() -> PoolState {
         PoolState {
             pool_id: PoolId("pool".to_string()),
-            token0: TokenAddress(Address::parse("0x1111111111111111111111111111111111111111").unwrap()),
-            token1: TokenAddress(Address::parse("0x2222222222222222222222222222222222222222").unwrap()),
+            token0: TokenAddress(
+                Address::parse("0x1111111111111111111111111111111111111111").unwrap(),
+            ),
+            token1: TokenAddress(
+                Address::parse("0x2222222222222222222222222222222222222222").unwrap(),
+            ),
             fee: 500,
             tick: Tick(0),
             liquidity: Liquidity(1_000_000),
@@ -87,14 +91,15 @@ mod tests {
 
     #[test]
     fn integer_segment_swap_applies_fee() {
-        let result = simulate_exact_input(&pool(), Amount(1_000_000), Direction::ZeroForOne, 1).unwrap();
+        let result =
+            simulate_exact_input(&pool(), Amount(1_000_000), Direction::ZeroForOne, 1).unwrap();
         assert_eq!(result.amount_out, Amount(1_999_000));
     }
 
     #[test]
     fn rejects_unknown_tick_region() {
-        let err = simulate_exact_input(&pool(), Amount(3_000_000), Direction::ZeroForOne, 1).unwrap_err();
+        let err =
+            simulate_exact_input(&pool(), Amount(3_000_000), Direction::ZeroForOne, 1).unwrap_err();
         assert_eq!(err, DomainError::StateIncomplete);
     }
 }
-

@@ -53,21 +53,28 @@ impl OriginDetector {
         let selector = &calldata[0..8];
         match selector {
             EXACT_INPUT_SINGLE_SELECTOR => match decode_exact_input_single(&calldata[8..]) {
-                Ok(decoded) => OriginClassification::SupportedSwapOrigin(OriginEvent {
-                    origin_tx_hash: tx.tx_hash.clone(),
-                    origin_sequence: tx.sequence,
-                    router: to.clone(),
-                    decoded_commands: vec!["exactInputSingle".to_string()],
-                    swap_path: vec![TokenAddress(decoded.token_in), TokenAddress(decoded.token_out)],
-                    exact_in: true,
-                    amount: decoded.amount_in,
-                    candidate_touched_pools: vec![PoolId(format!(
+                Ok(decoded) => {
+                    let touched_pool = PoolId(format!(
                         "{}:{}:{}",
                         decoded.token_in.as_str(),
                         decoded.token_out.as_str(),
                         decoded.fee
-                    ))],
-                }),
+                    ));
+
+                    OriginClassification::SupportedSwapOrigin(OriginEvent {
+                        origin_tx_hash: tx.tx_hash.clone(),
+                        origin_sequence: tx.sequence,
+                        router: to.clone(),
+                        decoded_commands: vec!["exactInputSingle".to_string()],
+                        swap_path: vec![
+                            TokenAddress(decoded.token_in),
+                            TokenAddress(decoded.token_out),
+                        ],
+                        exact_in: true,
+                        amount: decoded.amount_in,
+                        candidate_touched_pools: vec![touched_pool],
+                    })
+                }
                 Err(_) => OriginClassification::Malformed,
             },
             EXACT_INPUT_SELECTOR => OriginClassification::KnownRouterUnsupportedCommand,
@@ -87,7 +94,9 @@ struct ExactInputSingle {
 fn decode_exact_input_single(data: &str) -> Result<ExactInputSingle, DomainError> {
     let slots = abi_slots(data)?;
     if slots.len() < 8 {
-        return Err(DomainError::InvalidCalldata("exactInputSingle too short".to_string()));
+        return Err(DomainError::InvalidCalldata(
+            "exactInputSingle too short".to_string(),
+        ));
     }
     let token_in = Address::parse(&format!("0x{}", &slots[0][24..64]))?;
     let token_out = Address::parse(&format!("0x{}", &slots[1][24..64]))?;
@@ -102,8 +111,12 @@ fn decode_exact_input_single(data: &str) -> Result<ExactInputSingle, DomainError
 }
 
 fn abi_slots(data: &str) -> Result<Vec<String>, DomainError> {
-    if data.len() % 64 != 0 || !data.chars().all(|c| c.is_ascii_hexdigit()) {
-        return Err(DomainError::InvalidCalldata("invalid abi slot data".to_string()));
+    if !data.as_bytes().chunks_exact(64).remainder().is_empty()
+        || !data.chars().all(|c| c.is_ascii_hexdigit())
+    {
+        return Err(DomainError::InvalidCalldata(
+            "invalid abi slot data".to_string(),
+        ));
     }
     Ok(data
         .as_bytes()
@@ -119,7 +132,9 @@ fn parse_u32_slot(slot: &str) -> Result<u32, DomainError> {
 
 fn parse_u128_slot(slot: &str) -> Result<u128, DomainError> {
     if &slot[0..32] != "00000000000000000000000000000000" {
-        return Err(DomainError::InvalidCalldata("uint256 exceeds local u128 fixture range".to_string()));
+        return Err(DomainError::InvalidCalldata(
+            "uint256 exceeds local u128 fixture range".to_string(),
+        ));
     }
     u128::from_str_radix(&slot[32..64], 16)
         .map_err(|_| DomainError::InvalidCalldata("invalid uint256 slot".to_string()))
@@ -132,7 +147,10 @@ mod tests {
     use crate::messaging::NormalizedTx;
 
     fn slot_address(address: &str) -> String {
-        format!("000000000000000000000000{}", address.trim_start_matches("0x"))
+        format!(
+            "000000000000000000000000{}",
+            address.trim_start_matches("0x")
+        )
     }
 
     fn slot_u(value: u128) -> String {
@@ -159,7 +177,9 @@ mod tests {
         );
         let tx = NormalizedTx {
             sequence: SequenceNumber(7),
-            tx_hash: TxHash("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string()),
+            tx_hash: TxHash(
+                "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+            ),
             tx_type: "0x2".to_string(),
             chain_id: ChainId(42161),
             from: Address::parse("0x1111111111111111111111111111111111111111").unwrap(),
@@ -180,4 +200,3 @@ mod tests {
         }
     }
 }
-

@@ -1,4 +1,8 @@
-BEGIN;
+CREATE TABLE IF NOT EXISTS schema_migrations (
+    version TEXT PRIMARY KEY,
+    checksum TEXT NOT NULL,
+    applied_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
 
 CREATE TABLE IF NOT EXISTS origin_transactions (
     id BIGSERIAL PRIMARY KEY,
@@ -133,6 +137,3 @@ CREATE TABLE IF NOT EXISTS feed_events (
 CREATE INDEX IF NOT EXISTS opportunities_lifecycle_idx ON opportunities(lifecycle_state);
 CREATE INDEX IF NOT EXISTS miss_reasons_reason_idx ON miss_reasons(reason);
 CREATE INDEX IF NOT EXISTS execution_attempts_status_idx ON execution_attempts(status);
-
-COMMIT;
-

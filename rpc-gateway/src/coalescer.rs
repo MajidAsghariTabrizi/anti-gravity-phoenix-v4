@@ -27,4 +27,3 @@ impl Coalescer {
         self.waiters.remove(key).unwrap_or(0)
     }
 }
-

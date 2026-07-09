@@ -1,5 +1,7 @@
 use phoenix_engine::domain::*;
-use phoenix_engine::execution::{ExecutionCoordinator, ExecutionDecision, ExecutionMode, Opportunity};
+use phoenix_engine::execution::{
+    ExecutionCoordinator, ExecutionDecision, ExecutionMode, Opportunity,
+};
 use phoenix_engine::graph::{PoolEdge, PoolGraph, Route};
 use phoenix_engine::optimizer::{optimize, CandidateEvaluation, OptimizerConfig};
 use phoenix_engine::origin::{OriginClassification, OriginDetector};
@@ -17,7 +19,12 @@ fn slot_u(v: u128) -> String {
     format!("{v:064x}")
 }
 
-fn fixture_tx(to: Address, token_in: &str, token_out: &str, amount: u128) -> phoenix_engine::messaging::NormalizedTx {
+fn fixture_tx(
+    to: Address,
+    token_in: &str,
+    token_out: &str,
+    amount: u128,
+) -> phoenix_engine::messaging::NormalizedTx {
     let calldata = format!(
         "0x414bf389{}{}{}{}{}{}{}{}",
         slot_address(token_in),
@@ -31,7 +38,9 @@ fn fixture_tx(to: Address, token_in: &str, token_out: &str, amount: u128) -> pho
     );
     phoenix_engine::messaging::NormalizedTx {
         sequence: SequenceNumber(1),
-        tx_hash: TxHash("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string()),
+        tx_hash: TxHash(
+            "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+        ),
         tx_type: "0x2".to_string(),
         chain_id: ChainId(42161),
         from: address("0x1111111111111111111111111111111111111111"),
@@ -103,7 +112,8 @@ fn profitable_fixture_reaches_shadow_sink_and_dynamic_sizing() {
         },
         |amount| {
             let distance = amount.0.abs_diff(500);
-            let final_out = 1_100u128.saturating_sub(distance);
+            let synthetic_profit = 1_000u128.saturating_sub(distance.saturating_mul(2));
+            let final_out = amount.0.saturating_add(synthetic_profit);
             let breakdown = model.evaluate(ProfitInput {
                 final_route_output: Amount(final_out),
                 principal: amount,
@@ -149,7 +159,10 @@ fn profitable_fixture_reaches_shadow_sink_and_dynamic_sizing() {
         simulation_latency_ns: 1,
     };
     let coordinator = ExecutionCoordinator::new(ExecutionMode::Shadow);
-    assert_eq!(coordinator.submit(&opportunity), ExecutionDecision::RecordedShadow);
+    assert_eq!(
+        coordinator.submit(&opportunity),
+        ExecutionDecision::RecordedShadow
+    );
 }
 
 #[test]
@@ -162,7 +175,10 @@ fn unsupported_router_fixture_is_measured_not_guessed() {
         "0xaf88d065e77c8cc2239327c5edb3a432268e5831",
         500,
     );
-    assert_eq!(detector.classify(&tx), OriginClassification::PossibleAggregator);
+    assert_eq!(
+        detector.classify(&tx),
+        OriginClassification::PossibleAggregator
+    );
 }
 
 #[test]
@@ -189,4 +205,3 @@ fn non_profitable_fixture_does_not_create_opportunity() {
     .unwrap();
     assert!(result.is_none());
 }
-

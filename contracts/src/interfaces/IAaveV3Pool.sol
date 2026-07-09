@@ -12,12 +12,7 @@ interface IAaveV3Pool {
 }
 
 interface IAaveFlashBorrower {
-    function executeOperation(
-        address asset,
-        uint256 amount,
-        uint256 premium,
-        address initiator,
-        bytes calldata params
-    ) external returns (bool);
+    function executeOperation(address asset, uint256 amount, uint256 premium, address initiator, bytes calldata params)
+        external
+        returns (bool);
 }
-

@@ -5,7 +5,8 @@ SHELL := /bin/sh
 verify: go-test rust-test contract-test python-smoke secret-scan
 
 go-test:
-	cd feed-ingestor && gofmt -w $$(find . -name '*.go') && go vet ./... && go test ./...
+	cd feed-ingestor && test -z "$$(gofmt -l .)" && go vet ./... && go test ./...
+	cd migration-runner && test -z "$$(gofmt -l .)" && go vet ./... && go test ./...
 
 rust-test:
 	@if command -v cargo >/dev/null 2>&1; then \
@@ -41,4 +42,3 @@ integration:
 
 bench:
 	@if command -v cargo >/dev/null 2>&1; then cargo test --manifest-path phoenix-engine/Cargo.toml --release bench_decision_path -- --ignored --nocapture; else echo "cargo unavailable; benchmark not measured"; exit 2; fi
-

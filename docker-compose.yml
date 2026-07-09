@@ -15,7 +15,7 @@ services:
     networks: [phoenix-internal]
     restart: unless-stopped
     healthcheck:
-      test: ["CMD-SHELL", "test -n \"$HOSTNAME\""]
+      test: ["CMD-SHELL", "wget -q -O - http://127.0.0.1:8547/livenessprobe >/dev/null 2>&1"]
       interval: 30s
       timeout: 5s
       retries: 3
@@ -62,7 +62,7 @@ services:
     networks: [phoenix-internal]
     restart: unless-stopped
     healthcheck:
-      test: ["CMD-SHELL", "true"]
+      test: ["CMD-SHELL", "wget -q -O - http://127.0.0.1:9300/readyz >/dev/null 2>&1"]
       interval: 15s
       timeout: 3s
       retries: 5
@@ -80,6 +80,11 @@ services:
         condition: service_healthy
     networks: [phoenix-internal]
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O - http://127.0.0.1:9100/readyz >/dev/null 2>&1"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
 
   phoenix-engine:
     build:
@@ -92,13 +97,19 @@ services:
       LIVE_EXECUTION: ${LIVE_EXECUTION:-false}
       NATS_URL: nats://nats:4222
       CHAIN_ID: 42161
+      ENGINE_HEALTH_ADDR: 0.0.0.0:9200
     depends_on:
       nats:
         condition: service_healthy
       rpc-gateway:
-        condition: service_started
+        condition: service_healthy
     networks: [phoenix-internal]
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O - http://127.0.0.1:9200/readyz >/dev/null 2>&1"]
+      interval: 15s
+      timeout: 3s
+      retries: 5
 
   recorder:
     build:
@@ -106,10 +117,16 @@ services:
       dockerfile: deploy/rust.Dockerfile
       args:
         CRATE: recorder
-    entrypoint: ["/bin/sh", "-c"]
-    command: ["sleep infinity"]
+    environment:
+      RECORDER_DAEMON: "true"
+      RECORDER_HEALTH_ADDR: 0.0.0.0:9400
     networks: [phoenix-internal]
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O - http://127.0.0.1:9400/readyz >/dev/null 2>&1"]
+      interval: 15s
+      timeout: 3s
+      retries: 5
 
   dashboard:
     build:
@@ -127,6 +144,11 @@ services:
         condition: service_started
     networks: [phoenix-internal]
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8501/_stcore/health', timeout=2)\""]
+      interval: 15s
+      timeout: 3s
+      retries: 5
 
   prometheus:
     image: prom/prometheus:v2.53.0
@@ -139,6 +161,11 @@ services:
       - "127.0.0.1:9090:9090"
     networks: [phoenix-internal]
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O - http://127.0.0.1:9090/-/ready >/dev/null 2>&1"]
+      interval: 15s
+      timeout: 3s
+      retries: 5
 
 networks:
   phoenix-internal:

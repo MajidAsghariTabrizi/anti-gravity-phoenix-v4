@@ -31,4 +31,3 @@ impl PartialOrd for QueuedRequest {
         Some(self.cmp(other))
     }
 }
-

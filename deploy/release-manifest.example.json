@@ -1,0 +1,32 @@
+{
+  "schema": "phoenix.release.v1",
+  "release_sha": "0000000000000000000000000000000000000000",
+  "created_at": "2026-07-08T00:00:00Z",
+  "images": {
+    "dashboard": {
+      "repository": "ghcr.io/majidasgharitabrizi/dashboard",
+      "tag": "sha-0000000000000000000000000000000000000000",
+      "digest": "sha256:replace_with_dashboard_digest"
+    },
+    "feed-ingestor": {
+      "repository": "ghcr.io/majidasgharitabrizi/feed-ingestor",
+      "tag": "sha-0000000000000000000000000000000000000000",
+      "digest": "sha256:replace_with_feed_ingestor_digest"
+    },
+    "phoenix-engine": {
+      "repository": "ghcr.io/majidasgharitabrizi/phoenix-engine",
+      "tag": "sha-0000000000000000000000000000000000000000",
+      "digest": "sha256:replace_with_phoenix_engine_digest"
+    },
+    "recorder": {
+      "repository": "ghcr.io/majidasgharitabrizi/recorder",
+      "tag": "sha-0000000000000000000000000000000000000000",
+      "digest": "sha256:replace_with_recorder_digest"
+    },
+    "rpc-gateway": {
+      "repository": "ghcr.io/majidasgharitabrizi/rpc-gateway",
+      "tag": "sha-0000000000000000000000000000000000000000",
+      "digest": "sha256:replace_with_rpc_gateway_digest"
+    }
+  }
+}

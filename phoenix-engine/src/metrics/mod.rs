@@ -31,4 +31,3 @@ pub const REQUIRED_COUNTERS: &[&str] = &[
     "realized_profit_total",
     "hot_path_external_rpc_calls_total",
 ];
-
