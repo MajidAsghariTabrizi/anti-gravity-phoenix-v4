@@ -13,7 +13,10 @@ import (
 	"anti-gravity-phoenix-v4/feed-ingestor/internal/decoder"
 	"anti-gravity-phoenix-v4/feed-ingestor/internal/feed"
 	"anti-gravity-phoenix-v4/feed-ingestor/internal/metrics"
+	"anti-gravity-phoenix-v4/feed-ingestor/internal/nitro"
+	"anti-gravity-phoenix-v4/feed-ingestor/internal/normalizer"
 	"anti-gravity-phoenix-v4/feed-ingestor/internal/publisher"
+	"anti-gravity-phoenix-v4/feed-ingestor/internal/sequence"
 )
 
 const txSubject = "phoenix.feed.tx"
@@ -21,6 +24,7 @@ const txSubject = "phoenix.feed.tx"
 type sourceConfig struct {
 	kind        string
 	fixturePath string
+	relayURL    string
 }
 
 func main() {
@@ -32,6 +36,7 @@ func main() {
 func run(ctx context.Context) error {
 	registry := metrics.NewRegistry()
 	readiness := &metrics.Readiness{}
+	registry.SetGauge("feed_readiness", 0)
 	metricsAddr := env("METRICS_ADDR", "0.0.0.0:9100")
 	go func() {
 		mux := http.NewServeMux()
@@ -58,16 +63,27 @@ func run(ctx context.Context) error {
 		input = io.NopCloser(os.Stdin)
 	}
 	defer input.Close()
-	readiness.MarkSourceInitialized()
 
 	natsURL := env("NATS_URL", "nats://127.0.0.1:4222")
 	pub, err := publisher.DialNATSCore(natsURL, 2*time.Second)
 	if err != nil {
-		return fmt.Errorf("connect nats: %w", err)
+		wrapped := fmt.Errorf("connect nats: %w", err)
+		readiness.MarkFatal(wrapped.Error())
+		return wrapped
 	}
 	defer pub.Close()
 	readiness.MarkNATSReachable()
 
+	if sourceCfg.kind == "relay" {
+		return runRelaySource(ctx, sourceCfg, pub, registry, readiness)
+	}
+	return runLineSource(ctx, input, pub, registry, readiness)
+}
+
+func runLineSource(ctx context.Context, input io.Reader, pub publisher.Publisher, registry *metrics.Registry, readiness *metrics.Readiness) error {
+	readiness.MarkSourceInitialized()
+	readiness.MarkAdapterInitialized()
+	readiness.MarkSourceConnected()
 	source := feed.NewLineSource(input)
 	ordered := decoder.NewOrderedDecoder(time.Now)
 
@@ -84,8 +100,8 @@ func run(ctx context.Context) error {
 		registry.Inc("feed_messages_total")
 		result, err := ordered.DecodeJSONFrame(raw)
 		if err != nil {
-			registry.Inc("feed_decode_errors_total")
-			log.Printf("decode error: %v", err)
+			registry.Inc("feed_decode_failures_total")
+			log.Printf("feed_decode_failure source=line error=%q", err.Error())
 			continue
 		}
 		if result.Duplicate {
@@ -94,16 +110,153 @@ func run(ctx context.Context) error {
 		}
 		if result.Gap {
 			registry.Inc("feed_sequence_gaps_total")
-			log.Printf("sequence gap from %d to %d", result.GapFrom, result.GapTo)
+			readiness.MarkSequenceGap()
+			log.Printf("feed_sequence_gap source=line gap_from=%d gap_to=%d", result.GapFrom, result.GapTo)
+		} else {
+			readiness.ClearSequenceGap()
 		}
-		for _, tx := range result.Transactions {
-			if err := pub.Publish(txSubject, tx); err != nil {
-				return err
-			}
-			registry.Inc("feed_transactions_total")
-			registry.ObserveIngestLatency(start)
+		readiness.MarkValidFeedMessage()
+		registry.SetGauge("feed_last_sequence", float64(result.Sequence))
+		registry.SetGauge("feed_last_message_timestamp", float64(result.TimestampUnixMS))
+		registry.SetGauge("feed_readiness", readinessGauge(readiness))
+		if err := publishTransactions(pub, registry, result.Transactions, start); err != nil {
+			readiness.MarkFatal(err.Error())
+			return err
 		}
 	}
+}
+
+func runRelaySource(ctx context.Context, sourceCfg sourceConfig, pub publisher.Publisher, registry *metrics.Registry, readiness *metrics.Readiness) error {
+	state := sequence.New()
+	source, err := feed.NewRelaySource(sourceCfg.relayURL, nitro.ArbitrumOneChainID, state.NextExpected, 30*time.Second)
+	if err != nil {
+		readiness.MarkFatal(err.Error())
+		return err
+	}
+	defer source.Close()
+	readiness.MarkSourceInitialized()
+	readiness.MarkAdapterInitialized()
+
+	for {
+		start := time.Now()
+		message, err := source.Next(ctx)
+		if err != nil {
+			readiness.MarkFatal(err.Error())
+			return err
+		}
+		if message.Connected {
+			readiness.MarkSourceConnected()
+			registry.Inc("feed_connections_total")
+		}
+		if message.AfterReconnect {
+			registry.Inc("feed_reconnects_total")
+		}
+		registry.Inc("feed_messages_total")
+		frames, _, err := nitro.DecodeBroadcast(message.Data)
+		if err != nil {
+			registry.Inc("feed_decode_failures_total")
+			log.Printf("feed_decode_failure source=relay error=%q", err.Error())
+			continue
+		}
+		for index, frame := range frames {
+			if len(frame.Unsupported) > 0 {
+				registry.Add("feed_unsupported_messages_total", uint64(len(frame.Unsupported)))
+				readiness.MarkUnsupportedCoverage()
+				log.Printf("unsupported Nitro feed message sequence=%d reasons=%s", frame.Sequence, strings.Join(frame.Unsupported, "; "))
+			}
+			if len(frame.Ignored) > 0 {
+				log.Printf("ignored Nitro feed message sequence=%d reasons=%s", frame.Sequence, strings.Join(frame.Ignored, "; "))
+			}
+			observation := state.Observe(frame.Sequence, message.AfterReconnect && index == 0)
+			switch observation.Event {
+			case sequence.Duplicate:
+				registry.Inc("feed_duplicates_total")
+				continue
+			case sequence.Gap:
+				registry.Inc("feed_sequence_gaps_total")
+				readiness.MarkSequenceGap()
+				log.Printf("feed_sequence_gap source=relay gap_from=%d gap_to=%d", observation.GapFrom, observation.GapTo)
+				continue
+			case sequence.FeedReset:
+				registry.Inc("feed_out_of_order_total")
+				readiness.MarkSequenceGap()
+				log.Printf("feed_reset source=relay sequence=%d", observation.Sequence)
+				continue
+			case sequence.OutOfOrder:
+				registry.Inc("feed_out_of_order_total")
+				log.Printf("feed_out_of_order source=relay sequence=%d", observation.Sequence)
+				continue
+			}
+			if state.HasUnresolvedGap() {
+				readiness.MarkSequenceGap()
+			} else {
+				readiness.ClearSequenceGap()
+			}
+			readiness.MarkSequenceKnown()
+			registry.SetGauge("feed_last_sequence", float64(frame.Sequence))
+			registry.SetGauge("feed_last_message_timestamp", float64(frame.TimestampUnixMS))
+			if len(frame.Unsupported) > 0 {
+				registry.SetGauge("feed_readiness", readinessGauge(readiness))
+				continue
+			}
+			if len(frame.Ignored) > 0 {
+				registry.SetGauge("feed_readiness", readinessGauge(readiness))
+				continue
+			}
+
+			normalized, ok := normalizeRelayTransactions(frame, registry)
+			if !ok {
+				readiness.MarkUnsupportedCoverage()
+				registry.SetGauge("feed_readiness", readinessGauge(readiness))
+				continue
+			}
+			if len(normalized) == 0 {
+				continue
+			}
+			readiness.MarkValidFeedMessage()
+			registry.SetGauge("feed_readiness", readinessGauge(readiness))
+			if err := publishTransactions(pub, registry, normalized, start); err != nil {
+				readiness.MarkFatal(err.Error())
+				return err
+			}
+		}
+		registry.SetGauge("feed_readiness", readinessGauge(readiness))
+	}
+}
+
+func normalizeRelayTransactions(frame nitro.Frame, registry *metrics.Registry) ([]normalizer.NormalizedTx, bool) {
+	normalized := make([]normalizer.NormalizedTx, 0, len(frame.Transactions))
+	for _, tx := range frame.Transactions {
+		n, err := normalizer.Normalize(frame.Sequence, frame.TimestampUnixMS, tx, time.Now())
+		if err != nil {
+			registry.Inc("feed_decode_failures_total")
+			log.Printf("feed_decode_failure source=relay sequence=%d error=%q", frame.Sequence, err.Error())
+			return nil, false
+		}
+		normalized = append(normalized, n)
+	}
+	return normalized, true
+}
+
+func publishTransactions(pub publisher.Publisher, registry *metrics.Registry, transactions []normalizer.NormalizedTx, start time.Time) error {
+	for _, tx := range transactions {
+		if err := pub.Publish(txSubject, tx); err != nil {
+			registry.Inc("feed_publish_failures_total")
+			log.Printf("feed_publish_failure subject=%s error=%q", txSubject, err.Error())
+			return err
+		}
+		registry.Inc("feed_publish_success_total")
+		registry.Inc("feed_normalized_transactions_total")
+		registry.ObserveIngestLatency(start)
+	}
+	return nil
+}
+
+func readinessGauge(readiness *metrics.Readiness) float64 {
+	if ok, _ := readiness.Ready(); ok {
+		return 1
+	}
+	return 0
 }
 
 func resolveSourceConfig(getenv func(string) string) (sourceConfig, error) {
@@ -122,7 +275,22 @@ func resolveSourceConfig(getenv func(string) string) (sourceConfig, error) {
 		if relayURL == "" {
 			return sourceConfig{}, fmt.Errorf("production feed readiness blocked: PHOENIX_FEED_RELAY_URL is required")
 		}
-		return sourceConfig{}, fmt.Errorf("production feed readiness blocked: official Nitro relay adapter is not implemented or verified")
+		return sourceConfig{}, fmt.Errorf("production feed readiness blocked: Nitro relay adapter is implemented but not live-verified for production")
+	}
+	switch source {
+	case "relay":
+		if relayURL == "" {
+			return sourceConfig{}, fmt.Errorf("PHOENIX_FEED_RELAY_URL is required when PHOENIX_FEED_SOURCE=relay")
+		}
+		return sourceConfig{kind: "relay", relayURL: relayURL}, nil
+	case "fixture":
+		if fixturePath == "" {
+			return sourceConfig{}, fmt.Errorf("PHOENIX_FEED_FIXTURE is required when PHOENIX_FEED_SOURCE=fixture")
+		}
+		return sourceConfig{kind: "fixture", fixturePath: fixturePath}, nil
+	case "stdin", "":
+	default:
+		return sourceConfig{}, fmt.Errorf("unsupported PHOENIX_FEED_SOURCE %q", source)
 	}
 	if fixturePath != "" {
 		return sourceConfig{kind: "fixture", fixturePath: fixturePath}, nil

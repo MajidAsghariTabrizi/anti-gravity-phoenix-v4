@@ -27,7 +27,7 @@ Production operations use `/opt/phoenix/deploy/deploy-release.sh <sha>`, `/opt/p
 
 ### High feed decode errors
 
-- Inspect `feed_decode_errors_total` and malformed payload categories.
+- Inspect `feed_decode_failures_total`, `feed_unsupported_messages_total`, and malformed payload categories.
 - Keep SHADOW only.
 - Compare against pinned Nitro release semantics before changing parser logic.
 
