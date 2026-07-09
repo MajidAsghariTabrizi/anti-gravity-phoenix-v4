@@ -20,4 +20,3 @@ impl MulticallBatch {
             .all(|call| call.target.starts_with("0x") && call.calldata.starts_with("0x"))
     }
 }
-

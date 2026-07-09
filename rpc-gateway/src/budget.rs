@@ -55,4 +55,3 @@ impl GlobalBudget {
         self.bucket.try_take(now)
     }
 }
-

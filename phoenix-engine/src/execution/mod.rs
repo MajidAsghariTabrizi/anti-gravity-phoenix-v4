@@ -85,8 +85,10 @@ mod tests {
 
     #[test]
     fn live_requires_explicit_flag() {
-        assert_eq!(ExecutionMode::from_env("LIVE", false), ExecutionMode::Shadow);
+        assert_eq!(
+            ExecutionMode::from_env("LIVE", false),
+            ExecutionMode::Shadow
+        );
         assert_eq!(ExecutionMode::from_env("LIVE", true), ExecutionMode::Live);
     }
 }
-

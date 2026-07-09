@@ -2,6 +2,7 @@ FROM golang:1.23-alpine AS feed-build
 WORKDIR /src/feed-ingestor
 COPY feed-ingestor/go.mod ./
 COPY feed-ingestor ./
+COPY fixtures /src/fixtures
 RUN go test ./...
 RUN go build -o /out/feed-ingestor ./cmd/feed-ingestor
 

@@ -36,4 +36,3 @@ mod tests {
         assert_eq!(clock.now_unix_ms(), 105);
     }
 }
-

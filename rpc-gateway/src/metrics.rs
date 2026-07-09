@@ -25,4 +25,3 @@ pub const REQUIRED_RPC_METRICS: &[&str] = &[
     "rpc_budget_rejected_total",
     "rpc_latency_seconds",
 ];
-

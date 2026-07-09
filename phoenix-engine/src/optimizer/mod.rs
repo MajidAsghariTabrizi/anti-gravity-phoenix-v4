@@ -31,15 +31,25 @@ pub struct CandidateEvaluation {
     pub expected_net_profit: Amount,
 }
 
-pub fn optimize<F>(cfg: OptimizerConfig, mut evaluate: F) -> Result<Option<OptimizerResult>, DomainError>
+pub fn optimize<F>(
+    cfg: OptimizerConfig,
+    mut evaluate: F,
+) -> Result<Option<OptimizerResult>, DomainError>
 where
     F: FnMut(Amount) -> Result<CandidateEvaluation, DomainError>,
 {
-    if cfg.min_amount.0 == 0 || cfg.max_amount.0 < cfg.min_amount.0 || cfg.max_evaluations == 0 {
+    if cfg.min_amount.0 == 0
+        || cfg.max_amount.0 < cfg.min_amount.0
+        || cfg.max_evaluations == 0
+    {
         return Ok(None);
     }
 
-    let mut candidates = coarse_grid(cfg.min_amount.0, cfg.max_amount.0, cfg.max_evaluations.min(16));
+    let mut candidates = coarse_grid(
+        cfg.min_amount.0,
+        cfg.max_amount.0,
+        cfg.max_evaluations.min(16),
+    );
     let mut best: Option<CandidateEvaluation> = None;
     let mut evaluated = 0usize;
 
@@ -136,4 +146,3 @@ mod tests {
         assert_eq!(result.best_amount, Amount(500));
     }
 }
-

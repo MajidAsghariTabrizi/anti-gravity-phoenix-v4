@@ -36,4 +36,3 @@ impl TtlCache {
         self.entries.get(key).map(|entry| entry.value.clone())
     }
 }
-

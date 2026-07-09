@@ -83,4 +83,3 @@ impl ProviderPool {
         best_idx.map(|idx| &mut self.providers[idx])
     }
 }
-

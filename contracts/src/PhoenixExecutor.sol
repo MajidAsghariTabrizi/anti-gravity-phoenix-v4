@@ -32,11 +32,7 @@ contract PhoenixExecutor is IAaveFlashBorrower {
     event PoolUpdated(address indexed pool, address indexed factory, bool approved);
     event OpportunityStarted(bytes32 indexed routeId, address indexed asset, uint256 flashAmount);
     event OpportunitySettled(
-        bytes32 indexed routeId,
-        address indexed asset,
-        uint256 flashAmount,
-        uint256 premium,
-        uint256 realizedProfit
+        bytes32 indexed routeId, address indexed asset, uint256 flashAmount, uint256 premium, uint256 realizedProfit
     );
     event Rescue(address indexed token, address indexed to, uint256 amount);
 
@@ -179,13 +175,8 @@ contract PhoenixExecutor is IAaveFlashBorrower {
         if (IV3Pool(pool).token0() != token0 || IV3Pool(pool).token1() != token1 || IV3Pool(pool).fee() != fee) {
             revert InvalidPool(pool);
         }
-        approvedPools[pool] = PoolConfig({
-            factory: factory,
-            token0: token0,
-            token1: token1,
-            fee: fee,
-            approved: approved
-        });
+        approvedPools[pool] =
+            PoolConfig({factory: factory, token0: token0, token1: token1, fee: fee, approved: approved});
         emit PoolUpdated(pool, factory, approved);
     }
 
@@ -224,13 +215,14 @@ contract PhoenixExecutor is IAaveFlashBorrower {
         for (uint256 i = 0; i < op.legs.length; i++) {
             Leg memory leg = op.legs[i];
             uint256 beforeOut = IERC20(leg.tokenOut).balanceOf(address(this));
-            IV3Pool(leg.pool).swap(
-                address(this),
-                leg.zeroForOne,
-                int256(leg.amountIn),
-                leg.zeroForOne ? uint160(4_295_128_739) + 1 : type(uint160).max - 1,
-                abi.encode(SwapCallbackData({tokenIn: leg.tokenIn, tokenOut: leg.tokenOut, pool: leg.pool}))
-            );
+            IV3Pool(leg.pool)
+                .swap(
+                    address(this),
+                    leg.zeroForOne,
+                    int256(leg.amountIn),
+                    leg.zeroForOne ? uint160(4_295_128_739) + 1 : type(uint160).max - 1,
+                    abi.encode(SwapCallbackData({tokenIn: leg.tokenIn, tokenOut: leg.tokenOut, pool: leg.pool}))
+                );
             uint256 received = IERC20(leg.tokenOut).balanceOf(address(this)) - beforeOut;
             if (received < leg.minAmountOut) revert InvalidLeg();
         }
@@ -301,4 +293,3 @@ contract PhoenixExecutor is IAaveFlashBorrower {
         if (!ok || (ret.length != 0 && !abi.decode(ret, (bool)))) revert TransferFailed();
     }
 }
-
