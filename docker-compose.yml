@@ -74,7 +74,9 @@ services:
     environment:
       NATS_URL: nats://nats:4222
       METRICS_ADDR: 0.0.0.0:9100
-      PHOENIX_FEED_FIXTURE: /app/fixtures/feed/profitable.ndjson
+      PHOENIX_FEED_SOURCE: ${PHOENIX_FEED_SOURCE:-fixture}
+      PHOENIX_FEED_FIXTURE: ${PHOENIX_FEED_FIXTURE:-/app/fixtures/feed/profitable.ndjson}
+      PHOENIX_FEED_RELAY_URL: ${PHOENIX_FEED_RELAY_URL:-ws://nitro-feed-relay:9642/feed}
     depends_on:
       nats:
         condition: service_healthy

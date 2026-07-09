@@ -20,7 +20,7 @@ impl Metrics {
 }
 
 pub const REQUIRED_COUNTERS: &[&str] = &[
-    "feed_transactions_total",
+    "feed_normalized_transactions_total",
     "supported_origins_total",
     "affected_routes_total",
     "route_simulations_total",

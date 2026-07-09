@@ -15,7 +15,8 @@ type Publisher interface {
 }
 
 type NATSCorePublisher struct {
-	conn net.Conn
+	conn         net.Conn
+	writeTimeout time.Duration
 }
 
 func DialNATSCore(addr string, timeout time.Duration) (*NATSCorePublisher, error) {
@@ -35,10 +36,13 @@ func DialNATSCore(addr string, timeout time.Duration) (*NATSCorePublisher, error
 		conn.Close()
 		return nil, err
 	}
-	return &NATSCorePublisher{conn: conn}, nil
+	return &NATSCorePublisher{conn: conn, writeTimeout: timeout}, nil
 }
 
 func (p *NATSCorePublisher) Publish(subject string, value any) error {
+	if p.writeTimeout > 0 {
+		_ = p.conn.SetWriteDeadline(time.Now().Add(p.writeTimeout))
+	}
 	payload, err := json.Marshal(value)
 	if err != nil {
 		return err

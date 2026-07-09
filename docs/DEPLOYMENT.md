@@ -49,4 +49,4 @@ Production bootstrap, GHCR authentication, environment validation, release, and 
 - `docs/RELEASE_AND_ROLLBACK.md`
 - `docs/CI_CD.md`
 
-Current blocker: real Nitro feed relay ingestion is not implemented or verified. Production feed readiness fails intentionally until `docs/NITRO_FEED_INTEGRATION.md` is resolved.
+Current blocker: real Nitro feed relay ingestion is implemented for first runtime verification but not live-verified. Production feed startup fails intentionally until `docs/NITRO_FEED_INTEGRATION.md` is resolved with real-feed evidence.

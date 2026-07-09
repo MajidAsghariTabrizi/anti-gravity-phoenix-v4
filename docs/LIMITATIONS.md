@@ -7,5 +7,5 @@
 - Rust and Foundry local verification is blocked on this machine by missing `cargo`, `rustc`, and `forge`.
 - Live Nitro relay operation, Arbitrum fork tests, and simulator/quoter parity tests require a Linux host and RPC credentials.
 - Production latency benchmarks are not measured.
-- Production feed readiness is intentionally blocked until an official Nitro relay adapter is implemented and verified.
+- Production feed readiness is intentionally blocked until the Nitro relay adapter is live-verified against the real Arbitrum sequencer feed and unsupported payload coverage is resolved.
 - Production engine and recorder readiness remain conservative because NATS subscription/state bootstrap and recorder PostgreSQL/NATS wiring are not complete.

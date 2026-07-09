@@ -6,7 +6,7 @@ Primary funnel:
 
 Required metrics:
 
-- `feed_transactions_total`
+- `feed_normalized_transactions_total`
 - `supported_origins_total`
 - `affected_routes_total`
 - `route_simulations_total`
@@ -33,4 +33,3 @@ Profit labels remain separate:
 - theoretical profit
 - expected net profit
 - realized profit
-

@@ -7,7 +7,7 @@ Status is intentionally honest. A component marked blocked has source code and f
 - Phase 0 old-system audit: completed.
 - Phase 1 agent and execution documents: completed.
 - Phase 2 local Nitro feed relay: implemented in Compose, pinned to the verified official Nitro release documented in `docs/DEPENDENCIES.md`; live relay not run locally.
-- Phase 3 Go feed ingestor: implemented with fixture decoder, ordering, duplicate/gap handling, NATS Core publisher, and metrics.
+- Phase 3 Go feed ingestor: implemented with fixture decoder, Nitro relay WebSocket/envelope adapter, ordering, duplicate/gap/out-of-order handling, NATS Core publisher, readiness, and metrics.
 - Phase 4 cold RPC gateway: implemented as Rust crate source with provider budgets, cache, coalescing, circuit breaker, priority model, and internal API. Local compile blocked by missing Rust toolchain.
 - Phase 5 verified protocol registry: implemented schema and startup validation model. Uniswap V3 Arbitrum addresses are documented from official Uniswap docs. Sushi V3 production addresses remain configuration-only until verified from Sushi official package/source.
 - Phase 6 origin detector: implemented for supported V3 `exactInputSingle` and `exactInput` calldata surfaces using configured routers.
@@ -47,13 +47,13 @@ Before any LIVE mode attempt:
 - LIVE gate: implemented manual readiness-report workflow that cannot enable LIVE or receive signer material.
 - Production Compose: implemented `compose.prod.yml` with GHCR image refs, `/etc/phoenix/phoenix.env`, loopback dashboard/Prometheus, log rotation, persistent storage, and defensive SHADOW defaults.
 - Health/readiness: implemented feed-ingestor health/readiness; added conservative Rust service readiness endpoints; production not-ready remains truthful where NATS/PostgreSQL wiring is incomplete.
-- Nitro feed: production relay ingestion is explicitly blocked until official Nitro adapter parsing is implemented and verified.
+- Nitro feed: relay adapter parsing is implemented for first runtime verification, but production relay ingestion is explicitly blocked until real Arbitrum feed validation and unsupported payload coverage are verified.
 - Migrations: implemented a small Go PostgreSQL migration runner with schema table, checksums, advisory lock, and transactional apply.
 - Deployment scripts: implemented bootstrap, env validation, release deploy, health gate, and rollback scripts.
 
 Current production release blockers:
 
-- Official Nitro relay adapter is not implemented or live-verified.
+- Official Nitro relay adapter is implemented for first runtime verification but not live-verified.
 - Phoenix engine production NATS subscription/state bootstrap is not implemented.
 - Recorder production PostgreSQL schema verification and NATS subscription are not implemented.
 - Rust, Foundry, Docker, and production Linux scripts still require validation on a host with those tools.

@@ -16,11 +16,13 @@ type RelayFrame struct {
 }
 
 type DecodeResult struct {
-	Transactions []normalizer.NormalizedTx
-	Duplicate    bool
-	Gap          bool
-	GapFrom      uint64
-	GapTo        uint64
+	Transactions    []normalizer.NormalizedTx
+	Sequence        uint64
+	TimestampUnixMS uint64
+	Duplicate       bool
+	Gap             bool
+	GapFrom         uint64
+	GapTo           uint64
 }
 
 type OrderedDecoder struct {
@@ -52,7 +54,7 @@ func (d *OrderedDecoder) DecodeJSONFrame(raw []byte) (DecodeResult, error) {
 		return DecodeResult{Duplicate: true}, nil
 	}
 
-	result := DecodeResult{}
+	result := DecodeResult{Sequence: frame.Sequence, TimestampUnixMS: frame.TimestampUnixMS}
 	if d.haveLast && frame.Sequence > d.lastSequence+1 {
 		result.Gap = true
 		result.GapFrom = d.lastSequence + 1

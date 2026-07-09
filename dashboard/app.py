@@ -78,7 +78,7 @@ with tabs[0]:
 
 with tabs[1]:
     funnel = {
-        "Origin Seen": metric_value("feed_transactions_total"),
+        "Origin Seen": metric_value("feed_normalized_transactions_total"),
         "Supported": metric_value("supported_origins_total"),
         "Affected Route": metric_value("affected_routes_total"),
         "Simulated": metric_value("route_simulations_total"),
@@ -189,4 +189,3 @@ with tabs[9]:
         "Hot Path RPC Calls": metric_value("hot_path_external_rpc_calls_total"),
     }
     st.dataframe(pd.DataFrame({"metric": list(system.keys()), "value": list(system.values())}), use_container_width=True)
-

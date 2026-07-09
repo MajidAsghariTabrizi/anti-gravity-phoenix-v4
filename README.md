@@ -54,7 +54,7 @@ Default production safety:
 
 Production deployment is documented in `docs/PRODUCTION_BOOTSTRAP.md` and `docs/RELEASE_AND_ROLLBACK.md`.
 
-Current real Nitro feed status: official Nitro relay parsing is not implemented or verified. Production feed startup is blocked by design until that adapter exists.
+Current real Nitro feed status: Nitro relay parsing is implemented for first runtime verification but not live-verified. Production feed startup is blocked by design until real-feed evidence exists.
 
 ## Live Release Gate
 

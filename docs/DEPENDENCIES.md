@@ -12,11 +12,16 @@ This file records protocol-critical source references and versions. Do not add a
 - Support policy source: Nitro repository README currently lists supported versions and notes the current minor support policy.
 - Feed input flags verified from official Nitro `broadcastclient.ConfigAddOptions`: `node.feed.input.url`, `node.feed.input.secondary-url`, `node.feed.input.require-chain-id`, `node.feed.input.require-feed-version`, reconnect backoff, timeout, and compression options.
 - Feed output flags verified from official Nitro `wsbroadcastserver.BroadcasterConfigAddOptions`: `node.feed.output.enable`, `node.feed.output.addr`, `node.feed.output.port`, client version requirements, compression, and backlog settings. Default output port in source is `9642`.
+- Feed envelope structures verified from official Nitro `broadcaster/message/message.go`, `arbos/arbostypes/messagewithmeta.go`, and `arbos/arbostypes/incomingmessage.go`.
+- Feed WebSocket protocol headers and versions verified from official Nitro `wsbroadcastserver/wsbroadcastserver.go`.
+- OffchainLabs/go-ethereum submodule commit used by Nitro `v3.11.2`: `f3a977ddf30b138da2fe673ac5cbff2bc6dd4c88`.
+- Transaction type identifiers verified from that submodule: standard `0x00`, `0x01`, `0x02`, `0x03`, `0x04`; Arbitrum `0x64`, `0x65`, `0x66`, `0x68`, `0x69`, `0x6a`, `0x78`.
+- Arbitrum unsigned transaction payload type `0x65` is the only transaction payload currently decoded by Phoenix.
 - Local Compose uses one relay ingress and exposes it only inside the Docker network.
 
 The live relay command still requires a Linux host and operator validation against current Arbitrum node flags. Phoenix does not let individual services connect independently to the upstream public feed.
 
-Current feed-ingestor status: official Nitro websocket parsing is not implemented in code. Production relay mode is blocked by startup guard until the official adapter is implemented and verified. See `docs/NITRO_FEED_INTEGRATION.md`.
+Current feed-ingestor status: Nitro relay mode is implemented for first runtime verification with a version-pinned WebSocket/envelope adapter and Arbitrum unsigned transaction payload support. Production relay mode remains blocked by startup guard until the adapter is live-verified against the real Arbitrum feed and unsupported payload coverage is resolved. See `docs/NITRO_FEED_INTEGRATION.md`.
 
 ## Uniswap V3 on Arbitrum One
 

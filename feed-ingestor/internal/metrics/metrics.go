@@ -12,22 +12,40 @@ import (
 type Registry struct {
 	mu       sync.Mutex
 	counters map[string]uint64
+	gauges   map[string]float64
 	latency  []float64
 }
 
 var defaultCounters = []string{
+	"feed_connections_total",
 	"feed_messages_total",
-	"feed_transactions_total",
-	"feed_decode_errors_total",
+	"feed_decode_failures_total",
 	"feed_reconnects_total",
+	"feed_normalized_transactions_total",
 	"feed_sequence_gaps_total",
 	"feed_duplicates_total",
+	"feed_out_of_order_total",
+	"feed_publish_success_total",
+	"feed_publish_failures_total",
+	"feed_unsupported_messages_total",
+}
+
+var defaultGauges = []string{
+	"feed_last_sequence",
+	"feed_last_message_timestamp",
+	"feed_readiness",
 }
 
 func NewRegistry() *Registry {
-	r := &Registry{counters: make(map[string]uint64)}
+	r := &Registry{
+		counters: make(map[string]uint64),
+		gauges:   make(map[string]float64),
+	}
 	for _, name := range defaultCounters {
 		r.counters[name] = 0
+	}
+	for _, name := range defaultGauges {
+		r.gauges[name] = 0
 	}
 	return r
 }
@@ -40,6 +58,12 @@ func (r *Registry) Add(name string, delta uint64) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.counters[name] += delta
+}
+
+func (r *Registry) SetGauge(name string, value float64) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.gauges[name] = value
 }
 
 func (r *Registry) ObserveIngestLatency(start time.Time) {
@@ -67,6 +91,14 @@ func (r *Registry) Render() string {
 	for _, k := range keys {
 		fmt.Fprintf(&b, "%s %d\n", k, r.counters[k])
 	}
+	gaugeKeys := make([]string, 0, len(r.gauges))
+	for k := range r.gauges {
+		gaugeKeys = append(gaugeKeys, k)
+	}
+	sort.Strings(gaugeKeys)
+	for _, k := range gaugeKeys {
+		fmt.Fprintf(&b, "%s %.0f\n", k, r.gauges[k])
+	}
 	for _, v := range r.latency {
 		fmt.Fprintf(&b, "feed_ingest_latency_seconds %.9f\n", v)
 	}
@@ -74,16 +106,66 @@ func (r *Registry) Render() string {
 }
 
 type Readiness struct {
-	mu                sync.RWMutex
-	sourceInitialized bool
-	natsReachable     bool
-	fatal             string
+	mu                  sync.RWMutex
+	sourceInitialized   bool
+	adapterInitialized  bool
+	sourceConnected     bool
+	validFeedObserved   bool
+	sequenceKnown       bool
+	unresolvedGap       bool
+	unsupportedCoverage bool
+	natsReachable       bool
+	fatal               string
 }
 
 func (r *Readiness) MarkSourceInitialized() {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.sourceInitialized = true
+}
+
+func (r *Readiness) MarkAdapterInitialized() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.adapterInitialized = true
+}
+
+func (r *Readiness) MarkSourceConnected() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.sourceConnected = true
+}
+
+func (r *Readiness) MarkValidFeedMessage() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.validFeedObserved = true
+	r.sequenceKnown = true
+}
+
+func (r *Readiness) MarkSequenceKnown() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.sequenceKnown = true
+}
+
+func (r *Readiness) MarkUnsupportedCoverage() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.unsupportedCoverage = true
+	r.sequenceKnown = true
+}
+
+func (r *Readiness) MarkSequenceGap() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.unresolvedGap = true
+}
+
+func (r *Readiness) ClearSequenceGap() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.unresolvedGap = false
 }
 
 func (r *Readiness) MarkNATSReachable() {
@@ -107,8 +189,26 @@ func (r *Readiness) Ready() (bool, string) {
 	if !r.sourceInitialized {
 		return false, "source not initialized"
 	}
+	if !r.adapterInitialized {
+		return false, "feed adapter not initialized"
+	}
+	if !r.sourceConnected {
+		return false, "feed source not connected"
+	}
 	if !r.natsReachable {
 		return false, "NATS not reachable"
+	}
+	if r.unsupportedCoverage {
+		return false, "unsupported feed coverage observed"
+	}
+	if !r.validFeedObserved {
+		return false, "no valid feed message observed"
+	}
+	if !r.sequenceKnown {
+		return false, "feed sequence unknown"
+	}
+	if r.unresolvedGap {
+		return false, "unresolved feed sequence gap"
 	}
 	return true, "ready"
 }
