@@ -1,13 +1,24 @@
 use std::io::{Read, Write};
 use std::net::TcpListener;
 
+use rpc_gateway::providers::parse_provider_config;
+
 fn main() -> std::io::Result<()> {
     let addr = std::env::var("RPC_GATEWAY_ADDR").unwrap_or_else(|_| "0.0.0.0:9300".to_string());
     let production = std::env::var("PHOENIX_ENV")
         .map(|v| v.eq_ignore_ascii_case("production"))
         .unwrap_or(false);
     let provider_urls = std::env::var("RPC_PROVIDER_URLS").unwrap_or_default();
-    let ready = !production || provider_config_valid(&provider_urls);
+    let provider_weights = std::env::var("RPC_PROVIDER_WEIGHTS").unwrap_or_default();
+    let global_rps = std::env::var("RPC_GLOBAL_RPS").unwrap_or_default();
+    let provider_config_error = if production {
+        parse_provider_config(&provider_urls, &provider_weights, &global_rps)
+            .err()
+            .map(|err| err.to_string())
+    } else {
+        None
+    };
+    let ready = provider_config_error.is_none();
     let listener = TcpListener::bind(&addr)?;
     println!("rpc-gateway listening on {addr}");
     for stream in listener.incoming() {
@@ -19,22 +30,16 @@ fn main() -> std::io::Result<()> {
         match path {
             "/healthz" => write_response(&mut stream, 200, "ok\n")?,
             "/readyz" if ready => write_response(&mut stream, 200, "ready\n")?,
-            "/readyz" => write_response(
-                &mut stream,
-                503,
-                "RPC_PROVIDER_URLS must contain at least one http(s) provider in production\n",
-            )?,
+            "/readyz" => {
+                let detail = provider_config_error
+                    .as_deref()
+                    .unwrap_or("RPC provider configuration is invalid");
+                write_response(&mut stream, 503, &format!("{detail}\n"))?
+            }
             _ => write_response(&mut stream, 404, "not found\n")?,
         }
     }
     Ok(())
-}
-
-fn provider_config_valid(value: &str) -> bool {
-    value
-        .split(',')
-        .map(str::trim)
-        .any(|url| url.starts_with("https://") || url.starts_with("http://"))
 }
 
 fn write_response(stream: &mut impl Write, status: u16, body: &str) -> std::io::Result<()> {
