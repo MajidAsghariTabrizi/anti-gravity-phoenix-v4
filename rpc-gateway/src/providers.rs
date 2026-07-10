@@ -207,7 +207,7 @@ pub fn parse_provider_config(
 
     let global_rps = parse_global_rps(global_rps)?;
     let mut providers = Vec::with_capacity(urls.len());
-    for (index, (url, priority)) in urls.into_iter().zip(priorities.into_iter()).enumerate() {
+    for (index, (url, priority)) in urls.into_iter().zip(priorities).enumerate() {
         if url.is_empty() {
             return Err(ProviderConfigError::EmptyProviderUrl { index });
         }
