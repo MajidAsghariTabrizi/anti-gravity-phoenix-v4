@@ -34,7 +34,7 @@ Production operations use `/opt/phoenix/deploy/deploy-release.sh <sha>`, `/opt/p
 ### NATS unavailable
 
 - Check NATS health endpoint and Docker network.
-- Expect feed-ingestor, engine, and recorder readiness to fail.
+- Expect feed-ingestor and recorder readiness to fail. Production Compose also prevents the engine from starting before NATS is healthy, but the engine `/readyz` endpoint only reports engine-owned runtime initialization.
 - Restore NATS before restarting dependent services.
 
 ### RPC gateway degraded
@@ -65,7 +65,7 @@ Production operations use `/opt/phoenix/deploy/deploy-release.sh <sha>`, `/opt/p
 ### Phoenix engine unhealthy
 
 - Check `/readyz`.
-- In production, not-ready is expected until NATS subscription and state bootstrap are implemented.
+- In production, not-ready means engine-owned runtime initialization failed or is still initializing. The response body is sanitized and should be one of the engine readiness detail constants.
 - Do not override health gates to force a deploy.
 
 ### State incomplete spike
