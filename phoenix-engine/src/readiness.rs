@@ -190,12 +190,18 @@ mod tests {
 
     #[test]
     fn shadow_readiness_does_not_require_executor_address() {
-        assert_eq!(initialize_runtime(&shadow_config()).unwrap().mode, ExecutionMode::Shadow);
+        assert_eq!(
+            initialize_runtime(&shadow_config()).unwrap().mode,
+            ExecutionMode::Shadow
+        );
     }
 
     #[test]
     fn shadow_readiness_does_not_require_signer_private_key() {
-        assert_eq!(initialize_runtime(&shadow_config()).unwrap().mode, ExecutionMode::Shadow);
+        assert_eq!(
+            initialize_runtime(&shadow_config()).unwrap().mode,
+            ExecutionMode::Shadow
+        );
     }
 
     #[test]
@@ -211,7 +217,10 @@ mod tests {
             live_execution: false,
             ..shadow_config()
         };
-        assert_eq!(initialize_runtime(&cfg).unwrap().mode, ExecutionMode::Shadow);
+        assert_eq!(
+            initialize_runtime(&cfg).unwrap().mode,
+            ExecutionMode::Shadow
+        );
     }
 
     #[test]

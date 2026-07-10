@@ -77,7 +77,10 @@ fn preferred_and_drpc_failure_selects_publicnode() {
     let mut pool = priority_pool(now);
     pool.choose(now).unwrap().record_failure(now);
     pool.choose(now).unwrap().record_failure(now);
-    assert_eq!(pool.choose(now).map(|p| p.name.as_str()), Some("publicnode"));
+    assert_eq!(
+        pool.choose(now).map(|p| p.name.as_str()),
+        Some("publicnode")
+    );
 }
 
 #[test]
@@ -140,14 +143,13 @@ fn recovered_preferred_provider_becomes_selectable_again() {
 #[test]
 fn equal_priorities_preserve_configured_order() {
     let now = Instant::now();
-    let cfg = parse_provider_config(
-        "https://first.example,https://second.example",
-        "1,1",
-        "5",
-    )
-    .unwrap();
+    let cfg =
+        parse_provider_config("https://first.example,https://second.example", "1,1", "5").unwrap();
     let mut pool = cfg.into_pool(now);
-    assert_eq!(pool.choose(now).map(|p| p.name.as_str()), Some("provider_0"));
+    assert_eq!(
+        pool.choose(now).map(|p| p.name.as_str()),
+        Some("provider_0")
+    );
 }
 
 #[test]

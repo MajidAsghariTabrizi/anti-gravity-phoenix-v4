@@ -21,13 +21,13 @@ fn main() {
                 coordinator.mode().as_str(),
                 coordinator.live_allowed()
             );
-            set_readiness(
-                &readiness,
-                ReadinessState::ready(init.readiness_detail),
-            );
+            set_readiness(&readiness, ReadinessState::ready(init.readiness_detail));
         }
         Err(err) => {
-            eprintln!("phoenix-engine runtime initialization failed: {}", err.detail());
+            eprintln!(
+                "phoenix-engine runtime initialization failed: {}",
+                err.detail()
+            );
             set_readiness(&readiness, ReadinessState::not_ready(err.detail()));
         }
     }

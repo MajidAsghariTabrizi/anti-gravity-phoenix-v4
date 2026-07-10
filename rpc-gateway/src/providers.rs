@@ -171,7 +171,10 @@ impl fmt::Display for ProviderConfigError {
                 write!(f, "RPC provider priority at index {index} is invalid")
             }
             Self::ZeroPriority { index } => {
-                write!(f, "RPC provider priority at index {index} must be greater than zero")
+                write!(
+                    f,
+                    "RPC provider priority at index {index} must be greater than zero"
+                )
             }
             Self::InvalidGlobalRps => write!(f, "RPC_GLOBAL_RPS must be a positive integer"),
             Self::ZeroGlobalRps => write!(f, "RPC_GLOBAL_RPS must be greater than zero"),
