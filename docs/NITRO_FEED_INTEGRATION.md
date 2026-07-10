@@ -1,8 +1,8 @@
 # Nitro Feed Integration
 
-Status: relay adapter implemented for first runtime verification; production relay ingestion remains blocked until live validation passes.
+Status: relay adapter implemented for first runtime verification; production relay mode can start in SHADOW, but real feed validation evidence is still required before claiming production readiness.
 
-Phoenix supports deterministic fixture JSON frames, stdin line input, and non-production relay mode in `feed-ingestor`.
+Phoenix supports deterministic fixture JSON frames, stdin line input, and relay mode in `feed-ingestor`.
 
 The relay adapter is pinned to Offchain Labs Nitro `v3.11.2` semantics recorded in `docs/DEPENDENCIES.md`. It implements:
 
@@ -78,13 +78,13 @@ This matrix is deliberately conservative. Phoenix must not claim broad Arbitrum 
 
 The local RLP helper exists only because the workspace could not fetch the desired Nitro/go-ethereum dependency graph. It is a minimal canonical RLP parser for the supported Arbitrum unsigned transaction payload subset. Tests cover single bytes, short/long strings, short/long lists, nested lists, empty string/list, trailing bytes, truncation, non-canonical length encodings, length overflow, integer leading-zero rejection, and malformed nested values.
 
-Production readiness stays blocked until either this subset is proven against real feed fixtures or replaced with official go-ethereum/Nitro decoding.
+Production readiness claims remain blocked until either this subset is proven against real feed fixtures or replaced with official go-ethereum/Nitro decoding.
 
 ## Custom Keccak Status
 
 The local Keccak helper implements Ethereum legacy Keccak-256 using rate `136`, Keccak padding suffix `0x01`, and Keccak-f[1600] constants/rotations. Tests cover Keccak-256 of empty input, `abc`, binary bytes `000102030405`, and a multi-block 256-byte input. These vectors distinguish Ethereum Keccak from SHA3-256.
 
-Production readiness still remains blocked because custom crypto should be replaced with or verified against an official dependency before a live release gate is lifted.
+Production readiness claims still require custom crypto to be replaced with or verified against an official dependency before a live release gate is lifted.
 
 ## WebSocket Source Status
 
@@ -95,10 +95,10 @@ Compressed feed frames are not negotiated. Fragmentation is explicitly rejected 
 ## Runtime Modes
 
 - `PHOENIX_FEED_SOURCE=fixture`: deterministic development and CI mode. Requires `PHOENIX_FEED_FIXTURE`.
-- `PHOENIX_FEED_SOURCE=relay`: non-production runtime verification mode. Requires `PHOENIX_FEED_RELAY_URL`.
+- `PHOENIX_FEED_SOURCE=relay`: SHADOW runtime verification mode. Requires `PHOENIX_FEED_RELAY_URL`.
 - `PHOENIX_FEED_SOURCE=stdin`: line-oriented deterministic input for local tooling.
 
-Production rejects any configured fixture path and refuses startup until real relay validation has passed.
+Production rejects any configured fixture path and requires relay mode. Relay startup is allowed for SHADOW runtime verification, but readiness still depends on real source connection, NATS reachability, sequence integrity, and at least one valid normalized transaction-bearing message.
 
 ## Sequence Integrity Policy
 
@@ -151,14 +151,13 @@ Liveness only reports that the process is alive. Readiness requires:
 - no unresolved sequence gap or feed reset condition
 - no unsupported transaction-like or unknown feed coverage observed
 
-The production guard is deliberate:
+The production guard is deliberately limited to source selection:
 
 - If `PHOENIX_ENV=production` and `PHOENIX_FEED_FIXTURE` is set, startup fails.
 - If `PHOENIX_ENV=production` and `PHOENIX_FEED_SOURCE` is not `relay`, startup fails.
 - If `PHOENIX_ENV=production` and `PHOENIX_FEED_RELAY_URL` is missing, startup fails.
-- If production relay mode is requested, startup fails until the relay adapter has been live-verified against the real Arbitrum sequencer feed.
 
-This is the truthful outcome for the current repository. Do not claim live relay testing has passed.
+Do not claim live relay testing has passed until a real relay smoke test has actually run.
 
 ## Required Adapter Behavior
 

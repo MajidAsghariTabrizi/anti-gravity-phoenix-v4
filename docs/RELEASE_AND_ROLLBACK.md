@@ -48,4 +48,4 @@ Database migrations are forward-only. Rollbacks require backward-compatible migr
 
 ## Known Current Gate
 
-Production feed readiness is intentionally blocked until the Nitro relay adapter is live-verified against the real Arbitrum sequencer feed. A production deploy of the current code should fail health and rollback rather than silently consume fixtures.
+Linux VPS validation must still prove the Nitro relay adapter against the real Arbitrum sequencer feed. A production deploy must fail health and rollback if relay/feed readiness cannot be established, and it must never silently consume fixtures.

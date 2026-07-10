@@ -14,7 +14,7 @@ services:
     command:
       - --chain.id=42161
       - --parent-chain.connection.url=${PARENT_CHAIN_RPC_URL:?PARENT_CHAIN_RPC_URL is required}
-      - --node.feed.input.url=${ARBITRUM_SEQUENCER_FEED_URL:-}
+      - --node.feed.input.url=${ARBITRUM_SEQUENCER_FEED_URL:?ARBITRUM_SEQUENCER_FEED_URL is required}
       - --node.feed.input.require-chain-id=true
       - --node.feed.input.require-feed-version=true
       - --node.feed.output.enable=true
@@ -100,6 +100,7 @@ services:
       PHOENIX_ENV: production
       PHOENIX_FEED_SOURCE: relay
       PHOENIX_FEED_RELAY_URL: ${PHOENIX_FEED_RELAY_URL:?PHOENIX_FEED_RELAY_URL is required}
+      PHOENIX_FEED_FIXTURE: ""
       NATS_URL: nats://nats:4222
       METRICS_ADDR: 0.0.0.0:9100
     depends_on:

@@ -21,14 +21,17 @@ func TestResolveSourceConfigBlocksProductionFixture(t *testing.T) {
 	}
 }
 
-func TestResolveSourceConfigBlocksProductionRelayUntilLiveVerified(t *testing.T) {
-	_, err := resolveSourceConfig(mapEnv(map[string]string{
+func TestResolveSourceConfigAllowsProductionRelay(t *testing.T) {
+	cfg, err := resolveSourceConfig(mapEnv(map[string]string{
 		"PHOENIX_ENV":            "production",
 		"PHOENIX_FEED_SOURCE":    "relay",
 		"PHOENIX_FEED_RELAY_URL": "ws://nitro-feed-relay:9642/feed",
 	}))
-	if err == nil {
-		t.Fatal("expected production relay source to fail until Nitro adapter is live-verified")
+	if err != nil {
+		t.Fatalf("unexpected production relay error: %v", err)
+	}
+	if cfg.kind != "relay" || cfg.relayURL != "ws://nitro-feed-relay:9642/feed" {
+		t.Fatalf("unexpected config: %+v", cfg)
 	}
 }
 

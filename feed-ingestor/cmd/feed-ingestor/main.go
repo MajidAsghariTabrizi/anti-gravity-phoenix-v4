@@ -275,7 +275,7 @@ func resolveSourceConfig(getenv func(string) string) (sourceConfig, error) {
 		if relayURL == "" {
 			return sourceConfig{}, fmt.Errorf("production feed readiness blocked: PHOENIX_FEED_RELAY_URL is required")
 		}
-		return sourceConfig{}, fmt.Errorf("production feed readiness blocked: Nitro relay adapter is implemented but not live-verified for production")
+		return sourceConfig{kind: "relay", relayURL: relayURL}, nil
 	}
 	switch source {
 	case "relay":
