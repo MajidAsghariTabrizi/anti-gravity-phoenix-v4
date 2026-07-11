@@ -1,3 +1,12 @@
+pub mod logging;
+pub mod metrics;
+pub mod model;
+pub mod persistence;
+pub mod runtime;
+pub mod state;
+
+pub const NATS_SUBJECT: &str = "phoenix.feed.tx";
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum OpportunityLifecycle {
     OriginSeen,
@@ -10,6 +19,23 @@ pub enum OpportunityLifecycle {
     ReceiptSuccess,
     Settled,
     RealizedProfit,
+}
+
+impl OpportunityLifecycle {
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::OriginSeen => "origin_seen",
+            Self::OriginSupported => "origin_supported",
+            Self::RoutesAffected => "routes_affected",
+            Self::Simulated => "simulated",
+            Self::Profitable => "profitable",
+            Self::Submitted => "submitted",
+            Self::SequencedOrAccepted => "sequenced_or_accepted",
+            Self::ReceiptSuccess => "receipt_success",
+            Self::Settled => "settled",
+            Self::RealizedProfit => "realized_profit",
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -38,7 +64,7 @@ impl RecorderBuffer {
 }
 
 #[cfg(test)]
-mod tests {
+mod compatibility_tests {
     use super::*;
 
     #[test]
@@ -49,5 +75,6 @@ mod tests {
             payload: "{}".to_string(),
         });
         assert_eq!(buffer.len(), 1);
+        assert_eq!(OpportunityLifecycle::OriginSeen.as_str(), "origin_seen");
     }
 }

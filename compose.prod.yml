@@ -146,6 +146,7 @@ services:
       RECORDER_DAEMON: "true"
       RECORDER_HEALTH_ADDR: 0.0.0.0:9400
       POSTGRES_DSN: ${POSTGRES_DSN:?POSTGRES_DSN is required}
+      PGSSLMODE: ${PGSSLMODE:-prefer}
       NATS_URL: nats://nats:4222
     depends_on:
       postgres:

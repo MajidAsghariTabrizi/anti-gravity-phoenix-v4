@@ -2,6 +2,7 @@
 name = "phoenix-recorder"
 version = "0.4.0"
 edition = "2021"
+rust-version = "1.79"
 license = "MIT"
 
 [lib]
@@ -13,4 +14,17 @@ name = "phoenix-recorder"
 path = "src/main.rs"
 
 [dependencies]
-
+async-nats = "=0.37.0"
+async-trait = "=0.1.81"
+base64 = "=0.22.1"
+chrono = { version = "=0.4.38", features = ["serde"] }
+futures-util = "=0.3.31"
+hex = "=0.4.3"
+serde = { version = "=1.0.210", features = ["derive"] }
+serde_json = "=1.0.128"
+sqlx = { version = "=0.8.2", default-features = false, features = ["runtime-tokio-rustls", "postgres", "chrono", "json"] }
+thiserror = "=1.0.63"
+tokio = { version = "=1.40.0", features = ["full"] }
+tokio-util = "=0.7.12"
+tracing = "=0.1.40"
+tracing-subscriber = { version = "=0.3.18", features = ["env-filter", "fmt", "json"] }

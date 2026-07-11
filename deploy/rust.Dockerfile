@@ -5,6 +5,7 @@ COPY phoenix-engine ./phoenix-engine
 COPY rpc-gateway ./rpc-gateway
 COPY recorder ./recorder
 COPY replay ./replay
+COPY migrations ./migrations
 RUN cd "${CRATE}" && cargo test --all
 RUN case "${CRATE}" in \
       phoenix-engine) BIN=phoenix-engine ;; \

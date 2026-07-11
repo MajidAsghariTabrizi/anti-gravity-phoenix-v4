@@ -35,6 +35,7 @@ Production operations use `/opt/phoenix/deploy/deploy-release.sh <sha>`, `/opt/p
 
 - Check NATS health endpoint and Docker network.
 - Expect feed-ingestor and recorder readiness to fail. Production Compose also prevents the engine from starting before NATS is healthy, but the engine `/readyz` endpoint only reports engine-owned runtime initialization.
+- Core NATS has no acknowledgement or replay log. Preserve outage timestamps and reconcile database coverage before treating Recorder history as complete.
 - Restore NATS before restarting dependent services.
 
 ### RPC gateway degraded
@@ -52,7 +53,7 @@ Production operations use `/opt/phoenix/deploy/deploy-release.sh <sha>`, `/opt/p
 ### PostgreSQL unavailable
 
 - Check `pg_isready`, disk, and volume permissions.
-- Recorder/dashboard may degrade.
+- Recorder readiness fails and the current in-memory message is retried with backpressure. A Recorder crash during the outage loses that Core NATS delivery.
 - Hot decision path must not block on database recovery.
 
 ### Migration failure

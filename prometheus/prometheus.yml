@@ -11,4 +11,6 @@ scrape_configs:
   - job_name: phoenix-engine
     static_configs:
       - targets: ["phoenix-engine:9200"]
-
+  - job_name: recorder
+    static_configs:
+      - targets: ["recorder:9400"]
