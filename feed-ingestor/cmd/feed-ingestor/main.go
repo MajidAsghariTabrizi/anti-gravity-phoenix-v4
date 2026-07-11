@@ -128,7 +128,16 @@ func runLineSource(ctx context.Context, input io.Reader, pub publisher.Publisher
 
 func runRelaySource(ctx context.Context, sourceCfg sourceConfig, pub publisher.Publisher, registry *metrics.Registry, readiness *metrics.Readiness) error {
 	state := sequence.New()
-	source, err := feed.NewRelaySource(sourceCfg.relayURL, nitro.ArbitrumOneChainID, state.NextExpected, 30*time.Second)
+	source, err := feed.NewRelaySource(
+		sourceCfg.relayURL,
+		nitro.ArbitrumOneChainID,
+		state.NextExpected,
+		feed.RelaySourceOptions{
+			Timeout: 30 * time.Second,
+			Logger:  log.Default(),
+			OnEvent: relayLifecycleHandler(registry, readiness),
+		},
+	)
 	if err != nil {
 		readiness.MarkFatal(err.Error())
 		return err
@@ -143,13 +152,6 @@ func runRelaySource(ctx context.Context, sourceCfg sourceConfig, pub publisher.P
 		if err != nil {
 			readiness.MarkFatal(err.Error())
 			return err
-		}
-		if message.Connected {
-			readiness.MarkSourceConnected()
-			registry.Inc("feed_connections_total")
-		}
-		if message.AfterReconnect {
-			registry.Inc("feed_reconnects_total")
 		}
 		registry.Inc("feed_messages_total")
 		frames, _, err := nitro.DecodeBroadcast(message.Data)
@@ -221,6 +223,18 @@ func runRelaySource(ctx context.Context, sourceCfg sourceConfig, pub publisher.P
 			}
 		}
 		registry.SetGauge("feed_readiness", readinessGauge(readiness))
+	}
+}
+
+func relayLifecycleHandler(registry *metrics.Registry, readiness *metrics.Readiness) func(feed.RelayEvent) {
+	return func(event feed.RelayEvent) {
+		switch event.Kind {
+		case feed.RelayEventConnected:
+			readiness.MarkSourceConnected()
+			registry.Inc("feed_connections_total")
+		case feed.RelayEventReconnectAttempt:
+			registry.Inc("feed_reconnects_total")
+		}
 	}
 }
 

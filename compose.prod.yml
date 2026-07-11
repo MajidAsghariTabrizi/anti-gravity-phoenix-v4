@@ -11,27 +11,24 @@ x-logging: &bounded-logging
 services:
   nitro-feed-relay:
     image: offchainlabs/nitro-node:v3.11.2-3599aca
+    entrypoint: ["relay"]
     command:
       - --chain.id=42161
-      - --parent-chain.connection.url=${PARENT_CHAIN_RPC_URL:?PARENT_CHAIN_RPC_URL is required}
       - --node.feed.input.url=${ARBITRUM_SEQUENCER_FEED_URL:?ARBITRUM_SEQUENCER_FEED_URL is required}
       - --node.feed.input.require-chain-id=true
       - --node.feed.input.require-feed-version=true
       - --node.feed.output.enable=true
       - --node.feed.output.addr=0.0.0.0
       - --node.feed.output.port=9642
-      - --http.addr=127.0.0.1
-      - --http.port=8547
-      - --ws.addr=127.0.0.1
     networks: [phoenix-internal]
     restart: unless-stopped
     logging: *bounded-logging
     healthcheck:
-      test: ["CMD-SHELL", "wget -q -O - http://127.0.0.1:8547/livenessprobe >/dev/null 2>&1"]
-      interval: 30s
-      timeout: 5s
+      test: ["CMD-SHELL", "grep -Eq ':25AA[[:space:]].*[[:space:]]0A[[:space:]]' /proc/net/tcp /proc/net/tcp6"]
+      interval: 10s
+      timeout: 3s
       retries: 5
-      start_period: 30s
+      start_period: 10s
 
   nats:
     image: nats:2.10-alpine

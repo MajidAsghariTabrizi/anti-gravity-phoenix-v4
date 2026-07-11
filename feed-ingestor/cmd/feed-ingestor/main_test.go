@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"anti-gravity-phoenix-v4/feed-ingestor/internal/feed"
 	"anti-gravity-phoenix-v4/feed-ingestor/internal/metrics"
 	"anti-gravity-phoenix-v4/feed-ingestor/internal/nitro"
 	"anti-gravity-phoenix-v4/feed-ingestor/internal/normalizer"
@@ -83,6 +84,33 @@ func TestNormalizeRelayTransactionsRejectsUnsupportedChain(t *testing.T) {
 	}
 	if !strings.Contains(registry.Render(), "feed_decode_failures_total 1") {
 		t.Fatalf("missing decode failure counter: %s", registry.Render())
+	}
+}
+
+func TestRelayLifecycleCountsReconnectsWithoutClaimingReadiness(t *testing.T) {
+	registry := metrics.NewRegistry()
+	readiness := &metrics.Readiness{}
+	readiness.MarkSourceInitialized()
+	readiness.MarkAdapterInitialized()
+	readiness.MarkNATSReachable()
+	handle := relayLifecycleHandler(registry, readiness)
+
+	handle(feed.RelayEvent{Kind: feed.RelayEventConnected, Attempt: 1})
+	handle(feed.RelayEvent{Kind: feed.RelayEventReconnectAttempt, Attempt: 2, Backoff: time.Millisecond})
+	handle(feed.RelayEvent{Kind: feed.RelayEventConnected, Attempt: 2, Reconnected: true})
+
+	rendered := registry.Render()
+	if !strings.Contains(rendered, "feed_connections_total 2") {
+		t.Fatalf("connection metric does not reflect successful handshakes: %s", rendered)
+	}
+	if !strings.Contains(rendered, "feed_reconnects_total 1") {
+		t.Fatalf("reconnect metric does not reflect retry attempts: %s", rendered)
+	}
+	if !strings.Contains(rendered, "feed_messages_total 0") || !strings.Contains(rendered, "feed_decode_failures_total 0") {
+		t.Fatalf("lifecycle events must not count as delivered or rejected messages: %s", rendered)
+	}
+	if ok, reason := readiness.Ready(); ok || reason != "no valid feed message observed" {
+		t.Fatalf("readiness must remain false before valid live evidence, ok=%v reason=%q", ok, reason)
 	}
 }
 
