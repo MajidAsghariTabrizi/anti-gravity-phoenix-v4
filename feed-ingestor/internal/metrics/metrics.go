@@ -106,16 +106,15 @@ func (r *Registry) Render() string {
 }
 
 type Readiness struct {
-	mu                  sync.RWMutex
-	sourceInitialized   bool
-	adapterInitialized  bool
-	sourceConnected     bool
-	validFeedObserved   bool
-	sequenceKnown       bool
-	unresolvedGap       bool
-	unsupportedCoverage bool
-	natsReachable       bool
-	fatal               string
+	mu                 sync.RWMutex
+	sourceInitialized  bool
+	adapterInitialized bool
+	sourceConnected    bool
+	successfulPublish  bool
+	sequenceKnown      bool
+	unresolvedGap      bool
+	natsReachable      bool
+	fatal              string
 }
 
 func (r *Readiness) MarkSourceInitialized() {
@@ -136,23 +135,16 @@ func (r *Readiness) MarkSourceConnected() {
 	r.sourceConnected = true
 }
 
-func (r *Readiness) MarkValidFeedMessage() {
+func (r *Readiness) MarkSuccessfulPublish() {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	r.validFeedObserved = true
+	r.successfulPublish = true
 	r.sequenceKnown = true
 }
 
 func (r *Readiness) MarkSequenceKnown() {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	r.sequenceKnown = true
-}
-
-func (r *Readiness) MarkUnsupportedCoverage() {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	r.unsupportedCoverage = true
 	r.sequenceKnown = true
 }
 
@@ -198,11 +190,8 @@ func (r *Readiness) Ready() (bool, string) {
 	if !r.natsReachable {
 		return false, "NATS not reachable"
 	}
-	if r.unsupportedCoverage {
-		return false, "unsupported feed coverage observed"
-	}
-	if !r.validFeedObserved {
-		return false, "no valid feed message observed"
+	if !r.successfulPublish {
+		return false, "no successful feed transaction published"
 	}
 	if !r.sequenceKnown {
 		return false, "feed sequence unknown"

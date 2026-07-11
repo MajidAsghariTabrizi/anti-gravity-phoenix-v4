@@ -22,7 +22,7 @@ func TestRegistryRendersCountersAndLatency(t *testing.T) {
 	}
 }
 
-func TestReadinessRequiresSourceAdapterConnectionValidFeedAndNATS(t *testing.T) {
+func TestReadinessRequiresSourceAdapterConnectionSuccessfulPublishAndNATS(t *testing.T) {
 	var ready Readiness
 	if ok, reason := ready.Ready(); ok || reason != "source not initialized" {
 		t.Fatalf("unexpected initial readiness ok=%v reason=%q", ok, reason)
@@ -40,10 +40,10 @@ func TestReadinessRequiresSourceAdapterConnectionValidFeedAndNATS(t *testing.T) 
 		t.Fatalf("unexpected source-connected readiness ok=%v reason=%q", ok, reason)
 	}
 	ready.MarkNATSReachable()
-	if ok, reason := ready.Ready(); ok || reason != "no valid feed message observed" {
+	if ok, reason := ready.Ready(); ok || reason != "no successful feed transaction published" {
 		t.Fatalf("unexpected nats-only readiness ok=%v reason=%q", ok, reason)
 	}
-	ready.MarkValidFeedMessage()
+	ready.MarkSuccessfulPublish()
 	if ok, reason := ready.Ready(); !ok || reason != "ready" {
 		t.Fatalf("unexpected final readiness ok=%v reason=%q", ok, reason)
 	}
@@ -61,14 +61,14 @@ func TestReadinessRequiresSourceAdapterConnectionValidFeedAndNATS(t *testing.T) 
 	}
 }
 
-func TestReadinessTracksUnsupportedCoverage(t *testing.T) {
+func TestReadinessSequenceEvidenceCannotReplaceSuccessfulPublish(t *testing.T) {
 	var ready Readiness
 	ready.MarkSourceInitialized()
 	ready.MarkAdapterInitialized()
 	ready.MarkSourceConnected()
 	ready.MarkNATSReachable()
-	ready.MarkUnsupportedCoverage()
-	if ok, reason := ready.Ready(); ok || reason != "unsupported feed coverage observed" {
-		t.Fatalf("unexpected unsupported readiness ok=%v reason=%q", ok, reason)
+	ready.MarkSequenceKnown()
+	if ok, reason := ready.Ready(); ok || reason != "no successful feed transaction published" {
+		t.Fatalf("sequence evidence must not claim readiness ok=%v reason=%q", ok, reason)
 	}
 }

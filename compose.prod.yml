@@ -15,8 +15,6 @@ services:
     command:
       - --chain.id=42161
       - --node.feed.input.url=${ARBITRUM_SEQUENCER_FEED_URL:?ARBITRUM_SEQUENCER_FEED_URL is required}
-      - --node.feed.input.require-chain-id=true
-      - --node.feed.input.require-feed-version=true
       - --node.feed.output.enable=true
       - --node.feed.output.addr=0.0.0.0
       - --node.feed.output.port=9642

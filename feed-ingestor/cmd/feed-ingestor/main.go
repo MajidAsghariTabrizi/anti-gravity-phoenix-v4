@@ -115,12 +115,10 @@ func runLineSource(ctx context.Context, input io.Reader, pub publisher.Publisher
 		} else {
 			readiness.ClearSequenceGap()
 		}
-		readiness.MarkValidFeedMessage()
 		registry.SetGauge("feed_last_sequence", float64(result.Sequence))
 		registry.SetGauge("feed_last_message_timestamp", float64(result.TimestampUnixMS))
-		registry.SetGauge("feed_readiness", readinessGauge(readiness))
-		if err := publishTransactions(pub, registry, result.Transactions, start); err != nil {
-			readiness.MarkFatal(err.Error())
+		registry.Add("feed_normalized_transactions_total", uint64(len(result.Transactions)))
+		if err := publishAndUpdateReadiness(pub, registry, readiness, result.Transactions, start); err != nil {
 			return err
 		}
 	}
@@ -145,6 +143,7 @@ func runRelaySource(ctx context.Context, sourceCfg sourceConfig, pub publisher.P
 	defer source.Close()
 	readiness.MarkSourceInitialized()
 	readiness.MarkAdapterInitialized()
+	issueLogger := newSampledIssueLogger(log.Default(), defaultIssueLogInterval, nil)
 
 	for {
 		start := time.Now()
@@ -154,21 +153,17 @@ func runRelaySource(ctx context.Context, sourceCfg sourceConfig, pub publisher.P
 			return err
 		}
 		registry.Inc("feed_messages_total")
-		frames, _, err := nitro.DecodeBroadcast(message.Data)
+		frames, _, err := nitro.DecodeBroadcastContext(ctx, message.Data)
 		if err != nil {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
 			registry.Inc("feed_decode_failures_total")
-			log.Printf("feed_decode_failure source=relay error=%q", err.Error())
+			issueLogger.Log("malformed", 0, "decode Nitro broadcast: "+err.Error())
 			continue
 		}
 		for index, frame := range frames {
-			if len(frame.Unsupported) > 0 {
-				registry.Add("feed_unsupported_messages_total", uint64(len(frame.Unsupported)))
-				readiness.MarkUnsupportedCoverage()
-				log.Printf("unsupported Nitro feed message sequence=%d reasons=%s", frame.Sequence, strings.Join(frame.Unsupported, "; "))
-			}
-			if len(frame.Ignored) > 0 {
-				log.Printf("ignored Nitro feed message sequence=%d reasons=%s", frame.Sequence, strings.Join(frame.Ignored, "; "))
-			}
+			recordFrameIssues(registry, issueLogger, frame)
 			observation := state.Observe(frame.Sequence, message.AfterReconnect && index == 0)
 			switch observation.Event {
 			case sequence.Duplicate:
@@ -197,28 +192,18 @@ func runRelaySource(ctx context.Context, sourceCfg sourceConfig, pub publisher.P
 			readiness.MarkSequenceKnown()
 			registry.SetGauge("feed_last_sequence", float64(frame.Sequence))
 			registry.SetGauge("feed_last_message_timestamp", float64(frame.TimestampUnixMS))
-			if len(frame.Unsupported) > 0 {
-				registry.SetGauge("feed_readiness", readinessGauge(readiness))
-				continue
-			}
-			if len(frame.Ignored) > 0 {
-				registry.SetGauge("feed_readiness", readinessGauge(readiness))
-				continue
-			}
 
-			normalized, ok := normalizeRelayTransactions(frame, registry)
-			if !ok {
-				readiness.MarkUnsupportedCoverage()
+			normalized, normalizationFailures := normalizeRelayTransactions(frame)
+			registry.Add("feed_decode_failures_total", uint64(len(normalizationFailures)))
+			for _, reason := range normalizationFailures {
+				issueLogger.Log("malformed", frame.Sequence, reason)
+			}
+			registry.Add("feed_normalized_transactions_total", uint64(len(normalized)))
+			if len(normalized) == 0 {
 				registry.SetGauge("feed_readiness", readinessGauge(readiness))
 				continue
 			}
-			if len(normalized) == 0 {
-				continue
-			}
-			readiness.MarkValidFeedMessage()
-			registry.SetGauge("feed_readiness", readinessGauge(readiness))
-			if err := publishTransactions(pub, registry, normalized, start); err != nil {
-				readiness.MarkFatal(err.Error())
+			if err := publishAndUpdateReadiness(pub, registry, readiness, normalized, start); err != nil {
 				return err
 			}
 		}
@@ -238,31 +223,52 @@ func relayLifecycleHandler(registry *metrics.Registry, readiness *metrics.Readin
 	}
 }
 
-func normalizeRelayTransactions(frame nitro.Frame, registry *metrics.Registry) ([]normalizer.NormalizedTx, bool) {
+func normalizeRelayTransactions(frame nitro.Frame) ([]normalizer.NormalizedTx, []string) {
 	normalized := make([]normalizer.NormalizedTx, 0, len(frame.Transactions))
-	for _, tx := range frame.Transactions {
+	failures := make([]string, 0)
+	for index, tx := range frame.Transactions {
 		n, err := normalizer.Normalize(frame.Sequence, frame.TimestampUnixMS, tx, time.Now())
 		if err != nil {
-			registry.Inc("feed_decode_failures_total")
-			log.Printf("feed_decode_failure source=relay sequence=%d error=%q", frame.Sequence, err.Error())
-			return nil, false
+			failures = append(failures, fmt.Sprintf("normalize transaction %d: %s", index, err.Error()))
+			continue
 		}
 		normalized = append(normalized, n)
 	}
-	return normalized, true
+	return normalized, failures
 }
 
-func publishTransactions(pub publisher.Publisher, registry *metrics.Registry, transactions []normalizer.NormalizedTx, start time.Time) error {
+func publishTransactions(pub publisher.Publisher, registry *metrics.Registry, transactions []normalizer.NormalizedTx, start time.Time) (uint64, error) {
+	var published uint64
 	for _, tx := range transactions {
 		if err := pub.Publish(txSubject, tx); err != nil {
 			registry.Inc("feed_publish_failures_total")
 			log.Printf("feed_publish_failure subject=%s error=%q", txSubject, err.Error())
-			return err
+			return published, err
 		}
 		registry.Inc("feed_publish_success_total")
-		registry.Inc("feed_normalized_transactions_total")
 		registry.ObserveIngestLatency(start)
+		published++
 	}
+	return published, nil
+}
+
+func publishAndUpdateReadiness(
+	pub publisher.Publisher,
+	registry *metrics.Registry,
+	readiness *metrics.Readiness,
+	transactions []normalizer.NormalizedTx,
+	start time.Time,
+) error {
+	published, err := publishTransactions(pub, registry, transactions, start)
+	if err != nil {
+		readiness.MarkFatal(err.Error())
+		registry.SetGauge("feed_readiness", readinessGauge(readiness))
+		return err
+	}
+	if published > 0 {
+		readiness.MarkSuccessfulPublish()
+	}
+	registry.SetGauge("feed_readiness", readinessGauge(readiness))
 	return nil
 }
 
