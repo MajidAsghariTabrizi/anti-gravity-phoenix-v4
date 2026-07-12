@@ -194,7 +194,10 @@ fn sensitivity_delta(cases: &[ReplayCase], kind: Sensitivity) -> Result<i128, Re
 }
 
 fn scale_up(value: u128, multiplier_bps: u128) -> u128 {
-    value.saturating_mul(multiplier_bps) / BPS_DENOMINATOR as u128
+    value
+        .saturating_mul(multiplier_bps)
+        .saturating_add(BPS_DENOMINATOR as u128 - 1)
+        / BPS_DENOMINATOR as u128
 }
 
 fn cluster_pnl(decisions: &[ReplayDecision]) -> Vec<i128> {
@@ -323,8 +326,8 @@ mod tests {
     #[test]
     fn sensitivity_stress_never_improves_aggregate_pnl() {
         let report = build(CASES).unwrap();
-        assert!(report.gas_sensitivity_delta <= 0);
-        assert!(report.slippage_sensitivity_delta <= 0);
-        assert!(report.latency_sensitivity_delta <= 0);
+        assert!(report.gas_sensitivity_delta < 0);
+        assert!(report.slippage_sensitivity_delta < 0);
+        assert!(report.latency_sensitivity_delta < 0);
     }
 }
