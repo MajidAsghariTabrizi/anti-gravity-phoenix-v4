@@ -175,7 +175,7 @@ fn decode_hex(value: &str) -> Option<Vec<u8>> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     pub fn sample_payload(sequence: u64, hash_byte: char) -> Vec<u8> {

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"strings"
 	"testing"
@@ -64,7 +65,7 @@ func TestResolveSourceConfigAllowsShadowRelay(t *testing.T) {
 
 func TestPublishTransactionsCountsFailure(t *testing.T) {
 	registry := metrics.NewRegistry()
-	published, err := publishTransactions(failingPublisher{}, registry, []normalizer.NormalizedTx{{TxHash: "0xabc"}}, time.Now())
+	published, err := publishTransactions(context.Background(), failingPublisher{}, registry, []normalizer.NormalizedTx{{TxHash: "0xabc"}}, time.Now())
 	if err == nil {
 		t.Fatal("expected publish failure")
 	}
@@ -133,14 +134,14 @@ func TestReadinessBecomesTrueOnlyAfterSuccessfulPublish(t *testing.T) {
 	if ok, _ := readiness.Ready(); ok {
 		t.Fatal("readiness was true before publication")
 	}
-	if err := publishAndUpdateReadiness(pub, registry, readiness, transactions, time.Now()); err != nil {
+	if err := publishAndUpdateReadiness(context.Background(), pub, registry, readiness, transactions, time.Now()); err != nil {
 		t.Fatal(err)
 	}
 	if ok, reason := readiness.Ready(); !ok || reason != "ready" {
 		t.Fatalf("successful publish did not enable readiness ok=%v reason=%q", ok, reason)
 	}
 	rendered := registry.Render()
-	if !strings.Contains(rendered, "feed_publish_success_total 1") || !strings.Contains(rendered, "feed_readiness 1") {
+	if !strings.Contains(rendered, "feed_publish_success_total 1") || !strings.Contains(rendered, "feed_jetstream_publish_success_total 1") || !strings.Contains(rendered, "feed_readiness 1") {
 		t.Fatalf("successful publish metrics mismatch: %s", rendered)
 	}
 }
@@ -150,22 +151,24 @@ func TestPublishFailureRemainsFailClosed(t *testing.T) {
 	readiness := publishReadyState()
 	transactions := []normalizer.NormalizedTx{{TxHash: "0xabc"}}
 
-	if err := publishAndUpdateReadiness(failingPublisher{}, registry, readiness, transactions, time.Now()); err == nil {
+	if err := publishAndUpdateReadiness(context.Background(), failingPublisher{}, registry, readiness, transactions, time.Now()); err == nil {
 		t.Fatal("expected publish failure")
 	}
 	if ok, _ := readiness.Ready(); ok {
 		t.Fatal("publish failure enabled readiness")
 	}
 	rendered := registry.Render()
-	if !strings.Contains(rendered, "feed_publish_failures_total 1") || !strings.Contains(rendered, "feed_publish_success_total 0") || !strings.Contains(rendered, "feed_readiness 0") {
+	if !strings.Contains(rendered, "feed_publish_failures_total 1") || !strings.Contains(rendered, "feed_jetstream_publish_failures_total 1") || !strings.Contains(rendered, "feed_publish_success_total 0") || !strings.Contains(rendered, "feed_readiness 0") {
 		t.Fatalf("failed publish metrics mismatch: %s", rendered)
 	}
 }
 
 type failingPublisher struct{}
 
-func (failingPublisher) Publish(string, any) error { return errors.New("publish failed") }
-func (failingPublisher) Close() error              { return nil }
+func (failingPublisher) Publish(context.Context, string, any) error {
+	return errors.New("publish failed")
+}
+func (failingPublisher) Close() error { return nil }
 
 func publishReadyState() *metrics.Readiness {
 	readiness := &metrics.Readiness{}

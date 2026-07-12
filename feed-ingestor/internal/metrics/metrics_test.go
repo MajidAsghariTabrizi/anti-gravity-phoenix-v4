@@ -10,6 +10,7 @@ func TestRegistryRendersCountersAndLatency(t *testing.T) {
 	reg := NewRegistry()
 	reg.Inc("feed_messages_total")
 	reg.ObserveIngestLatency(time.Now().Add(-time.Millisecond))
+	reg.ObserveJetStreamPublishLatency(time.Now().Add(-time.Millisecond))
 	rendered := reg.Render()
 	if !strings.Contains(rendered, "feed_messages_total 1") {
 		t.Fatalf("missing counter: %s", rendered)
@@ -19,6 +20,32 @@ func TestRegistryRendersCountersAndLatency(t *testing.T) {
 	}
 	if !strings.Contains(rendered, "feed_ingest_latency_seconds") {
 		t.Fatalf("missing latency: %s", rendered)
+	}
+	if !strings.Contains(rendered, "feed_jetstream_publish_latency_count 1") {
+		t.Fatalf("missing JetStream acknowledgement latency: %s", rendered)
+	}
+	if !strings.Contains(rendered, "feed_jetstream_publish_success_total 0") {
+		t.Fatalf("missing JetStream counters: %s", rendered)
+	}
+}
+
+func TestReadinessFallsWhenDurableNATSConnectionIsUnavailable(t *testing.T) {
+	var ready Readiness
+	ready.MarkSourceInitialized()
+	ready.MarkAdapterInitialized()
+	ready.MarkSourceConnected()
+	ready.MarkNATSReachable()
+	ready.MarkSuccessfulPublish()
+	if ok, _ := ready.Ready(); !ok {
+		t.Fatal("expected acknowledged publication evidence to be ready")
+	}
+	ready.MarkNATSUnavailable()
+	if ok, reason := ready.Ready(); ok || reason != "NATS not reachable" {
+		t.Fatalf("durable NATS outage did not clear readiness ok=%v reason=%q", ok, reason)
+	}
+	ready.MarkNATSReachable()
+	if ok, reason := ready.Ready(); !ok || reason != "ready" {
+		t.Fatalf("readiness did not recover with NATS ok=%v reason=%q", ok, reason)
 	}
 }
 

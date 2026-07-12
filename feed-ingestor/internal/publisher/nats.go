@@ -1,67 +1,181 @@
 package publisher
 
 import (
-	"bufio"
+	"context"
 	"encoding/json"
-	"fmt"
-	"net"
-	"strings"
+	"errors"
 	"time"
+
+	"github.com/nats-io/nats.go"
+	"github.com/nats-io/nats.go/jetstream"
+)
+
+const (
+	StreamName            = "PHOENIX_FEED_TX"
+	StreamSubject         = "phoenix.feed.tx"
+	StreamMaxMessages     = 5_000_000
+	StreamMaxBytes        = 2 * 1024 * 1024 * 1024
+	StreamMaxMessageBytes = 1024 * 1024
+	StreamMaxAge          = 24 * time.Hour
+	StreamDuplicateWindow = 2 * time.Minute
+)
+
+var (
+	ErrNATSUnavailable       = errors.New("NATS connection unavailable")
+	ErrStreamUnavailable     = errors.New("JetStream stream unavailable")
+	ErrPublishAckTimeout     = errors.New("JetStream publish acknowledgement timed out")
+	ErrPublishAckUnavailable = errors.New("JetStream publish acknowledgement unavailable")
+	ErrInvalidPublishAck     = errors.New("JetStream returned an invalid publish acknowledgement")
 )
 
 type Publisher interface {
-	Publish(subject string, value any) error
+	Publish(context.Context, string, any) error
 	Close() error
 }
 
-type NATSCorePublisher struct {
-	conn         net.Conn
-	writeTimeout time.Duration
+type ConnectionEvents struct {
+	Disconnected func()
+	Reconnected  func()
 }
 
-func DialNATSCore(addr string, timeout time.Duration) (*NATSCorePublisher, error) {
-	if strings.HasPrefix(addr, "nats://") {
-		addr = strings.TrimPrefix(addr, "nats://")
-	}
-	conn, err := net.DialTimeout("tcp", addr, timeout)
-	if err != nil {
-		return nil, err
-	}
-	reader := bufio.NewReader(conn)
-	if _, err := reader.ReadString('\n'); err != nil {
-		conn.Close()
-		return nil, err
-	}
-	if _, err := fmt.Fprintf(conn, "CONNECT {\"verbose\":false,\"pedantic\":true,\"name\":\"phoenix-feed-ingestor\"}\r\n"); err != nil {
-		conn.Close()
-		return nil, err
-	}
-	return &NATSCorePublisher{conn: conn, writeTimeout: timeout}, nil
+type durableMessageID interface {
+	DurableMessageID() string
 }
 
-func (p *NATSCorePublisher) Publish(subject string, value any) error {
-	if p.writeTimeout > 0 {
-		_ = p.conn.SetWriteDeadline(time.Now().Add(p.writeTimeout))
-	}
-	payload, err := json.Marshal(value)
-	if err != nil {
-		return err
-	}
-	if _, err := fmt.Fprintf(p.conn, "PUB %s %d\r\n", subject, len(payload)); err != nil {
-		return err
-	}
-	if _, err := p.conn.Write(payload); err != nil {
-		return err
-	}
-	_, err = p.conn.Write([]byte("\r\n"))
+type jetStreamAPI interface {
+	EnsureStream(context.Context, jetstream.StreamConfig) error
+	Publish(context.Context, string, []byte, ...jetstream.PublishOpt) (*jetstream.PubAck, error)
+}
+
+type connectionCloser interface {
+	Close()
+}
+
+type natsJetStreamAPI struct {
+	jetstream.JetStream
+}
+
+func (api natsJetStreamAPI) EnsureStream(ctx context.Context, config jetstream.StreamConfig) error {
+	_, err := api.CreateOrUpdateStream(ctx, config)
 	return err
 }
 
-func (p *NATSCorePublisher) Close() error {
-	if p.conn == nil {
-		return nil
+type JetStreamPublisher struct {
+	api        jetStreamAPI
+	connection connectionCloser
+	timeout    time.Duration
+}
+
+func DialJetStream(addr string, timeout time.Duration, events ConnectionEvents) (*JetStreamPublisher, error) {
+	options := []nats.Option{
+		nats.Name("phoenix-feed-ingestor"),
+		nats.Timeout(timeout),
+		nats.ReconnectWait(500 * time.Millisecond),
+		nats.MaxReconnects(-1),
+		nats.PingInterval(20 * time.Second),
+		nats.MaxPingsOutstanding(2),
 	}
-	return p.conn.Close()
+	if events.Disconnected != nil {
+		options = append(options, nats.DisconnectErrHandler(func(_ *nats.Conn, _ error) {
+			events.Disconnected()
+		}))
+	}
+	if events.Reconnected != nil {
+		options = append(options, nats.ReconnectHandler(func(_ *nats.Conn) {
+			events.Reconnected()
+		}))
+	}
+	connection, err := nats.Connect(addr, options...)
+	if err != nil {
+		return nil, ErrNATSUnavailable
+	}
+
+	js, err := jetstream.New(connection, jetstream.WithDefaultTimeout(timeout))
+	if err != nil {
+		connection.Close()
+		return nil, ErrStreamUnavailable
+	}
+	publisher := &JetStreamPublisher{
+		api:        natsJetStreamAPI{JetStream: js},
+		connection: connection,
+		timeout:    timeout,
+	}
+	if err := publisher.ensureStream(context.Background()); err != nil {
+		connection.Close()
+		return nil, err
+	}
+	return publisher, nil
+}
+
+func StreamConfig() jetstream.StreamConfig {
+	return jetstream.StreamConfig{
+		Name:              StreamName,
+		Description:       "Durable normalized Arbitrum transactions for the Phoenix Recorder",
+		Subjects:          []string{StreamSubject},
+		Retention:         jetstream.WorkQueuePolicy,
+		MaxConsumers:      1,
+		MaxMsgs:           StreamMaxMessages,
+		MaxBytes:          StreamMaxBytes,
+		Discard:           jetstream.DiscardNew,
+		MaxAge:            StreamMaxAge,
+		MaxMsgsPerSubject: -1,
+		MaxMsgSize:        StreamMaxMessageBytes,
+		Storage:           jetstream.FileStorage,
+		Replicas:          1,
+		Duplicates:        StreamDuplicateWindow,
+	}
+}
+
+func newJetStreamPublisher(ctx context.Context, api jetStreamAPI, connection connectionCloser, timeout time.Duration) (*JetStreamPublisher, error) {
+	publisher := &JetStreamPublisher{api: api, connection: connection, timeout: timeout}
+	if err := publisher.ensureStream(ctx); err != nil {
+		return nil, err
+	}
+	return publisher, nil
+}
+
+func (p *JetStreamPublisher) ensureStream(parent context.Context) error {
+	ctx, cancel := context.WithTimeout(parent, p.timeout)
+	defer cancel()
+	if err := p.api.EnsureStream(ctx, StreamConfig()); err != nil {
+		return ErrStreamUnavailable
+	}
+	return nil
+}
+
+func (p *JetStreamPublisher) Publish(parent context.Context, subject string, value any) error {
+	payload, err := json.Marshal(value)
+	if err != nil {
+		return ErrPublishAckUnavailable
+	}
+	ctx, cancel := context.WithTimeout(parent, p.timeout)
+	defer cancel()
+
+	options := []jetstream.PublishOpt{jetstream.WithExpectStream(StreamName)}
+	if identified, ok := value.(durableMessageID); ok {
+		options = append(options, jetstream.WithMsgID(identified.DurableMessageID()))
+	}
+	ack, err := p.api.Publish(ctx, subject, payload, options...)
+	if err != nil {
+		if errors.Is(ctx.Err(), context.DeadlineExceeded) || errors.Is(err, context.DeadlineExceeded) {
+			return ErrPublishAckTimeout
+		}
+		if errors.Is(err, jetstream.ErrStreamNotFound) || errors.Is(err, jetstream.ErrNoStreamResponse) || errors.Is(err, jetstream.ErrJetStreamNotEnabled) {
+			return ErrStreamUnavailable
+		}
+		return ErrPublishAckUnavailable
+	}
+	if ack == nil || ack.Stream != StreamName || ack.Sequence == 0 {
+		return ErrInvalidPublishAck
+	}
+	return nil
+}
+
+func (p *JetStreamPublisher) Close() error {
+	if p.connection != nil {
+		p.connection.Close()
+	}
+	return nil
 }
 
 type MemoryPublisher struct {
@@ -73,7 +187,7 @@ type PublishedMessage struct {
 	Value   any
 }
 
-func (p *MemoryPublisher) Publish(subject string, value any) error {
+func (p *MemoryPublisher) Publish(_ context.Context, subject string, value any) error {
 	p.Messages = append(p.Messages, PublishedMessage{Subject: subject, Value: value})
 	return nil
 }

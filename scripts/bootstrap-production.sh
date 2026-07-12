@@ -57,6 +57,7 @@ script_dir="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
 repo_root="$(CDPATH= cd -- "$script_dir/.." && pwd)"
 
 install -m 0640 -o phoenix -g phoenix "$repo_root/compose.prod.yml" /opt/phoenix/deploy/compose.prod.yml
+install -m 0644 -o phoenix -g phoenix "$repo_root/deploy/nats-server.conf" /opt/phoenix/deploy/nats-server.conf
 install -d -m 0750 -o phoenix -g phoenix /opt/phoenix/deploy/prometheus
 install -m 0640 -o phoenix -g phoenix "$repo_root/prometheus/prometheus.yml" /opt/phoenix/deploy/prometheus/prometheus.yml
 for script in validate-production-env.sh production-healthcheck.sh rollback-release.sh deploy-release.sh; do

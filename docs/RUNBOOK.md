@@ -34,8 +34,9 @@ Production operations use `/opt/phoenix/deploy/deploy-release.sh <sha>`, `/opt/p
 ### NATS unavailable
 
 - Check NATS health endpoint and Docker network.
-- Expect feed-ingestor and recorder readiness to fail. Production Compose also prevents the engine from starting before NATS is healthy, but the engine `/readyz` endpoint only reports engine-owned runtime initialization.
-- Core NATS has no acknowledgement or replay log. Preserve outage timestamps and reconcile database coverage before treating Recorder history as complete.
+- Confirm `/healthz?js-enabled-only=true`, stream `PHOENIX_FEED_TX`, durable consumer `PHOENIX_RECORDER`, and Docker volume `phoenix-nats-jetstream` still exist.
+- Expect feed-ingestor and Recorder readiness to fail. Do not delete or recreate the volume as a recovery shortcut.
+- Inspect `recorder_consumer_pending_messages`, `recorder_consumer_ack_pending`, publish acknowledgement failures, and disk capacity. Restore service before the 24-hour stream age limit.
 - Restore NATS before restarting dependent services.
 
 ### RPC gateway degraded
@@ -53,7 +54,7 @@ Production operations use `/opt/phoenix/deploy/deploy-release.sh <sha>`, `/opt/p
 ### PostgreSQL unavailable
 
 - Check `pg_isready`, disk, and volume permissions.
-- Recorder readiness fails and the current in-memory message is retried with backpressure. A Recorder crash during the outage loses that Core NATS delivery.
+- Recorder readiness fails. The bounded in-flight batch remains unacknowledged and sends work-in-progress signals while PostgreSQL retries; a Recorder restart replays it from JetStream.
 - Hot decision path must not block on database recovery.
 
 ### Migration failure
@@ -112,7 +113,8 @@ Production operations use `/opt/phoenix/deploy/deploy-release.sh <sha>`, `/opt/p
 
 ### Production disk pressure
 
-- Check `/opt/phoenix/data`, Docker image cache, logs, and PostgreSQL volume.
+- Check `/opt/phoenix/data`, Docker image cache, logs, PostgreSQL, and `docker volume inspect phoenix-nats-jetstream`.
+- If JetStream reaches its bound, `DiscardNew` rejects publication and feed readiness must fail. Do not purge unacknowledged data to force readiness.
 - Preserve critical database and release artifacts.
 - Prune only reviewed caches/images.
 

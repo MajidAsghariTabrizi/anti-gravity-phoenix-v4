@@ -35,6 +35,12 @@ jobs:
           pwsh -NoProfile -ExecutionPolicy Bypass -File ./scripts/forbidden-file-check.ps1
           sh ./scripts/forbidden-file-check.sh
 
+      - name: Validate shell syntax
+        shell: bash
+        run: |
+          set -euo pipefail
+          sh -n scripts/*.sh
+
       - name: Validate tracked hygiene
         shell: bash
         run: |
@@ -253,6 +259,14 @@ jobs:
           EOF
           docker compose config
           PHOENIX_ENV_FILE=.ci-prod.env docker compose --env-file .ci-prod.env -f compose.prod.yml config
+
+      - name: Validate NATS JetStream configuration
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker run --rm \
+            -v "$PWD/deploy/nats-server.conf:/etc/nats/nats-server.conf:ro" \
+            nats:2.10-alpine -t -c /etc/nats/nats-server.conf
       - name: Build Phoenix-owned Dockerfiles
         shell: bash
         run: |
@@ -280,3 +294,50 @@ jobs:
           cargo test --manifest-path phoenix-engine/Cargo.toml --test e2e_fixtures
           cd feed-ingestor
           go test ./internal/decoder -run 'Fixture|Duplicate|Gap'
+
+  jetstream-integration:
+    name: jetstream-integration
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+      - name: Setup Go
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff
+        with:
+          go-version-file: feed-ingestor/go.mod
+          cache: true
+          cache-dependency-path: feed-ingestor/go.sum
+      - name: Install Rust components
+        shell: bash
+        run: rustup toolchain install stable --profile minimal
+      - name: Verify durable JetStream publication and consumption
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker run --detach --name phoenix-ci-nats \
+            --publish 127.0.0.1:4222:4222 \
+            --volume "$PWD/deploy/nats-server.conf:/etc/nats/nats-server.conf:ro" \
+            nats:2.10-alpine -c /etc/nats/nats-server.conf
+          trap 'docker rm --force phoenix-ci-nats >/dev/null 2>&1 || true' EXIT
+
+          for attempt in $(seq 1 30); do
+            if docker exec phoenix-ci-nats wget -q -O - \
+              'http://127.0.0.1:8222/healthz?js-enabled-only=true' >/dev/null; then
+              break
+            fi
+            if [ "$attempt" -eq 30 ]; then
+              docker logs --tail 100 phoenix-ci-nats
+              exit 1
+            fi
+            sleep 1
+          done
+
+          (
+            cd feed-ingestor
+            PHOENIX_TEST_NATS_URL=nats://127.0.0.1:4222 \
+              go test ./internal/publisher -run '^TestJetStreamPublisherIntegration$' -count=1 -v
+          )
+          PHOENIX_TEST_NATS_URL=nats://127.0.0.1:4222 \
+            cargo test --locked --manifest-path recorder/Cargo.toml \
+              --test jetstream_integration -- --nocapture

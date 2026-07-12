@@ -3,6 +3,7 @@ package normalizer
 import (
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"strings"
 	"time"
 )
@@ -78,6 +79,10 @@ func Normalize(sequence uint64, timestampMS uint64, tx RelayTx, now time.Time) (
 		RawTx:                raw,
 		IngestedAtUnixNS:     now.UnixNano(),
 	}, nil
+}
+
+func (tx NormalizedTx) DurableMessageID() string {
+	return fmt.Sprintf("%d:%s", tx.Sequence, tx.TxHash)
 }
 
 func isHexAddress(v string) bool {

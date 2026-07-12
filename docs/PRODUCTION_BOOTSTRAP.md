@@ -42,7 +42,7 @@ Run from a trusted Phoenix release checkout or deployment asset bundle:
 sudo sh scripts/bootstrap-production.sh
 ```
 
-The script validates Linux, Ubuntu compatibility, amd64 architecture, Docker Engine, Docker Compose plugin, production directories, `/etc/phoenix/phoenix.env` ownership and permissions, and required environment variable shape. It installs Compose, Prometheus, and deployment scripts into `/opt/phoenix/deploy`.
+The script validates Linux, Ubuntu compatibility, amd64 architecture, Docker Engine, Docker Compose plugin, production directories, `/etc/phoenix/phoenix.env` ownership and permissions, and required environment variable shape. It installs Compose, the bounded NATS JetStream server configuration, Prometheus, and deployment scripts into `/opt/phoenix/deploy`.
 
 It does not request the Ethereum signer key. It does not start LIVE.
 

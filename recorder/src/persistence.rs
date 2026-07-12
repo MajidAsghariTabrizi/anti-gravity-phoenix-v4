@@ -2,7 +2,7 @@ use crate::model::{ValidatedMessage, ORIGIN_CLASSIFICATION};
 use async_trait::async_trait;
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions, PgSslMode};
 use sqlx::types::Json;
-use sqlx::{PgPool, Row};
+use sqlx::{PgPool, Postgres, QueryBuilder, Row};
 use std::collections::{BTreeMap, BTreeSet};
 use std::str::FromStr;
 use std::time::Duration;
@@ -33,19 +33,12 @@ const REQUIRED_COLUMNS: &[(&str, &str, &str, bool)] = &[
     ("origin_transactions", "metadata", "jsonb", false),
 ];
 
-const ORIGIN_INSERT_SQL: &str = r#"
-INSERT INTO origin_transactions (
+const ORIGIN_BATCH_INSERT_PREFIX: &str = r#"INSERT INTO origin_transactions (
     tx_hash, sequence_number, chain_id, router, classification, calldata, seen_at, metadata
-)
-VALUES ($1, $2::numeric, $3, $4, $5, $6, $7, $8)
-ON CONFLICT (tx_hash) DO NOTHING
-"#;
+) "#;
 
-const FEED_EVENT_INSERT_SQL: &str = r#"
-INSERT INTO feed_events (sequence_number, tx_hash, payload, recorded_at)
-VALUES ($1::numeric, $2, $3, $4)
-ON CONFLICT (sequence_number, tx_hash) DO NOTHING
-"#;
+const FEED_EVENT_BATCH_INSERT_PREFIX: &str =
+    "INSERT INTO feed_events (sequence_number, tx_hash, payload, recorded_at) ";
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct SchemaSnapshot {
@@ -88,7 +81,10 @@ pub enum StoreError {
 pub trait EventStore: Send + Sync {
     async fn ping(&self) -> Result<(), StoreError>;
     async fn verify_schema(&self) -> Result<(), StoreError>;
-    async fn persist(&self, message: &ValidatedMessage) -> Result<PersistOutcome, StoreError>;
+    async fn persist_batch(
+        &self,
+        messages: &[ValidatedMessage],
+    ) -> Result<Vec<PersistOutcome>, StoreError>;
 }
 
 #[derive(Clone, Debug)]
@@ -203,39 +199,78 @@ impl EventStore for PostgresStore {
         validate_schema_snapshot(&self.load_schema_snapshot().await?)
     }
 
-    async fn persist(&self, message: &ValidatedMessage) -> Result<PersistOutcome, StoreError> {
+    async fn persist_batch(
+        &self,
+        messages: &[ValidatedMessage],
+    ) -> Result<Vec<PersistOutcome>, StoreError> {
+        if messages.is_empty() {
+            return Ok(Vec::new());
+        }
         let mut transaction = self.pool.begin().await.map_err(classify_sqlx_error)?;
-        let sequence = message.tx.sequence.to_string();
-        let router = (!message.tx.to.is_empty()).then_some(message.tx.to.as_str());
 
-        let origin = sqlx::query(ORIGIN_INSERT_SQL)
-            .bind(&message.tx.tx_hash)
-            .bind(&sequence)
-            .bind(message.tx.chain_id as i64)
-            .bind(router)
-            .bind(ORIGIN_CLASSIFICATION)
-            .bind(&message.calldata)
-            .bind(message.seen_at)
-            .bind(Json(&message.metadata))
-            .execute(&mut *transaction)
+        let mut origin_query = QueryBuilder::<Postgres>::new(ORIGIN_BATCH_INSERT_PREFIX);
+        origin_query.push_values(messages, |mut row, message| {
+            let router = (!message.tx.to.is_empty()).then_some(message.tx.to.as_str());
+            row.push_bind(&message.tx.tx_hash)
+                .push_bind(message.tx.sequence.to_string())
+                .push_unseparated("::numeric")
+                .push_bind(message.tx.chain_id as i64)
+                .push_bind(router)
+                .push_bind(ORIGIN_CLASSIFICATION)
+                .push_bind(&message.calldata)
+                .push_bind(message.seen_at)
+                .push_bind(Json(&message.metadata));
+        });
+        origin_query.push(" ON CONFLICT (tx_hash) DO NOTHING RETURNING tx_hash");
+        let inserted_origins = origin_query
+            .build_query_as::<(String,)>()
+            .fetch_all(&mut *transaction)
             .await
-            .map_err(classify_sqlx_error)?;
+            .map_err(classify_sqlx_error)?
+            .into_iter()
+            .map(|(tx_hash,)| tx_hash)
+            .collect::<BTreeSet<_>>();
 
-        let event = sqlx::query(FEED_EVENT_INSERT_SQL)
-            .bind(&sequence)
-            .bind(&message.tx.tx_hash)
-            .bind(Json(&message.payload))
-            .bind(message.seen_at)
-            .execute(&mut *transaction)
+        let mut event_query = QueryBuilder::<Postgres>::new(FEED_EVENT_BATCH_INSERT_PREFIX);
+        event_query.push_values(messages, |mut row, message| {
+            row.push_bind(message.tx.sequence.to_string())
+                .push_unseparated("::numeric")
+                .push_bind(&message.tx.tx_hash)
+                .push_bind(Json(&message.payload))
+                .push_bind(message.seen_at);
+        });
+        event_query.push(
+            " ON CONFLICT (sequence_number, tx_hash) DO NOTHING \
+             RETURNING sequence_number::text, tx_hash",
+        );
+        let inserted_events = event_query
+            .build_query_as::<(String, String)>()
+            .fetch_all(&mut *transaction)
             .await
-            .map_err(classify_sqlx_error)?;
+            .map_err(classify_sqlx_error)?
+            .into_iter()
+            .collect::<BTreeSet<_>>();
 
         transaction.commit().await.map_err(classify_sqlx_error)?;
-        Ok(PersistOutcome {
-            feed_event_inserted: event.rows_affected() == 1,
-            origin_transaction_inserted: origin.rows_affected() == 1,
-        })
+        Ok(build_outcomes(messages, inserted_origins, inserted_events))
     }
+}
+
+fn build_outcomes(
+    messages: &[ValidatedMessage],
+    mut inserted_origins: BTreeSet<String>,
+    mut inserted_events: BTreeSet<(String, String)>,
+) -> Vec<PersistOutcome> {
+    messages
+        .iter()
+        .map(|message| {
+            let event_key = (message.tx.sequence.to_string(), message.tx.tx_hash.clone());
+            PersistOutcome {
+                feed_event_inserted: inserted_events.remove(&event_key),
+                origin_transaction_inserted: inserted_origins.remove(&message.tx.tx_hash),
+            }
+        })
+        .collect()
 }
 
 pub fn validate_schema_snapshot(snapshot: &SchemaSnapshot) -> Result<(), StoreError> {
@@ -418,8 +453,8 @@ mod tests {
 
     #[test]
     fn inserts_are_transactional_and_idempotent() {
-        assert!(ORIGIN_INSERT_SQL.contains("ON CONFLICT (tx_hash) DO NOTHING"));
-        assert!(FEED_EVENT_INSERT_SQL.contains("ON CONFLICT (sequence_number, tx_hash) DO NOTHING"));
+        assert!(ORIGIN_BATCH_INSERT_PREFIX.contains("origin_transactions"));
+        assert!(FEED_EVENT_BATCH_INSERT_PREFIX.contains("feed_events"));
     }
 
     #[test]
@@ -445,5 +480,26 @@ mod tests {
         let display = StoreError::Connection.to_string();
         assert!(!display.contains("postgres://"));
         assert!(!display.to_ascii_lowercase().contains("password"));
+    }
+
+    #[test]
+    fn batch_outcomes_count_each_returned_row_once() {
+        let first = crate::model::decode_message(&crate::model::tests::sample_payload(7, 'a'))
+            .expect("valid first message");
+        let second = crate::model::decode_message(&crate::model::tests::sample_payload(8, 'a'))
+            .expect("valid duplicate transaction message");
+        let messages = vec![first, second];
+        let outcomes = build_outcomes(
+            &messages,
+            BTreeSet::from([messages[0].tx.tx_hash.clone()]),
+            BTreeSet::from([
+                ("7".to_string(), messages[0].tx.tx_hash.clone()),
+                ("8".to_string(), messages[1].tx.tx_hash.clone()),
+            ]),
+        );
+        assert_eq!(outcomes.len(), 2);
+        assert!(outcomes[0].origin_transaction_inserted);
+        assert!(!outcomes[1].origin_transaction_inserted);
+        assert!(outcomes.iter().all(|outcome| outcome.feed_event_inserted));
     }
 }

@@ -64,7 +64,7 @@ Merging to `main` can deploy SHADOW. It cannot enable LIVE. The manual `Live Rea
 
 - `nitro-feed-relay`: one internal Nitro feed ingress.
 - `feed-ingestor`: Go ordered feed normalizer, NATS publisher, metrics, health, readiness.
-- `nats`: NATS Core, no JetStream in hot path.
+- `nats`: file-backed JetStream for durable normalized-feed delivery; internal network only.
 - `phoenix-engine`: Rust strategy engine.
 - `rpc-gateway`: single cold read-RPC gateway.
 - `recorder`: feed/opportunity recorder.

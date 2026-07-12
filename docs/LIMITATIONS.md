@@ -7,5 +7,6 @@
 - Foundry local verification is blocked on this machine by missing `forge`.
 - Live Nitro relay operation, Arbitrum fork tests, and simulator/quoter parity tests require a Linux host and RPC credentials.
 - Production latency benchmarks are not measured.
-- The Recorder consumes Core NATS, which provides best-effort at-most-once delivery. It retries an in-memory message while PostgreSQL is unavailable, but process crashes, subscriber disconnects, slow-consumer drops, and publications before subscription cannot be replayed. Durable recovery requires an explicit, tested JetStream or equivalent persistence design.
-- Recorder readiness proves PostgreSQL reachability, schema compatibility, NATS connectivity, and an active subscription. It does not prove durable delivery or historical completeness.
+- Recorder delivery uses a single-node, one-replica JetStream work queue. It supports restart replay and confirmed acknowledgements after PostgreSQL commit, but host or Docker-volume loss is not replicated and messages older than the bounded 24-hour stream age can expire.
+- Core NATS losses from releases before the JetStream cutover cannot be reconstructed. The first VPS JetStream smoke must pass before durable production readiness is claimed.
+- Recorder readiness proves the current PostgreSQL, stream, durable consumer, fetch loop, persistence, acknowledgement, and integrity state. It does not prove historical completeness before the migration.

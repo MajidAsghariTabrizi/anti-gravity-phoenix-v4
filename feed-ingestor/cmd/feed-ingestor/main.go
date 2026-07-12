@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -65,8 +66,22 @@ func run(ctx context.Context) error {
 	defer input.Close()
 
 	natsURL := env("NATS_URL", "nats://127.0.0.1:4222")
-	pub, err := publisher.DialNATSCore(natsURL, 2*time.Second)
+	pub, err := publisher.DialJetStream(natsURL, 2*time.Second, publisher.ConnectionEvents{
+		Disconnected: func() {
+			readiness.MarkNATSUnavailable()
+			registry.SetGauge("feed_readiness", 0)
+			log.Printf("feed_jetstream_disconnected")
+		},
+		Reconnected: func() {
+			readiness.MarkNATSReachable()
+			registry.SetGauge("feed_readiness", readinessGauge(readiness))
+			log.Printf("feed_jetstream_reconnected")
+		},
+	})
 	if err != nil {
+		if errors.Is(err, publisher.ErrStreamUnavailable) {
+			registry.Inc("feed_jetstream_stream_unavailable_total")
+		}
 		wrapped := fmt.Errorf("connect nats: %w", err)
 		readiness.MarkFatal(wrapped.Error())
 		return wrapped
@@ -118,7 +133,7 @@ func runLineSource(ctx context.Context, input io.Reader, pub publisher.Publisher
 		registry.SetGauge("feed_last_sequence", float64(result.Sequence))
 		registry.SetGauge("feed_last_message_timestamp", float64(result.TimestampUnixMS))
 		registry.Add("feed_normalized_transactions_total", uint64(len(result.Transactions)))
-		if err := publishAndUpdateReadiness(pub, registry, readiness, result.Transactions, start); err != nil {
+		if err := publishAndUpdateReadiness(ctx, pub, registry, readiness, result.Transactions, start); err != nil {
 			return err
 		}
 	}
@@ -203,7 +218,7 @@ func runRelaySource(ctx context.Context, sourceCfg sourceConfig, pub publisher.P
 				registry.SetGauge("feed_readiness", readinessGauge(readiness))
 				continue
 			}
-			if err := publishAndUpdateReadiness(pub, registry, readiness, normalized, start); err != nil {
+			if err := publishAndUpdateReadiness(ctx, pub, registry, readiness, normalized, start); err != nil {
 				return err
 			}
 		}
@@ -237,15 +252,22 @@ func normalizeRelayTransactions(frame nitro.Frame) ([]normalizer.NormalizedTx, [
 	return normalized, failures
 }
 
-func publishTransactions(pub publisher.Publisher, registry *metrics.Registry, transactions []normalizer.NormalizedTx, start time.Time) (uint64, error) {
+func publishTransactions(ctx context.Context, pub publisher.Publisher, registry *metrics.Registry, transactions []normalizer.NormalizedTx, start time.Time) (uint64, error) {
 	var published uint64
 	for _, tx := range transactions {
-		if err := pub.Publish(txSubject, tx); err != nil {
+		ackStarted := time.Now()
+		if err := pub.Publish(ctx, txSubject, tx); err != nil {
 			registry.Inc("feed_publish_failures_total")
+			registry.Inc("feed_jetstream_publish_failures_total")
+			if errors.Is(err, publisher.ErrStreamUnavailable) {
+				registry.Inc("feed_jetstream_stream_unavailable_total")
+			}
 			log.Printf("feed_publish_failure subject=%s error=%q", txSubject, err.Error())
 			return published, err
 		}
 		registry.Inc("feed_publish_success_total")
+		registry.Inc("feed_jetstream_publish_success_total")
+		registry.ObserveJetStreamPublishLatency(ackStarted)
 		registry.ObserveIngestLatency(start)
 		published++
 	}
@@ -253,15 +275,16 @@ func publishTransactions(pub publisher.Publisher, registry *metrics.Registry, tr
 }
 
 func publishAndUpdateReadiness(
+	ctx context.Context,
 	pub publisher.Publisher,
 	registry *metrics.Registry,
 	readiness *metrics.Readiness,
 	transactions []normalizer.NormalizedTx,
 	start time.Time,
 ) error {
-	published, err := publishTransactions(pub, registry, transactions, start)
+	published, err := publishTransactions(ctx, pub, registry, transactions, start)
 	if err != nil {
-		readiness.MarkFatal(err.Error())
+		readiness.MarkNATSUnavailable()
 		registry.SetGauge("feed_readiness", readinessGauge(readiness))
 		return err
 	}

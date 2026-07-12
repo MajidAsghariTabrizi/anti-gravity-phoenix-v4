@@ -30,12 +30,17 @@ services:
 
   nats:
     image: nats:2.10-alpine
-    command: ["-js=false", "-m", "8222"]
+    command: ["-c", "/etc/nats/nats-server.conf"]
+    environment:
+      GOMEMLIMIT: 512MiB
+    volumes:
+      - /opt/phoenix/deploy/nats-server.conf:/etc/nats/nats-server.conf:ro
+      - nats-jetstream:/data/jetstream
     networks: [phoenix-internal]
     restart: unless-stopped
     logging: *bounded-logging
     healthcheck:
-      test: ["CMD", "wget", "-q", "-O", "-", "http://127.0.0.1:8222/healthz"]
+      test: ["CMD", "wget", "-q", "-O", "-", "http://127.0.0.1:8222/healthz?js-enabled-only=true"]
       interval: 10s
       timeout: 3s
       retries: 5
@@ -148,6 +153,8 @@ services:
       POSTGRES_DSN: ${POSTGRES_DSN:?POSTGRES_DSN is required}
       PGSSLMODE: ${PGSSLMODE:-prefer}
       NATS_URL: nats://nats:4222
+      RECORDER_BATCH_MAX_SIZE: ${RECORDER_BATCH_MAX_SIZE:-256}
+      RECORDER_BATCH_MAX_WAIT_MS: ${RECORDER_BATCH_MAX_WAIT_MS:-100}
     depends_on:
       postgres:
         condition: service_healthy
@@ -207,3 +214,7 @@ services:
 networks:
   phoenix-internal:
     driver: bridge
+
+volumes:
+  nats-jetstream:
+    name: phoenix-nats-jetstream

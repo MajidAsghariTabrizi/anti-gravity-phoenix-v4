@@ -1,9 +1,13 @@
+use phoenix_recorder::jetstream::{
+    ensure_durable_pipeline, MessageFetcher, CONSUMER_ACK_WAIT, CONSUMER_MAX_ACK_PENDING,
+    DURABLE_CONSUMER_NAME, STREAM_NAME,
+};
 use phoenix_recorder::logging::LogSampler;
 use phoenix_recorder::metrics::Metrics;
 use phoenix_recorder::persistence::{EventStore, PostgresStore};
 use phoenix_recorder::runtime::{
-    activate_subscription, consume_messages, mark_nats_connected, mark_nats_disconnected,
-    monitor_database, nats_connect_options, ConsumerExit, RetryPolicy,
+    consume_durable_messages, mark_nats_connected, mark_nats_disconnected, monitor_database,
+    nats_connect_options, BatchConfig, ConsumerExit, RetryPolicy,
 };
 use phoenix_recorder::state::Readiness;
 use std::error::Error;
@@ -23,17 +27,43 @@ struct Config {
     postgres_dsn: String,
     pg_ssl_mode: String,
     nats_url: String,
+    batch: BatchConfig,
 }
 
 impl Config {
     fn from_env() -> Result<Self, &'static str> {
+        let batch = BatchConfig {
+            max_size: optional_usize("RECORDER_BATCH_MAX_SIZE", 256)?,
+            max_wait: Duration::from_millis(optional_u64("RECORDER_BATCH_MAX_WAIT_MS", 100)?),
+        }
+        .validate()
+        .map_err(|_| "invalid Recorder batch configuration")?;
         Ok(Self {
             health_addr: std::env::var("RECORDER_HEALTH_ADDR")
                 .unwrap_or_else(|_| "0.0.0.0:9400".to_string()),
             postgres_dsn: required_env("POSTGRES_DSN")?,
             pg_ssl_mode: std::env::var("PGSSLMODE").unwrap_or_else(|_| "prefer".to_string()),
             nats_url: required_env("NATS_URL")?,
+            batch,
         })
+    }
+}
+
+fn optional_usize(name: &'static str, default: usize) -> Result<usize, &'static str> {
+    match std::env::var(name) {
+        Ok(value) => value
+            .parse::<usize>()
+            .map_err(|_| "invalid Recorder batch configuration"),
+        Err(_) => Ok(default),
+    }
+}
+
+fn optional_u64(name: &'static str, default: u64) -> Result<u64, &'static str> {
+    match std::env::var(name) {
+        Ok(value) => value
+            .parse::<u64>()
+            .map_err(|_| "invalid Recorder batch configuration"),
+        Err(_) => Ok(default),
     }
 }
 
@@ -85,8 +115,13 @@ async fn run_daemon() -> Result<(), &'static str> {
     tracing::info!(
         event = "recorder_startup",
         nats_subject = phoenix_recorder::NATS_SUBJECT,
-        nats_delivery = "core_at_most_once",
-        subscription_capacity = phoenix_recorder::runtime::NATS_SUBSCRIPTION_CAPACITY
+        nats_delivery = "jetstream_durable_pull",
+        stream = STREAM_NAME,
+        durable_consumer = DURABLE_CONSUMER_NAME,
+        batch_max_messages = config.batch.max_size,
+        batch_max_wait_ms = config.batch.max_wait.as_millis() as u64,
+        max_ack_pending = CONSUMER_MAX_ACK_PENDING,
+        ack_wait_seconds = CONSUMER_ACK_WAIT.as_secs()
     );
 
     let health_task = tokio::spawn(serve_health(
@@ -123,6 +158,7 @@ async fn run_daemon() -> Result<(), &'static str> {
     ));
 
     let disconnected = Arc::new(AtomicBool::new(false));
+    let mut integrity_failure = false;
     loop {
         if shutdown.is_cancelled() {
             break;
@@ -136,10 +172,10 @@ async fn run_daemon() -> Result<(), &'static str> {
         let client = match options.connect(config.nats_url.clone()).await {
             Ok(client) => client,
             Err(_) => {
-                readiness.set_nats_connected(false);
-                if let Some(suppressed) = sampler.sample("nats_connect_failure") {
+                readiness.set_jetstream_connected(false);
+                if let Some(suppressed) = sampler.sample("jetstream_connect_failure") {
                     tracing::warn!(
-                        event = "recorder_nats_connect_failed",
+                        event = "recorder_jetstream_connect_failed",
                         suppressed,
                         retry_delay_ms = 1_000_u64
                     );
@@ -152,13 +188,25 @@ async fn run_daemon() -> Result<(), &'static str> {
         };
         mark_nats_connected(&readiness, &metrics, disconnected.as_ref());
 
-        let stream = match activate_subscription(&client, &readiness).await {
-            Ok(stream) => stream,
-            Err(_) => {
+        let consumer = match ensure_durable_pipeline(&client).await {
+            Ok(consumer) => {
+                readiness.set_stream_ready(true);
+                readiness.set_consumer_ready(true);
+                tracing::info!(
+                    event = "recorder_jetstream_pipeline_ready",
+                    stream = STREAM_NAME,
+                    durable_consumer = DURABLE_CONSUMER_NAME
+                );
+                consumer
+            }
+            Err(error) => {
+                readiness.set_stream_ready(false);
+                readiness.set_consumer_ready(false);
                 mark_nats_disconnected(&readiness, disconnected.as_ref());
-                if let Some(suppressed) = sampler.sample("nats_subscribe_failure") {
+                if let Some(suppressed) = sampler.sample("jetstream_provision_failure") {
                     tracing::warn!(
-                        event = "recorder_nats_subscribe_failed",
+                        event = "recorder_jetstream_provision_failed",
+                        error_class = %error,
                         suppressed,
                         retry_delay_ms = 1_000_u64
                     );
@@ -170,13 +218,15 @@ async fn run_daemon() -> Result<(), &'static str> {
             }
         };
 
-        let exit = consume_messages(
-            stream,
+        let fetcher: Arc<dyn MessageFetcher> = Arc::new(consumer);
+        let exit = consume_durable_messages(
+            fetcher,
             store.clone(),
             readiness.clone(),
             metrics.clone(),
             sampler.clone(),
             shutdown.clone(),
+            config.batch,
             RetryPolicy::default(),
         )
         .await;
@@ -184,8 +234,12 @@ async fn run_daemon() -> Result<(), &'static str> {
         if exit == ConsumerExit::Shutdown {
             break;
         }
+        if exit == ConsumerExit::IntegrityFailure {
+            integrity_failure = true;
+            break;
+        }
         tracing::warn!(
-            event = "recorder_subscription_ended",
+            event = "recorder_jetstream_fetch_loop_ended",
             retry_delay_ms = 1_000_u64
         );
         if sleep_or_shutdown(Duration::from_secs(1), &shutdown).await {
@@ -198,7 +252,11 @@ async fn run_daemon() -> Result<(), &'static str> {
     readiness.stop_event_loop();
     let _ = health_task.await;
     tracing::info!(event = "recorder_graceful_shutdown_complete");
-    Ok(())
+    if integrity_failure {
+        Err("Recorder stopped on a terminal integrity condition")
+    } else {
+        Ok(())
+    }
 }
 
 async fn connect_postgres_until_ready(
@@ -406,8 +464,10 @@ mod tests {
 
         readiness.set_postgres_connected(true);
         readiness.set_schema_verified(true);
-        readiness.set_nats_connected(true);
-        readiness.set_subscription_active(true);
+        readiness.set_jetstream_connected(true);
+        readiness.set_stream_ready(true);
+        readiness.set_consumer_ready(true);
+        readiness.set_fetching_active(true);
         let ready = request("/readyz", readiness.clone(), metrics.clone()).await;
         assert!(ready.starts_with("HTTP/1.1 200 OK"));
         assert!(ready.ends_with("ready\n"));

@@ -23,6 +23,7 @@ Production host layout:
         postgres/
         prometheus/
         feed/
+        # Docker volume phoenix-nats-jetstream stores JetStream data.
     logs/
 
 /etc/phoenix/
@@ -50,3 +51,5 @@ Production bootstrap, GHCR authentication, environment validation, release, and 
 - `docs/CI_CD.md`
 
 Current live-evidence gap: real Nitro feed relay ingestion is implemented for first SHADOW runtime verification but not live-verified. A Linux VPS validation run must still prove the pinned relay can observe and decode real Arbitrum feed messages before any production-readiness or LIVE claim.
+
+Recorder durability configuration and single-node storage limits are documented in `docs/RECORDER_DURABLE_DELIVERY.md`.

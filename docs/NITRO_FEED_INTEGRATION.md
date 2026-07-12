@@ -136,7 +136,7 @@ If a field cannot be derived honestly from a supported payload, normalization fa
 
 ## NATS Publishing
 
-Valid normalized transactions publish synchronously to NATS Core subject `phoenix.feed.tx`. The publisher uses the existing NATS Core TCP protocol implementation, applies a write deadline, records publish success/failure counters, and returns errors instead of dropping failed publishes silently. JetStream is not introduced into the hot path.
+Valid normalized transactions publish synchronously to JetStream subject `phoenix.feed.tx` using `nats.go`. The publisher idempotently creates or updates stream `PHOENIX_FEED_TX`, supplies a stable sequence-plus-transaction-hash message ID, expects the configured stream, and counts success only after the server returns a valid persistence acknowledgement. A timeout, missing stream, disconnected server, or invalid acknowledgement increments durable publish failure metrics and clears readiness. No public RPC read or fixture fallback is part of this path.
 
 ## Readiness Policy
 
@@ -186,6 +186,10 @@ Required metrics:
 - `feed_out_of_order_total`
 - `feed_publish_success_total`
 - `feed_publish_failures_total`
+- `feed_jetstream_publish_success_total`
+- `feed_jetstream_publish_failures_total`
+- `feed_jetstream_publish_latency`
+- `feed_jetstream_stream_unavailable_total`
 - `feed_unsupported_messages_total`
 - `feed_last_sequence`
 - `feed_last_message_timestamp`

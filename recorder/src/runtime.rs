@@ -1,21 +1,53 @@
+use crate::jetstream::{
+    Delivery, MessageFetcher, PipelineError, CONSUMER_MAX_BATCH, CONSUMER_MAX_DELIVERIES,
+    POISON_REDELIVERY_DELAY,
+};
 use crate::logging::LogSampler;
 use crate::metrics::Metrics;
 use crate::model::{decode_message, ValidatedMessage};
 use crate::persistence::{EventStore, PersistOutcome};
 use crate::state::Readiness;
-use crate::NATS_SUBJECT;
-use async_trait::async_trait;
-use futures_util::{Stream, StreamExt};
-use std::pin::Pin;
+use futures_util::{stream, StreamExt};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 
-pub const NATS_SUBSCRIPTION_CAPACITY: usize = 256;
+pub const NATS_CLIENT_SUBSCRIPTION_CAPACITY: usize = 1024;
+pub const DEFAULT_BATCH_SIZE: usize = 256;
+pub const DEFAULT_BATCH_WAIT: Duration = Duration::from_millis(100);
+pub const MAX_BATCH_WAIT: Duration = Duration::from_secs(1);
+pub const ACK_FAILURE_READINESS_THRESHOLD: u64 = 3;
+pub const MAX_CONCURRENT_ACKS: usize = 32;
+const CONSUMER_STATE_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 
-pub type MessageStream = Pin<Box<dyn Stream<Item = Vec<u8>> + Send>>;
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BatchConfig {
+    pub max_size: usize,
+    pub max_wait: Duration,
+}
+
+impl Default for BatchConfig {
+    fn default() -> Self {
+        Self {
+            max_size: DEFAULT_BATCH_SIZE,
+            max_wait: DEFAULT_BATCH_WAIT,
+        }
+    }
+}
+
+impl BatchConfig {
+    pub fn validate(self) -> Result<Self, RuntimeConfigError> {
+        if self.max_size == 0 || self.max_size > CONSUMER_MAX_BATCH as usize {
+            return Err(RuntimeConfigError::BatchSize);
+        }
+        if self.max_wait.is_zero() || self.max_wait > MAX_BATCH_WAIT {
+            return Err(RuntimeConfigError::BatchWait);
+        }
+        Ok(self)
+    }
+}
 
 #[derive(Clone, Copy, Debug)]
 pub struct RetryPolicy {
@@ -35,122 +67,286 @@ impl Default for RetryPolicy {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ConsumerExit {
     Shutdown,
-    SubscriptionEnded,
+    FetchFailed,
+    IntegrityFailure,
 }
 
 #[derive(Clone, Debug, Error, PartialEq, Eq)]
-pub enum SubscriptionError {
-    #[error("Core NATS subscription failed")]
-    Subscribe,
+pub enum RuntimeConfigError {
+    #[error("RECORDER_BATCH_MAX_SIZE must be between 1 and 256")]
+    BatchSize,
+    #[error("RECORDER_BATCH_MAX_WAIT_MS must be between 1 and 1000")]
+    BatchWait,
 }
 
-#[async_trait]
-pub trait CoreSubscriber: Send + Sync {
-    async fn subscribe_core(&self, subject: &str) -> Result<MessageStream, SubscriptionError>;
+#[derive(Default)]
+struct AckHealthTracker {
+    consecutive_failures: u64,
 }
 
-#[async_trait]
-impl CoreSubscriber for async_nats::Client {
-    async fn subscribe_core(&self, subject: &str) -> Result<MessageStream, SubscriptionError> {
-        let subscriber = self
-            .subscribe(subject.to_string())
-            .await
-            .map_err(|_| SubscriptionError::Subscribe)?;
-        self.flush()
-            .await
-            .map_err(|_| SubscriptionError::Subscribe)?;
-        Ok(Box::pin(subscriber.map(|message| message.payload.to_vec())))
+impl AckHealthTracker {
+    fn observe(
+        &mut self,
+        result: Result<(), PipelineError>,
+        readiness: &Readiness,
+        metrics: &Metrics,
+    ) -> bool {
+        match result {
+            Ok(()) => {
+                self.consecutive_failures = 0;
+                readiness.set_acknowledgements_healthy(true);
+                true
+            }
+            Err(_) => {
+                metrics.jetstream_ack_failure();
+                self.consecutive_failures = self.consecutive_failures.saturating_add(1);
+                if self.consecutive_failures >= ACK_FAILURE_READINESS_THRESHOLD {
+                    readiness.set_acknowledgements_healthy(false);
+                }
+                false
+            }
+        }
     }
 }
 
-pub async fn activate_subscription(
-    subscriber: &dyn CoreSubscriber,
-    readiness: &Readiness,
-) -> Result<MessageStream, SubscriptionError> {
-    let stream = subscriber.subscribe_core(NATS_SUBJECT).await?;
-    readiness.set_subscription_active(true);
-    tracing::info!(
-        event = "recorder_subject_subscribed",
-        subject = NATS_SUBJECT,
-        delivery = "core_nats_at_most_once"
-    );
-    Ok(stream)
-}
-
-pub async fn consume_messages(
-    mut stream: MessageStream,
+#[allow(clippy::too_many_arguments)]
+pub async fn consume_durable_messages(
+    fetcher: Arc<dyn MessageFetcher>,
     store: Arc<dyn EventStore>,
     readiness: Readiness,
     metrics: Metrics,
     sampler: LogSampler,
     shutdown: CancellationToken,
+    batch_config: BatchConfig,
     retry_policy: RetryPolicy,
 ) -> ConsumerExit {
+    let mut ack_health = AckHealthTracker::default();
+    let mut last_state_refresh = Instant::now()
+        .checked_sub(CONSUMER_STATE_REFRESH_INTERVAL)
+        .unwrap_or_else(Instant::now);
+
     loop {
-        let payload = tokio::select! {
+        let deliveries = tokio::select! {
             _ = shutdown.cancelled() => return ConsumerExit::Shutdown,
-            payload = stream.next() => payload,
+            result = fetcher.fetch_batch(batch_config.max_size, batch_config.max_wait) => result,
         };
-        let Some(payload) = payload else {
-            readiness.set_subscription_active(false);
-            readiness.set_nats_connected(false);
-            return ConsumerExit::SubscriptionEnded;
+        let deliveries = match deliveries {
+            Ok(deliveries) => {
+                readiness.set_fetching_active(true);
+                deliveries
+            }
+            Err(error) => {
+                metrics.jetstream_fetch_failure();
+                readiness.set_fetching_active(false);
+                readiness.set_consumer_ready(false);
+                if let Some(suppressed) = sampler.sample("jetstream_fetch_failure") {
+                    tracing::warn!(
+                        event = "recorder_jetstream_fetch_failed",
+                        error_class = %error,
+                        suppressed
+                    );
+                }
+                return ConsumerExit::FetchFailed;
+            }
         };
 
-        metrics.message_received();
-        if let Some(suppressed) = sampler.sample("message_received") {
-            tracing::info!(event = "recorder_message_received", suppressed);
+        if last_state_refresh.elapsed() >= CONSUMER_STATE_REFRESH_INTERVAL {
+            match fetcher.state().await {
+                Ok(state) => {
+                    metrics.set_consumer_state(state);
+                    readiness.set_consumer_ready(true);
+                }
+                Err(error) => {
+                    metrics.jetstream_fetch_failure();
+                    readiness.set_consumer_ready(false);
+                    readiness.set_fetching_active(false);
+                    if let Some(suppressed) = sampler.sample("consumer_state_failure") {
+                        tracing::warn!(
+                            event = "recorder_jetstream_consumer_state_failed",
+                            error_class = %error,
+                            suppressed
+                        );
+                    }
+                    return ConsumerExit::FetchFailed;
+                }
+            }
+            last_state_refresh = Instant::now();
         }
 
-        let message = match decode_message(&payload) {
-            Ok(message) => message,
+        if deliveries.is_empty() {
+            continue;
+        }
+        match process_delivery_batch(
+            deliveries,
+            store.as_ref(),
+            &readiness,
+            &metrics,
+            &sampler,
+            &shutdown,
+            retry_policy,
+            &mut ack_health,
+        )
+        .await
+        {
+            BatchDisposition::Continue => {}
+            BatchDisposition::Shutdown => return ConsumerExit::Shutdown,
+            BatchDisposition::IntegrityFailure => return ConsumerExit::IntegrityFailure,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BatchDisposition {
+    Continue,
+    Shutdown,
+    IntegrityFailure,
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn process_delivery_batch(
+    deliveries: Vec<Delivery>,
+    store: &dyn EventStore,
+    readiness: &Readiness,
+    metrics: &Metrics,
+    sampler: &LogSampler,
+    shutdown: &CancellationToken,
+    retry_policy: RetryPolicy,
+    ack_health: &mut AckHealthTracker,
+) -> BatchDisposition {
+    if shutdown.is_cancelled() {
+        return BatchDisposition::Shutdown;
+    }
+
+    let mut valid_deliveries = Vec::with_capacity(deliveries.len());
+    let mut valid_messages = Vec::with_capacity(deliveries.len());
+    for delivery in deliveries {
+        metrics.message_received();
+        if delivery.delivery_count > 1 {
+            metrics.jetstream_redelivery();
+        }
+        match decode_message(&delivery.payload) {
+            Ok(message) => {
+                valid_deliveries.push(delivery);
+                valid_messages.push(message);
+            }
             Err(error) => {
                 metrics.decode_failure();
                 if let Some(suppressed) = sampler.sample("decode_failure") {
                     tracing::warn!(
                         event = "recorder_malformed_payload",
                         error_class = %error,
+                        delivery_count = delivery.delivery_count,
                         suppressed
                     );
                 }
-                continue;
+                if delivery.delivery_count >= CONSUMER_MAX_DELIVERIES as u64 {
+                    let acknowledged =
+                        ack_health.observe(delivery.acker.term().await, readiness, metrics);
+                    metrics.poison_message();
+                    readiness.mark_integrity_loss();
+                    if let Some(suppressed) = sampler.sample("terminal_poison_message") {
+                        tracing::error!(
+                            event = "recorder_poison_message_terminated",
+                            delivery_count = delivery.delivery_count,
+                            term_sent = acknowledged,
+                            suppressed
+                        );
+                    }
+                } else {
+                    let acknowledged = ack_health.observe(
+                        delivery.acker.nak(POISON_REDELIVERY_DELAY).await,
+                        readiness,
+                        metrics,
+                    );
+                    if !acknowledged {
+                        sampled_ack_failure(sampler, "poison_nak_failure");
+                    }
+                }
             }
-        };
-
-        if persist_with_retry(
-            store.as_ref(),
-            &message,
-            &readiness,
-            &metrics,
-            &sampler,
-            &shutdown,
-            retry_policy,
-        )
-        .await
-        .is_err()
-        {
-            return ConsumerExit::Shutdown;
         }
+    }
+
+    if valid_messages.is_empty() {
+        return BatchDisposition::Continue;
+    }
+
+    let outcomes = match persist_batch_with_retry(
+        store,
+        &valid_messages,
+        &valid_deliveries,
+        readiness,
+        metrics,
+        sampler,
+        shutdown,
+        retry_policy,
+        ack_health,
+    )
+    .await
+    {
+        Some(outcomes) => outcomes,
+        None => return BatchDisposition::Shutdown,
+    };
+
+    if outcomes.len() != valid_messages.len() {
+        readiness.mark_integrity_loss();
+        tracing::error!(
+            event = "recorder_batch_outcome_cardinality_mismatch",
+            messages = valid_messages.len(),
+            outcomes = outcomes.len()
+        );
+        return BatchDisposition::IntegrityFailure;
+    }
+
+    record_persist_outcomes(&valid_messages, &outcomes, metrics);
+    let ack_results = stream::iter(valid_deliveries.iter().map(|delivery| {
+        let acker = delivery.acker.clone();
+        async move { acker.ack_confirmed().await }
+    }))
+    .buffer_unordered(MAX_CONCURRENT_ACKS)
+    .collect::<Vec<_>>()
+    .await;
+    for result in ack_results {
+        let acknowledged = ack_health.observe(result, readiness, metrics);
+        if !acknowledged {
+            sampled_ack_failure(sampler, "confirmed_ack_failure");
+        }
+    }
+
+    if shutdown.is_cancelled() {
+        BatchDisposition::Shutdown
+    } else {
+        BatchDisposition::Continue
     }
 }
 
-async fn persist_with_retry(
+#[allow(clippy::too_many_arguments)]
+async fn persist_batch_with_retry(
     store: &dyn EventStore,
-    message: &ValidatedMessage,
+    messages: &[ValidatedMessage],
+    deliveries: &[Delivery],
     readiness: &Readiness,
     metrics: &Metrics,
     sampler: &LogSampler,
     shutdown: &CancellationToken,
     retry_policy: RetryPolicy,
-) -> Result<(), ()> {
+    ack_health: &mut AckHealthTracker,
+) -> Option<Vec<PersistOutcome>> {
     let mut delay = retry_policy.initial;
     loop {
-        match store.persist(message).await {
-            Ok(outcome) => {
+        let started = Instant::now();
+        match store.persist_batch(messages).await {
+            Ok(outcomes) => {
                 readiness.set_postgres_connected(true);
                 readiness.set_persistence_healthy(true);
-                record_persist_outcome(message, outcome, metrics, sampler);
-                return Ok(());
+                metrics.batch_persisted(messages.len(), started.elapsed());
+                if let Some(suppressed) = sampler.sample("batch_persisted") {
+                    tracing::info!(
+                        event = "recorder_batch_persisted",
+                        messages = messages.len(),
+                        suppressed
+                    );
+                }
+                return Some(outcomes);
             }
             Err(error) => {
                 metrics.database_failure();
@@ -160,51 +356,53 @@ async fn persist_with_retry(
                     tracing::error!(
                         event = "recorder_database_failure",
                         error_class = %error,
-                        sequence = message.tx.sequence,
+                        batch_messages = messages.len(),
                         suppressed,
                         retry_delay_ms = delay.as_millis() as u64
                     );
+                }
+                for delivery in deliveries {
+                    let progressed =
+                        ack_health.observe(delivery.acker.progress().await, readiness, metrics);
+                    if !progressed {
+                        sampled_ack_failure(sampler, "progress_ack_failure");
+                    }
                 }
             }
         }
 
         tokio::select! {
-            _ = shutdown.cancelled() => return Err(()),
+            _ = shutdown.cancelled() => return None,
             _ = tokio::time::sleep(delay) => {}
         }
         delay = delay.saturating_mul(2).min(retry_policy.maximum);
     }
 }
 
-fn record_persist_outcome(
-    message: &ValidatedMessage,
-    outcome: PersistOutcome,
+fn record_persist_outcomes(
+    messages: &[ValidatedMessage],
+    outcomes: &[PersistOutcome],
     metrics: &Metrics,
-    sampler: &LogSampler,
 ) {
-    if outcome.feed_event_inserted || outcome.origin_transaction_inserted {
-        metrics.message_persisted();
-        metrics.set_last_persisted(message.tx.sequence, message.tx.timestamp_unix_ms);
-    }
-    if outcome.origin_transaction_inserted {
-        metrics.transaction_persisted();
-    }
-    if !outcome.feed_event_inserted || !outcome.origin_transaction_inserted {
-        metrics.duplicate_skip();
-        if let Some(suppressed) = sampler.sample("duplicate_skip") {
-            tracing::info!(
-                event = "recorder_duplicate_skip",
-                sequence = message.tx.sequence,
-                tx_hash = %message.tx.tx_hash,
-                suppressed
-            );
+    for (message, outcome) in messages.iter().zip(outcomes) {
+        if outcome.feed_event_inserted || outcome.origin_transaction_inserted {
+            metrics.message_persisted();
+            metrics.set_last_persisted(message.tx.sequence, message.tx.timestamp_unix_ms);
         }
-    } else if let Some(suppressed) = sampler.sample("rows_inserted") {
-        tracing::info!(
-            event = "recorder_rows_inserted",
-            sequence = message.tx.sequence,
-            tx_hash = %message.tx.tx_hash,
-            rows = 2_u8,
+        if outcome.origin_transaction_inserted {
+            metrics.transaction_persisted();
+        }
+        if !outcome.feed_event_inserted || !outcome.origin_transaction_inserted {
+            metrics.duplicate_skip();
+        }
+    }
+}
+
+fn sampled_ack_failure(sampler: &LogSampler, class: &'static str) {
+    if let Some(suppressed) = sampler.sample(class) {
+        tracing::warn!(
+            event = "recorder_jetstream_ack_failed",
+            ack_class = class,
             suppressed
         );
     }
@@ -267,7 +465,7 @@ pub fn nats_connect_options(
 ) -> async_nats::ConnectOptions {
     async_nats::ConnectOptions::new()
         .name("phoenix-recorder")
-        .subscription_capacity(NATS_SUBSCRIPTION_CAPACITY)
+        .subscription_capacity(NATS_CLIENT_SUBSCRIPTION_CAPACITY)
         .connection_timeout(Duration::from_secs(5))
         .event_callback(move |event| {
             let readiness = readiness.clone();
@@ -277,25 +475,26 @@ pub fn nats_connect_options(
             async move {
                 match event {
                     async_nats::Event::Connected => {
-                        readiness.set_nats_connected(true);
+                        readiness.set_jetstream_connected(true);
                         if disconnected.swap(false, Ordering::AcqRel) {
                             metrics.nats_reconnect();
-                            tracing::info!(event = "recorder_nats_reconnected");
+                            tracing::info!(event = "recorder_jetstream_reconnected");
                         }
                     }
                     async_nats::Event::Disconnected => {
                         disconnected.store(true, Ordering::Release);
-                        readiness.set_nats_connected(false);
-                        tracing::warn!(event = "recorder_nats_disconnected");
+                        readiness.set_jetstream_connected(false);
+                        tracing::warn!(event = "recorder_jetstream_disconnected");
                     }
                     async_nats::Event::SlowConsumer(subscription_id) => {
-                        readiness.mark_delivery_loss();
+                        metrics.jetstream_fetch_failure();
+                        readiness.set_fetching_active(false);
                         if let Some(suppressed) = sampler.sample("nats_slow_consumer") {
-                            tracing::error!(
-                                event = "recorder_nats_slow_consumer",
+                            tracing::warn!(
+                                event = "recorder_jetstream_client_slow_consumer",
                                 subscription_id,
                                 suppressed,
-                                delivery_risk = "core_nats_message_drop"
+                                delivery = "jetstream_redeliverable"
                             );
                         }
                     }
@@ -303,7 +502,10 @@ pub fn nats_connect_options(
                     | async_nats::Event::ServerError(_)
                     | async_nats::Event::ClientError(_) => {
                         if let Some(suppressed) = sampler.sample("nats_lifecycle_warning") {
-                            tracing::warn!(event = "recorder_nats_lifecycle_warning", suppressed);
+                            tracing::warn!(
+                                event = "recorder_jetstream_lifecycle_warning",
+                                suppressed
+                            );
                         }
                     }
                 }
@@ -316,46 +518,48 @@ pub fn mark_nats_connected(
     metrics: &Metrics,
     disconnected_since_last_connect: &AtomicBool,
 ) {
-    readiness.set_nats_connected(true);
+    readiness.set_jetstream_connected(true);
     if disconnected_since_last_connect.swap(false, Ordering::AcqRel) {
         metrics.nats_reconnect();
-        tracing::info!(event = "recorder_nats_reconnected");
+        tracing::info!(event = "recorder_jetstream_reconnected");
     } else {
-        tracing::info!(event = "recorder_nats_connected");
+        tracing::info!(event = "recorder_jetstream_connected");
     }
 }
 
 pub fn mark_nats_disconnected(readiness: &Readiness, disconnected_since_last_connect: &AtomicBool) {
     disconnected_since_last_connect.store(true, Ordering::Release);
-    readiness.set_nats_connected(false);
-    readiness.set_subscription_active(false);
+    readiness.set_jetstream_connected(false);
+    readiness.set_stream_ready(false);
+    readiness.set_consumer_ready(false);
+    readiness.set_fetching_active(false);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::jetstream::{ConsumerState, DeliveryAcker};
     use crate::model::{ARBITRUM_ONE_CHAIN_ID, NORMALIZED_SCHEMA_VERSION};
     use crate::persistence::StoreError;
+    use async_trait::async_trait;
     use std::collections::VecDeque;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::AtomicUsize;
     use std::sync::Mutex;
 
     #[derive(Debug)]
     struct FakeStore {
-        outcomes: Mutex<VecDeque<Result<PersistOutcome, StoreError>>>,
+        outcomes: Mutex<VecDeque<Result<Vec<PersistOutcome>, StoreError>>>,
         calls: AtomicUsize,
-        in_flight: AtomicUsize,
-        max_in_flight: AtomicUsize,
+        batch_sizes: Mutex<Vec<usize>>,
         delay: Duration,
     }
 
     impl FakeStore {
-        fn new(outcomes: Vec<Result<PersistOutcome, StoreError>>) -> Self {
+        fn new(outcomes: Vec<Result<Vec<PersistOutcome>, StoreError>>) -> Self {
             Self {
                 outcomes: Mutex::new(outcomes.into()),
                 calls: AtomicUsize::new(0),
-                in_flight: AtomicUsize::new(0),
-                max_in_flight: AtomicUsize::new(0),
+                batch_sizes: Mutex::new(Vec::new()),
                 delay: Duration::from_millis(1),
             }
         }
@@ -371,33 +575,103 @@ mod tests {
             Ok(())
         }
 
-        async fn persist(&self, _message: &ValidatedMessage) -> Result<PersistOutcome, StoreError> {
+        async fn persist_batch(
+            &self,
+            messages: &[ValidatedMessage],
+        ) -> Result<Vec<PersistOutcome>, StoreError> {
             self.calls.fetch_add(1, Ordering::Relaxed);
-            let current = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
-            self.max_in_flight.fetch_max(current, Ordering::SeqCst);
+            self.batch_sizes.lock().unwrap().push(messages.len());
             tokio::time::sleep(self.delay).await;
-            self.in_flight.fetch_sub(1, Ordering::SeqCst);
             self.outcomes
                 .lock()
                 .unwrap()
                 .pop_front()
-                .unwrap_or(Ok(PersistOutcome {
-                    feed_event_inserted: true,
-                    origin_transaction_inserted: true,
-                }))
+                .unwrap_or_else(|| {
+                    Ok(vec![
+                        PersistOutcome {
+                            feed_event_inserted: true,
+                            origin_transaction_inserted: true,
+                        };
+                        messages.len()
+                    ])
+                })
         }
     }
 
-    struct FakeSubscriber {
-        subjects: Arc<Mutex<Vec<String>>>,
-        messages: Vec<Vec<u8>>,
+    #[derive(Debug, Default)]
+    struct FakeAcker {
+        ack: AtomicUsize,
+        nak: AtomicUsize,
+        progress: AtomicUsize,
+        term: AtomicUsize,
+        ack_failures: AtomicUsize,
+    }
+
+    impl FakeAcker {
+        fn fail_acks(count: usize) -> Self {
+            Self {
+                ack_failures: AtomicUsize::new(count),
+                ..Default::default()
+            }
+        }
+
+        fn maybe_fail(&self) -> Result<(), PipelineError> {
+            self.ack_failures.fetch_sub(1, Ordering::SeqCst);
+            Err(PipelineError::Acknowledgement)
+        }
     }
 
     #[async_trait]
-    impl CoreSubscriber for FakeSubscriber {
-        async fn subscribe_core(&self, subject: &str) -> Result<MessageStream, SubscriptionError> {
-            self.subjects.lock().unwrap().push(subject.to_string());
-            Ok(Box::pin(futures_util::stream::iter(self.messages.clone())))
+    impl DeliveryAcker for FakeAcker {
+        async fn ack_confirmed(&self) -> Result<(), PipelineError> {
+            self.ack.fetch_add(1, Ordering::Relaxed);
+            if self.ack_failures.load(Ordering::Relaxed) > 0 {
+                self.maybe_fail()
+            } else {
+                Ok(())
+            }
+        }
+
+        async fn nak(&self, _delay: Duration) -> Result<(), PipelineError> {
+            self.nak.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }
+
+        async fn progress(&self) -> Result<(), PipelineError> {
+            self.progress.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }
+
+        async fn term(&self) -> Result<(), PipelineError> {
+            self.term.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }
+    }
+
+    #[derive(Debug)]
+    struct FakeFetcher {
+        batches: Mutex<VecDeque<Result<Vec<Delivery>, PipelineError>>>,
+        state: Mutex<Result<ConsumerState, PipelineError>>,
+        requests: Mutex<Vec<(usize, Duration)>>,
+    }
+
+    #[async_trait]
+    impl MessageFetcher for FakeFetcher {
+        async fn fetch_batch(
+            &self,
+            max_messages: usize,
+            max_wait: Duration,
+        ) -> Result<Vec<Delivery>, PipelineError> {
+            self.requests.lock().unwrap().push((max_messages, max_wait));
+            self.batches
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or(Err(PipelineError::Fetch))
+        }
+
+        async fn state(&self) -> Result<ConsumerState, PipelineError> {
+            self.state.lock().unwrap().clone()
         }
     }
 
@@ -423,206 +697,336 @@ mod tests {
         .unwrap()
     }
 
+    fn delivery(
+        sequence: u64,
+        hash_byte: char,
+        delivery_count: u64,
+        acker: Arc<FakeAcker>,
+    ) -> Delivery {
+        Delivery {
+            payload: payload(sequence, hash_byte),
+            delivery_count,
+            acker,
+        }
+    }
+
+    fn malformed(delivery_count: u64, acker: Arc<FakeAcker>) -> Delivery {
+        Delivery {
+            payload: b"not-json".to_vec(),
+            delivery_count,
+            acker,
+        }
+    }
+
     fn ready_state() -> Readiness {
         let readiness = Readiness::new();
         readiness.set_postgres_connected(true);
         readiness.set_schema_verified(true);
-        readiness.set_nats_connected(true);
+        readiness.set_jetstream_connected(true);
+        readiness.set_stream_ready(true);
+        readiness.set_consumer_ready(true);
+        readiness.set_fetching_active(true);
         readiness
     }
 
     #[tokio::test]
-    async fn successful_subscription_uses_exact_subject_and_enables_readiness() {
-        let readiness = ready_state();
-        assert_eq!(readiness.ready(), Err("NATS subscription inactive"));
-        let subjects = Arc::new(Mutex::new(Vec::new()));
-        let subscriber = FakeSubscriber {
-            subjects: subjects.clone(),
-            messages: Vec::new(),
-        };
-        let _stream = activate_subscription(&subscriber, &readiness)
-            .await
-            .unwrap();
-        assert_eq!(&*subjects.lock().unwrap(), &[NATS_SUBJECT.to_string()]);
-        assert_eq!(readiness.ready(), Ok(()));
-    }
-
-    #[tokio::test]
-    async fn normalized_messages_persist_sequentially_with_bounded_concurrency() {
-        let store = Arc::new(FakeStore::new(vec![]));
-        let readiness = ready_state();
-        readiness.set_subscription_active(true);
+    async fn successful_batch_persists_once_then_confirms_each_ack() {
+        let store = FakeStore::new(vec![]);
+        let first_ack = Arc::new(FakeAcker::default());
+        let second_ack = Arc::new(FakeAcker::default());
         let metrics = Metrics::default();
-        let exit = consume_messages(
-            Box::pin(futures_util::stream::iter(vec![
-                payload(9, 'a'),
-                payload(9, 'b'),
-            ])),
-            store.clone(),
-            readiness,
-            metrics.clone(),
-            LogSampler::default(),
-            CancellationToken::new(),
-            RetryPolicy {
-                initial: Duration::from_millis(1),
-                maximum: Duration::from_millis(2),
-            },
+        let mut ack_health = AckHealthTracker::default();
+        let result = process_delivery_batch(
+            vec![
+                delivery(1, 'a', 1, first_ack.clone()),
+                delivery(2, 'b', 1, second_ack.clone()),
+            ],
+            &store,
+            &ready_state(),
+            &metrics,
+            &LogSampler::default(),
+            &CancellationToken::new(),
+            RetryPolicy::default(),
+            &mut ack_health,
         )
         .await;
-        assert_eq!(exit, ConsumerExit::SubscriptionEnded);
-        assert_eq!(store.calls.load(Ordering::Relaxed), 2);
-        assert_eq!(store.max_in_flight.load(Ordering::Relaxed), 1);
+        assert_eq!(result, BatchDisposition::Continue);
+        assert_eq!(store.calls.load(Ordering::Relaxed), 1);
+        assert_eq!(&*store.batch_sizes.lock().unwrap(), &[2]);
+        assert_eq!(first_ack.ack.load(Ordering::Relaxed), 1);
+        assert_eq!(second_ack.ack.load(Ordering::Relaxed), 1);
         let rendered = metrics.render(&Readiness::new());
-        assert!(rendered.contains("recorder_messages_received_total 2"));
-        assert!(rendered.contains("recorder_transactions_persisted_total 2"));
+        assert!(rendered.contains("recorder_batches_persisted_total 1"));
+        assert!(rendered.contains("recorder_messages_persisted_total 2"));
     }
 
     #[tokio::test]
-    async fn duplicate_delivery_is_skipped_idempotently() {
+    async fn postgres_failure_makes_progress_without_ack_then_recovers() {
         let inserted = PersistOutcome {
             feed_event_inserted: true,
             origin_transaction_inserted: true,
         };
-        let store = Arc::new(FakeStore::new(vec![
-            Ok(inserted),
-            Ok(PersistOutcome::default()),
-        ]));
+        let store = FakeStore::new(vec![Err(StoreError::Connection), Ok(vec![inserted])]);
+        let acker = Arc::new(FakeAcker::default());
         let readiness = ready_state();
-        readiness.set_subscription_active(true);
-        let metrics = Metrics::default();
-        let message = payload(5, 'a');
-        consume_messages(
-            Box::pin(futures_util::stream::iter(vec![message.clone(), message])),
-            store,
-            readiness,
-            metrics.clone(),
-            LogSampler::default(),
-            CancellationToken::new(),
-            RetryPolicy::default(),
-        )
-        .await;
-        let rendered = metrics.render(&Readiness::new());
-        assert!(rendered.contains("recorder_messages_persisted_total 1"));
-        assert!(rendered.contains("recorder_duplicate_skips_total 1"));
-    }
-
-    #[tokio::test]
-    async fn duplicate_transaction_hash_preserves_new_feed_event_without_new_origin() {
-        let store = Arc::new(FakeStore::new(vec![Ok(PersistOutcome {
-            feed_event_inserted: true,
-            origin_transaction_inserted: false,
-        })]));
-        let readiness = ready_state();
-        readiness.set_subscription_active(true);
-        let metrics = Metrics::default();
-        consume_messages(
-            Box::pin(futures_util::stream::iter(vec![payload(6, 'a')])),
-            store,
-            readiness,
-            metrics.clone(),
-            LogSampler::default(),
-            CancellationToken::new(),
-            RetryPolicy::default(),
-        )
-        .await;
-        let rendered = metrics.render(&Readiness::new());
-        assert!(rendered.contains("recorder_messages_persisted_total 1"));
-        assert!(rendered.contains("recorder_transactions_persisted_total 0"));
-        assert!(rendered.contains("recorder_duplicate_skips_total 1"));
-    }
-
-    #[tokio::test]
-    async fn malformed_payload_is_not_persisted() {
-        let store = Arc::new(FakeStore::new(vec![]));
-        let readiness = ready_state();
-        readiness.set_subscription_active(true);
-        let metrics = Metrics::default();
-        consume_messages(
-            Box::pin(futures_util::stream::iter(vec![b"not-json".to_vec()])),
-            store.clone(),
-            readiness,
-            metrics.clone(),
-            LogSampler::default(),
-            CancellationToken::new(),
-            RetryPolicy::default(),
-        )
-        .await;
-        assert_eq!(store.calls.load(Ordering::Relaxed), 0);
-        assert!(metrics
-            .render(&Readiness::new())
-            .contains("recorder_decode_failures_total 1"));
-    }
-
-    #[tokio::test]
-    async fn database_failure_retries_same_message_without_silent_success() {
-        let store = Arc::new(FakeStore::new(vec![
-            Err(StoreError::Connection),
-            Ok(PersistOutcome {
-                feed_event_inserted: true,
-                origin_transaction_inserted: true,
-            }),
-        ]));
-        let readiness = ready_state();
-        readiness.set_subscription_active(true);
-        let metrics = Metrics::default();
-        consume_messages(
-            Box::pin(futures_util::stream::iter(vec![payload(7, 'a')])),
-            store.clone(),
-            readiness,
-            metrics.clone(),
-            LogSampler::default(),
-            CancellationToken::new(),
+        let mut ack_health = AckHealthTracker::default();
+        let result = process_delivery_batch(
+            vec![delivery(1, 'a', 1, acker.clone())],
+            &store,
+            &readiness,
+            &Metrics::default(),
+            &LogSampler::default(),
+            &CancellationToken::new(),
             RetryPolicy {
                 initial: Duration::from_millis(1),
                 maximum: Duration::from_millis(2),
             },
+            &mut ack_health,
         )
         .await;
+        assert_eq!(result, BatchDisposition::Continue);
         assert_eq!(store.calls.load(Ordering::Relaxed), 2);
-        let rendered = metrics.render(&Readiness::new());
-        assert!(rendered.contains("recorder_database_failures_total 1"));
-        assert!(rendered.contains("recorder_messages_persisted_total 1"));
+        assert_eq!(acker.progress.load(Ordering::Relaxed), 1);
+        assert_eq!(acker.ack.load(Ordering::Relaxed), 1);
     }
 
     #[tokio::test]
-    async fn graceful_shutdown_interrupts_database_retry() {
-        let store = Arc::new(FakeStore::new(vec![Err(StoreError::Connection); 20]));
+    async fn duplicate_restart_replay_is_committed_idempotently_before_ack() {
+        let store = FakeStore::new(vec![
+            Ok(vec![PersistOutcome {
+                feed_event_inserted: true,
+                origin_transaction_inserted: true,
+            }]),
+            Ok(vec![PersistOutcome::default()]),
+        ]);
+        let failed_ack = Arc::new(FakeAcker::fail_acks(1));
+        let replay_ack = Arc::new(FakeAcker::default());
         let readiness = ready_state();
-        readiness.set_subscription_active(true);
+        let metrics = Metrics::default();
+        let mut ack_health = AckHealthTracker::default();
+
+        process_delivery_batch(
+            vec![delivery(7, 'a', 1, failed_ack)],
+            &store,
+            &readiness,
+            &metrics,
+            &LogSampler::default(),
+            &CancellationToken::new(),
+            RetryPolicy::default(),
+            &mut ack_health,
+        )
+        .await;
+        process_delivery_batch(
+            vec![delivery(7, 'a', 2, replay_ack.clone())],
+            &store,
+            &readiness,
+            &metrics,
+            &LogSampler::default(),
+            &CancellationToken::new(),
+            RetryPolicy::default(),
+            &mut ack_health,
+        )
+        .await;
+
+        assert_eq!(store.calls.load(Ordering::Relaxed), 2);
+        assert_eq!(replay_ack.ack.load(Ordering::Relaxed), 1);
+        let rendered = metrics.render(&readiness);
+        assert!(rendered.contains("recorder_duplicate_skips_total 1"));
+        assert!(rendered.contains("recorder_jetstream_redeliveries_total 1"));
+    }
+
+    #[tokio::test]
+    async fn poison_policy_is_bounded_and_valid_siblings_continue() {
+        let store = FakeStore::new(vec![]);
+        let retry_ack = Arc::new(FakeAcker::default());
+        let terminal_ack = Arc::new(FakeAcker::default());
+        let valid_ack = Arc::new(FakeAcker::default());
+        let readiness = ready_state();
+        let mut ack_health = AckHealthTracker::default();
+        let result = process_delivery_batch(
+            vec![
+                malformed(1, retry_ack.clone()),
+                malformed(CONSUMER_MAX_DELIVERIES as u64, terminal_ack.clone()),
+                delivery(9, 'b', 1, valid_ack.clone()),
+            ],
+            &store,
+            &readiness,
+            &Metrics::default(),
+            &LogSampler::default(),
+            &CancellationToken::new(),
+            RetryPolicy::default(),
+            &mut ack_health,
+        )
+        .await;
+        assert_eq!(result, BatchDisposition::Continue);
+        assert_eq!(retry_ack.nak.load(Ordering::Relaxed), 1);
+        assert_eq!(terminal_ack.term.load(Ordering::Relaxed), 1);
+        assert_eq!(valid_ack.ack.load(Ordering::Relaxed), 1);
+        assert_eq!(store.calls.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            readiness.ready(),
+            Err("terminal Recorder integrity condition detected")
+        );
+    }
+
+    #[tokio::test]
+    async fn graceful_shutdown_before_persistence_safely_abandons_batch() {
+        let store = FakeStore::new(vec![]);
+        let acker = Arc::new(FakeAcker::default());
+        let shutdown = CancellationToken::new();
+        shutdown.cancel();
+        let mut ack_health = AckHealthTracker::default();
+        let result = process_delivery_batch(
+            vec![delivery(1, 'a', 1, acker.clone())],
+            &store,
+            &ready_state(),
+            &Metrics::default(),
+            &LogSampler::default(),
+            &shutdown,
+            RetryPolicy::default(),
+            &mut ack_health,
+        )
+        .await;
+        assert_eq!(result, BatchDisposition::Shutdown);
+        assert_eq!(store.calls.load(Ordering::Relaxed), 0);
+        assert_eq!(acker.ack.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn graceful_shutdown_during_commit_finishes_batch_then_acks() {
+        let mut store = FakeStore::new(vec![]);
+        store.delay = Duration::from_millis(20);
+        let acker = Arc::new(FakeAcker::default());
         let shutdown = CancellationToken::new();
         let cancel = shutdown.clone();
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(5)).await;
             cancel.cancel();
         });
-        let exit = consume_messages(
-            Box::pin(futures_util::stream::iter(vec![payload(7, 'a')])),
-            store,
-            readiness,
-            Metrics::default(),
-            LogSampler::default(),
-            shutdown,
-            RetryPolicy {
-                initial: Duration::from_secs(1),
-                maximum: Duration::from_secs(1),
-            },
+        let mut ack_health = AckHealthTracker::default();
+        let result = process_delivery_batch(
+            vec![delivery(1, 'a', 1, acker.clone())],
+            &store,
+            &ready_state(),
+            &Metrics::default(),
+            &LogSampler::default(),
+            &shutdown,
+            RetryPolicy::default(),
+            &mut ack_health,
         )
         .await;
-        assert_eq!(exit, ConsumerExit::Shutdown);
+        assert_eq!(result, BatchDisposition::Shutdown);
+        assert_eq!(store.calls.load(Ordering::Relaxed), 1);
+        assert_eq!(acker.ack.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn persistent_acknowledgement_failures_clear_readiness() {
+        let store = FakeStore::new(vec![]);
+        let readiness = ready_state();
+        let metrics = Metrics::default();
+        let mut ack_health = AckHealthTracker::default();
+        let deliveries = vec![
+            delivery(1, 'a', 1, Arc::new(FakeAcker::fail_acks(1))),
+            delivery(2, 'b', 1, Arc::new(FakeAcker::fail_acks(1))),
+            delivery(3, 'c', 1, Arc::new(FakeAcker::fail_acks(1))),
+        ];
+        let result = process_delivery_batch(
+            deliveries,
+            &store,
+            &readiness,
+            &metrics,
+            &LogSampler::default(),
+            &CancellationToken::new(),
+            RetryPolicy::default(),
+            &mut ack_health,
+        )
+        .await;
+        assert_eq!(result, BatchDisposition::Continue);
+        assert_eq!(
+            readiness.ready(),
+            Err("JetStream acknowledgement failures persist")
+        );
+        assert!(metrics
+            .render(&readiness)
+            .contains("recorder_jetstream_ack_failures_total 3"));
+    }
+
+    #[tokio::test]
+    async fn bounded_pull_uses_configured_batch_size_wait_and_lag_metrics() {
+        let config = BatchConfig::default().validate().unwrap();
+        let fetcher = Arc::new(FakeFetcher {
+            batches: Mutex::new(VecDeque::from([Ok(Vec::new()), Err(PipelineError::Fetch)])),
+            state: Mutex::new(Ok(ConsumerState {
+                pending: 44,
+                ack_pending: 3,
+                redelivered: 0,
+            })),
+            requests: Mutex::new(Vec::new()),
+        });
+        let metrics = Metrics::default();
+        let exit = consume_durable_messages(
+            fetcher.clone(),
+            Arc::new(FakeStore::new(vec![])),
+            ready_state(),
+            metrics.clone(),
+            LogSampler::default(),
+            CancellationToken::new(),
+            config,
+            RetryPolicy::default(),
+        )
+        .await;
+        assert_eq!(exit, ConsumerExit::FetchFailed);
+        assert_eq!(
+            fetcher.requests.lock().unwrap()[0],
+            (256, DEFAULT_BATCH_WAIT)
+        );
+        let rendered = metrics.render(&Readiness::new());
+        assert!(rendered.contains("recorder_consumer_pending_messages 44"));
+        assert!(rendered.contains("recorder_consumer_ack_pending 3"));
+    }
+
+    #[test]
+    fn batch_configuration_rejects_unbounded_values() {
+        assert_eq!(
+            BatchConfig {
+                max_size: 0,
+                max_wait: DEFAULT_BATCH_WAIT,
+            }
+            .validate(),
+            Err(RuntimeConfigError::BatchSize)
+        );
+        assert_eq!(
+            BatchConfig {
+                max_size: 257,
+                max_wait: DEFAULT_BATCH_WAIT,
+            }
+            .validate(),
+            Err(RuntimeConfigError::BatchSize)
+        );
+        assert_eq!(
+            BatchConfig {
+                max_size: 1,
+                max_wait: Duration::from_secs(2),
+            }
+            .validate(),
+            Err(RuntimeConfigError::BatchWait)
+        );
     }
 
     #[test]
     fn nats_disconnect_and_reconnect_control_readiness_and_metrics() {
         let readiness = ready_state();
-        readiness.set_subscription_active(true);
         let disconnected = AtomicBool::new(false);
         mark_nats_disconnected(&readiness, &disconnected);
-        assert_eq!(readiness.ready(), Err("NATS disconnected"));
+        assert_eq!(readiness.ready(), Err("JetStream disconnected"));
         assert!(disconnected.load(Ordering::Acquire));
 
         let metrics = Metrics::default();
         mark_nats_connected(&readiness, &metrics, &disconnected);
-        readiness.set_subscription_active(true);
+        readiness.set_stream_ready(true);
+        readiness.set_consumer_ready(true);
+        readiness.set_fetching_active(true);
         assert_eq!(readiness.ready(), Ok(()));
         assert!(metrics
             .render(&readiness)

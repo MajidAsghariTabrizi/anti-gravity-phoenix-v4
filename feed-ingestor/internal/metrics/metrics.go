@@ -10,10 +10,15 @@ import (
 )
 
 type Registry struct {
-	mu       sync.Mutex
-	counters map[string]uint64
-	gauges   map[string]float64
-	latency  []float64
+	mu           sync.Mutex
+	counters     map[string]uint64
+	gauges       map[string]float64
+	observations map[string]observation
+}
+
+type observation struct {
+	count uint64
+	sum   float64
 }
 
 var defaultCounters = []string{
@@ -27,6 +32,9 @@ var defaultCounters = []string{
 	"feed_out_of_order_total",
 	"feed_publish_success_total",
 	"feed_publish_failures_total",
+	"feed_jetstream_publish_success_total",
+	"feed_jetstream_publish_failures_total",
+	"feed_jetstream_stream_unavailable_total",
 	"feed_unsupported_messages_total",
 }
 
@@ -38,8 +46,9 @@ var defaultGauges = []string{
 
 func NewRegistry() *Registry {
 	r := &Registry{
-		counters: make(map[string]uint64),
-		gauges:   make(map[string]float64),
+		counters:     make(map[string]uint64),
+		gauges:       make(map[string]float64),
+		observations: make(map[string]observation),
 	}
 	for _, name := range defaultCounters {
 		r.counters[name] = 0
@@ -67,9 +76,20 @@ func (r *Registry) SetGauge(name string, value float64) {
 }
 
 func (r *Registry) ObserveIngestLatency(start time.Time) {
+	r.ObserveDuration("feed_ingest_latency_seconds", time.Since(start))
+}
+
+func (r *Registry) ObserveJetStreamPublishLatency(start time.Time) {
+	r.ObserveDuration("feed_jetstream_publish_latency", time.Since(start))
+}
+
+func (r *Registry) ObserveDuration(name string, duration time.Duration) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	r.latency = append(r.latency, time.Since(start).Seconds())
+	value := r.observations[name]
+	value.count++
+	value.sum += duration.Seconds()
+	r.observations[name] = value
 }
 
 func (r *Registry) Handler() http.Handler {
@@ -99,8 +119,16 @@ func (r *Registry) Render() string {
 	for _, k := range gaugeKeys {
 		fmt.Fprintf(&b, "%s %.0f\n", k, r.gauges[k])
 	}
-	for _, v := range r.latency {
-		fmt.Fprintf(&b, "feed_ingest_latency_seconds %.9f\n", v)
+	observationKeys := make([]string, 0, len(r.observations))
+	for name := range r.observations {
+		observationKeys = append(observationKeys, name)
+	}
+	sort.Strings(observationKeys)
+	for _, name := range observationKeys {
+		value := r.observations[name]
+		fmt.Fprintf(&b, "# TYPE %s summary\n", name)
+		fmt.Fprintf(&b, "%s_count %d\n", name, value.count)
+		fmt.Fprintf(&b, "%s_sum %.9f\n", name, value.sum)
 	}
 	return b.String()
 }
@@ -164,6 +192,12 @@ func (r *Readiness) MarkNATSReachable() {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.natsReachable = true
+}
+
+func (r *Readiness) MarkNATSUnavailable() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.natsReachable = false
 }
 
 func (r *Readiness) MarkFatal(reason string) {
