@@ -1,5 +1,6 @@
 pub mod amm;
 pub mod config;
+pub mod decision;
 pub mod domain;
 pub mod economics;
 pub mod execution;
