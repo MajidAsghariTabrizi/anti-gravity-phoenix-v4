@@ -6,7 +6,7 @@ use crate::opportunity::{Opportunity, ShadowDisposition, SimulationClassificatio
 #[derive(Clone, Debug, Default)]
 pub struct Metrics {
     counters: BTreeMap<&'static str, u64>,
-    gauges: BTreeMap<&'static str, i128>,
+    gauges: BTreeMap<&'static str, f64>,
     rejection_reasons: BTreeMap<&'static str, u64>,
 }
 
@@ -19,12 +19,12 @@ impl Metrics {
         self.counters.get(name).copied().unwrap_or(0)
     }
 
-    pub fn set_gauge(&mut self, name: &'static str, value: i128) {
+    pub fn set_gauge(&mut self, name: &'static str, value: f64) {
         self.gauges.insert(name, value);
     }
 
-    pub fn gauge(&self, name: &'static str) -> i128 {
-        self.gauges.get(name).copied().unwrap_or(0)
+    pub fn gauge(&self, name: &'static str) -> f64 {
+        self.gauges.get(name).copied().unwrap_or(0.0)
     }
 
     pub fn record_candidate(&mut self, opportunity: &Opportunity) {
@@ -45,46 +45,47 @@ impl Metrics {
         }
         self.set_gauge(
             "phoenix_expected_gross_pnl",
-            opportunity.economics.base.gross_spread.0,
+            opportunity.economics.base.gross_spread.0 as f64,
         );
         self.set_gauge(
             "phoenix_expected_net_pnl",
-            opportunity.economics.base.expected_net_pnl.0,
+            opportunity.economics.base.expected_net_pnl.0 as f64,
         );
         self.set_gauge(
             "phoenix_conservative_net_pnl",
-            opportunity.economics.conservative.expected_net_pnl.0,
+            opportunity.economics.conservative.expected_net_pnl.0 as f64,
         );
         self.set_gauge(
             "phoenix_severe_net_pnl",
-            opportunity.economics.severe.expected_net_pnl.0,
+            opportunity.economics.severe.expected_net_pnl.0 as f64,
         );
         self.set_gauge(
             "phoenix_hypothetical_realized_pnl",
             opportunity
                 .outcome
                 .replay_pnl
-                .map(|value| value.0)
-                .unwrap_or(0),
+                .map(|value| value.0 as f64)
+                .unwrap_or(0.0),
         );
         self.set_gauge(
-            "phoenix_opportunity_age_milliseconds",
+            "phoenix_opportunity_age_seconds",
             opportunity
                 .decision
                 .decided_at_unix_ms
-                .saturating_sub(opportunity.identity.observed_at_unix_ms) as i128,
+                .saturating_sub(opportunity.identity.observed_at_unix_ms) as f64
+                / 1_000.0,
         );
         self.set_gauge(
-            "phoenix_detection_latency_nanoseconds",
-            opportunity.market.feed_to_detection_latency_ns as i128,
+            "phoenix_detection_latency_seconds",
+            opportunity.market.feed_to_detection_latency_ns as f64 / 1_000_000_000.0,
         );
         self.set_gauge(
-            "phoenix_simulation_latency_nanoseconds",
-            opportunity.simulation.latency_ns as i128,
+            "phoenix_simulation_latency_seconds",
+            opportunity.simulation.latency_ns as f64 / 1_000_000_000.0,
         );
         self.set_gauge(
-            "phoenix_quote_staleness_milliseconds",
-            opportunity.market.quote_age_ms as i128,
+            "phoenix_quote_staleness_seconds",
+            opportunity.market.quote_age_ms as f64 / 1_000.0,
         );
     }
 
@@ -135,11 +136,11 @@ pub const REQUIRED_GAUGES: &[&str] = &[
     "phoenix_conservative_net_pnl",
     "phoenix_severe_net_pnl",
     "phoenix_hypothetical_realized_pnl",
-    "phoenix_opportunity_age_milliseconds",
-    "phoenix_detection_latency_nanoseconds",
-    "phoenix_simulation_latency_nanoseconds",
-    "phoenix_rpc_latency_nanoseconds",
-    "phoenix_quote_staleness_milliseconds",
+    "phoenix_opportunity_age_seconds",
+    "phoenix_detection_latency_seconds",
+    "phoenix_simulation_latency_seconds",
+    "phoenix_rpc_latency_seconds",
+    "phoenix_quote_staleness_seconds",
     "phoenix_strategy_readiness",
     "phoenix_shadow_readiness",
 ];

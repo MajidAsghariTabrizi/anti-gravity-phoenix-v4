@@ -209,10 +209,10 @@ with tabs[10]:
         "Conservative Net PnL": metric_value("phoenix_conservative_net_pnl"),
         "Severe Net PnL": metric_value("phoenix_severe_net_pnl"),
         "Hypothetical Realized PnL": metric_value("phoenix_hypothetical_realized_pnl"),
-        "Opportunity Age (ms)": metric_value("phoenix_opportunity_age_milliseconds"),
-        "Detection Latency (ns)": metric_value("phoenix_detection_latency_nanoseconds"),
-        "Simulation Latency (ns)": metric_value("phoenix_simulation_latency_nanoseconds"),
-        "Quote Staleness (ms)": metric_value("phoenix_quote_staleness_milliseconds"),
+        "Opportunity Age (s)": metric_value("phoenix_opportunity_age_seconds"),
+        "Detection Latency (s)": metric_value("phoenix_detection_latency_seconds"),
+        "Simulation Latency (s)": metric_value("phoenix_simulation_latency_seconds"),
+        "Quote Staleness (s)": metric_value("phoenix_quote_staleness_seconds"),
     }
     st.dataframe(
         pd.DataFrame({"shadow_metric": list(economics.keys()), "value": list(economics.values())}),
