@@ -1,6 +1,7 @@
 pub mod amm;
 pub mod config;
 pub mod domain;
+pub mod economics;
 pub mod execution;
 pub mod graph;
 pub mod messaging;
