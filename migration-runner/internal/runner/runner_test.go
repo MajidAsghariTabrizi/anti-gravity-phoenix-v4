@@ -6,11 +6,36 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
 	_ "github.com/lib/pq"
 )
+
+func TestShadowProfitabilityMigrationIsAdditiveAndFailClosed(t *testing.T) {
+	migrationPath := filepath.Join("..", "..", "..", "migrations", "003_shadow_profitability_evidence.sql")
+	content, err := os.ReadFile(migrationPath)
+	if err != nil {
+		t.Fatalf("read shadow profitability migration: %v", err)
+	}
+	sqlText := strings.ToUpper(string(content))
+	for _, required := range []string{
+		"CREATE TABLE IF NOT EXISTS SHADOW_DECISIONS",
+		"CREATE TABLE IF NOT EXISTS RPC_QUALITY_RECORDS",
+		"CREATE TABLE IF NOT EXISTS SHADOW_REPLAY_RUNS",
+		"CHECK (EXECUTION_ELIGIBLE = FALSE)",
+	} {
+		if !strings.Contains(sqlText, required) {
+			t.Fatalf("migration missing %q", required)
+		}
+	}
+	for _, destructive := range []string{"DROP TABLE", "DROP COLUMN", "TRUNCATE TABLE"} {
+		if strings.Contains(sqlText, destructive) {
+			t.Fatalf("migration contains destructive statement %q", destructive)
+		}
+	}
+}
 
 func TestLoadMigrationsOrdersByVersion(t *testing.T) {
 	dir := t.TempDir()

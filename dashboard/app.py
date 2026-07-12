@@ -17,6 +17,8 @@ METRICS_URL = os.getenv("PROMETHEUS_METRICS_URL", "http://prometheus:9090")
 
 st.set_page_config(page_title="Phoenix Command Center", layout="wide")
 
+SHADOW_FINANCIAL_LABEL = "SHADOW / SIMULATED — NOT REALIZED CAPITAL PNL"
+
 
 def query(sql: str, params=None) -> pd.DataFrame:
     if psycopg is None:
@@ -46,6 +48,7 @@ def kpi(label: str, value):
 
 
 st.title("Phoenix Command Center")
+st.warning(SHADOW_FINANCIAL_LABEL)
 
 tabs = st.tabs(
     [
@@ -59,17 +62,18 @@ tabs = st.tabs(
         "Pool State Health",
         "RPC Budget",
         "System Health",
+        "Shadow Economics",
+        "Shadow Risk",
     ]
 )
 
 with tabs[0]:
-    pnl = query("select coalesce(sum(realized_profit_asset_units), 0) as realized_pnl from realized_pnl")
     attempts = query("select status, count(*) as count from execution_attempts group by status order by status")
     c1, c2, c3, c4 = st.columns(4)
     with c1:
-        kpi("Realized PnL", pnl.iloc[0]["realized_pnl"] if not pnl.empty else "0")
+        kpi("Expected Net PnL (SHADOW)", metric_value("phoenix_expected_net_pnl"))
     with c2:
-        kpi("Capture Rate", metric_value("opportunities_settled_total"))
+        kpi("Shadow Accepted", metric_value("phoenix_shadow_accepted_total"))
     with c3:
         kpi("Median Decision Latency", metric_value("decision_latency_seconds"))
     with c4:
@@ -132,6 +136,8 @@ with tabs[4]:
     )
 
 with tabs[5]:
+    st.warning(SHADOW_FINANCIAL_LABEL)
+    st.caption("Execution reconciliation is inactive unless a separately reviewed LIVE release exists.")
     realized = query(
         """
         select asset, flash_amount, premium, realized_profit_asset_units as realized_profit,
@@ -182,6 +188,11 @@ with tabs[8]:
 
 with tabs[9]:
     system = {
+        "Feed Readiness": metric_value("feed_readiness"),
+        "JetStream Publish Failures": metric_value("feed_jetstream_publish_failures_total"),
+        "Recorder Readiness": metric_value("recorder_readiness"),
+        "RPC Gateway Readiness": metric_value("rpc_readiness"),
+        "Engine Readiness": metric_value("engine_readiness"),
         "Pools Tracked": metric_value("pools_tracked"),
         "Pools Complete": metric_value("pools_complete"),
         "Pools Incomplete": metric_value("pools_incomplete"),
@@ -189,3 +200,39 @@ with tabs[9]:
         "Hot Path RPC Calls": metric_value("hot_path_external_rpc_calls_total"),
     }
     st.dataframe(pd.DataFrame({"metric": list(system.keys()), "value": list(system.values())}), use_container_width=True)
+
+with tabs[10]:
+    st.warning(SHADOW_FINANCIAL_LABEL)
+    economics = {
+        "Expected Gross PnL": metric_value("phoenix_expected_gross_pnl"),
+        "Expected Net PnL": metric_value("phoenix_expected_net_pnl"),
+        "Conservative Net PnL": metric_value("phoenix_conservative_net_pnl"),
+        "Severe Net PnL": metric_value("phoenix_severe_net_pnl"),
+        "Hypothetical Realized PnL": metric_value("phoenix_hypothetical_realized_pnl"),
+        "Opportunity Age (ms)": metric_value("phoenix_opportunity_age_milliseconds"),
+        "Detection Latency (ns)": metric_value("phoenix_detection_latency_nanoseconds"),
+        "Simulation Latency (ns)": metric_value("phoenix_simulation_latency_nanoseconds"),
+        "Quote Staleness (ms)": metric_value("phoenix_quote_staleness_milliseconds"),
+    }
+    st.dataframe(
+        pd.DataFrame({"shadow_metric": list(economics.keys()), "value": list(economics.values())}),
+        use_container_width=True,
+    )
+
+with tabs[11]:
+    quality = {
+        "Sequence Gaps": metric_value("feed_sequence_gaps_total"),
+        "Missing Feed Messages": metric_value("feed_sequence_gap_messages_total"),
+        "Decoder Failures": metric_value("feed_decode_failures_total"),
+        "Unsupported Messages": metric_value("feed_unsupported_messages_total"),
+        "Replay Lag": metric_value("phoenix_replay_lag_seconds"),
+        "Candidates": metric_value("phoenix_candidates_total"),
+        "Shadow Accepted": metric_value("phoenix_shadow_accepted_total"),
+        "Shadow Rejected": metric_value("phoenix_shadow_rejected_total"),
+        "Simulation Failures": metric_value("phoenix_simulation_failures_total"),
+        "RPC Disagreements": metric_value("rpc_provider_disagreement_total"),
+    }
+    st.dataframe(
+        pd.DataFrame({"risk_or_quality_metric": list(quality.keys()), "value": list(quality.values())}),
+        use_container_width=True,
+    )
