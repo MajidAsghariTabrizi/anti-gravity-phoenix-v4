@@ -14,6 +14,8 @@ use phoenix_engine::opportunity::{
 };
 use serde::Deserialize;
 
+pub mod evidence;
+
 pub const REPLAY_SCHEMA_VERSION: &str = "shadow-replay-v1";
 pub const STRATEGY_VERSION: &str = "two-pool-v3-v1";
 pub const POLICY_VERSION: &str = "shadow-policy-v1";
@@ -96,6 +98,11 @@ pub struct ReplayDecision {
     pub case_id: String,
     pub observed_block: u64,
     pub source_sequence: u64,
+    pub observed_at_unix_ms: u64,
+    pub route_fingerprint: String,
+    pub protocol: String,
+    pub token_pair: String,
+    pub simulation_passed: bool,
     pub decision: DecisionEvidence,
     pub base_net_pnl: i128,
     pub conservative_net_pnl: i128,
@@ -185,7 +192,10 @@ pub fn parse_cases(input: &str) -> Result<Vec<ReplayCase>, ReplayError> {
 }
 
 pub fn replay(input: &str) -> Result<ReplayReport, ReplayError> {
-    let mut cases = parse_cases(input)?;
+    replay_cases(parse_cases(input)?)
+}
+
+pub fn replay_cases(mut cases: Vec<ReplayCase>) -> Result<ReplayReport, ReplayError> {
     cases.sort_by(|left, right| {
         (left.observed_block, left.source_sequence, &left.case_id).cmp(&(
             right.observed_block,
@@ -255,6 +265,16 @@ fn evaluate_case(case: &ReplayCase) -> Result<ReplayDecision, ReplayError> {
         case_id: case.case_id.clone(),
         observed_block: case.observed_block,
         source_sequence: case.source_sequence,
+        observed_at_unix_ms: case.observed_at_unix_ms,
+        route_fingerprint: opportunity.route.route_fingerprint,
+        protocol: opportunity.route.protocols[0].clone(),
+        token_pair: format!(
+            "{}:{}",
+            opportunity.route.input_token.0.as_str(),
+            opportunity.route.output_token.0.as_str()
+        ),
+        simulation_passed: opportunity.simulation.classification
+            == SimulationClassification::Passed,
         decision: opportunity.decision,
         base_net_pnl: opportunity.economics.base.expected_net_pnl.0,
         conservative_net_pnl: opportunity.economics.conservative.expected_net_pnl.0,

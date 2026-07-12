@@ -1,7 +1,7 @@
 use std::fs;
 use std::io;
 
-use phoenix_replay::{replay, ReplayConfig};
+use phoenix_replay::{evidence, replay, ReplayConfig};
 
 fn main() -> io::Result<()> {
     let mut args = std::env::args().skip(1);
@@ -29,5 +29,12 @@ fn main() -> io::Result<()> {
         "{}",
         report.render(&config.code_version, &config.config_version)
     );
+    let evidence = evidence::build(&input).map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("shadow evidence report failed: {error:?}"),
+        )
+    })?;
+    print!("{}", evidence.render());
     Ok(())
 }
