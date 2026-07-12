@@ -18,7 +18,7 @@ pub struct PoolId(pub String);
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct TokenAddress(pub Address);
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Amount(pub u128);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]

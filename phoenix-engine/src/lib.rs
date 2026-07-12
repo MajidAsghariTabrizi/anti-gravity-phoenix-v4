@@ -5,6 +5,7 @@ pub mod execution;
 pub mod graph;
 pub mod messaging;
 pub mod metrics;
+pub mod opportunity;
 pub mod optimizer;
 pub mod origin;
 pub mod profit;

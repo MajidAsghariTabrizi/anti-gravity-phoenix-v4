@@ -3,6 +3,12 @@ use phoenix_engine::execution::{
     ExecutionCoordinator, ExecutionDecision, ExecutionMode, Opportunity,
 };
 use phoenix_engine::graph::{PoolEdge, PoolGraph, Route};
+use phoenix_engine::opportunity::{
+    BasisPoints, CostBreakdown, DecisionEvidence, MarketEvidence, OpportunityIdentity,
+    OutcomeEvidence, PoolStateEvidence, RouteEvidence, ScenarioEconomics, ShadowDisposition,
+    SignedAmount, SimulationClassification, SimulationEvidence, SimulationKind, StateSource,
+    Strategy,
+};
 use phoenix_engine::optimizer::{optimize, CandidateEvaluation, OptimizerConfig};
 use phoenix_engine::origin::{OriginClassification, OriginDetector};
 use phoenix_engine::profit::{ProfitInput, ProfitModel};
@@ -140,24 +146,115 @@ fn profitable_fixture_reaches_shadow_sink_and_dynamic_sizing() {
     assert_ne!(optimized.best_amount, Amount(100));
     assert!(optimized.expected_net_profit > Amount(10));
 
-    let opportunity = Opportunity {
-        opportunity_id: OpportunityId("op-1".to_string()),
-        route_id: routes[0].route_id.clone(),
-        origin_tx_hash: event.origin_tx_hash.0,
-        origin_sequence: event.origin_sequence.0,
-        snapshot_id: "snapshot-1".to_string(),
-        flash_asset: "USDC".to_string(),
-        optimized_amount: optimized.best_amount,
-        expected_gross_profit: optimized.gross_profit,
-        expected_flash_premium: optimized.flash_premium,
-        expected_execution_cost: optimized.expected_execution_cost,
-        expected_net_profit: optimized.expected_net_profit,
-        exact_ordered_legs: routes[0].legs.clone(),
-        min_profit: Amount(10),
-        expires_at_unix_ms: 1_700_000_001_000,
-        created_at_monotonic_ns: 1,
-        simulation_latency_ns: 1,
+    let base = CostBreakdown {
+        gross_spread: SignedAmount(optimized.gross_profit.0 as i128),
+        flash_loan_fee: optimized.flash_premium,
+        arbitrum_execution_fee: optimized.expected_execution_cost,
+        uncertainty_reserve: optimized.uncertainty_reserve,
+        expected_net_pnl: SignedAmount(optimized.expected_net_profit.0 as i128),
+        expected_roi_bps: BasisPoints(100),
+        probability_of_success_bps: 9_000,
+        expected_value_after_success_probability: SignedAmount(
+            optimized.expected_net_profit.0 as i128,
+        ),
+        ..CostBreakdown::default()
     };
+    let opportunity = Opportunity {
+        identity: OpportunityIdentity {
+            opportunity_id: OpportunityId("op-1".to_string()),
+            strategy: Strategy::TwoPoolV3Arbitrage,
+            strategy_version: "fixture-v1".to_string(),
+            detector_version: "fixture-v1".to_string(),
+            code_version: "test".to_string(),
+            config_version: "test".to_string(),
+            chain_id: 42161,
+            source_sequence: event.origin_sequence.0,
+            origin_tx_hash: event.origin_tx_hash,
+            observed_block: 1,
+            observed_at_unix_ms: 1_700_000_000_000,
+            detected_at_unix_ms: 1_700_000_000_001,
+        },
+        route: RouteEvidence {
+            route_id: routes[0].route_id.clone(),
+            route_fingerprint: "fixture-route-v1".to_string(),
+            token_path: vec![
+                routes[0].legs[0].token_in.clone(),
+                routes[0].legs[1].token_in.clone(),
+                routes[0].legs[1].token_out.clone(),
+            ],
+            pools: routes[0]
+                .legs
+                .iter()
+                .map(|leg| leg.pool_id.clone())
+                .collect(),
+            protocols: routes[0]
+                .legs
+                .iter()
+                .map(|leg| leg.protocol.clone())
+                .collect(),
+            input_token: routes[0].legs[0].token_in.clone(),
+            output_token: routes[0].legs[1].token_out.clone(),
+            input_amount: optimized.best_amount,
+            expected_output: Amount(optimized.best_amount.0 + optimized.gross_profit.0),
+            exact_ordered_legs: routes[0].legs.clone(),
+        },
+        market: MarketEvidence {
+            pool_states: vec![PoolStateEvidence {
+                pool: touched,
+                state_hash: "fixture-state-hash".to_string(),
+                reserve_or_liquidity_summary: "fixture-only".to_string(),
+            }],
+            state_block: 1,
+            state_block_hash: Some("fixture-block-hash".to_string()),
+            quote_block: 1,
+            quote_age_ms: 1,
+            state_source: StateSource::RecordedCheckpoint,
+            rpc_provider_id: None,
+            rpc_response_hash: None,
+            feed_to_detection_latency_ns: 1,
+        },
+        economics: ScenarioEconomics {
+            base: base.clone(),
+            conservative: base.clone(),
+            severe: base,
+        },
+        simulation: SimulationEvidence {
+            kind: SimulationKind::HistoricalReplay,
+            block_number: 1,
+            block_hash: Some("fixture-block-hash".to_string()),
+            from_address: None,
+            target_contract: None,
+            contract_code_hash: None,
+            calldata_hash: "fixture-calldata-hash".to_string(),
+            value: Amount::ZERO,
+            gas_estimate: Some(1),
+            gas_used: Some(1),
+            simulated_output: Some(optimized.best_amount),
+            simulated_net_pnl: Some(SignedAmount(optimized.expected_net_profit.0 as i128)),
+            revert_reason: None,
+            state_overrides_hash: None,
+            provider_id: None,
+            simulated_at_unix_ms: 1_700_000_000_002,
+            latency_ns: 1,
+            state_drift_bps: BasisPoints(0),
+            classification: SimulationClassification::Passed,
+        },
+        decision: DecisionEvidence {
+            disposition: ShadowDisposition::Accepted,
+            primary_rejection_reason: None,
+            secondary_rejection_reasons: Vec::new(),
+            risk_flags: Vec::new(),
+            confidence_bps: 9_000,
+            policy_version: "fixture-policy-v1".to_string(),
+            execution_eligible: false,
+            decided_at_unix_ms: 1_700_000_000_003,
+        },
+        outcome: OutcomeEvidence {
+            opportunity_expires_at_unix_ms: 1_700_000_001_000,
+            ..OutcomeEvidence::default()
+        },
+    };
+    opportunity.validate_traceability().unwrap();
     let coordinator = ExecutionCoordinator::new(ExecutionMode::Shadow);
     assert_eq!(
         coordinator.submit(&opportunity),
