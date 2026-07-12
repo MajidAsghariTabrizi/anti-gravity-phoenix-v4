@@ -12,6 +12,7 @@ pub mod optimizer;
 pub mod origin;
 pub mod profit;
 pub mod readiness;
+pub mod simulation;
 pub mod state;
 
 pub use domain::*;

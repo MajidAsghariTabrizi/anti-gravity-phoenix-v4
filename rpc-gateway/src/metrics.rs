@@ -23,5 +23,9 @@ pub const REQUIRED_RPC_METRICS: &[&str] = &[
     "rpc_rate_limit_total",
     "rpc_circuit_open_total",
     "rpc_budget_rejected_total",
+    "rpc_provider_disagreement_total",
+    "rpc_provider_timeout_total",
+    "rpc_provider_retries_total",
+    "rpc_archive_unavailable_total",
     "rpc_latency_seconds",
 ];
