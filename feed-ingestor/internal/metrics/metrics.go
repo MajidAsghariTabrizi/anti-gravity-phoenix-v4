@@ -28,6 +28,9 @@ var defaultCounters = []string{
 	"feed_reconnects_total",
 	"feed_normalized_transactions_total",
 	"feed_sequence_gaps_total",
+	"feed_sequence_gap_messages_total",
+	"feed_sequence_regressions_total",
+	"feed_sequence_duplicates_total",
 	"feed_duplicates_total",
 	"feed_out_of_order_total",
 	"feed_publish_success_total",
@@ -142,6 +145,7 @@ type Readiness struct {
 	sequenceKnown      bool
 	unresolvedGap      bool
 	natsReachable      bool
+	integrityFailure   string
 	fatal              string
 }
 
@@ -161,6 +165,13 @@ func (r *Readiness) MarkSourceConnected() {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.sourceConnected = true
+}
+
+func (r *Readiness) MarkSourceDisconnected() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.sourceConnected = false
+	r.sequenceKnown = false
 }
 
 func (r *Readiness) MarkSuccessfulPublish() {
@@ -200,6 +211,14 @@ func (r *Readiness) MarkNATSUnavailable() {
 	r.natsReachable = false
 }
 
+func (r *Readiness) MarkIntegrityFailure(reason string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.integrityFailure == "" {
+		r.integrityFailure = reason
+	}
+}
+
 func (r *Readiness) MarkFatal(reason string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -211,6 +230,9 @@ func (r *Readiness) Ready() (bool, string) {
 	defer r.mu.RUnlock()
 	if r.fatal != "" {
 		return false, r.fatal
+	}
+	if r.integrityFailure != "" {
+		return false, r.integrityFailure
 	}
 	if !r.sourceInitialized {
 		return false, "source not initialized"

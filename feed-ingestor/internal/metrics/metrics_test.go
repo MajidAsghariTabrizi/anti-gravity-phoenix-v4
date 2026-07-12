@@ -27,6 +27,15 @@ func TestRegistryRendersCountersAndLatency(t *testing.T) {
 	if !strings.Contains(rendered, "feed_jetstream_publish_success_total 0") {
 		t.Fatalf("missing JetStream counters: %s", rendered)
 	}
+	for _, required := range []string{
+		"feed_sequence_gap_messages_total 0",
+		"feed_sequence_regressions_total 0",
+		"feed_sequence_duplicates_total 0",
+	} {
+		if !strings.Contains(rendered, required) {
+			t.Fatalf("missing sequence counter %q: %s", required, rendered)
+		}
+	}
 }
 
 func TestReadinessFallsWhenDurableNATSConnectionIsUnavailable(t *testing.T) {
@@ -97,5 +106,42 @@ func TestReadinessSequenceEvidenceCannotReplaceSuccessfulPublish(t *testing.T) {
 	ready.MarkSequenceKnown()
 	if ok, reason := ready.Ready(); ok || reason != "no successful feed transaction published" {
 		t.Fatalf("sequence evidence must not claim readiness ok=%v reason=%q", ok, reason)
+	}
+}
+
+func TestDisconnectRequiresFreshSequenceEvidenceBeforeReadinessRecovers(t *testing.T) {
+	ready := Readiness{}
+	ready.MarkSourceInitialized()
+	ready.MarkAdapterInitialized()
+	ready.MarkSourceConnected()
+	ready.MarkNATSReachable()
+	ready.MarkSuccessfulPublish()
+	ready.MarkSourceDisconnected()
+	if ok, reason := ready.Ready(); ok || reason != "feed source not connected" {
+		t.Fatalf("disconnect did not clear readiness ok=%v reason=%q", ok, reason)
+	}
+	ready.MarkSourceConnected()
+	if ok, reason := ready.Ready(); ok || reason != "feed sequence unknown" {
+		t.Fatalf("reconnect claimed readiness before sequence evidence ok=%v reason=%q", ok, reason)
+	}
+	ready.MarkSequenceKnown()
+	if ok, reason := ready.Ready(); !ok || reason != "ready" {
+		t.Fatalf("fresh sequence evidence did not recover readiness ok=%v reason=%q", ok, reason)
+	}
+}
+
+func TestIntegrityFailureIsTerminalForProcessLifetime(t *testing.T) {
+	ready := Readiness{}
+	ready.MarkSourceInitialized()
+	ready.MarkAdapterInitialized()
+	ready.MarkSourceConnected()
+	ready.MarkNATSReachable()
+	ready.MarkSuccessfulPublish()
+	ready.MarkIntegrityFailure("Nitro feed sequence regression")
+	ready.MarkSourceDisconnected()
+	ready.MarkSourceConnected()
+	ready.MarkSequenceKnown()
+	if ok, reason := ready.Ready(); ok || reason != "Nitro feed sequence regression" {
+		t.Fatalf("terminal integrity failure recovered unexpectedly ok=%v reason=%q", ok, reason)
 	}
 }

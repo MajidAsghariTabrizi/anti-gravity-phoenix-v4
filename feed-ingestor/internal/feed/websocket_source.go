@@ -33,6 +33,7 @@ type RelayEventKind string
 
 const (
 	RelayEventConnected        RelayEventKind = "connected"
+	RelayEventDisconnected     RelayEventKind = "disconnected"
 	RelayEventReconnectAttempt RelayEventKind = "reconnect_attempt"
 )
 
@@ -175,6 +176,7 @@ func (s *RelaySource) Next(ctx context.Context) (RelayMessage, error) {
 			return RelayMessage{}, ctx.Err()
 		}
 		s.logTransportError(err)
+		s.emitEvent(RelayEvent{Kind: RelayEventDisconnected})
 		s.dropConn()
 	}
 }
@@ -300,6 +302,8 @@ func (s *RelaySource) emitEvent(event RelayEvent) {
 			event.Attempt,
 			event.Backoff.String(),
 		)
+	case RelayEventDisconnected:
+		s.logger.Printf("event=feed_websocket_disconnected source=relay")
 	}
 	if s.onEvent != nil {
 		s.onEvent(event)

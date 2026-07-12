@@ -138,8 +138,19 @@ diagnostics() {
   echo "RECORDER_LIVE_SMOKE_DIAGNOSTICS: bounded status and last 40 service log lines follow" >&2
   compose ps postgres nats recorder nitro-feed-relay feed-ingestor >&2 || true
   echo "jetstream_stream_exists=$(jetstream_value stream_exists) jetstream_consumer_exists=$(jetstream_value consumer_exists) pending=$(jetstream_value pending) ack_pending=$(jetstream_value ack_pending)" >&2
-  echo "feed_publish_acks=$(feed_metric feed_jetstream_publish_success_total) recorder_persisted=$(recorder_metric recorder_messages_persisted_total) recorder_ack_failures=$(recorder_metric recorder_jetstream_ack_failures_total)" >&2
+  echo "feed_jetstream_publish_success_total=$(feed_metric feed_jetstream_publish_success_total) feed_jetstream_publish_failures_total=$(feed_metric feed_jetstream_publish_failures_total) feed_decode_failures_total=$(feed_metric feed_decode_failures_total)" >&2
+  echo "feed_sequence_gaps_total=$(feed_metric feed_sequence_gaps_total) feed_sequence_gap_messages_total=$(feed_metric feed_sequence_gap_messages_total) feed_sequence_regressions_total=$(feed_metric feed_sequence_regressions_total) feed_sequence_duplicates_total=$(feed_metric feed_sequence_duplicates_total) feed_unsupported_messages_total=$(feed_metric feed_unsupported_messages_total)" >&2
+  echo "recorder_messages_persisted_total=$(recorder_metric recorder_messages_persisted_total) recorder_jetstream_ack_failures_total=$(recorder_metric recorder_jetstream_ack_failures_total)" >&2
   compose logs --no-color --tail 40 nats recorder feed-ingestor >&2 || true
+}
+
+assert_metric_unchanged() {
+  metric=$1
+  before=$2
+  after=$3
+  if [ "$after" -ne "$before" ]; then
+    fail "$metric increased before=$before after=$after"
+  fi
 }
 
 fail() {
@@ -207,12 +218,16 @@ recorder_ack_failures_before=$(recorder_metric recorder_jetstream_ack_failures_t
 compose up -d feed-ingestor || fail "feed-ingestor failed to start"
 wait_for_feed || fail "feed-ingestor did not produce a JetStream persistence acknowledgement"
 
-[ "$(feed_metric feed_publish_failures_total)" -eq 0 ] || fail "feed publish failures appeared before observation"
-[ "$(feed_metric feed_jetstream_publish_failures_total)" -eq 0 ] || fail "JetStream publish acknowledgement failures appeared before observation"
-[ "$(feed_metric feed_jetstream_stream_unavailable_total)" -eq 0 ] || fail "JetStream stream availability failed before observation"
-[ "$(feed_metric feed_decode_failures_total)" -eq 0 ] || fail "feed decode failures appeared before observation"
-
 publish_acks_before=$(feed_metric feed_jetstream_publish_success_total)
+feed_publish_failures_before=$(feed_metric feed_publish_failures_total)
+feed_jetstream_publish_failures_before=$(feed_metric feed_jetstream_publish_failures_total)
+feed_stream_unavailable_before=$(feed_metric feed_jetstream_stream_unavailable_total)
+feed_decode_failures_before=$(feed_metric feed_decode_failures_total)
+feed_unsupported_before=$(feed_metric feed_unsupported_messages_total)
+feed_sequence_gaps_before=$(feed_metric feed_sequence_gaps_total)
+feed_sequence_gap_messages_before=$(feed_metric feed_sequence_gap_messages_total)
+feed_sequence_regressions_before=$(feed_metric feed_sequence_regressions_total)
+feed_sequence_duplicates_before=$(feed_metric feed_sequence_duplicates_total)
 last_publish_acks=$publish_acks_before
 last_publish_progress=$(date +%s)
 peak_pending=0
@@ -238,18 +253,34 @@ while [ "$(date +%s)" -lt "$observation_deadline" ]; do
     fail "JetStream publish acknowledgements stopped for 30 seconds"
   fi
 
-  [ "$(recorder_metric recorder_database_failures_total)" -eq "$recorder_database_failures_before" ] || fail "Recorder database failures increased"
-  [ "$(recorder_metric recorder_decode_failures_total)" -eq "$recorder_decode_failures_before" ] || fail "Recorder decode failures increased"
-  [ "$(recorder_metric recorder_jetstream_ack_failures_total)" -eq "$recorder_ack_failures_before" ] || fail "Recorder acknowledgement failures increased"
-  [ "$(feed_metric feed_publish_failures_total)" -eq 0 ] || fail "feed publish failures increased"
-  [ "$(feed_metric feed_jetstream_publish_failures_total)" -eq 0 ] || fail "JetStream publish acknowledgement failures increased"
-  [ "$(feed_metric feed_jetstream_stream_unavailable_total)" -eq 0 ] || fail "JetStream stream became unavailable"
-  [ "$(feed_metric feed_decode_failures_total)" -eq 0 ] || fail "feed decode failures increased"
+  recorder_database_failures_now=$(recorder_metric recorder_database_failures_total)
+  recorder_decode_failures_now=$(recorder_metric recorder_decode_failures_total)
+  recorder_ack_failures_now=$(recorder_metric recorder_jetstream_ack_failures_total)
+  feed_publish_failures_now=$(feed_metric feed_publish_failures_total)
+  feed_jetstream_publish_failures_now=$(feed_metric feed_jetstream_publish_failures_total)
+  feed_stream_unavailable_now=$(feed_metric feed_jetstream_stream_unavailable_total)
+  feed_decode_failures_now=$(feed_metric feed_decode_failures_total)
+  feed_sequence_regressions_now=$(feed_metric feed_sequence_regressions_total)
+
+  assert_metric_unchanged recorder_database_failures_total "$recorder_database_failures_before" "$recorder_database_failures_now"
+  assert_metric_unchanged recorder_decode_failures_total "$recorder_decode_failures_before" "$recorder_decode_failures_now"
+  assert_metric_unchanged recorder_jetstream_ack_failures_total "$recorder_ack_failures_before" "$recorder_ack_failures_now"
+  assert_metric_unchanged feed_publish_failures_total "$feed_publish_failures_before" "$feed_publish_failures_now"
+  assert_metric_unchanged feed_jetstream_publish_failures_total "$feed_jetstream_publish_failures_before" "$feed_jetstream_publish_failures_now"
+  assert_metric_unchanged feed_jetstream_stream_unavailable_total "$feed_stream_unavailable_before" "$feed_stream_unavailable_now"
+  assert_metric_unchanged feed_decode_failures_total "$feed_decode_failures_before" "$feed_decode_failures_now"
+  assert_metric_unchanged feed_sequence_regressions_total "$feed_sequence_regressions_before" "$feed_sequence_regressions_now"
   assert_no_loss_events
   sleep 5
 done
 
 publish_acks_after=$(feed_metric feed_jetstream_publish_success_total)
+feed_decode_failures_after=$(feed_metric feed_decode_failures_total)
+feed_unsupported_after=$(feed_metric feed_unsupported_messages_total)
+feed_sequence_gaps_after=$(feed_metric feed_sequence_gaps_total)
+feed_sequence_gap_messages_after=$(feed_metric feed_sequence_gap_messages_total)
+feed_sequence_regressions_after=$(feed_metric feed_sequence_regressions_total)
+feed_sequence_duplicates_after=$(feed_metric feed_sequence_duplicates_total)
 recorder_persisted_after=$(recorder_metric recorder_messages_persisted_total)
 feed_events_after=$(table_count feed_events)
 origins_after=$(table_count origin_transactions)
@@ -325,3 +356,4 @@ wait_for_feed || fail "feed-ingestor did not recover after the controlled drain"
 
 echo "RECORDER_LIVE_SMOKE_PASS: durable JetStream publication, bounded batching, restart replay, and PostgreSQL uniqueness observed"
 echo "publish_acks=$publish_acks_before->$final_publish_acks feed_events=$feed_events_before->$feed_events_drained origin_transactions=$origins_before->$origins_after peak_pending=$peak_pending restart_pending=$pending_before_restart->$pending_during_restart"
+echo "feed_decode_failures_total=$feed_decode_failures_before->$feed_decode_failures_after feed_unsupported_messages_total=$feed_unsupported_before->$feed_unsupported_after feed_sequence_gaps_total=$feed_sequence_gaps_before->$feed_sequence_gaps_after feed_sequence_gap_messages_total=$feed_sequence_gap_messages_before->$feed_sequence_gap_messages_after feed_sequence_regressions_total=$feed_sequence_regressions_before->$feed_sequence_regressions_after feed_sequence_duplicates_total=$feed_sequence_duplicates_before->$feed_sequence_duplicates_after"

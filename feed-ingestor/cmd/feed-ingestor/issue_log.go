@@ -7,6 +7,7 @@ import (
 
 	"anti-gravity-phoenix-v4/feed-ingestor/internal/metrics"
 	"anti-gravity-phoenix-v4/feed-ingestor/internal/nitro"
+	"anti-gravity-phoenix-v4/feed-ingestor/internal/sequence"
 )
 
 const (
@@ -50,22 +51,10 @@ func newSampledIssueLogger(logger *log.Logger, interval time.Duration, now func(
 
 func (l *sampledIssueLogger) Log(class string, sequence uint64, reason string) {
 	key := class + "\x00" + reason
-	now := l.now()
-
-	l.mu.Lock()
-	if _, found := l.states[key]; !found && len(l.states) >= maxIssueLogStates {
-		key = overflowIssueLogKey
-	}
-	state, found := l.states[key]
-	if found && !state.lastLogged.IsZero() && now.Sub(state.lastLogged) < l.interval {
-		state.suppressed++
-		l.states[key] = state
-		l.mu.Unlock()
+	suppressed, emit := l.sample(key)
+	if !emit {
 		return
 	}
-	suppressed := state.suppressed
-	l.states[key] = issueLogState{lastLogged: now}
-	l.mu.Unlock()
 
 	l.logger.Printf(
 		"event=nitro_payload_issue class=%s sequence=%d reason=%q suppressed=%d",
@@ -74,6 +63,42 @@ func (l *sampledIssueLogger) Log(class string, sequence uint64, reason string) {
 		reason,
 		suppressed,
 	)
+}
+
+func (l *sampledIssueLogger) LogSequence(observation sequence.Result) {
+	key := "sequence\x00" + string(observation.Event)
+	suppressed, emit := l.sample(key)
+	if !emit {
+		return
+	}
+	l.logger.Printf(
+		"event=feed_sequence_event class=%s sequence=%d gap_from=%d gap_to=%d missing=%d reconnected=%t suppressed=%d",
+		observation.Event,
+		observation.Sequence,
+		observation.GapFrom,
+		observation.GapTo,
+		observation.Missing,
+		observation.Reconnected,
+		suppressed,
+	)
+}
+
+func (l *sampledIssueLogger) sample(key string) (uint64, bool) {
+	now := l.now()
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if _, found := l.states[key]; !found && len(l.states) >= maxIssueLogStates {
+		key = overflowIssueLogKey
+	}
+	state, found := l.states[key]
+	if found && !state.lastLogged.IsZero() && now.Sub(state.lastLogged) < l.interval {
+		state.suppressed++
+		l.states[key] = state
+		return 0, false
+	}
+	suppressed := state.suppressed
+	l.states[key] = issueLogState{lastLogged: now}
+	return suppressed, true
 }
 
 func recordFrameIssues(registry *metrics.Registry, issueLogger *sampledIssueLogger, frame nitro.Frame) {

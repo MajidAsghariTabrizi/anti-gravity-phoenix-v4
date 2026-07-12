@@ -330,6 +330,10 @@ mod tests {
         for required in [
             "RECORDER_SMOKE_OBSERVATION_SECONDS",
             "feed_jetstream_publish_success_total",
+            "assert_metric_unchanged feed_decode_failures_total",
+            "feed_sequence_gap_messages_total=",
+            "feed_sequence_regressions_total=",
+            "feed_sequence_duplicates_total=",
             "recorder_jetstream_ack_failures_total",
             "jetstream_value stream_exists",
             "jetstream_value consumer_exists",

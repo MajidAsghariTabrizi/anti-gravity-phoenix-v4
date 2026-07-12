@@ -10,6 +10,7 @@ import (
 
 	"anti-gravity-phoenix-v4/feed-ingestor/internal/metrics"
 	"anti-gravity-phoenix-v4/feed-ingestor/internal/nitro"
+	"anti-gravity-phoenix-v4/feed-ingestor/internal/sequence"
 )
 
 func TestIssueLogRateLimitingDoesNotAffectCounters(t *testing.T) {
@@ -74,5 +75,42 @@ func TestIssueLogStateCardinalityIsBounded(t *testing.T) {
 	}
 	if got := strings.Count(output.String(), "event=nitro_payload_issue"); got > maxIssueLogStates {
 		t.Fatalf("high-cardinality issues emitted too many logs in one window: %d", got)
+	}
+}
+
+func TestSequenceLogsAreStructuredSampledAndPayloadFree(t *testing.T) {
+	var output bytes.Buffer
+	now := time.Unix(1700000000, 0)
+	issueLogger := newSampledIssueLogger(log.New(&output, "", 0), time.Minute, func() time.Time {
+		return now
+	})
+	observation := sequence.Result{
+		Event:       sequence.Gap,
+		Sequence:    103,
+		GapFrom:     101,
+		GapTo:       102,
+		Missing:     2,
+		Reconnected: true,
+	}
+	for range 20 {
+		issueLogger.LogSequence(observation)
+	}
+	if got := strings.Count(output.String(), "event=feed_sequence_event"); got != 1 {
+		t.Fatalf("expected one sampled sequence log, got %d: %s", got, output.String())
+	}
+	for _, expected := range []string{
+		"class=GAP",
+		"sequence=103",
+		"gap_from=101",
+		"gap_to=102",
+		"missing=2",
+		"reconnected=true",
+	} {
+		if !strings.Contains(output.String(), expected) {
+			t.Fatalf("sequence log missing %q: %s", expected, output.String())
+		}
+	}
+	if strings.Contains(output.String(), "raw_tx") {
+		t.Fatalf("sequence log exposed transaction payload: %s", output.String())
 	}
 }

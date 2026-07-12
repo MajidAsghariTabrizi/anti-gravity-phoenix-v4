@@ -296,17 +296,20 @@ func TestRelaySourceEmitsReconnectLifecycleEvents(t *testing.T) {
 	if !message.AfterReconnect {
 		t.Fatal("expected first message after the second connection to be marked as reconnected")
 	}
-	if len(events) != 3 {
+	if len(events) != 4 {
 		t.Fatalf("unexpected lifecycle events: %+v", events)
 	}
 	if events[0].Kind != RelayEventConnected || events[0].Reconnected {
 		t.Fatalf("unexpected initial connection event: %+v", events[0])
 	}
-	if events[1].Kind != RelayEventReconnectAttempt || events[1].Attempt != 2 || events[1].Backoff <= 0 {
-		t.Fatalf("unexpected reconnect event: %+v", events[1])
+	if events[1].Kind != RelayEventDisconnected {
+		t.Fatalf("unexpected disconnect event: %+v", events[1])
 	}
-	if events[2].Kind != RelayEventConnected || !events[2].Reconnected {
-		t.Fatalf("unexpected reconnected event: %+v", events[2])
+	if events[2].Kind != RelayEventReconnectAttempt || events[2].Attempt != 2 || events[2].Backoff <= 0 {
+		t.Fatalf("unexpected reconnect event: %+v", events[2])
+	}
+	if events[3].Kind != RelayEventConnected || !events[3].Reconnected {
+		t.Fatalf("unexpected reconnected event: %+v", events[3])
 	}
 }
 
