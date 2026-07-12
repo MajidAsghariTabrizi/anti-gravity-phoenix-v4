@@ -14,4 +14,5 @@ path = "src/main.rs"
 
 [dependencies]
 phoenix-engine = { path = "../phoenix-engine" }
-
+serde = { version = "=1.0.210", features = ["derive"] }
+serde_json = "=1.0.128"
