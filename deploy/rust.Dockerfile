@@ -16,11 +16,15 @@ RUN case "${CRATE}" in \
       *) echo "unknown crate ${CRATE}" && exit 1 ;; \
     esac && \
     cd "${CRATE}" && cargo build --release --bin "${BIN}" && \
-    mkdir -p /out && cp "target/release/${BIN}" /out/service
+    mkdir -p /out && cp "target/release/${BIN}" /out/service && \
+    if [ "${CRATE}" = "recorder" ]; then \
+      cargo build --release --bin shadow-dispatcher && \
+      cp target/release/shadow-dispatcher /out/shadow-dispatcher; \
+    fi
 
 FROM debian:bookworm-slim
 WORKDIR /app
 RUN apt-get update && apt-get install -y --no-install-recommends wget ca-certificates && rm -rf /var/lib/apt/lists/*
-COPY --from=build /out/service /usr/local/bin/service
+COPY --from=build /out/ /usr/local/bin/
 USER 65532:65532
 ENTRYPOINT ["/usr/local/bin/service"]

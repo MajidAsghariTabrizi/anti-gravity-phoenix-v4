@@ -249,4 +249,14 @@ pub(crate) mod tests {
         assert_eq!(error, DecodeError::InvalidRawTransaction);
         assert!(!error.to_string().contains("secret-material"));
     }
+
+    #[test]
+    fn largest_valid_normalized_event_leaves_bounded_jetstream_header_budget() {
+        let mut value: Value = serde_json::from_slice(&sample_payload(1, 'a')).unwrap();
+        value["calldata"] = json!(format!("0x{}", "aa".repeat(MAX_TRANSACTION_BYTES)));
+        value["raw_tx"] = json!(BASE64_STANDARD.encode(vec![0_u8; MAX_TRANSACTION_BYTES]));
+        let encoded = serde_json::to_vec(&value).unwrap();
+        assert!(encoded.len() + 1024 <= MAX_MESSAGE_BYTES);
+        assert!(decode_message(&encoded).is_ok());
+    }
 }

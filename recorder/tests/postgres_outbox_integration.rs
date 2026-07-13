@@ -1,7 +1,9 @@
+use phoenix_recorder::engine_outbox::{OutboxStore, PostgresOutbox};
 use phoenix_recorder::model::{decode_message, ARBITRUM_ONE_CHAIN_ID, NORMALIZED_SCHEMA_VERSION};
 use phoenix_recorder::persistence::{EventStore, PostgresStore, StoreError};
 use serde_json::json;
 use sqlx::{PgPool, Row};
+use std::time::Duration;
 
 fn local_postgres_dsn() -> Option<String> {
     let dsn = std::env::var("PHOENIX_TEST_POSTGRES_DSN").ok()?;
@@ -128,6 +130,43 @@ async fn recorder_commit_outbox_recovery_and_rollback_are_atomic() {
     assert!(mixed[1].origin_transaction_inserted);
     assert!(mixed[1].feed_event_inserted);
     assert!(mixed[1].engine_outbox_inserted);
+
+    let outbox = PostgresOutbox::connect(&dsn, "disable")
+        .await
+        .expect("connect Dispatcher outbox store");
+    outbox.verify_schema().await.expect("verify outbox schema");
+    let owner_one = outbox
+        .claim_batch("dispatcher-one", 1, Duration::from_secs(1))
+        .await
+        .expect("claim first outbox row");
+    let owner_two = outbox
+        .claim_batch("dispatcher-two", 1, Duration::from_secs(30))
+        .await
+        .expect("concurrently claim second outbox row");
+    assert_eq!(owner_one.len(), 1);
+    assert_eq!(owner_two.len(), 1);
+    assert_ne!(owner_one[0].outbox_id, owner_two[0].outbox_id);
+
+    outbox
+        .mark_published(&owner_two[0].outbox_id, "dispatcher-two", 41)
+        .await
+        .expect("mark second row published after ACK");
+    tokio::time::sleep(Duration::from_millis(1_100)).await;
+    let recovered = outbox
+        .claim_batch("dispatcher-recovery", 64, Duration::from_secs(30))
+        .await
+        .expect("reclaim expired lease");
+    assert_eq!(recovered.len(), 1);
+    assert_eq!(recovered[0].outbox_id, owner_one[0].outbox_id);
+    outbox
+        .mark_published(&recovered[0].outbox_id, "dispatcher-recovery", 42)
+        .await
+        .expect("mark recovered row published");
+    assert!(outbox
+        .claim_batch("dispatcher-final", 64, Duration::from_secs(30))
+        .await
+        .expect("verify published rows are not claimable")
+        .is_empty());
 
     sqlx::raw_sql(
         r#"

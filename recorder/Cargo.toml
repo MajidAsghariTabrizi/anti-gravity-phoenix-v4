@@ -13,6 +13,10 @@ path = "src/lib.rs"
 name = "phoenix-recorder"
 path = "src/main.rs"
 
+[[bin]]
+name = "shadow-dispatcher"
+path = "src/bin/shadow-dispatcher.rs"
+
 [dependencies]
 async-nats = "=0.37.0"
 async-trait = "=0.1.81"
