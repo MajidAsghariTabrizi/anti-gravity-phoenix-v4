@@ -14,6 +14,7 @@ struct MetricValues {
     messages_received: AtomicU64,
     messages_persisted: AtomicU64,
     transactions_persisted: AtomicU64,
+    engine_outbox_inserted: AtomicU64,
     duplicate_skips: AtomicU64,
     decode_failures: AtomicU64,
     database_failures: AtomicU64,
@@ -46,6 +47,12 @@ impl Metrics {
     pub fn transaction_persisted(&self) {
         self.inner
             .transactions_persisted
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn engine_outbox_inserted(&self) {
+        self.inner
+            .engine_outbox_inserted
             .fetch_add(1, Ordering::Relaxed);
     }
 
@@ -132,6 +139,8 @@ impl Metrics {
                 "recorder_messages_persisted_total {}\n",
                 "# TYPE recorder_transactions_persisted_total counter\n",
                 "recorder_transactions_persisted_total {}\n",
+                "# TYPE recorder_engine_outbox_inserted_total counter\n",
+                "recorder_engine_outbox_inserted_total {}\n",
                 "# TYPE recorder_duplicate_skips_total counter\n",
                 "recorder_duplicate_skips_total {}\n",
                 "# TYPE recorder_decode_failures_total counter\n",
@@ -170,6 +179,7 @@ impl Metrics {
             self.inner.messages_received.load(Ordering::Relaxed),
             self.inner.messages_persisted.load(Ordering::Relaxed),
             self.inner.transactions_persisted.load(Ordering::Relaxed),
+            self.inner.engine_outbox_inserted.load(Ordering::Relaxed),
             self.inner.duplicate_skips.load(Ordering::Relaxed),
             self.inner.decode_failures.load(Ordering::Relaxed),
             self.inner.database_failures.load(Ordering::Relaxed),

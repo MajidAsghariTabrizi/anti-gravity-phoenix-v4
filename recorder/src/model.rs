@@ -6,10 +6,18 @@ use serde_json::{json, Value};
 use thiserror::Error;
 
 pub const NORMALIZED_SCHEMA_VERSION: &str = "phoenix.v4.normalized_tx.v1";
+pub const ENGINE_INPUT_SCHEMA_VERSION: &str = "phoenix.engine.input.v1";
 pub const ARBITRUM_ONE_CHAIN_ID: u64 = 42161;
 pub const ORIGIN_CLASSIFICATION: &str = crate::OpportunityLifecycle::OriginSeen.as_str();
 pub const MAX_MESSAGE_BYTES: usize = 1024 * 1024;
 pub const MAX_TRANSACTION_BYTES: usize = 256 * 1024;
+
+pub fn engine_event_identity(tx: &NormalizedTx) -> String {
+    format!(
+        "{}:{}:{}",
+        ENGINE_INPUT_SCHEMA_VERSION, tx.sequence, tx.tx_hash
+    )
+}
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -207,6 +215,11 @@ pub(crate) mod tests {
         assert_eq!(message.calldata, vec![0x12, 0x34]);
         assert_eq!(message.metadata["source_subject"], crate::NATS_SUBJECT);
         assert!(message.metadata.get("raw_tx").is_none());
+        assert_eq!(
+            engine_event_identity(&message.tx),
+            format!("{}:7:0x{}", ENGINE_INPUT_SCHEMA_VERSION, "a".repeat(64))
+        );
+        assert!(serde_json::to_vec(&message.payload).unwrap().len() <= MAX_MESSAGE_BYTES);
     }
 
     #[test]

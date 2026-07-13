@@ -37,6 +37,33 @@ func TestShadowProfitabilityMigrationIsAdditiveAndFailClosed(t *testing.T) {
 	}
 }
 
+func TestShadowEngineRuntimeMigrationIsAdditiveBoundedAndIdempotent(t *testing.T) {
+	migrationPath := filepath.Join("..", "..", "..", "migrations", "004_shadow_engine_runtime.sql")
+	content, err := os.ReadFile(migrationPath)
+	if err != nil {
+		t.Fatalf("read shadow Engine runtime migration: %v", err)
+	}
+	sqlText := strings.ToUpper(string(content))
+	for _, required := range []string{
+		"CREATE TABLE IF NOT EXISTS ENGINE_OUTBOX",
+		"SOURCE_EVENT_IDENTITY TEXT NOT NULL UNIQUE",
+		"OCTET_LENGTH(PAYLOAD::TEXT) <= 1048576",
+		"ENGINE_OUTBOX_PENDING_IDX",
+		"ENGINE_OUTBOX_RETRY_IDX",
+		"CREATE TABLE IF NOT EXISTS SHADOW_ENGINE_CLASSIFICATIONS",
+		"CREATE TABLE IF NOT EXISTS SHADOW_ENGINE_PROCESSING_ATTEMPTS",
+	} {
+		if !strings.Contains(sqlText, required) {
+			t.Fatalf("migration missing %q", required)
+		}
+	}
+	for _, destructive := range []string{"DROP TABLE", "DROP COLUMN", "TRUNCATE TABLE", "DELETE FROM"} {
+		if strings.Contains(sqlText, destructive) {
+			t.Fatalf("migration contains destructive statement %q", destructive)
+		}
+	}
+}
+
 func TestLoadMigrationsOrdersByVersion(t *testing.T) {
 	dir := t.TempDir()
 	writeMigration(t, dir, "002_second.sql", "SELECT 2;")

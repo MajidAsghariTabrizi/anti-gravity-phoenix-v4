@@ -385,14 +385,23 @@ fn record_persist_outcomes(
     metrics: &Metrics,
 ) {
     for (message, outcome) in messages.iter().zip(outcomes) {
-        if outcome.feed_event_inserted || outcome.origin_transaction_inserted {
+        if outcome.feed_event_inserted
+            || outcome.origin_transaction_inserted
+            || outcome.engine_outbox_inserted
+        {
             metrics.message_persisted();
             metrics.set_last_persisted(message.tx.sequence, message.tx.timestamp_unix_ms);
         }
         if outcome.origin_transaction_inserted {
             metrics.transaction_persisted();
         }
-        if !outcome.feed_event_inserted || !outcome.origin_transaction_inserted {
+        if outcome.engine_outbox_inserted {
+            metrics.engine_outbox_inserted();
+        }
+        if !outcome.feed_event_inserted
+            || !outcome.origin_transaction_inserted
+            || !outcome.engine_outbox_inserted
+        {
             metrics.duplicate_skip();
         }
     }
@@ -591,6 +600,7 @@ mod tests {
                         PersistOutcome {
                             feed_event_inserted: true,
                             origin_transaction_inserted: true,
+                            engine_outbox_inserted: true,
                         };
                         messages.len()
                     ])
@@ -765,6 +775,7 @@ mod tests {
         let inserted = PersistOutcome {
             feed_event_inserted: true,
             origin_transaction_inserted: true,
+            engine_outbox_inserted: true,
         };
         let store = FakeStore::new(vec![Err(StoreError::Connection), Ok(vec![inserted])]);
         let acker = Arc::new(FakeAcker::default());
@@ -796,6 +807,7 @@ mod tests {
             Ok(vec![PersistOutcome {
                 feed_event_inserted: true,
                 origin_transaction_inserted: true,
+                engine_outbox_inserted: true,
             }]),
             Ok(vec![PersistOutcome::default()]),
         ]);
