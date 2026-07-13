@@ -2,8 +2,6 @@ use std::collections::HashSet;
 use std::fmt;
 use std::time::{Duration, Instant};
 
-use crate::budget::TokenBucket;
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CircuitState {
     Closed,
@@ -18,7 +16,6 @@ pub struct Provider {
     pub health_score: i32,
     pub circuit: CircuitState,
     pub cooldown_until: Option<Instant>,
-    pub bucket: TokenBucket,
     pub consecutive_failures: u32,
 }
 
@@ -62,14 +59,13 @@ impl fmt::Debug for ProviderLease {
 }
 
 impl Provider {
-    pub fn new(name: String, url: String, weight: u32, now: Instant) -> Self {
+    pub fn new(name: String, url: String, weight: u32, _now: Instant) -> Self {
         Self {
             name,
             url,
             weight,
             health_score: 100,
             circuit: CircuitState::Closed,
-            bucket: TokenBucket::new(weight, Duration::from_secs(1), now),
             cooldown_until: None,
             consecutive_failures: 0,
         }
@@ -79,15 +75,11 @@ impl Provider {
         if !self.refresh_eligibility(now) {
             return false;
         }
-        self.bucket.refill(now);
-        self.bucket.available() > 0
+        true
     }
 
     pub fn reserve(&mut self, now: Instant) -> bool {
-        if !self.refresh_eligibility(now) {
-            return false;
-        }
-        self.bucket.try_take(now)
+        self.refresh_eligibility(now)
     }
 
     fn refresh_eligibility(&mut self, now: Instant) -> bool {
@@ -121,6 +113,10 @@ impl Provider {
                 until: now + Duration::from_secs(30),
             };
         }
+    }
+
+    pub fn record_cooldown(&mut self, now: Instant, duration: Duration) {
+        self.cooldown_until = Some(now + duration);
     }
 }
 
@@ -180,6 +176,20 @@ impl ProviderPool {
         })
     }
 
+    pub fn reserve_named(&mut self, now: Instant, provider_id: &str) -> Option<ProviderLease> {
+        let provider = self
+            .providers
+            .iter_mut()
+            .find(|provider| provider.name == provider_id)?;
+        if !provider.reserve(now) {
+            return None;
+        }
+        Some(ProviderLease {
+            provider_id: provider.name.clone(),
+            url: provider.url.clone(),
+        })
+    }
+
     pub fn record_success(&mut self, provider_id: &str) -> bool {
         if let Some(provider) = self
             .providers
@@ -206,6 +216,19 @@ impl ProviderPool {
         }
     }
 
+    pub fn record_cooldown(&mut self, provider_id: &str, now: Instant, duration: Duration) -> bool {
+        if let Some(provider) = self
+            .providers
+            .iter_mut()
+            .find(|provider| provider.name == provider_id)
+        {
+            provider.record_cooldown(now, duration);
+            true
+        } else {
+            false
+        }
+    }
+
     pub fn len(&self) -> usize {
         self.providers.len()
     }
@@ -218,7 +241,6 @@ impl ProviderPool {
 #[derive(Clone, PartialEq, Eq)]
 pub struct ProviderConfig {
     pub providers: Vec<ProviderSpec>,
-    pub global_rps: u32,
 }
 
 impl fmt::Debug for ProviderConfig {
@@ -226,7 +248,6 @@ impl fmt::Debug for ProviderConfig {
         formatter
             .debug_struct("ProviderConfig")
             .field("provider_count", &self.providers.len())
-            .field("global_rps", &self.global_rps)
             .finish()
     }
 }
@@ -268,8 +289,6 @@ pub enum ProviderConfigError {
     CountMismatch { urls: usize, priorities: usize },
     InvalidPriority { index: usize },
     ZeroPriority { index: usize },
-    InvalidGlobalRps,
-    ZeroGlobalRps,
 }
 
 impl fmt::Display for ProviderConfigError {
@@ -296,8 +315,6 @@ impl fmt::Display for ProviderConfigError {
                     "RPC provider priority at index {index} must be greater than zero"
                 )
             }
-            Self::InvalidGlobalRps => write!(f, "RPC_GLOBAL_RPS must be a positive integer"),
-            Self::ZeroGlobalRps => write!(f, "RPC_GLOBAL_RPS must be greater than zero"),
         }
     }
 }
@@ -307,7 +324,6 @@ impl std::error::Error for ProviderConfigError {}
 pub fn parse_provider_config(
     urls: &str,
     priorities: &str,
-    global_rps: &str,
 ) -> Result<ProviderConfig, ProviderConfigError> {
     if urls.trim().is_empty() {
         return Err(ProviderConfigError::EmptyProviderList);
@@ -325,7 +341,6 @@ pub fn parse_provider_config(
         });
     }
 
-    let global_rps = parse_global_rps(global_rps)?;
     let mut providers = Vec::with_capacity(urls.len());
     let mut provider_names = HashSet::with_capacity(urls.len());
     for (index, (url, priority)) in urls.into_iter().zip(priorities).enumerate() {
@@ -350,10 +365,7 @@ pub fn parse_provider_config(
     if providers.is_empty() {
         return Err(ProviderConfigError::EmptyProviderList);
     }
-    Ok(ProviderConfig {
-        providers,
-        global_rps,
-    })
+    Ok(ProviderConfig { providers })
 }
 
 fn parse_priority(index: usize, value: &str) -> Result<u32, ProviderConfigError> {
@@ -365,20 +377,6 @@ fn parse_priority(index: usize, value: &str) -> Result<u32, ProviderConfigError>
     }
     if parsed < 0 || parsed > u32::MAX as i64 {
         return Err(ProviderConfigError::InvalidPriority { index });
-    }
-    Ok(parsed as u32)
-}
-
-fn parse_global_rps(value: &str) -> Result<u32, ProviderConfigError> {
-    let parsed = value
-        .trim()
-        .parse::<i64>()
-        .map_err(|_| ProviderConfigError::InvalidGlobalRps)?;
-    if parsed == 0 {
-        return Err(ProviderConfigError::ZeroGlobalRps);
-    }
-    if parsed < 0 || parsed > u32::MAX as i64 {
-        return Err(ProviderConfigError::InvalidGlobalRps);
     }
     Ok(parsed as u32)
 }

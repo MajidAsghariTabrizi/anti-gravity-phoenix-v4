@@ -3,6 +3,7 @@ use crate::decision::{decide, DecisionContext, ShadowPolicy};
 use crate::domain::{Amount, Direction, DomainError, Liquidity, OpportunityId, SqrtPriceX96, Tick};
 use crate::economics::{evaluate_scenarios, EconomicInput};
 use crate::engine_input::EngineInput;
+use crate::metrics::RuntimeMetrics;
 use crate::opportunity::{
     BasisPoints, DecisionEvidence, MarketEvidence, Opportunity, OpportunityIdentity,
     OutcomeEvidence, PoolStateEvidence, RejectionReason, RouteEvidence, ScenarioEconomics,
@@ -20,10 +21,10 @@ use futures_util::StreamExt;
 use primitive_types::U256;
 use reqwest::{Client, StatusCode, Url};
 use rpc_gateway::shadow_state::{
-    canonical_block_hash, canonical_data, canonical_hash_bytes, GatewayErrorResponse,
-    PoolStateRequest, RpcQualityEvidence, ShadowStateRequest, ShadowStateResponse,
-    ARBITRUM_ONE_CHAIN_ID, MAX_GATEWAY_REQUEST_BYTES, MAX_GATEWAY_RESPONSE_BYTES,
-    SHADOW_STATE_SCHEMA_VERSION,
+    canonical_block_hash, canonical_data, canonical_digest, canonical_hash_bytes, EvidenceRequest,
+    GatewayErrorResponse, PoolStateRequest, RpcQualityEvidence, ShadowStateRequest,
+    ShadowStateResponse, VerificationStatus, ARBITRUM_ONE_CHAIN_ID, MAX_GATEWAY_REQUEST_BYTES,
+    MAX_GATEWAY_RESPONSE_BYTES, SHADOW_STATE_SCHEMA_VERSION,
 };
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -186,6 +187,7 @@ impl ShadowStateClient for RpcGatewayClient {
 pub struct RpcCandidateEvaluator {
     client: Arc<dyn ShadowStateClient>,
     code_version: String,
+    metrics: RuntimeMetrics,
 }
 
 impl fmt::Debug for RpcCandidateEvaluator {
@@ -202,12 +204,21 @@ impl RpcCandidateEvaluator {
         client: Arc<dyn ShadowStateClient>,
         code_version: String,
     ) -> Result<Self, &'static str> {
+        Self::with_metrics(client, code_version, RuntimeMetrics::default())
+    }
+
+    pub fn with_metrics(
+        client: Arc<dyn ShadowStateClient>,
+        code_version: String,
+        metrics: RuntimeMetrics,
+    ) -> Result<Self, &'static str> {
         if !bounded_label(&code_version, 1, 128) {
             return Err("invalid Engine code version");
         }
         Ok(Self {
             client,
             code_version,
+            metrics,
         })
     }
 }
@@ -222,7 +233,7 @@ impl CandidateEvaluator for RpcCandidateEvaluator {
     ) -> Result<CandidateBatch, EvaluationError> {
         let request = state_request(route)?;
         let requested_at = Instant::now();
-        let response = self
+        let primary_response = self
             .client
             .fetch(&request)
             .await
@@ -235,8 +246,8 @@ impl CandidateEvaluator for RpcCandidateEvaluator {
                 }
             })?;
         let now_ms = unix_time_ms();
-        validate_response(&request, &response, now_ms)?;
-        let pools = decode_pools(route, &response)?;
+        validate_response(&request, &primary_response, now_ms)?;
+        let pools = decode_pools(route, &primary_response)?;
         let gas_price_wei = parse_decimal_u128(&input.normalized.max_fee_per_gas)
             .ok_or(EvaluationError::Terminal("economic_input_out_of_range"))?;
         let mut incomplete_state_seen = false;
@@ -275,6 +286,47 @@ impl CandidateEvaluator for RpcCandidateEvaluator {
         )
         .map_err(|_| EvaluationError::Terminal("shadow_model_arithmetic_failure"))?;
 
+        let Some(optimized) = optimized else {
+            self.metrics.rpc_primary_screen_rejected();
+            self.metrics.rpc_secondary_skipped();
+            return Ok(CandidateBatch {
+                evaluations: Vec::new(),
+                evidence: json!({
+                    "state_block": primary_response.block_number,
+                    "state_block_hash": primary_response.block_hash,
+                    "primary_provider_id": primary_response.primary_provider_id,
+                    "verification_status": primary_response.verification_status,
+                    "rpc_quality_record_count": primary_response.quality.len(),
+                    "state_model_tick_crossings_supported": 0,
+                    "incomplete_state_seen": incomplete_state_seen,
+                    "primary_screen_rejected": true,
+                    "secondary_skipped": true
+                }),
+            });
+        };
+        let verification_request = verification_request(&request, &primary_response)?;
+        let (response, secondary_transport_unavailable) =
+            match self.client.fetch(&verification_request).await {
+                Ok(response) => (response, false),
+                Err(GatewayClientError::Retryable) => {
+                    let mut unavailable = primary_response.clone();
+                    unavailable.request_hash = verification_request
+                        .canonical_hash()
+                        .map_err(|_| EvaluationError::Terminal("route_state_request_invalid"))?;
+                    unavailable.agreement_provider_id = None;
+                    unavailable.provider_agreement = false;
+                    unavailable.verification_status = VerificationStatus::SecondaryUnavailable;
+                    (unavailable, true)
+                }
+                Err(GatewayClientError::Integrity) => {
+                    return Err(EvaluationError::Terminal(
+                        "rpc_gateway_response_integrity_failure",
+                    ));
+                }
+            };
+        let now_ms = unix_time_ms();
+        validate_response(&verification_request, &response, now_ms)?;
+        let verified_pools = decode_pools(route, &response)?;
         let response_hash =
             canonical_hash_bytes(&serde_json::to_vec(&response).map_err(|_| {
                 EvaluationError::Terminal("rpc_gateway_response_integrity_failure")
@@ -286,24 +338,21 @@ impl CandidateEvaluator for RpcCandidateEvaluator {
             "primary_provider_id": response.primary_provider_id,
             "agreement_provider_id": response.agreement_provider_id,
             "provider_agreement": response.provider_agreement,
+            "verification_status": response.verification_status,
+            "secondary_verification_transport_unavailable": secondary_transport_unavailable,
             "rpc_quality_record_count": response.quality.len(),
             "state_model_tick_crossings_supported": 0,
             "incomplete_state_seen": incomplete_state_seen
         });
-        let Some(optimized) = optimized else {
-            return Ok(CandidateBatch {
-                evaluations: Vec::new(),
-                evidence: base_evidence,
-            });
-        };
-        let selected = evaluate_amount(route, &pools, optimized.best_amount, gas_price_wei)
-            .map_err(|_| EvaluationError::Terminal("shadow_model_recalculation_failure"))?;
+        let selected =
+            evaluate_amount(route, &verified_pools, optimized.best_amount, gas_price_wei)
+                .map_err(|_| EvaluationError::Terminal("shadow_model_recalculation_failure"))?;
         let opportunity = build_opportunity(
             input,
             origin,
             route,
             &response,
-            &pools,
+            &verified_pools,
             response_hash,
             selected,
             requested_at.elapsed(),
@@ -353,6 +402,23 @@ fn state_request(route: &RuntimeRoute) -> Result<ShadowStateRequest, EvaluationE
         chain_id: ARBITRUM_ONE_CHAIN_ID,
         route_fingerprint: route.fingerprint.clone(),
         pools,
+        evidence: EvidenceRequest::Primary,
+    };
+    request
+        .validate()
+        .map_err(|_| EvaluationError::Terminal("route_state_request_invalid"))?;
+    Ok(request)
+}
+
+fn verification_request(
+    primary_request: &ShadowStateRequest,
+    primary_response: &ShadowStateResponse,
+) -> Result<ShadowStateRequest, EvaluationError> {
+    let mut request = primary_request.clone();
+    request.evidence = EvidenceRequest::Verify {
+        block_number: primary_response.block_number,
+        block_hash: primary_response.block_hash.clone(),
+        primary_state_hash: primary_response.state_hash.clone(),
     };
     request
         .validate()
@@ -373,6 +439,7 @@ fn validate_response(
         || response.request_hash != request_hash
         || response.block_number == 0
         || !canonical_block_hash(&response.block_hash)
+        || !canonical_digest(&response.state_hash)
         || response.pools.len() != request.pools.len()
         || !bounded_label(&response.primary_provider_id, 1, 128)
         || response.primary_provider_id.contains("://")
@@ -381,6 +448,46 @@ fn validate_response(
         || response.quality.is_empty()
         || response.quality.len() > MAX_PROVIDER_QUALITY_RECORDS
     {
+        return Err(EvaluationError::Terminal(
+            "rpc_gateway_response_integrity_failure",
+        ));
+    }
+    let pools_hash = canonical_hash_bytes(
+        &serde_json::to_vec(&response.pools)
+            .map_err(|_| EvaluationError::Terminal("pool_state_identity_mismatch"))?,
+    );
+    if response.state_hash != pools_hash {
+        return Err(EvaluationError::Terminal("pool_state_identity_mismatch"));
+    }
+    let stage_valid = match &request.evidence {
+        EvidenceRequest::Primary => {
+            response.verification_status == VerificationStatus::PrimaryOnly
+                && !response.provider_agreement
+                && response.agreement_provider_id.is_none()
+        }
+        EvidenceRequest::Verify {
+            block_number,
+            block_hash,
+            primary_state_hash,
+        } => {
+            response.block_number == *block_number
+                && response.block_hash == *block_hash
+                && response.state_hash == *primary_state_hash
+                && response.verification_status != VerificationStatus::PrimaryOnly
+        }
+    };
+    let verification_valid = match response.verification_status {
+        VerificationStatus::PrimaryOnly | VerificationStatus::SecondaryUnavailable => {
+            !response.provider_agreement && response.agreement_provider_id.is_none()
+        }
+        VerificationStatus::Agreed => {
+            response.provider_agreement && response.agreement_provider_id.is_some()
+        }
+        VerificationStatus::Disagreed => {
+            !response.provider_agreement && response.agreement_provider_id.is_some()
+        }
+    };
+    if !stage_valid || !verification_valid {
         return Err(EvaluationError::Terminal(
             "rpc_gateway_response_integrity_failure",
         ));
@@ -432,7 +539,10 @@ fn validate_response(
             ));
         }
     }
-    if response.provider_agreement {
+    if matches!(
+        response.verification_status,
+        VerificationStatus::Agreed | VerificationStatus::Disagreed
+    ) {
         let agreement_provider = response
             .agreement_provider_id
             .as_deref()
@@ -917,6 +1027,7 @@ mod tests {
     use crate::shadow_processor::RuntimeStrategy;
     use chrono::Utc;
     use rpc_gateway::shadow_state::PoolStateResponse;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::Mutex;
 
     const BLOCK_HASH: &str = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
@@ -926,12 +1037,15 @@ mod tests {
     #[derive(Clone, Copy, Debug)]
     enum FakeMode {
         Profitable { agreement: bool },
+        Unprofitable,
         Retryable,
+        SecondaryRetryable,
     }
 
     #[derive(Debug)]
     struct FakeClient {
         mode: Mutex<FakeMode>,
+        calls: AtomicU64,
     }
 
     #[async_trait]
@@ -940,9 +1054,17 @@ mod tests {
             &self,
             request: &ShadowStateRequest,
         ) -> Result<ShadowStateResponse, GatewayClientError> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
             match *self.mode.lock().unwrap() {
                 FakeMode::Retryable => Err(GatewayClientError::Retryable),
-                FakeMode::Profitable { agreement } => Ok(response(request, agreement)),
+                FakeMode::SecondaryRetryable
+                    if matches!(request.evidence, EvidenceRequest::Verify { .. }) =>
+                {
+                    Err(GatewayClientError::Retryable)
+                }
+                FakeMode::SecondaryRetryable => Ok(response(request, false, true)),
+                FakeMode::Unprofitable => Ok(response(request, false, false)),
+                FakeMode::Profitable { agreement } => Ok(response(request, agreement, true)),
             }
         }
 
@@ -1052,17 +1174,25 @@ mod tests {
         }
     }
 
-    fn response(request: &ShadowStateRequest, agreement: bool) -> ShadowStateResponse {
+    fn response(
+        request: &ShadowStateRequest,
+        agreement: bool,
+        profitable: bool,
+    ) -> ShadowStateResponse {
         let first_sqrt = U256::from(1_u8) << 96;
         let second_sqrt = U256::from(1_u8) << 95;
-        let pools = request
+        let pools: Vec<PoolStateResponse> = request
             .pools
             .iter()
             .enumerate()
             .map(|(index, pool)| {
                 let slot0 = format!(
                     "0x{:064x}{:064x}",
-                    if index == 0 { first_sqrt } else { second_sqrt },
+                    if index == 0 || !profitable {
+                        first_sqrt
+                    } else {
+                        second_sqrt
+                    },
                     0
                 );
                 let liquidity = format!("0x{:064x}", 1_000_000_000_u128);
@@ -1090,7 +1220,13 @@ mod tests {
                 }
             })
             .collect();
-        let quality = ["provider_0", "provider_1"]
+        let primary_only = matches!(request.evidence, EvidenceRequest::Primary);
+        let providers = if primary_only {
+            vec!["provider_0"]
+        } else {
+            vec!["provider_0", "provider_1"]
+        };
+        let quality = providers
             .into_iter()
             .map(|provider| RpcQualityEvidence {
                 provider_id: provider.to_string(),
@@ -1101,7 +1237,7 @@ mod tests {
                 latency_ns: 100,
                 success: true,
                 stale_result: false,
-                disagreement: !agreement,
+                disagreement: !primary_only && !agreement,
                 timeout: false,
                 retry_count: 0,
             })
@@ -1112,23 +1248,42 @@ mod tests {
             request_hash: request.canonical_hash().unwrap(),
             block_number: 100,
             block_hash: BLOCK_HASH.to_string(),
+            state_hash: canonical_hash_bytes(&serde_json::to_vec(&pools).unwrap()),
             pools,
             primary_provider_id: "provider_0".to_string(),
-            agreement_provider_id: Some("provider_1".to_string()),
-            provider_agreement: agreement,
+            agreement_provider_id: (!primary_only).then(|| "provider_1".to_string()),
+            provider_agreement: !primary_only && agreement,
+            verification_status: if primary_only {
+                VerificationStatus::PrimaryOnly
+            } else if agreement {
+                VerificationStatus::Agreed
+            } else {
+                VerificationStatus::Disagreed
+            },
             quality,
             resolved_at_unix_ms: unix_time_ms(),
         }
     }
 
     fn evaluator(mode: FakeMode) -> RpcCandidateEvaluator {
-        RpcCandidateEvaluator::new(
-            Arc::new(FakeClient {
-                mode: Mutex::new(mode),
-            }),
+        evaluator_with_client(mode).0
+    }
+
+    fn evaluator_with_client(
+        mode: FakeMode,
+    ) -> (RpcCandidateEvaluator, Arc<FakeClient>, RuntimeMetrics) {
+        let client = Arc::new(FakeClient {
+            mode: Mutex::new(mode),
+            calls: AtomicU64::new(0),
+        });
+        let metrics = RuntimeMetrics::default();
+        let evaluator = RpcCandidateEvaluator::with_metrics(
+            client.clone(),
             "test-code".to_string(),
+            metrics.clone(),
         )
-        .unwrap()
+        .unwrap();
+        (evaluator, client, metrics)
     }
 
     #[test]
@@ -1159,6 +1314,59 @@ mod tests {
         assert_eq!(first.len(), 36);
         assert_ne!(first, second);
         assert_eq!(&first[14..15], "8");
+    }
+
+    #[tokio::test]
+    async fn primary_economic_rejection_skips_secondary_verification() {
+        let now = unix_time_ms();
+        let (evaluator, client, metrics) = evaluator_with_client(FakeMode::Unprofitable);
+        let batch = evaluator
+            .evaluate(&input(now), &origin(), &route())
+            .await
+            .unwrap();
+        assert!(batch.evaluations.is_empty());
+        assert_eq!(client.calls.load(Ordering::Relaxed), 1);
+        let rendered = metrics.render(&crate::runtime_state::RuntimeReadiness::new());
+        assert!(rendered.contains("rpc_primary_screen_rejected_total 1"));
+        assert!(rendered.contains("rpc_secondary_skipped_total 1"));
+    }
+
+    #[tokio::test]
+    async fn promising_primary_evidence_requests_secondary_exactly_once() {
+        let now = unix_time_ms();
+        let (evaluator, client, _) =
+            evaluator_with_client(FakeMode::Profitable { agreement: true });
+        let batch = evaluator
+            .evaluate(&input(now), &origin(), &route())
+            .await
+            .unwrap();
+        assert_eq!(batch.evaluations.len(), 1);
+        assert_eq!(client.calls.load(Ordering::Relaxed), 2);
+    }
+
+    #[tokio::test]
+    async fn secondary_transport_unavailability_is_persistable_fail_closed_evidence() {
+        let now = unix_time_ms();
+        let (evaluator, client, _) = evaluator_with_client(FakeMode::SecondaryRetryable);
+        let batch = evaluator
+            .evaluate(&input(now), &origin(), &route())
+            .await
+            .unwrap();
+        assert_eq!(client.calls.load(Ordering::Relaxed), 2);
+        assert_eq!(batch.evaluations.len(), 1);
+        let opportunity = &batch.evaluations[0].opportunity;
+        assert_eq!(
+            opportunity.simulation.classification,
+            SimulationClassification::ProviderDisagreement
+        );
+        assert_eq!(
+            opportunity.decision.primary_rejection_reason,
+            Some(RejectionReason::RpcStateDisagreement)
+        );
+        assert_eq!(
+            batch.evidence["state"]["secondary_verification_transport_unavailable"],
+            json!(true)
+        );
     }
 
     #[tokio::test]

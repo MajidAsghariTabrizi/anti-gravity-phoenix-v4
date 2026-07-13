@@ -3,7 +3,7 @@ use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 use thiserror::Error;
 
-pub const SHADOW_STATE_SCHEMA_VERSION: &str = "phoenix.rpc.shadow_state.v1";
+pub const SHADOW_STATE_SCHEMA_VERSION: &str = "phoenix.rpc.shadow_state.v2";
 pub const ARBITRUM_ONE_CHAIN_ID: u64 = 42161;
 pub const MAX_POOLS_PER_REQUEST: usize = 16;
 pub const MAX_GATEWAY_REQUEST_BYTES: usize = 64 * 1024;
@@ -16,6 +16,18 @@ pub struct ShadowStateRequest {
     pub chain_id: u64,
     pub route_fingerprint: String,
     pub pools: Vec<PoolStateRequest>,
+    pub evidence: EvidenceRequest,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(tag = "stage", rename_all = "snake_case", deny_unknown_fields)]
+pub enum EvidenceRequest {
+    Primary,
+    Verify {
+        block_number: u64,
+        block_hash: String,
+        primary_state_hash: String,
+    },
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -37,12 +49,23 @@ pub struct ShadowStateResponse {
     pub request_hash: String,
     pub block_number: u64,
     pub block_hash: String,
+    pub state_hash: String,
     pub pools: Vec<PoolStateResponse>,
     pub primary_provider_id: String,
     pub agreement_provider_id: Option<String>,
     pub provider_agreement: bool,
+    pub verification_status: VerificationStatus,
     pub quality: Vec<RpcQualityEvidence>,
     pub resolved_at_unix_ms: u64,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum VerificationStatus {
+    PrimaryOnly,
+    Agreed,
+    Disagreed,
+    SecondaryUnavailable,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -93,6 +116,8 @@ pub enum ContractError {
     InvalidRoute,
     #[error("SHADOW state request pool set is invalid")]
     InvalidPools,
+    #[error("SHADOW state request evidence stage is invalid")]
+    InvalidEvidence,
 }
 
 impl ShadowStateRequest {
@@ -127,12 +152,32 @@ impl ShadowStateRequest {
                 return Err(ContractError::InvalidPools);
             }
         }
+        if let EvidenceRequest::Verify {
+            block_number,
+            block_hash,
+            primary_state_hash,
+        } = &self.evidence
+        {
+            if *block_number == 0
+                || !canonical_block_hash(block_hash)
+                || !canonical_digest(primary_state_hash)
+            {
+                return Err(ContractError::InvalidEvidence);
+            }
+        }
         Ok(())
     }
 
     pub fn canonical_hash(&self) -> Result<String, ContractError> {
         self.validate()?;
         let encoded = serde_json::to_vec(self).map_err(|_| ContractError::InvalidRoute)?;
+        Ok(hex::encode(Sha256::digest(encoded)))
+    }
+
+    pub fn route_config_hash(&self) -> Result<String, ContractError> {
+        self.validate()?;
+        let encoded = serde_json::to_vec(&(&self.route_fingerprint, &self.pools))
+            .map_err(|_| ContractError::InvalidRoute)?;
         Ok(hex::encode(Sha256::digest(encoded)))
     }
 }
@@ -147,6 +192,13 @@ pub fn canonical_hash_str(value: &str) -> String {
 
 pub fn canonical_block_hash(value: &str) -> bool {
     canonical_hex(value, 32)
+}
+
+pub fn canonical_digest(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 pub fn canonical_data(value: &str, max_bytes: usize) -> bool {
@@ -203,6 +255,7 @@ mod tests {
                     fee: 500,
                 },
             ],
+            evidence: EvidenceRequest::Primary,
         }
     }
 
@@ -224,6 +277,24 @@ mod tests {
         let mut uppercase = request();
         uppercase.pools[0].address = "0xAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_string();
         assert_eq!(uppercase.validate(), Err(ContractError::InvalidPools));
+    }
+
+    #[test]
+    fn verification_stage_requires_an_exact_block_and_primary_state_hash() {
+        let mut verify = request();
+        verify.evidence = EvidenceRequest::Verify {
+            block_number: 100,
+            block_hash: format!("0x{}", "a".repeat(64)),
+            primary_state_hash: "b".repeat(64),
+        };
+        assert_eq!(verify.validate(), Ok(()));
+        let mut malformed = verify;
+        malformed.evidence = EvidenceRequest::Verify {
+            block_number: 0,
+            block_hash: "latest".to_string(),
+            primary_state_hash: "not-a-hash".to_string(),
+        };
+        assert_eq!(malformed.validate(), Err(ContractError::InvalidEvidence));
     }
 
     #[test]

@@ -1,7 +1,7 @@
 use rpc_gateway::economic::MethodTimeouts;
 use rpc_gateway::metrics::RuntimeRpcMetrics;
 use rpc_gateway::providers::parse_provider_config;
-use rpc_gateway::runtime::{GatewayError, GatewayRuntime};
+use rpc_gateway::runtime::{GatewayError, GatewayLimits, GatewayRuntime};
 use rpc_gateway::runtime_state::GatewayReadiness;
 use rpc_gateway::shadow_state::{
     ShadowStateRequest, MAX_GATEWAY_REQUEST_BYTES, SHADOW_STATE_SCHEMA_VERSION,
@@ -20,21 +20,20 @@ use tokio_util::sync::CancellationToken;
 const MAX_HTTP_HEADER_BYTES: usize = 16 * 1024;
 const HTTP_READ_TIMEOUT: Duration = Duration::from_secs(3);
 const STATE_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
-const PROVIDER_PROBE_INTERVAL: Duration = Duration::from_secs(10);
-
 #[derive(Clone, Debug)]
 struct Config {
     address: String,
     providers: rpc_gateway::providers::ProviderConfig,
     timeouts: MethodTimeouts,
+    limits: GatewayLimits,
+    provider_probe_interval: Duration,
 }
 
 impl Config {
     fn from_env() -> Result<Self, &'static str> {
         let urls = required_env("RPC_PROVIDER_URLS")?;
         let priorities = required_env("RPC_PROVIDER_WEIGHTS")?;
-        let global_rps = required_env("RPC_GLOBAL_RPS")?;
-        let providers = parse_provider_config(&urls, &priorities, &global_rps)
+        let providers = parse_provider_config(&urls, &priorities)
             .map_err(|_| "invalid RPC provider configuration")?;
         Ok(Self {
             address: std::env::var("RPC_GATEWAY_ADDR")
@@ -45,6 +44,21 @@ impl Config {
                 state_read: timeout_from_env("RPC_STATE_READ_TIMEOUT_MS", 2_000)?,
                 logs: timeout_from_env("RPC_LOGS_TIMEOUT_MS", 10_000)?,
             },
+            limits: GatewayLimits {
+                upstream_calls_per_second: positive_u32_from_env(
+                    "RPC_UPSTREAM_CALLS_PER_SECOND",
+                    1,
+                )?,
+                upstream_call_burst: positive_u32_from_env("RPC_UPSTREAM_CALL_BURST", 4)?,
+                state_requests_per_minute: positive_u32_from_env(
+                    "RPC_STATE_REQUESTS_PER_MINUTE",
+                    12,
+                )?,
+            },
+            provider_probe_interval: Duration::from_secs(u64::from(positive_u32_from_env(
+                "RPC_PROVIDER_PROBE_INTERVAL_SECONDS",
+                60,
+            )?)),
         })
     }
 }
@@ -76,12 +90,13 @@ async fn run() -> Result<(), &'static str> {
     let metrics = RuntimeRpcMetrics::default();
     let client =
         ReqwestJsonRpcClient::new().map_err(|_| "RPC HTTP client initialization failed")?;
-    let runtime = Arc::new(GatewayRuntime::new(
+    let runtime = Arc::new(GatewayRuntime::with_limits(
         config.providers,
         Arc::new(client),
         config.timeouts,
         metrics.clone(),
         readiness.clone(),
+        config.limits,
     ));
     let shutdown = CancellationToken::new();
 
@@ -90,7 +105,11 @@ async fn run() -> Result<(), &'static str> {
         shadow_state_schema = SHADOW_STATE_SCHEMA_VERSION,
         provider_urls_logged = false
     );
-    let probe_task = tokio::spawn(monitor_providers(runtime.clone(), shutdown.clone()));
+    let probe_task = tokio::spawn(monitor_providers(
+        runtime.clone(),
+        config.provider_probe_interval,
+        shutdown.clone(),
+    ));
     let signal_shutdown = shutdown.clone();
     tokio::spawn(async move {
         wait_for_shutdown_signal().await;
@@ -111,7 +130,11 @@ async fn run() -> Result<(), &'static str> {
     Ok(())
 }
 
-async fn monitor_providers(runtime: Arc<GatewayRuntime>, shutdown: CancellationToken) {
+async fn monitor_providers(
+    runtime: Arc<GatewayRuntime>,
+    interval: Duration,
+    shutdown: CancellationToken,
+) {
     loop {
         if let Err(error) = runtime.probe().await {
             tracing::warn!(
@@ -119,7 +142,7 @@ async fn monitor_providers(runtime: Arc<GatewayRuntime>, shutdown: CancellationT
                 error_class = error.class()
             );
         }
-        if sleep_or_shutdown(PROVIDER_PROBE_INTERVAL, &shutdown).await {
+        if sleep_or_shutdown(interval, &shutdown).await {
             return;
         }
     }
@@ -386,6 +409,19 @@ fn timeout_from_env(name: &'static str, default_ms: u64) -> Result<Duration, &'s
         return Err("invalid RPC timeout configuration");
     }
     Ok(Duration::from_millis(value))
+}
+
+fn positive_u32_from_env(name: &'static str, default: u32) -> Result<u32, &'static str> {
+    let value = match std::env::var(name) {
+        Ok(value) => value
+            .parse::<u32>()
+            .map_err(|_| "invalid RPC budget configuration")?,
+        Err(_) => default,
+    };
+    if value == 0 {
+        return Err("invalid RPC budget configuration");
+    }
+    Ok(value)
 }
 
 fn required_env(name: &'static str) -> Result<String, &'static str> {

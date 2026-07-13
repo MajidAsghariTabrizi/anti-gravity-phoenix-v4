@@ -109,8 +109,12 @@ async fn run_daemon() -> Result<(), &'static str> {
             .map_err(|_| "invalid RPC Gateway configuration")?,
     );
     let evaluator = Arc::new(
-        RpcCandidateEvaluator::new(rpc_client.clone(), config.code_version.clone())
-            .map_err(|_| "invalid Engine evaluator configuration")?,
+        RpcCandidateEvaluator::with_metrics(
+            rpc_client.clone(),
+            config.code_version.clone(),
+            metrics.clone(),
+        )
+        .map_err(|_| "invalid Engine evaluator configuration")?,
     );
     let processor = Arc::new(ShadowProcessor::new(
         config.routers.clone(),

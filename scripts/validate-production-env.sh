@@ -184,7 +184,10 @@ for name in \
   PARENT_CHAIN_RPC_URL \
   RPC_PROVIDER_URLS \
   RPC_PROVIDER_WEIGHTS \
-  RPC_GLOBAL_RPS
+  RPC_UPSTREAM_CALLS_PER_SECOND \
+  RPC_UPSTREAM_CALL_BURST \
+  RPC_STATE_REQUESTS_PER_MINUTE \
+  RPC_PROVIDER_PROBE_INTERVAL_SECONDS
 do
   require_var "$name"
 done
@@ -217,8 +220,16 @@ require_shape PHOENIX_FEED_RELAY_URL '^ws://[^/]+(:[0-9]+)?/.+'
 require_shape ARBITRUM_SEQUENCER_FEED_URL '^wss?://.+'
 require_shape ARBITRUM_RPC_URL '^https?://.+'
 require_shape PARENT_CHAIN_RPC_URL '^https?://.+'
-require_shape RPC_GLOBAL_RPS '^[0-9]+$'
-validate_positive_integer RPC_GLOBAL_RPS "${RPC_GLOBAL_RPS:-}"
+for name in \
+  RPC_UPSTREAM_CALLS_PER_SECOND \
+  RPC_UPSTREAM_CALL_BURST \
+  RPC_STATE_REQUESTS_PER_MINUTE \
+  RPC_PROVIDER_PROBE_INTERVAL_SECONDS
+do
+  require_shape "$name" '^[0-9]+$'
+  eval "value=\${$name:-}"
+  validate_positive_integer "$name" "$value"
+done
 validate_rpc_providers
 validate_postgres_consistency
 
@@ -241,7 +252,9 @@ ok "Feed source: relay"
 ok "Sequencer feed configured"
 ok "$(csv_count "${RPC_PROVIDER_URLS:-}") RPC providers configured"
 ok "RPC priority values valid"
-ok "Global RPC budget: ${RPC_GLOBAL_RPS} RPS"
+ok "Upstream RPC budget: ${RPC_UPSTREAM_CALLS_PER_SECOND} calls/s, burst ${RPC_UPSTREAM_CALL_BURST}"
+ok "RPC state request budget: ${RPC_STATE_REQUESTS_PER_MINUTE}/minute"
+ok "RPC provider probe interval: ${RPC_PROVIDER_PROBE_INTERVAL_SECONDS}s"
 ok "Parent-chain RPC configured"
 ok "Arbitrum RPC configured"
 ok "PostgreSQL configuration consistent"

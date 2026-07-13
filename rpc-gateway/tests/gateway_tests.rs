@@ -10,7 +10,7 @@ use rpc_gateway::providers::{
 #[test]
 fn global_budget_rejects_after_capacity() {
     let now = Instant::now();
-    let mut budget = GlobalBudget::new(2, Duration::from_secs(1), now);
+    let mut budget = GlobalBudget::new(2, 2, Duration::from_secs(1), now);
     assert!(budget.admit(now));
     assert!(budget.admit(now));
     assert!(!budget.admit(now));
@@ -170,8 +170,7 @@ fn recovered_preferred_provider_becomes_selectable_again() {
 #[test]
 fn equal_priorities_preserve_configured_order() {
     let now = Instant::now();
-    let cfg =
-        parse_provider_config("https://first.example,https://second.example", "1,1", "5").unwrap();
+    let cfg = parse_provider_config("https://first.example,https://second.example", "1,1").unwrap();
     let mut pool = cfg.into_pool(now);
     assert_eq!(
         pool.choose(now).map(|p| p.name.as_str()),
@@ -181,8 +180,8 @@ fn equal_priorities_preserve_configured_order() {
 
 #[test]
 fn url_priority_count_mismatch_fails() {
-    let err = parse_provider_config("https://first.example,https://second.example", "1", "5")
-        .unwrap_err();
+    let err =
+        parse_provider_config("https://first.example,https://second.example", "1").unwrap_err();
     assert_eq!(
         err,
         ProviderConfigError::CountMismatch {
@@ -194,43 +193,31 @@ fn url_priority_count_mismatch_fails() {
 
 #[test]
 fn invalid_priority_fails() {
-    let err = parse_provider_config("https://first.example", "not-a-number", "5").unwrap_err();
+    let err = parse_provider_config("https://first.example", "not-a-number").unwrap_err();
     assert_eq!(err, ProviderConfigError::InvalidPriority { index: 0 });
 }
 
 #[test]
 fn negative_priority_fails() {
-    let err = parse_provider_config("https://first.example", "-1", "5").unwrap_err();
+    let err = parse_provider_config("https://first.example", "-1").unwrap_err();
     assert_eq!(err, ProviderConfigError::InvalidPriority { index: 0 });
 }
 
 #[test]
 fn zero_priority_fails() {
-    let err = parse_provider_config("https://first.example", "0", "5").unwrap_err();
+    let err = parse_provider_config("https://first.example", "0").unwrap_err();
     assert_eq!(err, ProviderConfigError::ZeroPriority { index: 0 });
-}
-
-#[test]
-fn malformed_global_rps_fails() {
-    let err = parse_provider_config("https://first.example", "1", "fast").unwrap_err();
-    assert_eq!(err, ProviderConfigError::InvalidGlobalRps);
-}
-
-#[test]
-fn zero_global_rps_fails() {
-    let err = parse_provider_config("https://first.example", "1", "0").unwrap_err();
-    assert_eq!(err, ProviderConfigError::ZeroGlobalRps);
 }
 
 #[test]
 fn provider_names_and_errors_do_not_expose_credential_bearing_urls() {
     let credential_url = "https://secret-token.quiknode.pro/credential/path?api_key=hidden";
-    let cfg = parse_provider_config(credential_url, "4", "5").unwrap();
+    let cfg = parse_provider_config(credential_url, "4").unwrap();
     assert_eq!(cfg.providers[0].name, "quicknode");
     assert!(!cfg.providers[0].name.contains("secret-token"));
     assert!(!cfg.providers[0].name.contains("api_key"));
 
-    let err = parse_provider_config(credential_url, "0", "5")
+    let err = parse_provider_config(credential_url, "0")
         .unwrap_err()
         .to_string();
     assert!(!err.contains("secret-token"));
@@ -246,7 +233,6 @@ fn priority_pool(now: Instant) -> ProviderPool {
     parse_provider_config(
         "https://secret-token.quiknode.pro/credential/path,https://arbitrum.drpc.org,https://arbitrum-one-rpc.publicnode.com,https://arb1.arbitrum.io/rpc",
         "4,3,1,1",
-        "5",
     )
     .unwrap()
     .into_pool(now)

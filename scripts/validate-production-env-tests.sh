@@ -25,7 +25,10 @@ ARBITRUM_RPC_URL=https://arbitrum.drpc.org
 PARENT_CHAIN_RPC_URL=https://eth.drpc.org
 RPC_PROVIDER_URLS=https://credential-bearing-rpc.example/private-token,https://arbitrum.drpc.org
 RPC_PROVIDER_WEIGHTS=4,3
-RPC_GLOBAL_RPS=5
+RPC_UPSTREAM_CALLS_PER_SECOND=1
+RPC_UPSTREAM_CALL_BURST=4
+RPC_STATE_REQUESTS_PER_MINUTE=12
+RPC_PROVIDER_PROBE_INTERVAL_SECONDS=60
 EXECUTOR_ADDRESS=
 SIGNER_PRIVATE_KEY=
 ENV
@@ -53,6 +56,15 @@ if output=$("$validator" "$bad_rpc" 2>&1); then
 fi
 assert_redacted "$output"
 printf '%s' "$output" | grep -q 'RPC_PROVIDER_URLS count must match RPC_PROVIDER_WEIGHTS count'
+
+bad_budget="$tmp_dir/bad-budget.env"
+sed 's/RPC_UPSTREAM_CALLS_PER_SECOND=1/RPC_UPSTREAM_CALLS_PER_SECOND=0/' "$valid_env" >"$bad_budget"
+if output=$("$validator" "$bad_budget" 2>&1); then
+  echo "expected zero upstream call budget to fail"
+  exit 1
+fi
+assert_redacted "$output"
+printf '%s' "$output" | grep -q 'RPC_UPSTREAM_CALLS_PER_SECOND must be greater than zero'
 
 bad_postgres="$tmp_dir/bad-postgres.env"
 sed 's/POSTGRES_DSN=postgres:\/\/phoenix_app:super-secret-password@postgres:5432\/phoenix/POSTGRES_DSN=postgres:\/\/phoenix_app:different-password@postgres:5432\/phoenix/' "$valid_env" >"$bad_postgres"

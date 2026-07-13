@@ -5,11 +5,13 @@ use async_trait::async_trait;
 use futures_util::StreamExt;
 use serde::Deserialize;
 use serde_json::{json, Value};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 use thiserror::Error;
 
 const JSON_RPC_ID: u64 = 1;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
+const DEFAULT_RATE_LIMIT_COOLDOWN: Duration = Duration::from_secs(5);
+pub const MAX_RATE_LIMIT_COOLDOWN: Duration = Duration::from_secs(60);
 
 #[derive(Clone, Debug)]
 pub struct RpcCallResult {
@@ -29,6 +31,8 @@ pub enum TransportError {
     InvalidResponse,
     #[error("RPC provider returned a JSON-RPC error")]
     ProviderError,
+    #[error("RPC provider applied an HTTP rate limit")]
+    RateLimited { retry_after: Duration },
 }
 
 impl TransportError {
@@ -39,11 +43,19 @@ impl TransportError {
             Self::Oversized => "provider_oversized_response",
             Self::InvalidResponse => "provider_invalid_response",
             Self::ProviderError => "provider_rpc_error",
+            Self::RateLimited { .. } => "provider_rate_limited",
         }
     }
 
     pub const fn timeout(self) -> bool {
         matches!(self, Self::Timeout)
+    }
+
+    pub const fn retry_after(self) -> Option<Duration> {
+        match self {
+            Self::RateLimited { retry_after } => Some(retry_after),
+            _ => None,
+        }
     }
 }
 
@@ -117,6 +129,14 @@ impl JsonRpcClient for ReqwestJsonRpcClient {
                     TransportError::Http
                 }
             })?;
+        if response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+            return Err(TransportError::RateLimited {
+                retry_after: parse_retry_after(
+                    response.headers().get(reqwest::header::RETRY_AFTER),
+                    SystemTime::now(),
+                ),
+            });
+        }
         if !response.status().is_success() {
             return Err(TransportError::Http);
         }
@@ -161,6 +181,27 @@ impl JsonRpcClient for ReqwestJsonRpcClient {
     }
 }
 
+fn parse_retry_after(value: Option<&reqwest::header::HeaderValue>, now: SystemTime) -> Duration {
+    let parsed = value
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| {
+            value
+                .trim()
+                .parse::<u64>()
+                .ok()
+                .map(Duration::from_secs)
+                .or_else(|| {
+                    httpdate::parse_http_date(value)
+                        .ok()
+                        .and_then(|deadline| deadline.duration_since(now).ok())
+                })
+        })
+        .unwrap_or(DEFAULT_RATE_LIMIT_COOLDOWN);
+    parsed
+        .max(Duration::from_secs(1))
+        .min(MAX_RATE_LIMIT_COOLDOWN)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -177,12 +218,33 @@ mod tests {
             TransportError::Oversized,
             TransportError::InvalidResponse,
             TransportError::ProviderError,
+            TransportError::RateLimited {
+                retry_after: Duration::from_secs(10),
+            },
         ] {
             let rendered = error.to_string().to_ascii_lowercase();
             assert!(!rendered.contains("https://"));
             assert!(!rendered.contains("token"));
             assert!(error.class().len() <= 64);
         }
+    }
+
+    #[test]
+    fn retry_after_supports_delta_seconds_and_clamps_provider_input() {
+        let ten = reqwest::header::HeaderValue::from_static("10");
+        let huge = reqwest::header::HeaderValue::from_static("999999");
+        assert_eq!(
+            parse_retry_after(Some(&ten), SystemTime::UNIX_EPOCH),
+            Duration::from_secs(10)
+        );
+        assert_eq!(
+            parse_retry_after(Some(&huge), SystemTime::UNIX_EPOCH),
+            MAX_RATE_LIMIT_COOLDOWN
+        );
+        assert_eq!(
+            parse_retry_after(None, SystemTime::UNIX_EPOCH),
+            DEFAULT_RATE_LIMIT_COOLDOWN
+        );
     }
 
     #[test]
@@ -222,7 +284,7 @@ mod tests {
                 .await
                 .unwrap();
         });
-        let config = parse_provider_config(&format!("http://{address}"), "1", "1").unwrap();
+        let config = parse_provider_config(&format!("http://{address}"), "1").unwrap();
         let mut pool = config.into_pool(Instant::now());
         let provider = pool.reserve_best(Instant::now(), &HashSet::new()).unwrap();
         let result = ReqwestJsonRpcClient::new()
@@ -236,6 +298,42 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(result.value, json!("0xa4b1"));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn loopback_http_429_parses_and_clamps_retry_after() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 2048];
+            let read = stream.read(&mut request).await.unwrap();
+            assert!(read > 0);
+            stream
+                .write_all(
+                    b"HTTP/1.1 429 Too Many Requests\r\nretry-after: 120\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+                )
+                .await
+                .unwrap();
+        });
+        let config = parse_provider_config(&format!("http://{address}"), "1").unwrap();
+        let mut pool = config.into_pool(Instant::now());
+        let provider = pool.reserve_best(Instant::now(), &HashSet::new()).unwrap();
+        let result = ReqwestJsonRpcClient::new()
+            .unwrap()
+            .call(
+                &provider,
+                RpcMethod::EthChainId,
+                json!([]),
+                Duration::from_secs(2),
+            )
+            .await;
+        assert!(matches!(
+            result,
+            Err(TransportError::RateLimited { retry_after })
+                if retry_after == MAX_RATE_LIMIT_COOLDOWN
+        ));
         server.await.unwrap();
     }
 }

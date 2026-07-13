@@ -284,7 +284,10 @@ jobs:
           ARBITRUM_SEQUENCER_FEED_URL=wss://sequencer-feed-placeholder.invalid
           RPC_PROVIDER_URLS=https://rpc-placeholder.invalid
           RPC_PROVIDER_WEIGHTS=1
-          RPC_GLOBAL_RPS=5
+          RPC_UPSTREAM_CALLS_PER_SECOND=1
+          RPC_UPSTREAM_CALL_BURST=4
+          RPC_STATE_REQUESTS_PER_MINUTE=12
+          RPC_PROVIDER_PROBE_INTERVAL_SECONDS=60
           FEED_INGESTOR_IMAGE=ghcr.io/majidasgharitabrizi/feed-ingestor:sha-0000000000000000000000000000000000000000
           PHOENIX_ENGINE_IMAGE=ghcr.io/majidasgharitabrizi/phoenix-engine:sha-0000000000000000000000000000000000000000
           RPC_GATEWAY_IMAGE=ghcr.io/majidasgharitabrizi/rpc-gateway:sha-0000000000000000000000000000000000000000

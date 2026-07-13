@@ -200,13 +200,15 @@ with tabs[7]:
 
 with tabs[8]:
     rpc = {
-        "Requests": metric_value("rpc_requests_total"),
-        "Provider Requests": metric_value("rpc_provider_requests_total"),
-        "Cache Hits": metric_value("rpc_cache_hits_total"),
+        "State Requests": metric_value("rpc_state_requests_total"),
+        "Upstream Calls": metric_value("rpc_upstream_calls_total"),
+        "Route/Block Cache Hits": metric_value("rpc_route_block_cache_hits_total"),
         "Coalesced": metric_value("rpc_coalesced_requests_total"),
-        "Rate Limited": metric_value("rpc_rate_limit_total"),
-        "Circuit Open": metric_value("rpc_circuit_open_total"),
-        "Budget Rejected": metric_value("rpc_budget_rejected_total"),
+        "Provider Rate Limited": metric_value("rpc_provider_rate_limited_total"),
+        "State Budget Rejected": metric_value("rpc_state_request_budget_rejected_total"),
+        "Upstream Budget Rejected": metric_value("rpc_upstream_call_budget_rejected_total"),
+        "Primary Screen Rejected": metric_value("rpc_primary_screen_rejected_total"),
+        "Secondary Skipped": metric_value("rpc_secondary_skipped_total"),
     }
     st.dataframe(pd.DataFrame({"metric": list(rpc.keys()), "value": list(rpc.values())}), use_container_width=True)
 

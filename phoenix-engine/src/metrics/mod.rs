@@ -23,6 +23,8 @@ struct RuntimeMetricValues {
     processing_failures: AtomicU64,
     redeliveries: AtomicU64,
     duplicate_skips: AtomicU64,
+    rpc_primary_screen_rejected: AtomicU64,
+    rpc_secondary_skipped: AtomicU64,
     consumer_pending: AtomicU64,
     consumer_ack_pending: AtomicU64,
     processing_latency_nanos: AtomicU64,
@@ -76,6 +78,18 @@ impl RuntimeMetrics {
         self.inner.duplicate_skips.fetch_add(1, Ordering::Relaxed);
     }
 
+    pub fn rpc_primary_screen_rejected(&self) {
+        self.inner
+            .rpc_primary_screen_rejected
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn rpc_secondary_skipped(&self) {
+        self.inner
+            .rpc_secondary_skipped
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
     pub fn set_consumer_state(&self, pending: u64, ack_pending: u64) {
         self.inner
             .consumer_pending
@@ -108,6 +122,10 @@ impl RuntimeMetrics {
                 "phoenix_engine_redeliveries_total {}\n",
                 "# TYPE phoenix_engine_duplicate_skips_total counter\n",
                 "phoenix_engine_duplicate_skips_total {}\n",
+                "# TYPE rpc_primary_screen_rejected_total counter\n",
+                "rpc_primary_screen_rejected_total {}\n",
+                "# TYPE rpc_secondary_skipped_total counter\n",
+                "rpc_secondary_skipped_total {}\n",
                 "# TYPE phoenix_engine_consumer_pending gauge\n",
                 "phoenix_engine_consumer_pending {}\n",
                 "# TYPE phoenix_engine_consumer_ack_pending gauge\n",
@@ -126,6 +144,10 @@ impl RuntimeMetrics {
             self.inner.processing_failures.load(Ordering::Relaxed),
             self.inner.redeliveries.load(Ordering::Relaxed),
             self.inner.duplicate_skips.load(Ordering::Relaxed),
+            self.inner
+                .rpc_primary_screen_rejected
+                .load(Ordering::Relaxed),
+            self.inner.rpc_secondary_skipped.load(Ordering::Relaxed),
             self.inner.consumer_pending.load(Ordering::Relaxed),
             self.inner.consumer_ack_pending.load(Ordering::Relaxed),
             latency,

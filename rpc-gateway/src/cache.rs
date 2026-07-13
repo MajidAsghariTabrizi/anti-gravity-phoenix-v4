@@ -65,6 +65,11 @@ impl<T> TtlCache<T> {
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
+
+    pub fn retain(&mut self, mut keep: impl FnMut(&str, &T) -> bool) {
+        self.entries
+            .retain(|key, entry| keep(key.as_str(), &entry.value));
+    }
 }
 
 impl<T: Clone> TtlCache<T> {
