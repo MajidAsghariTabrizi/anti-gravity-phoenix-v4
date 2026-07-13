@@ -31,6 +31,33 @@ fn cache_honors_ttl() {
 }
 
 #[test]
+fn cache_evicts_deterministically_at_its_configured_bound() {
+    let now = Instant::now();
+    let mut cache = TtlCache::new(2);
+    cache.insert(
+        "old".to_string(),
+        "1".to_string(),
+        Duration::from_secs(1),
+        now,
+    );
+    cache.insert(
+        "new".to_string(),
+        "2".to_string(),
+        Duration::from_secs(2),
+        now,
+    );
+    cache.insert(
+        "newest".to_string(),
+        "3".to_string(),
+        Duration::from_secs(3),
+        now,
+    );
+    assert_eq!(cache.len(), 2);
+    assert_eq!(cache.get("old", now), None);
+    assert_eq!(cache.get("new", now), Some("2".to_string()));
+}
+
+#[test]
 fn coalescer_marks_followers() {
     let mut c = Coalescer::default();
     assert_eq!(c.enter("eth_getCode:abc"), CoalesceDecision::Leader);
@@ -209,6 +236,10 @@ fn provider_names_and_errors_do_not_expose_credential_bearing_urls() {
     assert!(!err.contains("secret-token"));
     assert!(!err.contains("api_key"));
     assert!(!err.contains(credential_url));
+
+    let rendered = format!("{cfg:?}");
+    assert!(!rendered.contains("secret-token"));
+    assert!(!rendered.contains("api_key"));
 }
 
 fn priority_pool(now: Instant) -> ProviderPool {

@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::fmt;
 use std::time::{Duration, Instant};
 
@@ -9,7 +10,7 @@ pub enum CircuitState {
     Open { until: Instant },
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct Provider {
     pub name: String,
     pub url: String,
@@ -19,6 +20,45 @@ pub struct Provider {
     pub cooldown_until: Option<Instant>,
     pub bucket: TokenBucket,
     pub consecutive_failures: u32,
+}
+
+impl fmt::Debug for Provider {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("Provider")
+            .field("name", &self.name)
+            .field("weight", &self.weight)
+            .field("health_score", &self.health_score)
+            .field("circuit", &self.circuit)
+            .field("cooldown_until", &self.cooldown_until)
+            .field("consecutive_failures", &self.consecutive_failures)
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Clone)]
+pub struct ProviderLease {
+    provider_id: String,
+    url: String,
+}
+
+impl ProviderLease {
+    pub fn provider_id(&self) -> &str {
+        &self.provider_id
+    }
+
+    pub(crate) fn url(&self) -> &str {
+        &self.url
+    }
+}
+
+impl fmt::Debug for ProviderLease {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ProviderLease")
+            .field("provider_id", &self.provider_id)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Provider {
@@ -113,12 +153,82 @@ impl ProviderPool {
         }
         None
     }
+
+    pub fn reserve_best(
+        &mut self,
+        now: Instant,
+        excluded: &HashSet<String>,
+    ) -> Option<ProviderLease> {
+        let mut best_idx: Option<usize> = None;
+        let mut best_weight = 0;
+        for (idx, provider) in self.providers.iter_mut().enumerate() {
+            if excluded.contains(&provider.name) || !provider.available(now) {
+                continue;
+            }
+            if best_idx.is_none() || provider.weight > best_weight {
+                best_weight = provider.weight;
+                best_idx = Some(idx);
+            }
+        }
+        let idx = best_idx?;
+        if !self.providers[idx].reserve(now) {
+            return None;
+        }
+        Some(ProviderLease {
+            provider_id: self.providers[idx].name.clone(),
+            url: self.providers[idx].url.clone(),
+        })
+    }
+
+    pub fn record_success(&mut self, provider_id: &str) -> bool {
+        if let Some(provider) = self
+            .providers
+            .iter_mut()
+            .find(|provider| provider.name == provider_id)
+        {
+            provider.record_success();
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn record_failure(&mut self, provider_id: &str, now: Instant) -> bool {
+        if let Some(provider) = self
+            .providers
+            .iter_mut()
+            .find(|provider| provider.name == provider_id)
+        {
+            provider.record_failure(now);
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.providers.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.providers.is_empty()
+    }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct ProviderConfig {
     pub providers: Vec<ProviderSpec>,
     pub global_rps: u32,
+}
+
+impl fmt::Debug for ProviderConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ProviderConfig")
+            .field("provider_count", &self.providers.len())
+            .field("global_rps", &self.global_rps)
+            .finish()
+    }
 }
 
 impl ProviderConfig {
@@ -132,11 +242,21 @@ impl ProviderConfig {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct ProviderSpec {
     pub name: String,
     pub url: String,
     pub priority: u32,
+}
+
+impl fmt::Debug for ProviderSpec {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ProviderSpec")
+            .field("name", &self.name)
+            .field("priority", &self.priority)
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -207,6 +327,7 @@ pub fn parse_provider_config(
 
     let global_rps = parse_global_rps(global_rps)?;
     let mut providers = Vec::with_capacity(urls.len());
+    let mut provider_names = HashSet::with_capacity(urls.len());
     for (index, (url, priority)) in urls.into_iter().zip(priorities).enumerate() {
         if url.is_empty() {
             return Err(ProviderConfigError::EmptyProviderUrl { index });
@@ -215,8 +336,13 @@ pub fn parse_provider_config(
             return Err(ProviderConfigError::InvalidProviderUrl { index });
         }
         let priority = parse_priority(index, priority)?;
+        let mut name = safe_provider_name(index, url);
+        if !provider_names.insert(name.clone()) {
+            name = format!("{name}_{index}");
+            provider_names.insert(name.clone());
+        }
         providers.push(ProviderSpec {
-            name: safe_provider_name(index, url),
+            name,
             url: url.to_string(),
             priority,
         });

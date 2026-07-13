@@ -25,6 +25,7 @@ impl BlockReference {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum RpcMethod {
+    EthChainId,
     EthCall,
     EthGetBalance,
     EthGetBlockByNumber,
@@ -36,6 +37,7 @@ pub enum RpcMethod {
 impl RpcMethod {
     pub fn as_str(self) -> &'static str {
         match self {
+            Self::EthChainId => "eth_chainId",
             Self::EthCall => "eth_call",
             Self::EthGetBalance => "eth_getBalance",
             Self::EthGetBlockByNumber => "eth_getBlockByNumber",
@@ -109,7 +111,8 @@ impl MethodTimeouts {
         match method {
             RpcMethod::EthCall => self.eth_call,
             RpcMethod::EthGetLogs => self.logs,
-            RpcMethod::EthGetBalance
+            RpcMethod::EthChainId
+            | RpcMethod::EthGetBalance
             | RpcMethod::EthGetBlockByNumber
             | RpcMethod::EthGetCode
             | RpcMethod::EthGetStorageAt => self.state_read,
