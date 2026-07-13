@@ -1,0 +1,25 @@
+{
+  "messages": [
+    {
+      "blockHash": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "blockMetadata": "",
+      "message": {
+        "delayedMessagesRead": 42,
+        "message": {
+          "header": {
+            "baseFeeL1": 9007199254740993,
+            "blockNumber": 289000000,
+            "kind": 3,
+            "requestId": null,
+            "sender": "0x1111111111111111111111111111111111111111",
+            "timestamp": 1700000000
+          },
+          "l2Msg": "BAL4ZoKksQcCeILqYJQiIiIiIiIiIiIiIiIiIiIiIiIiIgWCAQLAgKAzrW0w2KbxKn0oeNZe+48vILuR1zjWX40O5K97xOPzbKAdETpOLVwX9Uzdi9MF2Wd48kFRbxgqHRfezg+rpg/FvA=="
+        }
+      },
+      "sequenceNumber": 460530858,
+      "signatureV2": null
+    }
+  ],
+  "version": 1
+}

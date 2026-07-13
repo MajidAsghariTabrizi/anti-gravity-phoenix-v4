@@ -75,12 +75,12 @@ type L1IncomingMessage struct {
 }
 
 type L1IncomingMessageHeader struct {
-	Kind        uint8  `json:"kind"`
-	Sender      string `json:"sender,omitempty"`
-	BlockNumber uint64 `json:"blockNumber,omitempty"`
-	Timestamp   uint64 `json:"timestamp,omitempty"`
-	RequestID   string `json:"requestId,omitempty"`
-	BaseFeeL1   string `json:"baseFeeL1,omitempty"`
+	Kind        uint8        `json:"kind"`
+	Sender      string       `json:"sender,omitempty"`
+	BlockNumber uint64       `json:"blockNumber,omitempty"`
+	Timestamp   uint64       `json:"timestamp,omitempty"`
+	RequestID   string       `json:"requestId,omitempty"`
+	BaseFeeL1   *jsonUint256 `json:"baseFeeL1,omitempty"`
 }
 
 type ConfirmedSequenceNumberMessage struct {

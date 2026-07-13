@@ -1,10 +1,13 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"io"
 	"log"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -240,6 +243,88 @@ func TestRelayDecodeCorruptionIsNotASequenceMetricAndIsTerminal(t *testing.T) {
 	}
 }
 
+func TestCanonicalNumericBaseFeePreservesReadinessSequenceAndPublication(t *testing.T) {
+	registry := metrics.NewRegistry()
+	readiness := relayDependencyReadyState()
+	state := sequence.New()
+	pub := &publisher.MemoryPublisher{}
+	var output bytes.Buffer
+	issueLogger := newSampledIssueLogger(log.New(&output, "", 0), time.Minute, nil)
+
+	raw := numericBaseFeeFixture(t)
+	for _, sequenceNumber := range []string{"460530858", "460530859"} {
+		candidate := bytes.Replace(raw, []byte("460530858"), []byte(sequenceNumber), 1)
+		frames, report, err := nitro.DecodeBroadcast(candidate)
+		if err != nil {
+			t.Fatalf("decode canonical numeric baseFeeL1: %v", err)
+		}
+		if len(frames) != 1 || len(report.Malformed) != 0 {
+			t.Fatalf("unexpected numeric baseFeeL1 result: frames=%+v report=%+v", frames, report)
+		}
+		processRelayFrameForTest(t, frames[0], false, state, pub, registry, readiness, issueLogger)
+	}
+
+	last, haveLast := state.LastSequence()
+	if !haveLast || last != 460530859 || len(pub.Messages) != 2 {
+		t.Fatalf("numeric baseFeeL1 interrupted sequence or publication last=%d have=%t published=%d", last, haveLast, len(pub.Messages))
+	}
+	if ok, reason := readiness.Ready(); !ok || reason != "ready" {
+		t.Fatalf("numeric baseFeeL1 cleared readiness ok=%v reason=%q", ok, reason)
+	}
+	rendered := registry.Render()
+	for _, expected := range []string{
+		"feed_decode_failures_total 0",
+		"feed_sequence_gaps_total 0",
+		"feed_jetstream_publish_success_total 2",
+		"feed_readiness 1",
+	} {
+		if !strings.Contains(rendered, expected) {
+			t.Fatalf("numeric baseFeeL1 metrics missing %q: %s", expected, rendered)
+		}
+	}
+	if strings.Contains(output.String(), "event=feed_sequence_event") {
+		t.Fatalf("contiguous numeric baseFeeL1 produced sequence logs: %s", output.String())
+	}
+}
+
+func TestMalformedBaseFeeFailsClosedWithoutPublishingOrLoggingPayload(t *testing.T) {
+	registry := metrics.NewRegistry()
+	readiness := publishReadyState()
+	readiness.MarkSuccessfulPublish()
+	state := sequence.New()
+	pub := &publisher.MemoryPublisher{}
+	var output bytes.Buffer
+	issueLogger := newSampledIssueLogger(log.New(&output, "", 0), time.Minute, nil)
+	raw := bytes.Replace(numericBaseFeeFixture(t), []byte("9007199254740993"), []byte("1.5"), 1)
+
+	frames, _, err := nitro.DecodeBroadcast(raw)
+	if err != nil {
+		recordRelayDecodeFailure(registry, readiness, issueLogger, err)
+	} else {
+		for _, frame := range frames {
+			processRelayFrameForTest(t, frame, false, state, pub, registry, readiness, issueLogger)
+		}
+	}
+	if err == nil {
+		t.Fatal("accepted malformed baseFeeL1")
+	}
+
+	if len(pub.Messages) != 0 {
+		t.Fatalf("malformed baseFeeL1 was published: %d", len(pub.Messages))
+	}
+	if ok, reason := readiness.Ready(); ok || reason != "Nitro broadcast decoding integrity failure" {
+		t.Fatalf("malformed baseFeeL1 did not fail closed ok=%v reason=%q", ok, reason)
+	}
+	if !strings.Contains(registry.Render(), "feed_decode_failures_total 1") {
+		t.Fatalf("malformed baseFeeL1 was not counted: %s", registry.Render())
+	}
+	for _, forbidden := range []string{"BAL4ZoK", "l2Msg", "raw_tx", "signatureV2"} {
+		if strings.Contains(output.String(), forbidden) {
+			t.Fatalf("malformed baseFeeL1 log exposed payload %q: %s", forbidden, output.String())
+		}
+	}
+}
+
 func TestUnsupportedRelayMessageIsObservableWithoutFailingReadiness(t *testing.T) {
 	registry := metrics.NewRegistry()
 	readiness := relayDependencyReadyState()
@@ -360,6 +445,16 @@ func relayFrame(sequenceNumber uint64, hashByte byte, transactionCount int) nitr
 		frame.Transactions = append(frame.Transactions, tx)
 	}
 	return frame
+}
+
+func numericBaseFeeFixture(t *testing.T) []byte {
+	t.Helper()
+	path := filepath.Join("..", "..", "internal", "nitro", "testdata", "numeric_base_fee_l1.json")
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read numeric baseFeeL1 fixture: %v", err)
+	}
+	return raw
 }
 
 func nitroFrameWithChain(chainID uint64) nitro.Frame {
