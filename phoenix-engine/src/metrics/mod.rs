@@ -1,7 +1,138 @@
 use std::collections::BTreeMap;
 use std::fmt::Write;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
 
 use crate::opportunity::{Opportunity, ShadowDisposition, SimulationClassification};
+use crate::runtime_state::RuntimeReadiness;
+
+#[derive(Clone, Debug, Default)]
+pub struct RuntimeMetrics {
+    inner: Arc<RuntimeMetricValues>,
+}
+
+#[derive(Debug, Default)]
+struct RuntimeMetricValues {
+    inputs_received: AtomicU64,
+    inputs_processed: AtomicU64,
+    candidates: AtomicU64,
+    no_route: AtomicU64,
+    shadow_accepted: AtomicU64,
+    shadow_rejected: AtomicU64,
+    processing_failures: AtomicU64,
+    redeliveries: AtomicU64,
+    duplicate_skips: AtomicU64,
+    consumer_pending: AtomicU64,
+    consumer_ack_pending: AtomicU64,
+    processing_latency_nanos: AtomicU64,
+}
+
+impl RuntimeMetrics {
+    pub fn input_received(&self, redelivery: bool) {
+        self.inner.inputs_received.fetch_add(1, Ordering::Relaxed);
+        if redelivery {
+            self.inner.redeliveries.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    pub fn input_processed(&self, latency: Duration) {
+        self.inner.inputs_processed.fetch_add(1, Ordering::Relaxed);
+        self.inner.processing_latency_nanos.store(
+            latency.as_nanos().min(u64::MAX as u128) as u64,
+            Ordering::Relaxed,
+        );
+    }
+
+    pub fn candidates(&self, count: usize) {
+        self.inner
+            .candidates
+            .fetch_add(count as u64, Ordering::Relaxed);
+    }
+
+    pub fn no_route(&self) {
+        self.inner.no_route.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn shadow_accepted(&self, count: usize) {
+        self.inner
+            .shadow_accepted
+            .fetch_add(count as u64, Ordering::Relaxed);
+    }
+
+    pub fn shadow_rejected(&self, count: usize) {
+        self.inner
+            .shadow_rejected
+            .fetch_add(count as u64, Ordering::Relaxed);
+    }
+
+    pub fn processing_failure(&self) {
+        self.inner
+            .processing_failures
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn duplicate_skip(&self) {
+        self.inner.duplicate_skips.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn set_consumer_state(&self, pending: u64, ack_pending: u64) {
+        self.inner
+            .consumer_pending
+            .store(pending, Ordering::Relaxed);
+        self.inner
+            .consumer_ack_pending
+            .store(ack_pending, Ordering::Relaxed);
+    }
+
+    pub fn render(&self, readiness: &RuntimeReadiness) -> String {
+        let latency =
+            self.inner.processing_latency_nanos.load(Ordering::Relaxed) as f64 / 1_000_000_000.0;
+        format!(
+            concat!(
+                "# TYPE phoenix_engine_inputs_received_total counter\n",
+                "phoenix_engine_inputs_received_total {}\n",
+                "# TYPE phoenix_engine_inputs_processed_total counter\n",
+                "phoenix_engine_inputs_processed_total {}\n",
+                "# TYPE phoenix_engine_candidates_total counter\n",
+                "phoenix_engine_candidates_total {}\n",
+                "# TYPE phoenix_engine_no_route_total counter\n",
+                "phoenix_engine_no_route_total {}\n",
+                "# TYPE phoenix_engine_shadow_accepted_total counter\n",
+                "phoenix_engine_shadow_accepted_total {}\n",
+                "# TYPE phoenix_engine_shadow_rejected_total counter\n",
+                "phoenix_engine_shadow_rejected_total {}\n",
+                "# TYPE phoenix_engine_processing_failures_total counter\n",
+                "phoenix_engine_processing_failures_total {}\n",
+                "# TYPE phoenix_engine_redeliveries_total counter\n",
+                "phoenix_engine_redeliveries_total {}\n",
+                "# TYPE phoenix_engine_duplicate_skips_total counter\n",
+                "phoenix_engine_duplicate_skips_total {}\n",
+                "# TYPE phoenix_engine_consumer_pending gauge\n",
+                "phoenix_engine_consumer_pending {}\n",
+                "# TYPE phoenix_engine_consumer_ack_pending gauge\n",
+                "phoenix_engine_consumer_ack_pending {}\n",
+                "# TYPE phoenix_engine_processing_latency_seconds gauge\n",
+                "phoenix_engine_processing_latency_seconds {:.9}\n",
+                "# TYPE phoenix_engine_readiness gauge\n",
+                "phoenix_engine_readiness {}\n"
+            ),
+            self.inner.inputs_received.load(Ordering::Relaxed),
+            self.inner.inputs_processed.load(Ordering::Relaxed),
+            self.inner.candidates.load(Ordering::Relaxed),
+            self.inner.no_route.load(Ordering::Relaxed),
+            self.inner.shadow_accepted.load(Ordering::Relaxed),
+            self.inner.shadow_rejected.load(Ordering::Relaxed),
+            self.inner.processing_failures.load(Ordering::Relaxed),
+            self.inner.redeliveries.load(Ordering::Relaxed),
+            self.inner.duplicate_skips.load(Ordering::Relaxed),
+            self.inner.consumer_pending.load(Ordering::Relaxed),
+            self.inner.consumer_ack_pending.load(Ordering::Relaxed),
+            latency,
+            u8::from(readiness.ready().is_ok()),
+        )
+    }
+}
 
 #[derive(Clone, Debug, Default)]
 pub struct Metrics {
@@ -173,6 +304,41 @@ mod tests {
     fn renderer_has_no_high_cardinality_identity_labels() {
         let rendered = Metrics::default().render();
         for forbidden in ["tx_hash=", "wallet=", "opportunity_id=", "pool_address="] {
+            assert!(!rendered.contains(forbidden));
+        }
+    }
+
+    #[test]
+    fn runtime_renderer_declares_exact_durable_consumer_metrics() {
+        let metrics = RuntimeMetrics::default();
+        metrics.input_received(true);
+        metrics.input_processed(Duration::from_millis(25));
+        metrics.candidates(2);
+        metrics.no_route();
+        metrics.shadow_accepted(1);
+        metrics.shadow_rejected(1);
+        metrics.processing_failure();
+        metrics.duplicate_skip();
+        metrics.set_consumer_state(7, 3);
+        let rendered = metrics.render(&RuntimeReadiness::new());
+        for expected in [
+            "phoenix_engine_inputs_received_total 1",
+            "phoenix_engine_inputs_processed_total 1",
+            "phoenix_engine_candidates_total 2",
+            "phoenix_engine_no_route_total 1",
+            "phoenix_engine_shadow_accepted_total 1",
+            "phoenix_engine_shadow_rejected_total 1",
+            "phoenix_engine_processing_failures_total 1",
+            "phoenix_engine_redeliveries_total 1",
+            "phoenix_engine_duplicate_skips_total 1",
+            "phoenix_engine_consumer_pending 7",
+            "phoenix_engine_consumer_ack_pending 3",
+            "phoenix_engine_processing_latency_seconds 0.025000000",
+            "phoenix_engine_readiness 0",
+        ] {
+            assert!(rendered.contains(expected), "missing metric: {expected}");
+        }
+        for forbidden in ["tx_hash=", "source_event_identity=", "pool_address="] {
             assert!(!rendered.contains(forbidden));
         }
     }
