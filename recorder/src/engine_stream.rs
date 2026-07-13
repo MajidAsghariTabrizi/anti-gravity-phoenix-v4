@@ -17,7 +17,7 @@ pub const ENGINE_STREAM_MAX_MESSAGES: i64 = 2_000_000;
 pub const ENGINE_STREAM_MAX_BYTES: i64 = 1024 * 1024 * 1024;
 pub const ENGINE_STREAM_MAX_AGE: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 pub const ENGINE_STREAM_MAX_MESSAGE_BYTES: i32 = 1024 * 1024;
-pub const ENGINE_STREAM_DUPLICATE_WINDOW: Duration = Duration::from_secs(24 * 60 * 60);
+pub const ENGINE_STREAM_DUPLICATE_WINDOW: Duration = Duration::from_secs(2 * 60);
 pub const ENGINE_ACK_WAIT: Duration = Duration::from_secs(120);
 pub const ENGINE_MAX_DELIVERIES: i64 = 20;
 pub const ENGINE_MAX_ACK_PENDING: i64 = 512;
@@ -301,7 +301,12 @@ mod tests {
 
         let server_config = include_str!("../../deploy/nats-server.conf");
         assert!(server_config.contains("max_payload: 1MB"));
+        assert!(server_config.contains("duplicate_window: \"2m\""));
         assert_eq!(ENGINE_STREAM_MAX_MESSAGE_BYTES, 1024 * 1024);
+        assert_eq!(
+            ENGINE_STREAM_DUPLICATE_WINDOW,
+            crate::jetstream::STREAM_DUPLICATE_WINDOW
+        );
     }
 
     #[test]
