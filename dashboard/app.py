@@ -1,4 +1,6 @@
+import json
 import os
+import urllib.parse
 import urllib.request
 from decimal import Decimal
 
@@ -30,15 +32,19 @@ def query(sql: str, params=None) -> pd.DataFrame:
         return pd.DataFrame()
 
 
-def metric_value(name: str) -> Decimal:
+def metric_value(expression: str) -> Decimal:
     try:
-        with urllib.request.urlopen(f"{METRICS_URL}/api/v1/query?query={name}", timeout=2) as response:
-            payload = response.read().decode("utf-8")
-        marker = '"value":['
-        if marker not in payload:
+        encoded = urllib.parse.urlencode({"query": expression})
+        with urllib.request.urlopen(f"{METRICS_URL}/api/v1/query?{encoded}", timeout=2) as response:
+            payload = json.load(response)
+        if payload.get("status") != "success":
             return Decimal("0")
-        value_part = payload.split(marker, 1)[1].split("]", 1)[0].split(",", 1)[1]
-        return Decimal(value_part.strip().strip('"'))
+        values = []
+        for result in payload.get("data", {}).get("result", []):
+            value = Decimal(str(result.get("value", [0, "0"])[1]))
+            if value.is_finite():
+                values.append(value)
+        return sum(values, Decimal("0"))
     except Exception:
         return Decimal("0")
 
@@ -55,7 +61,7 @@ tabs = st.tabs(
         "Command Center",
         "Opportunity Funnel",
         "Live Origins",
-        "Arbitrage Opportunities",
+        "Shadow Decisions",
         "Executions",
         "Realized PnL",
         "Miss Analysis",
@@ -68,31 +74,47 @@ tabs = st.tabs(
 )
 
 with tabs[0]:
-    attempts = query("select status, count(*) as count from execution_attempts group by status order by status")
+    classifications = query(
+        """
+        select classification, count(*) as count
+        from shadow_engine_classifications
+        group by classification
+        order by classification
+        """
+    )
     c1, c2, c3, c4 = st.columns(4)
     with c1:
-        kpi("Expected Net PnL (SHADOW)", metric_value("phoenix_expected_net_pnl"))
+        kpi("Engine Inputs", metric_value("phoenix_engine_inputs_received_total"))
     with c2:
-        kpi("Shadow Accepted", metric_value("phoenix_shadow_accepted_total"))
+        kpi("Candidates", metric_value("phoenix_engine_candidates_total"))
     with c3:
-        kpi("Median Decision Latency", metric_value("decision_latency_seconds"))
+        kpi("Shadow Rejected", metric_value("phoenix_engine_shadow_rejected_total"))
     with c4:
-        kpi("P95 Origin To Submission", metric_value("origin_to_submission_latency_seconds"))
-    st.dataframe(attempts, use_container_width=True)
+        kpi(
+            "Input Throughput (5m)",
+            metric_value("sum(rate(phoenix_engine_inputs_processed_total[5m]))"),
+        )
+    st.dataframe(classifications, use_container_width=True)
 
 with tabs[1]:
     funnel = {
         "Origin Seen": metric_value("feed_normalized_transactions_total"),
-        "Supported": metric_value("supported_origins_total"),
-        "Affected Route": metric_value("affected_routes_total"),
-        "Simulated": metric_value("route_simulations_total"),
-        "Profitable": metric_value("profitable_opportunities_total"),
-        "Submitted": metric_value("opportunities_submitted_total"),
-        "Receipt Success": metric_value("execution_receipt_success_total"),
-        "Settled": metric_value("opportunities_settled_total"),
-        "Realized Profit": metric_value("realized_profit_total"),
+        "Engine Input": metric_value("phoenix_engine_inputs_received_total"),
+        "Processed": metric_value("phoenix_engine_inputs_processed_total"),
+        "Candidate Route": metric_value("phoenix_engine_candidates_total"),
+        "Shadow Rejected": metric_value("phoenix_engine_shadow_rejected_total"),
+        "Shadow Accepted": metric_value("phoenix_engine_shadow_accepted_total"),
     }
-    st.bar_chart(pd.DataFrame({"stage": list(funnel.keys()), "count": list(funnel.values())}), x="stage", y="count")
+    st.bar_chart(
+        pd.DataFrame(
+            {
+                "stage": list(funnel.keys()),
+                "count": [float(value) for value in funnel.values()],
+            }
+        ),
+        x="stage",
+        y="count",
+    )
 
 with tabs[2]:
     st.dataframe(
@@ -108,18 +130,20 @@ with tabs[2]:
     )
 
 with tabs[3]:
-    opportunities = query(
+    decisions = query(
         """
-        select id, route_id, lifecycle_state, flash_asset, optimized_amount,
-               expected_gross_profit as theoretical_profit,
-               expected_net_profit,
-               created_at
-        from opportunities
-        order by created_at desc
+        select id, source_event_identity, route_fingerprint, disposition,
+               primary_rejection_reason, confidence_bps, execution_eligible,
+               base_net_pnl as base_simulated_net_pnl,
+               conservative_net_pnl as conservative_simulated_net_pnl,
+               severe_net_pnl as severe_simulated_net_pnl,
+               decided_at
+        from shadow_decisions
+        order by decided_at desc
         limit 200
         """
     )
-    st.dataframe(opportunities, use_container_width=True)
+    st.dataframe(decisions, use_container_width=True)
 
 with tabs[4]:
     st.dataframe(
@@ -191,33 +215,37 @@ with tabs[9]:
         "Feed Readiness": metric_value("feed_readiness"),
         "JetStream Publish Failures": metric_value("feed_jetstream_publish_failures_total"),
         "Recorder Readiness": metric_value("recorder_readiness"),
-        "RPC Gateway Readiness": metric_value("rpc_readiness"),
-        "Engine Readiness": metric_value("engine_readiness"),
-        "Pools Tracked": metric_value("pools_tracked"),
-        "Pools Complete": metric_value("pools_complete"),
-        "Pools Incomplete": metric_value("pools_incomplete"),
-        "State Reconciliation Age": metric_value("state_reconciliation_age_seconds"),
+        "Dispatcher Readiness": metric_value("shadow_dispatcher_readiness"),
+        "Outbox Pending": metric_value("shadow_dispatcher_pending_rows"),
+        "Oldest Outbox Age (s)": metric_value(
+            "shadow_dispatcher_oldest_pending_age_seconds"
+        ),
+        "RPC Gateway Readiness": metric_value("rpc_gateway_readiness"),
+        "Engine Readiness": metric_value("phoenix_engine_readiness"),
+        "Engine Consumer Pending": metric_value("phoenix_engine_consumer_pending"),
+        "Engine ACK Pending": metric_value("phoenix_engine_consumer_ack_pending"),
+        "Engine Processing Failures": metric_value(
+            "phoenix_engine_processing_failures_total"
+        ),
         "Hot Path RPC Calls": metric_value("hot_path_external_rpc_calls_total"),
     }
     st.dataframe(pd.DataFrame({"metric": list(system.keys()), "value": list(system.values())}), use_container_width=True)
 
 with tabs[10]:
     st.warning(SHADOW_FINANCIAL_LABEL)
-    economics = {
-        "Expected Gross PnL": metric_value("phoenix_expected_gross_pnl"),
-        "Expected Net PnL": metric_value("phoenix_expected_net_pnl"),
-        "Conservative Net PnL": metric_value("phoenix_conservative_net_pnl"),
-        "Severe Net PnL": metric_value("phoenix_severe_net_pnl"),
-        "Hypothetical Realized PnL": metric_value("phoenix_hypothetical_realized_pnl"),
-        "Opportunity Age (s)": metric_value("phoenix_opportunity_age_seconds"),
-        "Detection Latency (s)": metric_value("phoenix_detection_latency_seconds"),
-        "Simulation Latency (s)": metric_value("phoenix_simulation_latency_seconds"),
-        "Quote Staleness (s)": metric_value("phoenix_quote_staleness_seconds"),
-    }
-    st.dataframe(
-        pd.DataFrame({"shadow_metric": list(economics.keys()), "value": list(economics.values())}),
-        use_container_width=True,
+    economics = query(
+        """
+        select decided_at, route_fingerprint, disposition,
+               base_net_pnl as base_simulated_net_pnl,
+               conservative_net_pnl as conservative_simulated_net_pnl,
+               severe_net_pnl as severe_simulated_net_pnl,
+               primary_rejection_reason
+        from shadow_decisions
+        order by decided_at desc
+        limit 200
+        """
     )
+    st.dataframe(economics, use_container_width=True)
 
 with tabs[11]:
     quality = {
@@ -226,13 +254,26 @@ with tabs[11]:
         "Decoder Failures": metric_value("feed_decode_failures_total"),
         "Unsupported Messages": metric_value("feed_unsupported_messages_total"),
         "Replay Lag": metric_value("phoenix_replay_lag_seconds"),
-        "Candidates": metric_value("phoenix_candidates_total"),
-        "Shadow Accepted": metric_value("phoenix_shadow_accepted_total"),
-        "Shadow Rejected": metric_value("phoenix_shadow_rejected_total"),
-        "Simulation Failures": metric_value("phoenix_simulation_failures_total"),
+        "Engine Candidates": metric_value("phoenix_engine_candidates_total"),
+        "No Route": metric_value("phoenix_engine_no_route_total"),
+        "Shadow Accepted": metric_value("phoenix_engine_shadow_accepted_total"),
+        "Shadow Rejected": metric_value("phoenix_engine_shadow_rejected_total"),
+        "Redeliveries": metric_value("phoenix_engine_redeliveries_total"),
+        "Duplicate Skips": metric_value("phoenix_engine_duplicate_skips_total"),
         "RPC Disagreements": metric_value("rpc_provider_disagreement_total"),
     }
     st.dataframe(
         pd.DataFrame({"risk_or_quality_metric": list(quality.keys()), "value": list(quality.values())}),
         use_container_width=True,
     )
+    rejection_reasons = query(
+        """
+        select coalesce(primary_rejection_reason, 'unspecified') as rejection_reason,
+               count(*) as count
+        from shadow_decisions
+        where disposition = 'rejected'
+        group by coalesce(primary_rejection_reason, 'unspecified')
+        order by count desc, rejection_reason
+        """
+    )
+    st.dataframe(rejection_reasons, use_container_width=True)

@@ -4,8 +4,8 @@ from pathlib import Path
 
 
 def main() -> None:
-    os.environ.setdefault("POSTGRES_DSN", "postgres://phoenix:placeholder@localhost:5432/phoenix")
-    os.environ.setdefault("PROMETHEUS_METRICS_URL", "http://127.0.0.1:9090")
+    os.environ["POSTGRES_DSN"] = "not=valid=conninfo"
+    os.environ["PROMETHEUS_METRICS_URL"] = "invalid-metrics-url"
     path = Path(__file__).with_name("app.py")
     spec = importlib.util.spec_from_file_location("phoenix_dashboard_app", path)
     if spec is None or spec.loader is None:
@@ -15,6 +15,9 @@ def main() -> None:
     for name in ("query", "metric_value", "kpi"):
         if not hasattr(module, name):
             raise RuntimeError(f"dashboard app missing {name}")
+    expected_label = "SHADOW / SIMULATED — NOT REALIZED CAPITAL PNL"
+    if module.SHADOW_FINANCIAL_LABEL != expected_label:
+        raise RuntimeError("dashboard SHADOW financial label changed")
 
 
 if __name__ == "__main__":
