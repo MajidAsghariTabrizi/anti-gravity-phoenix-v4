@@ -2,26 +2,26 @@ use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 #[derive(Clone, Debug)]
-pub struct CacheEntry {
-    pub value: String,
+pub struct CacheEntry<T> {
+    pub value: T,
     expires_at: Instant,
     generation: u64,
 }
 
 #[derive(Clone, Debug)]
-pub struct TtlCache {
-    entries: HashMap<String, CacheEntry>,
+pub struct TtlCache<T = String> {
+    entries: HashMap<String, CacheEntry<T>>,
     capacity: usize,
     next_generation: u64,
 }
 
-impl Default for TtlCache {
+impl<T> Default for TtlCache<T> {
     fn default() -> Self {
         Self::new(1024)
     }
 }
 
-impl TtlCache {
+impl<T> TtlCache<T> {
     pub fn new(capacity: usize) -> Self {
         Self {
             entries: HashMap::with_capacity(capacity.max(1)),
@@ -30,7 +30,7 @@ impl TtlCache {
         }
     }
 
-    pub fn insert(&mut self, key: String, value: String, ttl: Duration, now: Instant) {
+    pub fn insert(&mut self, key: String, value: T, ttl: Duration, now: Instant) {
         self.entries.retain(|_, entry| now < entry.expires_at);
         if !self.entries.contains_key(&key) && self.entries.len() >= self.capacity {
             let oldest = self
@@ -58,7 +58,17 @@ impl TtlCache {
         );
     }
 
-    pub fn get(&mut self, key: &str, now: Instant) -> Option<String> {
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+}
+
+impl<T: Clone> TtlCache<T> {
+    pub fn get(&mut self, key: &str, now: Instant) -> Option<T> {
         let expired = self
             .entries
             .get(key)
@@ -69,13 +79,5 @@ impl TtlCache {
             return None;
         }
         self.entries.get(key).map(|entry| entry.value.clone())
-    }
-
-    pub fn len(&self) -> usize {
-        self.entries.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
     }
 }

@@ -120,7 +120,7 @@ impl ShadowStateRequest {
                 || !canonical_address(&pool.token1)
                 || pool.token0 == pool.token1
                 || pool.fee == 0
-                || pool.fee > 1_000_000
+                || pool.fee >= 1_000_000
                 || !pool_ids.insert(pool.pool_id.as_str())
                 || !addresses.insert(pool.address.as_str())
             {

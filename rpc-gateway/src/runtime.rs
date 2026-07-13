@@ -1,4 +1,5 @@
 use crate::budget::GlobalBudget;
+use crate::cache::TtlCache;
 use crate::economic::{
     compare_provider_results, MethodTimeouts, PinnedBlock, ProviderResult, RpcMethod,
 };
@@ -12,11 +13,11 @@ use crate::shadow_state::{
 };
 use crate::transport::{JsonRpcClient, TransportError};
 use serde_json::{json, Value};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
-use tokio::sync::Mutex;
+use tokio::sync::{watch, Mutex};
 
 const ARBITRUM_CHAIN_ID_HEX: &str = "0xa4b1";
 const SLOT0_SELECTOR: &str = "0x3850c7bd";
@@ -25,6 +26,13 @@ const TOKEN0_SELECTOR: &str = "0x0dfe1681";
 const TOKEN1_SELECTOR: &str = "0xd21220a7";
 const FEE_SELECTOR: &str = "0xddca3f43";
 const MAX_STATE_RESPONSE_DATA_BYTES: usize = 4096;
+const SHADOW_STATE_CACHE_CAPACITY: usize = 1024;
+const SHADOW_STATE_CACHE_TTL: Duration = Duration::from_millis(100);
+const MAX_IN_FLIGHT_REQUESTS: usize = 64;
+const MAX_STATE_RESOLUTION: Duration = Duration::from_secs(25);
+const MAX_COALESCE_WAIT: Duration = Duration::from_secs(26);
+
+type SharedResult = Option<Result<ShadowStateResponse, GatewayError>>;
 
 #[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
 pub enum GatewayError {
@@ -77,6 +85,8 @@ impl GatewayError {
 pub struct GatewayRuntime {
     providers: Arc<Mutex<ProviderPool>>,
     budget: Arc<Mutex<GlobalBudget>>,
+    cache: Arc<Mutex<TtlCache<ShadowStateResponse>>>,
+    in_flight: Arc<Mutex<HashMap<String, watch::Receiver<SharedResult>>>>,
     client: Arc<dyn JsonRpcClient>,
     timeouts: MethodTimeouts,
     metrics: RuntimeRpcMetrics,
@@ -109,6 +119,8 @@ impl GatewayRuntime {
                 Duration::from_secs(1),
                 now,
             ))),
+            cache: Arc::new(Mutex::new(TtlCache::new(SHADOW_STATE_CACHE_CAPACITY))),
+            in_flight: Arc::new(Mutex::new(HashMap::new())),
             client,
             timeouts,
             metrics,
@@ -170,7 +182,6 @@ impl GatewayRuntime {
         &self,
         request: ShadowStateRequest,
     ) -> Result<ShadowStateResponse, GatewayError> {
-        let started = Instant::now();
         request
             .validate()
             .map_err(|_| GatewayError::InvalidRequest)?;
@@ -178,6 +189,63 @@ impl GatewayRuntime {
             .canonical_hash()
             .map_err(|_| GatewayError::InvalidRequest)?;
         self.metrics.request();
+        if let Some(response) = self.cache.lock().await.get(&request_hash, Instant::now()) {
+            self.metrics.cache_hit();
+            return Ok(response);
+        }
+
+        match self.coalesce_role(&request_hash).await? {
+            CoalesceRole::Follower(mut receiver) => {
+                self.metrics.coalesced_request();
+                tokio::time::timeout(MAX_COALESCE_WAIT, async move {
+                    loop {
+                        if let Some(result) = receiver.borrow().clone() {
+                            return result;
+                        }
+                        receiver
+                            .changed()
+                            .await
+                            .map_err(|_| GatewayError::ProviderUnavailable)?;
+                    }
+                })
+                .await
+                .map_err(|_| GatewayError::ProviderUnavailable)?
+            }
+            CoalesceRole::Leader(sender) => {
+                if let Some(response) = self.cache.lock().await.get(&request_hash, Instant::now()) {
+                    self.metrics.cache_hit();
+                    let result = Ok(response);
+                    let _ = sender.send(Some(result.clone()));
+                    self.in_flight.lock().await.remove(&request_hash);
+                    return result;
+                }
+                let result = tokio::time::timeout(
+                    MAX_STATE_RESOLUTION,
+                    self.resolve_uncached(request, request_hash.clone()),
+                )
+                .await
+                .unwrap_or(Err(GatewayError::ProviderUnavailable));
+                if let Ok(response) = &result {
+                    self.cache.lock().await.insert(
+                        request_hash.clone(),
+                        response.clone(),
+                        SHADOW_STATE_CACHE_TTL,
+                        Instant::now(),
+                    );
+                }
+                let _ = sender.send(Some(result.clone()));
+                self.in_flight.lock().await.remove(&request_hash);
+                result
+            }
+        }
+    }
+
+    async fn resolve_uncached(
+        &self,
+        request: ShadowStateRequest,
+        request_hash: String,
+    ) -> Result<ShadowStateResponse, GatewayError> {
+        let started = Instant::now();
         if !self.budget.lock().await.admit(Instant::now()) {
             self.metrics.rate_limited();
             self.metrics.budget_rejected();
@@ -243,6 +311,24 @@ impl GatewayRuntime {
         }
         self.metrics.observe_latency(started.elapsed().as_nanos());
         Ok(response)
+    }
+
+    async fn coalesce_role(&self, request_hash: &str) -> Result<CoalesceRole, GatewayError> {
+        let mut in_flight = self.in_flight.lock().await;
+        if let Some(receiver) = in_flight.get(request_hash).cloned() {
+            if receiver.has_changed().is_ok() {
+                return Ok(CoalesceRole::Follower(receiver));
+            }
+            in_flight.remove(request_hash);
+        }
+        if in_flight.len() >= MAX_IN_FLIGHT_REQUESTS {
+            self.metrics.rate_limited();
+            self.metrics.budget_rejected();
+            return Err(GatewayError::BudgetExhausted);
+        }
+        let (sender, receiver) = watch::channel(None);
+        in_flight.insert(request_hash.to_string(), receiver);
+        Ok(CoalesceRole::Leader(sender))
     }
 
     async fn bundle_with_failover(
@@ -559,6 +645,11 @@ impl GatewayRuntime {
     }
 }
 
+enum CoalesceRole {
+    Leader(watch::Sender<SharedResult>),
+    Follower(watch::Receiver<SharedResult>),
+}
+
 #[derive(Clone, Debug)]
 struct RecordedCall {
     value: Value,
@@ -693,6 +784,7 @@ mod tests {
     struct ScriptedClient {
         responses: StdMutex<ScriptQueue>,
         calls: StdMutex<Vec<(String, RpcMethod, Value)>>,
+        delay: Duration,
     }
 
     impl ScriptedClient {
@@ -715,6 +807,9 @@ mod tests {
             params: Value,
             _timeout: Duration,
         ) -> Result<RpcCallResult, TransportError> {
+            if !self.delay.is_zero() {
+                tokio::time::sleep(self.delay).await;
+            }
             self.calls
                 .lock()
                 .unwrap()
@@ -871,6 +966,32 @@ mod tests {
             .quality
             .iter()
             .any(|entry| { entry.provider_id == "provider_1" && !entry.success && entry.timeout }));
+    }
+
+    #[tokio::test]
+    async fn concurrent_identical_state_reads_share_one_pinned_result_and_short_cache() {
+        let client = Arc::new(ScriptedClient {
+            delay: Duration::from_millis(2),
+            ..ScriptedClient::default()
+        });
+        script_bundle(&client, "provider_0", 'a');
+        script_bundle(&client, "provider_1", 'a');
+        let runtime = runtime(client.clone());
+        let state_request = request();
+        let (first, follower) = tokio::join!(
+            runtime.resolve_shadow_state(state_request.clone()),
+            runtime.resolve_shadow_state(state_request.clone())
+        );
+        let first = first.unwrap();
+        assert_eq!(follower.unwrap(), first);
+        assert_eq!(client.calls.lock().unwrap().len(), 16);
+
+        let cached = runtime.resolve_shadow_state(state_request).await.unwrap();
+        assert_eq!(cached, first);
+        assert_eq!(client.calls.lock().unwrap().len(), 16);
+        let rendered = runtime.metrics().render(&runtime.readiness());
+        assert!(rendered.contains("rpc_coalesced_requests_total 1"));
+        assert!(rendered.contains("rpc_cache_hits_total 1"));
     }
 
     #[tokio::test]
