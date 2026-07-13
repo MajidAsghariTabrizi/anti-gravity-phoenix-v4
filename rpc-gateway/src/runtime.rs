@@ -21,6 +21,9 @@ use tokio::sync::Mutex;
 const ARBITRUM_CHAIN_ID_HEX: &str = "0xa4b1";
 const SLOT0_SELECTOR: &str = "0x3850c7bd";
 const LIQUIDITY_SELECTOR: &str = "0x1a686502";
+const TOKEN0_SELECTOR: &str = "0x0dfe1681";
+const TOKEN1_SELECTOR: &str = "0xd21220a7";
+const FEE_SELECTOR: &str = "0xddca3f43";
 const MAX_STATE_RESPONSE_DATA_BYTES: usize = 4096;
 
 #[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
@@ -332,6 +335,48 @@ impl GatewayRuntime {
 
         let mut pools = Vec::with_capacity(request.pools.len());
         for pool in &request.pools {
+            let token0 = self
+                .recorded_call(
+                    provider,
+                    RpcMethod::EthCall,
+                    json!([
+                        {"to": pool.address, "data": TOKEN0_SELECTOR},
+                        format_quantity(block.number)
+                    ]),
+                    Some(&block),
+                    retry_count,
+                )
+                .await
+                .map_err(|failure| failure.with_prior(quality.clone()))?;
+            quality.push(token0.quality);
+            let token1 = self
+                .recorded_call(
+                    provider,
+                    RpcMethod::EthCall,
+                    json!([
+                        {"to": pool.address, "data": TOKEN1_SELECTOR},
+                        format_quantity(block.number)
+                    ]),
+                    Some(&block),
+                    retry_count,
+                )
+                .await
+                .map_err(|failure| failure.with_prior(quality.clone()))?;
+            quality.push(token1.quality);
+            let fee = self
+                .recorded_call(
+                    provider,
+                    RpcMethod::EthCall,
+                    json!([
+                        {"to": pool.address, "data": FEE_SELECTOR},
+                        format_quantity(block.number)
+                    ]),
+                    Some(&block),
+                    retry_count,
+                )
+                .await
+                .map_err(|failure| failure.with_prior(quality.clone()))?;
+            quality.push(fee.quality);
             let slot0 = self
                 .recorded_call(
                     provider,
@@ -366,10 +411,25 @@ impl GatewayRuntime {
             let Some(liquidity) = normalize_state_data(liquidity.value, 32) else {
                 return Err(BundleFailure::integrity(quality));
             };
+            let Some(token0) = parse_address_result(&token0.value) else {
+                return Err(BundleFailure::integrity(quality));
+            };
+            let Some(token1) = parse_address_result(&token1.value) else {
+                return Err(BundleFailure::integrity(quality));
+            };
+            let Some(fee) = parse_u32_result(&fee.value) else {
+                return Err(BundleFailure::integrity(quality));
+            };
+            if token0 != pool.token0 || token1 != pool.token1 || fee != pool.fee {
+                return Err(BundleFailure::integrity(quality));
+            }
             let state_material = serde_json::to_vec(&(
                 &pool.pool_id,
                 &pool.address,
                 &pool.protocol,
+                &token0,
+                &token1,
+                fee,
                 &slot0,
                 &liquidity,
             ))
@@ -378,6 +438,9 @@ impl GatewayRuntime {
                 pool_id: pool.pool_id.clone(),
                 address: pool.address.clone(),
                 protocol: pool.protocol.clone(),
+                token0,
+                token1,
+                fee,
                 slot0,
                 liquidity,
                 state_hash: canonical_hash_bytes(&state_material),
@@ -571,6 +634,22 @@ fn normalize_state_data(value: Value, minimum_bytes: usize) -> Option<String> {
     }
 }
 
+fn parse_address_result(value: &Value) -> Option<String> {
+    let value = normalize_state_data(value.clone(), 32)?;
+    if value.len() != 66 || value[2..26].bytes().any(|byte| byte != b'0') {
+        return None;
+    }
+    Some(format!("0x{}", &value[26..66]))
+}
+
+fn parse_u32_result(value: &Value) -> Option<u32> {
+    let value = normalize_state_data(value.clone(), 32)?;
+    if value.len() != 66 || value[2..58].bytes().any(|byte| byte != b'0') {
+        return None;
+    }
+    u32::from_str_radix(&value[58..66], 16).ok()
+}
+
 fn canonical_quantity(value: &str) -> bool {
     let Some(body) = value.strip_prefix("0x") else {
         return false;
@@ -662,6 +741,9 @@ mod tests {
                 pool_id: "pool-a".to_string(),
                 address: "0x1111111111111111111111111111111111111111".to_string(),
                 protocol: "UniswapV3".to_string(),
+                token0: "0x3333333333333333333333333333333333333333".to_string(),
+                token1: "0x4444444444444444444444444444444444444444".to_string(),
+                fee: 500,
             }],
         }
     }
@@ -696,6 +778,21 @@ mod tests {
             provider,
             RpcMethod::EthGetBlockByNumber,
             Ok(json!({"number": "0x64", "hash": BLOCK_HASH})),
+        );
+        client.push(
+            provider,
+            RpcMethod::EthCall,
+            Ok(json!(format!("0x{}{}", "0".repeat(24), "3".repeat(40)))),
+        );
+        client.push(
+            provider,
+            RpcMethod::EthCall,
+            Ok(json!(format!("0x{}{}", "0".repeat(24), "4".repeat(40)))),
+        );
+        client.push(
+            provider,
+            RpcMethod::EthCall,
+            Ok(json!(format!("0x{:064x}", 500))),
         );
         client.push(
             provider,

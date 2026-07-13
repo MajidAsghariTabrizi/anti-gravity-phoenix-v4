@@ -24,6 +24,9 @@ pub struct PoolStateRequest {
     pub pool_id: String,
     pub address: String,
     pub protocol: String,
+    pub token0: String,
+    pub token1: String,
+    pub fee: u32,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -48,6 +51,9 @@ pub struct PoolStateResponse {
     pub pool_id: String,
     pub address: String,
     pub protocol: String,
+    pub token0: String,
+    pub token1: String,
+    pub fee: u32,
     pub slot0: String,
     pub liquidity: String,
     pub state_hash: String,
@@ -110,6 +116,11 @@ impl ShadowStateRequest {
                 || !canonical_address(&pool.address)
                 || !bounded(&pool.protocol, 1, 64)
                 || !pool.protocol.ends_with("V3")
+                || !canonical_address(&pool.token0)
+                || !canonical_address(&pool.token1)
+                || pool.token0 == pool.token1
+                || pool.fee == 0
+                || pool.fee > 1_000_000
                 || !pool_ids.insert(pool.pool_id.as_str())
                 || !addresses.insert(pool.address.as_str())
             {
@@ -179,11 +190,17 @@ mod tests {
                     pool_id: "pool-a".to_string(),
                     address: "0x1111111111111111111111111111111111111111".to_string(),
                     protocol: "UniswapV3".to_string(),
+                    token0: "0x3333333333333333333333333333333333333333".to_string(),
+                    token1: "0x4444444444444444444444444444444444444444".to_string(),
+                    fee: 500,
                 },
                 PoolStateRequest {
                     pool_id: "pool-b".to_string(),
                     address: "0x2222222222222222222222222222222222222222".to_string(),
                     protocol: "SushiSwapV3".to_string(),
+                    token0: "0x3333333333333333333333333333333333333333".to_string(),
+                    token1: "0x4444444444444444444444444444444444444444".to_string(),
+                    fee: 500,
                 },
             ],
         }
