@@ -6,6 +6,7 @@ COPY rpc-gateway ./rpc-gateway
 COPY recorder ./recorder
 COPY replay ./replay
 COPY migrations ./migrations
+COPY deploy/nats-server.conf ./deploy/nats-server.conf
 COPY scripts/recorder-live-smoke.sh ./scripts/recorder-live-smoke.sh
 RUN cd "${CRATE}" && cargo test --all
 RUN case "${CRATE}" in \
