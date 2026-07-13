@@ -5,9 +5,10 @@ use phoenix_engine::execution::ExecutionMode;
 use phoenix_engine::metrics::RuntimeMetrics;
 use phoenix_engine::persistence::{PostgresShadowStore, ShadowStore};
 use phoenix_engine::readiness::initialize_runtime;
+use phoenix_engine::rpc_evaluator::{RpcCandidateEvaluator, RpcGatewayClient, ShadowStateClient};
 use phoenix_engine::runtime::{consume_engine_messages, RuntimeExit};
 use phoenix_engine::runtime_state::RuntimeReadiness;
-use phoenix_engine::shadow_processor::{RouteRegistry, ShadowProcessor, UnavailableEvaluator};
+use phoenix_engine::shadow_processor::{RouteRegistry, ShadowProcessor};
 use phoenix_recorder::engine_stream::{
     ensure_engine_pipeline, ENGINE_DURABLE_NAME, ENGINE_STREAM_NAME,
 };
@@ -25,6 +26,7 @@ const DEFAULT_ROUTER: &str = "0x68b3465833fb72a70ecdf485e0e4c7bd8665fc45";
 const RETRY_INITIAL: Duration = Duration::from_secs(1);
 const RETRY_MAXIMUM: Duration = Duration::from_secs(30);
 const DATABASE_MONITOR_INTERVAL: Duration = Duration::from_secs(5);
+const RPC_MONITOR_INTERVAL: Duration = Duration::from_secs(2);
 
 #[derive(Clone, Debug)]
 struct DaemonConfig {
@@ -34,6 +36,8 @@ struct DaemonConfig {
     pg_ssl_mode: String,
     routers: Vec<Address>,
     routes: RouteRegistry,
+    rpc_gateway_url: String,
+    code_version: String,
 }
 
 impl DaemonConfig {
@@ -61,6 +65,10 @@ impl DaemonConfig {
             pg_ssl_mode: std::env::var("PGSSLMODE").unwrap_or_else(|_| "prefer".to_string()),
             routers,
             routes,
+            rpc_gateway_url: std::env::var("RPC_GATEWAY_URL")
+                .unwrap_or_else(|_| "http://rpc-gateway:9300".to_string()),
+            code_version: std::env::var("PHOENIX_CODE_VERSION")
+                .unwrap_or_else(|_| env!("CARGO_PKG_VERSION").to_string()),
         })
     }
 }
@@ -96,10 +104,18 @@ async fn run_daemon() -> Result<(), &'static str> {
     let strategy_configured = !config.routes.is_empty();
     readiness.set_strategy_configured(strategy_configured);
     readiness.set_evaluation_dependencies_ready(false);
+    let rpc_client = Arc::new(
+        RpcGatewayClient::new(&config.rpc_gateway_url)
+            .map_err(|_| "invalid RPC Gateway configuration")?,
+    );
+    let evaluator = Arc::new(
+        RpcCandidateEvaluator::new(rpc_client.clone(), config.code_version.clone())
+            .map_err(|_| "invalid Engine evaluator configuration")?,
+    );
     let processor = Arc::new(ShadowProcessor::new(
         config.routers.clone(),
         config.routes.clone(),
-        Arc::new(UnavailableEvaluator),
+        evaluator,
     ));
 
     tracing::info!(
@@ -108,7 +124,8 @@ async fn run_daemon() -> Result<(), &'static str> {
         stream = ENGINE_STREAM_NAME,
         durable_consumer = ENGINE_DURABLE_NAME,
         strategy_configured,
-        evaluation_backend = "fail_closed_unavailable",
+        evaluation_backend = "block_pinned_rpc_state",
+        simulation_level = "state_based",
         live_execution = false
     );
 
@@ -124,12 +141,19 @@ async fn run_daemon() -> Result<(), &'static str> {
         tracing::info!(event = "phoenix_engine_graceful_shutdown_started");
         signal_shutdown.cancel();
     });
+    let rpc_monitor = tokio::spawn(monitor_rpc_gateway(
+        rpc_client,
+        readiness.clone(),
+        sampler.clone(),
+        shutdown.clone(),
+    ));
 
     if std::env::var("PHOENIX_ONESHOT")
         .map(|value| value.eq_ignore_ascii_case("true"))
         .unwrap_or(false)
     {
         shutdown.cancel();
+        let _ = rpc_monitor.await;
         let _ = health_task.await;
         return Ok(());
     }
@@ -245,6 +269,7 @@ async fn run_daemon() -> Result<(), &'static str> {
 
     shutdown.cancel();
     let _ = database_monitor.await;
+    let _ = rpc_monitor.await;
     readiness.stop_event_loop();
     let _ = health_task.await;
     tracing::info!(event = "phoenix_engine_graceful_shutdown_complete");
@@ -252,6 +277,30 @@ async fn run_daemon() -> Result<(), &'static str> {
         Err("Engine stopped on a terminal integrity condition")
     } else {
         Ok(())
+    }
+}
+
+async fn monitor_rpc_gateway(
+    client: Arc<RpcGatewayClient>,
+    readiness: RuntimeReadiness,
+    sampler: LogSampler,
+    shutdown: CancellationToken,
+) {
+    loop {
+        match client.ready().await {
+            Ok(true) => readiness.set_evaluation_dependencies_ready(true),
+            Ok(false) | Err(_) => {
+                readiness.set_evaluation_dependencies_ready(false);
+                sampled_warning(
+                    &sampler,
+                    "engine_rpc_gateway_monitor_failure",
+                    "phoenix_engine_rpc_gateway_unready",
+                );
+            }
+        }
+        if sleep_or_shutdown(RPC_MONITOR_INTERVAL, &shutdown).await {
+            return;
+        }
     }
 }
 

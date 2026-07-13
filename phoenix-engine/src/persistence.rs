@@ -1,16 +1,19 @@
 use crate::engine_input::{EngineClassification, InputIdentity};
+use crate::opportunity::{ShadowDisposition, SimulationKind, StateSource};
+use crate::shadow_processor::EvaluatedOpportunity;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde_json::Value;
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions, PgSslMode};
 use sqlx::types::Json;
-use sqlx::{PgPool, Row};
+use sqlx::{PgPool, Postgres, Row, Transaction};
 use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
 use std::time::Duration;
 use thiserror::Error;
 
 const MAX_EVIDENCE_BYTES: usize = 1024 * 1024;
+const MAX_RPC_QUALITY_RECORDS: usize = 512;
 const MAX_POOL_CONNECTIONS: u32 = 8;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -26,6 +29,7 @@ pub struct ClassificationRecord {
     pub first_received_at: DateTime<Utc>,
     pub completed_at: DateTime<Utc>,
     pub processing_latency_ns: u128,
+    pub evaluations: Vec<EvaluatedOpportunity>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -90,7 +94,9 @@ FROM information_schema.columns
 WHERE table_schema = 'public'
   AND table_name IN (
       'shadow_engine_classifications',
-      'shadow_engine_processing_attempts'
+      'shadow_engine_processing_attempts',
+      'shadow_decisions',
+      'rpc_quality_records'
   )
 "#,
         )
@@ -123,7 +129,9 @@ JOIN information_schema.key_column_usage kcu
 WHERE tc.constraint_schema = 'public'
   AND tc.table_name IN (
       'shadow_engine_classifications',
-      'shadow_engine_processing_attempts'
+      'shadow_engine_processing_attempts',
+      'shadow_decisions',
+      'rpc_quality_records'
   )
   AND tc.constraint_type IN ('PRIMARY KEY', 'UNIQUE')
 GROUP BY tc.table_name, tc.constraint_name
@@ -152,7 +160,9 @@ JOIN pg_namespace namespace_row ON namespace_row.oid = table_row.relnamespace
 WHERE namespace_row.nspname = 'public'
   AND table_row.relname IN (
       'shadow_engine_classifications',
-      'shadow_engine_processing_attempts'
+      'shadow_engine_processing_attempts',
+      'shadow_decisions',
+      'rpc_quality_records'
   )
   AND constraint_row.contype = 'c'
 "#,
@@ -168,6 +178,23 @@ WHERE namespace_row.nspname = 'public'
                 .entry(table)
                 .or_default()
                 .push(definition);
+        }
+
+        let rows = sqlx::query(
+            r#"
+SELECT tablename AS table_name, indexdef AS definition
+FROM pg_indexes
+WHERE schemaname = 'public'
+  AND tablename IN ('shadow_decisions', 'rpc_quality_records')
+"#,
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(classify_sqlx_error)?;
+        for row in rows {
+            let table: String = row.try_get("table_name").map_err(classify_sqlx_error)?;
+            let definition: String = row.try_get("definition").map_err(classify_sqlx_error)?;
+            snapshot.indexes.entry(table).or_default().push(definition);
         }
         Ok(snapshot)
     }
@@ -216,6 +243,12 @@ impl ShadowStore for PostgresShadowStore {
     ) -> Result<PersistOutcome, StoreError> {
         validate_record(record)?;
         let mut transaction = self.pool.begin().await.map_err(classify_sqlx_error)?;
+
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+            .bind(&record.identity.source_event_identity)
+            .execute(&mut *transaction)
+            .await
+            .map_err(classify_sqlx_error)?;
 
         let existing = sqlx::query(
             "SELECT classification FROM shadow_engine_classifications \
@@ -327,9 +360,243 @@ ON CONFLICT (source_event_identity) DO UPDATE SET
         .await
         .map_err(classify_sqlx_error)?;
 
+        for evaluation in &record.evaluations {
+            persist_decision(&mut transaction, record, evaluation).await?;
+        }
+
         transaction.commit().await.map_err(classify_sqlx_error)?;
         Ok(PersistOutcome::Committed)
     }
+}
+
+async fn persist_decision(
+    transaction: &mut Transaction<'_, Postgres>,
+    record: &ClassificationRecord,
+    evaluation: &EvaluatedOpportunity,
+) -> Result<(), StoreError> {
+    let opportunity = &evaluation.opportunity;
+    let observed_at = timestamp_from_millis(opportunity.identity.observed_at_unix_ms)?;
+    let detected_at = timestamp_from_millis(opportunity.identity.detected_at_unix_ms)?;
+    let decided_at = timestamp_from_millis(opportunity.decision.decided_at_unix_ms)?;
+    let identity_evidence =
+        serde_json::to_value(&opportunity.identity).map_err(|_| StoreError::Integrity)?;
+    let route_evidence =
+        serde_json::to_value(&opportunity.route).map_err(|_| StoreError::Integrity)?;
+    let market_evidence =
+        serde_json::to_value(&opportunity.market).map_err(|_| StoreError::Integrity)?;
+    let economics_evidence =
+        serde_json::to_value(&opportunity.economics).map_err(|_| StoreError::Integrity)?;
+    let simulation_evidence =
+        serde_json::to_value(&opportunity.simulation).map_err(|_| StoreError::Integrity)?;
+    let decision_evidence =
+        serde_json::to_value(&opportunity.decision).map_err(|_| StoreError::Integrity)?;
+    let outcome_evidence =
+        serde_json::to_value(&opportunity.outcome).map_err(|_| StoreError::Integrity)?;
+    let secondary_reasons = serde_json::to_value(&opportunity.decision.secondary_rejection_reasons)
+        .map_err(|_| StoreError::Integrity)?;
+    let risk_flags = serde_json::to_value(&opportunity.decision.risk_flags)
+        .map_err(|_| StoreError::Integrity)?;
+    let disposition = match opportunity.decision.disposition {
+        ShadowDisposition::Accepted => "accepted",
+        ShadowDisposition::Rejected => "rejected",
+    };
+
+    let inserted = sqlx::query(
+        r#"
+INSERT INTO shadow_decisions (
+    id,
+    opportunity_id,
+    strategy,
+    strategy_version,
+    detector_version,
+    code_version,
+    config_version,
+    policy_version,
+    chain_id,
+    source_sequence,
+    observed_block,
+    state_block,
+    quote_block,
+    route_fingerprint,
+    disposition,
+    primary_rejection_reason,
+    confidence_bps,
+    execution_eligible,
+    base_net_pnl,
+    conservative_net_pnl,
+    severe_net_pnl,
+    identity_evidence,
+    route_evidence,
+    market_evidence,
+    economics_evidence,
+    simulation_evidence,
+    decision_evidence,
+    outcome_evidence,
+    observed_at,
+    detected_at,
+    decided_at,
+    source_event_identity,
+    secondary_rejection_reasons,
+    risk_flags,
+    processing_latency_ns
+) VALUES (
+    CAST($1 AS uuid),
+    NULL,
+    $2,
+    $3,
+    $4,
+    $5,
+    $6,
+    $7,
+    $8,
+    CAST($9 AS numeric),
+    CAST($10 AS numeric),
+    CAST($11 AS numeric),
+    CAST($12 AS numeric),
+    $13,
+    $14,
+    $15,
+    $16,
+    false,
+    CAST($17 AS numeric),
+    CAST($18 AS numeric),
+    CAST($19 AS numeric),
+    $20,
+    $21,
+    $22,
+    $23,
+    $24,
+    $25,
+    $26,
+    $27,
+    $28,
+    $29,
+    $30,
+    $31,
+    $32,
+    CAST($33 AS numeric)
+)
+ON CONFLICT (id) DO NOTHING
+"#,
+    )
+    .bind(&opportunity.identity.opportunity_id.0)
+    .bind(opportunity.identity.strategy.as_str())
+    .bind(&opportunity.identity.strategy_version)
+    .bind(&opportunity.identity.detector_version)
+    .bind(&opportunity.identity.code_version)
+    .bind(&opportunity.identity.config_version)
+    .bind(&opportunity.decision.policy_version)
+    .bind(opportunity.identity.chain_id as i64)
+    .bind(opportunity.identity.source_sequence.to_string())
+    .bind(opportunity.identity.observed_block.to_string())
+    .bind(opportunity.market.state_block.to_string())
+    .bind(opportunity.market.quote_block.to_string())
+    .bind(&opportunity.route.route_fingerprint)
+    .bind(disposition)
+    .bind(
+        opportunity
+            .decision
+            .primary_rejection_reason
+            .map(|reason| reason.as_str()),
+    )
+    .bind(opportunity.decision.confidence_bps as i32)
+    .bind(opportunity.economics.base.expected_net_pnl.0.to_string())
+    .bind(
+        opportunity
+            .economics
+            .conservative
+            .expected_net_pnl
+            .0
+            .to_string(),
+    )
+    .bind(opportunity.economics.severe.expected_net_pnl.0.to_string())
+    .bind(Json(identity_evidence))
+    .bind(Json(route_evidence))
+    .bind(Json(market_evidence))
+    .bind(Json(economics_evidence))
+    .bind(Json(simulation_evidence))
+    .bind(Json(decision_evidence))
+    .bind(Json(outcome_evidence))
+    .bind(observed_at)
+    .bind(detected_at)
+    .bind(decided_at)
+    .bind(&record.identity.source_event_identity)
+    .bind(Json(secondary_reasons))
+    .bind(Json(risk_flags))
+    .bind(record.processing_latency_ns.to_string())
+    .execute(&mut **transaction)
+    .await
+    .map_err(classify_sqlx_error)?;
+    if inserted.rows_affected() != 1 {
+        return Err(StoreError::Integrity);
+    }
+
+    let block_hash = opportunity
+        .market
+        .state_block_hash
+        .as_deref()
+        .ok_or(StoreError::Integrity)?;
+    for quality in &evaluation.rpc_quality {
+        sqlx::query(
+            r#"
+INSERT INTO rpc_quality_records (
+    shadow_decision_id,
+    provider_id,
+    method,
+    block_number,
+    block_hash,
+    response_hash,
+    latency_ns,
+    success,
+    stale_result,
+    disagreement,
+    timeout,
+    retry_count
+) VALUES (
+    CAST($1 AS uuid),
+    $2,
+    $3,
+    CAST($4 AS numeric),
+    $5,
+    $6,
+    CAST($7 AS numeric),
+    $8,
+    $9,
+    $10,
+    $11,
+    $12
+)
+"#,
+        )
+        .bind(&opportunity.identity.opportunity_id.0)
+        .bind(&quality.provider_id)
+        .bind(&quality.method)
+        .bind(
+            quality
+                .block_number
+                .unwrap_or(opportunity.market.state_block)
+                .to_string(),
+        )
+        .bind(quality.block_hash.as_deref().unwrap_or(block_hash))
+        .bind(quality.response_hash.as_deref())
+        .bind(quality.latency_ns.to_string())
+        .bind(quality.success)
+        .bind(quality.stale_result)
+        .bind(quality.disagreement)
+        .bind(quality.timeout)
+        .bind(quality.retry_count as i32)
+        .execute(&mut **transaction)
+        .await
+        .map_err(classify_sqlx_error)?;
+    }
+    Ok(())
+}
+
+fn timestamp_from_millis(value: u64) -> Result<DateTime<Utc>, StoreError> {
+    i64::try_from(value)
+        .ok()
+        .and_then(DateTime::<Utc>::from_timestamp_millis)
+        .ok_or(StoreError::Integrity)
 }
 
 #[derive(Clone, Debug, Default)]
@@ -337,6 +604,7 @@ pub struct SchemaSnapshot {
     columns: HashMap<(String, String), ColumnDefinition>,
     unique_constraints: HashMap<String, HashSet<Vec<String>>>,
     check_constraints: HashMap<String, Vec<String>>,
+    indexes: HashMap<String, Vec<String>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -464,6 +732,74 @@ const REQUIRED_COLUMNS: &[(&str, &str, &str, bool)] = &[
         "numeric",
         false,
     ),
+    ("shadow_decisions", "id", "uuid", false),
+    ("shadow_decisions", "opportunity_id", "uuid", true),
+    ("shadow_decisions", "strategy", "text", false),
+    ("shadow_decisions", "strategy_version", "text", false),
+    ("shadow_decisions", "detector_version", "text", false),
+    ("shadow_decisions", "code_version", "text", false),
+    ("shadow_decisions", "config_version", "text", false),
+    ("shadow_decisions", "policy_version", "text", false),
+    ("shadow_decisions", "chain_id", "bigint", false),
+    ("shadow_decisions", "source_sequence", "numeric", false),
+    ("shadow_decisions", "observed_block", "numeric", false),
+    ("shadow_decisions", "state_block", "numeric", false),
+    ("shadow_decisions", "quote_block", "numeric", false),
+    ("shadow_decisions", "route_fingerprint", "text", false),
+    ("shadow_decisions", "disposition", "text", false),
+    ("shadow_decisions", "primary_rejection_reason", "text", true),
+    ("shadow_decisions", "confidence_bps", "integer", false),
+    ("shadow_decisions", "execution_eligible", "boolean", false),
+    ("shadow_decisions", "base_net_pnl", "numeric", false),
+    ("shadow_decisions", "conservative_net_pnl", "numeric", false),
+    ("shadow_decisions", "severe_net_pnl", "numeric", false),
+    ("shadow_decisions", "identity_evidence", "jsonb", false),
+    ("shadow_decisions", "route_evidence", "jsonb", false),
+    ("shadow_decisions", "market_evidence", "jsonb", false),
+    ("shadow_decisions", "economics_evidence", "jsonb", false),
+    ("shadow_decisions", "simulation_evidence", "jsonb", false),
+    ("shadow_decisions", "decision_evidence", "jsonb", false),
+    ("shadow_decisions", "outcome_evidence", "jsonb", false),
+    (
+        "shadow_decisions",
+        "observed_at",
+        "timestamp with time zone",
+        false,
+    ),
+    (
+        "shadow_decisions",
+        "detected_at",
+        "timestamp with time zone",
+        false,
+    ),
+    (
+        "shadow_decisions",
+        "decided_at",
+        "timestamp with time zone",
+        false,
+    ),
+    ("shadow_decisions", "source_event_identity", "text", true),
+    (
+        "shadow_decisions",
+        "secondary_rejection_reasons",
+        "jsonb",
+        false,
+    ),
+    ("shadow_decisions", "risk_flags", "jsonb", false),
+    ("shadow_decisions", "processing_latency_ns", "numeric", true),
+    ("rpc_quality_records", "id", "bigint", false),
+    ("rpc_quality_records", "shadow_decision_id", "uuid", true),
+    ("rpc_quality_records", "provider_id", "text", false),
+    ("rpc_quality_records", "method", "text", false),
+    ("rpc_quality_records", "block_number", "numeric", false),
+    ("rpc_quality_records", "block_hash", "text", false),
+    ("rpc_quality_records", "response_hash", "text", true),
+    ("rpc_quality_records", "latency_ns", "numeric", false),
+    ("rpc_quality_records", "success", "boolean", false),
+    ("rpc_quality_records", "stale_result", "boolean", false),
+    ("rpc_quality_records", "disagreement", "boolean", false),
+    ("rpc_quality_records", "timeout", "boolean", false),
+    ("rpc_quality_records", "retry_count", "integer", false),
 ];
 
 pub fn validate_schema_snapshot(snapshot: &SchemaSnapshot) -> Result<(), StoreError> {
@@ -495,6 +831,13 @@ pub fn validate_schema_snapshot(snapshot: &SchemaSnapshot) -> Result<(), StoreEr
         "shadow_engine_processing_attempts",
         &["source_event_identity", "delivery_attempt"],
     )?;
+    require_unique(snapshot, "shadow_decisions", &["id"])?;
+    require_unique(snapshot, "rpc_quality_records", &["id"])?;
+    require_index_fragment(
+        snapshot,
+        "shadow_decisions",
+        "(source_event_identity,strategy_version,route_fingerprint)",
+    )?;
 
     let checks = snapshot
         .check_constraints
@@ -508,12 +851,34 @@ pub fn validate_schema_snapshot(snapshot: &SchemaSnapshot) -> Result<(), StoreEr
         "classification=any",
         "octet_lengthevidence::text<=1048576",
         "delivery_attempt>=1",
+        "execution_eligible=false",
+        "retry_count>=0",
+        "jsonb_typeofsecondary_rejection_reasons='array'::text",
+        "jsonb_typeofrisk_flags='array'::text",
     ] {
         if !checks.contains(required) {
             return Err(StoreError::Schema);
         }
     }
     Ok(())
+}
+
+fn require_index_fragment(
+    snapshot: &SchemaSnapshot,
+    table: &str,
+    required: &str,
+) -> Result<(), StoreError> {
+    let normalized = |value: &str| value.to_ascii_lowercase().replace([' ', '(', ')', '"'], "");
+    let required = normalized(required);
+    if snapshot.indexes.get(table).is_some_and(|indexes| {
+        indexes
+            .iter()
+            .any(|value| normalized(value).contains(&required))
+    }) {
+        Ok(())
+    } else {
+        Err(StoreError::Schema)
+    }
 }
 
 fn require_unique(
@@ -536,7 +901,7 @@ fn require_unique(
     }
 }
 
-fn validate_record(record: &ClassificationRecord) -> Result<(), StoreError> {
+pub(crate) fn validate_record(record: &ClassificationRecord) -> Result<(), StoreError> {
     let evidence_bytes = serde_json::to_vec(&record.evidence).map_err(|_| StoreError::Integrity)?;
     if !valid_identity(&record.identity.source_event_identity)
         || !valid_tx_hash(&record.identity.tx_hash)
@@ -551,8 +916,116 @@ fn validate_record(record: &ClassificationRecord) -> Result<(), StoreError> {
             .detail_class
             .is_some_and(|value| value.is_empty() || value.len() > 128)
         || record.completed_at < record.first_received_at
+        || record.decision_count != record.evaluations.len()
     {
         return Err(StoreError::Integrity);
+    }
+    let accepted = record
+        .evaluations
+        .iter()
+        .filter(|value| value.opportunity.decision.disposition == ShadowDisposition::Accepted)
+        .count();
+    if (record.classification == EngineClassification::ShadowAccepted && accepted == 0)
+        || (record.classification == EngineClassification::CandidateRejected && accepted > 0)
+        || (!matches!(
+            record.classification,
+            EngineClassification::ShadowAccepted | EngineClassification::CandidateRejected
+        ) && !record.evaluations.is_empty())
+    {
+        return Err(StoreError::Integrity);
+    }
+    let mut opportunity_ids = HashSet::new();
+    let mut route_fingerprints = HashSet::new();
+    for evaluation in &record.evaluations {
+        validate_evaluation(record, evaluation)?;
+        if !opportunity_ids.insert(&evaluation.opportunity.identity.opportunity_id.0)
+            || !route_fingerprints.insert(&evaluation.opportunity.route.route_fingerprint)
+        {
+            return Err(StoreError::Integrity);
+        }
+    }
+    Ok(())
+}
+
+fn validate_evaluation(
+    record: &ClassificationRecord,
+    evaluation: &EvaluatedOpportunity,
+) -> Result<(), StoreError> {
+    let opportunity = &evaluation.opportunity;
+    let encoded = serde_json::to_vec(opportunity).map_err(|_| StoreError::Integrity)?;
+    let block_hash = opportunity
+        .market
+        .state_block_hash
+        .as_deref()
+        .ok_or(StoreError::Integrity)?;
+    if opportunity.validate_traceability().is_err()
+        || encoded.len() > MAX_EVIDENCE_BYTES
+        || !valid_uuid(&opportunity.identity.opportunity_id.0)
+        || opportunity.identity.source_sequence != record.identity.source_sequence
+        || opportunity.identity.origin_tx_hash.0 != record.identity.tx_hash
+        || opportunity.identity.chain_id != record.identity.chain_id
+        || opportunity.identity.observed_at_unix_ms == 0
+        || opportunity.decision.decided_at_unix_ms < opportunity.identity.detected_at_unix_ms
+        || opportunity.market.state_source != StateSource::BlockPinnedRpc
+        || opportunity.market.state_block != opportunity.identity.observed_block
+        || opportunity.market.quote_block != opportunity.market.state_block
+        || !valid_block_hash(block_hash)
+        || opportunity.simulation.block_number != opportunity.market.state_block
+        || opportunity.simulation.block_hash.as_deref() != Some(block_hash)
+        || opportunity.route.input_token != opportunity.route.output_token
+        || opportunity.market.pool_states.len() != opportunity.route.pools.len()
+        || opportunity
+            .market
+            .pool_states
+            .iter()
+            .any(|state| !valid_evidence_hash(&state.state_hash))
+        || opportunity
+            .market
+            .rpc_response_hash
+            .as_deref()
+            .map_or(true, |value| !valid_evidence_hash(value))
+        || opportunity
+            .market
+            .rpc_provider_id
+            .as_deref()
+            .map_or(true, |value| {
+                !bounded_text(value, 1, 128) || value.contains("://")
+            })
+        || !bounded_text(&opportunity.route.route_fingerprint, 1, 256)
+        || !bounded_text(&opportunity.identity.strategy_version, 1, 128)
+        || !bounded_text(&opportunity.identity.detector_version, 1, 128)
+        || !bounded_text(&opportunity.identity.code_version, 1, 128)
+        || !bounded_text(&opportunity.identity.config_version, 1, 256)
+        || !bounded_text(&opportunity.decision.policy_version, 1, 128)
+        || opportunity.decision.execution_eligible
+        || (opportunity.decision.disposition == ShadowDisposition::Accepted
+            && opportunity.simulation.kind == SimulationKind::StateBased)
+        || evaluation.rpc_quality.is_empty()
+        || evaluation.rpc_quality.len() > MAX_RPC_QUALITY_RECORDS
+    {
+        return Err(StoreError::Integrity);
+    }
+    for quality in &evaluation.rpc_quality {
+        if !bounded_text(&quality.provider_id, 1, 128)
+            || quality.provider_id.contains("://")
+            || !matches!(
+                quality.method.as_str(),
+                "eth_chainId" | "eth_getBlockByNumber" | "eth_call"
+            )
+            || quality
+                .block_number
+                .is_some_and(|value| value != opportunity.market.state_block)
+            || quality
+                .block_hash
+                .as_deref()
+                .is_some_and(|value| value != block_hash)
+            || quality
+                .response_hash
+                .as_deref()
+                .is_some_and(|value| !valid_evidence_hash(value))
+        {
+            return Err(StoreError::Integrity);
+        }
     }
     Ok(())
 }
@@ -567,6 +1040,29 @@ fn valid_tx_hash(value: &str) -> bool {
         && value[2..]
             .bytes()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn valid_uuid(value: &str) -> bool {
+    value.len() == 36
+        && value.bytes().enumerate().all(|(index, byte)| match index {
+            8 | 13 | 18 | 23 => byte == b'-',
+            _ => byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte),
+        })
+}
+
+fn valid_block_hash(value: &str) -> bool {
+    value.len() == 66 && value.starts_with("0x") && valid_evidence_hash(&value[2..])
+}
+
+fn valid_evidence_hash(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn bounded_text(value: &str, minimum: usize, maximum: usize) -> bool {
+    value.len() >= minimum && value.len() <= maximum && !value.chars().any(char::is_control)
 }
 
 fn parse_ssl_mode(value: &str) -> Result<PgSslMode, StoreError> {
@@ -625,6 +1121,16 @@ mod tests {
                 "source_event_identity".to_string(),
                 "delivery_attempt".to_string(),
             ]);
+        snapshot
+            .unique_constraints
+            .entry("shadow_decisions".to_string())
+            .or_default()
+            .insert(vec!["id".to_string()]);
+        snapshot
+            .unique_constraints
+            .entry("rpc_quality_records".to_string())
+            .or_default()
+            .insert(vec!["id".to_string()]);
         snapshot.check_constraints.insert(
             "shadow_engine_classifications".to_string(),
             vec![
@@ -636,6 +1142,24 @@ mod tests {
         snapshot.check_constraints.insert(
             "shadow_engine_processing_attempts".to_string(),
             vec!["CHECK ((delivery_attempt >= 1))".to_string()],
+        );
+        snapshot.check_constraints.insert(
+            "shadow_decisions".to_string(),
+            vec![
+                "CHECK ((execution_eligible = false))".to_string(),
+                "CHECK ((jsonb_typeof(secondary_rejection_reasons) = 'array'::text))".to_string(),
+                "CHECK ((jsonb_typeof(risk_flags) = 'array'::text))".to_string(),
+            ],
+        );
+        snapshot.check_constraints.insert(
+            "rpc_quality_records".to_string(),
+            vec!["CHECK ((retry_count >= 0))".to_string()],
+        );
+        snapshot.indexes.insert(
+            "shadow_decisions".to_string(),
+            vec![
+                "CREATE UNIQUE INDEX shadow_decisions_source_event_route_idx ON public.shadow_decisions USING btree (source_event_identity, strategy_version, route_fingerprint) WHERE (source_event_identity IS NOT NULL)".to_string(),
+            ],
         );
         snapshot
     }
@@ -658,6 +1182,7 @@ mod tests {
             first_received_at: now,
             completed_at: now,
             processing_latency_ns: 1,
+            evaluations: Vec::new(),
         }
     }
 
@@ -718,5 +1243,11 @@ mod tests {
         ] {
             assert!(migration.contains(required));
         }
+        let identity_migration = include_str!("../../migrations/005_shadow_decision_identity.sql");
+        assert!(identity_migration.contains(
+            "UNIQUE (strategy_version, route_fingerprint, source_sequence, observed_block)"
+        ));
+        assert!(identity_migration.contains("DROP CONSTRAINT"));
+        assert!(identity_migration.contains("shadow_decisions_source_event_route_idx"));
     }
 }

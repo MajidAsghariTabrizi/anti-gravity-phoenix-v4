@@ -112,6 +112,20 @@ jobs:
     name: rust-phoenix
     runs-on: ubuntu-24.04
     timeout-minutes: 15
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: phoenix_test
+          POSTGRES_PASSWORD: phoenix_test_password
+          POSTGRES_DB: phoenix_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U phoenix_test -d phoenix_test"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
     steps:
       - name: Checkout
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
@@ -125,6 +139,9 @@ jobs:
           cargo fmt --check --manifest-path phoenix-engine/Cargo.toml
           cargo clippy --manifest-path phoenix-engine/Cargo.toml --all-targets --all-features -- -D warnings
           cargo test --manifest-path phoenix-engine/Cargo.toml
+          PHOENIX_TEST_POSTGRES_DSN=postgres://phoenix_test:phoenix_test_password@127.0.0.1:5432/phoenix_test \
+            cargo test --locked --manifest-path phoenix-engine/Cargo.toml \
+              --test postgres_decision_integration -- --nocapture
 
   rust-rpc-gateway:
     name: rust-rpc-gateway

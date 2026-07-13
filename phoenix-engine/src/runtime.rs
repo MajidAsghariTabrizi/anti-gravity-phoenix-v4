@@ -161,7 +161,7 @@ pub async fn process_delivery(
                 "delivery_attempts_exhausted": delivery.delivery_count,
                 "prior_evidence": result.evidence
             }),
-            opportunities: Vec::new(),
+            evaluations: Vec::new(),
             action: ProcessingAction::Terminate,
         };
     }
@@ -179,6 +179,7 @@ pub async fn process_delivery(
         first_received_at: started_at,
         completed_at,
         processing_latency_ns: elapsed.as_nanos(),
+        evaluations: result.evaluations.clone(),
     };
     let outcome = match store.persist_classification(&record).await {
         Ok(outcome) => outcome,
@@ -209,7 +210,7 @@ fn decode_failure_result(kind: InputFailureKind, evidence: serde_json::Value) ->
             candidate_count: 0,
             decision_count: 0,
             evidence,
-            opportunities: Vec::new(),
+            evaluations: Vec::new(),
             action: ProcessingAction::Terminate,
         },
         InputFailureKind::Malformed => ProcessResult {
@@ -218,7 +219,7 @@ fn decode_failure_result(kind: InputFailureKind, evidence: serde_json::Value) ->
             candidate_count: 0,
             decision_count: 0,
             evidence,
-            opportunities: Vec::new(),
+            evaluations: Vec::new(),
             action: ProcessingAction::Retry,
         },
     }
@@ -230,15 +231,17 @@ fn record_result_metrics(metrics: &RuntimeMetrics, result: &ProcessResult) {
         EngineClassification::NoRelevantRoute => metrics.no_route(),
         EngineClassification::ShadowAccepted | EngineClassification::CandidateRejected => {
             let accepted = result
-                .opportunities
+                .evaluations
                 .iter()
-                .filter(|value| value.decision.disposition == ShadowDisposition::Accepted)
+                .filter(|value| {
+                    value.opportunity.decision.disposition == ShadowDisposition::Accepted
+                })
                 .count();
-            let rejected = result.opportunities.len().saturating_sub(accepted);
+            let rejected = result.evaluations.len().saturating_sub(accepted);
             metrics.shadow_accepted(accepted);
             metrics.shadow_rejected(rejected.max(usize::from(
                 result.classification == EngineClassification::CandidateRejected
-                    && result.opportunities.is_empty(),
+                    && result.evaluations.is_empty(),
             )));
         }
         EngineClassification::CandidateGenerated => {}

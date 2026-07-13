@@ -1,9 +1,10 @@
-use crate::domain::{Address, Direction, PoolId, RouteId, TokenAddress};
+use crate::domain::{Address, Amount, Direction, PoolId, RouteId, TokenAddress};
 use crate::engine_input::{EngineClassification, EngineInput};
 use crate::graph::{PoolEdge, PoolGraph, Route};
 use crate::opportunity::{Opportunity, ShadowDisposition};
 use crate::origin::{OriginClassification, OriginDetector, OriginEvent};
 use async_trait::async_trait;
+use rpc_gateway::shadow_state::RpcQualityEvidence;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
@@ -27,7 +28,7 @@ pub struct ProcessResult {
     pub candidate_count: usize,
     pub decision_count: usize,
     pub evidence: Value,
-    pub opportunities: Vec<Opportunity>,
+    pub evaluations: Vec<EvaluatedOpportunity>,
     pub action: ProcessingAction,
 }
 
@@ -39,7 +40,7 @@ impl ProcessResult {
             candidate_count: 0,
             decision_count: 0,
             evidence,
-            opportunities: Vec::new(),
+            evaluations: Vec::new(),
             action: ProcessingAction::Ack,
         }
     }
@@ -51,7 +52,7 @@ impl ProcessResult {
             candidate_count,
             decision_count: 0,
             evidence,
-            opportunities: Vec::new(),
+            evaluations: Vec::new(),
             action: ProcessingAction::Retry,
         }
     }
@@ -63,7 +64,7 @@ impl ProcessResult {
             candidate_count,
             decision_count: 0,
             evidence,
-            opportunities: Vec::new(),
+            evaluations: Vec::new(),
             action: ProcessingAction::Terminate,
         }
     }
@@ -71,8 +72,14 @@ impl ProcessResult {
 
 #[derive(Clone, Debug)]
 pub struct CandidateBatch {
-    pub opportunities: Vec<Opportunity>,
+    pub evaluations: Vec<EvaluatedOpportunity>,
     pub evidence: Value,
+}
+
+#[derive(Clone, Debug)]
+pub struct EvaluatedOpportunity {
+    pub opportunity: Opportunity,
+    pub rpc_quality: Vec<RpcQualityEvidence>,
 }
 
 #[derive(Clone, Debug, Error, PartialEq, Eq)]
@@ -112,6 +119,35 @@ impl CandidateEvaluator for UnavailableEvaluator {
 pub struct RuntimeRoute {
     pub route: Route,
     pub fingerprint: String,
+    pub state_targets: Vec<Address>,
+    pub strategy: RuntimeStrategy,
+}
+
+#[derive(Clone, Debug)]
+pub struct RuntimeStrategy {
+    pub min_input_amount: Amount,
+    pub max_input_amount: Amount,
+    pub max_evaluations: usize,
+    pub minimum_net_profit: Amount,
+    pub flash_premium_bps: u16,
+    pub minimum_slippage_bps: u16,
+    pub protocol_fees: Amount,
+    pub estimated_execution_gas: u64,
+    pub l1_data_fee: Amount,
+    pub contract_overhead: Amount,
+    pub failed_attempt_gas_cost: Amount,
+    pub failure_probability_bps: u16,
+    pub stale_state_loss: Amount,
+    pub stale_quote_probability_bps: u16,
+    pub state_drift_reserve: Amount,
+    pub latency_reserve: Amount,
+    pub uncertainty_reserve: Amount,
+    pub replacement_transaction_cost: Amount,
+    pub probability_of_success_bps: u16,
+    pub max_gas_price_wei: u128,
+    pub max_quote_age_ms: u64,
+    pub max_simulation_age_ms: u64,
+    pub min_confidence_bps: u16,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -245,7 +281,7 @@ impl ShadowProcessor {
                     candidate_count: 0,
                     decision_count: 0,
                     evidence: json!({"origin_classification": "malformed"}),
-                    opportunities: Vec::new(),
+                    evaluations: Vec::new(),
                     action: ProcessingAction::Retry,
                 };
             }
@@ -265,12 +301,12 @@ impl ShadowProcessor {
             .iter()
             .map(|route| route.fingerprint.clone())
             .collect::<Vec<_>>();
-        let mut opportunities = Vec::new();
+        let mut evaluations = Vec::new();
         let mut evaluation_evidence = Vec::new();
         for route in &routes {
             match self.evaluator.evaluate(input, &origin, route).await {
                 Ok(batch) => {
-                    opportunities.extend(batch.opportunities);
+                    evaluations.extend(batch.evaluations);
                     evaluation_evidence.push(batch.evidence);
                 }
                 Err(EvaluationError::Transient(class)) => {
@@ -298,7 +334,7 @@ impl ShadowProcessor {
             }
         }
 
-        if opportunities.is_empty() {
+        if evaluations.is_empty() {
             return ProcessResult {
                 classification: EngineClassification::CandidateRejected,
                 detail_class: "no_profitable_candidate",
@@ -308,13 +344,13 @@ impl ShadowProcessor {
                     "route_fingerprints": route_fingerprints,
                     "evaluations": evaluation_evidence
                 }),
-                opportunities,
+                evaluations,
                 action: ProcessingAction::Ack,
             };
         }
-        let accepted = opportunities
+        let accepted = evaluations
             .iter()
-            .any(|opportunity| opportunity.decision.disposition == ShadowDisposition::Accepted);
+            .any(|value| value.opportunity.decision.disposition == ShadowDisposition::Accepted);
         ProcessResult {
             classification: if accepted {
                 EngineClassification::ShadowAccepted
@@ -327,12 +363,12 @@ impl ShadowProcessor {
                 "shadow_policy_rejected"
             },
             candidate_count: routes.len(),
-            decision_count: opportunities.len(),
+            decision_count: evaluations.len(),
             evidence: json!({
                 "route_fingerprints": route_fingerprints,
                 "evaluations": evaluation_evidence
             }),
-            opportunities,
+            evaluations,
             action: ProcessingAction::Ack,
         }
     }
@@ -345,12 +381,14 @@ struct RouteSpec {
     route_fingerprint: String,
     trigger_pool_id: String,
     legs: Vec<RouteLegSpec>,
+    strategy: StrategySpec,
 }
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RouteLegSpec {
     pool_id: String,
+    state_target: String,
     protocol: String,
     fee: u32,
     token_in: String,
@@ -358,45 +396,84 @@ struct RouteLegSpec {
     direction: String,
 }
 
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StrategySpec {
+    min_input_amount: String,
+    max_input_amount: String,
+    max_evaluations: usize,
+    minimum_net_profit: String,
+    flash_premium_bps: u16,
+    minimum_slippage_bps: u16,
+    protocol_fees: String,
+    estimated_execution_gas: u64,
+    l1_data_fee: String,
+    contract_overhead: String,
+    failed_attempt_gas_cost: String,
+    failure_probability_bps: u16,
+    stale_state_loss: String,
+    stale_quote_probability_bps: u16,
+    state_drift_reserve: String,
+    latency_reserve: String,
+    uncertainty_reserve: String,
+    replacement_transaction_cost: String,
+    probability_of_success_bps: u16,
+    max_gas_price_wei: String,
+    max_quote_age_ms: u64,
+    max_simulation_age_ms: u64,
+    min_confidence_bps: u16,
+}
+
 impl RouteSpec {
     fn into_runtime(self) -> Result<RuntimeRoute, RouteRegistryError> {
-        if !bounded(&self.route_id, 1, 128)
-            || !bounded(&self.route_fingerprint, 1, 256)
-            || !bounded(&self.trigger_pool_id, 1, 256)
-            || self.legs.len() != 2
+        let RouteSpec {
+            route_id,
+            route_fingerprint,
+            trigger_pool_id,
+            legs,
+            strategy,
+        } = self;
+        if !bounded(&route_id, 1, 128)
+            || !bounded(&route_fingerprint, 1, 256)
+            || !bounded(&trigger_pool_id, 1, 256)
+            || legs.len() != 2
         {
             return Err(RouteRegistryError::InvalidRoute);
         }
-        let legs = self
-            .legs
+        let (legs, state_targets): (Vec<_>, Vec<_>) = legs
             .into_iter()
-            .map(RouteLegSpec::into_edge)
-            .collect::<Result<Vec<_>, _>>()?;
-        if legs[0].pool_id.0 != self.trigger_pool_id
+            .map(RouteLegSpec::into_parts)
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .unzip();
+        if legs[0].pool_id.0 != trigger_pool_id
             || legs[0].protocol != "UniswapV3"
             || legs.iter().any(|leg| !leg.protocol.ends_with("V3"))
             || legs[0].token_out != legs[1].token_in
             || legs[1].token_out != legs[0].token_in
             || legs[0].pool_id == legs[1].pool_id
+            || state_targets[0] == state_targets[1]
         {
             return Err(RouteRegistryError::InvalidRoute);
         }
         Ok(RuntimeRoute {
             route: Route {
-                route_id: RouteId(self.route_id),
+                route_id: RouteId(route_id),
                 legs,
             },
-            fingerprint: self.route_fingerprint,
+            fingerprint: route_fingerprint,
+            state_targets,
+            strategy: strategy.into_runtime()?,
         })
     }
 }
 
 impl RouteLegSpec {
-    fn into_edge(self) -> Result<PoolEdge, RouteRegistryError> {
+    fn into_parts(self) -> Result<(PoolEdge, Address), RouteRegistryError> {
         if !bounded(&self.pool_id, 1, 256)
             || !bounded(&self.protocol, 1, 64)
             || self.fee == 0
-            || self.fee > 1_000_000
+            || self.fee >= 1_000_000
         {
             return Err(RouteRegistryError::InvalidRoute);
         }
@@ -406,20 +483,107 @@ impl RouteLegSpec {
         let token_out = Address::parse(&self.token_out)
             .map(TokenAddress)
             .map_err(|_| RouteRegistryError::InvalidRoute)?;
+        let state_target =
+            Address::parse(&self.state_target).map_err(|_| RouteRegistryError::InvalidRoute)?;
         let direction = match self.direction.as_str() {
             "zero_for_one" => Direction::ZeroForOne,
             "one_for_zero" => Direction::OneForZero,
             _ => return Err(RouteRegistryError::InvalidRoute),
         };
-        Ok(PoolEdge {
-            pool_id: PoolId(self.pool_id),
-            protocol: self.protocol,
-            fee: self.fee,
-            token_in,
-            token_out,
-            direction,
-        })
+        let direction_matches_token_order = match direction {
+            Direction::ZeroForOne => token_in.0.as_str() < token_out.0.as_str(),
+            Direction::OneForZero => token_out.0.as_str() < token_in.0.as_str(),
+        };
+        if token_in == token_out || !direction_matches_token_order {
+            return Err(RouteRegistryError::InvalidRoute);
+        }
+        Ok((
+            PoolEdge {
+                pool_id: PoolId(self.pool_id),
+                protocol: self.protocol,
+                fee: self.fee,
+                token_in,
+                token_out,
+                direction,
+            },
+            state_target,
+        ))
     }
+}
+
+impl StrategySpec {
+    fn into_runtime(self) -> Result<RuntimeStrategy, RouteRegistryError> {
+        let strategy = RuntimeStrategy {
+            min_input_amount: parse_amount(&self.min_input_amount)?,
+            max_input_amount: parse_amount(&self.max_input_amount)?,
+            max_evaluations: self.max_evaluations,
+            minimum_net_profit: parse_amount(&self.minimum_net_profit)?,
+            flash_premium_bps: self.flash_premium_bps,
+            minimum_slippage_bps: self.minimum_slippage_bps,
+            protocol_fees: parse_amount(&self.protocol_fees)?,
+            estimated_execution_gas: self.estimated_execution_gas,
+            l1_data_fee: parse_amount(&self.l1_data_fee)?,
+            contract_overhead: parse_amount(&self.contract_overhead)?,
+            failed_attempt_gas_cost: parse_amount(&self.failed_attempt_gas_cost)?,
+            failure_probability_bps: self.failure_probability_bps,
+            stale_state_loss: parse_amount(&self.stale_state_loss)?,
+            stale_quote_probability_bps: self.stale_quote_probability_bps,
+            state_drift_reserve: parse_amount(&self.state_drift_reserve)?,
+            latency_reserve: parse_amount(&self.latency_reserve)?,
+            uncertainty_reserve: parse_amount(&self.uncertainty_reserve)?,
+            replacement_transaction_cost: parse_amount(&self.replacement_transaction_cost)?,
+            probability_of_success_bps: self.probability_of_success_bps,
+            max_gas_price_wei: parse_u128(&self.max_gas_price_wei)?,
+            max_quote_age_ms: self.max_quote_age_ms,
+            max_simulation_age_ms: self.max_simulation_age_ms,
+            min_confidence_bps: self.min_confidence_bps,
+        };
+        if strategy.min_input_amount.0 == 0
+            || strategy.max_input_amount < strategy.min_input_amount
+            || strategy.max_evaluations == 0
+            || strategy.max_evaluations > 64
+            || strategy.minimum_net_profit.0 == 0
+            || strategy.estimated_execution_gas == 0
+            || strategy.max_gas_price_wei == 0
+            || strategy.max_quote_age_ms == 0
+            || strategy.max_simulation_age_ms == 0
+            || strategy.probability_of_success_bps == 0
+            || [
+                strategy.flash_premium_bps,
+                strategy.minimum_slippage_bps,
+                strategy.failure_probability_bps,
+                strategy.stale_quote_probability_bps,
+                strategy.probability_of_success_bps,
+                strategy.min_confidence_bps,
+            ]
+            .into_iter()
+            .any(|value| value > 10_000)
+        {
+            return Err(RouteRegistryError::InvalidRoute);
+        }
+        Ok(strategy)
+    }
+}
+
+fn parse_amount(value: &str) -> Result<Amount, RouteRegistryError> {
+    let value = parse_u128(value)?;
+    if value > i128::MAX as u128 {
+        return Err(RouteRegistryError::InvalidRoute);
+    }
+    Ok(Amount(value))
+}
+
+fn parse_u128(value: &str) -> Result<u128, RouteRegistryError> {
+    if value.is_empty()
+        || value.len() > 39
+        || !value.bytes().all(|byte| byte.is_ascii_digit())
+        || (value.len() > 1 && value.starts_with('0'))
+    {
+        return Err(RouteRegistryError::InvalidRoute);
+    }
+    value
+        .parse::<u128>()
+        .map_err(|_| RouteRegistryError::InvalidRoute)
 }
 
 fn bounded(value: &str, minimum: usize, maximum: usize) -> bool {
@@ -431,7 +595,6 @@ mod tests {
     use super::*;
     use crate::domain::{ChainId, SequenceNumber, TxHash};
     use crate::messaging::NormalizedTx;
-    use crate::opportunity::Opportunity;
     use std::sync::Mutex;
 
     const ROUTER: &str = "0x68b3465833fb72a70ecdf485e0e4c7bd8665fc45";
@@ -462,9 +625,19 @@ mod tests {
                 "route_fingerprint":"weth-usdc-two-pool-v1",
                 "trigger_pool_id":"{WETH}:{USDC}:500",
                 "legs":[
-                    {{"pool_id":"{WETH}:{USDC}:500","protocol":"UniswapV3","fee":500,"token_in":"{WETH}","token_out":"{USDC}","direction":"zero_for_one"}},
-                    {{"pool_id":"comparison-pool","protocol":"SushiSwapV3","fee":500,"token_in":"{USDC}","token_out":"{WETH}","direction":"one_for_zero"}}
-                ]
+                    {{"pool_id":"{WETH}:{USDC}:500","state_target":"0x0000000000000000000000000000000000001001","protocol":"UniswapV3","fee":500,"token_in":"{WETH}","token_out":"{USDC}","direction":"zero_for_one"}},
+                    {{"pool_id":"comparison-pool","state_target":"0x0000000000000000000000000000000000002001","protocol":"SushiSwapV3","fee":500,"token_in":"{USDC}","token_out":"{WETH}","direction":"one_for_zero"}}
+                ],
+                "strategy":{{
+                    "min_input_amount":"100","max_input_amount":"1000","max_evaluations":16,
+                    "minimum_net_profit":"1","flash_premium_bps":5,"minimum_slippage_bps":10,
+                    "protocol_fees":"0","estimated_execution_gas":500000,"l1_data_fee":"1",
+                    "contract_overhead":"1","failed_attempt_gas_cost":"1","failure_probability_bps":500,
+                    "stale_state_loss":"1","stale_quote_probability_bps":100,"state_drift_reserve":"1",
+                    "latency_reserve":"1","uncertainty_reserve":"1","replacement_transaction_cost":"1",
+                    "probability_of_success_bps":8000,"max_gas_price_wei":"1000000000000",
+                    "max_quote_age_ms":2000,"max_simulation_age_ms":2000,"min_confidence_bps":9000
+                }}
             }}]"#
         )
     }
@@ -537,6 +710,20 @@ mod tests {
             RouteRegistry::from_json("[{}]"),
             Err(RouteRegistryError::InvalidJson)
         ));
+        let wrong_token_order = route_json().replacen(
+            "\"direction\":\"zero_for_one\"",
+            "\"direction\":\"one_for_zero\"",
+            1,
+        );
+        assert!(matches!(
+            RouteRegistry::from_json(&wrong_token_order),
+            Err(RouteRegistryError::InvalidRoute)
+        ));
+        let invalid_fee = route_json().replacen("\"fee\":500", "\"fee\":1000000", 1);
+        assert!(matches!(
+            RouteRegistry::from_json(&invalid_fee),
+            Err(RouteRegistryError::InvalidRoute)
+        ));
     }
 
     #[tokio::test]
@@ -574,7 +761,7 @@ mod tests {
     async fn empty_real_evaluation_is_auditable_candidate_rejection() {
         let evaluator = FakeEvaluator {
             result: Mutex::new(Some(Ok(CandidateBatch {
-                opportunities: Vec::<Opportunity>::new(),
+                evaluations: Vec::<EvaluatedOpportunity>::new(),
                 evidence: json!({"reason": "no_spread"}),
             }))),
         };

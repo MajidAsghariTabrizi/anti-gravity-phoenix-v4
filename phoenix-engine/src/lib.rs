@@ -15,6 +15,7 @@ pub mod origin;
 pub mod persistence;
 pub mod profit;
 pub mod readiness;
+pub mod rpc_evaluator;
 pub mod runtime;
 pub mod runtime_state;
 pub mod shadow_processor;

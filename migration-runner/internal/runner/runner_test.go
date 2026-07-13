@@ -64,6 +64,30 @@ func TestShadowEngineRuntimeMigrationIsAdditiveBoundedAndIdempotent(t *testing.T
 	}
 }
 
+func TestShadowDecisionIdentityMigrationRemovesOnlyLegacyCollisionKey(t *testing.T) {
+	migrationPath := filepath.Join("..", "..", "..", "migrations", "005_shadow_decision_identity.sql")
+	content, err := os.ReadFile(migrationPath)
+	if err != nil {
+		t.Fatalf("read shadow decision identity migration: %v", err)
+	}
+	sqlText := strings.ToUpper(string(content))
+	for _, required := range []string{
+		"UNIQUE (STRATEGY_VERSION, ROUTE_FINGERPRINT, SOURCE_SEQUENCE, OBSERVED_BLOCK)",
+		"ALTER TABLE PUBLIC.SHADOW_DECISIONS DROP CONSTRAINT",
+		"CREATE UNIQUE INDEX IF NOT EXISTS SHADOW_DECISIONS_SOURCE_EVENT_ROUTE_IDX",
+		"SOURCE_EVENT_IDENTITY, STRATEGY_VERSION, ROUTE_FINGERPRINT",
+	} {
+		if !strings.Contains(sqlText, required) {
+			t.Fatalf("migration missing %q", required)
+		}
+	}
+	for _, destructive := range []string{"DROP TABLE", "DROP COLUMN", "TRUNCATE TABLE", "DELETE FROM"} {
+		if strings.Contains(sqlText, destructive) {
+			t.Fatalf("migration contains destructive statement %q", destructive)
+		}
+	}
+}
+
 func TestLoadMigrationsOrdersByVersion(t *testing.T) {
 	dir := t.TempDir()
 	writeMigration(t, dir, "002_second.sql", "SELECT 2;")

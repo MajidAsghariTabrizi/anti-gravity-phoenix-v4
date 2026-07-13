@@ -1,13 +1,17 @@
 use crate::domain::{Amount, OpportunityId, PoolId, RouteId, TokenAddress, TxHash};
 use crate::graph::PoolEdge;
+use serde::Serialize;
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[serde(transparent)]
 pub struct SignedAmount(pub i128);
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[serde(transparent)]
 pub struct BasisPoints(pub i32);
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Strategy {
     TwoPoolV3Arbitrage,
 }
@@ -20,7 +24,7 @@ impl Strategy {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct OpportunityIdentity {
     pub opportunity_id: OpportunityId,
     pub strategy: Strategy,
@@ -36,7 +40,7 @@ pub struct OpportunityIdentity {
     pub detected_at_unix_ms: u64,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct RouteEvidence {
     pub route_id: RouteId,
     pub route_fingerprint: String,
@@ -50,20 +54,21 @@ pub struct RouteEvidence {
     pub exact_ordered_legs: Vec<PoolEdge>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum StateSource {
     RecordedCheckpoint,
     BlockPinnedRpc,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct PoolStateEvidence {
     pub pool: PoolId,
     pub state_hash: String,
     pub reserve_or_liquidity_summary: String,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct MarketEvidence {
     pub pool_states: Vec<PoolStateEvidence>,
     pub state_block: u64,
@@ -76,7 +81,7 @@ pub struct MarketEvidence {
     pub feed_to_detection_latency_ns: u128,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
 pub struct CostBreakdown {
     pub gross_spread: SignedAmount,
     pub protocol_fees: Amount,
@@ -98,14 +103,15 @@ pub struct CostBreakdown {
     pub expected_value_after_success_probability: SignedAmount,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
 pub struct ScenarioEconomics {
     pub base: CostBreakdown,
     pub conservative: CostBreakdown,
     pub severe: CostBreakdown,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum SimulationKind {
     StaticQuote,
     StateBased,
@@ -116,7 +122,8 @@ pub enum SimulationKind {
     HypotheticalInclusion,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum SimulationClassification {
     Passed,
     Reverted,
@@ -128,7 +135,7 @@ pub enum SimulationClassification {
     NotRun,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct SimulationEvidence {
     pub kind: SimulationKind,
     pub block_number: u64,
@@ -151,7 +158,8 @@ pub struct SimulationEvidence {
     pub classification: SimulationClassification,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum RejectionReason {
     GrossSpreadInsufficient,
     NetPnlNegative,
@@ -196,7 +204,8 @@ impl RejectionReason {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum RiskFlag {
     StaleQuote,
     StateDrift,
@@ -207,13 +216,14 @@ pub enum RiskFlag {
     ConcentrationUnknown,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ShadowDisposition {
     Accepted,
     Rejected,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct DecisionEvidence {
     pub disposition: ShadowDisposition,
     pub primary_rejection_reason: Option<RejectionReason>,
@@ -225,7 +235,7 @@ pub struct DecisionEvidence {
     pub decided_at_unix_ms: u64,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
 pub struct OutcomeEvidence {
     pub hypothetical_execution_at_unix_ms: Option<u64>,
     pub hypothetical_inclusion_block: Option<u64>,
@@ -235,7 +245,7 @@ pub struct OutcomeEvidence {
     pub missed_opportunity_reason: Option<RejectionReason>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct Opportunity {
     pub identity: OpportunityIdentity,
     pub route: RouteEvidence,
