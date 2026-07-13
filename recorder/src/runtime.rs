@@ -554,6 +554,13 @@ mod tests {
     use std::collections::VecDeque;
     use std::sync::atomic::AtomicUsize;
     use std::sync::Mutex;
+    use tokio::sync::Notify;
+
+    #[derive(Clone, Debug, Default)]
+    struct PersistGate {
+        started: Arc<Notify>,
+        release: Arc<Notify>,
+    }
 
     #[derive(Debug)]
     struct FakeStore {
@@ -561,6 +568,7 @@ mod tests {
         calls: AtomicUsize,
         batch_sizes: Mutex<Vec<usize>>,
         delay: Duration,
+        persist_gate: Option<PersistGate>,
     }
 
     impl FakeStore {
@@ -570,6 +578,7 @@ mod tests {
                 calls: AtomicUsize::new(0),
                 batch_sizes: Mutex::new(Vec::new()),
                 delay: Duration::from_millis(1),
+                persist_gate: None,
             }
         }
     }
@@ -590,7 +599,12 @@ mod tests {
         ) -> Result<Vec<PersistOutcome>, StoreError> {
             self.calls.fetch_add(1, Ordering::Relaxed);
             self.batch_sizes.lock().unwrap().push(messages.len());
-            tokio::time::sleep(self.delay).await;
+            if let Some(gate) = &self.persist_gate {
+                gate.started.notify_one();
+                gate.release.notified().await;
+            } else {
+                tokio::time::sleep(self.delay).await;
+            }
             self.outcomes
                 .lock()
                 .unwrap()
@@ -907,13 +921,15 @@ mod tests {
     #[tokio::test]
     async fn graceful_shutdown_during_commit_finishes_batch_then_acks() {
         let mut store = FakeStore::new(vec![]);
-        store.delay = Duration::from_millis(20);
+        let persist_gate = PersistGate::default();
+        store.persist_gate = Some(persist_gate.clone());
         let acker = Arc::new(FakeAcker::default());
         let shutdown = CancellationToken::new();
         let cancel = shutdown.clone();
-        tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(5)).await;
+        let cancel_task = tokio::spawn(async move {
+            persist_gate.started.notified().await;
             cancel.cancel();
+            persist_gate.release.notify_one();
         });
         let mut ack_health = AckHealthTracker::default();
         let result = process_delivery_batch(
@@ -927,6 +943,7 @@ mod tests {
             &mut ack_health,
         )
         .await;
+        cancel_task.await.expect("cancellation task must complete");
         assert_eq!(result, BatchDisposition::Shutdown);
         assert_eq!(store.calls.load(Ordering::Relaxed), 1);
         assert_eq!(acker.ack.load(Ordering::Relaxed), 1);
