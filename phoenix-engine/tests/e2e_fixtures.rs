@@ -32,13 +32,12 @@ fn fixture_tx(
     amount: u128,
 ) -> phoenix_engine::messaging::NormalizedTx {
     let calldata = format!(
-        "0x414bf389{}{}{}{}{}{}{}{}",
+        "0x04e45aaf{}{}{}{}{}{}{}",
         slot_address(token_in),
         slot_address(token_out),
         slot_u(500),
         slot_address("0x1111111111111111111111111111111111111111"),
         slot_u(amount),
-        slot_u(0),
         slot_u(0),
         slot_u(0)
     );
@@ -91,7 +90,7 @@ fn graph_for(pool_id: PoolId) -> PoolGraph {
 #[test]
 fn profitable_fixture_reaches_shadow_sink_and_dynamic_sizing() {
     let router = address("0x68b3465833fb72a70ecdf485e0e4c7bd8665fc45");
-    let detector = OriginDetector::new(vec![router.clone()]);
+    let detector = OriginDetector::new(vec![router.clone()]).unwrap();
     let tx = fixture_tx(
         router,
         "0x82af49447d8a07e3bd95bd0d56f35241523fbab1",
@@ -265,7 +264,7 @@ fn profitable_fixture_reaches_shadow_sink_and_dynamic_sizing() {
 #[test]
 fn unsupported_router_fixture_is_measured_not_guessed() {
     let router = address("0x68b3465833fb72a70ecdf485e0e4c7bd8665fc45");
-    let detector = OriginDetector::new(vec![router]);
+    let detector = OriginDetector::new(vec![router]).unwrap();
     let tx = fixture_tx(
         address("0x9999999999999999999999999999999999999999"),
         "0x82af49447d8a07e3bd95bd0d56f35241523fbab1",

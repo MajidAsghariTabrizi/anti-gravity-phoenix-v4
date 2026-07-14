@@ -136,6 +136,39 @@ validate_rpc_providers() {
   done
 }
 
+validate_engine_routers() {
+  count=$(csv_count "${ENGINE_ROUTER_ADDRESSES:-}")
+  if [ "$count" -lt 1 ] || [ "$count" -gt 3 ]; then
+    fail "ENGINE_ROUTER_ADDRESSES must contain between one and three reviewed routers"
+    return
+  fi
+
+  seen='|'
+  rest="${ENGINE_ROUTER_ADDRESSES:-}"
+  while :; do
+    case "$rest" in
+      *,*)
+        router=$(trim_value "${rest%%,*}")
+        rest=${rest#*,}
+        ;;
+      *)
+        router=$(trim_value "$rest")
+        rest=
+        ;;
+    esac
+    canonical=$(printf '%s' "$router" | tr '[:upper:]' '[:lower:]')
+    case "$canonical" in
+      0xe592427a0aece92de3edee1f18e0157c05861564|0x68b3465833fb72a70ecdf485e0e4c7bd8665fc45|0xa51afafe0263b40edaef0df8781ea9aa03e381a3) ;;
+      *) fail "ENGINE_ROUTER_ADDRESSES contains an unreviewed router" ;;
+    esac
+    case "$seen" in
+      *"|$canonical|"*) fail "ENGINE_ROUTER_ADDRESSES contains a duplicate router" ;;
+      *) seen="${seen}${canonical}|" ;;
+    esac
+    [ -z "$rest" ] && break
+  done
+}
+
 validate_postgres_consistency() {
   dsn_without_scheme=${POSTGRES_DSN#postgres://}
   if [ "$dsn_without_scheme" = "$POSTGRES_DSN" ]; then
@@ -187,7 +220,8 @@ for name in \
   RPC_UPSTREAM_CALLS_PER_SECOND \
   RPC_UPSTREAM_CALL_BURST \
   RPC_STATE_REQUESTS_PER_MINUTE \
-  RPC_PROVIDER_PROBE_INTERVAL_SECONDS
+  RPC_PROVIDER_PROBE_INTERVAL_SECONDS \
+  ENGINE_ROUTER_ADDRESSES
 do
   require_var "$name"
 done
@@ -231,6 +265,7 @@ do
   validate_positive_integer "$name" "$value"
 done
 validate_rpc_providers
+validate_engine_routers
 validate_postgres_consistency
 
 if [ -n "${SIGNER_PRIVATE_KEY:-}" ]; then
@@ -255,6 +290,7 @@ ok "RPC priority values valid"
 ok "Upstream RPC budget: ${RPC_UPSTREAM_CALLS_PER_SECOND} calls/s, burst ${RPC_UPSTREAM_CALL_BURST}"
 ok "RPC state request budget: ${RPC_STATE_REQUESTS_PER_MINUTE}/minute"
 ok "RPC provider probe interval: ${RPC_PROVIDER_PROBE_INTERVAL_SECONDS}s"
+ok "$(csv_count "${ENGINE_ROUTER_ADDRESSES:-}") reviewed Engine routers configured"
 ok "Parent-chain RPC configured"
 ok "Arbitrum RPC configured"
 ok "PostgreSQL configuration consistent"

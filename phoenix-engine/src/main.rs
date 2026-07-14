@@ -3,6 +3,7 @@ use phoenix_engine::domain::Address;
 use phoenix_engine::engine_jetstream::{JetStreamFetcher, MessageFetcher};
 use phoenix_engine::execution::ExecutionMode;
 use phoenix_engine::metrics::RuntimeMetrics;
+use phoenix_engine::origin::{reviewed_router_kind, REVIEWED_ROUTER_ADDRESSES};
 use phoenix_engine::persistence::{PostgresShadowStore, ShadowStore};
 use phoenix_engine::readiness::initialize_runtime;
 use phoenix_engine::rpc_evaluator::{RpcCandidateEvaluator, RpcGatewayClient, ShadowStateClient};
@@ -13,6 +14,7 @@ use phoenix_recorder::engine_stream::{
     ensure_engine_pipeline, ENGINE_DURABLE_NAME, ENGINE_STREAM_NAME,
 };
 use phoenix_recorder::logging::LogSampler;
+use std::collections::HashSet;
 use std::error::Error;
 use std::io;
 use std::sync::Arc;
@@ -22,7 +24,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 
-const DEFAULT_ROUTER: &str = "0x68b3465833fb72a70ecdf485e0e4c7bd8665fc45";
+const DEFAULT_ROUTERS: &str = "0xe592427a0aece92de3edee1f18e0157c05861564,0x68b3465833fb72a70ecdf485e0e4c7bd8665fc45,0xa51afafe0263b40edaef0df8781ea9aa03e381a3";
 const RETRY_INITIAL: Duration = Duration::from_secs(1);
 const RETRY_MAXIMUM: Duration = Duration::from_secs(30);
 const DATABASE_MONITOR_INTERVAL: Duration = Duration::from_secs(5);
@@ -51,7 +53,7 @@ impl DaemonConfig {
         let postgres_dsn = required_env("POSTGRES_DSN")?;
         let routers = parse_routers(
             &std::env::var("ENGINE_ROUTER_ADDRESSES")
-                .unwrap_or_else(|_| DEFAULT_ROUTER.to_string()),
+                .unwrap_or_else(|_| DEFAULT_ROUTERS.to_string()),
         )?;
         let routes = RouteRegistry::from_json(
             &std::env::var("ENGINE_ROUTE_REGISTRY_JSON").unwrap_or_else(|_| "[]".to_string()),
@@ -116,11 +118,10 @@ async fn run_daemon() -> Result<(), &'static str> {
         )
         .map_err(|_| "invalid Engine evaluator configuration")?,
     );
-    let processor = Arc::new(ShadowProcessor::new(
-        config.routers.clone(),
-        config.routes.clone(),
-        evaluator,
-    ));
+    let processor = Arc::new(
+        ShadowProcessor::new(config.routers.clone(), config.routes.clone(), evaluator)
+            .map_err(|_| "invalid Engine router registry")?,
+    );
 
     tracing::info!(
         event = "phoenix_engine_startup",
@@ -502,13 +503,24 @@ async fn write_http_response(
 
 fn parse_routers(raw: &str) -> Result<Vec<Address>, &'static str> {
     let values = raw.split(',').map(str::trim).collect::<Vec<_>>();
-    if values.is_empty() || values.len() > 16 || values.iter().any(|value| value.is_empty()) {
+    if values.is_empty()
+        || values.len() > REVIEWED_ROUTER_ADDRESSES.len()
+        || values.iter().any(|value| value.is_empty())
+    {
         return Err("invalid Engine router registry");
     }
-    values
+    let routers = values
         .into_iter()
         .map(|value| Address::parse(value).map_err(|_| "invalid Engine router registry"))
-        .collect()
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut seen = HashSet::new();
+    if routers
+        .iter()
+        .any(|router| reviewed_router_kind(router).is_none() || !seen.insert(router.clone()))
+    {
+        return Err("invalid Engine router registry");
+    }
+    Ok(routers)
 }
 
 fn required_env(name: &'static str) -> Result<String, &'static str> {
@@ -573,11 +585,17 @@ mod tests {
 
     #[test]
     fn router_configuration_is_bounded_and_canonicalized() {
-        let routers = parse_routers(DEFAULT_ROUTER).unwrap();
-        assert_eq!(routers.len(), 1);
-        assert_eq!(routers[0].as_str(), DEFAULT_ROUTER);
+        let routers = parse_routers(DEFAULT_ROUTERS).unwrap();
+        assert_eq!(routers.len(), REVIEWED_ROUTER_ADDRESSES.len());
+        assert_eq!(routers[0].as_str(), REVIEWED_ROUTER_ADDRESSES[0]);
         assert!(parse_routers("").is_err());
         assert!(parse_routers("not-an-address").is_err());
+        assert!(parse_routers("0x1b81d678ffb9c0263b24a97847620c99d213eb14").is_err());
+        assert!(parse_routers(&format!(
+            "{},{}",
+            REVIEWED_ROUTER_ADDRESSES[0], REVIEWED_ROUTER_ADDRESSES[0]
+        ))
+        .is_err());
     }
 
     #[tokio::test]

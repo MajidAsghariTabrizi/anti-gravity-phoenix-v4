@@ -1470,6 +1470,7 @@ dependencies = [
  "async-nats",
  "async-trait",
  "chrono",
+ "ethabi",
  "futures-util",
  "hex",
  "phoenix-recorder",

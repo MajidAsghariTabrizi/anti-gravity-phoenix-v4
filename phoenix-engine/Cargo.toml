@@ -17,6 +17,7 @@ path = "src/main.rs"
 async-nats = "=0.37.0"
 async-trait = "=0.1.81"
 chrono = { version = "=0.4.38", features = ["serde"] }
+ethabi = "=18.0.0"
 futures-util = "=0.3.31"
 hex = "=0.4.3"
 phoenix-recorder = { path = "../recorder" }

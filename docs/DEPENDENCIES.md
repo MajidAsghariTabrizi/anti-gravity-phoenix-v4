@@ -31,12 +31,15 @@ Verified entries used by Phoenix configuration:
 
 - Chain id: `42161`.
 - Factory: `0x1F98431c8aD98523631AE4a59f267346ea31F984`.
+- SwapRouter: `0xE592427A0AEce92De3Edee1F18E0157C05861564`.
 - SwapRouter02: `0x68b3465833fb72A70ecDF485E0e4C7bD8665Fc45`.
 - UniversalRouter: `0xa51afafe0263b40edaef0df8781ea9aa03e381a3`.
 - QuoterV2, parity tests only: `0x61fFE014bA17989E743c5F6cB21bF9697530B21e`.
 - WETH: `0x82aF49447D8a07e3bd95BD0d56f35241523fBab1`.
 
 The Uniswap page states the listed deployments are current and warns integrators to confirm per-chain mappings. Phoenix validates configured addresses with `eth_getCode` through `rpc-gateway` at startup when credentials exist.
+
+Engine origin decoding is pinned separately for each reviewed entrypoint. See `docs/UNISWAP_ENTRYPOINTS.md`; no ABI layout is shared between SwapRouter and SwapRouter02.
 
 ## SushiSwap V3 on Arbitrum One
 

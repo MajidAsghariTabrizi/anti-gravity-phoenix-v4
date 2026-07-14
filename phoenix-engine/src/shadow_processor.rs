@@ -2,7 +2,10 @@ use crate::domain::{Address, Amount, Direction, PoolId, RouteId, TokenAddress};
 use crate::engine_input::{EngineClassification, EngineInput};
 use crate::graph::{PoolEdge, PoolGraph, Route};
 use crate::opportunity::{Opportunity, ShadowDisposition};
-use crate::origin::{OriginClassification, OriginDetector, OriginEvent};
+use crate::origin::{
+    OriginClassification, OriginConfigurationError, OriginDetector, OriginEvent, OriginMetricKind,
+    UnsupportedReason,
+};
 use async_trait::async_trait;
 use rpc_gateway::shadow_state::RpcQualityEvidence;
 use serde::Deserialize;
@@ -30,6 +33,7 @@ pub struct ProcessResult {
     pub evidence: Value,
     pub evaluations: Vec<EvaluatedOpportunity>,
     pub action: ProcessingAction,
+    pub origin_metric: Option<OriginMetricKind>,
 }
 
 impl ProcessResult {
@@ -42,6 +46,7 @@ impl ProcessResult {
             evidence,
             evaluations: Vec::new(),
             action: ProcessingAction::Ack,
+            origin_metric: None,
         }
     }
 
@@ -54,6 +59,7 @@ impl ProcessResult {
             evidence,
             evaluations: Vec::new(),
             action: ProcessingAction::Retry,
+            origin_metric: None,
         }
     }
 
@@ -66,7 +72,13 @@ impl ProcessResult {
             evidence,
             evaluations: Vec::new(),
             action: ProcessingAction::Terminate,
+            origin_metric: None,
         }
+    }
+
+    pub fn with_origin_metric(mut self, metric: OriginMetricKind) -> Self {
+        self.origin_metric = Some(metric);
+        self
     }
 }
 
@@ -241,12 +253,12 @@ impl ShadowProcessor {
         routers: Vec<Address>,
         routes: RouteRegistry,
         evaluator: Arc<dyn CandidateEvaluator>,
-    ) -> Self {
-        Self {
-            detector: OriginDetector::new(routers),
+    ) -> Result<Self, OriginConfigurationError> {
+        Ok(Self {
+            detector: OriginDetector::new(routers)?,
             routes,
             evaluator,
-        }
+        })
     }
 
     pub fn strategy_configured(&self) -> bool {
@@ -254,13 +266,26 @@ impl ShadowProcessor {
     }
 
     pub async fn process(&self, input: &EngineInput) -> ProcessResult {
-        let origin = match self.detector.classify(&input.normalized) {
-            OriginClassification::SupportedSwapOrigin(origin) => origin,
-            OriginClassification::KnownRouterUnsupportedCommand => {
+        let (origin, origin_metric) = match self.detector.classify(&input.normalized) {
+            OriginClassification::SupportedSwapOrigin(origin) => {
+                let metric = origin.classification_evidence.metric_kind();
+                (origin, metric)
+            }
+            OriginClassification::KnownRouterUnsupportedCommand(evidence) => {
+                let metric = evidence.metric_kind();
+                let detail_class = match evidence.unsupported_reason {
+                    UnsupportedReason::ExactOutput => "known_router_unsupported_exact_output",
+                    UnsupportedReason::AmbiguousMultiSwap => "known_router_ambiguous_multi_swap",
+                    _ => "known_router_unsupported_command",
+                };
                 return ProcessResult::no_route(
-                    "known_router_unsupported_command",
-                    json!({"origin_classification": "known_router_unsupported_command"}),
-                );
+                    detail_class,
+                    json!({
+                        "origin_classification": detail_class,
+                        "origin_decoder": evidence
+                    }),
+                )
+                .with_origin_metric(metric);
             }
             OriginClassification::PossibleAggregator => {
                 return ProcessResult::no_route(
@@ -274,27 +299,35 @@ impl ShadowProcessor {
                     json!({"origin_classification": "irrelevant"}),
                 );
             }
-            OriginClassification::Malformed => {
+            OriginClassification::Malformed(evidence) => {
+                let metric = evidence.metric_kind();
                 return ProcessResult {
-                    classification: EngineClassification::MalformedInternalEvent,
+                    classification: EngineClassification::NoRelevantRoute,
                     detail_class: "malformed_origin_calldata",
                     candidate_count: 0,
                     decision_count: 0,
-                    evidence: json!({"origin_classification": "malformed"}),
+                    evidence: json!({
+                        "origin_classification": "malformed_router_calldata",
+                        "origin_decoder": evidence
+                    }),
                     evaluations: Vec::new(),
-                    action: ProcessingAction::Retry,
+                    action: ProcessingAction::Ack,
+                    origin_metric: Some(metric),
                 };
             }
         };
+        let origin_evidence = origin.classification_evidence.clone();
         let routes = self.routes.affected_routes(&origin.candidate_touched_pools);
         if routes.is_empty() {
             return ProcessResult::no_route(
                 "no_affected_two_pool_route",
                 json!({
                     "origin_classification": "supported_swap_origin",
-                    "touched_pool_count": origin.candidate_touched_pools.len()
+                    "touched_pool_count": origin.candidate_touched_pools.len(),
+                    "origin_decoder": &origin_evidence
                 }),
-            );
+            )
+            .with_origin_metric(origin_metric);
         }
 
         let route_fingerprints = routes
@@ -315,10 +348,12 @@ impl ShadowProcessor {
                         routes.len(),
                         json!({
                             "origin_classification": "supported_swap_origin",
+                            "origin_decoder": &origin_evidence,
                             "route_fingerprints": route_fingerprints,
                             "dependency_failure_class": class
                         }),
-                    );
+                    )
+                    .with_origin_metric(origin_metric);
                 }
                 Err(EvaluationError::Terminal(class)) => {
                     return ProcessResult::terminal(
@@ -326,10 +361,12 @@ impl ShadowProcessor {
                         routes.len(),
                         json!({
                             "origin_classification": "supported_swap_origin",
+                            "origin_decoder": &origin_evidence,
                             "route_fingerprints": route_fingerprints,
                             "integrity_failure_class": class
                         }),
-                    );
+                    )
+                    .with_origin_metric(origin_metric);
                 }
             }
         }
@@ -341,11 +378,13 @@ impl ShadowProcessor {
                 candidate_count: routes.len(),
                 decision_count: 0,
                 evidence: json!({
+                    "origin_decoder": &origin_evidence,
                     "route_fingerprints": route_fingerprints,
                     "evaluations": evaluation_evidence
                 }),
                 evaluations,
                 action: ProcessingAction::Ack,
+                origin_metric: Some(origin_metric),
             };
         }
         let accepted = evaluations
@@ -365,11 +404,13 @@ impl ShadowProcessor {
             candidate_count: routes.len(),
             decision_count: evaluations.len(),
             evidence: json!({
+                "origin_decoder": &origin_evidence,
                 "route_fingerprints": route_fingerprints,
                 "evaluations": evaluation_evidence
             }),
             evaluations,
             action: ProcessingAction::Ack,
+            origin_metric: Some(origin_metric),
         }
     }
 }
@@ -655,13 +696,12 @@ mod tests {
 
     fn input(to: &str) -> EngineInput {
         let calldata = format!(
-            "0x414bf389{}{}{}{}{}{}{}{}",
+            "0x04e45aaf{}{}{}{}{}{}{}",
             slot_address(WETH),
             slot_address(USDC),
             slot_u(500),
             slot_address("0x1111111111111111111111111111111111111111"),
             slot_u(1000),
-            slot_u(0),
             slot_u(0),
             slot_u(0)
         );
@@ -732,7 +772,8 @@ mod tests {
             vec![Address::parse(ROUTER).unwrap()],
             RouteRegistry::from_json(&route_json()).unwrap(),
             Arc::new(UnavailableEvaluator),
-        );
+        )
+        .unwrap();
         let result = processor
             .process(&input("0x9999999999999999999999999999999999999999"))
             .await;
@@ -746,7 +787,8 @@ mod tests {
             vec![Address::parse(ROUTER).unwrap()],
             RouteRegistry::from_json(&route_json()).unwrap(),
             Arc::new(UnavailableEvaluator),
-        );
+        )
+        .unwrap();
         let result = processor.process(&input(ROUTER)).await;
         assert_eq!(
             result.classification,
@@ -755,6 +797,62 @@ mod tests {
         assert_eq!(result.detail_class, "rpc_gateway_unavailable");
         assert_eq!(result.candidate_count, 1);
         assert_eq!(result.action, ProcessingAction::Retry);
+        assert_eq!(result.evidence["origin_decoder"]["supported"], true);
+        assert_eq!(result.evidence["origin_decoder"]["v3_hop_count"], 1);
+        assert_eq!(
+            result.origin_metric,
+            Some(OriginMetricKind::SupportedDirectV3)
+        );
+    }
+
+    #[tokio::test]
+    async fn exact_output_and_malformed_official_calldata_are_persisted_fail_closed() {
+        let legacy_router = "0xe592427a0aece92de3edee1f18e0157c05861564";
+        let processor = ShadowProcessor::new(
+            vec![Address::parse(legacy_router).unwrap()],
+            RouteRegistry::from_json(&route_json()).unwrap(),
+            Arc::new(UnavailableEvaluator),
+        )
+        .unwrap();
+
+        let mut exact_output = input(ROUTER);
+        exact_output.normalized.to = Some(Address::parse(legacy_router).unwrap());
+        exact_output.normalized.calldata = format!(
+            "0xdb3e2198{}{}{}{}{}{}{}{}",
+            slot_address(WETH),
+            slot_address(USDC),
+            slot_u(500),
+            slot_address("0x1111111111111111111111111111111111111111"),
+            slot_u(1_800_000_000),
+            slot_u(1),
+            slot_u(1000),
+            slot_u(0)
+        );
+        let result = processor.process(&exact_output).await;
+        assert_eq!(result.action, ProcessingAction::Ack);
+        assert_eq!(result.detail_class, "known_router_unsupported_exact_output");
+        assert_eq!(
+            result.evidence["origin_decoder"]["unsupported_reason"],
+            "exact_output"
+        );
+        assert_eq!(
+            result.origin_metric,
+            Some(OriginMetricKind::UnsupportedExactOutput)
+        );
+
+        let mut malformed = exact_output;
+        malformed.normalized.calldata = "0x414bf38900".to_string();
+        let result = processor.process(&malformed).await;
+        assert_eq!(result.action, ProcessingAction::Ack);
+        assert_eq!(result.detail_class, "malformed_origin_calldata");
+        assert_eq!(
+            result.evidence["origin_decoder"]["unsupported_reason"],
+            "malformed_calldata"
+        );
+        assert_eq!(
+            result.origin_metric,
+            Some(OriginMetricKind::MalformedRouterCalldata)
+        );
     }
 
     #[tokio::test]
@@ -769,7 +867,8 @@ mod tests {
             vec![Address::parse(ROUTER).unwrap()],
             RouteRegistry::from_json(&route_json()).unwrap(),
             Arc::new(evaluator),
-        );
+        )
+        .unwrap();
         let result = processor.process(&input(ROUTER)).await;
         assert_eq!(
             result.classification,

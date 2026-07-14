@@ -163,6 +163,7 @@ pub async fn process_delivery(
             }),
             evaluations: Vec::new(),
             action: ProcessingAction::Terminate,
+            origin_metric: result.origin_metric,
         };
     }
 
@@ -212,6 +213,7 @@ fn decode_failure_result(kind: InputFailureKind, evidence: serde_json::Value) ->
             evidence,
             evaluations: Vec::new(),
             action: ProcessingAction::Terminate,
+            origin_metric: None,
         },
         InputFailureKind::Malformed => ProcessResult {
             classification: EngineClassification::MalformedInternalEvent,
@@ -221,11 +223,15 @@ fn decode_failure_result(kind: InputFailureKind, evidence: serde_json::Value) ->
             evidence,
             evaluations: Vec::new(),
             action: ProcessingAction::Retry,
+            origin_metric: None,
         },
     }
 }
 
 fn record_result_metrics(metrics: &RuntimeMetrics, result: &ProcessResult) {
+    if let Some(kind) = result.origin_metric {
+        metrics.origin_classified(kind);
+    }
     metrics.candidates(result.candidate_count);
     match result.classification {
         EngineClassification::NoRelevantRoute => metrics.no_route(),
@@ -415,6 +421,7 @@ mod tests {
             RouteRegistry::from_json("[]").unwrap(),
             Arc::new(UnavailableEvaluator),
         )
+        .unwrap()
     }
 
     fn payload() -> Vec<u8> {

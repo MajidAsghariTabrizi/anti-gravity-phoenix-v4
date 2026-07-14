@@ -1,16 +1,147 @@
-use crate::domain::{Address, Amount, DomainError, PoolId, SequenceNumber, TokenAddress, TxHash};
-use crate::messaging::NormalizedTx;
+mod uniswap;
 
-const EXACT_INPUT_SINGLE_SELECTOR: &str = "414bf389";
-const EXACT_INPUT_SELECTOR: &str = "c04b8d59";
+use crate::domain::{Address, Amount, PoolId, SequenceNumber, TokenAddress, TxHash};
+use crate::messaging::NormalizedTx;
+use serde::Serialize;
+use std::collections::{HashMap, HashSet};
+use std::fmt;
+
+pub const LEGACY_SWAP_ROUTER_ADDRESS: &str = "0xe592427a0aece92de3edee1f18e0157c05861564";
+pub const SWAP_ROUTER_02_ADDRESS: &str = "0x68b3465833fb72a70ecdf485e0e4c7bd8665fc45";
+pub const UNIVERSAL_ROUTER_ADDRESS: &str = "0xa51afafe0263b40edaef0df8781ea9aa03e381a3";
+pub const REVIEWED_ROUTER_ADDRESSES: [&str; 3] = [
+    LEGACY_SWAP_ROUTER_ADDRESS,
+    SWAP_ROUTER_02_ADDRESS,
+    UNIVERSAL_ROUTER_ADDRESS,
+];
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RouterKind {
+    LegacySwapRouter,
+    SwapRouter02,
+    UniversalRouter,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OuterSelectorKind {
+    LegacyExactInputSingle,
+    LegacyExactInput,
+    LegacyExactOutputSingle,
+    LegacyMulticall,
+    SwapRouter02ExactInputSingle,
+    UniversalExecute,
+    UniversalExecuteWithDeadline,
+    Unknown,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WrapperKind {
+    Direct,
+    Multicall,
+    UniversalRouter,
+    None,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DecodedSwapKind {
+    V3ExactInputSingle,
+    V3ExactInput,
+    None,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UnsupportedReason {
+    None,
+    ExactOutput,
+    AmbiguousMultiSwap,
+    UnknownSelector,
+    UnknownCommand,
+    UnsupportedSwapFamily,
+    NestedSubPlan,
+    OptionalSwap,
+    MissingSwap,
+    MalformedCalldata,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OriginMetricKind {
+    SupportedDirectV3,
+    SupportedMulticall,
+    SupportedUniversalRouterV3ExactIn,
+    UnsupportedExactOutput,
+    AmbiguousMultiSwap,
+    MalformedRouterCalldata,
+    UnknownOfficialRouterCommand,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct OriginEvidence {
+    pub router_kind: Option<RouterKind>,
+    pub outer_selector_kind: OuterSelectorKind,
+    pub wrapper_kind: WrapperKind,
+    pub decoded_swap_kind: DecodedSwapKind,
+    pub command_count: usize,
+    pub v3_hop_count: usize,
+    pub exact_in: Option<bool>,
+    pub supported: bool,
+    pub unsupported_reason: UnsupportedReason,
+}
+
+impl OriginEvidence {
+    pub(crate) fn new(
+        router_kind: RouterKind,
+        outer_selector_kind: OuterSelectorKind,
+        wrapper_kind: WrapperKind,
+    ) -> Self {
+        Self {
+            router_kind: Some(router_kind),
+            outer_selector_kind,
+            wrapper_kind,
+            decoded_swap_kind: DecodedSwapKind::None,
+            command_count: 1,
+            v3_hop_count: 0,
+            exact_in: None,
+            supported: false,
+            unsupported_reason: UnsupportedReason::None,
+        }
+    }
+
+    pub fn metric_kind(&self) -> OriginMetricKind {
+        if self.supported {
+            return match self.wrapper_kind {
+                WrapperKind::Direct => OriginMetricKind::SupportedDirectV3,
+                WrapperKind::Multicall => OriginMetricKind::SupportedMulticall,
+                WrapperKind::UniversalRouter => OriginMetricKind::SupportedUniversalRouterV3ExactIn,
+                WrapperKind::None => OriginMetricKind::MalformedRouterCalldata,
+            };
+        }
+        match self.unsupported_reason {
+            UnsupportedReason::ExactOutput => OriginMetricKind::UnsupportedExactOutput,
+            UnsupportedReason::AmbiguousMultiSwap => OriginMetricKind::AmbiguousMultiSwap,
+            UnsupportedReason::MalformedCalldata => OriginMetricKind::MalformedRouterCalldata,
+            UnsupportedReason::None
+            | UnsupportedReason::UnknownSelector
+            | UnsupportedReason::UnknownCommand
+            | UnsupportedReason::UnsupportedSwapFamily
+            | UnsupportedReason::NestedSubPlan
+            | UnsupportedReason::OptionalSwap
+            | UnsupportedReason::MissingSwap => OriginMetricKind::UnknownOfficialRouterCommand,
+        }
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum OriginClassification {
     SupportedSwapOrigin(OriginEvent),
-    KnownRouterUnsupportedCommand,
+    KnownRouterUnsupportedCommand(OriginEvidence),
     PossibleAggregator,
     Irrelevant,
-    Malformed,
+    Malformed(OriginEvidence),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -23,180 +154,105 @@ pub struct OriginEvent {
     pub exact_in: bool,
     pub amount: Amount,
     pub candidate_touched_pools: Vec<PoolId>,
+    pub classification_evidence: OriginEvidence,
 }
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum OriginConfigurationError {
+    Empty,
+    TooManyRouters,
+    UnknownRouter,
+    DuplicateRouter,
+}
+
+impl fmt::Display for OriginConfigurationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Empty => "the reviewed router registry is empty",
+            Self::TooManyRouters => "the reviewed router registry is too large",
+            Self::UnknownRouter => "the router is not a reviewed official entrypoint",
+            Self::DuplicateRouter => "the reviewed router registry contains a duplicate",
+        })
+    }
+}
+
+impl std::error::Error for OriginConfigurationError {}
 
 #[derive(Clone, Debug)]
 pub struct OriginDetector {
-    routers: Vec<Address>,
+    routers: HashMap<Address, RouterKind>,
 }
 
 impl OriginDetector {
-    pub fn new(routers: Vec<Address>) -> Self {
-        Self { routers }
+    pub fn new(routers: Vec<Address>) -> Result<Self, OriginConfigurationError> {
+        if routers.is_empty() {
+            return Err(OriginConfigurationError::Empty);
+        }
+        if routers.len() > REVIEWED_ROUTER_ADDRESSES.len() {
+            return Err(OriginConfigurationError::TooManyRouters);
+        }
+        let mut seen = HashSet::new();
+        let mut reviewed = HashMap::new();
+        for router in routers {
+            if !seen.insert(router.clone()) {
+                return Err(OriginConfigurationError::DuplicateRouter);
+            }
+            let kind =
+                reviewed_router_kind(&router).ok_or(OriginConfigurationError::UnknownRouter)?;
+            reviewed.insert(router, kind);
+        }
+        Ok(Self { routers: reviewed })
     }
 
     pub fn classify(&self, tx: &NormalizedTx) -> OriginClassification {
         let Some(to) = &tx.to else {
             return OriginClassification::Irrelevant;
         };
-        if !self.routers.iter().any(|r| r == to) {
+        let Some(router_kind) = self.routers.get(to).copied() else {
             return if tx.calldata.len() > 10 {
                 OriginClassification::PossibleAggregator
             } else {
                 OriginClassification::Irrelevant
             };
-        }
-        let calldata = tx.calldata.trim_start_matches("0x").to_ascii_lowercase();
-        if calldata.len() < 8 {
-            return OriginClassification::Malformed;
-        }
-        let selector = &calldata[0..8];
-        match selector {
-            EXACT_INPUT_SINGLE_SELECTOR => match decode_exact_input_single(&calldata[8..]) {
-                Ok(decoded) => {
-                    let touched_pool = PoolId(format!(
-                        "{}:{}:{}",
-                        decoded.token_in.as_str(),
-                        decoded.token_out.as_str(),
-                        decoded.fee
-                    ));
-
-                    OriginClassification::SupportedSwapOrigin(OriginEvent {
-                        origin_tx_hash: tx.tx_hash.clone(),
-                        origin_sequence: tx.sequence,
-                        router: to.clone(),
-                        decoded_commands: vec!["exactInputSingle".to_string()],
-                        swap_path: vec![
-                            TokenAddress(decoded.token_in),
-                            TokenAddress(decoded.token_out),
-                        ],
-                        exact_in: true,
-                        amount: decoded.amount_in,
-                        candidate_touched_pools: vec![touched_pool],
-                    })
-                }
-                Err(_) => OriginClassification::Malformed,
-            },
-            EXACT_INPUT_SELECTOR => OriginClassification::KnownRouterUnsupportedCommand,
-            _ => OriginClassification::KnownRouterUnsupportedCommand,
-        }
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct ExactInputSingle {
-    token_in: Address,
-    token_out: Address,
-    fee: u32,
-    amount_in: Amount,
-}
-
-fn decode_exact_input_single(data: &str) -> Result<ExactInputSingle, DomainError> {
-    let slots = abi_slots(data)?;
-    if slots.len() < 8 {
-        return Err(DomainError::InvalidCalldata(
-            "exactInputSingle too short".to_string(),
-        ));
-    }
-    let token_in = Address::parse(&format!("0x{}", &slots[0][24..64]))?;
-    let token_out = Address::parse(&format!("0x{}", &slots[1][24..64]))?;
-    let fee = parse_u32_slot(&slots[2])?;
-    let amount_in = Amount(parse_u128_slot(&slots[4])?);
-    Ok(ExactInputSingle {
-        token_in,
-        token_out,
-        fee,
-        amount_in,
-    })
-}
-
-fn abi_slots(data: &str) -> Result<Vec<String>, DomainError> {
-    if !data.as_bytes().chunks_exact(64).remainder().is_empty()
-        || !data.chars().all(|c| c.is_ascii_hexdigit())
-    {
-        return Err(DomainError::InvalidCalldata(
-            "invalid abi slot data".to_string(),
-        ));
-    }
-    Ok(data
-        .as_bytes()
-        .chunks(64)
-        .map(|chunk| String::from_utf8_lossy(chunk).to_string())
-        .collect())
-}
-
-fn parse_u32_slot(slot: &str) -> Result<u32, DomainError> {
-    u32::from_str_radix(&slot[56..64], 16)
-        .map_err(|_| DomainError::InvalidCalldata("invalid uint24/uint32 slot".to_string()))
-}
-
-fn parse_u128_slot(slot: &str) -> Result<u128, DomainError> {
-    if &slot[0..32] != "00000000000000000000000000000000" {
-        return Err(DomainError::InvalidCalldata(
-            "uint256 exceeds local u128 fixture range".to_string(),
-        ));
-    }
-    u128::from_str_radix(&slot[32..64], 16)
-        .map_err(|_| DomainError::InvalidCalldata("invalid uint256 slot".to_string()))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::domain::{ChainId, TxHash};
-    use crate::messaging::NormalizedTx;
-
-    fn slot_address(address: &str) -> String {
-        format!(
-            "000000000000000000000000{}",
-            address.trim_start_matches("0x")
-        )
-    }
-
-    fn slot_u(value: u128) -> String {
-        format!("{value:064x}")
-    }
-
-    #[test]
-    fn decodes_exact_input_single_origin() {
-        let router = Address::parse("0x68b3465833fb72a70ecdf485e0e4c7bd8665fc45").unwrap();
-        let detector = OriginDetector::new(vec![router.clone()]);
-        let token_in = "0x82af49447d8a07e3bd95bd0d56f35241523fbab1";
-        let token_out = "0xaf88d065e77c8cc2239327c5edb3a432268e5831";
-        let calldata = format!(
-            "0x{}{}{}{}{}{}{}{}{}",
-            EXACT_INPUT_SINGLE_SELECTOR,
-            slot_address(token_in),
-            slot_address(token_out),
-            slot_u(500),
-            slot_address("0x1111111111111111111111111111111111111111"),
-            slot_u(12345),
-            slot_u(0),
-            slot_u(0),
-            slot_u(0)
-        );
-        let tx = NormalizedTx {
-            sequence: SequenceNumber(7),
-            tx_hash: TxHash(
-                "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
-            ),
-            tx_type: "0x2".to_string(),
-            chain_id: ChainId(42161),
-            from: Address::parse("0x1111111111111111111111111111111111111111").unwrap(),
-            to: Some(router),
-            nonce: 1,
-            value: "0".to_string(),
-            calldata,
-            gas_limit: "1".to_string(),
-            max_fee_per_gas: "1".to_string(),
-            max_priority_fee_per_gas: "1".to_string(),
         };
-        match detector.classify(&tx) {
-            OriginClassification::SupportedSwapOrigin(event) => {
-                assert_eq!(event.amount, Amount(12345));
-                assert_eq!(event.swap_path.len(), 2);
+
+        match uniswap::classify(router_kind, &tx.calldata) {
+            uniswap::DecodeOutcome::Supported(decoded) => {
+                OriginClassification::SupportedSwapOrigin(OriginEvent {
+                    origin_tx_hash: tx.tx_hash.clone(),
+                    origin_sequence: tx.sequence,
+                    router: to.clone(),
+                    decoded_commands: decoded.decoded_commands,
+                    swap_path: decoded.swap_path.into_iter().map(TokenAddress).collect(),
+                    exact_in: true,
+                    amount: decoded.amount_in,
+                    candidate_touched_pools: decoded.touched_pools,
+                    classification_evidence: decoded.evidence,
+                })
             }
-            other => panic!("unexpected classification: {other:?}"),
+            uniswap::DecodeOutcome::Unsupported(evidence) => {
+                OriginClassification::KnownRouterUnsupportedCommand(evidence)
+            }
+            uniswap::DecodeOutcome::Malformed(evidence) => {
+                OriginClassification::Malformed(evidence)
+            }
         }
     }
+}
+
+pub fn reviewed_router_kind(address: &Address) -> Option<RouterKind> {
+    match address.as_str() {
+        LEGACY_SWAP_ROUTER_ADDRESS => Some(RouterKind::LegacySwapRouter),
+        SWAP_ROUTER_02_ADDRESS => Some(RouterKind::SwapRouter02),
+        UNIVERSAL_ROUTER_ADDRESS => Some(RouterKind::UniversalRouter),
+        _ => None,
+    }
+}
+
+pub(crate) struct DecodedSwap {
+    pub decoded_commands: Vec<String>,
+    pub swap_path: Vec<Address>,
+    pub amount_in: Amount,
+    pub touched_pools: Vec<PoolId>,
+    pub evidence: OriginEvidence,
 }

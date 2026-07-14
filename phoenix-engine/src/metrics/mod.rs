@@ -5,6 +5,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::opportunity::{Opportunity, ShadowDisposition, SimulationClassification};
+use crate::origin::OriginMetricKind;
 use crate::runtime_state::RuntimeReadiness;
 
 #[derive(Clone, Debug, Default)]
@@ -25,6 +26,13 @@ struct RuntimeMetricValues {
     duplicate_skips: AtomicU64,
     rpc_primary_screen_rejected: AtomicU64,
     rpc_secondary_skipped: AtomicU64,
+    origin_supported_direct_v3: AtomicU64,
+    origin_supported_multicall: AtomicU64,
+    origin_supported_universal_router_v3_exact_in: AtomicU64,
+    origin_unsupported_exact_output: AtomicU64,
+    origin_ambiguous_multi_swap: AtomicU64,
+    origin_malformed_router_calldata: AtomicU64,
+    origin_unknown_official_router_command: AtomicU64,
     consumer_pending: AtomicU64,
     consumer_ack_pending: AtomicU64,
     processing_latency_nanos: AtomicU64,
@@ -90,6 +98,25 @@ impl RuntimeMetrics {
             .fetch_add(1, Ordering::Relaxed);
     }
 
+    pub fn origin_classified(&self, kind: OriginMetricKind) {
+        let counter = match kind {
+            OriginMetricKind::SupportedDirectV3 => &self.inner.origin_supported_direct_v3,
+            OriginMetricKind::SupportedMulticall => &self.inner.origin_supported_multicall,
+            OriginMetricKind::SupportedUniversalRouterV3ExactIn => {
+                &self.inner.origin_supported_universal_router_v3_exact_in
+            }
+            OriginMetricKind::UnsupportedExactOutput => &self.inner.origin_unsupported_exact_output,
+            OriginMetricKind::AmbiguousMultiSwap => &self.inner.origin_ambiguous_multi_swap,
+            OriginMetricKind::MalformedRouterCalldata => {
+                &self.inner.origin_malformed_router_calldata
+            }
+            OriginMetricKind::UnknownOfficialRouterCommand => {
+                &self.inner.origin_unknown_official_router_command
+            }
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+
     pub fn set_consumer_state(&self, pending: u64, ack_pending: u64) {
         self.inner
             .consumer_pending
@@ -126,6 +153,20 @@ impl RuntimeMetrics {
                 "rpc_primary_screen_rejected_total {}\n",
                 "# TYPE rpc_secondary_skipped_total counter\n",
                 "rpc_secondary_skipped_total {}\n",
+                "# TYPE phoenix_origin_supported_direct_v3_total counter\n",
+                "phoenix_origin_supported_direct_v3_total {}\n",
+                "# TYPE phoenix_origin_supported_multicall_total counter\n",
+                "phoenix_origin_supported_multicall_total {}\n",
+                "# TYPE phoenix_origin_supported_universal_router_v3_exact_in_total counter\n",
+                "phoenix_origin_supported_universal_router_v3_exact_in_total {}\n",
+                "# TYPE phoenix_origin_unsupported_exact_output_total counter\n",
+                "phoenix_origin_unsupported_exact_output_total {}\n",
+                "# TYPE phoenix_origin_ambiguous_multi_swap_total counter\n",
+                "phoenix_origin_ambiguous_multi_swap_total {}\n",
+                "# TYPE phoenix_origin_malformed_router_calldata_total counter\n",
+                "phoenix_origin_malformed_router_calldata_total {}\n",
+                "# TYPE phoenix_origin_unknown_official_router_command_total counter\n",
+                "phoenix_origin_unknown_official_router_command_total {}\n",
                 "# TYPE phoenix_engine_consumer_pending gauge\n",
                 "phoenix_engine_consumer_pending {}\n",
                 "# TYPE phoenix_engine_consumer_ack_pending gauge\n",
@@ -148,6 +189,27 @@ impl RuntimeMetrics {
                 .rpc_primary_screen_rejected
                 .load(Ordering::Relaxed),
             self.inner.rpc_secondary_skipped.load(Ordering::Relaxed),
+            self.inner
+                .origin_supported_direct_v3
+                .load(Ordering::Relaxed),
+            self.inner
+                .origin_supported_multicall
+                .load(Ordering::Relaxed),
+            self.inner
+                .origin_supported_universal_router_v3_exact_in
+                .load(Ordering::Relaxed),
+            self.inner
+                .origin_unsupported_exact_output
+                .load(Ordering::Relaxed),
+            self.inner
+                .origin_ambiguous_multi_swap
+                .load(Ordering::Relaxed),
+            self.inner
+                .origin_malformed_router_calldata
+                .load(Ordering::Relaxed),
+            self.inner
+                .origin_unknown_official_router_command
+                .load(Ordering::Relaxed),
             self.inner.consumer_pending.load(Ordering::Relaxed),
             self.inner.consumer_ack_pending.load(Ordering::Relaxed),
             latency,
@@ -361,6 +423,38 @@ mod tests {
             assert!(rendered.contains(expected), "missing metric: {expected}");
         }
         for forbidden in ["tx_hash=", "source_event_identity=", "pool_address="] {
+            assert!(!rendered.contains(forbidden));
+        }
+    }
+
+    #[test]
+    fn runtime_renderer_exposes_only_bounded_origin_counters() {
+        let metrics = RuntimeMetrics::default();
+        for kind in [
+            OriginMetricKind::SupportedDirectV3,
+            OriginMetricKind::SupportedMulticall,
+            OriginMetricKind::SupportedUniversalRouterV3ExactIn,
+            OriginMetricKind::UnsupportedExactOutput,
+            OriginMetricKind::AmbiguousMultiSwap,
+            OriginMetricKind::MalformedRouterCalldata,
+            OriginMetricKind::UnknownOfficialRouterCommand,
+        ] {
+            metrics.origin_classified(kind);
+        }
+
+        let rendered = metrics.render(&RuntimeReadiness::new());
+        for expected in [
+            "phoenix_origin_supported_direct_v3_total 1",
+            "phoenix_origin_supported_multicall_total 1",
+            "phoenix_origin_supported_universal_router_v3_exact_in_total 1",
+            "phoenix_origin_unsupported_exact_output_total 1",
+            "phoenix_origin_ambiguous_multi_swap_total 1",
+            "phoenix_origin_malformed_router_calldata_total 1",
+            "phoenix_origin_unknown_official_router_command_total 1",
+        ] {
+            assert!(rendered.contains(expected), "missing metric: {expected}");
+        }
+        for forbidden in ["router=", "selector=", "command=", "tx_hash=", "calldata="] {
             assert!(!rendered.contains(forbidden));
         }
     }

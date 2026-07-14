@@ -1023,6 +1023,10 @@ mod tests {
     use crate::domain::{Address, ChainId, PoolId, RouteId, SequenceNumber, TokenAddress, TxHash};
     use crate::graph::{PoolEdge, Route};
     use crate::messaging::NormalizedTx;
+    use crate::origin::{
+        DecodedSwapKind, OriginEvidence, OuterSelectorKind, RouterKind, UnsupportedReason,
+        WrapperKind,
+    };
     use crate::persistence::{validate_record, ClassificationRecord};
     use crate::shadow_processor::RuntimeStrategy;
     use chrono::Utc;
@@ -1171,6 +1175,17 @@ mod tests {
             exact_in: true,
             amount: Amount(500),
             candidate_touched_pools: vec![PoolId("origin-pool".to_string())],
+            classification_evidence: OriginEvidence {
+                router_kind: Some(RouterKind::SwapRouter02),
+                outer_selector_kind: OuterSelectorKind::SwapRouter02ExactInputSingle,
+                wrapper_kind: WrapperKind::Direct,
+                decoded_swap_kind: DecodedSwapKind::V3ExactInputSingle,
+                command_count: 1,
+                v3_hop_count: 1,
+                exact_in: Some(true),
+                supported: true,
+                unsupported_reason: UnsupportedReason::None,
+            },
         }
     }
 
