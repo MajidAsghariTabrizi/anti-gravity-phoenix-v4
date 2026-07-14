@@ -29,6 +29,7 @@ RPC_UPSTREAM_CALLS_PER_SECOND=1
 RPC_UPSTREAM_CALL_BURST=4
 RPC_STATE_REQUESTS_PER_MINUTE=12
 RPC_PROVIDER_PROBE_INTERVAL_SECONDS=60
+ENGINE_ROUTER_ADDRESSES=0xe592427a0aece92de3edee1f18e0157c05861564,0x68b3465833fb72a70ecdf485e0e4c7bd8665fc45,0xa51afafe0263b40edaef0df8781ea9aa03e381a3
 EXECUTOR_ADDRESS=
 SIGNER_PRIVATE_KEY=
 ENV
@@ -74,5 +75,14 @@ if output=$("$validator" "$bad_postgres" 2>&1); then
 fi
 assert_redacted "$output"
 printf '%s' "$output" | grep -q 'POSTGRES_DSN does not match'
+
+bad_router="$tmp_dir/bad-router.env"
+sed 's/0xa51afafe0263b40edaef0df8781ea9aa03e381a3/0x1b81d678ffb9c0263b24a97847620c99d213eb14/' "$valid_env" >"$bad_router"
+if output=$("$validator" "$bad_router" 2>&1); then
+  echo "expected an unreviewed Engine router to fail"
+  exit 1
+fi
+assert_redacted "$output"
+printf '%s' "$output" | grep -q 'ENGINE_ROUTER_ADDRESSES contains an unreviewed router'
 
 echo "validate-production-env-tests: ok"
