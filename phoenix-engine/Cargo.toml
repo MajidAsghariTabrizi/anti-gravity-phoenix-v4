@@ -13,6 +13,10 @@ path = "src/lib.rs"
 name = "phoenix-engine"
 path = "src/main.rs"
 
+[[bin]]
+name = "shadow-positive-route-evidence"
+path = "src/shadow_positive_route_evidence_main.rs"
+
 [dependencies]
 async-nats = "=0.37.0"
 async-trait = "=0.1.81"

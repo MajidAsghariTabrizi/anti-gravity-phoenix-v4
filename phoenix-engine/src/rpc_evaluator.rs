@@ -294,6 +294,7 @@ impl CandidateEvaluator for RpcCandidateEvaluator {
                 evidence: json!({
                     "state_block": primary_response.block_number,
                     "state_block_hash": primary_response.block_hash,
+                    "state_hash": primary_response.state_hash,
                     "primary_provider_id": primary_response.primary_provider_id,
                     "verification_status": primary_response.verification_status,
                     "rpc_quality_record_count": primary_response.quality.len(),
@@ -334,6 +335,7 @@ impl CandidateEvaluator for RpcCandidateEvaluator {
         let base_evidence = json!({
             "state_block": response.block_number,
             "state_block_hash": response.block_hash,
+            "state_hash": response.state_hash,
             "rpc_response_hash": response_hash,
             "primary_provider_id": response.primary_provider_id,
             "agreement_provider_id": response.agreement_provider_id,

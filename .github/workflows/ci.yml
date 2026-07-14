@@ -47,6 +47,7 @@ jobs:
           set -euo pipefail
           sh ./scripts/shadow-engine-canary-control-tests.sh
           sh ./scripts/shadow-engine-isolated-canary-tests.sh
+          sh ./scripts/shadow-positive-route-evidence-tests.sh
 
       - name: Validate tracked hygiene
         shell: bash
@@ -343,6 +344,7 @@ jobs:
         run: |
           set -euo pipefail
           cargo test --manifest-path phoenix-engine/Cargo.toml --test e2e_fixtures
+          cargo test --manifest-path phoenix-engine/Cargo.toml --test positive_route_evidence
           cd feed-ingestor
           go test ./internal/decoder -run 'Fixture|Duplicate|Gap'
 

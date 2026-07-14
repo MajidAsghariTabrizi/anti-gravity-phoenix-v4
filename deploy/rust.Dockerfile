@@ -18,6 +18,10 @@ RUN case "${CRATE}" in \
     esac && \
     cd "${CRATE}" && cargo build --release --bin "${BIN}" && \
     mkdir -p /out && cp "target/release/${BIN}" /out/service && \
+    if [ "${CRATE}" = "phoenix-engine" ]; then \
+      cargo build --release --bin shadow-positive-route-evidence && \
+      cp target/release/shadow-positive-route-evidence /out/shadow-positive-route-evidence; \
+    fi && \
     if [ "${CRATE}" = "recorder" ]; then \
       cargo build --release --bin shadow-dispatcher && \
       cp target/release/shadow-dispatcher /out/shadow-dispatcher; \

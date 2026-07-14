@@ -13,6 +13,7 @@ pub mod opportunity;
 pub mod optimizer;
 pub mod origin;
 pub mod persistence;
+pub mod positive_route_evidence;
 pub mod profit;
 pub mod readiness;
 pub mod rpc_evaluator;
