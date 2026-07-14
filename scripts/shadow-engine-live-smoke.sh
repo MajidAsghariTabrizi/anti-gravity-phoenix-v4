@@ -12,6 +12,13 @@ max_pending=${SHADOW_ENGINE_SMOKE_MAX_PENDING:-100000}
 max_ack_pending=512
 evidence_timeout=${SHADOW_ENGINE_SMOKE_EVIDENCE_TIMEOUT_SECONDS:-180}
 recovery_timeout=${SHADOW_ENGINE_SMOKE_RECOVERY_TIMEOUT_SECONDS:-180}
+canary_input_limit=${SHADOW_ENGINE_CANARY_INPUT_LIMIT:-0}
+canary_settle_timeout=${SHADOW_ENGINE_CANARY_SETTLE_TIMEOUT_SECONDS:-180}
+canary_max_overshoot=64
+canary_poll_interval=0.1
+
+# shellcheck disable=SC1091
+. "$script_dir/shadow-engine-canary-control.sh"
 
 if [ ! -f "$release_env" ] && [ -f "$repo_dir/current-release.env" ]; then
   release_env="$repo_dir/current-release.env"
@@ -55,6 +62,10 @@ case "$max_pending:$evidence_timeout:$recovery_timeout" in
 esac
 if [ "$max_pending" -le 0 ] || [ "$evidence_timeout" -le 0 ] || [ "$recovery_timeout" -le 0 ]; then
   blocked "smoke thresholds must be greater than zero"
+fi
+canary_input_limit_is_valid "$canary_input_limit" || blocked "canary input limit must be an integer from 0 to 1000000"
+if canary_is_enabled "$canary_input_limit"; then
+  canary_positive_timeout_is_valid "$canary_settle_timeout" || blocked "canary settle timeout must be an integer from 1 to 3600"
 fi
 
 compose() {
@@ -208,6 +219,59 @@ wait_runtime() {
   return 1
 }
 
+canary_dependencies_ready() {
+  service_ready feed-ingestor 9100 &&
+    service_ready recorder 9400 &&
+    service_ready shadow-dispatcher 9500 &&
+    service_ready rpc-gateway 9300
+}
+
+wait_canary_dependencies() {
+  canary_dependency_deadline=$(( $(date +%s) + recovery_timeout ))
+  while [ "$(date +%s)" -lt "$canary_dependency_deadline" ]; do
+    if canary_dependencies_ready; then
+      return 0
+    fi
+    sleep 1
+  done
+  return 1
+}
+
+stop_engine_for_canary() {
+  compose stop phoenix-engine >/dev/null 2>&1
+}
+
+wait_for_canary_target() {
+  canary_target_deadline=$(( $(date +%s) + evidence_timeout ))
+  while [ "$(date +%s)" -lt "$canary_target_deadline" ]; do
+    canary_observed_processed=$(service_metric_count phoenix-engine 9200 phoenix_engine_inputs_processed_total)
+    if canary_target_reached 0 "$canary_observed_processed" "$canary_input_limit"; then
+      stop_engine_for_canary || return 1
+      return 0
+    fi
+    sleep "$canary_poll_interval"
+  done
+  return 1
+}
+
+wait_for_canary_ack_settle() {
+  canary_ack_deadline=$(( $(date +%s) + canary_settle_timeout ))
+  canary_zero_samples=0
+  while [ "$(date +%s)" -lt "$canary_ack_deadline" ]; do
+    canary_ack_pending=$(engine_js_value ack_pending)
+    if [ "$canary_ack_pending" -eq 0 ]; then
+      canary_zero_samples=$((canary_zero_samples + 1))
+      if [ "$canary_zero_samples" -ge 2 ]; then
+        return 0
+      fi
+    else
+      canary_zero_samples=0
+    fi
+    sleep 1
+  done
+  return 1
+}
+
 diagnostics() {
   echo "SHADOW_ENGINE_LIVE_SMOKE_DIAGNOSTICS: bounded status and logs follow" >&2
   compose ps postgres nats rpc-gateway feed-ingestor recorder shadow-dispatcher phoenix-engine >&2 || true
@@ -218,7 +282,11 @@ diagnostics() {
 
 fail() {
   echo "SHADOW_ENGINE_LIVE_SMOKE_FAIL: $1" >&2
-  compose up -d postgres nats rpc-gateway recorder shadow-dispatcher phoenix-engine feed-ingestor >/dev/null 2>&1 || true
+  if canary_is_enabled "$canary_input_limit"; then
+    stop_engine_for_canary || true
+  else
+    compose up -d postgres nats rpc-gateway recorder shadow-dispatcher phoenix-engine feed-ingestor >/dev/null 2>&1 || true
+  fi
   diagnostics
   exit 1
 }
@@ -264,6 +332,36 @@ wait_for_classification_growth() {
   return 1
 }
 
+run_bounded_canary() {
+  wait_for_canary_target || fail "Engine did not reach the requested canary input threshold"
+  wait_for_canary_ack_settle || fail "Engine ACK-pending did not settle after the canary stop"
+
+  canary_classifications_after=$(sql_count 'SELECT count(*) FROM shadow_engine_classifications')
+  canary_persisted_classifications=$(canary_processed_delta "$classifications_before" "$canary_classifications_after") || fail "classification count moved backwards during canary"
+  canary_accounted_processed=$canary_observed_processed
+  if [ "$canary_persisted_classifications" -gt "$canary_accounted_processed" ]; then
+    canary_accounted_processed=$canary_persisted_classifications
+  fi
+  canary_target_reached 0 "$canary_accounted_processed" "$canary_input_limit" || fail "persisted canary inputs did not reach the requested threshold"
+  canary_within_overshoot_bound 0 "$canary_accounted_processed" "$canary_input_limit" "$canary_max_overshoot" || fail "canary input overshoot exceeded one Engine pull batch"
+  [ "$(engine_js_value stream_exists)" -eq 1 ] || fail "Engine stream disappeared during canary stop"
+  [ "$(engine_js_value consumer_exists)" -eq 1 ] || fail "Engine durable consumer disappeared during canary stop"
+
+  execution_attempts_after=$(sql_count 'SELECT count(*) FROM execution_attempts')
+  executions_after=$(sql_count 'SELECT count(*) FROM executions')
+  realized_after=$(sql_count 'SELECT count(*) FROM realized_pnl')
+  execution_eligible=$(sql_count "SELECT count(*) FROM shadow_decisions WHERE created_at >= '$smoke_started'::timestamptz AND execution_eligible")
+  [ "$execution_attempts_after" -eq "$execution_attempts_before" ] || fail "execution attempts changed during bounded SHADOW canary"
+  [ "$executions_after" -eq "$executions_before" ] || fail "executions changed during bounded SHADOW canary"
+  [ "$realized_after" -eq "$realized_before" ] || fail "realized PnL rows changed during bounded SHADOW canary"
+  [ "$execution_eligible" -eq 0 ] || fail "a bounded SHADOW canary decision became execution eligible"
+
+  canary_pending=$(engine_js_value pending)
+  echo "SHADOW_ENGINE_CANARY_PASS: Engine stopped automatically at the bounded persisted-input threshold"
+  echo "processed_inputs=$canary_accounted_processed metric_at_stop=$canary_observed_processed persisted_classifications=$canary_persisted_classifications requested_limit=$canary_input_limit max_overshoot=$canary_max_overshoot pending_replayable=$canary_pending ack_pending=0"
+  exit 0
+}
+
 shadow_label='SHADOW / SIMULATED — NOT REALIZED CAPITAL PNL'
 grep -F "$shadow_label" "$repo_dir/dashboard/app.py" >/dev/null || blocked "dashboard SHADOW label is absent"
 
@@ -281,6 +379,13 @@ classifications_before=$(sql_count 'SELECT count(*) FROM shadow_engine_classific
 execution_attempts_before=$(sql_count 'SELECT count(*) FROM execution_attempts')
 executions_before=$(sql_count 'SELECT count(*) FROM executions')
 realized_before=$(sql_count 'SELECT count(*) FROM realized_pnl')
+
+if canary_is_enabled "$canary_input_limit"; then
+  compose up -d prometheus dashboard recorder shadow-dispatcher feed-ingestor || fail "SHADOW canary dependencies failed to start"
+  wait_canary_dependencies || fail "SHADOW canary dependencies did not become ready"
+  compose up -d phoenix-engine || fail "SHADOW canary Engine failed to start"
+  run_bounded_canary
+fi
 
 compose up -d prometheus dashboard recorder shadow-dispatcher feed-ingestor phoenix-engine || fail "SHADOW runtime services failed to start"
 wait_runtime || fail "SHADOW runtime did not become ready"

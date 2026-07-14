@@ -41,6 +41,12 @@ jobs:
           set -euo pipefail
           sh -n scripts/*.sh
 
+      - name: Validate bounded Engine canary control
+        shell: bash
+        run: |
+          set -euo pipefail
+          sh ./scripts/shadow-engine-canary-control-tests.sh
+
       - name: Validate tracked hygiene
         shell: bash
         run: |

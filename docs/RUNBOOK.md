@@ -9,6 +9,18 @@ Production default:
 
 Production operations use `/opt/phoenix/deploy/deploy-release.sh <sha>`, `/opt/phoenix/deploy/rollback-release.sh`, and `/opt/phoenix/deploy/production-healthcheck.sh`.
 
+## Bounded Engine Canary
+
+Set `SHADOW_ENGINE_CANARY_INPUT_LIMIT` only for a manually reviewed SHADOW smoke run:
+
+```sh
+SHADOW_ENGINE_CANARY_INPUT_LIMIT=500 ./scripts/shadow-engine-live-smoke.sh
+```
+
+The default value is `0`, which leaves the existing full smoke workflow unchanged. A positive limit starts the Engine only after its dependencies are ready, watches `phoenix_engine_inputs_processed_total` immediately, and stops the Engine automatically when the requested persisted-input threshold is observed. Post-stop accounting uses the larger of that metric and new persisted classifications; the run fails if the accounted total exceeds the requested limit by more than the fixed 64-message Engine pull batch.
+
+After stopping, the script waits up to `SHADOW_ENGINE_CANARY_SETTLE_TIMEOUT_SECONDS` (default 180 seconds) for ACK-pending to remain at zero. It verifies that `PHOENIX_ENGINE_INPUT` and durable consumer `PHOENIX_ENGINE_SHADOW` still exist, leaves the Engine stopped, and leaves any pending messages replayable. The canary path requires the same `PHOENIX_MODE=SHADOW`, `LIVE_EXECUTION=false`, and blank signer, executor, and wallet settings as the full smoke.
+
 ## Incidents
 
 ### Nitro feed relay disconnected
