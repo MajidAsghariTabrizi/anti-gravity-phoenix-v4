@@ -19,6 +19,7 @@ canary_poll_interval=0.1
 
 # shellcheck disable=SC1091
 . "$script_dir/shadow-engine-canary-control.sh"
+. "$script_dir/shadow-engine-isolated-canary.sh"
 
 if [ ! -f "$release_env" ] && [ -f "$repo_dir/current-release.env" ]; then
   release_env="$repo_dir/current-release.env"
@@ -365,6 +366,10 @@ run_bounded_canary() {
 shadow_label='SHADOW / SIMULATED — NOT REALIZED CAPITAL PNL'
 grep -F "$shadow_label" "$repo_dir/dashboard/app.py" >/dev/null || blocked "dashboard SHADOW label is absent"
 
+if canary_is_enabled "$canary_input_limit"; then
+  run_isolated_canary
+fi
+
 smoke_started=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 compose config >/dev/null || fail "production Compose configuration is invalid"
 compose stop feed-ingestor recorder shadow-dispatcher phoenix-engine dashboard prometheus >/dev/null 2>&1 || true
@@ -379,13 +384,6 @@ classifications_before=$(sql_count 'SELECT count(*) FROM shadow_engine_classific
 execution_attempts_before=$(sql_count 'SELECT count(*) FROM execution_attempts')
 executions_before=$(sql_count 'SELECT count(*) FROM executions')
 realized_before=$(sql_count 'SELECT count(*) FROM realized_pnl')
-
-if canary_is_enabled "$canary_input_limit"; then
-  compose up -d prometheus dashboard recorder shadow-dispatcher feed-ingestor || fail "SHADOW canary dependencies failed to start"
-  wait_canary_dependencies || fail "SHADOW canary dependencies did not become ready"
-  compose up -d phoenix-engine || fail "SHADOW canary Engine failed to start"
-  run_bounded_canary
-fi
 
 compose up -d prometheus dashboard recorder shadow-dispatcher feed-ingestor phoenix-engine || fail "SHADOW runtime services failed to start"
 wait_runtime || fail "SHADOW runtime did not become ready"

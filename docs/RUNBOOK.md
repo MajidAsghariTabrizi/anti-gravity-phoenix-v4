@@ -17,7 +17,11 @@ Set `SHADOW_ENGINE_CANARY_INPUT_LIMIT` only for a manually reviewed SHADOW smoke
 SHADOW_ENGINE_CANARY_INPUT_LIMIT=500 ./scripts/shadow-engine-live-smoke.sh
 ```
 
-The default value is `0`, which leaves the existing full smoke workflow unchanged. A positive limit starts the Engine only after its dependencies are ready, watches `phoenix_engine_inputs_processed_total` immediately, and stops the Engine automatically when the requested persisted-input threshold is observed. Post-stop accounting uses the larger of that metric and new persisted classifications; the run fails if the accounted total exceeds the requested limit by more than the fixed 64-message Engine pull batch.
+The default value is `0`, which leaves the existing full smoke workflow unchanged. A positive limit selects isolated canary mode: the durable Nitro relay, NATS, PostgreSQL, Feed Ingestor, and Recorder must already be healthy, and their readiness, JetStream stream/consumer, and PostgreSQL connectivity are checked before any optional runtime starts. Migrations must be run separately before the canary. The canary never starts, recreates, stops, or modifies those core services, the Shadow Dispatcher, Prometheus, or Dashboard; monitoring is not required. It starts only RPC Gateway and Phoenix Engine with explicit `--no-deps` service names.
+
+The isolated path records protected container identity, image, creation/start timestamps, and restart count before startup and verifies them again after cleanup. A missing or unhealthy dependency fails closed without starting RPC Gateway or Engine, and a protected identity change fails the canary. Failure does not alter the durable Feed path.
+
+The canary watches `phoenix_engine_inputs_processed_total` immediately before Engine startup and stops the Engine automatically when the requested persisted-input threshold is observed. Post-stop accounting uses the larger of that metric and new persisted classifications; the run fails if the accounted total exceeds the requested limit by more than the fixed 64-message Engine pull batch.
 
 After stopping, the script waits up to `SHADOW_ENGINE_CANARY_SETTLE_TIMEOUT_SECONDS` (default 180 seconds) for ACK-pending to remain at zero. It verifies that `PHOENIX_ENGINE_INPUT` and durable consumer `PHOENIX_ENGINE_SHADOW` still exist, leaves the Engine stopped, and leaves any pending messages replayable. The canary path requires the same `PHOENIX_MODE=SHADOW`, `LIVE_EXECUTION=false`, and blank signer, executor, and wallet settings as the full smoke.
 

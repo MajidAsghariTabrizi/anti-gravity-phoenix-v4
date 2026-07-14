@@ -46,6 +46,7 @@ jobs:
         run: |
           set -euo pipefail
           sh ./scripts/shadow-engine-canary-control-tests.sh
+          sh ./scripts/shadow-engine-isolated-canary-tests.sh
 
       - name: Validate tracked hygiene
         shell: bash
