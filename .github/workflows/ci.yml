@@ -305,6 +305,12 @@ jobs:
           docker compose config
           PHOENIX_ENV_FILE=.ci-prod.env docker compose --env-file .ci-prod.env -f compose.prod.yml config
 
+      - name: Validate Compose route registry preservation
+        shell: bash
+        run: |
+          set -euo pipefail
+          sh ./scripts/compose-route-registry-tests.sh
+
       - name: Validate NATS JetStream configuration
         shell: bash
         run: |

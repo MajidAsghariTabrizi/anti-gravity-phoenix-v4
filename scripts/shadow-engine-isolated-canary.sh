@@ -21,6 +21,15 @@ isolated_canary_image_is_local_and_pinned() {
   docker image inspect "$isolated_image" >/dev/null 2>&1
 }
 
+isolated_canary_route_registry_preflight() {
+  isolated_rendered_config=$isolated_canary_state_dir/compose.rendered.json
+  compose config --format json >"$isolated_rendered_config" 2>/dev/null || return 1
+  python3 "$repo_dir/scripts/verify-compose-route-registry.py" \
+    --compose-config "$isolated_rendered_config" \
+    --expected-env-file "$env_file" \
+    --expected-env-file "$release_env" >/dev/null 2>&1
+}
+
 isolated_canary_snapshot_value() {
   isolated_service=$1
   isolated_container_id=$(isolated_canary_container_id "$isolated_service")
@@ -119,6 +128,8 @@ isolated_canary_exit_guard() {
 }
 
 isolated_canary_dependency_preflight() {
+  isolated_canary_route_registry_preflight || isolated_canary_fail 'route registry rendering invalid'
+
   for isolated_service in $isolated_canary_required_services; do
     isolated_canary_container_is_healthy "$isolated_service" || isolated_canary_fail "dependency not ready: $isolated_service"
   done
@@ -133,10 +144,54 @@ isolated_canary_dependency_preflight() {
   isolated_canary_image_is_local_and_pinned "${PHOENIX_ENGINE_IMAGE:-}" || isolated_canary_fail 'optional image unavailable: phoenix-engine'
 }
 
+isolated_canary_engine_failure_reason() {
+  isolated_engine_container=$(isolated_canary_container_id phoenix-engine)
+  if [ -z "$isolated_engine_container" ]; then
+    printf 'engine-exited\n'
+    return 0
+  fi
+  isolated_engine_state=$(docker inspect --format '{{.State.Status}}|{{if .State.Health}}{{.State.Health.Status}}{{else}}missing{{end}}|{{.RestartCount}}' "$isolated_engine_container" 2>/dev/null) || return 1
+
+  isolated_engine_status=${isolated_engine_state%%|*}
+  isolated_engine_rest=${isolated_engine_state#*|}
+  isolated_engine_health=${isolated_engine_rest%%|*}
+  isolated_engine_restarts=${isolated_engine_rest##*|}
+  case "$isolated_engine_restarts" in
+    ''|*[!0-9]*) isolated_engine_restarts=0 ;;
+  esac
+  isolated_engine_failure=
+  if [ "$isolated_engine_restarts" -gt 0 ] || [ "$isolated_engine_status" = restarting ]; then
+    isolated_engine_failure=restart-loop
+  fi
+  if [ -z "$isolated_engine_failure" ]; then
+    case "$isolated_engine_status" in
+      exited|dead) isolated_engine_failure=engine-exited ;;
+    esac
+  fi
+  if [ -z "$isolated_engine_failure" ] && [ "$isolated_engine_health" = unhealthy ]; then
+    isolated_engine_failure=engine-unhealthy
+  fi
+  [ -n "$isolated_engine_failure" ] || return 1
+
+  if compose logs --no-color --tail 20 phoenix-engine 2>/dev/null | grep -Fq 'invalid Engine route registry'; then
+    printf 'invalid-route-registry\n'
+  else
+    printf '%s\n' "$isolated_engine_failure"
+  fi
+}
+
 isolated_canary_watch_target() {
   : >"$isolated_canary_state_dir/watcher-ready"
   isolated_target_deadline=$(( $(date +%s) + evidence_timeout ))
   while [ "$(date +%s)" -lt "$isolated_target_deadline" ]; do
+    if [ ! -f "$isolated_canary_state_dir/engine-started" ]; then
+      sleep "$canary_poll_interval"
+      continue
+    fi
+    if isolated_engine_failure=$(isolated_canary_engine_failure_reason); then
+      printf '%s\n' "$isolated_engine_failure" >"$isolated_canary_state_dir/watcher-result"
+      return 1
+    fi
     isolated_observed=$(service_metric_count phoenix-engine 9200 phoenix_engine_inputs_processed_total)
     if canary_target_reached 0 "$isolated_observed" "$canary_input_limit"; then
       printf '%s\n' "$isolated_observed" >"$isolated_canary_state_dir/metric-at-stop"
@@ -169,6 +224,7 @@ isolated_canary_start_and_watch() {
   isolated_canary_wait_for_watcher_ready || isolated_canary_fail 'input watcher did not arm'
 
   compose up -d --no-deps --force-recreate rpc-gateway phoenix-engine >/dev/null 2>&1 || isolated_canary_fail 'Engine and RPC Gateway failed to start'
+  : >"$isolated_canary_state_dir/engine-started"
 
   if wait "$isolated_canary_watcher_pid"; then
     isolated_watcher_exit=0
@@ -177,7 +233,15 @@ isolated_canary_start_and_watch() {
   fi
   isolated_canary_watcher_pid=
   isolated_watcher_result=$(cat "$isolated_canary_state_dir/watcher-result" 2>/dev/null || printf 'failed')
-  [ "$isolated_watcher_exit" -eq 0 ] && [ "$isolated_watcher_result" = 'reached' ] || isolated_canary_fail 'Engine did not reach the requested canary input threshold'
+  if [ "$isolated_watcher_exit" -ne 0 ] || [ "$isolated_watcher_result" != 'reached' ]; then
+    case "$isolated_watcher_result" in
+      invalid-route-registry) isolated_canary_fail 'Engine rejected the route registry' ;;
+      restart-loop) isolated_canary_fail 'Engine entered a restart loop' ;;
+      engine-exited) isolated_canary_fail 'Engine exited before the canary threshold' ;;
+      engine-unhealthy) isolated_canary_fail 'Engine became unhealthy before the canary threshold' ;;
+      *) isolated_canary_fail 'Engine did not reach the requested canary input threshold' ;;
+    esac
+  fi
   isolated_canary_metric_at_stop=$(cat "$isolated_canary_state_dir/metric-at-stop")
 }
 

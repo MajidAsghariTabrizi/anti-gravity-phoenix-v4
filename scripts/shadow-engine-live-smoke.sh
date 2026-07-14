@@ -70,8 +70,11 @@ if canary_is_enabled "$canary_input_limit"; then
 fi
 
 compose() {
-  PHOENIX_ENV_FILE="$env_file" PHOENIX_RELEASE_ENV="$release_env" \
-    docker compose --env-file "$env_file" --env-file "$release_env" -f "$compose_file" "$@"
+  (
+    unset ENGINE_ROUTE_REGISTRY_JSON
+    PHOENIX_ENV_FILE="$env_file" PHOENIX_RELEASE_ENV="$release_env" \
+      docker compose --env-file "$env_file" --env-file "$release_env" -f "$compose_file" "$@"
+  )
 }
 
 number_or_zero() {
