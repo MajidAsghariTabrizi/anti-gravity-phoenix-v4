@@ -430,7 +430,11 @@ for installed_script in \
   validate-production-release-context.sh \
   shadow-profitability-report.sh \
   shadow_profitability_report.py \
-  shadow-profitability-report.sql
+  shadow-profitability-report.sql \
+  shadow-route-discovery.sh \
+  shadow_route_discovery.py \
+  shadow-route-discovery-enrichment.sql \
+  arbitrum_uniswap_v3_pool_proofs.json
 do
   grep -F "$installed_script" "$script_dir/bootstrap-production.sh" >/dev/null ||
     fail "bootstrap does not install $installed_script"

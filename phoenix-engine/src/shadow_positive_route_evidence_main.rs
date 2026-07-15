@@ -191,10 +191,15 @@ async fn scan_postgres(options: &Options, routes: &RouteRegistry) -> Result<(), 
     let eligible_count: i64 = sqlx::query_scalar(
         r#"
 SELECT count(*)
-FROM feed_events AS feed
-WHERE lower(feed.payload->>'to') IN ($1, $2, $3)
-  AND ($4::text IS NULL OR feed.tx_hash = $4)
-  AND ($5::numeric IS NULL OR feed.sequence_number = $5::numeric)
+FROM (
+    SELECT 1
+    FROM feed_events AS feed
+    WHERE lower(feed.payload->>'to') IN ($1, $2, $3)
+      AND ($4::text IS NULL OR feed.tx_hash = $4)
+      AND ($5::numeric IS NULL OR feed.sequence_number = $5::numeric)
+    ORDER BY feed.id
+    LIMIT $6
+) AS bounded_eligible
 "#,
     )
     .bind("0xe592427a0aece92de3edee1f18e0157c05861564")
@@ -202,6 +207,7 @@ WHERE lower(feed.payload->>'to') IN ($1, $2, $3)
     .bind("0xa51afafe0263b40edaef0df8781ea9aa03e381a3")
     .bind(options.tx_hash.as_deref())
     .bind(options.source_sequence.as_deref())
+    .bind(options.limit as i64 + 1)
     .fetch_one(&mut *transaction)
     .await
     .map_err(|_| CliError::DatabaseQuery)?;

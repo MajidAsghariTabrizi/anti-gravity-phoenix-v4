@@ -51,6 +51,8 @@ jobs:
           sh ./scripts/production-compose-context-tests.sh
           python3 -m py_compile scripts/shadow_profitability_report.py
           sh ./scripts/shadow-profitability-report-tests.sh
+          python3 -m py_compile scripts/shadow_route_discovery.py
+          sh ./scripts/shadow-route-discovery-tests.sh
 
       - name: Validate tracked hygiene
         shell: bash
