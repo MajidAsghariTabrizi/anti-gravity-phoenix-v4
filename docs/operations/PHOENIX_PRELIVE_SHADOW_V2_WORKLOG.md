@@ -21,3 +21,14 @@
 - test result: PASS - all locally available deterministic Phase 1 gates completed successfully; no runtime service was started
 - known blocker: Docker is unavailable locally, so Docker-backed Compose route preservation and the complete Linux CI matrix must run in GitHub Actions
 - next gate: push the exact branch tip, require every `ci.yml` job to pass, then merge Phase 1 into the cumulative integration branch without deploying
+
+## Phase 2
+
+- phase: Phase 2 - Transient dependency exhaustion quarantine
+- branch: `fix/engine-transient-exhaustion-quarantine`
+- commit SHA: `b15ee3c576f601ae557da88af33f7314ee9c29cf`
+- files changed: `dashboard/app.py`; `docs/ENGINE_DEPENDENCY_EXHAUSTION.md`; `docs/RUNBOOK.md`; `fixtures/engine/dependency_exhaustion_soak.json`; `migration-runner/internal/runner/runner_test.go`; `migrations/006_dependency_exhaustion_quarantine.sql`; `phoenix-engine/src/engine_input.rs`; `phoenix-engine/src/main.rs`; `phoenix-engine/src/metrics/mod.rs`; `phoenix-engine/src/persistence.rs`; `phoenix-engine/src/runtime.rs`; `phoenix-engine/tests/postgres_decision_integration.rs`; `recorder/tests/postgres_outbox_integration.rs`; `scripts/shadow-engine-live-smoke.sh`
+- tests run: `gofmt -w migration-runner/internal/runner/runner_test.go`; `go vet ./...` and `go test ./...` in `migration-runner`; `python -m py_compile dashboard/app.py`; `sh -n scripts/*.sh`; `sh ./scripts/shadow-engine-canary-control-tests.sh`; `sh ./scripts/shadow-engine-isolated-canary-tests.sh`; `sh ./scripts/shadow-positive-route-evidence-tests.sh`; `sh ./scripts/production-compose-context-tests.sh`; PowerShell and POSIX secret scans; PowerShell and POSIX forbidden-file scans; `git diff --check`; complete implementation diff review
+- test result: PASS - all locally available deterministic Phase 2 gates completed successfully; the 211-delivery soak is committed for the Linux Rust test job
+- known blocker: Cargo, rustc, rustfmt, Docker, and the dashboard Python dependency set are unavailable locally; authoritative Rust formatting, clippy, unit/integration tests, dashboard import, Docker builds, and the complete CI matrix must run in GitHub Actions
+- next gate: commit this worklog, push the exact branch tip, require every `ci.yml` job to pass, then merge Phase 2 into the cumulative integration branch without deploying
