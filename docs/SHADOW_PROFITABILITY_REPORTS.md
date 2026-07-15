@@ -39,3 +39,10 @@ All financial sections are labeled `SHADOW expected` and `not realized`. The rep
 Only rows with `evidence_completeness_status=complete` participate in financial calculations. Historical decisions and candidate classifications with missing canonical evidence appear in counts as `incomplete`; their missing values remain null. This preserves the candidate funnel without manufacturing historical economics.
 
 The report is evidence for SHADOW analysis only. It does not prove a route is executable, authorize LIVE mode, create an execution request, or replace real relay, RPC, fork, contract, or settlement verification.
+
+Migration 009 extends each new complete row with a route configuration hash,
+explicit independent-verification status and lifecycle, and secondary
+block/hash/route proof when a second provider returns evidence. The report
+rejects same-provider agreement and mismatched context. Pre-migration rows keep
+nulls in these columns and are counted as `historical_null`; they are not
+backfilled with inferred verification outcomes.

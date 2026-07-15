@@ -8,10 +8,10 @@ use phoenix_engine::domain::{
 use phoenix_engine::economics::{evaluate_scenarios, EconomicError, EconomicInput};
 use phoenix_engine::graph::PoolEdge;
 use phoenix_engine::opportunity::{
-    AgreementState, BasisPoints, DecisionEvidence, MarketEvidence, Opportunity,
-    OpportunityIdentity, OutcomeEvidence, PoolStateEvidence, RejectionReason, RouteEvidence,
-    ShadowDisposition, SimulationClassification, SimulationEvidence, SimulationKind, StateSource,
-    Strategy, VerificationSkipReason, VerificationStatus,
+    AgreementState, BasisPoints, DecisionEvidence, IndependentVerificationStatus, MarketEvidence,
+    Opportunity, OpportunityIdentity, OutcomeEvidence, PoolStateEvidence, RejectionReason,
+    RouteEvidence, ShadowDisposition, SimulationClassification, SimulationEvidence, SimulationKind,
+    StateSource, Strategy, VerificationSkipReason, VerificationStatus,
 };
 use serde::Deserialize;
 
@@ -335,6 +335,7 @@ fn build_opportunity(
             }],
             state_block: case.observed_block,
             state_block_hash: Some(case.state_block_hash.clone()),
+            route_config_hash: None,
             quote_block: case.observed_block,
             quote_age_ms: case.quote_age_ms,
             state_source: StateSource::RecordedCheckpoint,
@@ -343,7 +344,12 @@ fn build_opportunity(
             primary_state_hash: Some(case.state_hash.clone()),
             secondary_provider_id: None,
             secondary_state_hash: None,
+            secondary_block_number: None,
+            secondary_block_hash: None,
+            secondary_route_config_hash: None,
             verification_status: VerificationStatus::HistoricalEvidence,
+            independent_verification_status: IndependentVerificationStatus::NotRequested,
+            independent_verification_lifecycle: vec![IndependentVerificationStatus::NotRequested],
             agreement_state: AgreementState::NotChecked,
             verification_skip_reason: Some(VerificationSkipReason::HistoricalEvidence),
             feed_to_detection_latency_ns: (case

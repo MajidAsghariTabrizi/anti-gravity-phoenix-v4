@@ -1,8 +1,8 @@
 use crate::engine_input::{EngineClassification, InputIdentity};
 use crate::opportunity::{
-    AgreementState, CostBreakdown, Opportunity, PrimaryProfitabilityStatus, ShadowDisposition,
-    SimulationKind, StateSource, VerificationSkipReason, VerificationStatus,
-    PROFITABILITY_MODEL_VERSION,
+    AgreementState, CostBreakdown, IndependentVerificationStatus, Opportunity,
+    PrimaryProfitabilityStatus, ShadowDisposition, SimulationKind, StateSource,
+    VerificationSkipReason, VerificationStatus, PROFITABILITY_MODEL_VERSION,
 };
 use crate::shadow_processor::EvaluatedOpportunity;
 use async_trait::async_trait;
@@ -722,9 +722,15 @@ struct ProfitabilityFactRecord<'a> {
     code_version: &'a str,
     primary_provider_id: &'a str,
     primary_response_hash: &'a str,
+    route_config_hash: &'a str,
     secondary_provider_id: Option<&'a str>,
     secondary_state_hash: Option<&'a str>,
+    secondary_block_number: Option<String>,
+    secondary_block_hash: Option<&'a str>,
+    secondary_route_config_hash: Option<&'a str>,
     verification_status: &'static str,
+    independent_verification_status: &'static str,
+    independent_verification_lifecycle: Value,
     agreement_state: &'static str,
     verification_skip_reason: Option<&'static str>,
     shadow_only: bool,
@@ -756,6 +762,9 @@ async fn persist_profitability_fact(
     .map_err(|_| StoreError::Integrity)?;
     let secondary_reasons = serde_json::to_value(&opportunity.decision.secondary_rejection_reasons)
         .map_err(|_| StoreError::Integrity)?;
+    let independent_verification_lifecycle =
+        serde_json::to_value(&opportunity.market.independent_verification_lifecycle)
+            .map_err(|_| StoreError::Integrity)?;
     let disposition = match opportunity.decision.disposition {
         ShadowDisposition::Accepted => "accepted",
         ShadowDisposition::Rejected => "rejected",
@@ -835,9 +844,25 @@ async fn persist_profitability_fact(
             .primary_response_hash
             .as_deref()
             .ok_or(StoreError::Integrity)?,
+        route_config_hash: opportunity
+            .market
+            .route_config_hash
+            .as_deref()
+            .ok_or(StoreError::Integrity)?,
         secondary_provider_id: opportunity.market.secondary_provider_id.as_deref(),
         secondary_state_hash: opportunity.market.secondary_state_hash.as_deref(),
+        secondary_block_number: opportunity
+            .market
+            .secondary_block_number
+            .map(|value| value.to_string()),
+        secondary_block_hash: opportunity.market.secondary_block_hash.as_deref(),
+        secondary_route_config_hash: opportunity.market.secondary_route_config_hash.as_deref(),
         verification_status: opportunity.market.verification_status.as_str(),
+        independent_verification_status: opportunity
+            .market
+            .independent_verification_status
+            .as_str(),
+        independent_verification_lifecycle,
         agreement_state: opportunity.market.agreement_state.as_str(),
         verification_skip_reason: opportunity
             .market
@@ -901,9 +926,15 @@ INSERT INTO shadow_profitability_facts (
     code_version,
     primary_provider_id,
     primary_response_hash,
+    route_config_hash,
     secondary_provider_id,
     secondary_state_hash,
+    secondary_block_number,
+    secondary_block_hash,
+    secondary_route_config_hash,
     verification_status,
+    independent_verification_status,
+    independent_verification_lifecycle,
     agreement_state,
     verification_skip_reason,
     shadow_only,
@@ -963,9 +994,15 @@ FROM jsonb_to_record($1) AS fact(
     code_version text,
     primary_provider_id text,
     primary_response_hash text,
+    route_config_hash text,
     secondary_provider_id text,
     secondary_state_hash text,
+    secondary_block_number numeric,
+    secondary_block_hash text,
+    secondary_route_config_hash text,
     verification_status text,
+    independent_verification_status text,
+    independent_verification_lifecycle jsonb,
     agreement_state text,
     verification_skip_reason text,
     shadow_only boolean,
@@ -1430,6 +1467,12 @@ const REQUIRED_COLUMNS: &[(&str, &str, &str, bool)] = &[
     ),
     (
         "shadow_profitability_facts",
+        "route_config_hash",
+        "text",
+        true,
+    ),
+    (
+        "shadow_profitability_facts",
         "secondary_provider_id",
         "text",
         true,
@@ -1442,9 +1485,39 @@ const REQUIRED_COLUMNS: &[(&str, &str, &str, bool)] = &[
     ),
     (
         "shadow_profitability_facts",
+        "secondary_block_number",
+        "numeric",
+        true,
+    ),
+    (
+        "shadow_profitability_facts",
+        "secondary_block_hash",
+        "text",
+        true,
+    ),
+    (
+        "shadow_profitability_facts",
+        "secondary_route_config_hash",
+        "text",
+        true,
+    ),
+    (
+        "shadow_profitability_facts",
         "verification_status",
         "text",
         false,
+    ),
+    (
+        "shadow_profitability_facts",
+        "independent_verification_status",
+        "text",
+        true,
+    ),
+    (
+        "shadow_profitability_facts",
+        "independent_verification_lifecycle",
+        "jsonb",
+        true,
     ),
     (
         "shadow_profitability_facts",
@@ -1555,7 +1628,12 @@ pub fn validate_schema_snapshot(snapshot: &SchemaSnapshot) -> Result<(), StoreEr
         "execution_request_created=false",
         "primary_profitability_status=any",
         "verification_status=any",
-        "verification_skip_reason='primary_below_minimum'::text",
+        "verification_skip_reason='primary_screen_no_profitable_candidate'::text",
+        "independent_verification_status=any",
+        "jsonb_typeofindependent_verification_lifecycle='array'::text",
+        "secondary_block_number=pinned_block_number",
+        "secondary_block_hash=pinned_block_hash",
+        "secondary_route_config_hash=route_config_hash",
         "gross_profit=gross_spread-protocol_fees-dex_fees-price_impact",
         "arbitrum_execution_fee=execution_gas*gas_price",
         "expected_net_pnl=gross_spread-total_cost",
@@ -1702,6 +1780,25 @@ fn validate_evaluation(
             .map_or(true, |value| !valid_evidence_hash(value))
         || opportunity
             .market
+            .route_config_hash
+            .as_deref()
+            .map_or(true, |value| !valid_evidence_hash(value))
+        || opportunity
+            .market
+            .secondary_block_number
+            .is_some_and(|value| value == 0)
+        || opportunity
+            .market
+            .secondary_block_hash
+            .as_deref()
+            .is_some_and(|value| !valid_block_hash(value))
+        || opportunity
+            .market
+            .secondary_route_config_hash
+            .as_deref()
+            .is_some_and(|value| !valid_evidence_hash(value))
+        || opportunity
+            .market
             .primary_provider_id
             .as_deref()
             .map_or(true, |value| {
@@ -1769,33 +1866,74 @@ fn valid_verification_evidence(opportunity: &Opportunity) -> bool {
     match market.verification_status {
         VerificationStatus::PrimaryOnly => {
             market.agreement_state == AgreementState::NotChecked
+                && market.independent_verification_status
+                    == IndependentVerificationStatus::NotRequested
+                && market.independent_verification_lifecycle
+                    == [IndependentVerificationStatus::NotRequested]
                 && market.secondary_provider_id.is_none()
                 && market.secondary_state_hash.is_none()
+                && market.secondary_block_number.is_none()
+                && market.secondary_block_hash.is_none()
+                && market.secondary_route_config_hash.is_none()
                 && market.verification_skip_reason
-                    == Some(VerificationSkipReason::PrimaryBelowMinimum)
+                    == Some(VerificationSkipReason::PrimaryScreenNoProfitableCandidate)
                 && opportunity.economics.primary_status == PrimaryProfitabilityStatus::BelowMinimum
         }
         VerificationStatus::Agreed => {
             market.agreement_state == AgreementState::Agreed
+                && market.independent_verification_status == IndependentVerificationStatus::Agreed
+                && market.independent_verification_lifecycle
+                    == [
+                        IndependentVerificationStatus::Requested,
+                        IndependentVerificationStatus::Agreed,
+                    ]
                 && market.secondary_provider_id.is_some()
                 && market.secondary_state_hash == market.primary_state_hash
+                && secondary_identity_matches(market)
                 && market.verification_skip_reason.is_none()
         }
         VerificationStatus::Disagreed => {
             market.agreement_state == AgreementState::Disagreed
+                && market.independent_verification_status
+                    == IndependentVerificationStatus::Disagreed
+                && market.independent_verification_lifecycle
+                    == [
+                        IndependentVerificationStatus::Requested,
+                        IndependentVerificationStatus::Disagreed,
+                    ]
                 && market.secondary_provider_id.is_some()
                 && market.secondary_state_hash.is_some()
                 && market.secondary_state_hash != market.primary_state_hash
+                && secondary_identity_matches(market)
                 && market.verification_skip_reason.is_none()
         }
         VerificationStatus::SecondaryUnavailable => {
             market.agreement_state == AgreementState::Unavailable
+                && matches!(
+                    market.independent_verification_status,
+                    IndependentVerificationStatus::ProviderUnavailable
+                        | IndependentVerificationStatus::IntegrityFailure
+                )
+                && market.independent_verification_lifecycle
+                    == [
+                        IndependentVerificationStatus::Requested,
+                        market.independent_verification_status,
+                    ]
                 && market.secondary_provider_id.is_none()
                 && market.secondary_state_hash.is_none()
+                && market.secondary_block_number.is_none()
+                && market.secondary_block_hash.is_none()
+                && market.secondary_route_config_hash.is_none()
                 && market.verification_skip_reason.is_none()
         }
         VerificationStatus::Incomplete | VerificationStatus::HistoricalEvidence => false,
     }
+}
+
+fn secondary_identity_matches(market: &crate::opportunity::MarketEvidence) -> bool {
+    market.secondary_block_number == Some(market.state_block)
+        && market.secondary_block_hash == market.state_block_hash
+        && market.secondary_route_config_hash == market.route_config_hash
 }
 
 fn valid_profitability_evidence(opportunity: &Opportunity) -> bool {
@@ -2107,7 +2245,14 @@ mod tests {
                 "CHECK ((execution_request_created = false))".to_string(),
                 "CHECK ((primary_profitability_status = ANY (...)))".to_string(),
                 "CHECK ((verification_status = ANY (...)))".to_string(),
-                "CHECK ((verification_skip_reason = 'primary_below_minimum'::text))".to_string(),
+                "CHECK ((verification_skip_reason = 'primary_screen_no_profitable_candidate'::text))"
+                    .to_string(),
+                "CHECK ((independent_verification_status = ANY (...)))".to_string(),
+                "CHECK ((jsonb_typeof(independent_verification_lifecycle) = 'array'::text))"
+                    .to_string(),
+                "CHECK ((secondary_block_number = pinned_block_number))".to_string(),
+                "CHECK ((secondary_block_hash = pinned_block_hash))".to_string(),
+                "CHECK ((secondary_route_config_hash = route_config_hash))".to_string(),
                 "CHECK ((gross_profit = gross_spread - protocol_fees - dex_fees - price_impact))"
                     .to_string(),
                 "CHECK ((arbitrum_execution_fee = execution_gas * gas_price))".to_string(),
@@ -2233,6 +2378,18 @@ mod tests {
             "shadow_profitability_evaluated_idx",
         ] {
             assert!(profitability_migration.contains(required));
+        }
+        let verification_migration =
+            include_str!("../../migrations/009_profit_triggered_secondary_verification.sql");
+        for required in [
+            "independent_verification_status IN",
+            "'primary_screen_no_profitable_candidate'",
+            "secondary_provider_id <> primary_provider_id",
+            "secondary_block_number = pinned_block_number",
+            "secondary_block_hash = pinned_block_hash",
+            "secondary_route_config_hash = route_config_hash",
+        ] {
+            assert!(verification_migration.contains(required));
         }
     }
 }

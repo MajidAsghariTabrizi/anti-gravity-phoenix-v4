@@ -52,7 +52,20 @@ SELECT jsonb_build_object(
            'agreement_state', agreement_state,
            'shadow_only', shadow_only,
            'execution_eligible', execution_eligible,
-           'execution_request_created', execution_request_created
+           'execution_request_created', execution_request_created,
+           'pinned_block_number', pinned_block_number::text,
+           'pinned_block_hash', pinned_block_hash,
+           'route_config_hash', route_config_hash,
+           'primary_provider_id', primary_provider_id,
+           'primary_state_hash', primary_state_hash,
+           'secondary_provider_id', secondary_provider_id,
+           'secondary_state_hash', secondary_state_hash,
+           'secondary_block_number', secondary_block_number::text,
+           'secondary_block_hash', secondary_block_hash,
+           'secondary_route_config_hash', secondary_route_config_hash,
+           'independent_verification_status', independent_verification_status,
+           'independent_verification_lifecycle', independent_verification_lifecycle,
+           'verification_skip_reason', verification_skip_reason
        )::text
 FROM bounded_rows
 ORDER BY evaluated_at DESC, candidate_key DESC;

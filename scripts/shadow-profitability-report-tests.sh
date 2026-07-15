@@ -66,6 +66,11 @@ distributions = report["profitability_distribution"]["by_settlement_asset"]
 assert [item["expected_net_pnl"]["sum"] for item in distributions] == ["575", "1460"]
 assert report["nearest_to_profitable"][0]["candidates"][0]["gap_to_minimum"] == "25"
 assert report["rpc_failure_contribution"]["failure_evidence_candidates"] == 1
+assert report["rpc_failure_contribution"]["candidate_counts_by_independent_verification_status"] == [
+    {"independent_verification_status": "disagreed", "candidates": 1},
+    {"independent_verification_status": "historical_null", "candidates": 1},
+    {"independent_verification_status": "not_requested", "candidates": 1},
+]
 assert report["stale_state_contribution"]["stale_state_reserve_by_settlement_asset"] == [
     {"settlement_asset": "0x1111111111111111111111111111111111111111", "sum": "25"}
 ]
@@ -144,6 +149,38 @@ if "$python_command" "$analyzer" --format json --limit 1 \
   <"$tmp_dir/arithmetic.ndjson" >"$tmp_dir/arithmetic.out" 2>"$tmp_dir/arithmetic.err"
 then
   echo "report analyzer accepted inconsistent profitability arithmetic" >&2
+  exit 1
+fi
+
+"$python_command" - "$fixture" >"$tmp_dir/self-verified.ndjson" <<'PY'
+import json
+import pathlib
+import sys
+
+row = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8").splitlines()[1])
+row["secondary_provider_id"] = row["primary_provider_id"]
+print(json.dumps(row, separators=(",", ":")))
+PY
+if "$python_command" "$analyzer" --format json --limit 1 \
+  <"$tmp_dir/self-verified.ndjson" >"$tmp_dir/self-verified.out" 2>"$tmp_dir/self-verified.err"
+then
+  echo "report analyzer accepted same-provider self-verification" >&2
+  exit 1
+fi
+
+"$python_command" - "$fixture" >"$tmp_dir/wrong-route.ndjson" <<'PY'
+import json
+import pathlib
+import sys
+
+row = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8").splitlines()[1])
+row["secondary_route_config_hash"] = "0" * 64
+print(json.dumps(row, separators=(",", ":")))
+PY
+if "$python_command" "$analyzer" --format json --limit 1 \
+  <"$tmp_dir/wrong-route.ndjson" >"$tmp_dir/wrong-route.out" 2>"$tmp_dir/wrong-route.err"
+then
+  echo "report analyzer accepted mismatched route evidence" >&2
   exit 1
 fi
 

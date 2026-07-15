@@ -75,6 +75,7 @@ pub struct MarketEvidence {
     pub pool_states: Vec<PoolStateEvidence>,
     pub state_block: u64,
     pub state_block_hash: Option<String>,
+    pub route_config_hash: Option<String>,
     pub quote_block: u64,
     pub quote_age_ms: u64,
     pub state_source: StateSource,
@@ -83,10 +84,39 @@ pub struct MarketEvidence {
     pub primary_state_hash: Option<String>,
     pub secondary_provider_id: Option<String>,
     pub secondary_state_hash: Option<String>,
+    pub secondary_block_number: Option<u64>,
+    pub secondary_block_hash: Option<String>,
+    pub secondary_route_config_hash: Option<String>,
     pub verification_status: VerificationStatus,
+    pub independent_verification_status: IndependentVerificationStatus,
+    pub independent_verification_lifecycle: Vec<IndependentVerificationStatus>,
     pub agreement_state: AgreementState,
     pub verification_skip_reason: Option<VerificationSkipReason>,
     pub feed_to_detection_latency_ns: u128,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IndependentVerificationStatus {
+    NotRequested,
+    Requested,
+    Agreed,
+    Disagreed,
+    ProviderUnavailable,
+    IntegrityFailure,
+}
+
+impl IndependentVerificationStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::NotRequested => "not_requested",
+            Self::Requested => "requested",
+            Self::Agreed => "agreed",
+            Self::Disagreed => "disagreed",
+            Self::ProviderUnavailable => "provider_unavailable",
+            Self::IntegrityFailure => "integrity_failure",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
@@ -138,14 +168,14 @@ impl AgreementState {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum VerificationSkipReason {
-    PrimaryBelowMinimum,
+    PrimaryScreenNoProfitableCandidate,
     HistoricalEvidence,
 }
 
 impl VerificationSkipReason {
     pub fn as_str(self) -> &'static str {
         match self {
-            Self::PrimaryBelowMinimum => "primary_below_minimum",
+            Self::PrimaryScreenNoProfitableCandidate => "primary_screen_no_profitable_candidate",
             Self::HistoricalEvidence => "historical_evidence",
         }
     }
@@ -378,6 +408,17 @@ impl Opportunity {
         }
         if self.market.state_block == 0 || self.market.quote_block == 0 {
             return Err("block context missing");
+        }
+        let lifecycle = self.market.independent_verification_lifecycle.as_slice();
+        let lifecycle_valid = match self.market.independent_verification_status {
+            IndependentVerificationStatus::NotRequested => {
+                lifecycle == [IndependentVerificationStatus::NotRequested]
+            }
+            IndependentVerificationStatus::Requested => false,
+            final_status => lifecycle == [IndependentVerificationStatus::Requested, final_status],
+        };
+        if !lifecycle_valid {
+            return Err("independent verification lifecycle invalid");
         }
         if self.decision.disposition == ShadowDisposition::Rejected
             && self.decision.primary_rejection_reason.is_none()

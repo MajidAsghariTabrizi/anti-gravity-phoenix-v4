@@ -3,7 +3,7 @@ use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 use thiserror::Error;
 
-pub const SHADOW_STATE_SCHEMA_VERSION: &str = "phoenix.rpc.shadow_state.v2";
+pub const SHADOW_STATE_SCHEMA_VERSION: &str = "phoenix.rpc.shadow_state.v3";
 pub const ARBITRUM_ONE_CHAIN_ID: u64 = 42161;
 pub const MAX_POOLS_PER_REQUEST: usize = 16;
 pub const MAX_GATEWAY_REQUEST_BYTES: usize = 64 * 1024;
@@ -47,6 +47,7 @@ pub struct ShadowStateResponse {
     pub schema_version: String,
     pub chain_id: u64,
     pub request_hash: String,
+    pub route_config_hash: String,
     pub block_number: u64,
     pub block_hash: String,
     pub state_hash: String,
@@ -54,8 +55,12 @@ pub struct ShadowStateResponse {
     pub primary_provider_id: String,
     pub agreement_provider_id: Option<String>,
     pub secondary_state_hash: Option<String>,
+    pub secondary_block_number: Option<u64>,
+    pub secondary_block_hash: Option<String>,
+    pub secondary_route_config_hash: Option<String>,
     pub provider_agreement: bool,
     pub verification_status: VerificationStatus,
+    pub independent_verification_status: IndependentVerificationStatus,
     pub quality: Vec<RpcQualityEvidence>,
     pub resolved_at_unix_ms: u64,
 }
@@ -67,6 +72,17 @@ pub enum VerificationStatus {
     Agreed,
     Disagreed,
     SecondaryUnavailable,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum IndependentVerificationStatus {
+    NotRequested,
+    Requested,
+    Agreed,
+    Disagreed,
+    ProviderUnavailable,
+    IntegrityFailure,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]

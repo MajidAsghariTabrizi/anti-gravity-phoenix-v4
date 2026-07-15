@@ -239,7 +239,19 @@ WITH selected AS (
          state.state_evidence->>'verification_status' AS verification_status,
          state.state_evidence->>'agreement_provider_id' AS agreement_provider_id,
          state.state_evidence->>'provider_agreement' AS provider_agreement,
-         state.state_evidence->>'rpc_response_hash' AS rpc_response_hash,
+         COALESCE(
+           state.state_evidence->>'verification_response_hash',
+           state.state_evidence->>'primary_response_hash',
+           state.state_evidence->>'rpc_response_hash'
+         ) AS rpc_response_hash,
+         state.state_evidence->>'route_config_hash' AS route_config_hash,
+         state.state_evidence->>'secondary_state_hash' AS secondary_state_hash,
+         state.state_evidence->>'secondary_block_number' AS secondary_block_number,
+         state.state_evidence->>'secondary_block_hash' AS secondary_block_hash,
+         state.state_evidence->>'secondary_route_config_hash' AS secondary_route_config_hash,
+         state.state_evidence->>'independent_verification_status' AS explicit_independent_status,
+         state.state_evidence->'independent_verification_lifecycle' AS independent_lifecycle,
+         state.state_evidence->>'verification_skip_reason' AS explicit_skip_reason,
          state.state_evidence->>'secondary_skipped' AS secondary_skipped,
          state.state_evidence->>'primary_screen_rejected' AS primary_screen_rejected
   FROM state
@@ -261,10 +273,11 @@ SELECT jsonb_strip_nulls(jsonb_build_object(
   'pinned_block_number', normalized.state_evidence->>'state_block',
   'pinned_block_hash', normalized.state_evidence->>'state_block_hash',
   'primary_state_hash', normalized.state_evidence->>'state_hash',
+  'route_config_hash', normalized.route_config_hash,
   'rpc_response_hash', normalized.rpc_response_hash,
   'primary_provider_result', normalized.state_evidence->>'primary_provider_id',
   'verification_status', normalized.verification_status,
-  'independent_verification_status', CASE
+  'independent_verification_status', COALESCE(normalized.explicit_independent_status, CASE
     WHEN normalized.verification_status = 'primary_only'
       AND normalized.rejection_reason = 'no_profitable_candidate'
       AND normalized.primary_screen_rejected = 'true'
@@ -272,15 +285,25 @@ SELECT jsonb_strip_nulls(jsonb_build_object(
       THEN 'not_requested'
     WHEN normalized.verification_status = 'agreed' THEN 'agreed'
     WHEN normalized.verification_status = 'disagreed' THEN 'disagreed'
-    WHEN normalized.verification_status = 'secondary_unavailable' THEN 'unavailable'
-  END,
-  'independent_verification_skip_reason', CASE
+    WHEN normalized.verification_status = 'secondary_unavailable' THEN 'provider_unavailable'
+  END),
+  'independent_verification_lifecycle', COALESCE(
+    normalized.independent_lifecycle,
+    CASE
+      WHEN normalized.verification_status = 'primary_only' THEN '["not_requested"]'::jsonb
+      WHEN normalized.verification_status IN ('agreed', 'disagreed')
+        THEN jsonb_build_array('requested', normalized.verification_status)
+      WHEN normalized.verification_status = 'secondary_unavailable'
+        THEN '["requested", "provider_unavailable"]'::jsonb
+    END
+  ),
+  'independent_verification_skip_reason', COALESCE(normalized.explicit_skip_reason, CASE
     WHEN normalized.verification_status = 'primary_only'
       AND normalized.rejection_reason = 'no_profitable_candidate'
       AND normalized.primary_screen_rejected = 'true'
       AND normalized.secondary_skipped = 'true'
       THEN 'primary_screen_no_profitable_candidate'
-  END,
+  END),
   'independent_provider_result', CASE
     WHEN normalized.verification_status IN ('agreed', 'disagreed')
       THEN normalized.agreement_provider_id
@@ -293,6 +316,10 @@ SELECT jsonb_strip_nulls(jsonb_build_object(
       AND normalized.provider_agreement = 'false'
       THEN 'disagreed'
   END,
+  'secondary_state_hash', normalized.secondary_state_hash,
+  'secondary_block_number', normalized.secondary_block_number,
+  'secondary_block_hash', normalized.secondary_block_hash,
+  'secondary_route_config_hash', normalized.secondary_route_config_hash,
   'shadow_disposition', normalized.disposition,
   'shadow_only', true,
   'execution_request_created', false
@@ -338,9 +365,11 @@ required = {
     "pinned_block_number",
     "pinned_block_hash",
     "primary_state_hash",
+    "route_config_hash",
     "primary_provider_result",
     "verification_status",
     "independent_verification_status",
+    "independent_verification_lifecycle",
     "shadow_only",
     "execution_request_created",
 }
@@ -363,9 +392,25 @@ for field in ("processing_attempt_id", "delivery_attempt"):
         raise SystemExit(1)
 if report["shadow_only"] is not True or report["execution_request_created"] is not False:
     raise SystemExit(1)
-for field in ("pinned_block_number", "pinned_block_hash", "primary_state_hash", "primary_provider_result"):
+for field in (
+    "pinned_block_number",
+    "pinned_block_hash",
+    "primary_state_hash",
+    "route_config_hash",
+    "primary_provider_result",
+):
     if not isinstance(report[field], str) or not report[field]:
         raise SystemExit(1)
+if not re.fullmatch(r"[0-9]+", report["pinned_block_number"]):
+    raise SystemExit(1)
+if not re.fullmatch(r"0x[0-9a-f]{64}", report["pinned_block_hash"]):
+    raise SystemExit(1)
+if not re.fullmatch(r"[0-9a-f]{64}", report["primary_state_hash"]):
+    raise SystemExit(1)
+if not re.fullmatch(r"[0-9a-f]{64}", report["route_config_hash"]):
+    raise SystemExit(1)
+if "://" in report["primary_provider_result"]:
+    raise SystemExit(1)
 
 def timestamp(value):
     if not isinstance(value, str):
@@ -383,29 +428,62 @@ if attempt_completed < started or persisted < started:
 
 status = report["verification_status"]
 independent = report["independent_verification_status"]
+lifecycle = report["independent_verification_lifecycle"]
 if status == "primary_only":
     if report["rejection_reason"] != "no_profitable_candidate":
         raise SystemExit(1)
     if independent != "not_requested":
         raise SystemExit(1)
+    if lifecycle != ["not_requested"]:
+        raise SystemExit(1)
     if report.get("independent_verification_skip_reason") != "primary_screen_no_profitable_candidate":
         raise SystemExit(1)
-    if any(field in report for field in ("independent_provider_result", "verification_agreement")):
+    if any(field in report for field in (
+        "independent_provider_result",
+        "verification_agreement",
+        "secondary_block_number",
+        "secondary_block_hash",
+        "secondary_route_config_hash",
+        "secondary_state_hash",
+    )):
         raise SystemExit(1)
 elif status in {"agreed", "disagreed"}:
     if independent != status or report.get("verification_agreement") != status:
         raise SystemExit(1)
+    if lifecycle != ["requested", status]:
+        raise SystemExit(1)
     if not report.get("independent_provider_result") or not report.get("rpc_response_hash"):
+        raise SystemExit(1)
+    if report["independent_provider_result"] == report["primary_provider_result"]:
+        raise SystemExit(1)
+    if "://" in report["independent_provider_result"]:
+        raise SystemExit(1)
+    if report.get("secondary_block_number") != report["pinned_block_number"]:
+        raise SystemExit(1)
+    if report.get("secondary_block_hash") != report["pinned_block_hash"]:
+        raise SystemExit(1)
+    if report.get("secondary_route_config_hash") != report["route_config_hash"]:
+        raise SystemExit(1)
+    secondary_state = report.get("secondary_state_hash")
+    if not isinstance(secondary_state, str) or not re.fullmatch(r"[0-9a-f]{64}", secondary_state):
+        raise SystemExit(1)
+    if (status == "agreed") != (secondary_state == report["primary_state_hash"]):
         raise SystemExit(1)
     if "independent_verification_skip_reason" in report:
         raise SystemExit(1)
 elif status == "secondary_unavailable":
-    if independent != "unavailable":
+    if independent not in {"provider_unavailable", "integrity_failure"}:
+        raise SystemExit(1)
+    if lifecycle != ["requested", independent]:
         raise SystemExit(1)
     if any(field in report for field in (
         "independent_provider_result",
         "verification_agreement",
         "independent_verification_skip_reason",
+        "secondary_block_number",
+        "secondary_block_hash",
+        "secondary_route_config_hash",
+        "secondary_state_hash",
     )):
         raise SystemExit(1)
 else:

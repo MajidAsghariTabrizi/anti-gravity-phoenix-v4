@@ -4,11 +4,11 @@ use phoenix_engine::execution::{
 };
 use phoenix_engine::graph::{PoolEdge, PoolGraph, Route};
 use phoenix_engine::opportunity::{
-    AgreementState, BasisPoints, CostBreakdown, DecisionEvidence, MarketEvidence,
-    OpportunityIdentity, OutcomeEvidence, PoolStateEvidence, PrimaryProfitabilityStatus,
-    RouteEvidence, ScenarioEconomics, ShadowDisposition, SignedAmount, SimulationClassification,
-    SimulationEvidence, SimulationKind, StateSource, Strategy, VerificationSkipReason,
-    VerificationStatus, PROFITABILITY_MODEL_VERSION,
+    AgreementState, BasisPoints, CostBreakdown, DecisionEvidence, IndependentVerificationStatus,
+    MarketEvidence, OpportunityIdentity, OutcomeEvidence, PoolStateEvidence,
+    PrimaryProfitabilityStatus, RouteEvidence, ScenarioEconomics, ShadowDisposition, SignedAmount,
+    SimulationClassification, SimulationEvidence, SimulationKind, StateSource, Strategy,
+    VerificationSkipReason, VerificationStatus, PROFITABILITY_MODEL_VERSION,
 };
 use phoenix_engine::optimizer::{optimize, CandidateEvaluation, OptimizerConfig};
 use phoenix_engine::origin::{OriginClassification, OriginDetector};
@@ -221,6 +221,7 @@ fn profitable_fixture_reaches_shadow_sink_and_dynamic_sizing() {
             }],
             state_block: 1,
             state_block_hash: Some("fixture-block-hash".to_string()),
+            route_config_hash: None,
             quote_block: 1,
             quote_age_ms: 1,
             state_source: StateSource::RecordedCheckpoint,
@@ -229,7 +230,12 @@ fn profitable_fixture_reaches_shadow_sink_and_dynamic_sizing() {
             primary_state_hash: Some("fixture-primary-state-hash".to_string()),
             secondary_provider_id: None,
             secondary_state_hash: None,
+            secondary_block_number: None,
+            secondary_block_hash: None,
+            secondary_route_config_hash: None,
             verification_status: VerificationStatus::HistoricalEvidence,
+            independent_verification_status: IndependentVerificationStatus::NotRequested,
+            independent_verification_lifecycle: vec![IndependentVerificationStatus::NotRequested],
             agreement_state: AgreementState::NotChecked,
             verification_skip_reason: Some(VerificationSkipReason::HistoricalEvidence),
             feed_to_detection_latency_ns: 1,

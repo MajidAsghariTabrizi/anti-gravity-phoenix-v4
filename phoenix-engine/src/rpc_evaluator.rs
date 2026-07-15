@@ -5,9 +5,10 @@ use crate::economics::{evaluate_scenarios, EconomicInput};
 use crate::engine_input::EngineInput;
 use crate::metrics::RuntimeMetrics;
 use crate::opportunity::{
-    AgreementState, BasisPoints, DecisionEvidence, MarketEvidence, Opportunity,
-    OpportunityIdentity, OutcomeEvidence, PoolStateEvidence, RejectionReason, RouteEvidence,
-    ScenarioEconomics, ShadowDisposition, SignedAmount, SimulationClassification,
+    AgreementState, BasisPoints, DecisionEvidence,
+    IndependentVerificationStatus as OpportunityIndependentVerificationStatus, MarketEvidence,
+    Opportunity, OpportunityIdentity, OutcomeEvidence, PoolStateEvidence, RejectionReason,
+    RouteEvidence, ScenarioEconomics, ShadowDisposition, SignedAmount, SimulationClassification,
     SimulationEvidence, SimulationKind, StateSource, Strategy, VerificationSkipReason,
     VerificationStatus as OpportunityVerificationStatus,
 };
@@ -23,8 +24,9 @@ use primitive_types::U256;
 use reqwest::{Client, StatusCode, Url};
 use rpc_gateway::shadow_state::{
     canonical_block_hash, canonical_data, canonical_digest, canonical_hash_bytes, EvidenceRequest,
-    GatewayErrorResponse, PoolStateRequest, RpcQualityEvidence, ShadowStateRequest,
-    ShadowStateResponse, VerificationStatus as GatewayVerificationStatus, ARBITRUM_ONE_CHAIN_ID,
+    GatewayErrorResponse, IndependentVerificationStatus as GatewayIndependentVerificationStatus,
+    PoolStateRequest, RpcQualityEvidence, ShadowStateRequest, ShadowStateResponse,
+    VerificationStatus as GatewayVerificationStatus, ARBITRUM_ONE_CHAIN_ID,
     MAX_GATEWAY_REQUEST_BYTES, MAX_GATEWAY_RESPONSE_BYTES, SHADOW_STATE_SCHEMA_VERSION,
 };
 use serde_json::json;
@@ -301,8 +303,12 @@ impl CandidateEvaluator for RpcCandidateEvaluator {
                     "state_block": primary_response.block_number,
                     "state_block_hash": primary_response.block_hash,
                     "state_hash": primary_response.state_hash,
+                    "route_config_hash": primary_response.route_config_hash,
                     "primary_provider_id": primary_response.primary_provider_id,
                     "verification_status": primary_response.verification_status,
+                    "independent_verification_status": "not_requested",
+                    "independent_verification_lifecycle": ["not_requested"],
+                    "verification_skip_reason": "primary_screen_no_profitable_candidate",
                     "rpc_quality_record_count": primary_response.quality.len(),
                     "state_model_tick_crossings_supported": 0,
                     "incomplete_state_seen": incomplete_state_seen,
@@ -324,7 +330,7 @@ impl CandidateEvaluator for RpcCandidateEvaluator {
                 &pools,
                 primary_response_hash.clone(),
                 selected,
-                Some(VerificationSkipReason::PrimaryBelowMinimum),
+                Some(VerificationSkipReason::PrimaryScreenNoProfitableCandidate),
                 requested_at.elapsed(),
                 now_ms,
                 &self.code_version,
@@ -334,10 +340,13 @@ impl CandidateEvaluator for RpcCandidateEvaluator {
                     "state_block": primary_response.block_number,
                     "state_block_hash": &primary_response.block_hash,
                     "state_hash": &primary_response.state_hash,
+                    "route_config_hash": &primary_response.route_config_hash,
                     "primary_response_hash": primary_response_hash,
                     "primary_provider_id": &primary_response.primary_provider_id,
                     "verification_status": primary_response.verification_status,
-                    "verification_skip_reason": "primary_below_minimum",
+                    "independent_verification_status": "not_requested",
+                    "independent_verification_lifecycle": ["not_requested"],
+                    "verification_skip_reason": "primary_screen_no_profitable_candidate",
                     "rpc_quality_record_count": primary_response.quality.len(),
                     "state_model_tick_crossings_supported": 0,
                     "incomplete_state_seen": incomplete_state_seen,
@@ -356,27 +365,19 @@ impl CandidateEvaluator for RpcCandidateEvaluator {
             });
         }
         let verification_request = verification_request(&request, &primary_response)?;
-        let (response, secondary_transport_unavailable) =
-            match self.client.fetch(&verification_request).await {
-                Ok(response) => (response, false),
-                Err(GatewayClientError::Retryable) => {
-                    let mut unavailable = primary_response.clone();
-                    unavailable.request_hash = verification_request
-                        .canonical_hash()
-                        .map_err(|_| EvaluationError::Terminal("route_state_request_invalid"))?;
-                    unavailable.agreement_provider_id = None;
-                    unavailable.secondary_state_hash = None;
-                    unavailable.provider_agreement = false;
-                    unavailable.verification_status =
-                        GatewayVerificationStatus::SecondaryUnavailable;
-                    (unavailable, true)
-                }
-                Err(GatewayClientError::Integrity) => {
-                    return Err(EvaluationError::Terminal(
-                        "rpc_gateway_response_integrity_failure",
-                    ));
-                }
-            };
+        let response = match self.client.fetch(&verification_request).await {
+            Ok(response) => response,
+            Err(GatewayClientError::Retryable) => synthesize_failed_verification(
+                &primary_response,
+                &verification_request,
+                GatewayIndependentVerificationStatus::ProviderUnavailable,
+            )?,
+            Err(GatewayClientError::Integrity) => synthesize_failed_verification(
+                &primary_response,
+                &verification_request,
+                GatewayIndependentVerificationStatus::IntegrityFailure,
+            )?,
+        };
         let now_ms = unix_time_ms();
         validate_response(&verification_request, &response, now_ms)?;
         let verified_pools = decode_pools(route, &response)?;
@@ -388,14 +389,22 @@ impl CandidateEvaluator for RpcCandidateEvaluator {
             "state_block": response.block_number,
             "state_block_hash": response.block_hash,
             "state_hash": response.state_hash,
+            "route_config_hash": response.route_config_hash,
             "primary_response_hash": primary_response_hash,
             "verification_response_hash": verification_response_hash,
             "primary_provider_id": response.primary_provider_id,
             "agreement_provider_id": response.agreement_provider_id,
             "secondary_state_hash": response.secondary_state_hash,
+            "secondary_block_number": response.secondary_block_number,
+            "secondary_block_hash": response.secondary_block_hash,
+            "secondary_route_config_hash": response.secondary_route_config_hash,
             "provider_agreement": response.provider_agreement,
             "verification_status": response.verification_status,
-            "secondary_verification_transport_unavailable": secondary_transport_unavailable,
+            "independent_verification_status": response.independent_verification_status,
+            "independent_verification_lifecycle": [
+                "requested",
+                response.independent_verification_status
+            ],
             "rpc_quality_record_count": response.quality.len(),
             "state_model_tick_crossings_supported": 0,
             "incomplete_state_seen": incomplete_state_seen
@@ -483,6 +492,35 @@ fn verification_request(
     Ok(request)
 }
 
+fn synthesize_failed_verification(
+    primary: &ShadowStateResponse,
+    request: &ShadowStateRequest,
+    status: GatewayIndependentVerificationStatus,
+) -> Result<ShadowStateResponse, EvaluationError> {
+    if !matches!(
+        status,
+        GatewayIndependentVerificationStatus::ProviderUnavailable
+            | GatewayIndependentVerificationStatus::IntegrityFailure
+    ) {
+        return Err(EvaluationError::Terminal(
+            "rpc_gateway_response_integrity_failure",
+        ));
+    }
+    let mut response = primary.clone();
+    response.request_hash = request
+        .canonical_hash()
+        .map_err(|_| EvaluationError::Terminal("route_state_request_invalid"))?;
+    response.agreement_provider_id = None;
+    response.secondary_state_hash = None;
+    response.secondary_block_number = None;
+    response.secondary_block_hash = None;
+    response.secondary_route_config_hash = None;
+    response.provider_agreement = false;
+    response.verification_status = GatewayVerificationStatus::SecondaryUnavailable;
+    response.independent_verification_status = status;
+    Ok(response)
+}
+
 fn validate_response(
     request: &ShadowStateRequest,
     response: &ShadowStateResponse,
@@ -491,9 +529,13 @@ fn validate_response(
     let request_hash = request
         .canonical_hash()
         .map_err(|_| EvaluationError::Terminal("route_state_request_invalid"))?;
+    let route_config_hash = request
+        .route_config_hash()
+        .map_err(|_| EvaluationError::Terminal("route_state_request_invalid"))?;
     if response.schema_version != SHADOW_STATE_SCHEMA_VERSION
         || response.chain_id != ARBITRUM_ONE_CHAIN_ID
         || response.request_hash != request_hash
+        || response.route_config_hash != route_config_hash
         || response.block_number == 0
         || !canonical_block_hash(&response.block_hash)
         || !canonical_digest(&response.state_hash)
@@ -519,9 +561,14 @@ fn validate_response(
     let stage_valid = match &request.evidence {
         EvidenceRequest::Primary => {
             response.verification_status == GatewayVerificationStatus::PrimaryOnly
+                && response.independent_verification_status
+                    == GatewayIndependentVerificationStatus::NotRequested
                 && !response.provider_agreement
                 && response.agreement_provider_id.is_none()
                 && response.secondary_state_hash.is_none()
+                && response.secondary_block_number.is_none()
+                && response.secondary_block_hash.is_none()
+                && response.secondary_route_config_hash.is_none()
         }
         EvidenceRequest::Verify {
             block_number,
@@ -532,22 +579,49 @@ fn validate_response(
                 && response.block_hash == *block_hash
                 && response.state_hash == *primary_state_hash
                 && response.verification_status != GatewayVerificationStatus::PrimaryOnly
+                && !matches!(
+                    response.independent_verification_status,
+                    GatewayIndependentVerificationStatus::NotRequested
+                        | GatewayIndependentVerificationStatus::Requested
+                )
         }
     };
-    let verification_valid = match response.verification_status {
-        GatewayVerificationStatus::PrimaryOnly
-        | GatewayVerificationStatus::SecondaryUnavailable => {
-            !response.provider_agreement
+    let secondary_identity_matches = response.secondary_block_number == Some(response.block_number)
+        && response.secondary_block_hash.as_deref() == Some(response.block_hash.as_str())
+        && response.secondary_route_config_hash.as_deref()
+            == Some(response.route_config_hash.as_str());
+    let verification_valid = match response.independent_verification_status {
+        GatewayIndependentVerificationStatus::NotRequested => {
+            response.verification_status == GatewayVerificationStatus::PrimaryOnly
+                && !response.provider_agreement
                 && response.agreement_provider_id.is_none()
                 && response.secondary_state_hash.is_none()
+                && response.secondary_block_number.is_none()
+                && response.secondary_block_hash.is_none()
+                && response.secondary_route_config_hash.is_none()
         }
-        GatewayVerificationStatus::Agreed => {
-            response.provider_agreement
+        GatewayIndependentVerificationStatus::Requested => false,
+        GatewayIndependentVerificationStatus::ProviderUnavailable
+        | GatewayIndependentVerificationStatus::IntegrityFailure => {
+            response.verification_status == GatewayVerificationStatus::SecondaryUnavailable
+                && !response.provider_agreement
+                && response.agreement_provider_id.is_none()
+                && response.secondary_state_hash.is_none()
+                && response.secondary_block_number.is_none()
+                && response.secondary_block_hash.is_none()
+                && response.secondary_route_config_hash.is_none()
+        }
+        GatewayIndependentVerificationStatus::Agreed => {
+            response.verification_status == GatewayVerificationStatus::Agreed
+                && secondary_identity_matches
+                && response.provider_agreement
                 && response.agreement_provider_id.is_some()
                 && response.secondary_state_hash.as_deref() == Some(response.state_hash.as_str())
         }
-        GatewayVerificationStatus::Disagreed => {
-            !response.provider_agreement
+        GatewayIndependentVerificationStatus::Disagreed => {
+            response.verification_status == GatewayVerificationStatus::Disagreed
+                && secondary_identity_matches
+                && !response.provider_agreement
                 && response.agreement_provider_id.is_some()
                 && response
                     .secondary_state_hash
@@ -578,6 +652,14 @@ fn validate_response(
         .secondary_state_hash
         .as_deref()
         .is_some_and(|value| !canonical_digest(value))
+        || response
+            .secondary_block_hash
+            .as_deref()
+            .is_some_and(|value| !canonical_block_hash(value))
+        || response
+            .secondary_route_config_hash
+            .as_deref()
+            .is_some_and(|value| !canonical_digest(value))
     {
         return Err(EvaluationError::Terminal(
             "rpc_gateway_response_integrity_failure",
@@ -925,6 +1007,7 @@ fn build_opportunity(
                 .collect(),
             state_block: response.block_number,
             state_block_hash: Some(response.block_hash.clone()),
+            route_config_hash: Some(response.route_config_hash.clone()),
             quote_block: response.block_number,
             quote_age_ms: now_ms.saturating_sub(response.resolved_at_unix_ms),
             state_source: StateSource::BlockPinnedRpc,
@@ -933,7 +1016,16 @@ fn build_opportunity(
             primary_state_hash: Some(response.state_hash.clone()),
             secondary_provider_id: response.agreement_provider_id.clone(),
             secondary_state_hash: response.secondary_state_hash.clone(),
+            secondary_block_number: response.secondary_block_number,
+            secondary_block_hash: response.secondary_block_hash.clone(),
+            secondary_route_config_hash: response.secondary_route_config_hash.clone(),
             verification_status: opportunity_verification_status(response.verification_status),
+            independent_verification_status: opportunity_independent_verification_status(
+                response.independent_verification_status,
+            ),
+            independent_verification_lifecycle: independent_verification_lifecycle(
+                response.independent_verification_status,
+            ),
             agreement_state: opportunity_agreement_state(response.verification_status),
             verification_skip_reason,
             feed_to_detection_latency_ns: feed_latency_ns,
@@ -1049,6 +1141,45 @@ fn opportunity_verification_status(
     }
 }
 
+fn opportunity_independent_verification_status(
+    status: GatewayIndependentVerificationStatus,
+) -> OpportunityIndependentVerificationStatus {
+    match status {
+        GatewayIndependentVerificationStatus::NotRequested => {
+            OpportunityIndependentVerificationStatus::NotRequested
+        }
+        GatewayIndependentVerificationStatus::Requested => {
+            OpportunityIndependentVerificationStatus::Requested
+        }
+        GatewayIndependentVerificationStatus::Agreed => {
+            OpportunityIndependentVerificationStatus::Agreed
+        }
+        GatewayIndependentVerificationStatus::Disagreed => {
+            OpportunityIndependentVerificationStatus::Disagreed
+        }
+        GatewayIndependentVerificationStatus::ProviderUnavailable => {
+            OpportunityIndependentVerificationStatus::ProviderUnavailable
+        }
+        GatewayIndependentVerificationStatus::IntegrityFailure => {
+            OpportunityIndependentVerificationStatus::IntegrityFailure
+        }
+    }
+}
+
+fn independent_verification_lifecycle(
+    status: GatewayIndependentVerificationStatus,
+) -> Vec<OpportunityIndependentVerificationStatus> {
+    let final_status = opportunity_independent_verification_status(status);
+    if status == GatewayIndependentVerificationStatus::NotRequested {
+        vec![final_status]
+    } else {
+        vec![
+            OpportunityIndependentVerificationStatus::Requested,
+            final_status,
+        ]
+    }
+}
+
 fn opportunity_agreement_state(status: GatewayVerificationStatus) -> AgreementState {
     match status {
         GatewayVerificationStatus::PrimaryOnly => AgreementState::NotChecked,
@@ -1160,6 +1291,7 @@ mod tests {
         Unprofitable,
         Retryable,
         SecondaryRetryable,
+        SecondaryIntegrity,
     }
 
     #[derive(Debug)]
@@ -1182,7 +1314,13 @@ mod tests {
                 {
                     Err(GatewayClientError::Retryable)
                 }
+                FakeMode::SecondaryIntegrity
+                    if matches!(request.evidence, EvidenceRequest::Verify { .. }) =>
+                {
+                    Err(GatewayClientError::Integrity)
+                }
                 FakeMode::SecondaryRetryable => Ok(response(request, false, true)),
+                FakeMode::SecondaryIntegrity => Ok(response(request, false, true)),
                 FakeMode::Unprofitable => Ok(response(request, false, false)),
                 FakeMode::Profitable { agreement } => Ok(response(request, agreement, true)),
             }
@@ -1385,6 +1523,7 @@ mod tests {
             schema_version: SHADOW_STATE_SCHEMA_VERSION.to_string(),
             chain_id: ARBITRUM_ONE_CHAIN_ID,
             request_hash: request.canonical_hash().unwrap(),
+            route_config_hash: request.route_config_hash().unwrap(),
             block_number: 100,
             block_hash: BLOCK_HASH.to_string(),
             state_hash,
@@ -1392,6 +1531,10 @@ mod tests {
             primary_provider_id: "provider_0".to_string(),
             agreement_provider_id: (!primary_only).then(|| "provider_1".to_string()),
             secondary_state_hash,
+            secondary_block_number: (!primary_only).then_some(100),
+            secondary_block_hash: (!primary_only).then(|| BLOCK_HASH.to_string()),
+            secondary_route_config_hash: (!primary_only)
+                .then(|| request.route_config_hash().unwrap()),
             provider_agreement: !primary_only && agreement,
             verification_status: if primary_only {
                 GatewayVerificationStatus::PrimaryOnly
@@ -1399,6 +1542,13 @@ mod tests {
                 GatewayVerificationStatus::Agreed
             } else {
                 GatewayVerificationStatus::Disagreed
+            },
+            independent_verification_status: if primary_only {
+                GatewayIndependentVerificationStatus::NotRequested
+            } else if agreement {
+                GatewayIndependentVerificationStatus::Agreed
+            } else {
+                GatewayIndependentVerificationStatus::Disagreed
             },
             quality,
             resolved_at_unix_ms: unix_time_ms(),
@@ -1448,6 +1598,40 @@ mod tests {
     }
 
     #[test]
+    fn independent_verification_requires_distinct_provider_and_identical_context() {
+        let primary_request = state_request(&route()).unwrap();
+        let primary = response(&primary_request, false, true);
+        let verify_request = verification_request(&primary_request, &primary).unwrap();
+        let now = unix_time_ms();
+
+        let mut self_verified = response(&verify_request, true, true);
+        self_verified.agreement_provider_id = Some(self_verified.primary_provider_id.clone());
+        assert!(validate_response(&verify_request, &self_verified, now).is_err());
+
+        let mut wrong_block = response(&verify_request, true, true);
+        wrong_block.secondary_block_number = Some(wrong_block.block_number + 1);
+        assert!(validate_response(&verify_request, &wrong_block, now).is_err());
+
+        let mut wrong_hash = response(&verify_request, true, true);
+        wrong_hash.secondary_block_hash = Some(format!("0x{}", "b".repeat(64)));
+        assert!(validate_response(&verify_request, &wrong_hash, now).is_err());
+
+        let mut wrong_route = response(&verify_request, true, true);
+        wrong_route.secondary_route_config_hash = Some("b".repeat(64));
+        assert!(validate_response(&verify_request, &wrong_route, now).is_err());
+    }
+
+    #[test]
+    fn transient_requested_status_is_not_accepted_as_final_evidence() {
+        let primary_request = state_request(&route()).unwrap();
+        let primary = response(&primary_request, false, true);
+        let verify_request = verification_request(&primary_request, &primary).unwrap();
+        let mut requested = response(&verify_request, true, true);
+        requested.independent_verification_status = GatewayIndependentVerificationStatus::Requested;
+        assert!(validate_response(&verify_request, &requested, unix_time_ms()).is_err());
+    }
+
+    #[test]
     fn deterministic_identity_is_uuid_shaped_and_input_sensitive() {
         let first = deterministic_opportunity_id("source", "route", "block", Amount(1), Amount(2));
         let second = deterministic_opportunity_id("source", "route", "block", Amount(2), Amount(2));
@@ -1481,7 +1665,15 @@ mod tests {
         );
         assert_eq!(
             opportunity.market.verification_skip_reason,
-            Some(VerificationSkipReason::PrimaryBelowMinimum)
+            Some(VerificationSkipReason::PrimaryScreenNoProfitableCandidate)
+        );
+        assert_eq!(
+            opportunity.market.independent_verification_status,
+            OpportunityIndependentVerificationStatus::NotRequested
+        );
+        assert_eq!(
+            opportunity.market.independent_verification_lifecycle,
+            [OpportunityIndependentVerificationStatus::NotRequested]
         );
         assert_eq!(
             opportunity.simulation.classification,
@@ -1513,6 +1705,16 @@ mod tests {
         );
         assert_eq!(market.agreement_state, AgreementState::Agreed);
         assert_eq!(market.secondary_state_hash, market.primary_state_hash);
+        assert_eq!(market.secondary_block_number, Some(market.state_block));
+        assert_eq!(market.secondary_block_hash, market.state_block_hash);
+        assert_eq!(market.secondary_route_config_hash, market.route_config_hash);
+        assert_eq!(
+            market.independent_verification_lifecycle,
+            [
+                OpportunityIndependentVerificationStatus::Requested,
+                OpportunityIndependentVerificationStatus::Agreed,
+            ]
+        );
     }
 
     #[tokio::test]
@@ -1544,8 +1746,43 @@ mod tests {
         );
         assert!(opportunity.market.secondary_state_hash.is_none());
         assert_eq!(
-            batch.evidence["state"]["secondary_verification_transport_unavailable"],
-            json!(true)
+            opportunity.market.independent_verification_status,
+            OpportunityIndependentVerificationStatus::ProviderUnavailable
+        );
+        assert_eq!(
+            opportunity.market.independent_verification_lifecycle,
+            [
+                OpportunityIndependentVerificationStatus::Requested,
+                OpportunityIndependentVerificationStatus::ProviderUnavailable,
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn secondary_integrity_failure_is_persistable_fail_closed_evidence() {
+        let now = unix_time_ms();
+        let (evaluator, client, _) = evaluator_with_client(FakeMode::SecondaryIntegrity);
+        let batch = evaluator
+            .evaluate(&input(now), &origin(), &route())
+            .await
+            .unwrap();
+        assert_eq!(client.calls.load(Ordering::Relaxed), 2);
+        let opportunity = &batch.evaluations[0].opportunity;
+        assert_eq!(
+            opportunity.market.independent_verification_status,
+            OpportunityIndependentVerificationStatus::IntegrityFailure
+        );
+        assert_eq!(
+            opportunity.decision.primary_rejection_reason,
+            Some(RejectionReason::RpcStateDisagreement)
+        );
+        assert!(!opportunity.decision.execution_request_created);
+        assert_eq!(
+            opportunity.market.independent_verification_lifecycle,
+            [
+                OpportunityIndependentVerificationStatus::Requested,
+                OpportunityIndependentVerificationStatus::IntegrityFailure,
+            ]
         );
     }
 

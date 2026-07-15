@@ -173,6 +173,40 @@ func TestShadowRouteDiscoveryIndexesAreAdditive(t *testing.T) {
 	}
 }
 
+func TestProfitTriggeredVerificationMigrationIsForwardOnlyAndFailClosed(t *testing.T) {
+	migrationPath := filepath.Join("..", "..", "..", "migrations", "009_profit_triggered_secondary_verification.sql")
+	content, err := os.ReadFile(migrationPath)
+	if err != nil {
+		t.Fatalf("read profit-triggered verification migration: %v", err)
+	}
+	sqlText := strings.ToUpper(string(content))
+	for _, required := range []string{
+		"ADD COLUMN IF NOT EXISTS ROUTE_CONFIG_HASH",
+		"INDEPENDENT_VERIFICATION_STATUS IN",
+		"'NOT_REQUESTED'",
+		"'REQUESTED'",
+		"'AGREED'",
+		"'DISAGREED'",
+		"'PROVIDER_UNAVAILABLE'",
+		"'INTEGRITY_FAILURE'",
+		"SECONDARY_PROVIDER_ID <> PRIMARY_PROVIDER_ID",
+		"SECONDARY_BLOCK_NUMBER = PINNED_BLOCK_NUMBER",
+		"SECONDARY_BLOCK_HASH = PINNED_BLOCK_HASH",
+		"SECONDARY_ROUTE_CONFIG_HASH = ROUTE_CONFIG_HASH",
+		"EXECUTION_REQUEST_CREATED",
+		"CREATE INDEX IF NOT EXISTS SHADOW_PROFITABILITY_INDEPENDENT_VERIFICATION_IDX",
+	} {
+		if !strings.Contains(sqlText, required) {
+			t.Fatalf("migration missing %q", required)
+		}
+	}
+	for _, destructive := range []string{"DROP TABLE", "DROP COLUMN", "TRUNCATE TABLE", "DELETE FROM", "UPDATE SHADOW_PROFITABILITY_FACTS"} {
+		if strings.Contains(sqlText, destructive) {
+			t.Fatalf("migration contains destructive statement %q", destructive)
+		}
+	}
+}
+
 func TestLoadMigrationsOrdersByVersion(t *testing.T) {
 	dir := t.TempDir()
 	writeMigration(t, dir, "002_second.sql", "SELECT 2;")
