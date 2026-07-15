@@ -806,7 +806,12 @@ async fn persist_profitability_fact(
         contract_overhead: base.contract_overhead.0.to_string(),
         total_cost: base.total_cost.0.to_string(),
         expected_net_pnl: base.expected_net_pnl.0.to_string(),
-        conservative_net_pnl: opportunity.economics.conservative.expected_net_pnl.0.to_string(),
+        conservative_net_pnl: opportunity
+            .economics
+            .conservative
+            .expected_net_pnl
+            .0
+            .to_string(),
         severe_net_pnl: opportunity.economics.severe.expected_net_pnl.0.to_string(),
         minimum_required_net_pnl: opportunity.economics.minimum_required_net_pnl.0.to_string(),
         primary_profitability_status: opportunity.economics.primary_status.as_str(),

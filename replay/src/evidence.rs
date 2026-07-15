@@ -277,7 +277,7 @@ fn mean(values: &[i128]) -> Result<i128, ReplayError> {
     }
 }
 
-fn checked_sum(values: impl Iterator<Item = i128>) -> Result<i128, ReplayError> {
+fn checked_sum(mut values: impl Iterator<Item = i128>) -> Result<i128, ReplayError> {
     values
         .try_fold(0_i128, i128::checked_add)
         .ok_or(ReplayError::ArithmeticOverflow)

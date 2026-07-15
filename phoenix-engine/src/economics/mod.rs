@@ -225,9 +225,11 @@ fn validate(input: &EconomicInput, scenario: ScenarioConfig) -> Result<(), Econo
     if input.failure_probability_bps > 10_000
         || input.stale_quote_probability_bps > 10_000
         || input.probability_of_success_bps > 10_000
-        || input.minimum_required_net_pnl.0 < 0
     {
         return Err(EconomicError::InvalidProbability);
+    }
+    if input.minimum_required_net_pnl.0 < 0 {
+        return Err(EconomicError::InvalidScenario);
     }
     let multipliers = [
         scenario.gas_multiplier_bps,
