@@ -61,6 +61,7 @@ contract MockERC20 is IERC20 {
         uint24 public override fee;
         address public override factory;
         uint256 public outputAmount;
+        uint256 public lastAmountIn;
 
         constructor(address f, address a, address b, uint24 poolFee, uint256 out) {
             factory = f;
@@ -80,6 +81,7 @@ contract MockERC20 is IERC20 {
             returns (int256 amount0, int256 amount1)
         {
             uint256 amountIn = uint256(amountSpecified);
+            lastAmountIn = amountIn;
             if (zeroForOne) {
                 MockERC20(token1).mint(recipient, outputAmount);
                 PhoenixExecutor(msg.sender).uniswapV3SwapCallback(int256(amountIn), 0, data);
@@ -122,6 +124,7 @@ contract MockERC20 is IERC20 {
             MockPool pool1;
             MockPool pool2;
             PhoenixExecutor executor;
+            address originRouter = address(0xBEEF);
 
             function setUp() public {
                 usdc = new MockERC20("USDC");
@@ -129,12 +132,15 @@ contract MockERC20 is IERC20 {
                 aave = new MockAavePool(1);
                 factory1 = new MockFactory();
                 factory2 = new MockFactory();
-                pool1 = new MockPool(address(factory1), address(usdc), address(weth), 500, 100);
-                pool2 = new MockPool(address(factory2), address(weth), address(usdc), 500, 112);
+                pool1 = new MockPool(address(factory1), address(usdc), address(weth), 500, 105);
+                pool2 = new MockPool(address(factory2), address(weth), address(usdc), 500, 117);
                 factory1.setPool(address(usdc), address(weth), 500, address(pool1));
                 factory2.setPool(address(weth), address(usdc), 500, address(pool2));
                 executor = new PhoenixExecutor(address(this), address(aave));
                 executor.setAsset(address(usdc), true);
+                executor.setAsset(address(weth), true);
+                executor.setRouter(originRouter, true);
+                executor.setMaximumInputAmount(1_000);
                 executor.setFactory(address(factory1), true);
                 executor.setFactory(address(factory2), true);
                 executor.approvePool(address(pool1), address(factory1), address(usdc), address(weth), 500, true);
@@ -153,7 +159,6 @@ contract MockERC20 is IERC20 {
                     tokenOut: address(weth),
                     fee: 500,
                     zeroForOne: true,
-                    amountIn: 100,
                     minAmountOut: 100
                 });
                 legs[1] = PhoenixExecutor.Leg({
@@ -162,13 +167,15 @@ contract MockERC20 is IERC20 {
                     tokenOut: address(usdc),
                     fee: 500,
                     zeroForOne: true,
-                    amountIn: 100,
                     minAmountOut: 100
                 });
                 op = PhoenixExecutor.Opportunity({
                     routeId: bytes32("route-1"),
+                    originRouter: originRouter,
+                    recipient: address(executor),
                     flashAsset: address(usdc),
                     flashAmount: 100,
+                    maxInputAmount: 1_000,
                     minProfit: minProfit,
                     deadline: deadline,
                     legs: legs
@@ -178,7 +185,8 @@ contract MockERC20 is IERC20 {
             function testHappyPath() public {
                 setUp();
                 executor.executeOpportunity(opportunity(5, block.timestamp + 1));
-                require(usdc.balanceOf(address(executor)) == 11, "profit retained");
+                require(usdc.balanceOf(address(executor)) == 16, "profit retained");
+                require(pool2.lastAmountIn() == 105, "actual prior output not chained");
             }
 
             function testUnauthorizedCaller() public {
@@ -227,6 +235,14 @@ contract MockERC20 is IERC20 {
                 } catch {}
             }
 
+            function testSlippageFailure() public {
+                setUp();
+                pool1.setOutput(99);
+                try executor.executeOpportunity(opportunity(5, block.timestamp + 1)) {
+                    revert("slippage failure accepted");
+                } catch {}
+            }
+
             function testPausedContract() public {
                 setUp();
                 executor.setPaused(true);
@@ -244,11 +260,56 @@ contract MockERC20 is IERC20 {
                 } catch {}
             }
 
+            function testUnsupportedIntermediateToken() public {
+                setUp();
+                executor.setAsset(address(weth), false);
+                try executor.executeOpportunity(opportunity(5, block.timestamp + 1)) {
+                    revert("unsupported intermediate token accepted");
+                } catch {}
+            }
+
+            function testUnsupportedRouter() public {
+                setUp();
+                PhoenixExecutor.Opportunity memory op = opportunity(5, block.timestamp + 1);
+                op.originRouter = address(0xBAD);
+                try executor.executeOpportunity(op) {
+                    revert("unsupported router accepted");
+                } catch {}
+            }
+
+            function testUnsupportedPool() public {
+                setUp();
+                PhoenixExecutor.Opportunity memory op = opportunity(5, block.timestamp + 1);
+                op.legs[0].pool = address(this);
+                try executor.executeOpportunity(op) {
+                    revert("unsupported pool accepted");
+                } catch {}
+            }
+
+            function testInvalidRecipient() public {
+                setUp();
+                PhoenixExecutor.Opportunity memory op = opportunity(5, block.timestamp + 1);
+                op.recipient = address(this);
+                try executor.executeOpportunity(op) {
+                    revert("invalid recipient accepted");
+                } catch {}
+            }
+
+            function testMaximumInputGuard() public {
+                setUp();
+                PhoenixExecutor.Opportunity memory op = opportunity(5, block.timestamp + 1);
+                op.flashAmount = 1_001;
+                op.maxInputAmount = 1_001;
+                try executor.executeOpportunity(op) {
+                    revert("oversized input accepted");
+                } catch {}
+            }
+
             function testMultipleSequentialOpportunities() public {
                 setUp();
                 executor.executeOpportunity(opportunity(5, block.timestamp + 1));
                 executor.executeOpportunity(opportunity(5, block.timestamp + 1));
-                require(usdc.balanceOf(address(executor)) == 22, "sequential profit mismatch");
+                require(usdc.balanceOf(address(executor)) == 32, "sequential profit mismatch");
             }
         }
 

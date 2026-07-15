@@ -12,9 +12,12 @@ contract PhoenixExecutor is IAaveFlashBorrower {
     error ZeroAddress();
     error ZeroAmount();
     error UnsupportedAsset(address asset);
+    error InvalidRouter(address router);
     error InvalidFactory(address factory);
     error InvalidPool(address pool);
     error InvalidLeg();
+    error InvalidRecipient(address recipient);
+    error InputLimit(uint256 amount, uint256 maximum);
     error Expired();
     error MinProfit(uint256 realizedProfit, uint256 minProfit);
     error CallbackSpoof();
@@ -28,28 +31,30 @@ contract PhoenixExecutor is IAaveFlashBorrower {
     event PausedSet(bool paused);
     event FlashProviderUpdated(address indexed provider);
     event AssetUpdated(address indexed asset, bool approved);
+    event RouterUpdated(address indexed router, bool approved);
     event FactoryUpdated(address indexed factory, bool approved);
     event PoolUpdated(address indexed pool, address indexed factory, bool approved);
+    event MaximumInputUpdated(uint256 maximumInputAmount);
     event OpportunityStarted(bytes32 indexed routeId, address indexed asset, uint256 flashAmount);
     event OpportunitySettled(
         bytes32 indexed routeId, address indexed asset, uint256 flashAmount, uint256 premium, uint256 realizedProfit
     );
-    event Rescue(address indexed token, address indexed to, uint256 amount);
-
     struct Leg {
         address pool;
         address tokenIn;
         address tokenOut;
         uint24 fee;
         bool zeroForOne;
-        uint256 amountIn;
         uint256 minAmountOut;
     }
 
     struct Opportunity {
         bytes32 routeId;
+        address originRouter;
+        address recipient;
         address flashAsset;
         uint256 flashAmount;
+        uint256 maxInputAmount;
         uint256 minProfit;
         uint256 deadline;
         Leg[] legs;
@@ -85,8 +90,10 @@ contract PhoenixExecutor is IAaveFlashBorrower {
 
     mapping(address => bool) public authorizedSearchers;
     mapping(address => bool) public approvedAssets;
+    mapping(address => bool) public approvedRouters;
     mapping(address => bool) public approvedFactories;
     mapping(address => PoolConfig) public approvedPools;
+    uint256 public maximumInputAmount;
 
     ActiveExecution private activeExecution;
 
@@ -157,6 +164,21 @@ contract PhoenixExecutor is IAaveFlashBorrower {
         emit AssetUpdated(asset, approved);
     }
 
+    function setRouter(address router, bool approved) external onlyOwner {
+        if (router == address(0)) revert ZeroAddress();
+        approvedRouters[router] = approved;
+        emit RouterUpdated(router, approved);
+    }
+
+    function setMaximumInputAmount(uint256 maximum) external onlyOwner {
+        if (maximum == 0) revert ZeroAmount();
+        if (maximum > uint256(type(int256).max)) {
+            revert InputLimit(maximum, uint256(type(int256).max));
+        }
+        maximumInputAmount = maximum;
+        emit MaximumInputUpdated(maximum);
+    }
+
     function setFactory(address factory, bool approved) external onlyOwner {
         if (factory == address(0)) revert ZeroAddress();
         approvedFactories[factory] = approved;
@@ -183,6 +205,14 @@ contract PhoenixExecutor is IAaveFlashBorrower {
     function executeOpportunity(Opportunity calldata op) external onlySearcher whenNotPaused nonReentrant {
         if (op.flashAmount == 0) revert ZeroAmount();
         if (!approvedAssets[op.flashAsset]) revert UnsupportedAsset(op.flashAsset);
+        if (!approvedRouters[op.originRouter]) revert InvalidRouter(op.originRouter);
+        if (op.recipient != address(this)) revert InvalidRecipient(op.recipient);
+        if (
+            maximumInputAmount == 0 || op.maxInputAmount == 0 || op.maxInputAmount > maximumInputAmount
+                || op.flashAmount > op.maxInputAmount
+        ) {
+            revert InputLimit(op.flashAmount, maximumInputAmount);
+        }
         if (block.timestamp > op.deadline) revert Expired();
         _validateLegs(op);
 
@@ -212,6 +242,7 @@ contract PhoenixExecutor is IAaveFlashBorrower {
         Opportunity memory op = abi.decode(params, (Opportunity));
         if (op.flashAsset != asset || op.flashAmount != amount || op.routeId != ctx.routeId) revert CallbackSpoof();
 
+        uint256 amountIn = amount;
         for (uint256 i = 0; i < op.legs.length; i++) {
             Leg memory leg = op.legs[i];
             uint256 beforeOut = IERC20(leg.tokenOut).balanceOf(address(this));
@@ -219,12 +250,13 @@ contract PhoenixExecutor is IAaveFlashBorrower {
                 .swap(
                     address(this),
                     leg.zeroForOne,
-                    int256(leg.amountIn),
+                    int256(amountIn),
                     leg.zeroForOne ? uint160(4_295_128_739) + 1 : type(uint160).max - 1,
                     abi.encode(SwapCallbackData({tokenIn: leg.tokenIn, tokenOut: leg.tokenOut, pool: leg.pool}))
                 );
             uint256 received = IERC20(leg.tokenOut).balanceOf(address(this)) - beforeOut;
             if (received < leg.minAmountOut) revert InvalidLeg();
+            amountIn = received;
         }
 
         uint256 repay = amount + premium;
@@ -249,6 +281,7 @@ contract PhoenixExecutor is IAaveFlashBorrower {
         SwapCallbackData memory cb = abi.decode(data, (SwapCallbackData));
         if (cb.pool != msg.sender) revert CallbackSpoof();
 
+        if ((amount0Delta > 0) == (amount1Delta > 0)) revert CallbackSpoof();
         if (amount0Delta > 0) {
             if (cb.tokenIn != cfg.token0) revert CallbackSpoof();
             _safeTransfer(cb.tokenIn, msg.sender, uint256(amount0Delta));
@@ -259,12 +292,6 @@ contract PhoenixExecutor is IAaveFlashBorrower {
         }
     }
 
-    function rescue(address token, address to, uint256 amount) external onlyOwner {
-        if (to == address(0)) revert ZeroAddress();
-        _safeTransfer(token, to, amount);
-        emit Rescue(token, to, amount);
-    }
-
     function _validateLegs(Opportunity calldata op) internal view {
         if (op.legs.length == 0 || op.legs.length > 4) revert MalformedLegs();
         address expectedInput = op.flashAsset;
@@ -272,7 +299,10 @@ contract PhoenixExecutor is IAaveFlashBorrower {
             Leg calldata leg = op.legs[i];
             PoolConfig memory cfg = approvedPools[leg.pool];
             if (!cfg.approved || !approvedFactories[cfg.factory]) revert InvalidPool(leg.pool);
-            if (leg.amountIn == 0 || leg.tokenIn != expectedInput || leg.fee != cfg.fee) revert InvalidLeg();
+            if (
+                !approvedAssets[leg.tokenIn] || !approvedAssets[leg.tokenOut] || leg.tokenIn != expectedInput
+                    || leg.fee != cfg.fee || leg.minAmountOut == 0
+            ) revert InvalidLeg();
             if (leg.zeroForOne) {
                 if (leg.tokenIn != cfg.token0 || leg.tokenOut != cfg.token1) revert InvalidLeg();
             } else {
