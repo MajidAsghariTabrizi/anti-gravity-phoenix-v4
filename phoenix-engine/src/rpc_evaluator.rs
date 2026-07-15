@@ -297,6 +297,8 @@ impl CandidateEvaluator for RpcCandidateEvaluator {
         let Some(optimized) = optimized else {
             self.metrics.rpc_primary_screen_rejected();
             self.metrics.rpc_secondary_skipped();
+            self.metrics
+                .profitability_without_candidate(incomplete_state_seen);
             return Ok(CandidateBatch {
                 evaluations: Vec::new(),
                 evidence: json!({

@@ -185,6 +185,9 @@ func TestDecodeBroadcastBatchPreservesSupportedSiblingsAroundUnsupportedItem(t *
 	if len(report.Malformed) != 0 {
 		t.Fatalf("unsupported child was misclassified as malformed: %+v", report)
 	}
+	if len(report.UnsupportedKinds) != 1 || report.UnsupportedKinds[0] != (MessageKind{Layer: MessageLayerL2, Kind: 0x7f}) {
+		t.Fatalf("unsupported child lost structured kind evidence: %+v", report.UnsupportedKinds)
+	}
 }
 
 func TestDecodeBroadcastRejectsMalformedBatchFraming(t *testing.T) {
@@ -291,6 +294,9 @@ func TestDecodeBroadcastIgnoresKnownNonTransactionMessageKind(t *testing.T) {
 	if len(frames) != 1 || len(frames[0].Transactions) != 0 || len(frames[0].Ignored) != 1 || len(frames[0].Unsupported) != 0 || len(frames[0].Malformed) != 0 {
 		t.Fatalf("unexpected ignored frame: frames=%+v report=%+v", frames, report)
 	}
+	if len(report.IgnoredKinds) != 1 || report.IgnoredKinds[0] != (MessageKind{Layer: MessageLayerL1, Kind: L1MessageTypeEndOfBlock}) {
+		t.Fatalf("ignored L1 message lost structured kind evidence: %+v", report.IgnoredKinds)
+	}
 }
 
 func TestDecodeBroadcastReportsUnsupportedTransactionLikeMessageKind(t *testing.T) {
@@ -301,6 +307,9 @@ func TestDecodeBroadcastReportsUnsupportedTransactionLikeMessageKind(t *testing.
 	}
 	if len(frames) != 1 || len(frames[0].Transactions) != 0 || len(report.Unsupported) != 1 || len(report.Malformed) != 0 {
 		t.Fatalf("unexpected unsupported frame: frames=%+v report=%+v", frames, report)
+	}
+	if len(report.UnsupportedKinds) != 1 || report.UnsupportedKinds[0] != (MessageKind{Layer: MessageLayerL1, Kind: L1MessageTypeSubmitRetryable}) {
+		t.Fatalf("unsupported L1 message lost structured kind evidence: %+v", report.UnsupportedKinds)
 	}
 }
 

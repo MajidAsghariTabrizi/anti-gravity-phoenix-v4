@@ -1,6 +1,6 @@
 use crate::engine_input::{decode_engine_input, EngineClassification, InputFailureKind};
 use crate::engine_jetstream::{Delivery, MessageFetcher, PipelineError, RETRY_DELAY};
-use crate::metrics::RuntimeMetrics;
+use crate::metrics::{RouteExclusionMetric, RuntimeMetrics};
 use crate::opportunity::ShadowDisposition;
 use crate::persistence::{
     ClassificationRecord, DependencyFailureContext, PersistOutcome, ShadowStore, StoreError,
@@ -282,7 +282,10 @@ pub async fn process_delivery(
         processing_latency_ns: elapsed.as_nanos(),
         evaluations: result.evaluations.clone(),
     };
-    let outcome = match store.persist_classification(&record).await {
+    let persistence_started = Instant::now();
+    let persistence_result = store.persist_classification(&record).await;
+    metrics.persistence_observed(persistence_started.elapsed());
+    let outcome = match persistence_result {
         Ok(outcome) => outcome,
         Err(error) => {
             return handle_store_failure(
@@ -303,6 +306,12 @@ pub async fn process_delivery(
     }
 
     metrics.input_processed(elapsed);
+    if delivery.delivery_count > 1
+        && result.action == ProcessingAction::Ack
+        && result.classification != EngineClassification::DependencyExhausted
+    {
+        metrics.retry_recovered();
+    }
     record_result_metrics(metrics, &result);
     let terminal = result.action == ProcessingAction::Terminate;
     acknowledge(delivery, result.action, readiness, sampler, terminal).await
@@ -338,8 +347,22 @@ fn record_result_metrics(metrics: &RuntimeMetrics, result: &ProcessResult) {
         metrics.origin_classified(kind);
     }
     metrics.candidates(result.candidate_count);
+    for evaluation in &result.evaluations {
+        metrics.record_profitability(&evaluation.opportunity);
+    }
     match result.classification {
-        EngineClassification::NoRelevantRoute => metrics.no_route(),
+        EngineClassification::NoRelevantRoute => {
+            metrics.no_route();
+            let reason = match result.detail_class {
+                "no_affected_two_pool_route" => RouteExclusionMetric::NoAffectedRoute,
+                "known_router_unsupported_exact_output"
+                | "known_router_ambiguous_multi_swap"
+                | "known_router_unsupported_command"
+                | "malformed_origin_calldata" => RouteExclusionMetric::UnsupportedOrigin,
+                _ => RouteExclusionMetric::IneligibleOrigin,
+            };
+            metrics.route_ranking_exclusion(reason);
+        }
         EngineClassification::ShadowAccepted | EngineClassification::CandidateRejected => {
             let accepted = result
                 .evaluations
@@ -354,16 +377,34 @@ fn record_result_metrics(metrics: &RuntimeMetrics, result: &ProcessResult) {
                 result.classification == EngineClassification::CandidateRejected
                     && result.evaluations.is_empty(),
             )));
+            if result.classification == EngineClassification::CandidateRejected {
+                metrics.route_ranking_exclusion(if result.evaluations.is_empty() {
+                    RouteExclusionMetric::NotProfitable
+                } else {
+                    RouteExclusionMetric::PolicyRejected
+                });
+            }
         }
         EngineClassification::CandidateGenerated => {}
         EngineClassification::DependencyExhausted => {
             metrics.dependency_exhausted();
             metrics.processing_failure();
+            metrics.route_ranking_exclusion(RouteExclusionMetric::DependencyUnavailable);
         }
         EngineClassification::MalformedInternalEvent
-        | EngineClassification::UnsupportedSchema
-        | EngineClassification::TransientDependencyFailure
-        | EngineClassification::TerminalIntegrityFailure => metrics.processing_failure(),
+        | EngineClassification::UnsupportedSchema => {
+            metrics.processing_failure();
+            metrics.route_ranking_exclusion(RouteExclusionMetric::IntegrityFailure);
+        }
+        EngineClassification::TransientDependencyFailure => {
+            metrics.processing_failure();
+            metrics.route_ranking_exclusion(RouteExclusionMetric::DependencyUnavailable);
+        }
+        EngineClassification::TerminalIntegrityFailure => {
+            metrics.processing_failure();
+            metrics.terminal_integrity();
+            metrics.route_ranking_exclusion(RouteExclusionMetric::IntegrityFailure);
+        }
     }
 }
 
@@ -1525,9 +1566,10 @@ mod tests {
             Some(&EngineClassification::NoRelevantRoute)
         );
         assert_eq!(readiness.ready(), Ok(()));
-        assert!(metrics
-            .render(&readiness)
-            .contains("phoenix_engine_dependency_exhausted_total 1"));
+        let rendered = metrics.render(&readiness);
+        assert!(rendered.contains("phoenix_engine_dependency_exhausted_total 1"));
+        assert!(rendered
+            .contains("phoenix_engine_later_message_progress_after_quarantine_total 1"));
     }
 
     #[tokio::test]

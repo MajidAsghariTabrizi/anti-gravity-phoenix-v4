@@ -87,13 +87,38 @@ type ConfirmedSequenceNumberMessage struct {
 	SequenceNumber uint64 `json:"sequenceNumber"`
 }
 
+type MessageLayer uint8
+
+const (
+	MessageLayerL1 MessageLayer = iota + 1
+	MessageLayerL2
+)
+
+func (l MessageLayer) String() string {
+	switch l {
+	case MessageLayerL1:
+		return "l1"
+	case MessageLayerL2:
+		return "l2"
+	default:
+		return "unknown"
+	}
+}
+
+type MessageKind struct {
+	Layer MessageLayer
+	Kind  uint8
+}
+
 type Frame struct {
-	Sequence        uint64
-	TimestampUnixMS uint64
-	Transactions    []normalizer.RelayTx
-	Unsupported     []string
-	Malformed       []string
-	Ignored         []string
+	Sequence         uint64
+	TimestampUnixMS  uint64
+	Transactions     []normalizer.RelayTx
+	Unsupported      []string
+	Malformed        []string
+	Ignored          []string
+	UnsupportedKinds []MessageKind
+	IgnoredKinds     []MessageKind
 }
 
 type DecodeReport struct {
@@ -101,13 +126,17 @@ type DecodeReport struct {
 	Unsupported       []string
 	Malformed         []string
 	Ignored           []string
+	UnsupportedKinds  []MessageKind
+	IgnoredKinds      []MessageKind
 }
 
 type l2DecodeResult struct {
-	transactions []normalizer.RelayTx
-	unsupported  []string
-	malformed    []string
-	ignored      []string
+	transactions     []normalizer.RelayTx
+	unsupported      []string
+	malformed        []string
+	ignored          []string
+	unsupportedKinds []MessageKind
+	ignoredKinds     []MessageKind
 }
 
 type issueClass uint8
@@ -159,6 +188,8 @@ func DecodeBroadcastContext(ctx context.Context, raw []byte) ([]Frame, DecodeRep
 		report.Unsupported = append(report.Unsupported, frame.Unsupported...)
 		report.Malformed = append(report.Malformed, frame.Malformed...)
 		report.Ignored = append(report.Ignored, frame.Ignored...)
+		report.UnsupportedKinds = append(report.UnsupportedKinds, frame.UnsupportedKinds...)
+		report.IgnoredKinds = append(report.IgnoredKinds, frame.IgnoredKinds...)
 		if frame.Sequence != 0 || len(frame.Transactions) > 0 || len(frame.Unsupported) > 0 || len(frame.Malformed) > 0 || len(frame.Ignored) > 0 {
 			frames = append(frames, frame)
 		}
@@ -183,10 +214,13 @@ func decodeFeedMessage(ctx context.Context, feedMessage *BroadcastFeedMessage) (
 	frame.TimestampUnixMS = incoming.Header.Timestamp * 1000
 	if incoming.Header.Kind != L1MessageTypeL2Message {
 		reason := fmt.Sprintf("L1 message kind %d", incoming.Header.Kind)
+		kind := MessageKind{Layer: MessageLayerL1, Kind: incoming.Header.Kind}
 		if isIgnoredNonTransactionKind(incoming.Header.Kind) {
 			frame.Ignored = append(frame.Ignored, reason)
+			frame.IgnoredKinds = append(frame.IgnoredKinds, kind)
 		} else {
 			frame.Unsupported = append(frame.Unsupported, "unsupported "+reason)
+			frame.UnsupportedKinds = append(frame.UnsupportedKinds, kind)
 		}
 		return frame, nil
 	}
@@ -199,6 +233,8 @@ func decodeFeedMessage(ctx context.Context, feedMessage *BroadcastFeedMessage) (
 	frame.Unsupported = append(frame.Unsupported, result.unsupported...)
 	frame.Malformed = append(frame.Malformed, result.malformed...)
 	frame.Ignored = append(frame.Ignored, result.ignored...)
+	frame.UnsupportedKinds = append(frame.UnsupportedKinds, result.unsupportedKinds...)
+	frame.IgnoredKinds = append(frame.IgnoredKinds, result.ignoredKinds...)
 	return frame, nil
 }
 
@@ -222,18 +258,30 @@ func decodeL2Message(ctx context.Context, raw []byte, depth int) (l2DecodeResult
 			return l2DecodeResult{transactions: []normalizer.RelayTx{tx}}, nil
 		}
 		if class == issueUnsupported {
-			return l2DecodeResult{unsupported: []string{err.Error()}}, nil
+			return l2DecodeResult{
+				unsupported:      []string{err.Error()},
+				unsupportedKinds: []MessageKind{{Layer: MessageLayerL2, Kind: raw[0]}},
+			}, nil
 		}
 		return l2DecodeResult{malformed: []string{err.Error()}}, nil
 	case L2MessageKindHeartbeat:
-		return l2DecodeResult{ignored: []string{"heartbeat L2 message"}}, nil
+		return l2DecodeResult{
+			ignored:      []string{"heartbeat L2 message"},
+			ignoredKinds: []MessageKind{{Layer: MessageLayerL2, Kind: raw[0]}},
+		}, nil
 	case L2MessageKindUnsignedUserTx,
 		L2MessageKindContractTx,
 		L2MessageKindNonmutatingCall,
 		L2MessageKindSignedCompressed:
-		return l2DecodeResult{unsupported: []string{fmt.Sprintf("unsupported L2 message kind 0x%02x", raw[0])}}, nil
+		return l2DecodeResult{
+			unsupported:      []string{fmt.Sprintf("unsupported L2 message kind 0x%02x", raw[0])},
+			unsupportedKinds: []MessageKind{{Layer: MessageLayerL2, Kind: raw[0]}},
+		}, nil
 	default:
-		return l2DecodeResult{unsupported: []string{fmt.Sprintf("unknown L2 message kind 0x%02x", raw[0])}}, nil
+		return l2DecodeResult{
+			unsupported:      []string{fmt.Sprintf("unknown L2 message kind 0x%02x", raw[0])},
+			unsupportedKinds: []MessageKind{{Layer: MessageLayerL2, Kind: raw[0]}},
+		}, nil
 	}
 }
 
@@ -265,6 +313,8 @@ func decodeL2Batch(ctx context.Context, payload []byte, depth int) (l2DecodeResu
 		result.unsupported = appendPrefixed(result.unsupported, nestedResult.unsupported, index)
 		result.malformed = appendPrefixed(result.malformed, nestedResult.malformed, index)
 		result.ignored = appendPrefixed(result.ignored, nestedResult.ignored, index)
+		result.unsupportedKinds = append(result.unsupportedKinds, nestedResult.unsupportedKinds...)
+		result.ignoredKinds = append(result.ignoredKinds, nestedResult.ignoredKinds...)
 	}
 	return result, nil
 }

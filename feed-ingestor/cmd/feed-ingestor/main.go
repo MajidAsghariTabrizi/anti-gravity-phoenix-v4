@@ -125,12 +125,12 @@ func runLineSource(ctx context.Context, input io.Reader, pub publisher.Publisher
 			continue
 		}
 		if result.Gap {
-			registry.Inc("feed_sequence_gaps_total")
-			registry.Add("feed_sequence_gap_messages_total", result.GapTo-result.GapFrom+1)
+			recordSequenceGap(registry, result.GapTo-result.GapFrom+1)
 			readiness.MarkSequenceGap()
 			log.Printf("feed_sequence_gap source=line gap_from=%d gap_to=%d", result.GapFrom, result.GapTo)
 		} else {
 			readiness.ClearSequenceGap()
+			registry.SetGauge("feed_data_completeness", 1)
 		}
 		registry.SetGauge("feed_last_sequence", float64(result.Sequence))
 		registry.SetGauge("feed_last_message_timestamp", float64(result.TimestampUnixMS))
@@ -254,8 +254,7 @@ func processRelayFrame(
 		registry.SetGauge("feed_readiness", 0)
 		return nil
 	case sequence.Gap:
-		registry.Inc("feed_sequence_gaps_total")
-		registry.Add("feed_sequence_gap_messages_total", observation.Missing)
+		recordSequenceGap(registry, observation.Missing)
 		readiness.MarkSequenceGap()
 		issueLogger.LogSequence(observation)
 	case sequence.Reconnect:
@@ -264,8 +263,10 @@ func processRelayFrame(
 
 	if state.HasUnresolvedGap() {
 		readiness.MarkSequenceGap()
+		registry.SetGauge("feed_data_completeness", 0)
 	} else {
 		readiness.ClearSequenceGap()
+		registry.SetGauge("feed_data_completeness", 1)
 	}
 	readiness.MarkSequenceKnown()
 	registry.SetGauge("feed_last_sequence", float64(frame.Sequence))
@@ -295,13 +296,23 @@ func relayLifecycleHandler(registry *metrics.Registry, readiness *metrics.Readin
 			registry.Inc("feed_connections_total")
 		case feed.RelayEventDisconnected:
 			readiness.MarkSourceDisconnected()
+			registry.SetGauge("feed_data_completeness", 0)
 			registry.SetGauge("feed_readiness", 0)
 		case feed.RelayEventReconnectAttempt:
 			readiness.MarkSourceDisconnected()
+			registry.SetGauge("feed_data_completeness", 0)
 			registry.SetGauge("feed_readiness", 0)
 			registry.Inc("feed_reconnects_total")
 		}
 	}
+}
+
+func recordSequenceGap(registry *metrics.Registry, missing uint64) {
+	registry.Inc("feed_sequence_gaps_total")
+	registry.Add("feed_sequence_gap_messages_total", missing)
+	registry.Add("feed_missing_sequences_total", missing)
+	registry.SetGauge("feed_last_gap_timestamp_seconds", float64(time.Now().Unix()))
+	registry.SetGauge("feed_data_completeness", 0)
 }
 
 func normalizeRelayTransactions(frame nitro.Frame) ([]normalizer.NormalizedTx, []string) {

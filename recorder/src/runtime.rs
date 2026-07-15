@@ -332,12 +332,16 @@ async fn persist_batch_with_retry(
     ack_health: &mut AckHealthTracker,
 ) -> Option<Vec<PersistOutcome>> {
     let mut delay = retry_policy.initial;
+    let mut failed_attempts = 0_u64;
     loop {
         let started = Instant::now();
         match store.persist_batch(messages).await {
             Ok(outcomes) => {
                 readiness.set_postgres_connected(true);
                 readiness.set_persistence_healthy(true);
+                if failed_attempts > 0 {
+                    metrics.database_retry_recovered();
+                }
                 metrics.batch_persisted(messages.len(), started.elapsed());
                 if let Some(suppressed) = sampler.sample("batch_persisted") {
                     tracing::info!(
@@ -349,7 +353,9 @@ async fn persist_batch_with_retry(
                 return Some(outcomes);
             }
             Err(error) => {
+                failed_attempts = failed_attempts.saturating_add(1);
                 metrics.database_failure();
+                metrics.database_retry();
                 readiness.set_postgres_connected(false);
                 readiness.set_persistence_healthy(false);
                 if let Some(suppressed) = sampler.sample("database_failure") {
@@ -427,6 +433,7 @@ pub async fn monitor_database(
 ) {
     let mut ticker = tokio::time::interval(interval);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut database_unhealthy = false;
     loop {
         tokio::select! {
             _ = shutdown.cancelled() => return,
@@ -435,9 +442,17 @@ pub async fn monitor_database(
                     Ok(()) => {
                         readiness.set_postgres_connected(true);
                         match store.verify_schema().await {
-                            Ok(()) => readiness.set_schema_verified(true),
+                            Ok(()) => {
+                                readiness.set_schema_verified(true);
+                                if database_unhealthy {
+                                    metrics.database_retry_recovered();
+                                    database_unhealthy = false;
+                                }
+                            }
                             Err(error) => {
+                                database_unhealthy = true;
                                 metrics.database_failure();
+                                metrics.database_retry();
                                 readiness.set_schema_verified(false);
                                 if let Some(suppressed) = sampler.sample("schema_verification_failure") {
                                     tracing::error!(
@@ -450,7 +465,9 @@ pub async fn monitor_database(
                         }
                     }
                     Err(error) => {
+                        database_unhealthy = true;
                         metrics.database_failure();
+                        metrics.database_retry();
                         readiness.set_postgres_connected(false);
                         if let Some(suppressed) = sampler.sample("postgres_unavailable") {
                             tracing::warn!(
@@ -794,12 +811,13 @@ mod tests {
         let store = FakeStore::new(vec![Err(StoreError::Connection), Ok(vec![inserted])]);
         let acker = Arc::new(FakeAcker::default());
         let readiness = ready_state();
+        let metrics = Metrics::default();
         let mut ack_health = AckHealthTracker::default();
         let result = process_delivery_batch(
             vec![delivery(1, 'a', 1, acker.clone())],
             &store,
             &readiness,
-            &Metrics::default(),
+            &metrics,
             &LogSampler::default(),
             &CancellationToken::new(),
             RetryPolicy {
@@ -813,6 +831,9 @@ mod tests {
         assert_eq!(store.calls.load(Ordering::Relaxed), 2);
         assert_eq!(acker.progress.load(Ordering::Relaxed), 1);
         assert_eq!(acker.ack.load(Ordering::Relaxed), 1);
+        let rendered = metrics.render(&readiness);
+        assert!(rendered.contains("recorder_database_retries_total 1"));
+        assert!(rendered.contains("recorder_database_retry_recoveries_total 1"));
     }
 
     #[tokio::test]

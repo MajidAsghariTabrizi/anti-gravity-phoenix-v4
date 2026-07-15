@@ -68,6 +68,8 @@ struct MetricValues {
     publish_success: AtomicU64,
     publish_failures: AtomicU64,
     retries: AtomicU64,
+    retry_recoveries: AtomicU64,
+    terminal_integrity_failures: AtomicU64,
     pending_rows: AtomicU64,
     oldest_pending_age_nanos: AtomicU64,
     batch_size: AtomicU64,
@@ -102,6 +104,18 @@ impl DispatcherMetrics {
         self.inner.retries.fetch_add(1, Ordering::Relaxed);
     }
 
+    pub fn retry_recovered(&self) {
+        self.inner
+            .retry_recoveries
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn terminal_integrity_failure(&self) {
+        self.inner
+            .terminal_integrity_failures
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
     pub fn set_pending(&self, state: PendingState) {
         self.inner.pending_rows.store(state.rows, Ordering::Relaxed);
         let nanos =
@@ -122,6 +136,10 @@ impl DispatcherMetrics {
                 "shadow_dispatcher_publish_failures_total {}\n",
                 "# TYPE shadow_dispatcher_retries_total counter\n",
                 "shadow_dispatcher_retries_total {}\n",
+                "# TYPE shadow_dispatcher_retry_recoveries_total counter\n",
+                "shadow_dispatcher_retry_recoveries_total {}\n",
+                "# TYPE shadow_dispatcher_terminal_integrity_failures_total counter\n",
+                "shadow_dispatcher_terminal_integrity_failures_total {}\n",
                 "# TYPE shadow_dispatcher_pending_rows gauge\n",
                 "shadow_dispatcher_pending_rows {}\n",
                 "# TYPE shadow_dispatcher_oldest_pending_age_seconds gauge\n",
@@ -137,6 +155,10 @@ impl DispatcherMetrics {
             self.inner.publish_success.load(Ordering::Relaxed),
             self.inner.publish_failures.load(Ordering::Relaxed),
             self.inner.retries.load(Ordering::Relaxed),
+            self.inner.retry_recoveries.load(Ordering::Relaxed),
+            self.inner
+                .terminal_integrity_failures
+                .load(Ordering::Relaxed),
             self.inner.pending_rows.load(Ordering::Relaxed),
             self.inner.oldest_pending_age_nanos.load(Ordering::Relaxed) as f64 / 1_000_000_000.0,
             self.inner.batch_size.load(Ordering::Relaxed),
@@ -290,9 +312,13 @@ pub async fn dispatch_once(
                     return Err(DispatcherError::Outbox(error));
                 }
                 metrics.publish_success(started.elapsed());
+                if row.publish_attempts > 1 {
+                    metrics.retry_recovered();
+                }
             }
             Err(error) if error.terminal() => {
                 metrics.publish_failure(started.elapsed());
+                metrics.terminal_integrity_failure();
                 readiness.mark_terminal_integrity();
                 return Err(DispatcherError::TerminalIntegrity);
             }
@@ -559,13 +585,14 @@ mod tests {
         };
         let readiness = DispatcherReadiness::new();
         ready_dependencies(&readiness);
+        let metrics = DispatcherMetrics::default();
         assert_eq!(
             dispatch_once(
                 &store,
                 &publisher,
                 &DispatchConfig::default(),
                 &readiness,
-                &DispatcherMetrics::default(),
+                &metrics,
             )
             .await,
             Err(DispatcherError::TerminalIntegrity)
@@ -574,6 +601,11 @@ mod tests {
         assert_eq!(
             readiness.ready(),
             Err("terminal Shadow Dispatcher integrity condition detected")
+        );
+        assert!(
+            metrics
+                .render(&readiness)
+                .contains("shadow_dispatcher_terminal_integrity_failures_total 1")
         );
     }
 
@@ -635,8 +667,13 @@ mod tests {
     async fn nats_outage_retries_the_same_claimed_identity_then_recovers() {
         let events = Arc::new(Mutex::new(Vec::new()));
         let event = row();
+        let mut retried_event = event.clone();
+        retried_event.publish_attempts = 2;
         let store = FakeStore {
-            claims: Mutex::new(VecDeque::from([Ok(vec![event.clone()]), Ok(vec![event])])),
+            claims: Mutex::new(VecDeque::from([
+                Ok(vec![event]),
+                Ok(vec![retried_event]),
+            ])),
             mark_result: Mutex::new(Ok(())),
             release_result: Mutex::new(Ok(())),
             events: events.clone(),
@@ -693,6 +730,7 @@ mod tests {
         let rendered = metrics.render(&readiness);
         assert!(rendered.contains("shadow_dispatcher_publish_failures_total 1"));
         assert!(rendered.contains("shadow_dispatcher_retries_total 1"));
+        assert!(rendered.contains("shadow_dispatcher_retry_recoveries_total 1"));
         assert!(rendered.contains("shadow_dispatcher_publish_success_total 1"));
     }
 
@@ -744,6 +782,8 @@ mod tests {
             "shadow_dispatcher_publish_success_total",
             "shadow_dispatcher_publish_failures_total",
             "shadow_dispatcher_retries_total",
+            "shadow_dispatcher_retry_recoveries_total",
+            "shadow_dispatcher_terminal_integrity_failures_total",
             "shadow_dispatcher_pending_rows",
             "shadow_dispatcher_oldest_pending_age_seconds",
             "shadow_dispatcher_batch_size",
