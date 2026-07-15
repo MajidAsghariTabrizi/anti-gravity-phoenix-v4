@@ -36,7 +36,7 @@ impl DependencyRetryPolicy {
     }
 
     pub fn engine_default() -> Result<Self, &'static str> {
-        Self::bounded(ENGINE_MAX_DELIVERIES as i64)
+        Self::bounded(ENGINE_MAX_DELIVERIES)
     }
 
     pub const fn max_deliveries(self) -> u64 {
@@ -45,6 +45,21 @@ impl DependencyRetryPolicy {
 
     const fn exhausted(self, delivery_attempt: u64) -> bool {
         delivery_attempt >= self.max_deliveries
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct ConsumerRuntimeConfig {
+    sampler: LogSampler,
+    retry_policy: DependencyRetryPolicy,
+}
+
+impl ConsumerRuntimeConfig {
+    pub fn new(sampler: LogSampler, retry_policy: DependencyRetryPolicy) -> Self {
+        Self {
+            sampler,
+            retry_policy,
+        }
     }
 }
 
@@ -71,10 +86,13 @@ pub async fn consume_engine_messages(
     processor: Arc<ShadowProcessor>,
     readiness: RuntimeReadiness,
     metrics: RuntimeMetrics,
-    sampler: LogSampler,
-    retry_policy: DependencyRetryPolicy,
+    config: ConsumerRuntimeConfig,
     shutdown: CancellationToken,
 ) -> RuntimeExit {
+    let ConsumerRuntimeConfig {
+        sampler,
+        retry_policy,
+    } = config;
     let mut last_state_refresh = Instant::now()
         .checked_sub(CONSUMER_STATE_REFRESH_INTERVAL)
         .unwrap_or_else(Instant::now);
@@ -360,7 +378,7 @@ fn dependency_exhausted_result(
 ) -> Result<ProcessResult, StoreError> {
     let first_started_at = first_failure
         .as_ref()
-        .map_or(current_started_at, |context| context.started_at.clone());
+        .map_or(current_started_at, |context| context.started_at);
     let first_delivery_attempt = first_failure
         .as_ref()
         .map_or(delivery_attempt, |context| context.delivery_attempt);
@@ -741,7 +759,7 @@ mod tests {
                     classification: record.classification,
                     detail_class: record.detail_class.map(str::to_string),
                     evidence: record.evidence.clone(),
-                    started_at: record.first_received_at.clone(),
+                    started_at: record.first_received_at,
                     delivery_attempt: record.delivery_attempt,
                 }))
         }
@@ -1484,8 +1502,7 @@ mod tests {
             processor,
             readiness.clone(),
             metrics.clone(),
-            LogSampler::new(Duration::ZERO),
-            policy,
+            ConsumerRuntimeConfig::new(LogSampler::new(Duration::ZERO), policy),
             shutdown,
         )
         .await;
@@ -1534,8 +1551,10 @@ mod tests {
             Arc::new(processor()),
             readiness.clone(),
             RuntimeMetrics::default(),
-            LogSampler::new(Duration::ZERO),
-            DependencyRetryPolicy::bounded(2).unwrap(),
+            ConsumerRuntimeConfig::new(
+                LogSampler::new(Duration::ZERO),
+                DependencyRetryPolicy::bounded(2).unwrap(),
+            ),
             shutdown,
         )
         .await;
@@ -1558,8 +1577,10 @@ mod tests {
             Arc::new(processor()),
             RuntimeReadiness::new(),
             RuntimeMetrics::default(),
-            LogSampler::default(),
-            DependencyRetryPolicy::engine_default().unwrap(),
+            ConsumerRuntimeConfig::new(
+                LogSampler::default(),
+                DependencyRetryPolicy::engine_default().unwrap(),
+            ),
             shutdown,
         )
         .await;

@@ -7,7 +7,9 @@ use phoenix_engine::origin::{reviewed_router_kind, REVIEWED_ROUTER_ADDRESSES};
 use phoenix_engine::persistence::{PostgresShadowStore, ShadowStore};
 use phoenix_engine::readiness::initialize_runtime;
 use phoenix_engine::rpc_evaluator::{RpcCandidateEvaluator, RpcGatewayClient, ShadowStateClient};
-use phoenix_engine::runtime::{consume_engine_messages, DependencyRetryPolicy, RuntimeExit};
+use phoenix_engine::runtime::{
+    consume_engine_messages, ConsumerRuntimeConfig, DependencyRetryPolicy, RuntimeExit,
+};
 use phoenix_engine::runtime_state::RuntimeReadiness;
 use phoenix_engine::shadow_processor::{RouteRegistry, ShadowProcessor};
 use phoenix_recorder::engine_stream::{
@@ -253,8 +255,7 @@ async fn run_daemon() -> Result<(), &'static str> {
             processor.clone(),
             readiness.clone(),
             metrics.clone(),
-            sampler.clone(),
-            config.dependency_retry_policy,
+            ConsumerRuntimeConfig::new(sampler.clone(), config.dependency_retry_policy),
             shutdown.clone(),
         )
         .await;
