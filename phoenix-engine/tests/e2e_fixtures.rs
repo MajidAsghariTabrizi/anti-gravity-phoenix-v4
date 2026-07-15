@@ -179,6 +179,7 @@ fn profitable_fixture_reaches_shadow_sink_and_dynamic_sizing() {
             chain_id: 42161,
             source_sequence: event.origin_sequence.0,
             origin_tx_hash: event.origin_tx_hash,
+            origin_router: event.router,
             observed_block: 1,
             observed_at_unix_ms: 1_700_000_000_000,
             detected_at_unix_ms: 1_700_000_000_001,
@@ -196,6 +197,10 @@ fn profitable_fixture_reaches_shadow_sink_and_dynamic_sizing() {
                 .iter()
                 .map(|leg| leg.pool_id.clone())
                 .collect(),
+            pool_addresses: vec![
+                address("0x3333333333333333333333333333333333333333"),
+                address("0x4444444444444444444444444444444444444444"),
+            ],
             protocols: routes[0]
                 .legs
                 .iter()
@@ -211,6 +216,16 @@ fn profitable_fixture_reaches_shadow_sink_and_dynamic_sizing() {
                     .checked_add(u128::try_from(optimized.gross_profit).unwrap())
                     .unwrap(),
             ),
+            expected_leg_outputs: vec![
+                Amount(750),
+                Amount(
+                    optimized
+                        .best_amount
+                        .0
+                        .checked_add(u128::try_from(optimized.gross_profit).unwrap())
+                        .unwrap(),
+                ),
+            ],
             exact_ordered_legs: routes[0].legs.clone(),
         },
         market: MarketEvidence {

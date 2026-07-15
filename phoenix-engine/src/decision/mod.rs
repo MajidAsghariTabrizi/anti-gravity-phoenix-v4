@@ -216,6 +216,8 @@ mod tests {
                 chain_id: 42161,
                 source_sequence: 1,
                 origin_tx_hash: TxHash("0x01".to_string()),
+                origin_router: Address::parse("0x68b3465833fb72a70ecdf485e0e4c7bd8665fc45")
+                    .unwrap(),
                 observed_block: 100,
                 observed_at_unix_ms: 1_000,
                 detected_at_unix_ms: 1_001,
@@ -225,11 +227,15 @@ mod tests {
                 route_fingerprint: "route-fingerprint".to_string(),
                 token_path: vec![token0.clone(), token1.clone()],
                 pools: vec![PoolId("pool-1".to_string())],
+                pool_addresses: vec![
+                    Address::parse("0x3333333333333333333333333333333333333333").unwrap()
+                ],
                 protocols: vec!["UniswapV3".to_string()],
                 input_token: token0,
                 output_token: token1,
                 input_amount: Amount(1_000),
                 expected_output: Amount(1_100),
+                expected_leg_outputs: vec![Amount(1_100)],
                 exact_ordered_legs: Route {
                     route_id: RouteId("route-1".to_string()),
                     legs: vec![leg],

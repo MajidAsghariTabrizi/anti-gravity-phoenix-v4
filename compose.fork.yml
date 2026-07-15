@@ -1,0 +1,114 @@
+name: phoenix-fork-sandbox
+
+services:
+  fork-postgres:
+    profiles: ["fork-sandbox"]
+    image: postgres@sha256:57c72fd2a128e416c7fcc499958864df5301e940bca0a56f58fddf30ffc07777
+    environment:
+      POSTGRES_USER: phoenix_fork
+      POSTGRES_PASSWORD: ${FORK_POSTGRES_PASSWORD:?FORK_POSTGRES_PASSWORD is required}
+      POSTGRES_DB: phoenix_fork
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U phoenix_fork -d phoenix_fork"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    networks: [fork-data]
+    volumes:
+      - fork-postgres-data:/var/lib/postgresql/data
+    restart: "no"
+
+  fork-migrations:
+    profiles: ["fork-sandbox"]
+    build:
+      context: .
+      dockerfile: deploy/feed-ingestor.Dockerfile
+    entrypoint: ["/usr/local/bin/migration-runner"]
+    environment:
+      POSTGRES_DSN: postgres://phoenix_fork:${FORK_POSTGRES_PASSWORD:?FORK_POSTGRES_PASSWORD is required}@fork-postgres:5432/phoenix_fork?sslmode=disable
+      MIGRATIONS_DIR: /app/migrations
+    depends_on:
+      fork-postgres:
+        condition: service_healthy
+    networks: [fork-data]
+    read_only: true
+    tmpfs: [/tmp]
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    restart: "no"
+
+  anvil:
+    profiles: ["fork-sandbox"]
+    image: ghcr.io/foundry-rs/foundry@sha256:${FORK_ANVIL_DIGEST:?FORK_ANVIL_DIGEST is required}
+    entrypoint: ["anvil"]
+    command:
+      - --host
+      - 127.0.0.1
+      - --port
+      - "8545"
+      - --chain-id
+      - "42161"
+      - --fork-url
+      - ${FORK_UPSTREAM_RPC_URL:?FORK_UPSTREAM_RPC_URL is required}
+      - --fork-block-number
+      - ${FORK_BLOCK_NUMBER:?FORK_BLOCK_NUMBER is required}
+      - --no-mining
+    healthcheck:
+      test: ["CMD", "cast", "block-number", "--rpc-url", "http://127.0.0.1:8545"]
+      interval: 2s
+      timeout: 2s
+      retries: 45
+    networks: [fork-data, fork-upstream]
+    tmpfs: [/tmp]
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    restart: "no"
+
+  fork-sandbox:
+    profiles: ["fork-sandbox"]
+    build:
+      context: .
+      dockerfile: deploy/fork-sandbox.Dockerfile
+    environment:
+      PHOENIX_FORK_MODE: isolated-anvil
+      PHOENIX_MODE: SHADOW
+      LIVE_EXECUTION: "false"
+      SIGNER_PRIVATE_KEY: ""
+      PRIVATE_KEY: ""
+      MNEMONIC: ""
+      WALLET_ADDRESS: ""
+      EXECUTOR_ADDRESS: ""
+      DATABASE_URL: postgres://phoenix_fork:${FORK_POSTGRES_PASSWORD:?FORK_POSTGRES_PASSWORD is required}@fork-postgres:5432/phoenix_fork?sslmode=disable
+      DATABASE_SSL_MODE: disable
+      FORK_RPC_URL: http://127.0.0.1:8545
+      FORK_ALLOWED_TOKENS: ${FORK_ALLOWED_TOKENS:?FORK_ALLOWED_TOKENS is required}
+      FORK_ALLOWED_POOLS: ${FORK_ALLOWED_POOLS:?FORK_ALLOWED_POOLS is required}
+      FORK_ALLOWED_ROUTERS: ${FORK_ALLOWED_ROUTERS:?FORK_ALLOWED_ROUTERS is required}
+      FORK_ALLOWED_PROTOCOLS: ${FORK_ALLOWED_PROTOCOLS:?FORK_ALLOWED_PROTOCOLS is required}
+      FORK_TARGET_CONTRACT: ${FORK_TARGET_CONTRACT:?FORK_TARGET_CONTRACT is required}
+      FORK_TARGET_CODE_HASH: ${FORK_TARGET_CODE_HASH:?FORK_TARGET_CODE_HASH is required}
+      FORK_SIMULATION_FROM: ${FORK_SIMULATION_FROM:?FORK_SIMULATION_FROM is required}
+      FORK_MINIMUM_NET_PNL: ${FORK_MINIMUM_NET_PNL:?FORK_MINIMUM_NET_PNL is required}
+      FORK_MAXIMUM_INPUT_AMOUNT: ${FORK_MAXIMUM_INPUT_AMOUNT:?FORK_MAXIMUM_INPUT_AMOUNT is required}
+      FORK_SLIPPAGE_BPS: ${FORK_SLIPPAGE_BPS:?FORK_SLIPPAGE_BPS is required}
+      FORK_MAXIMUM_CALLDATA_BYTES: ${FORK_MAXIMUM_CALLDATA_BYTES:-65536}
+    command: ["run", "--decision-id", "${FORK_SHADOW_DECISION_ID:?FORK_SHADOW_DECISION_ID is required}"]
+    depends_on:
+      anvil:
+        condition: service_healthy
+      fork-migrations:
+        condition: service_completed_successfully
+    network_mode: "service:anvil"
+    read_only: true
+    tmpfs: [/tmp]
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    restart: "no"
+
+networks:
+  fork-data:
+    internal: true
+  fork-upstream:
+
+volumes:
+  fork-postgres-data:

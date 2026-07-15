@@ -1,0 +1,48 @@
+[
+  {
+    "type": "function",
+    "name": "executeOpportunity",
+    "stateMutability": "nonpayable",
+    "inputs": [
+      {
+        "name": "op",
+        "type": "tuple",
+        "components": [
+          { "name": "routeId", "type": "bytes32" },
+          { "name": "originRouter", "type": "address" },
+          { "name": "recipient", "type": "address" },
+          { "name": "flashAsset", "type": "address" },
+          { "name": "flashAmount", "type": "uint256" },
+          { "name": "maxInputAmount", "type": "uint256" },
+          { "name": "minProfit", "type": "uint256" },
+          { "name": "deadline", "type": "uint256" },
+          {
+            "name": "legs",
+            "type": "tuple[]",
+            "components": [
+              { "name": "pool", "type": "address" },
+              { "name": "tokenIn", "type": "address" },
+              { "name": "tokenOut", "type": "address" },
+              { "name": "fee", "type": "uint24" },
+              { "name": "zeroForOne", "type": "bool" },
+              { "name": "minAmountOut", "type": "uint256" }
+            ]
+          }
+        ]
+      }
+    ],
+    "outputs": []
+  },
+  {
+    "type": "event",
+    "name": "OpportunitySettled",
+    "anonymous": false,
+    "inputs": [
+      { "name": "routeId", "type": "bytes32", "indexed": true },
+      { "name": "asset", "type": "address", "indexed": true },
+      { "name": "flashAmount", "type": "uint256", "indexed": false },
+      { "name": "premium", "type": "uint256", "indexed": false },
+      { "name": "realizedProfit", "type": "uint256", "indexed": false }
+    ]
+  }
+]
