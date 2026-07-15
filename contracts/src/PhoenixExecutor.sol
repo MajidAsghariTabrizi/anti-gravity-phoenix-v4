@@ -39,6 +39,7 @@ contract PhoenixExecutor is IAaveFlashBorrower {
     event OpportunitySettled(
         bytes32 indexed routeId, address indexed asset, uint256 flashAmount, uint256 premium, uint256 realizedProfit
     );
+
     struct Leg {
         address pool;
         address tokenIn;
