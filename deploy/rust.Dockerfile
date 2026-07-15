@@ -6,6 +6,7 @@ COPY rpc-gateway ./rpc-gateway
 COPY recorder ./recorder
 COPY replay ./replay
 COPY fixtures/routes ./fixtures/routes
+COPY fixtures/engine ./fixtures/engine
 COPY migrations ./migrations
 COPY deploy/nats-server.conf ./deploy/nats-server.conf
 COPY scripts/recorder-live-smoke.sh ./scripts/recorder-live-smoke.sh

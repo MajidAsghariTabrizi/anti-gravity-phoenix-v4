@@ -277,10 +277,8 @@ LIMIT 1
         let classification = EngineClassification::parse(&value).ok_or(StoreError::Integrity)?;
         let detail_class: Option<String> =
             row.try_get("error_class").map_err(classify_sqlx_error)?;
-        let Json(evidence): Json<Value> =
-            row.try_get("evidence").map_err(classify_sqlx_error)?;
-        let started_at: DateTime<Utc> =
-            row.try_get("started_at").map_err(classify_sqlx_error)?;
+        let Json(evidence): Json<Value> = row.try_get("evidence").map_err(classify_sqlx_error)?;
+        let started_at: DateTime<Utc> = row.try_get("started_at").map_err(classify_sqlx_error)?;
         let delivery_attempt: i64 = row
             .try_get("delivery_attempt")
             .map_err(classify_sqlx_error)?;
@@ -1136,9 +1134,7 @@ fn bounded_text(value: &str, minimum: usize, maximum: usize) -> bool {
     value.len() >= minimum && value.len() <= maximum && !value.chars().any(char::is_control)
 }
 
-fn validate_dependency_exhausted_evidence(
-    record: &ClassificationRecord,
-) -> Result<(), StoreError> {
+fn validate_dependency_exhausted_evidence(record: &ClassificationRecord) -> Result<(), StoreError> {
     let evidence = &record.evidence;
     let first_failure_at = evidence
         .get("first_failure_at")
@@ -1179,8 +1175,7 @@ fn validate_dependency_exhausted_evidence(
             != Some(record.identity.source_event_identity.as_str())
         || evidence.get("source_sequence").and_then(Value::as_u64)
             != Some(record.identity.source_sequence)
-        || evidence.get("tx_hash").and_then(Value::as_str)
-            != Some(record.identity.tx_hash.as_str())
+        || evidence.get("tx_hash").and_then(Value::as_str) != Some(record.identity.tx_hash.as_str())
         || evidence
             .get("original_classification")
             .and_then(Value::as_str)
@@ -1252,9 +1247,7 @@ fn classify_sqlx_error(error: sqlx::Error) -> StoreError {
     match error {
         sqlx::Error::Configuration(_) => StoreError::Configuration,
         sqlx::Error::Database(database)
-            if database
-                .code()
-                .is_some_and(|code| code.starts_with("23")) =>
+            if database.code().is_some_and(|code| code.starts_with("23")) =>
         {
             StoreError::Integrity
         }
@@ -1313,8 +1306,7 @@ mod tests {
             "shadow_engine_classifications".to_string(),
             vec![
                 "CHECK ((chain_id = 42161))".to_string(),
-                "CHECK ((classification = ANY (... 'dependency_exhausted'::text ...)))"
-                    .to_string(),
+                "CHECK ((classification = ANY (... 'dependency_exhausted'::text ...)))".to_string(),
                 "CHECK ((octet_length((evidence)::text) <= 1048576))".to_string(),
             ],
         );

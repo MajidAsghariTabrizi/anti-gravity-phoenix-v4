@@ -371,9 +371,10 @@ fn dependency_exhausted_result(
         .as_ref()
         .and_then(|context| context.detail_class.as_deref())
         .unwrap_or(result.detail_class);
-    let original_evidence = first_failure
-        .as_ref()
-        .map_or_else(|| result.evidence.clone(), |context| context.evidence.clone());
+    let original_evidence = first_failure.as_ref().map_or_else(
+        || result.evidence.clone(),
+        |context| context.evidence.clone(),
+    );
     let route_fingerprints = result
         .evidence
         .get("route_fingerprints")
@@ -514,7 +515,14 @@ async fn handle_store_failure(
     );
     sampled_store_failure(sampler, failure_class, error);
     if terminal {
-        acknowledge(delivery, ProcessingAction::Terminate, readiness, sampler, true).await
+        acknowledge(
+            delivery,
+            ProcessingAction::Terminate,
+            readiness,
+            sampler,
+            true,
+        )
+        .await
     } else {
         progress_without_ack(delivery, readiness, sampler).await
     }
@@ -726,8 +734,7 @@ mod tests {
                 .iter()
                 .filter(|record| {
                     record.identity.source_event_identity == source_event_identity
-                        && record.classification
-                            == EngineClassification::TransientDependencyFailure
+                        && record.classification == EngineClassification::TransientDependencyFailure
                 })
                 .min_by_key(|record| record.delivery_attempt)
                 .map(|record| DependencyFailureContext {
@@ -1212,10 +1219,7 @@ mod tests {
             "../../fixtures/engine/dependency_exhaustion_soak.json"
         ))
         .unwrap();
-        assert_eq!(
-            fixture.schema_version,
-            "phoenix.engine.dependency-soak.v1"
-        );
+        assert_eq!(fixture.schema_version, "phoenix.engine.dependency-soak.v1");
         assert!(fixture.duplicate_exhausted);
         let recovered_start = 30_000_u64;
         let exhausted_sequence = 40_000_u64;
@@ -1236,12 +1240,7 @@ mod tests {
 
         for offset in 0..fixture.normal_before {
             let disposition = run_with(
-                delivery(
-                    events.clone(),
-                    normal_payload(10_000 + offset),
-                    1,
-                    false,
-                ),
+                delivery(events.clone(), normal_payload(10_000 + offset), 1, false),
                 &store,
                 &processor,
                 &readiness,
@@ -1253,12 +1252,7 @@ mod tests {
         }
         for offset in 0..fixture.route_candidates {
             let disposition = run_with(
-                delivery(
-                    events.clone(),
-                    route_payload(20_000 + offset),
-                    1,
-                    false,
-                ),
+                delivery(events.clone(), route_payload(20_000 + offset), 1, false),
                 &store,
                 &processor,
                 &readiness,
@@ -1306,12 +1300,7 @@ mod tests {
         }
         for offset in 0..fixture.normal_after {
             let disposition = run_with(
-                delivery(
-                    events.clone(),
-                    normal_payload(50_000 + offset),
-                    1,
-                    false,
-                ),
+                delivery(events.clone(), normal_payload(50_000 + offset), 1, false),
                 &store,
                 &processor,
                 &readiness,
@@ -1343,10 +1332,8 @@ mod tests {
             .iter()
             .map(|record| record.classification)
             .collect::<Vec<_>>();
-        let mut expected = vec![
-            EngineClassification::NoRelevantRoute;
-            fixture.normal_before as usize
-        ];
+        let mut expected =
+            vec![EngineClassification::NoRelevantRoute; fixture.normal_before as usize];
         expected.extend(vec![
             EngineClassification::CandidateRejected;
             fixture.route_candidates as usize
@@ -1365,7 +1352,10 @@ mod tests {
         drop(records);
 
         let events = events.lock().unwrap();
-        assert_eq!(events.iter().filter(|event| **event == "persist").count(), 210);
+        assert_eq!(
+            events.iter().filter(|event| **event == "persist").count(),
+            210
+        );
         assert_eq!(events.iter().filter(|event| **event == "ack").count(), 186);
         assert_eq!(events.iter().filter(|event| **event == "nak").count(), 25);
         assert_eq!(events.iter().filter(|event| **event == "term").count(), 0);
@@ -1513,7 +1503,10 @@ mod tests {
             .map(|record| record.classification)
             .collect::<Vec<_>>();
         assert!(classifications.contains(&EngineClassification::DependencyExhausted));
-        assert_eq!(classifications.last(), Some(&EngineClassification::NoRelevantRoute));
+        assert_eq!(
+            classifications.last(),
+            Some(&EngineClassification::NoRelevantRoute)
+        );
         assert_eq!(readiness.ready(), Ok(()));
         assert!(metrics
             .render(&readiness)
