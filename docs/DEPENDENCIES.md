@@ -7,6 +7,7 @@ This file records protocol-critical source references and versions. Do not add a
 - Official source: Offchain Labs Nitro GitHub repository.
 - Verified release page: `https://github.com/OffchainLabs/nitro/releases/tag/v3.11.2`.
 - Verified Docker image from the release notes: `offchainlabs/nitro-node:v3.11.2-3599aca`.
+- Production manifest-list digest: `sha256:ebc985e3b105980734630744981e1542001c22d74cba57509fe0d5ed8bb84c14`.
 - Release date shown by GitHub: 2026-07-06.
 - Chain id: `42161` for Arbitrum One.
 - Support policy source: Nitro repository README currently lists supported versions and notes the current minor support policy.
@@ -22,6 +23,19 @@ This file records protocol-critical source references and versions. Do not add a
 The live relay command still requires a Linux host and operator validation against current Arbitrum node flags. Phoenix does not let individual services connect independently to the upstream public feed.
 
 Current feed-ingestor status: Nitro relay mode is implemented for first runtime verification with a version-pinned WebSocket/envelope adapter and Arbitrum unsigned transaction payload support. Production relay mode remains blocked by startup guard until the adapter is live-verified against the real Arbitrum feed and unsupported payload coverage is resolved. See `docs/NITRO_FEED_INTEGRATION.md`.
+
+## Production Infrastructure Images
+
+The production Compose contract pins multi-platform manifest digests rather
+than resolving mutable tags at deploy time:
+
+- NATS `2.10-alpine`: `sha256:b83efabe3e7def1e0a4a31ec6e078999bb17c80363f881df35edc70fcb6bb927`
+- PostgreSQL `16-alpine`: `sha256:57c72fd2a128e416c7fcc499958864df5301e940bca0a56f58fddf30ffc07777`
+- Prometheus `v2.53.0`: `sha256:075b1ba2c4ebb04bc3a6ab86c06ec8d8099f8fda1c96ef6d104d9bb1def1d8bc`
+
+Changing one of these digests is a reviewed dependency update. Phoenix-owned
+images remain bound to the exact merged Git SHA and registry digest through
+`phoenix.release.v1`.
 
 ## Uniswap V3 on Arbitrum One
 
