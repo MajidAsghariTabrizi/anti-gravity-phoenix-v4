@@ -37,6 +37,7 @@ async fn apply_migrations(pool: &PgPool) {
         include_str!("../../migrations/003_shadow_profitability_evidence.sql"),
         include_str!("../../migrations/004_shadow_engine_runtime.sql"),
         include_str!("../../migrations/005_shadow_decision_identity.sql"),
+        include_str!("../../migrations/006_dependency_exhaustion_quarantine.sql"),
     ] {
         sqlx::raw_sql(migration)
             .execute(pool)
@@ -318,4 +319,36 @@ DROP FUNCTION phoenix_test_reject_rpc_quality();
     .execute(&pool)
     .await
     .expect("remove Engine integration rollback trigger");
+
+    let mut transient = record('4', "44444444-4444-8444-8444-444444444444");
+    transient.classification = EngineClassification::TransientDependencyFailure;
+    transient.detail_class = Some("rpc_gateway_unavailable");
+    transient.decision_count = 0;
+    transient.evaluations.clear();
+    transient.evidence = json!({
+        "route_fingerprints": ["two-pool-v1"],
+        "dependency_failure_class": "rpc_gateway_unavailable"
+    });
+    assert_eq!(
+        store.persist_classification(&transient).await,
+        Ok(PersistOutcome::Committed)
+    );
+    let context = store
+        .dependency_failure_context(&transient.identity.source_event_identity)
+        .await
+        .expect("load first dependency failure")
+        .expect("dependency failure context exists");
+    assert_eq!(
+        context.classification,
+        EngineClassification::TransientDependencyFailure
+    );
+    assert_eq!(
+        context.detail_class.as_deref(),
+        Some("rpc_gateway_unavailable")
+    );
+    assert_eq!(context.delivery_attempt, 1);
+    assert_eq!(
+        context.evidence["dependency_failure_class"],
+        "rpc_gateway_unavailable"
+    );
 }

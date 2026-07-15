@@ -16,6 +16,7 @@ pub enum EngineClassification {
     MalformedInternalEvent,
     UnsupportedSchema,
     TransientDependencyFailure,
+    DependencyExhausted,
     TerminalIntegrityFailure,
 }
 
@@ -29,6 +30,7 @@ impl EngineClassification {
             Self::MalformedInternalEvent => "malformed_internal_event",
             Self::UnsupportedSchema => "unsupported_schema",
             Self::TransientDependencyFailure => "transient_dependency_failure",
+            Self::DependencyExhausted => "dependency_exhausted",
             Self::TerminalIntegrityFailure => "terminal_integrity_failure",
         }
     }
@@ -42,6 +44,7 @@ impl EngineClassification {
             "malformed_internal_event" => Some(Self::MalformedInternalEvent),
             "unsupported_schema" => Some(Self::UnsupportedSchema),
             "transient_dependency_failure" => Some(Self::TransientDependencyFailure),
+            "dependency_exhausted" => Some(Self::DependencyExhausted),
             "terminal_integrity_failure" => Some(Self::TerminalIntegrityFailure),
             _ => None,
         }
@@ -314,6 +317,7 @@ mod tests {
             EngineClassification::MalformedInternalEvent,
             EngineClassification::UnsupportedSchema,
             EngineClassification::TransientDependencyFailure,
+            EngineClassification::DependencyExhausted,
             EngineClassification::TerminalIntegrityFailure,
         ] {
             assert_eq!(

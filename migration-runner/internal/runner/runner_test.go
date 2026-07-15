@@ -88,6 +88,31 @@ func TestShadowDecisionIdentityMigrationRemovesOnlyLegacyCollisionKey(t *testing
 	}
 }
 
+func TestDependencyExhaustionMigrationOnlyExtendsClassificationChecks(t *testing.T) {
+	migrationPath := filepath.Join("..", "..", "..", "migrations", "006_dependency_exhaustion_quarantine.sql")
+	content, err := os.ReadFile(migrationPath)
+	if err != nil {
+		t.Fatalf("read dependency exhaustion migration: %v", err)
+	}
+	sqlText := strings.ToUpper(string(content))
+	for _, required := range []string{
+		"ALTER TABLE SHADOW_ENGINE_CLASSIFICATIONS",
+		"ALTER TABLE SHADOW_ENGINE_PROCESSING_ATTEMPTS",
+		"DEPENDENCY_EXHAUSTED",
+		"TRANSIENT_DEPENDENCY_FAILURE",
+		"TERMINAL_INTEGRITY_FAILURE",
+	} {
+		if !strings.Contains(sqlText, required) {
+			t.Fatalf("migration missing %q", required)
+		}
+	}
+	for _, destructive := range []string{"DROP TABLE", "DROP COLUMN", "TRUNCATE TABLE", "DELETE FROM"} {
+		if strings.Contains(sqlText, destructive) {
+			t.Fatalf("migration contains destructive statement %q", destructive)
+		}
+	}
+}
+
 func TestLoadMigrationsOrdersByVersion(t *testing.T) {
 	dir := t.TempDir()
 	writeMigration(t, dir, "002_second.sql", "SELECT 2;")

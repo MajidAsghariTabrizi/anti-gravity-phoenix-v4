@@ -1,5 +1,9 @@
 # Runbook
 
+Engine dependency retry exhaustion is handled by the bounded SHADOW quarantine contract in
+[`ENGINE_DEPENDENCY_EXHAUSTION.md`](ENGINE_DEPENDENCY_EXHAUSTION.md). Treat
+`dependency_exhausted` as an unresolved dependency outcome, never as recovery or profitability.
+
 Production default:
 
 - `PHOENIX_MODE=SHADOW`
