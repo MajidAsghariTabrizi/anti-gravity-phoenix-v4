@@ -42,6 +42,7 @@ async fn apply_migrations(pool: &PgPool) {
         include_str!("../../migrations/007_canonical_profitability_truth.sql"),
         include_str!("../../migrations/008_shadow_route_discovery_indexes.sql"),
         include_str!("../../migrations/009_profit_triggered_secondary_verification.sql"),
+        include_str!("../../migrations/010_fork_simulation_evidence.sql"),
     ] {
         sqlx::raw_sql(migration)
             .execute(pool)
@@ -86,6 +87,8 @@ fn evaluation(hash_byte: char, opportunity_id: &str) -> EvaluatedOpportunity {
                 chain_id: 42161,
                 source_sequence: 7,
                 origin_tx_hash: TxHash(tx_hash),
+                origin_router: Address::parse("0x68b3465833fb72a70ecdf485e0e4c7bd8665fc45")
+                    .unwrap(),
                 observed_block: 100,
                 observed_at_unix_ms: 1_700_000_000_000,
                 detected_at_unix_ms: 1_700_000_000_001,
@@ -95,11 +98,16 @@ fn evaluation(hash_byte: char, opportunity_id: &str) -> EvaluatedOpportunity {
                 route_fingerprint: "two-pool-v1".to_string(),
                 token_path: vec![token0.clone(), token1.clone(), token0.clone()],
                 pools: vec![first_pool.clone(), second_pool.clone()],
+                pool_addresses: vec![
+                    Address::parse("0x3333333333333333333333333333333333333333").unwrap(),
+                    Address::parse("0x4444444444444444444444444444444444444444").unwrap(),
+                ],
                 protocols: vec!["UniswapV3".to_string(), "SushiSwapV3".to_string()],
                 input_token: token0.clone(),
                 output_token: token0.clone(),
                 input_amount: Amount(100),
                 expected_output: Amount(200),
+                expected_leg_outputs: vec![Amount(150), Amount(200)],
                 exact_ordered_legs: vec![
                     PoolEdge {
                         pool_id: first_pool.clone(),
@@ -252,7 +260,7 @@ async fn full_decision_commit_is_atomic_idempotent_and_source_scoped() {
         .expect("connect Engine integration PostgreSQL");
     apply_migrations(&pool).await;
     sqlx::query(
-        "TRUNCATE shadow_profitability_facts, rpc_quality_records, shadow_decisions, \
+        "TRUNCATE fork_simulation_results, shadow_profitability_facts, rpc_quality_records, shadow_decisions, \
          shadow_engine_processing_attempts, shadow_engine_classifications CASCADE",
     )
     .execute(&pool)
@@ -322,7 +330,15 @@ SELECT gross_spread::text AS gross_spread,
        route_config_hash,
        independent_verification_status,
        independent_verification_lifecycle,
-       verification_skip_reason
+       verification_skip_reason,
+       origin_router,
+       pool_address_path,
+       protocol_path,
+       direction_path,
+       expected_leg_outputs,
+       pool_state_hash_path,
+       opportunity_expires_at,
+       fork_evidence_schema_version
 FROM shadow_profitability_facts
 WHERE shadow_decision_id = CAST($1 AS uuid)
 "#,
@@ -383,6 +399,56 @@ WHERE shadow_decision_id = CAST($1 AS uuid)
             .try_get::<String, _>("verification_skip_reason")
             .unwrap(),
         "primary_screen_no_profitable_candidate"
+    );
+    assert_eq!(
+        canonical.try_get::<String, _>("origin_router").unwrap(),
+        "0x68b3465833fb72a70ecdf485e0e4c7bd8665fc45"
+    );
+    assert_eq!(
+        canonical
+            .try_get::<serde_json::Value, _>("pool_address_path")
+            .unwrap(),
+        json!([
+            "0x3333333333333333333333333333333333333333",
+            "0x4444444444444444444444444444444444444444"
+        ])
+    );
+    assert_eq!(
+        canonical
+            .try_get::<serde_json::Value, _>("protocol_path")
+            .unwrap(),
+        json!(["UniswapV3", "SushiSwapV3"])
+    );
+    assert_eq!(
+        canonical
+            .try_get::<serde_json::Value, _>("direction_path")
+            .unwrap(),
+        json!(["zero_for_one", "one_for_zero"])
+    );
+    assert_eq!(
+        canonical
+            .try_get::<serde_json::Value, _>("expected_leg_outputs")
+            .unwrap(),
+        json!(["150", "200"])
+    );
+    assert_eq!(
+        canonical
+            .try_get::<serde_json::Value, _>("pool_state_hash_path")
+            .unwrap(),
+        json!(["b".repeat(64), "c".repeat(64)])
+    );
+    assert_eq!(
+        canonical
+            .try_get::<chrono::DateTime<chrono::Utc>, _>("opportunity_expires_at")
+            .unwrap()
+            .timestamp_millis(),
+        1_700_000_002_000
+    );
+    assert_eq!(
+        canonical
+            .try_get::<String, _>("fork_evidence_schema_version")
+            .unwrap(),
+        "phoenix.fork-evidence.v1"
     );
 
     let mut plan_transaction = pool.begin().await.expect("begin query-plan check");

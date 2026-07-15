@@ -311,6 +311,8 @@ fn build_opportunity(
             chain_id: 42161,
             source_sequence: case.source_sequence,
             origin_tx_hash: TxHash(format!("fixture-{}", case.case_id)),
+            origin_router: Address::parse("0x68b3465833fb72a70ecdf485e0e4c7bd8665fc45")
+                .map_err(|_| ReplayError::InvalidAddress)?,
             observed_block: case.observed_block,
             observed_at_unix_ms: case.observed_at_unix_ms,
             detected_at_unix_ms: case.detected_at_unix_ms,
@@ -320,11 +322,14 @@ fn build_opportunity(
             route_fingerprint: "fixture-two-pool-route-v1".to_string(),
             token_path: vec![token0.clone(), token1.clone()],
             pools: vec![pool.clone()],
+            pool_addresses: vec![Address::parse("0x3333333333333333333333333333333333333333")
+                .map_err(|_| ReplayError::InvalidAddress)?],
             protocols: vec!["UniswapV3".to_string()],
             input_token: token0,
             output_token: token1,
             input_amount: Amount(case.principal),
             expected_output: Amount(case.gross_output),
+            expected_leg_outputs: vec![Amount(case.gross_output)],
             exact_ordered_legs: vec![leg],
         },
         market: MarketEvidence {

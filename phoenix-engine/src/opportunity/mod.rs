@@ -1,4 +1,4 @@
-use crate::domain::{Amount, OpportunityId, PoolId, RouteId, TokenAddress, TxHash};
+use crate::domain::{Address, Amount, OpportunityId, PoolId, RouteId, TokenAddress, TxHash};
 use crate::graph::PoolEdge;
 use serde::Serialize;
 
@@ -37,6 +37,7 @@ pub struct OpportunityIdentity {
     pub chain_id: u64,
     pub source_sequence: u64,
     pub origin_tx_hash: TxHash,
+    pub origin_router: Address,
     pub observed_block: u64,
     pub observed_at_unix_ms: u64,
     pub detected_at_unix_ms: u64,
@@ -48,11 +49,13 @@ pub struct RouteEvidence {
     pub route_fingerprint: String,
     pub token_path: Vec<TokenAddress>,
     pub pools: Vec<PoolId>,
+    pub pool_addresses: Vec<Address>,
     pub protocols: Vec<String>,
     pub input_token: TokenAddress,
     pub output_token: TokenAddress,
     pub input_amount: Amount,
     pub expected_output: Amount,
+    pub expected_leg_outputs: Vec<Amount>,
     pub exact_ordered_legs: Vec<PoolEdge>,
 }
 
@@ -403,7 +406,11 @@ impl Opportunity {
         if self.identity.chain_id != 42161 {
             return Err("unsupported chain");
         }
-        if self.route.token_path.len() < 2 || self.route.exact_ordered_legs.is_empty() {
+        if self.route.token_path.len() < 2
+            || self.route.exact_ordered_legs.is_empty()
+            || self.route.pool_addresses.len() != self.route.exact_ordered_legs.len()
+            || self.route.expected_leg_outputs.len() != self.route.exact_ordered_legs.len()
+        {
             return Err("route evidence incomplete");
         }
         if self.market.state_block == 0 || self.market.quote_block == 0 {

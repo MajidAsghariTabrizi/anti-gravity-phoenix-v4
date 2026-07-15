@@ -207,6 +207,43 @@ func TestProfitTriggeredVerificationMigrationIsForwardOnlyAndFailClosed(t *testi
 	}
 }
 
+func TestForkSimulationEvidenceMigrationIsAdditiveAndForkOnly(t *testing.T) {
+	migrationPath := filepath.Join("..", "..", "..", "migrations", "010_fork_simulation_evidence.sql")
+	content, err := os.ReadFile(migrationPath)
+	if err != nil {
+		t.Fatalf("read fork simulation evidence migration: %v", err)
+	}
+	sqlText := strings.ToUpper(string(content))
+	for _, required := range []string{
+		"ADD COLUMN IF NOT EXISTS FORK_EVIDENCE_SCHEMA_VERSION",
+		"CREATE TABLE IF NOT EXISTS FORK_SIMULATION_RESULTS",
+		"PHOENIX.UNSIGNED-FORK-PLAN.V1",
+		"PHOENIX.FORK-RESULT.V1",
+		"FORK_ONLY = TRUE",
+		"SHADOW_ONLY = TRUE",
+		"LIVE_EXECUTION = FALSE",
+		"EXECUTION_ELIGIBLE = FALSE",
+		"EXECUTION_REQUEST_CREATED = FALSE",
+		"PUBLIC_BROADCAST = FALSE",
+		"SIGNER_USED = FALSE",
+	} {
+		if !strings.Contains(sqlText, required) {
+			t.Fatalf("migration missing %q", required)
+		}
+	}
+	for _, destructive := range []string{
+		"DROP TABLE",
+		"DROP COLUMN",
+		"TRUNCATE TABLE",
+		"DELETE FROM",
+		"UPDATE SHADOW_PROFITABILITY_FACTS",
+	} {
+		if strings.Contains(sqlText, destructive) {
+			t.Fatalf("migration contains destructive statement %q", destructive)
+		}
+	}
+}
+
 func TestLoadMigrationsOrdersByVersion(t *testing.T) {
 	dir := t.TempDir()
 	writeMigration(t, dir, "002_second.sql", "SELECT 2;")

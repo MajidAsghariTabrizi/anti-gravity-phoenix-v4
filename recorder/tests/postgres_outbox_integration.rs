@@ -48,6 +48,7 @@ async fn apply_migrations(pool: &PgPool) {
         include_str!("../../migrations/007_canonical_profitability_truth.sql"),
         include_str!("../../migrations/008_shadow_route_discovery_indexes.sql"),
         include_str!("../../migrations/009_profit_triggered_secondary_verification.sql"),
+        include_str!("../../migrations/010_fork_simulation_evidence.sql"),
     ] {
         sqlx::raw_sql(migration)
             .execute(pool)

@@ -828,6 +828,7 @@ fn decode_liquidity(value: &str) -> Result<Liquidity, EvaluationError> {
 struct AmountEvaluation {
     input: Amount,
     output: Amount,
+    leg_outputs: Vec<Amount>,
     gross_profit: SignedAmount,
     economics: ScenarioEconomics,
 }
@@ -845,8 +846,8 @@ fn evaluate_amount(
     amount: Amount,
     gas_price_wei: u128,
 ) -> Result<AmountEvaluation, ModelError> {
-    let output = simulate_route(route, pools, amount, false)?;
-    let no_fee_output = simulate_route(route, pools, amount, true)?;
+    let (output, leg_outputs) = simulate_route(route, pools, amount, false)?;
+    let (no_fee_output, _) = simulate_route(route, pools, amount, true)?;
     let pool_fees = no_fee_output
         .checked_sub(output)
         .map_err(|_| ModelError::Integrity)?;
@@ -880,6 +881,7 @@ fn evaluate_amount(
     Ok(AmountEvaluation {
         input: amount,
         output,
+        leg_outputs,
         gross_profit: economics.base.gross_profit,
         economics,
     })
@@ -890,28 +892,27 @@ fn simulate_route(
     pools: &[PoolState],
     amount: Amount,
     remove_fees: bool,
-) -> Result<Amount, ModelError> {
+) -> Result<(Amount, Vec<Amount>), ModelError> {
     if pools.len() != route.route.legs.len() {
         return Err(ModelError::Integrity);
     }
-    route
-        .route
-        .legs
-        .iter()
-        .zip(pools)
-        .try_fold(amount, |current, (leg, pool)| {
-            let mut pool = pool.clone();
-            if remove_fees {
-                pool.fee = 0;
-            }
-            simulate_exact_input(&pool, current, leg.direction, 0)
-                .map(|simulation| simulation.amount_out)
-                .map_err(|error| match error {
-                    DomainError::StateIncomplete => ModelError::StateIncomplete,
-                    DomainError::ArithmeticUnderflow => ModelError::NotViable,
-                    _ => ModelError::Integrity,
-                })
-        })
+    let mut current = amount;
+    let mut leg_outputs = Vec::with_capacity(route.route.legs.len());
+    for (leg, pool) in route.route.legs.iter().zip(pools) {
+        let mut pool = pool.clone();
+        if remove_fees {
+            pool.fee = 0;
+        }
+        current = simulate_exact_input(&pool, current, leg.direction, 0)
+            .map(|simulation| simulation.amount_out)
+            .map_err(|error| match error {
+                DomainError::StateIncomplete => ModelError::StateIncomplete,
+                DomainError::ArithmeticUnderflow => ModelError::NotViable,
+                _ => ModelError::Integrity,
+            })?;
+        leg_outputs.push(current);
+    }
+    Ok((current, leg_outputs))
 }
 
 fn bps_amount(amount: Amount, bps: u16) -> Result<Amount, ModelError> {
@@ -961,6 +962,7 @@ fn build_opportunity(
             chain_id: ARBITRUM_ONE_CHAIN_ID,
             source_sequence: input.identity.source_sequence,
             origin_tx_hash: origin.origin_tx_hash.clone(),
+            origin_router: origin.router.clone(),
             observed_block: response.block_number,
             observed_at_unix_ms: input.observed_at_unix_ms,
             detected_at_unix_ms: now_ms,
@@ -979,6 +981,7 @@ fn build_opportunity(
                 .iter()
                 .map(|leg| leg.pool_id.clone())
                 .collect(),
+            pool_addresses: route.state_targets.clone(),
             protocols: route
                 .route
                 .legs
@@ -989,6 +992,7 @@ fn build_opportunity(
             output_token: route.route.legs[1].token_out.clone(),
             input_amount: selected.input,
             expected_output: selected.output,
+            expected_leg_outputs: selected.leg_outputs,
             exact_ordered_legs: route.route.legs.clone(),
         },
         market: MarketEvidence {

@@ -676,6 +676,7 @@ struct ProfitabilityFactRecord<'a> {
     source_event_identity: &'a str,
     source_sequence: String,
     transaction_hash: &'a str,
+    origin_router: &'a str,
     chain_id: u64,
     route_id: &'a str,
     route_fingerprint: &'a str,
@@ -687,6 +688,13 @@ struct ProfitabilityFactRecord<'a> {
     token_path: Value,
     pool_path: Value,
     fee_path: Value,
+    pool_address_path: Value,
+    protocol_path: Value,
+    direction_path: Value,
+    expected_leg_outputs: Value,
+    pool_state_hash_path: Value,
+    opportunity_expires_at: DateTime<Utc>,
+    fork_evidence_schema_version: &'static str,
     input_amount: String,
     expected_output: String,
     gross_spread: String,
@@ -760,6 +768,45 @@ async fn persist_profitability_fact(
             .collect::<Vec<_>>(),
     )
     .map_err(|_| StoreError::Integrity)?;
+    let pool_address_path = serde_json::to_value(&opportunity.route.pool_addresses)
+        .map_err(|_| StoreError::Integrity)?;
+    let protocol_path =
+        serde_json::to_value(&opportunity.route.protocols).map_err(|_| StoreError::Integrity)?;
+    let direction_path = serde_json::to_value(
+        opportunity
+            .route
+            .exact_ordered_legs
+            .iter()
+            .map(|leg| leg.direction)
+            .collect::<Vec<_>>(),
+    )
+    .map_err(|_| StoreError::Integrity)?;
+    let expected_leg_outputs = serde_json::to_value(
+        opportunity
+            .route
+            .expected_leg_outputs
+            .iter()
+            .map(|amount| amount.0.to_string())
+            .collect::<Vec<_>>(),
+    )
+    .map_err(|_| StoreError::Integrity)?;
+    let pool_state_hash_path = serde_json::to_value(
+        opportunity
+            .route
+            .pools
+            .iter()
+            .map(|pool| {
+                opportunity
+                    .market
+                    .pool_states
+                    .iter()
+                    .find(|state| state.pool == *pool)
+                    .map(|state| state.state_hash.clone())
+                    .ok_or(StoreError::Integrity)
+            })
+            .collect::<Result<Vec<_>, _>>()?,
+    )
+    .map_err(|_| StoreError::Integrity)?;
     let secondary_reasons = serde_json::to_value(&opportunity.decision.secondary_rejection_reasons)
         .map_err(|_| StoreError::Integrity)?;
     let independent_verification_lifecycle =
@@ -774,6 +821,7 @@ async fn persist_profitability_fact(
         source_event_identity: &record.identity.source_event_identity,
         source_sequence: opportunity.identity.source_sequence.to_string(),
         transaction_hash: &opportunity.identity.origin_tx_hash.0,
+        origin_router: opportunity.identity.origin_router.as_str(),
         chain_id: opportunity.identity.chain_id,
         route_id: &opportunity.route.route_id.0,
         route_fingerprint: &opportunity.route.route_fingerprint,
@@ -793,6 +841,15 @@ async fn persist_profitability_fact(
         token_path,
         pool_path,
         fee_path,
+        pool_address_path,
+        protocol_path,
+        direction_path,
+        expected_leg_outputs,
+        pool_state_hash_path,
+        opportunity_expires_at: timestamp_from_millis(
+            opportunity.outcome.opportunity_expires_at_unix_ms,
+        )?,
+        fork_evidence_schema_version: "phoenix.fork-evidence.v1",
         input_amount: opportunity.route.input_amount.0.to_string(),
         expected_output: opportunity.route.expected_output.0.to_string(),
         gross_spread: base.gross_spread.0.to_string(),
@@ -880,6 +937,7 @@ INSERT INTO shadow_profitability_facts (
     source_event_identity,
     source_sequence,
     transaction_hash,
+    origin_router,
     chain_id,
     route_id,
     route_fingerprint,
@@ -891,6 +949,13 @@ INSERT INTO shadow_profitability_facts (
     token_path,
     pool_path,
     fee_path,
+    pool_address_path,
+    protocol_path,
+    direction_path,
+    expected_leg_outputs,
+    pool_state_hash_path,
+    opportunity_expires_at,
+    fork_evidence_schema_version,
     input_amount,
     expected_output,
     gross_spread,
@@ -948,6 +1013,7 @@ FROM jsonb_to_record($1) AS fact(
     source_event_identity text,
     source_sequence numeric,
     transaction_hash text,
+    origin_router text,
     chain_id bigint,
     route_id text,
     route_fingerprint text,
@@ -959,6 +1025,13 @@ FROM jsonb_to_record($1) AS fact(
     token_path jsonb,
     pool_path jsonb,
     fee_path jsonb,
+    pool_address_path jsonb,
+    protocol_path jsonb,
+    direction_path jsonb,
+    expected_leg_outputs jsonb,
+    pool_state_hash_path jsonb,
+    opportunity_expires_at timestamptz,
+    fork_evidence_schema_version text,
     input_amount numeric,
     expected_output numeric,
     gross_spread numeric,
@@ -1254,6 +1327,7 @@ const REQUIRED_COLUMNS: &[(&str, &str, &str, bool)] = &[
         "text",
         true,
     ),
+    ("shadow_profitability_facts", "origin_router", "text", true),
     ("shadow_profitability_facts", "chain_id", "bigint", true),
     ("shadow_profitability_facts", "route_id", "text", true),
     (
@@ -1295,6 +1369,43 @@ const REQUIRED_COLUMNS: &[(&str, &str, &str, bool)] = &[
     ("shadow_profitability_facts", "token_path", "jsonb", true),
     ("shadow_profitability_facts", "pool_path", "jsonb", true),
     ("shadow_profitability_facts", "fee_path", "jsonb", true),
+    (
+        "shadow_profitability_facts",
+        "pool_address_path",
+        "jsonb",
+        true,
+    ),
+    ("shadow_profitability_facts", "protocol_path", "jsonb", true),
+    (
+        "shadow_profitability_facts",
+        "direction_path",
+        "jsonb",
+        true,
+    ),
+    (
+        "shadow_profitability_facts",
+        "expected_leg_outputs",
+        "jsonb",
+        true,
+    ),
+    (
+        "shadow_profitability_facts",
+        "pool_state_hash_path",
+        "jsonb",
+        true,
+    ),
+    (
+        "shadow_profitability_facts",
+        "opportunity_expires_at",
+        "timestamp with time zone",
+        true,
+    ),
+    (
+        "shadow_profitability_facts",
+        "fork_evidence_schema_version",
+        "text",
+        true,
+    ),
     (
         "shadow_profitability_facts",
         "input_amount",
@@ -1638,6 +1749,12 @@ pub fn validate_schema_snapshot(snapshot: &SchemaSnapshot) -> Result<(), StoreEr
         "arbitrum_execution_fee=execution_gas*gas_price",
         "expected_net_pnl=gross_spread-total_cost",
         "jsonb_array_lengthtoken_path=jsonb_array_lengthpool_path+1",
+        "jsonb_array_lengthpool_address_path=jsonb_array_lengthpool_path",
+        "jsonb_array_lengthprotocol_path=jsonb_array_lengthpool_path",
+        "jsonb_array_lengthdirection_path=jsonb_array_lengthpool_path",
+        "jsonb_array_lengthexpected_leg_outputs=jsonb_array_lengthpool_path",
+        "jsonb_array_lengthpool_state_hash_path=jsonb_array_lengthpool_path",
+        "opportunity_expires_at>detected_at",
         "retry_count>=0",
         "jsonb_typeofsecondary_rejection_reasons='array'::text",
         "jsonb_typeofrisk_flags='array'::text",
@@ -2259,6 +2376,17 @@ mod tests {
                 "CHECK ((expected_net_pnl = gross_spread - total_cost))".to_string(),
                 "CHECK ((jsonb_array_length(token_path) = jsonb_array_length(pool_path) + 1))"
                     .to_string(),
+                "CHECK ((jsonb_array_length(pool_address_path) = jsonb_array_length(pool_path)))"
+                    .to_string(),
+                "CHECK ((jsonb_array_length(protocol_path) = jsonb_array_length(pool_path)))"
+                    .to_string(),
+                "CHECK ((jsonb_array_length(direction_path) = jsonb_array_length(pool_path)))"
+                    .to_string(),
+                "CHECK ((jsonb_array_length(expected_leg_outputs) = jsonb_array_length(pool_path)))"
+                    .to_string(),
+                "CHECK ((jsonb_array_length(pool_state_hash_path) = jsonb_array_length(pool_path)))"
+                    .to_string(),
+                "CHECK ((opportunity_expires_at > detected_at))".to_string(),
             ],
         );
         snapshot.indexes.insert(
@@ -2390,6 +2518,20 @@ mod tests {
             "secondary_route_config_hash = route_config_hash",
         ] {
             assert!(verification_migration.contains(required));
+        }
+        let fork_migration = include_str!("../../migrations/010_fork_simulation_evidence.sql");
+        for required in [
+            "fork_evidence_schema_version = 'phoenix.fork-evidence.v1'",
+            "CREATE TABLE IF NOT EXISTS fork_simulation_results",
+            "plan_schema_version = 'phoenix.unsigned-fork-plan.v1'",
+            "fork_only = true",
+            "live_execution = false",
+            "execution_eligible = false",
+            "execution_request_created = false",
+            "public_broadcast = false",
+            "signer_used = false",
+        ] {
+            assert!(fork_migration.contains(required));
         }
     }
 }
