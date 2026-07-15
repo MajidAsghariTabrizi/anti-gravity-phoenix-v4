@@ -173,10 +173,10 @@ mod tests {
     use crate::domain::{Address, Amount, OpportunityId, PoolId, RouteId, TokenAddress, TxHash};
     use crate::graph::{PoolEdge, Route};
     use crate::opportunity::{
-        AgreementState, BasisPoints, CostBreakdown, MarketEvidence, OpportunityIdentity,
-        OutcomeEvidence, PrimaryProfitabilityStatus, RouteEvidence, ScenarioEconomics,
-        SimulationEvidence, SimulationKind, StateSource, Strategy, VerificationSkipReason,
-        VerificationStatus, PROFITABILITY_MODEL_VERSION,
+        AgreementState, BasisPoints, CostBreakdown, IndependentVerificationStatus, MarketEvidence,
+        OpportunityIdentity, OutcomeEvidence, PrimaryProfitabilityStatus, RouteEvidence,
+        ScenarioEconomics, SimulationEvidence, SimulationKind, StateSource, Strategy,
+        VerificationSkipReason, VerificationStatus, PROFITABILITY_MODEL_VERSION,
     };
     use crate::Direction;
 
@@ -240,6 +240,7 @@ mod tests {
                 pool_states: Vec::new(),
                 state_block: 100,
                 state_block_hash: Some("block-hash".to_string()),
+                route_config_hash: None,
                 quote_block: 100,
                 quote_age_ms: 10,
                 state_source: StateSource::RecordedCheckpoint,
@@ -248,7 +249,14 @@ mod tests {
                 primary_state_hash: Some("primary-state-hash".to_string()),
                 secondary_provider_id: None,
                 secondary_state_hash: None,
+                secondary_block_number: None,
+                secondary_block_hash: None,
+                secondary_route_config_hash: None,
                 verification_status: VerificationStatus::HistoricalEvidence,
+                independent_verification_status: IndependentVerificationStatus::NotRequested,
+                independent_verification_lifecycle: vec![
+                    IndependentVerificationStatus::NotRequested,
+                ],
                 agreement_state: AgreementState::NotChecked,
                 verification_skip_reason: Some(VerificationSkipReason::HistoricalEvidence),
                 feed_to_detection_latency_ns: 1,

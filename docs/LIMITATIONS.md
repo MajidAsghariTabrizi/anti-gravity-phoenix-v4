@@ -5,6 +5,12 @@
 - Sushi V3 Arbitrum production addresses are not hardcoded because they were not verified from a stable official source in this workspace.
 - Protobuf schema is present; local Go publishing uses canonical JSON because generated Protobuf tooling is not installed here.
 - Foundry local verification is blocked on this machine by missing `forge`.
+- Independent verification proves different configured logical provider IDs,
+  not different upstream operators or infrastructure. That distinction still
+  requires a reviewed provider inventory and live Arbitrum observation.
+- Profitability rows written before migration 009 do not contain the new route
+  hash or independent-verification lifecycle and remain explicit historical
+  nulls in reports.
 - Live Nitro relay operation, Arbitrum fork tests, and simulator/quoter parity tests require a Linux host and RPC credentials.
 - Production latency benchmarks are not measured.
 - The production Engine consumes its durable JetStream input, evaluates configured routes with block-pinned RPC state, and persists SHADOW decisions and canonical profitability facts. Its current V3 state model remains bounded to the reconciled tick, and it does not run contract or fork simulation in the production decision path; those missing execution proofs remain fail-closed rejection evidence.

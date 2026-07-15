@@ -9,9 +9,9 @@ use crate::providers::{ProviderConfig, ProviderLease, ProviderPool};
 use crate::runtime_state::GatewayReadiness;
 use crate::shadow_state::{
     canonical_block_hash, canonical_data, canonical_hash_bytes, EvidenceRequest,
-    GatewayErrorResponse, PoolStateResponse, RpcQualityEvidence, ShadowStateRequest,
-    ShadowStateResponse, VerificationStatus, ARBITRUM_ONE_CHAIN_ID, MAX_GATEWAY_RESPONSE_BYTES,
-    SHADOW_STATE_SCHEMA_VERSION,
+    GatewayErrorResponse, IndependentVerificationStatus, PoolStateResponse, RpcQualityEvidence,
+    ShadowStateRequest, ShadowStateResponse, VerificationStatus, ARBITRUM_ONE_CHAIN_ID,
+    MAX_GATEWAY_RESPONSE_BYTES, SHADOW_STATE_SCHEMA_VERSION,
 };
 use crate::transport::{JsonRpcClient, RpcCallResult, TransportError};
 use serde_json::{json, Value};
@@ -241,7 +241,7 @@ impl GatewayRuntime {
                 let primary = self
                     .resolve_primary(&request, &route_config_hash, &cache_key, &head)
                     .await?;
-                self.build_response(request_hash, primary, None)
+                self.build_response(request_hash, route_config_hash, primary, None)
             }
             EvidenceRequest::Verify {
                 block_number,
@@ -269,7 +269,7 @@ impl GatewayRuntime {
                 let verification = self
                     .resolve_verification(&request, &route_config_hash, &verification_key, &primary)
                     .await?;
-                self.build_response(request_hash, primary, Some(verification))
+                self.build_response(request_hash, route_config_hash, primary, Some(verification))
             }
         }
     }
@@ -412,8 +412,16 @@ impl GatewayRuntime {
             return Ok(VerificationEvidence {
                 agreement_provider_id: None,
                 secondary_state_hash: None,
+                secondary_block_number: None,
+                secondary_block_hash: None,
+                secondary_route_config_hash: None,
                 provider_agreement: false,
                 status: VerificationStatus::SecondaryUnavailable,
+                independent_status: if resolution.integrity_failure_observed {
+                    IndependentVerificationStatus::IntegrityFailure
+                } else {
+                    IndependentVerificationStatus::ProviderUnavailable
+                },
                 quality,
             });
         };
@@ -435,11 +443,19 @@ impl GatewayRuntime {
         Ok(VerificationEvidence {
             agreement_provider_id: Some(secondary.provider_id),
             secondary_state_hash: Some(secondary.state_hash),
+            secondary_block_number: Some(secondary.block.number),
+            secondary_block_hash: Some(secondary.block.hash),
+            secondary_route_config_hash: Some(route_config_hash.to_string()),
             provider_agreement: agreement,
             status: if agreement {
                 VerificationStatus::Agreed
             } else {
                 VerificationStatus::Disagreed
+            },
+            independent_status: if agreement {
+                IndependentVerificationStatus::Agreed
+            } else {
+                IndependentVerificationStatus::Disagreed
             },
             quality,
         })
@@ -448,28 +464,41 @@ impl GatewayRuntime {
     fn build_response(
         &self,
         request_hash: String,
+        route_config_hash: String,
         primary: ProviderBundle,
         verification: Option<VerificationEvidence>,
     ) -> Result<ShadowStateResponse, GatewayError> {
         let (
             agreement_provider_id,
             secondary_state_hash,
+            secondary_block_number,
+            secondary_block_hash,
+            secondary_route_config_hash,
             provider_agreement,
             verification_status,
+            independent_verification_status,
             quality,
         ) = match verification {
             Some(verification) => (
                 verification.agreement_provider_id,
                 verification.secondary_state_hash,
+                verification.secondary_block_number,
+                verification.secondary_block_hash,
+                verification.secondary_route_config_hash,
                 verification.provider_agreement,
                 verification.status,
+                verification.independent_status,
                 verification.quality,
             ),
             None => (
                 None,
                 None,
+                None,
+                None,
+                None,
                 false,
                 VerificationStatus::PrimaryOnly,
+                IndependentVerificationStatus::NotRequested,
                 primary.quality.clone(),
             ),
         };
@@ -477,6 +506,7 @@ impl GatewayRuntime {
             schema_version: SHADOW_STATE_SCHEMA_VERSION.to_string(),
             chain_id: ARBITRUM_ONE_CHAIN_ID,
             request_hash,
+            route_config_hash,
             block_number: primary.block.number,
             block_hash: primary.block.hash,
             state_hash: primary.state_hash,
@@ -484,8 +514,12 @@ impl GatewayRuntime {
             primary_provider_id: primary.provider_id,
             agreement_provider_id,
             secondary_state_hash,
+            secondary_block_number,
+            secondary_block_hash,
+            secondary_route_config_hash,
             provider_agreement,
             verification_status,
+            independent_verification_status,
             quality,
             resolved_at_unix_ms: unix_time_ms(),
         };
@@ -508,6 +542,7 @@ impl GatewayRuntime {
         let _operation_guard = self.upstream_operation_lock.lock().await;
         let provider_count = self.provider_count().await;
         let mut failed_quality = Vec::new();
+        let mut integrity_failure_observed = false;
         let mut preferred = preferred_provider.map(str::to_string);
         for retry_count in 0..provider_count {
             let provider = if let Some(provider_id) = preferred.take() {
@@ -532,6 +567,7 @@ impl GatewayRuntime {
                 if failure == CallFailure::Budget {
                     return Err(GatewayError::UpstreamBudgetExhausted);
                 }
+                integrity_failure_observed |= failure == CallFailure::Integrity;
                 self.apply_provider_failure(provider.provider_id(), failure)
                     .await;
                 continue;
@@ -554,6 +590,7 @@ impl GatewayRuntime {
                     return Ok(BundleResolution {
                         bundle: Some(bundle),
                         failed_quality: Vec::new(),
+                        integrity_failure_observed,
                     });
                 }
                 Err(mut failure) => {
@@ -561,6 +598,7 @@ impl GatewayRuntime {
                     if failure.cause == CallFailure::Budget {
                         return Err(GatewayError::UpstreamBudgetExhausted);
                     }
+                    integrity_failure_observed |= failure.cause == CallFailure::Integrity;
                     self.apply_provider_failure(provider.provider_id(), failure.cause)
                         .await;
                 }
@@ -569,6 +607,7 @@ impl GatewayRuntime {
         Ok(BundleResolution {
             bundle: None,
             failed_quality,
+            integrity_failure_observed,
         })
     }
 
@@ -1139,8 +1178,12 @@ impl ProviderBundle {
 struct VerificationEvidence {
     agreement_provider_id: Option<String>,
     secondary_state_hash: Option<String>,
+    secondary_block_number: Option<u64>,
+    secondary_block_hash: Option<String>,
+    secondary_route_config_hash: Option<String>,
     provider_agreement: bool,
     status: VerificationStatus,
+    independent_status: IndependentVerificationStatus,
     quality: Vec<RpcQualityEvidence>,
 }
 
@@ -1148,6 +1191,7 @@ struct VerificationEvidence {
 struct BundleResolution {
     bundle: Option<ProviderBundle>,
     failed_quality: Vec<RpcQualityEvidence>,
+    integrity_failure_observed: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -1565,8 +1609,15 @@ mod tests {
     async fn two_pool_primary_uses_one_multicall_and_caches_static_metadata() {
         let client = Arc::new(ModelClient::default());
         let runtime = runtime(client.clone());
-        let primary = runtime.resolve_shadow_state(request()).await.unwrap();
+        let state_request = request();
+        let expected_route_hash = state_request.route_config_hash().unwrap();
+        let primary = runtime.resolve_shadow_state(state_request).await.unwrap();
         assert_eq!(primary.verification_status, VerificationStatus::PrimaryOnly);
+        assert_eq!(
+            primary.independent_verification_status,
+            IndependentVerificationStatus::NotRequested
+        );
+        assert_eq!(primary.route_config_hash, expected_route_hash);
         assert!(!primary.provider_agreement);
         let calls = client.calls();
         assert_eq!(multicall_inner_counts(&calls), vec![10]);
@@ -1626,13 +1677,30 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(verified.verification_status, VerificationStatus::Agreed);
+        assert_eq!(
+            verified.independent_verification_status,
+            IndependentVerificationStatus::Agreed
+        );
         assert!(verified.provider_agreement);
+        assert_ne!(
+            verified.primary_provider_id,
+            verified.agreement_provider_id.clone().unwrap()
+        );
         assert_eq!(
             verified.secondary_state_hash.as_deref(),
             Some(verified.state_hash.as_str())
         );
         assert_eq!(verified.block_number, 100);
         assert_eq!(verified.block_hash, BLOCK_HASH);
+        assert_eq!(verified.secondary_block_number, Some(verified.block_number));
+        assert_eq!(
+            verified.secondary_block_hash.as_deref(),
+            Some(verified.block_hash.as_str())
+        );
+        assert_eq!(
+            verified.secondary_route_config_hash.as_deref(),
+            Some(verified.route_config_hash.as_str())
+        );
         let calls = client.calls();
         assert_eq!(multicall_inner_counts(&calls), vec![10, 10]);
         assert_eq!(calls.len(), 9, "cold path must stay below the old 26 calls");
@@ -1815,6 +1883,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(verified.verification_status, VerificationStatus::Disagreed);
+        assert_eq!(
+            verified.independent_verification_status,
+            IndependentVerificationStatus::Disagreed
+        );
         assert!(!verified.provider_agreement);
         assert!(verified.secondary_state_hash.is_some());
         assert_ne!(
@@ -1826,6 +1898,62 @@ mod tests {
             .iter()
             .filter(|quality| quality.success)
             .all(|quality| quality.disagreement));
+    }
+
+    #[tokio::test]
+    async fn secondary_integrity_failures_are_distinct_from_provider_unavailability() {
+        let client = Arc::new(ModelClient::default());
+        let runtime = runtime(client.clone());
+        let state_request = request();
+        let primary = runtime
+            .resolve_shadow_state(state_request.clone())
+            .await
+            .unwrap();
+        client.malformed_multicall.store(true, Ordering::Relaxed);
+        let verified = runtime
+            .resolve_shadow_state(verification_request(&state_request, &primary))
+            .await
+            .unwrap();
+        assert_eq!(
+            verified.verification_status,
+            VerificationStatus::SecondaryUnavailable
+        );
+        assert_eq!(
+            verified.independent_verification_status,
+            IndependentVerificationStatus::IntegrityFailure
+        );
+        assert!(verified.agreement_provider_id.is_none());
+        assert!(verified.secondary_state_hash.is_none());
+        assert!(verified.secondary_block_number.is_none());
+        assert!(verified.secondary_block_hash.is_none());
+        assert!(verified.secondary_route_config_hash.is_none());
+        assert!(!verified.provider_agreement);
+    }
+
+    #[tokio::test]
+    async fn secondary_transport_exhaustion_reports_provider_unavailable() {
+        let client = Arc::new(ModelClient::default());
+        let runtime = runtime(client.clone());
+        let state_request = request();
+        let primary = runtime
+            .resolve_shadow_state(state_request.clone())
+            .await
+            .unwrap();
+        client.rate_limit_next_multicall("provider_1");
+        let verified = runtime
+            .resolve_shadow_state(verification_request(&state_request, &primary))
+            .await
+            .unwrap();
+        assert_eq!(
+            verified.independent_verification_status,
+            IndependentVerificationStatus::ProviderUnavailable
+        );
+        assert_eq!(
+            verified.verification_status,
+            VerificationStatus::SecondaryUnavailable
+        );
+        assert!(verified.agreement_provider_id.is_none());
+        assert!(!verified.provider_agreement);
     }
 
     #[tokio::test]

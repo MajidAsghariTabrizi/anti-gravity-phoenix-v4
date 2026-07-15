@@ -67,6 +67,12 @@ execution_eligible=false
 execution_request_created=false
 ```
 
+Migration `009_profit_triggered_secondary_verification.sql` adds explicit
+profit-triggered independent-verification evidence. New complete rows persist
+the route hash, terminal status and lifecycle, and same-block/same-route
+secondary proof when present. Existing rows remain historical nulls rather
+than receiving inferred evidence.
+
 Rows created from older decisions and candidate classifications are retained as `incomplete`. Missing financial fields remain `NULL`; they are never filled with zeros or fixture values. See [`SHADOW_PROFITABILITY_REPORTS.md`](SHADOW_PROFITABILITY_REPORTS.md) for the bounded read-only report.
 
 ## Fail-Closed Unknowns

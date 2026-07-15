@@ -10,7 +10,8 @@ Phoenix discovery is driven by ordered Nitro Feed transactions. Public RPC is no
 4. The Engine runs the existing integer V3 model, optimizer, and SHADOW economics locally.
 5. A route clearly below the existing threshold stops without a secondary provider call.
 6. A potentially policy-passing route requests one secondary Multicall3 at the exact primary block number and hash.
-7. Only explicit provider agreement is recorded as agreement. Unavailability, malformed output, block drift, and disagreement remain fail-closed evidence.
+7. Only explicit provider agreement is recorded as agreement. The secondary must be a different logical provider and prove the same block number, block hash, and route configuration hash before state hashes are compared.
+8. Unavailability, malformed output, block or route drift, and disagreement remain distinct fail-closed evidence. See `SHADOW_SECONDARY_VERIFICATION.md`.
 
 The canonical Arbitrum Multicall3 deployment is `0xcA11bde05977b3631167028862bE2a173976CA11`. Each provider is checked once per process for Arbitrum chain ID `42161` and non-empty code at that address. A route's `token0`, `token1`, and `fee` values are validated on its first provider use and retained in a long-lived cache keyed by provider, route fingerprint, and pool configuration hash. A configuration change creates a new cache identity.
 

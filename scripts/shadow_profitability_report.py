@@ -16,6 +16,8 @@ MAX_LINE_BYTES = 1_048_576
 MAX_INPUT_BYTES = 16 * 1_048_576
 INTEGER_PATTERN = re.compile(r"-?(?:0|[1-9][0-9]*)\Z")
 ADDRESS_PATTERN = re.compile(r"0x[0-9a-f]{40}\Z")
+DIGEST_PATTERN = re.compile(r"[0-9a-f]{64}\Z")
+BLOCK_HASH_PATTERN = re.compile(r"0x[0-9a-f]{64}\Z")
 
 SIGNED_FINANCIAL_FIELDS = (
     "expected_net_pnl",
@@ -82,6 +84,19 @@ REQUIRED_FIELDS = frozenset(
         "shadow_only",
         "execution_eligible",
         "execution_request_created",
+        "pinned_block_number",
+        "pinned_block_hash",
+        "route_config_hash",
+        "primary_provider_id",
+        "primary_state_hash",
+        "secondary_provider_id",
+        "secondary_state_hash",
+        "secondary_block_number",
+        "secondary_block_hash",
+        "secondary_route_config_hash",
+        "independent_verification_status",
+        "independent_verification_lifecycle",
+        "verification_skip_reason",
         *FINANCIAL_FIELDS,
     }
 )
@@ -148,6 +163,23 @@ def integer_field(row: dict[str, Any], field: str, required: bool) -> int | None
     return parsed
 
 
+def positive_integer_text(value: Any, field: str, required: bool) -> int | None:
+    if value is None and not required:
+        return None
+    if not isinstance(value, str) or not INTEGER_PATTERN.fullmatch(value):
+        raise ReportError(f"{field} must be a canonical base-10 integer string")
+    if len(value) > 78 or value.startswith("-") or int(value) <= 0:
+        raise ReportError(f"{field} must be a positive NUMERIC(78,0) value")
+    return int(value)
+
+
+def canonical_optional(value: Any, field: str, pattern: re.Pattern[str]) -> str | None:
+    parsed = bounded_text(value, field, required=False)
+    if parsed is not None and not pattern.fullmatch(parsed):
+        raise ReportError(f"{field} is not canonical")
+    return parsed
+
+
 def validate_complete_arithmetic(row: dict[str, Any]) -> None:
     protocol_fees = row["_numbers"]["protocol_fees"]
     dex_fees = row["_numbers"]["dex_fees"]
@@ -181,6 +213,144 @@ def validate_complete_arithmetic(row: dict[str, Any]) -> None:
     expected_status = "meets_minimum" if expected_net >= minimum else "below_minimum"
     if row["primary_profitability_status"] != expected_status:
         raise ReportError("primary profitability status is inconsistent")
+
+
+def validate_verification_contract(row: dict[str, Any], complete: bool) -> None:
+    pinned_block = positive_integer_text(
+        row["pinned_block_number"], "pinned_block_number", required=False
+    )
+    secondary_block = positive_integer_text(
+        row["secondary_block_number"], "secondary_block_number", required=False
+    )
+    pinned_hash = canonical_optional(
+        row["pinned_block_hash"], "pinned_block_hash", BLOCK_HASH_PATTERN
+    )
+    route_hash = canonical_optional(
+        row["route_config_hash"], "route_config_hash", DIGEST_PATTERN
+    )
+    primary_state = canonical_optional(
+        row["primary_state_hash"], "primary_state_hash", DIGEST_PATTERN
+    )
+    secondary_state = canonical_optional(
+        row["secondary_state_hash"], "secondary_state_hash", DIGEST_PATTERN
+    )
+    secondary_hash = canonical_optional(
+        row["secondary_block_hash"], "secondary_block_hash", BLOCK_HASH_PATTERN
+    )
+    secondary_route = canonical_optional(
+        row["secondary_route_config_hash"],
+        "secondary_route_config_hash",
+        DIGEST_PATTERN,
+    )
+    primary_provider = bounded_text(
+        row["primary_provider_id"], "primary_provider_id", required=False
+    )
+    secondary_provider = bounded_text(
+        row["secondary_provider_id"], "secondary_provider_id", required=False
+    )
+    if any(
+        provider is not None and "://" in provider
+        for provider in (primary_provider, secondary_provider)
+    ):
+        raise ReportError("provider identifiers must not contain URLs")
+    skip_reason = bounded_text(
+        row["verification_skip_reason"], "verification_skip_reason", required=False
+    )
+    independent = row["independent_verification_status"]
+    lifecycle = row["independent_verification_lifecycle"]
+    new_contract = any(
+        value is not None
+        for value in (
+            route_hash,
+            independent,
+            lifecycle,
+            secondary_block,
+            secondary_hash,
+            secondary_route,
+        )
+    )
+    if not new_contract:
+        return
+    if not isinstance(independent, str) or independent not in {
+        "not_requested",
+        "requested",
+        "agreed",
+        "disagreed",
+        "provider_unavailable",
+        "integrity_failure",
+    }:
+        raise ReportError("invalid independent verification status")
+    if (
+        not isinstance(lifecycle, list)
+        or not 1 <= len(lifecycle) <= 2
+        or any(not isinstance(status, str) for status in lifecycle)
+    ):
+        raise ReportError("invalid independent verification lifecycle")
+    if any(
+        value is None
+        for value in (pinned_block, pinned_hash, route_hash, primary_provider, primary_state)
+    ):
+        raise ReportError("independent verification evidence is missing primary identity")
+
+    no_secondary = all(
+        value is None
+        for value in (
+            secondary_provider,
+            secondary_state,
+            secondary_block,
+            secondary_hash,
+            secondary_route,
+        )
+    )
+    same_context = (
+        secondary_block == pinned_block
+        and secondary_hash == pinned_hash
+        and secondary_route == route_hash
+    )
+    if independent == "not_requested":
+        valid = (
+            lifecycle == ["not_requested"]
+            and row["verification_status"] == "primary_only"
+            and row["agreement_state"] == "not_checked"
+            and skip_reason == "primary_screen_no_profitable_candidate"
+            and no_secondary
+        )
+    elif independent == "requested":
+        valid = (
+            not complete
+            and lifecycle == ["requested"]
+            and row["verification_status"] == "incomplete"
+            and row["agreement_state"] == "not_checked"
+            and skip_reason is None
+            and no_secondary
+        )
+    elif independent in {"agreed", "disagreed"}:
+        state_relation = (
+            secondary_state == primary_state
+            if independent == "agreed"
+            else secondary_state != primary_state
+        )
+        valid = (
+            lifecycle == ["requested", independent]
+            and row["verification_status"] == independent
+            and row["agreement_state"] == independent
+            and skip_reason is None
+            and secondary_provider is not None
+            and secondary_provider != primary_provider
+            and secondary_state is not None
+            and same_context
+            and state_relation
+        )
+    else:
+        valid = (
+            lifecycle == ["requested", independent]
+            and row["verification_status"] == "secondary_unavailable"
+            and row["agreement_state"] == "unavailable"
+            and skip_reason is None
+            and no_secondary
+        )
+    if not valid:
+        raise ReportError("independent verification evidence is inconsistent")
 
 
 def validate_row(raw: Any) -> dict[str, Any]:
@@ -239,6 +409,7 @@ def validate_row(raw: Any) -> dict[str, Any]:
         raise ReportError("unsafe execution lifecycle evidence")
 
     complete = completeness == "complete"
+    validate_verification_contract(row, complete)
     numbers = {
         field: integer_field(row, field, required=complete) for field in FINANCIAL_FIELDS
     }
@@ -477,6 +648,13 @@ def build_report(rows: list[dict[str, Any]], limit: int) -> dict[str, Any]:
     rpc_failure_complete = [
         row for row in rpc_failure_rows if row["evidence_completeness_status"] == "complete"
     ]
+    independent_status_counter = Counter(
+        row["independent_verification_status"] or "historical_null" for row in rows
+    )
+    independent_verification_counts = [
+        {"independent_verification_status": status, "candidates": count}
+        for status, count in sorted(independent_status_counter.items())
+    ]
 
     stale_reason_rows = [
         row
@@ -594,6 +772,7 @@ def build_report(rows: list[dict[str, Any]], limit: int) -> dict[str, Any]:
         "rpc_failure_contribution": {
             "causality_claimed": False,
             "candidate_counts_by_verification_status": verification_groups,
+            "candidate_counts_by_independent_verification_status": independent_verification_counts,
             "failure_evidence_candidates": len(rpc_failure_rows),
             "failure_evidence_complete_candidates": len(rpc_failure_complete),
             "failure_evidence_expected_net_pnl_by_settlement_asset": asset_sums(

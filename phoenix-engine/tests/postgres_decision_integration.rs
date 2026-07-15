@@ -5,11 +5,11 @@ use phoenix_engine::domain::{
 use phoenix_engine::engine_input::{EngineClassification, InputIdentity};
 use phoenix_engine::graph::PoolEdge;
 use phoenix_engine::opportunity::{
-    AgreementState, BasisPoints, CostBreakdown, DecisionEvidence, MarketEvidence, Opportunity,
-    OpportunityIdentity, OutcomeEvidence, PoolStateEvidence, PrimaryProfitabilityStatus,
-    RejectionReason, RiskFlag, RouteEvidence, ScenarioEconomics, ShadowDisposition, SignedAmount,
-    SimulationClassification, SimulationEvidence, SimulationKind, StateSource, Strategy,
-    VerificationSkipReason, VerificationStatus, PROFITABILITY_MODEL_VERSION,
+    AgreementState, BasisPoints, CostBreakdown, DecisionEvidence, IndependentVerificationStatus,
+    MarketEvidence, Opportunity, OpportunityIdentity, OutcomeEvidence, PoolStateEvidence,
+    PrimaryProfitabilityStatus, RejectionReason, RiskFlag, RouteEvidence, ScenarioEconomics,
+    ShadowDisposition, SignedAmount, SimulationClassification, SimulationEvidence, SimulationKind,
+    StateSource, Strategy, VerificationSkipReason, VerificationStatus, PROFITABILITY_MODEL_VERSION,
 };
 use phoenix_engine::persistence::{
     ClassificationRecord, PersistOutcome, PostgresShadowStore, ShadowStore, StoreError,
@@ -41,6 +41,7 @@ async fn apply_migrations(pool: &PgPool) {
         include_str!("../../migrations/006_dependency_exhaustion_quarantine.sql"),
         include_str!("../../migrations/007_canonical_profitability_truth.sql"),
         include_str!("../../migrations/008_shadow_route_discovery_indexes.sql"),
+        include_str!("../../migrations/009_profit_triggered_secondary_verification.sql"),
     ] {
         sqlx::raw_sql(migration)
             .execute(pool)
@@ -133,6 +134,7 @@ fn evaluation(hash_byte: char, opportunity_id: &str) -> EvaluatedOpportunity {
                 ],
                 state_block: 100,
                 state_block_hash: Some(BLOCK_HASH.to_string()),
+                route_config_hash: Some("f".repeat(64)),
                 quote_block: 100,
                 quote_age_ms: 1,
                 state_source: StateSource::BlockPinnedRpc,
@@ -141,9 +143,18 @@ fn evaluation(hash_byte: char, opportunity_id: &str) -> EvaluatedOpportunity {
                 primary_state_hash: Some("e".repeat(64)),
                 secondary_provider_id: None,
                 secondary_state_hash: None,
+                secondary_block_number: None,
+                secondary_block_hash: None,
+                secondary_route_config_hash: None,
                 verification_status: VerificationStatus::PrimaryOnly,
+                independent_verification_status: IndependentVerificationStatus::NotRequested,
+                independent_verification_lifecycle: vec![
+                    IndependentVerificationStatus::NotRequested,
+                ],
                 agreement_state: AgreementState::NotChecked,
-                verification_skip_reason: Some(VerificationSkipReason::PrimaryBelowMinimum),
+                verification_skip_reason: Some(
+                    VerificationSkipReason::PrimaryScreenNoProfitableCandidate,
+                ),
                 feed_to_detection_latency_ns: 1,
             },
             economics: ScenarioEconomics {
@@ -307,7 +318,11 @@ SELECT gross_spread::text AS gross_spread,
        expected_net_pnl::text AS expected_net_pnl,
        minimum_required_net_pnl::text AS minimum_required_net_pnl,
        primary_profitability_status,
-       verification_status
+       verification_status,
+       route_config_hash,
+       independent_verification_status,
+       independent_verification_lifecycle,
+       verification_skip_reason
 FROM shadow_profitability_facts
 WHERE shadow_decision_id = CAST($1 AS uuid)
 "#,
@@ -346,6 +361,28 @@ WHERE shadow_decision_id = CAST($1 AS uuid)
             .try_get::<String, _>("verification_status")
             .unwrap(),
         "primary_only"
+    );
+    assert_eq!(
+        canonical.try_get::<String, _>("route_config_hash").unwrap(),
+        "f".repeat(64)
+    );
+    assert_eq!(
+        canonical
+            .try_get::<String, _>("independent_verification_status")
+            .unwrap(),
+        "not_requested"
+    );
+    assert_eq!(
+        canonical
+            .try_get::<serde_json::Value, _>("independent_verification_lifecycle")
+            .unwrap(),
+        json!(["not_requested"])
+    );
+    assert_eq!(
+        canonical
+            .try_get::<String, _>("verification_skip_reason")
+            .unwrap(),
+        "primary_screen_no_profitable_candidate"
     );
 
     let mut plan_transaction = pool.begin().await.expect("begin query-plan check");

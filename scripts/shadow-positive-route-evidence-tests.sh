@@ -27,8 +27,8 @@ test_identity_b=phoenix.engine.input.v1:$test_sequence:$test_tx_b
 test_route=arb1-weth-usdc-uni500-uni3000-canary-v2
 RUN_STARTED_AT_UTC=2026-07-14T14:20:00.000000Z
 
-primary_report='{"source_event_identity":"'$test_identity_b'","source_sequence":"'$test_sequence'","source_transaction_hash":"'$test_tx_b'","classification":"candidate_rejected","rejection_reason":"no_profitable_candidate","candidate_count":1,"matched_route_id":"'$test_route'","processing_attempt_id":20931,"delivery_attempt":4,"processing_attempt_completed_at":"2026-07-14T14:24:02.000000+00:00","persisted_timestamp":"2026-07-14T14:24:02.000000+00:00","pinned_block_number":"483792695","pinned_block_hash":"0xfdb4b9a0a59ecf4c675b725390d41cb2820fe59a89caa0b7359b47eb644dda45","primary_state_hash":"1397b50a50d7b6128075572a6c730d731e0a5512c2463999cb509b7c989aa013","primary_provider_result":"publicnode","verification_status":"primary_only","independent_verification_status":"not_requested","independent_verification_skip_reason":"primary_screen_no_profitable_candidate","shadow_only":true,"execution_request_created":false}'
-agreed_report='{"source_event_identity":"'$test_identity_b'","source_sequence":"'$test_sequence'","source_transaction_hash":"'$test_tx_b'","classification":"shadow_accepted","rejection_reason":"shadow_policy_accepted","candidate_count":1,"matched_route_id":"'$test_route'","processing_attempt_id":20932,"delivery_attempt":5,"processing_attempt_completed_at":"2026-07-14T14:25:02.000000+00:00","persisted_timestamp":"2026-07-14T14:25:02.000000+00:00","pinned_block_number":"483792696","pinned_block_hash":"0xcccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","primary_state_hash":"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd","rpc_response_hash":"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee","primary_provider_result":"publicnode","verification_status":"agreed","independent_verification_status":"agreed","independent_provider_result":"secondary","verification_agreement":"agreed","shadow_disposition":"accepted","shadow_only":true,"execution_request_created":false}'
+primary_report='{"source_event_identity":"'$test_identity_b'","source_sequence":"'$test_sequence'","source_transaction_hash":"'$test_tx_b'","classification":"candidate_rejected","rejection_reason":"no_profitable_candidate","candidate_count":1,"matched_route_id":"'$test_route'","processing_attempt_id":20931,"delivery_attempt":4,"processing_attempt_completed_at":"2026-07-14T14:24:02.000000+00:00","persisted_timestamp":"2026-07-14T14:24:02.000000+00:00","pinned_block_number":"483792695","pinned_block_hash":"0xfdb4b9a0a59ecf4c675b725390d41cb2820fe59a89caa0b7359b47eb644dda45","primary_state_hash":"1397b50a50d7b6128075572a6c730d731e0a5512c2463999cb509b7c989aa013","route_config_hash":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","primary_provider_result":"publicnode","verification_status":"primary_only","independent_verification_status":"not_requested","independent_verification_lifecycle":["not_requested"],"independent_verification_skip_reason":"primary_screen_no_profitable_candidate","shadow_only":true,"execution_request_created":false}'
+agreed_report='{"source_event_identity":"'$test_identity_b'","source_sequence":"'$test_sequence'","source_transaction_hash":"'$test_tx_b'","classification":"shadow_accepted","rejection_reason":"shadow_policy_accepted","candidate_count":1,"matched_route_id":"'$test_route'","processing_attempt_id":20932,"delivery_attempt":5,"processing_attempt_completed_at":"2026-07-14T14:25:02.000000+00:00","persisted_timestamp":"2026-07-14T14:25:02.000000+00:00","pinned_block_number":"483792696","pinned_block_hash":"0xcccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","primary_state_hash":"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd","route_config_hash":"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff","rpc_response_hash":"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee","primary_provider_result":"publicnode","verification_status":"agreed","independent_verification_status":"agreed","independent_verification_lifecycle":["requested","agreed"],"independent_provider_result":"secondary","verification_agreement":"agreed","secondary_state_hash":"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd","secondary_block_number":"483792696","secondary_block_hash":"0xcccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","secondary_route_config_hash":"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff","shadow_disposition":"accepted","shadow_only":true,"execution_request_created":false}'
 
 fake_psql_mode=historical_only
 sql_query() {
@@ -112,6 +112,7 @@ import json, sys
 report = json.load(sys.stdin)
 assert report["verification_status"] == "primary_only"
 assert report["independent_verification_status"] == "not_requested"
+assert report["independent_verification_lifecycle"] == ["not_requested"]
 assert report["independent_verification_skip_reason"] == "primary_screen_no_profitable_candidate"
 assert "independent_provider_result" not in report
 assert "verification_agreement" not in report
@@ -127,8 +128,13 @@ import json, sys
 report = json.load(sys.stdin)
 assert report["verification_status"] == "agreed"
 assert report["independent_verification_status"] == "agreed"
+assert report["independent_verification_lifecycle"] == ["requested", "agreed"]
 assert report["verification_agreement"] == "agreed"
 assert report["independent_provider_result"] == "secondary"
+assert report["secondary_block_number"] == report["pinned_block_number"]
+assert report["secondary_block_hash"] == report["pinned_block_hash"]
+assert report["secondary_route_config_hash"] == report["route_config_hash"]
+assert report["secondary_state_hash"] == report["primary_state_hash"]
 ' || fail 'agreed verification was collapsed or omitted'
 
 write_rendered_budget() {

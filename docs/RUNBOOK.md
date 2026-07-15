@@ -65,6 +65,17 @@ After stopping, the script waits up to `SHADOW_ENGINE_CANARY_SETTLE_TIMEOUT_SECO
 - Reduce cold-path pressure.
 - Hot path must not add direct public RPC reads.
 
+### Independent verification failures
+
+- Keep SHADOW and inspect bounded `independent_verification_status` evidence.
+- Treat `provider_unavailable` as an availability or budget incident and
+  `integrity_failure` as a response-contract incident; do not relabel either as
+  agreement.
+- For `disagreed`, compare logical provider inventory and the persisted primary
+  and secondary block, block-hash, route-hash, and state-hash evidence.
+- A same-provider result or block/route mismatch is invalid evidence. Do not
+  bypass the gateway or relax the Engine/database checks.
+
 ### All RPC providers circuit-open
 
 - Keep SHADOW.
