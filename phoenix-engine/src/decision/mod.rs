@@ -105,7 +105,9 @@ pub fn decide(
         risk_flags,
         confidence_bps: context.confidence_bps,
         policy_version: policy.version.clone(),
+        shadow_only: true,
         execution_eligible: false,
+        execution_request_created: false,
         decided_at_unix_ms: context.now_unix_ms,
     }
 }
@@ -171,9 +173,10 @@ mod tests {
     use crate::domain::{Address, Amount, OpportunityId, PoolId, RouteId, TokenAddress, TxHash};
     use crate::graph::{PoolEdge, Route};
     use crate::opportunity::{
-        BasisPoints, CostBreakdown, MarketEvidence, OpportunityIdentity, OutcomeEvidence,
-        RouteEvidence, ScenarioEconomics, SimulationEvidence, SimulationKind, StateSource,
-        Strategy,
+        AgreementState, BasisPoints, CostBreakdown, MarketEvidence, OpportunityIdentity,
+        OutcomeEvidence, PrimaryProfitabilityStatus, RouteEvidence, ScenarioEconomics,
+        SimulationEvidence, SimulationKind, StateSource, Strategy, VerificationStatus,
+        VerificationSkipReason, PROFITABILITY_MODEL_VERSION,
     };
     use crate::Direction;
 
@@ -194,7 +197,10 @@ mod tests {
         };
         let economics = CostBreakdown {
             gross_spread: SignedAmount(100),
+            gross_profit: SignedAmount(100),
             gas_price_wei: 10,
+            contract_overhead: Amount(50),
+            total_cost: Amount(50),
             expected_net_pnl: SignedAmount(50),
             expected_roi_bps: BasisPoints(500),
             ..CostBreakdown::default()
@@ -237,14 +243,23 @@ mod tests {
                 quote_block: 100,
                 quote_age_ms: 10,
                 state_source: StateSource::RecordedCheckpoint,
-                rpc_provider_id: None,
-                rpc_response_hash: Some("state-hash".to_string()),
+                primary_provider_id: None,
+                primary_response_hash: Some("state-hash".to_string()),
+                primary_state_hash: Some("primary-state-hash".to_string()),
+                secondary_provider_id: None,
+                secondary_state_hash: None,
+                verification_status: VerificationStatus::HistoricalEvidence,
+                agreement_state: AgreementState::NotChecked,
+                verification_skip_reason: Some(VerificationSkipReason::HistoricalEvidence),
                 feed_to_detection_latency_ns: 1,
             },
             economics: ScenarioEconomics {
                 base: economics.clone(),
                 conservative: economics.clone(),
                 severe: economics,
+                minimum_required_net_pnl: SignedAmount(1),
+                primary_status: PrimaryProfitabilityStatus::MeetsMinimum,
+                model_version: PROFITABILITY_MODEL_VERSION.to_string(),
             },
             simulation: SimulationEvidence {
                 kind: SimulationKind::HistoricalReplay,
@@ -274,7 +289,9 @@ mod tests {
                 risk_flags: Vec::new(),
                 confidence_bps: 0,
                 policy_version: "pending".to_string(),
+                shadow_only: true,
                 execution_eligible: false,
+                execution_request_created: false,
                 decided_at_unix_ms: 0,
             },
             outcome: OutcomeEvidence {

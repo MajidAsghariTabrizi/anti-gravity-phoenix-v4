@@ -1,5 +1,8 @@
 use crate::domain::Amount;
-use crate::opportunity::{BasisPoints, CostBreakdown, ScenarioEconomics, SignedAmount};
+use crate::opportunity::{
+    BasisPoints, CostBreakdown, PrimaryProfitabilityStatus, ScenarioEconomics, SignedAmount,
+    PROFITABILITY_MODEL_VERSION,
+};
 
 const BPS_DENOMINATOR: u128 = 10_000;
 
@@ -25,6 +28,7 @@ pub struct EconomicInput {
     pub uncertainty_reserve: Amount,
     pub replacement_transaction_cost: Amount,
     pub probability_of_success_bps: u16,
+    pub minimum_required_net_pnl: SignedAmount,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -90,10 +94,18 @@ pub enum EconomicError {
 }
 
 pub fn evaluate_scenarios(input: &EconomicInput) -> Result<ScenarioEconomics, EconomicError> {
+    let base = evaluate(input, ScenarioConfig::BASE)?;
     Ok(ScenarioEconomics {
-        base: evaluate(input, ScenarioConfig::BASE)?,
+        primary_status: if base.expected_net_pnl >= input.minimum_required_net_pnl {
+            PrimaryProfitabilityStatus::MeetsMinimum
+        } else {
+            PrimaryProfitabilityStatus::BelowMinimum
+        },
+        base,
         conservative: evaluate(input, ScenarioConfig::CONSERVATIVE)?,
         severe: evaluate(input, ScenarioConfig::SEVERE)?,
+        minimum_required_net_pnl: input.minimum_required_net_pnl,
+        model_version: PROFITABILITY_MODEL_VERSION.to_string(),
     })
 }
 
@@ -117,11 +129,11 @@ pub fn evaluate(
     let failure_probability = scale_probability(
         input.failure_probability_bps,
         scenario.failure_multiplier_bps,
-    );
+    )?;
     let stale_probability = scale_probability(
         input.stale_quote_probability_bps,
         scenario.stale_state_multiplier_bps,
-    );
+    )?;
     let failure_cost_reserve =
         probability_cost(input.failed_attempt_gas_cost.0, failure_probability)?;
     let stale_probability_cost = probability_cost(input.stale_state_loss.0, stale_probability)?;
@@ -130,7 +142,7 @@ pub fn evaluate(
         scenario.state_drift_multiplier_bps,
     )?;
     let latency = scale(input.latency_reserve.0, scenario.latency_multiplier_bps)?;
-    let stale_state_penalty = checked_sum(&[stale_probability_cost, state_drift, latency])?;
+    let stale_state_penalty = stale_probability_cost;
     let uncertainty_reserve = scale(
         input.uncertainty_reserve.0,
         scenario.uncertainty_multiplier_bps,
@@ -139,10 +151,16 @@ pub fn evaluate(
         input.replacement_transaction_cost.0,
         scenario.replacement_cost_multiplier_bps,
     )?;
-    let contract_overhead = input
-        .contract_overhead
+    let contract_overhead = input.contract_overhead.0;
+
+    let market_cost = checked_sum(&[
+        input.protocol_fees.0,
+        input.pool_fees.0,
+        price_impact,
+    ])?;
+    let gross_profit = gross_spread
         .0
-        .checked_add(replacement_cost)
+        .checked_sub(as_i128(market_cost)?)
         .ok_or(EconomicError::ArithmeticOverflow)?;
 
     let total_cost = checked_sum(&[
@@ -156,6 +174,9 @@ pub fn evaluate(
         contract_overhead,
         failure_cost_reserve,
         stale_state_penalty,
+        replacement_cost,
+        state_drift,
+        latency,
         uncertainty_reserve,
     ])?;
     let expected_net_pnl = gross_spread
@@ -177,6 +198,7 @@ pub fn evaluate(
 
     Ok(CostBreakdown {
         gross_spread,
+        gross_profit: SignedAmount(gross_profit),
         protocol_fees: input.protocol_fees,
         pool_fees: input.pool_fees,
         price_impact: Amount(price_impact),
@@ -189,7 +211,11 @@ pub fn evaluate(
         contract_overhead: Amount(contract_overhead),
         failure_cost_reserve: Amount(failure_cost_reserve),
         stale_state_penalty: Amount(stale_state_penalty),
+        ordering_reserve: Amount(replacement_cost),
+        state_drift_reserve: Amount(state_drift),
+        latency_reserve: Amount(latency),
         uncertainty_reserve: Amount(uncertainty_reserve),
+        total_cost: Amount(total_cost),
         expected_net_pnl: SignedAmount(expected_net_pnl),
         expected_roi_bps: BasisPoints(
             i32::try_from(roi_bps).map_err(|_| EconomicError::ArithmeticOverflow)?,
@@ -203,6 +229,7 @@ fn validate(input: &EconomicInput, scenario: ScenarioConfig) -> Result<(), Econo
     if input.failure_probability_bps > 10_000
         || input.stale_quote_probability_bps > 10_000
         || input.probability_of_success_bps > 10_000
+        || input.minimum_required_net_pnl.0 < 0
     {
         return Err(EconomicError::InvalidProbability);
     }
@@ -226,9 +253,19 @@ fn validate(input: &EconomicInput, scenario: ScenarioConfig) -> Result<(), Econo
 
 fn signed_difference(lhs: u128, rhs: u128) -> Result<SignedAmount, EconomicError> {
     if lhs >= rhs {
-        Ok(SignedAmount(as_i128(lhs - rhs)?))
+        Ok(SignedAmount(as_i128(
+            lhs.checked_sub(rhs)
+                .ok_or(EconomicError::ArithmeticOverflow)?,
+        )?))
     } else {
-        Ok(SignedAmount(-as_i128(rhs - lhs)?))
+        Ok(SignedAmount(
+            as_i128(
+                rhs.checked_sub(lhs)
+                    .ok_or(EconomicError::ArithmeticOverflow)?,
+            )?
+            .checked_neg()
+            .ok_or(EconomicError::ArithmeticOverflow)?,
+        ))
     }
 }
 
@@ -243,9 +280,16 @@ fn scale(value: u128, multiplier_bps: u32) -> Result<u128, EconomicError> {
         .map(|scaled| scaled / BPS_DENOMINATOR)
 }
 
-fn scale_probability(probability_bps: u16, multiplier_bps: u32) -> u16 {
-    ((probability_bps as u128 * multiplier_bps as u128) / BPS_DENOMINATOR).min(BPS_DENOMINATOR)
-        as u16
+fn scale_probability(
+    probability_bps: u16,
+    multiplier_bps: u32,
+) -> Result<u16, EconomicError> {
+    let scaled = u128::from(probability_bps)
+        .checked_mul(u128::from(multiplier_bps))
+        .ok_or(EconomicError::ArithmeticOverflow)?
+        / BPS_DENOMINATOR;
+    u16::try_from(scaled.min(BPS_DENOMINATOR))
+        .map_err(|_| EconomicError::ArithmeticOverflow)
 }
 
 fn probability_cost(value: u128, probability_bps: u16) -> Result<u128, EconomicError> {
@@ -286,6 +330,7 @@ mod tests {
             uncertainty_reserve: Amount(2_000),
             replacement_transaction_cost: Amount(5_000),
             probability_of_success_bps: 9_000,
+            minimum_required_net_pnl: SignedAmount(1),
         }
     }
 
@@ -295,7 +340,11 @@ mod tests {
         assert_eq!(result.gross_spread, SignedAmount(100_000));
         assert_eq!(result.arbitrum_execution_fee, Amount(1_000));
         assert_eq!(result.failure_cost_reserve, Amount(1_000));
-        assert_eq!(result.stale_state_penalty, Amount(4_000));
+        assert_eq!(result.stale_state_penalty, Amount(1_000));
+        assert_eq!(result.state_drift_reserve, Amount(2_000));
+        assert_eq!(result.latency_reserve, Amount(1_000));
+        assert_eq!(result.gross_profit, SignedAmount(94_000));
+        assert_eq!(result.total_cost, Amount(26_000));
         assert_eq!(result.expected_net_pnl, SignedAmount(74_000));
         assert_eq!(
             result.expected_value_after_success_probability,
@@ -308,6 +357,11 @@ mod tests {
         let result = evaluate_scenarios(&input()).unwrap();
         assert!(result.base.expected_net_pnl >= result.conservative.expected_net_pnl);
         assert!(result.conservative.expected_net_pnl >= result.severe.expected_net_pnl);
+        assert_eq!(
+            result.primary_status,
+            PrimaryProfitabilityStatus::MeetsMinimum
+        );
+        assert_eq!(result.model_version, PROFITABILITY_MODEL_VERSION);
     }
 
     #[test]
@@ -345,6 +399,39 @@ mod tests {
         assert_eq!(
             evaluate(&invalid, ScenarioConfig::BASE),
             Err(EconomicError::InvalidProbability)
+        );
+    }
+
+    #[test]
+    fn rejects_negative_minimum_profitability_threshold() {
+        let mut invalid = input();
+        invalid.minimum_required_net_pnl = SignedAmount(-1);
+        assert_eq!(
+            evaluate_scenarios(&invalid),
+            Err(EconomicError::InvalidScenario)
+        );
+    }
+
+    #[test]
+    fn below_threshold_status_preserves_signed_economics() {
+        let mut candidate = input();
+        candidate.minimum_required_net_pnl = SignedAmount(80_000);
+        let result = evaluate_scenarios(&candidate).unwrap();
+        assert_eq!(
+            result.primary_status,
+            PrimaryProfitabilityStatus::BelowMinimum
+        );
+        assert_eq!(result.base.expected_net_pnl, SignedAmount(74_000));
+    }
+
+    #[test]
+    fn checked_arithmetic_rejects_overflow() {
+        let mut candidate = input();
+        candidate.estimated_execution_gas = u64::MAX;
+        candidate.gas_price_wei = u128::MAX;
+        assert_eq!(
+            evaluate(&candidate, ScenarioConfig::BASE),
+            Err(EconomicError::ArithmeticOverflow)
         );
     }
 }

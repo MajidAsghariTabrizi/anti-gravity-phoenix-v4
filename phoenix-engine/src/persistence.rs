@@ -1,5 +1,9 @@
 use crate::engine_input::{EngineClassification, InputIdentity};
-use crate::opportunity::{ShadowDisposition, SimulationKind, StateSource};
+use crate::opportunity::{
+    AgreementState, CostBreakdown, Opportunity, PrimaryProfitabilityStatus, ShadowDisposition,
+    SimulationKind, StateSource, VerificationSkipReason, VerificationStatus,
+    PROFITABILITY_MODEL_VERSION,
+};
 use crate::shadow_processor::EvaluatedOpportunity;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -109,7 +113,8 @@ WHERE table_schema = 'public'
       'shadow_engine_classifications',
       'shadow_engine_processing_attempts',
       'shadow_decisions',
-      'rpc_quality_records'
+      'rpc_quality_records',
+      'shadow_profitability_facts'
   )
 "#,
         )
@@ -144,7 +149,8 @@ WHERE tc.constraint_schema = 'public'
       'shadow_engine_classifications',
       'shadow_engine_processing_attempts',
       'shadow_decisions',
-      'rpc_quality_records'
+      'rpc_quality_records',
+      'shadow_profitability_facts'
   )
   AND tc.constraint_type IN ('PRIMARY KEY', 'UNIQUE')
 GROUP BY tc.table_name, tc.constraint_name
@@ -175,7 +181,8 @@ WHERE namespace_row.nspname = 'public'
       'shadow_engine_classifications',
       'shadow_engine_processing_attempts',
       'shadow_decisions',
-      'rpc_quality_records'
+      'rpc_quality_records',
+      'shadow_profitability_facts'
   )
   AND constraint_row.contype = 'c'
 "#,
@@ -198,7 +205,11 @@ WHERE namespace_row.nspname = 'public'
 SELECT tablename AS table_name, indexdef AS definition
 FROM pg_indexes
 WHERE schemaname = 'public'
-  AND tablename IN ('shadow_decisions', 'rpc_quality_records')
+  AND tablename IN (
+      'shadow_decisions',
+      'rpc_quality_records',
+      'shadow_profitability_facts'
+  )
 "#,
         )
         .fetch_all(&self.pool)
@@ -595,6 +606,7 @@ ON CONFLICT (id) DO NOTHING
     if inserted.rows_affected() != 1 {
         return Err(StoreError::Integrity);
     }
+    persist_profitability_fact(transaction, record, evaluation, decided_at).await?;
 
     let block_hash = opportunity
         .market
@@ -653,6 +665,231 @@ INSERT INTO rpc_quality_records (
         .execute(&mut **transaction)
         .await
         .map_err(classify_sqlx_error)?;
+    }
+    Ok(())
+}
+
+async fn persist_profitability_fact(
+    transaction: &mut Transaction<'_, Postgres>,
+    record: &ClassificationRecord,
+    evaluation: &EvaluatedOpportunity,
+    evaluated_at: DateTime<Utc>,
+) -> Result<(), StoreError> {
+    let opportunity = &evaluation.opportunity;
+    let base = &opportunity.economics.base;
+    let token_path = serde_json::to_value(&opportunity.route.token_path)
+        .map_err(|_| StoreError::Integrity)?;
+    let pool_path =
+        serde_json::to_value(&opportunity.route.pools).map_err(|_| StoreError::Integrity)?;
+    let fee_path = serde_json::to_value(
+        opportunity
+            .route
+            .exact_ordered_legs
+            .iter()
+            .map(|leg| leg.fee)
+            .collect::<Vec<_>>(),
+    )
+    .map_err(|_| StoreError::Integrity)?;
+    let secondary_reasons = serde_json::to_value(&opportunity.decision.secondary_rejection_reasons)
+        .map_err(|_| StoreError::Integrity)?;
+    let disposition = match opportunity.decision.disposition {
+        ShadowDisposition::Accepted => "accepted",
+        ShadowDisposition::Rejected => "rejected",
+    };
+    let fact = serde_json::json!({
+        "shadow_decision_id": opportunity.identity.opportunity_id.0,
+        "source_event_identity": record.identity.source_event_identity,
+        "source_sequence": opportunity.identity.source_sequence.to_string(),
+        "transaction_hash": opportunity.identity.origin_tx_hash.0,
+        "chain_id": opportunity.identity.chain_id,
+        "route_id": opportunity.route.route_id.0,
+        "route_fingerprint": opportunity.route.route_fingerprint,
+        "detected_at": timestamp_from_millis(opportunity.identity.detected_at_unix_ms)?,
+        "evaluated_at": evaluated_at,
+        "pinned_block_number": opportunity.market.state_block.to_string(),
+        "pinned_block_hash": opportunity.market.state_block_hash,
+        "primary_state_hash": opportunity.market.primary_state_hash,
+        "token_path": token_path,
+        "pool_path": pool_path,
+        "fee_path": fee_path,
+        "input_amount": opportunity.route.input_amount.0.to_string(),
+        "expected_output": opportunity.route.expected_output.0.to_string(),
+        "gross_spread": base.gross_spread.0.to_string(),
+        "gross_profit": base.gross_profit.0.to_string(),
+        "dex_fees": base.pool_fees.0.to_string(),
+        "price_impact": base.price_impact.0.to_string(),
+        "execution_gas": base.estimated_execution_gas.to_string(),
+        "gas_price": base.gas_price_wei.to_string(),
+        "arbitrum_execution_fee": base.arbitrum_execution_fee.0.to_string(),
+        "l1_data_fee": base.l1_data_fee.0.to_string(),
+        "flash_loan_premium": base.flash_loan_fee.0.to_string(),
+        "protocol_fees": base.protocol_fees.0.to_string(),
+        "failed_attempt_reserve": base.failure_cost_reserve.0.to_string(),
+        "ordering_reserve": base.ordering_reserve.0.to_string(),
+        "slippage_reserve": base.slippage_allowance.0.to_string(),
+        "stale_state_reserve": base.stale_state_penalty.0.to_string(),
+        "state_drift_reserve": base.state_drift_reserve.0.to_string(),
+        "latency_reserve": base.latency_reserve.0.to_string(),
+        "uncertainty_reserve": base.uncertainty_reserve.0.to_string(),
+        "contract_overhead": base.contract_overhead.0.to_string(),
+        "total_cost": base.total_cost.0.to_string(),
+        "expected_net_pnl": base.expected_net_pnl.0.to_string(),
+        "conservative_net_pnl": opportunity.economics.conservative.expected_net_pnl.0.to_string(),
+        "severe_net_pnl": opportunity.economics.severe.expected_net_pnl.0.to_string(),
+        "minimum_required_net_pnl": opportunity.economics.minimum_required_net_pnl.0.to_string(),
+        "primary_profitability_status": opportunity.economics.primary_status.as_str(),
+        "disposition": disposition,
+        "final_rejection_reason": opportunity.decision.primary_rejection_reason.map(|reason| reason.as_str()),
+        "secondary_rejection_reasons": secondary_reasons,
+        "model_version": opportunity.economics.model_version,
+        "policy_version": opportunity.decision.policy_version,
+        "detector_version": opportunity.identity.detector_version,
+        "code_version": opportunity.identity.code_version,
+        "primary_provider_id": opportunity.market.primary_provider_id,
+        "primary_response_hash": opportunity.market.primary_response_hash,
+        "secondary_provider_id": opportunity.market.secondary_provider_id,
+        "secondary_state_hash": opportunity.market.secondary_state_hash,
+        "verification_status": opportunity.market.verification_status.as_str(),
+        "agreement_state": opportunity.market.agreement_state.as_str(),
+        "verification_skip_reason": opportunity.market.verification_skip_reason.map(|reason| reason.as_str()),
+        "shadow_only": opportunity.decision.shadow_only,
+        "execution_eligible": opportunity.decision.execution_eligible,
+        "execution_request_created": opportunity.decision.execution_request_created,
+        "evidence_completeness_status": "complete"
+    });
+    let inserted = sqlx::query(
+        r#"
+INSERT INTO shadow_profitability_facts (
+    shadow_decision_id,
+    source_event_identity,
+    source_sequence,
+    transaction_hash,
+    chain_id,
+    route_id,
+    route_fingerprint,
+    detected_at,
+    evaluated_at,
+    pinned_block_number,
+    pinned_block_hash,
+    primary_state_hash,
+    token_path,
+    pool_path,
+    fee_path,
+    input_amount,
+    expected_output,
+    gross_spread,
+    gross_profit,
+    dex_fees,
+    price_impact,
+    execution_gas,
+    gas_price,
+    arbitrum_execution_fee,
+    l1_data_fee,
+    flash_loan_premium,
+    protocol_fees,
+    failed_attempt_reserve,
+    ordering_reserve,
+    slippage_reserve,
+    stale_state_reserve,
+    state_drift_reserve,
+    latency_reserve,
+    uncertainty_reserve,
+    contract_overhead,
+    total_cost,
+    expected_net_pnl,
+    conservative_net_pnl,
+    severe_net_pnl,
+    minimum_required_net_pnl,
+    primary_profitability_status,
+    disposition,
+    final_rejection_reason,
+    secondary_rejection_reasons,
+    model_version,
+    policy_version,
+    detector_version,
+    code_version,
+    primary_provider_id,
+    primary_response_hash,
+    secondary_provider_id,
+    secondary_state_hash,
+    verification_status,
+    agreement_state,
+    verification_skip_reason,
+    shadow_only,
+    execution_eligible,
+    execution_request_created,
+    evidence_completeness_status
+)
+SELECT *
+FROM jsonb_to_record($1) AS fact(
+    shadow_decision_id uuid,
+    source_event_identity text,
+    source_sequence numeric,
+    transaction_hash text,
+    chain_id bigint,
+    route_id text,
+    route_fingerprint text,
+    detected_at timestamptz,
+    evaluated_at timestamptz,
+    pinned_block_number numeric,
+    pinned_block_hash text,
+    primary_state_hash text,
+    token_path jsonb,
+    pool_path jsonb,
+    fee_path jsonb,
+    input_amount numeric,
+    expected_output numeric,
+    gross_spread numeric,
+    gross_profit numeric,
+    dex_fees numeric,
+    price_impact numeric,
+    execution_gas numeric,
+    gas_price numeric,
+    arbitrum_execution_fee numeric,
+    l1_data_fee numeric,
+    flash_loan_premium numeric,
+    protocol_fees numeric,
+    failed_attempt_reserve numeric,
+    ordering_reserve numeric,
+    slippage_reserve numeric,
+    stale_state_reserve numeric,
+    state_drift_reserve numeric,
+    latency_reserve numeric,
+    uncertainty_reserve numeric,
+    contract_overhead numeric,
+    total_cost numeric,
+    expected_net_pnl numeric,
+    conservative_net_pnl numeric,
+    severe_net_pnl numeric,
+    minimum_required_net_pnl numeric,
+    primary_profitability_status text,
+    disposition text,
+    final_rejection_reason text,
+    secondary_rejection_reasons jsonb,
+    model_version text,
+    policy_version text,
+    detector_version text,
+    code_version text,
+    primary_provider_id text,
+    primary_response_hash text,
+    secondary_provider_id text,
+    secondary_state_hash text,
+    verification_status text,
+    agreement_state text,
+    verification_skip_reason text,
+    shadow_only boolean,
+    execution_eligible boolean,
+    execution_request_created boolean,
+    evidence_completeness_status text
+)
+"#,
+    )
+    .bind(Json(fact))
+    .execute(&mut **transaction)
+    .await
+    .map_err(classify_sqlx_error)?;
+    if inserted.rows_affected() != 1 {
+        return Err(StoreError::Integrity);
     }
     Ok(())
 }
@@ -865,6 +1102,161 @@ const REQUIRED_COLUMNS: &[(&str, &str, &str, bool)] = &[
     ("rpc_quality_records", "disagreement", "boolean", false),
     ("rpc_quality_records", "timeout", "boolean", false),
     ("rpc_quality_records", "retry_count", "integer", false),
+    (
+        "shadow_profitability_facts",
+        "shadow_decision_id",
+        "uuid",
+        false,
+    ),
+    (
+        "shadow_profitability_facts",
+        "source_event_identity",
+        "text",
+        true,
+    ),
+    ("shadow_profitability_facts", "source_sequence", "numeric", true),
+    ("shadow_profitability_facts", "transaction_hash", "text", true),
+    ("shadow_profitability_facts", "chain_id", "bigint", true),
+    ("shadow_profitability_facts", "route_id", "text", true),
+    ("shadow_profitability_facts", "route_fingerprint", "text", true),
+    (
+        "shadow_profitability_facts",
+        "detected_at",
+        "timestamp with time zone",
+        true,
+    ),
+    (
+        "shadow_profitability_facts",
+        "evaluated_at",
+        "timestamp with time zone",
+        false,
+    ),
+    ("shadow_profitability_facts", "pinned_block_number", "numeric", true),
+    ("shadow_profitability_facts", "pinned_block_hash", "text", true),
+    ("shadow_profitability_facts", "primary_state_hash", "text", true),
+    ("shadow_profitability_facts", "token_path", "jsonb", true),
+    ("shadow_profitability_facts", "pool_path", "jsonb", true),
+    ("shadow_profitability_facts", "fee_path", "jsonb", true),
+    ("shadow_profitability_facts", "input_amount", "numeric", true),
+    ("shadow_profitability_facts", "expected_output", "numeric", true),
+    ("shadow_profitability_facts", "gross_spread", "numeric", true),
+    ("shadow_profitability_facts", "gross_profit", "numeric", true),
+    ("shadow_profitability_facts", "dex_fees", "numeric", true),
+    ("shadow_profitability_facts", "price_impact", "numeric", true),
+    ("shadow_profitability_facts", "execution_gas", "numeric", true),
+    ("shadow_profitability_facts", "gas_price", "numeric", true),
+    (
+        "shadow_profitability_facts",
+        "arbitrum_execution_fee",
+        "numeric",
+        true,
+    ),
+    ("shadow_profitability_facts", "l1_data_fee", "numeric", true),
+    (
+        "shadow_profitability_facts",
+        "flash_loan_premium",
+        "numeric",
+        true,
+    ),
+    ("shadow_profitability_facts", "protocol_fees", "numeric", true),
+    (
+        "shadow_profitability_facts",
+        "failed_attempt_reserve",
+        "numeric",
+        true,
+    ),
+    ("shadow_profitability_facts", "ordering_reserve", "numeric", true),
+    ("shadow_profitability_facts", "slippage_reserve", "numeric", true),
+    ("shadow_profitability_facts", "stale_state_reserve", "numeric", true),
+    ("shadow_profitability_facts", "state_drift_reserve", "numeric", true),
+    ("shadow_profitability_facts", "latency_reserve", "numeric", true),
+    (
+        "shadow_profitability_facts",
+        "uncertainty_reserve",
+        "numeric",
+        true,
+    ),
+    ("shadow_profitability_facts", "contract_overhead", "numeric", true),
+    ("shadow_profitability_facts", "total_cost", "numeric", true),
+    ("shadow_profitability_facts", "expected_net_pnl", "numeric", true),
+    (
+        "shadow_profitability_facts",
+        "conservative_net_pnl",
+        "numeric",
+        true,
+    ),
+    ("shadow_profitability_facts", "severe_net_pnl", "numeric", true),
+    (
+        "shadow_profitability_facts",
+        "minimum_required_net_pnl",
+        "numeric",
+        true,
+    ),
+    (
+        "shadow_profitability_facts",
+        "primary_profitability_status",
+        "text",
+        false,
+    ),
+    ("shadow_profitability_facts", "disposition", "text", true),
+    (
+        "shadow_profitability_facts",
+        "final_rejection_reason",
+        "text",
+        true,
+    ),
+    (
+        "shadow_profitability_facts",
+        "secondary_rejection_reasons",
+        "jsonb",
+        false,
+    ),
+    ("shadow_profitability_facts", "model_version", "text", true),
+    ("shadow_profitability_facts", "policy_version", "text", true),
+    ("shadow_profitability_facts", "detector_version", "text", true),
+    ("shadow_profitability_facts", "code_version", "text", true),
+    ("shadow_profitability_facts", "primary_provider_id", "text", true),
+    (
+        "shadow_profitability_facts",
+        "primary_response_hash",
+        "text",
+        true,
+    ),
+    ("shadow_profitability_facts", "secondary_provider_id", "text", true),
+    ("shadow_profitability_facts", "secondary_state_hash", "text", true),
+    ("shadow_profitability_facts", "verification_status", "text", false),
+    ("shadow_profitability_facts", "agreement_state", "text", false),
+    (
+        "shadow_profitability_facts",
+        "verification_skip_reason",
+        "text",
+        true,
+    ),
+    ("shadow_profitability_facts", "shadow_only", "boolean", false),
+    (
+        "shadow_profitability_facts",
+        "execution_eligible",
+        "boolean",
+        false,
+    ),
+    (
+        "shadow_profitability_facts",
+        "execution_request_created",
+        "boolean",
+        false,
+    ),
+    (
+        "shadow_profitability_facts",
+        "evidence_completeness_status",
+        "text",
+        false,
+    ),
+    (
+        "shadow_profitability_facts",
+        "created_at",
+        "timestamp with time zone",
+        false,
+    ),
 ];
 
 pub fn validate_schema_snapshot(snapshot: &SchemaSnapshot) -> Result<(), StoreError> {
@@ -898,10 +1290,16 @@ pub fn validate_schema_snapshot(snapshot: &SchemaSnapshot) -> Result<(), StoreEr
     )?;
     require_unique(snapshot, "shadow_decisions", &["id"])?;
     require_unique(snapshot, "rpc_quality_records", &["id"])?;
+    require_unique(snapshot, "shadow_profitability_facts", &["shadow_decision_id"])?;
     require_index_fragment(
         snapshot,
         "shadow_decisions",
         "(source_event_identity,strategy_version,route_fingerprint)",
+    )?;
+    require_index_fragment(
+        snapshot,
+        "shadow_profitability_facts",
+        "(evaluated_atdesc,shadow_decision_iddesc)",
     )?;
 
     let checks = snapshot
@@ -918,6 +1316,15 @@ pub fn validate_schema_snapshot(snapshot: &SchemaSnapshot) -> Result<(), StoreEr
         "octet_lengthevidence::text<=1048576",
         "delivery_attempt>=1",
         "execution_eligible=false",
+        "shadow_only=true",
+        "execution_request_created=false",
+        "primary_profitability_status=any",
+        "verification_status=any",
+        "verification_skip_reason='primary_below_minimum'::text",
+        "gross_profit=gross_spread-protocol_fees-dex_fees-price_impact",
+        "arbitrum_execution_fee=execution_gas*gas_price",
+        "expected_net_pnl=gross_spread-total_cost",
+        "jsonb_array_lengthtoken_path=jsonb_array_lengthpool_path+1",
         "retry_count>=0",
         "jsonb_typeofsecondary_rejection_reasons='array'::text",
         "jsonb_typeofrisk_flags='array'::text",
@@ -1050,23 +1457,32 @@ fn validate_evaluation(
             .any(|state| !valid_evidence_hash(&state.state_hash))
         || opportunity
             .market
-            .rpc_response_hash
+            .primary_response_hash
             .as_deref()
             .map_or(true, |value| !valid_evidence_hash(value))
         || opportunity
             .market
-            .rpc_provider_id
+            .primary_state_hash
+            .as_deref()
+            .map_or(true, |value| !valid_evidence_hash(value))
+        || opportunity
+            .market
+            .primary_provider_id
             .as_deref()
             .map_or(true, |value| {
                 !bounded_text(value, 1, 128) || value.contains("://")
             })
+        || !valid_verification_evidence(opportunity)
+        || !valid_profitability_evidence(opportunity)
         || !bounded_text(&opportunity.route.route_fingerprint, 1, 256)
         || !bounded_text(&opportunity.identity.strategy_version, 1, 128)
         || !bounded_text(&opportunity.identity.detector_version, 1, 128)
         || !bounded_text(&opportunity.identity.code_version, 1, 128)
         || !bounded_text(&opportunity.identity.config_version, 1, 256)
         || !bounded_text(&opportunity.decision.policy_version, 1, 128)
+        || !opportunity.decision.shadow_only
         || opportunity.decision.execution_eligible
+        || opportunity.decision.execution_request_created
         || (opportunity.decision.disposition == ShadowDisposition::Accepted
             && opportunity.simulation.kind == SimulationKind::StateBased)
         || evaluation.rpc_quality.is_empty()
@@ -1097,6 +1513,127 @@ fn validate_evaluation(
         }
     }
     Ok(())
+}
+
+fn valid_verification_evidence(opportunity: &Opportunity) -> bool {
+    let market = &opportunity.market;
+    let primary_provider = market.primary_provider_id.as_deref().unwrap_or_default();
+    let secondary_provider_valid =
+        market
+            .secondary_provider_id
+            .as_deref()
+            .map_or(true, |value| {
+                bounded_text(value, 1, 128)
+                    && !value.contains("://")
+                    && value != primary_provider
+            });
+    let secondary_hash_valid = market
+        .secondary_state_hash
+        .as_deref()
+        .map_or(true, valid_evidence_hash);
+    if !secondary_provider_valid || !secondary_hash_valid {
+        return false;
+    }
+    match market.verification_status {
+        VerificationStatus::PrimaryOnly => {
+            market.agreement_state == AgreementState::NotChecked
+                && market.secondary_provider_id.is_none()
+                && market.secondary_state_hash.is_none()
+                && market.verification_skip_reason
+                    == Some(VerificationSkipReason::PrimaryBelowMinimum)
+                && opportunity.economics.primary_status
+                    == PrimaryProfitabilityStatus::BelowMinimum
+        }
+        VerificationStatus::Agreed => {
+            market.agreement_state == AgreementState::Agreed
+                && market.secondary_provider_id.is_some()
+                && market.secondary_state_hash == market.primary_state_hash
+                && market.verification_skip_reason.is_none()
+        }
+        VerificationStatus::Disagreed => {
+            market.agreement_state == AgreementState::Disagreed
+                && market.secondary_provider_id.is_some()
+                && market.secondary_state_hash.is_some()
+                && market.secondary_state_hash != market.primary_state_hash
+                && market.verification_skip_reason.is_none()
+        }
+        VerificationStatus::SecondaryUnavailable => {
+            market.agreement_state == AgreementState::Unavailable
+                && market.secondary_provider_id.is_none()
+                && market.secondary_state_hash.is_none()
+                && market.verification_skip_reason.is_none()
+        }
+        VerificationStatus::Incomplete | VerificationStatus::HistoricalEvidence => false,
+    }
+}
+
+fn valid_profitability_evidence(opportunity: &Opportunity) -> bool {
+    let economics = &opportunity.economics;
+    if economics.model_version != PROFITABILITY_MODEL_VERSION
+        || economics.minimum_required_net_pnl.0 < 0
+        || economics.primary_status == PrimaryProfitabilityStatus::Incomplete
+        || economics.base.expected_net_pnl < economics.conservative.expected_net_pnl
+        || economics.conservative.expected_net_pnl < economics.severe.expected_net_pnl
+    {
+        return false;
+    }
+    let expected_status = if economics.base.expected_net_pnl >= economics.minimum_required_net_pnl {
+        PrimaryProfitabilityStatus::MeetsMinimum
+    } else {
+        PrimaryProfitabilityStatus::BelowMinimum
+    };
+    let base_execution_fee = u128::from(economics.base.estimated_execution_gas)
+        .checked_mul(economics.base.gas_price_wei);
+    economics.primary_status == expected_status
+        && base_execution_fee == Some(economics.base.arbitrum_execution_fee.0)
+        && valid_cost_breakdown(&economics.base)
+        && valid_cost_breakdown(&economics.conservative)
+        && valid_cost_breakdown(&economics.severe)
+}
+
+fn valid_cost_breakdown(costs: &CostBreakdown) -> bool {
+    let total = [
+        costs.protocol_fees.0,
+        costs.pool_fees.0,
+        costs.price_impact.0,
+        costs.slippage_allowance.0,
+        costs.flash_loan_fee.0,
+        costs.arbitrum_execution_fee.0,
+        costs.l1_data_fee.0,
+        costs.contract_overhead.0,
+        costs.failure_cost_reserve.0,
+        costs.stale_state_penalty.0,
+        costs.ordering_reserve.0,
+        costs.state_drift_reserve.0,
+        costs.latency_reserve.0,
+        costs.uncertainty_reserve.0,
+    ]
+    .into_iter()
+    .try_fold(0_u128, u128::checked_add);
+    let market_cost = [
+        costs.protocol_fees.0,
+        costs.pool_fees.0,
+        costs.price_impact.0,
+    ]
+    .into_iter()
+    .try_fold(0_u128, u128::checked_add);
+    let (Some(total), Some(market_cost)) = (total, market_cost) else {
+        return false;
+    };
+    let (Ok(total_signed), Ok(market_cost_signed)) =
+        (i128::try_from(total), i128::try_from(market_cost))
+    else {
+        return false;
+    };
+    let Some(gross_profit) = costs.gross_spread.0.checked_sub(market_cost_signed) else {
+        return false;
+    };
+    let Some(expected_net_pnl) = costs.gross_spread.0.checked_sub(total_signed) else {
+        return false;
+    };
+    costs.total_cost.0 == total
+        && costs.gross_profit.0 == gross_profit
+        && costs.expected_net_pnl.0 == expected_net_pnl
 }
 
 fn valid_identity(value: &str) -> bool {
@@ -1302,6 +1839,11 @@ mod tests {
             .entry("rpc_quality_records".to_string())
             .or_default()
             .insert(vec!["id".to_string()]);
+        snapshot
+            .unique_constraints
+            .entry("shadow_profitability_facts".to_string())
+            .or_default()
+            .insert(vec!["shadow_decision_id".to_string()]);
         snapshot.check_constraints.insert(
             "shadow_engine_classifications".to_string(),
             vec![
@@ -1326,10 +1868,34 @@ mod tests {
             "rpc_quality_records".to_string(),
             vec!["CHECK ((retry_count >= 0))".to_string()],
         );
+        snapshot.check_constraints.insert(
+            "shadow_profitability_facts".to_string(),
+            vec![
+                "CHECK ((shadow_only = true))".to_string(),
+                "CHECK ((execution_eligible = false))".to_string(),
+                "CHECK ((execution_request_created = false))".to_string(),
+                "CHECK ((primary_profitability_status = ANY (...)))".to_string(),
+                "CHECK ((verification_status = ANY (...)))".to_string(),
+                "CHECK ((verification_skip_reason = 'primary_below_minimum'::text))"
+                    .to_string(),
+                "CHECK ((gross_profit = gross_spread - protocol_fees - dex_fees - price_impact))"
+                    .to_string(),
+                "CHECK ((arbitrum_execution_fee = execution_gas * gas_price))".to_string(),
+                "CHECK ((expected_net_pnl = gross_spread - total_cost))".to_string(),
+                "CHECK ((jsonb_array_length(token_path) = jsonb_array_length(pool_path) + 1))"
+                    .to_string(),
+            ],
+        );
         snapshot.indexes.insert(
             "shadow_decisions".to_string(),
             vec![
                 "CREATE UNIQUE INDEX shadow_decisions_source_event_route_idx ON public.shadow_decisions USING btree (source_event_identity, strategy_version, route_fingerprint) WHERE (source_event_identity IS NOT NULL)".to_string(),
+            ],
+        );
+        snapshot.indexes.insert(
+            "shadow_profitability_facts".to_string(),
+            vec![
+                "CREATE INDEX shadow_profitability_evaluated_idx ON public.shadow_profitability_facts USING btree (evaluated_at DESC, shadow_decision_id DESC)".to_string(),
             ],
         );
         snapshot
@@ -1425,5 +1991,18 @@ mod tests {
         assert!(exhaustion_migration.contains("'dependency_exhausted'"));
         assert!(exhaustion_migration.contains("shadow_engine_classification_value_check"));
         assert!(exhaustion_migration.contains("shadow_engine_attempt_classification_check"));
+        let profitability_migration =
+            include_str!("../../migrations/007_canonical_profitability_truth.sql");
+        for required in [
+            "CREATE TABLE IF NOT EXISTS shadow_profitability_facts",
+            "evidence_completeness_status <> 'complete'",
+            "shadow_only = true",
+            "execution_eligible = false",
+            "execution_request_created = false",
+            "CREATE OR REPLACE VIEW shadow_profitability_report_rows",
+            "shadow_profitability_evaluated_idx",
+        ] {
+            assert!(profitability_migration.contains(required));
+        }
     }
 }

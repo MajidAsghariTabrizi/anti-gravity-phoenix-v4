@@ -113,6 +113,44 @@ func TestDependencyExhaustionMigrationOnlyExtendsClassificationChecks(t *testing
 	}
 }
 
+func TestCanonicalProfitabilityMigrationIsAdditiveBoundedAndFailClosed(t *testing.T) {
+	migrationPath := filepath.Join("..", "..", "..", "migrations", "007_canonical_profitability_truth.sql")
+	content, err := os.ReadFile(migrationPath)
+	if err != nil {
+		t.Fatalf("read canonical profitability migration: %v", err)
+	}
+	sqlText := strings.ToUpper(string(content))
+	for _, required := range []string{
+		"CREATE TABLE IF NOT EXISTS SHADOW_PROFITABILITY_FACTS",
+		"EVIDENCE_COMPLETENESS_STATUS <> 'COMPLETE'",
+		"GROSS_PROFIT = GROSS_SPREAD - PROTOCOL_FEES - DEX_FEES - PRICE_IMPACT",
+		"ARBITRUM_EXECUTION_FEE = EXECUTION_GAS * GAS_PRICE",
+		"EXPECTED_NET_PNL = GROSS_SPREAD - TOTAL_COST",
+		"VERIFICATION_SKIP_REASON = 'PRIMARY_BELOW_MINIMUM'",
+		"SHADOW_ONLY = TRUE",
+		"EXECUTION_ELIGIBLE = FALSE",
+		"EXECUTION_REQUEST_CREATED = FALSE",
+		"CREATE INDEX IF NOT EXISTS SHADOW_PROFITABILITY_EVALUATED_IDX",
+		"CREATE OR REPLACE VIEW SHADOW_PROFITABILITY_REPORT_ROWS",
+		"NULL::NUMERIC AS EXPECTED_NET_PNL",
+	} {
+		if !strings.Contains(sqlText, required) {
+			t.Fatalf("migration missing %q", required)
+		}
+	}
+	for _, destructive := range []string{
+		"DROP TABLE",
+		"DROP COLUMN",
+		"TRUNCATE TABLE",
+		"DELETE FROM",
+		"UPDATE SHADOW_DECISIONS",
+	} {
+		if strings.Contains(sqlText, destructive) {
+			t.Fatalf("migration contains destructive statement %q", destructive)
+		}
+	}
+}
+
 func TestLoadMigrationsOrdersByVersion(t *testing.T) {
 	dir := t.TempDir()
 	writeMigration(t, dir, "002_second.sql", "SELECT 2;")
