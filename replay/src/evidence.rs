@@ -168,9 +168,7 @@ pub fn build(input: &str) -> Result<EvidenceReport, ReplayError> {
         conservative_aggregate_pnl: checked_sum(
             decisions.iter().map(|item| item.conservative_net_pnl),
         )?,
-        severe_aggregate_pnl: checked_sum(
-            decisions.iter().map(|item| item.severe_net_pnl),
-        )?,
+        severe_aggregate_pnl: checked_sum(decisions.iter().map(|item| item.severe_net_pnl))?,
         in_sample_median_pnl: quantile(&base_values[..split], 50)?,
         out_of_sample_median_pnl: quantile(&base_values[split..], 50)?,
         cluster_bootstrap_mean_ci_low: ci_low,
@@ -199,12 +197,8 @@ fn sensitivity_delta(cases: &[ReplayCase], kind: Sensitivity) -> Result<i128, Re
     for case in &mut stressed {
         match kind {
             Sensitivity::Gas => case.gas_price_wei = scale_up(case.gas_price_wei, 12_500)?,
-            Sensitivity::Slippage => {
-                case.slippage_buffer = scale_up(case.slippage_buffer, 15_000)?
-            }
-            Sensitivity::Latency => {
-                case.latency_reserve = scale_up(case.latency_reserve, 15_000)?
-            }
+            Sensitivity::Slippage => case.slippage_buffer = scale_up(case.slippage_buffer, 15_000)?,
+            Sensitivity::Latency => case.latency_reserve = scale_up(case.latency_reserve, 15_000)?,
         }
     }
     let stressed = replay_cases(stressed)?
@@ -277,7 +271,8 @@ fn mean(values: &[i128]) -> Result<i128, ReplayError> {
     if values.is_empty() {
         Ok(0)
     } else {
-        let denominator = i128::try_from(values.len()).map_err(|_| ReplayError::ArithmeticOverflow)?;
+        let denominator =
+            i128::try_from(values.len()).map_err(|_| ReplayError::ArithmeticOverflow)?;
         Ok(checked_sum(values.iter().copied())? / denominator)
     }
 }
@@ -352,9 +347,7 @@ fn largest_contribution_bps(values: &[i128]) -> Result<i128, ReplayError> {
     }
 }
 
-fn concentration_bps<'a>(
-    values: impl Iterator<Item = &'a str>,
-) -> Result<i128, ReplayError> {
+fn concentration_bps<'a>(values: impl Iterator<Item = &'a str>) -> Result<i128, ReplayError> {
     let mut counts = BTreeMap::<&str, usize>::new();
     for value in values {
         let count = counts.entry(value).or_insert(0);
@@ -362,9 +355,10 @@ fn concentration_bps<'a>(
             .checked_add(1)
             .ok_or(ReplayError::ArithmeticOverflow)?;
     }
-    let total = counts.values().try_fold(0_usize, |total, count| {
-        total.checked_add(*count)
-    }).ok_or(ReplayError::ArithmeticOverflow)?;
+    let total = counts
+        .values()
+        .try_fold(0_usize, |total, count| total.checked_add(*count))
+        .ok_or(ReplayError::ArithmeticOverflow)?;
     rate_bps(counts.values().copied().max().unwrap_or(0), total)
 }
 

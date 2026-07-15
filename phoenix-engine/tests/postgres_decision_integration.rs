@@ -315,10 +315,19 @@ WHERE shadow_decision_id = CAST($1 AS uuid)
     .fetch_one(&pool)
     .await
     .expect("load canonical profitability fact");
-    assert_eq!(canonical.try_get::<String, _>("gross_spread").unwrap(), "100");
-    assert_eq!(canonical.try_get::<String, _>("gross_profit").unwrap(), "95");
+    assert_eq!(
+        canonical.try_get::<String, _>("gross_spread").unwrap(),
+        "100"
+    );
+    assert_eq!(
+        canonical.try_get::<String, _>("gross_profit").unwrap(),
+        "95"
+    );
     assert_eq!(canonical.try_get::<String, _>("total_cost").unwrap(), "6");
-    assert_eq!(canonical.try_get::<String, _>("expected_net_pnl").unwrap(), "94");
+    assert_eq!(
+        canonical.try_get::<String, _>("expected_net_pnl").unwrap(),
+        "94"
+    );
     assert_eq!(
         canonical
             .try_get::<String, _>("minimum_required_net_pnl")
@@ -332,7 +341,9 @@ WHERE shadow_decision_id = CAST($1 AS uuid)
         "below_minimum"
     );
     assert_eq!(
-        canonical.try_get::<String, _>("verification_status").unwrap(),
+        canonical
+            .try_get::<String, _>("verification_status")
+            .unwrap(),
         "primary_only"
     );
 
@@ -353,7 +364,10 @@ WHERE shadow_decision_id = CAST($1 AS uuid)
         .map(|row| row.try_get::<String, _>(0).unwrap())
         .collect::<Vec<_>>()
         .join("\n");
-    assert!(plan.contains("shadow_profitability_evaluated_idx"), "{plan}");
+    assert!(
+        plan.contains("shadow_profitability_evaluated_idx"),
+        "{plan}"
+    );
     plan_transaction
         .rollback()
         .await

@@ -8,8 +8,8 @@ use crate::opportunity::{
     AgreementState, BasisPoints, DecisionEvidence, MarketEvidence, Opportunity,
     OpportunityIdentity, OutcomeEvidence, PoolStateEvidence, RejectionReason, RouteEvidence,
     ScenarioEconomics, ShadowDisposition, SignedAmount, SimulationClassification,
-    SimulationEvidence, SimulationKind, StateSource, Strategy,
-    VerificationSkipReason, VerificationStatus as OpportunityVerificationStatus,
+    SimulationEvidence, SimulationKind, StateSource, Strategy, VerificationSkipReason,
+    VerificationStatus as OpportunityVerificationStatus,
 };
 use crate::optimizer::{optimize, CandidateEvaluation, OptimizerConfig};
 use crate::origin::OriginEvent;
@@ -248,11 +248,10 @@ impl CandidateEvaluator for RpcCandidateEvaluator {
             })?;
         let now_ms = unix_time_ms();
         validate_response(&request, &primary_response, now_ms)?;
-        let primary_response_hash = canonical_hash_bytes(
-            &serde_json::to_vec(&primary_response).map_err(|_| {
+        let primary_response_hash =
+            canonical_hash_bytes(&serde_json::to_vec(&primary_response).map_err(|_| {
                 EvaluationError::Terminal("rpc_gateway_response_integrity_failure")
-            })?,
-        );
+            })?);
         let pools = decode_pools(route, &primary_response)?;
         let gas_price_wei = parse_decimal_u128(&input.normalized.max_fee_per_gas)
             .ok_or(EvaluationError::Terminal("economic_input_out_of_range"))?;
@@ -315,10 +314,8 @@ impl CandidateEvaluator for RpcCandidateEvaluator {
         if !optimized.meets_minimum {
             self.metrics.rpc_primary_screen_rejected();
             self.metrics.rpc_secondary_skipped();
-            let selected =
-                evaluate_amount(route, &pools, optimized.best_amount, gas_price_wei).map_err(
-                    |_| EvaluationError::Terminal("shadow_model_recalculation_failure"),
-                )?;
+            let selected = evaluate_amount(route, &pools, optimized.best_amount, gas_price_wei)
+                .map_err(|_| EvaluationError::Terminal("shadow_model_recalculation_failure"))?;
             let opportunity = build_opportunity(
                 input,
                 origin,
@@ -1478,7 +1475,10 @@ mod tests {
             opportunity.market.verification_status,
             OpportunityVerificationStatus::PrimaryOnly
         );
-        assert_eq!(opportunity.market.agreement_state, AgreementState::NotChecked);
+        assert_eq!(
+            opportunity.market.agreement_state,
+            AgreementState::NotChecked
+        );
         assert_eq!(
             opportunity.market.verification_skip_reason,
             Some(VerificationSkipReason::PrimaryBelowMinimum)
@@ -1538,7 +1538,10 @@ mod tests {
             opportunity.market.verification_status,
             OpportunityVerificationStatus::SecondaryUnavailable
         );
-        assert_eq!(opportunity.market.agreement_state, AgreementState::Unavailable);
+        assert_eq!(
+            opportunity.market.agreement_state,
+            AgreementState::Unavailable
+        );
         assert!(opportunity.market.secondary_state_hash.is_none());
         assert_eq!(
             batch.evidence["state"]["secondary_verification_transport_unavailable"],
@@ -1596,7 +1599,10 @@ mod tests {
             opportunity.market.verification_status,
             OpportunityVerificationStatus::Disagreed
         );
-        assert_eq!(opportunity.market.agreement_state, AgreementState::Disagreed);
+        assert_eq!(
+            opportunity.market.agreement_state,
+            AgreementState::Disagreed
+        );
         assert_ne!(
             opportunity.market.secondary_state_hash,
             opportunity.market.primary_state_hash

@@ -414,10 +414,7 @@ mod tests {
     #[test]
     fn financial_gauges_preserve_integer_precision() {
         let mut metrics = Metrics::default();
-        metrics.set_financial_gauge(
-            "phoenix_expected_net_pnl",
-            9_007_199_254_740_993,
-        );
+        metrics.set_financial_gauge("phoenix_expected_net_pnl", 9_007_199_254_740_993);
         assert!(metrics
             .render()
             .contains("phoenix_expected_net_pnl 9007199254740993"));

@@ -6,9 +6,9 @@ use phoenix_engine::graph::{PoolEdge, PoolGraph, Route};
 use phoenix_engine::opportunity::{
     AgreementState, BasisPoints, CostBreakdown, DecisionEvidence, MarketEvidence,
     OpportunityIdentity, OutcomeEvidence, PoolStateEvidence, PrimaryProfitabilityStatus,
-    RouteEvidence, ScenarioEconomics, ShadowDisposition, SignedAmount,
-    SimulationClassification, SimulationEvidence, SimulationKind, StateSource, Strategy,
-    VerificationSkipReason, VerificationStatus, PROFITABILITY_MODEL_VERSION,
+    RouteEvidence, ScenarioEconomics, ShadowDisposition, SignedAmount, SimulationClassification,
+    SimulationEvidence, SimulationKind, StateSource, Strategy, VerificationSkipReason,
+    VerificationStatus, PROFITABILITY_MODEL_VERSION,
 };
 use phoenix_engine::optimizer::{optimize, CandidateEvaluation, OptimizerConfig};
 use phoenix_engine::origin::{OriginClassification, OriginDetector};
@@ -165,9 +165,7 @@ fn profitable_fixture_reaches_shadow_sink_and_dynamic_sizing() {
         expected_net_pnl: SignedAmount(optimized.expected_net_profit),
         expected_roi_bps: BasisPoints(100),
         probability_of_success_bps: 9_000,
-        expected_value_after_success_probability: SignedAmount(
-            optimized.expected_net_profit,
-        ),
+        expected_value_after_success_probability: SignedAmount(optimized.expected_net_profit),
         ..CostBreakdown::default()
     };
     let opportunity = Opportunity {

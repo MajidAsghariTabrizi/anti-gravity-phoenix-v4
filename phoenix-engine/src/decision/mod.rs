@@ -175,8 +175,8 @@ mod tests {
     use crate::opportunity::{
         AgreementState, BasisPoints, CostBreakdown, MarketEvidence, OpportunityIdentity,
         OutcomeEvidence, PrimaryProfitabilityStatus, RouteEvidence, ScenarioEconomics,
-        SimulationEvidence, SimulationKind, StateSource, Strategy, VerificationStatus,
-        VerificationSkipReason, PROFITABILITY_MODEL_VERSION,
+        SimulationEvidence, SimulationKind, StateSource, Strategy, VerificationSkipReason,
+        VerificationStatus, PROFITABILITY_MODEL_VERSION,
     };
     use crate::Direction;
 

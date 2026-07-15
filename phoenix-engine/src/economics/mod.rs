@@ -153,11 +153,7 @@ pub fn evaluate(
     )?;
     let contract_overhead = input.contract_overhead.0;
 
-    let market_cost = checked_sum(&[
-        input.protocol_fees.0,
-        input.pool_fees.0,
-        price_impact,
-    ])?;
+    let market_cost = checked_sum(&[input.protocol_fees.0, input.pool_fees.0, price_impact])?;
     let gross_profit = gross_spread
         .0
         .checked_sub(as_i128(market_cost)?)
@@ -280,16 +276,12 @@ fn scale(value: u128, multiplier_bps: u32) -> Result<u128, EconomicError> {
         .map(|scaled| scaled / BPS_DENOMINATOR)
 }
 
-fn scale_probability(
-    probability_bps: u16,
-    multiplier_bps: u32,
-) -> Result<u16, EconomicError> {
+fn scale_probability(probability_bps: u16, multiplier_bps: u32) -> Result<u16, EconomicError> {
     let scaled = u128::from(probability_bps)
         .checked_mul(u128::from(multiplier_bps))
         .ok_or(EconomicError::ArithmeticOverflow)?
         / BPS_DENOMINATOR;
-    u16::try_from(scaled.min(BPS_DENOMINATOR))
-        .map_err(|_| EconomicError::ArithmeticOverflow)
+    u16::try_from(scaled.min(BPS_DENOMINATOR)).map_err(|_| EconomicError::ArithmeticOverflow)
 }
 
 fn probability_cost(value: u128, probability_bps: u16) -> Result<u128, EconomicError> {
