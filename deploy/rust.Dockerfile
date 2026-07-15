@@ -10,6 +10,7 @@ COPY fixtures/engine ./fixtures/engine
 COPY migrations ./migrations
 COPY deploy/nats-server.conf ./deploy/nats-server.conf
 COPY scripts/recorder-live-smoke.sh ./scripts/recorder-live-smoke.sh
+COPY scripts/sql/prelive-money-path-report.sql ./scripts/sql/prelive-money-path-report.sql
 RUN cd "${CRATE}" && cargo test --all
 RUN case "${CRATE}" in \
       phoenix-engine) BIN=phoenix-engine ;; \
