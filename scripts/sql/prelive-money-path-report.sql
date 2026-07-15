@@ -31,12 +31,12 @@ engine AS (
                'candidate_count', coalesce(sum(candidate_count), 0)::text,
                'decisions_total', coalesce(sum(decision_count), 0)::text,
                'redeliveries_total', coalesce(sum(greatest(delivery_attempts - 1, 0)), 0)::text,
-               'dependency_exhausted_total', count(*) FILTER (
+               'dependency_exhausted_total', (count(*) FILTER (
                    WHERE classification = 'dependency_exhausted'
-               )::text,
-               'terminal_integrity_total', count(*) FILTER (
+               ))::text,
+               'terminal_integrity_total', (count(*) FILTER (
                    WHERE classification = 'terminal_integrity_failure'
-               )::text,
+               ))::text,
                'processing_latency_ns_sum', coalesce(sum(processing_latency_ns), 0)::text,
                'processing_latency_ns_max', coalesce(max(processing_latency_ns), 0)::text
            ) AS value
@@ -70,8 +70,10 @@ outbox_counts AS (
                WHERE created_at >= (SELECT window_start FROM params)
            ), 0) AS publish_attempts_total,
            coalesce(
-               floor(extract(epoch FROM now() - min(created_at)) FILTER (
-                   WHERE published_at IS NULL
+               floor(extract(
+                   epoch FROM now() - (min(created_at) FILTER (
+                       WHERE published_at IS NULL
+                   ))
                )),
                0
            )::bigint AS oldest_pending_age_seconds
@@ -92,10 +94,10 @@ outbox AS (
 rpc AS (
     SELECT jsonb_build_object(
                'records_total', count(*)::text,
-               'success_total', count(*) FILTER (WHERE success)::text,
-               'timeouts_total', count(*) FILTER (WHERE timeout)::text,
-               'stale_total', count(*) FILTER (WHERE stale_result)::text,
-               'disagreements_total', count(*) FILTER (WHERE disagreement)::text,
+               'success_total', (count(*) FILTER (WHERE success))::text,
+               'timeouts_total', (count(*) FILTER (WHERE timeout))::text,
+               'stale_total', (count(*) FILTER (WHERE stale_result))::text,
+               'disagreements_total', (count(*) FILTER (WHERE disagreement))::text,
                'retries_total', coalesce(sum(retry_count), 0)::text,
                'latency_ns_sum', coalesce(sum(latency_ns), 0)::text,
                'latency_ns_max', coalesce(max(latency_ns), 0)::text
@@ -124,26 +126,26 @@ profitability_reasons AS (
 profitability AS (
     SELECT jsonb_build_object(
                'facts_total', count(*)::text,
-               'complete_total', count(*) FILTER (
+               'complete_total', (count(*) FILTER (
                    WHERE evidence_completeness_status = 'complete'
-               )::text,
-               'profitable_total', count(*) FILTER (
+               ))::text,
+               'profitable_total', (count(*) FILTER (
                    WHERE primary_profitability_status = 'meets_minimum'
-               )::text,
-               'not_profitable_total', count(*) FILTER (
+               ))::text,
+               'not_profitable_total', (count(*) FILTER (
                    WHERE primary_profitability_status = 'below_minimum'
-               )::text,
-               'incomplete_total', count(*) FILTER (
+               ))::text,
+               'incomplete_total', (count(*) FILTER (
                    WHERE primary_profitability_status = 'incomplete'
-               )::text,
-               'near_profitable_total', count(*) FILTER (
+               ))::text,
+               'near_profitable_total', (count(*) FILTER (
                    WHERE expected_net_pnl > 0
                      AND minimum_required_net_pnl > 0
                      AND expected_net_pnl < minimum_required_net_pnl
                      AND expected_net_pnl * 2 >= minimum_required_net_pnl
-               )::text,
-               'accepted_total', count(*) FILTER (WHERE disposition = 'accepted')::text,
-               'rejected_total', count(*) FILTER (WHERE disposition = 'rejected')::text,
+               ))::text,
+               'accepted_total', (count(*) FILTER (WHERE disposition = 'accepted'))::text,
+               'rejected_total', (count(*) FILTER (WHERE disposition = 'rejected'))::text,
                'sum_expected_net_pnl', coalesce(sum(expected_net_pnl), 0)::text,
                'sum_conservative_net_pnl', coalesce(sum(conservative_net_pnl), 0)::text,
                'sum_severe_net_pnl', coalesce(sum(severe_net_pnl), 0)::text,
@@ -156,31 +158,31 @@ profitability AS (
 fork AS (
     SELECT jsonb_build_object(
                'simulations_total', count(*)::text,
-               'passed_total', count(*) FILTER (WHERE status = 'passed')::text,
-               'reverted_total', count(*) FILTER (WHERE status = 'reverted')::text,
-               'simulated_profitable_total', count(*) FILTER (
+               'passed_total', (count(*) FILTER (WHERE status = 'passed'))::text,
+               'reverted_total', (count(*) FILTER (WHERE status = 'reverted'))::text,
+               'simulated_profitable_total', (count(*) FILTER (
                    WHERE status = 'passed' AND simulated_net_pnl > 0
-               )::text,
-               'simulated_not_profitable_total', count(*) FILTER (
+               ))::text,
+               'simulated_not_profitable_total', (count(*) FILTER (
                    WHERE status = 'passed' AND simulated_net_pnl <= 0
-               )::text,
-               'prediction_error_negative_total', count(*) FILTER (
+               ))::text,
+               'prediction_error_negative_total', (count(*) FILTER (
                    WHERE status = 'passed' AND prediction_error < 0
-               )::text,
-               'prediction_error_non_negative_total', count(*) FILTER (
+               ))::text,
+               'prediction_error_non_negative_total', (count(*) FILTER (
                    WHERE status = 'passed' AND prediction_error >= 0
-               )::text,
-               'gas_utilization_at_most_50_total', count(*) FILTER (
+               ))::text,
+               'gas_utilization_at_most_50_total', (count(*) FILTER (
                    WHERE status = 'passed' AND gas_used * 100 <= gas_estimate * 50
-               )::text,
-               'gas_utilization_at_most_90_total', count(*) FILTER (
+               ))::text,
+               'gas_utilization_at_most_90_total', (count(*) FILTER (
                    WHERE status = 'passed'
                      AND gas_used * 100 > gas_estimate * 50
                      AND gas_used * 100 <= gas_estimate * 90
-               )::text,
-               'gas_utilization_over_90_total', count(*) FILTER (
+               ))::text,
+               'gas_utilization_over_90_total', (count(*) FILTER (
                    WHERE status = 'passed' AND gas_used * 100 > gas_estimate * 90
-               )::text,
+               ))::text,
                'sum_absolute_prediction_error', coalesce(sum(abs(prediction_error)), 0)::text,
                'sum_gas_used', coalesce(sum(gas_used), 0)::text
            ) AS value
