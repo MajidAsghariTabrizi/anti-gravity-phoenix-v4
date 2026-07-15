@@ -60,7 +60,11 @@ repo_root="$(CDPATH= cd -- "$script_dir/.." && pwd)"
 install -m 0640 -o phoenix -g phoenix "$repo_root/compose.prod.yml" /opt/phoenix/deploy/compose.prod.yml
 install -m 0644 -o phoenix -g phoenix "$repo_root/deploy/nats-server.conf" /opt/phoenix/deploy/nats-server.conf
 install -d -m 0750 -o phoenix -g phoenix /opt/phoenix/deploy/prometheus
+install -d -m 0750 -o phoenix -g phoenix /opt/phoenix/deploy/sql
 install -m 0640 -o phoenix -g phoenix "$repo_root/prometheus/prometheus.yml" /opt/phoenix/deploy/prometheus/prometheus.yml
+install -m 0640 -o phoenix -g phoenix \
+  "$repo_root/scripts/sql/shadow-profitability-report.sql" \
+  /opt/phoenix/deploy/sql/shadow-profitability-report.sql
 for script in \
   production_context.py \
   render-production-compose.sh \
@@ -70,6 +74,8 @@ for script in \
   production-healthcheck.sh \
   shadow-engine-isolated-canary.sh \
   shadow-positive-route-evidence.sh \
+  shadow-profitability-report.sh \
+  shadow_profitability_report.py \
   rollback-release.sh \
   deploy-release.sh
 do

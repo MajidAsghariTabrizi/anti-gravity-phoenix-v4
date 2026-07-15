@@ -49,6 +49,8 @@ jobs:
           sh ./scripts/shadow-engine-isolated-canary-tests.sh
           sh ./scripts/shadow-positive-route-evidence-tests.sh
           sh ./scripts/production-compose-context-tests.sh
+          python3 -m py_compile scripts/shadow_profitability_report.py
+          sh ./scripts/shadow-profitability-report-tests.sh
 
       - name: Validate tracked hygiene
         shell: bash
