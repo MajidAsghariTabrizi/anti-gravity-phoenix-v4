@@ -7,7 +7,9 @@ use phoenix_engine::origin::{reviewed_router_kind, REVIEWED_ROUTER_ADDRESSES};
 use phoenix_engine::persistence::{PostgresShadowStore, ShadowStore};
 use phoenix_engine::readiness::initialize_runtime;
 use phoenix_engine::rpc_evaluator::{RpcCandidateEvaluator, RpcGatewayClient, ShadowStateClient};
-use phoenix_engine::runtime::{consume_engine_messages, RuntimeExit};
+use phoenix_engine::runtime::{
+    consume_engine_messages, ConsumerRuntimeConfig, DependencyRetryPolicy, RuntimeExit,
+};
 use phoenix_engine::runtime_state::RuntimeReadiness;
 use phoenix_engine::shadow_processor::{RouteRegistry, ShadowProcessor};
 use phoenix_recorder::engine_stream::{
@@ -40,6 +42,7 @@ struct DaemonConfig {
     routes: RouteRegistry,
     rpc_gateway_url: String,
     code_version: String,
+    dependency_retry_policy: DependencyRetryPolicy,
 }
 
 impl DaemonConfig {
@@ -71,6 +74,7 @@ impl DaemonConfig {
                 .unwrap_or_else(|_| "http://rpc-gateway:9300".to_string()),
             code_version: std::env::var("PHOENIX_CODE_VERSION")
                 .unwrap_or_else(|_| env!("CARGO_PKG_VERSION").to_string()),
+            dependency_retry_policy: DependencyRetryPolicy::engine_default()?,
         })
     }
 }
@@ -131,6 +135,7 @@ async fn run_daemon() -> Result<(), &'static str> {
         strategy_configured,
         evaluation_backend = "block_pinned_rpc_state",
         simulation_level = "state_based",
+        dependency_exhaustion_limit = config.dependency_retry_policy.max_deliveries(),
         live_execution = false
     );
 
@@ -250,7 +255,7 @@ async fn run_daemon() -> Result<(), &'static str> {
             processor.clone(),
             readiness.clone(),
             metrics.clone(),
-            sampler.clone(),
+            ConsumerRuntimeConfig::new(sampler.clone(), config.dependency_retry_policy),
             shutdown.clone(),
         )
         .await;

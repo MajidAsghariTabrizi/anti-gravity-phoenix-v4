@@ -21,3 +21,14 @@
 - test result: PASS - all locally available deterministic Phase 1 gates completed successfully; no runtime service was started
 - known blocker: Docker is unavailable locally, so Docker-backed Compose route preservation and the complete Linux CI matrix must run in GitHub Actions
 - next gate: push the exact branch tip, require every `ci.yml` job to pass, then merge Phase 1 into the cumulative integration branch without deploying
+
+## Phase 2
+
+- phase: Phase 2 - Transient dependency exhaustion quarantine
+- branch: `fix/engine-transient-exhaustion-quarantine`
+- implementation commits: `b15ee3c576f601ae557da88af33f7314ee9c29cf`; `0b9310c8b899e9f69734a744f156fcb20c4aedab`; `7fb548aa99c04858845106c1b93972954d74f0b7`; `d9412a4516b233e714a91c36f820adb8377c1548`
+- files changed: `dashboard/app.py`; `deploy/rust.Dockerfile`; `docs/ENGINE_DEPENDENCY_EXHAUSTION.md`; `docs/RUNBOOK.md`; `fixtures/engine/dependency_exhaustion_soak.json`; `migration-runner/internal/runner/runner_test.go`; `migrations/006_dependency_exhaustion_quarantine.sql`; `phoenix-engine/src/engine_input.rs`; `phoenix-engine/src/main.rs`; `phoenix-engine/src/metrics/mod.rs`; `phoenix-engine/src/persistence.rs`; `phoenix-engine/src/runtime.rs`; `phoenix-engine/tests/postgres_decision_integration.rs`; `recorder/tests/postgres_outbox_integration.rs`; `scripts/shadow-engine-live-smoke.sh`
+- tests run: `gofmt -w migration-runner/internal/runner/runner_test.go`; `go vet ./...` and `go test ./...` in `migration-runner`; `python -m py_compile dashboard/app.py`; `sh -n scripts/*.sh`; `sh ./scripts/shadow-engine-canary-control-tests.sh`; `sh ./scripts/shadow-engine-isolated-canary-tests.sh`; `sh ./scripts/shadow-positive-route-evidence-tests.sh`; `sh ./scripts/production-compose-context-tests.sh`; PowerShell and POSIX secret scans; PowerShell and POSIX forbidden-file scans; `git diff --check`; complete implementation diff review
+- test result: PASS - all locally available deterministic Phase 2 gates completed successfully; GitHub Actions run `29405910600` passed all 11 `ci.yml` jobs at exact implementation SHA `d9412a4516b233e714a91c36f820adb8377c1548`, including Rust formatting, clippy with `-D warnings`, the 211-delivery soak, PostgreSQL integration, dashboard import, and all Phoenix-owned Docker builds
+- known blocker: none for the Phase 2 implementation gate; Cargo, rustc, rustfmt, Docker, and the dashboard Python dependency set remain unavailable locally, so the exact final documentation-only branch tip still requires authoritative GitHub Actions verification
+- next gate: commit this closure record, push the exact branch tip, require every `ci.yml` job to pass at that tip, then merge Phase 2 into the cumulative integration branch without deploying

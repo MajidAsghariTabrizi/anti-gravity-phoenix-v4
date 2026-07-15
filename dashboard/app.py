@@ -229,6 +229,9 @@ with tabs[9]:
         "Engine Processing Failures": metric_value(
             "phoenix_engine_processing_failures_total"
         ),
+        "Engine Dependency Exhausted": metric_value(
+            "phoenix_engine_dependency_exhausted_total"
+        ),
         "Hot Path RPC Calls": metric_value("hot_path_external_rpc_calls_total"),
     }
     st.dataframe(pd.DataFrame({"metric": list(system.keys()), "value": list(system.values())}), use_container_width=True)
@@ -262,6 +265,9 @@ with tabs[11]:
         "Shadow Rejected": metric_value("phoenix_engine_shadow_rejected_total"),
         "Redeliveries": metric_value("phoenix_engine_redeliveries_total"),
         "Duplicate Skips": metric_value("phoenix_engine_duplicate_skips_total"),
+        "Dependency Exhausted": metric_value(
+            "phoenix_engine_dependency_exhausted_total"
+        ),
         "RPC Disagreements": metric_value("rpc_provider_disagreement_total"),
     }
     st.dataframe(

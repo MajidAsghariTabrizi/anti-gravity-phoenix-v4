@@ -12,7 +12,7 @@ use std::str::FromStr;
 use std::time::Duration;
 use thiserror::Error;
 
-const MAX_EVIDENCE_BYTES: usize = 1024 * 1024;
+pub(crate) const MAX_EVIDENCE_BYTES: usize = 1024 * 1024;
 const MAX_RPC_QUALITY_RECORDS: usize = 512;
 const MAX_POOL_CONNECTIONS: u32 = 8;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -38,6 +38,15 @@ pub enum PersistOutcome {
     AlreadyFinal,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct DependencyFailureContext {
+    pub classification: EngineClassification,
+    pub detail_class: Option<String>,
+    pub evidence: Value,
+    pub started_at: DateTime<Utc>,
+    pub delivery_attempt: u64,
+}
+
 #[derive(Clone, Debug, Error, PartialEq, Eq)]
 pub enum StoreError {
     #[error("Engine PostgreSQL configuration is invalid")]
@@ -60,6 +69,10 @@ pub trait ShadowStore: Send + Sync {
         &self,
         source_event_identity: &str,
     ) -> Result<Option<EngineClassification>, StoreError>;
+    async fn dependency_failure_context(
+        &self,
+        source_event_identity: &str,
+    ) -> Result<Option<DependencyFailureContext>, StoreError>;
     async fn persist_classification(
         &self,
         record: &ClassificationRecord,
@@ -235,6 +248,58 @@ impl ShadowStore for PostgresShadowStore {
         let value: String = row.try_get("classification").map_err(classify_sqlx_error)?;
         let classification = EngineClassification::parse(&value).ok_or(StoreError::Integrity)?;
         Ok(classification.is_final().then_some(classification))
+    }
+
+    async fn dependency_failure_context(
+        &self,
+        source_event_identity: &str,
+    ) -> Result<Option<DependencyFailureContext>, StoreError> {
+        if !valid_identity(source_event_identity) {
+            return Err(StoreError::Integrity);
+        }
+        let row = sqlx::query(
+            r#"
+SELECT classification, error_class, evidence, started_at, delivery_attempt
+FROM shadow_engine_processing_attempts
+WHERE source_event_identity = $1
+ORDER BY delivery_attempt ASC, id ASC
+LIMIT 1
+"#,
+        )
+        .bind(source_event_identity)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(classify_sqlx_error)?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let value: String = row.try_get("classification").map_err(classify_sqlx_error)?;
+        let classification = EngineClassification::parse(&value).ok_or(StoreError::Integrity)?;
+        let detail_class: Option<String> =
+            row.try_get("error_class").map_err(classify_sqlx_error)?;
+        let Json(evidence): Json<Value> = row.try_get("evidence").map_err(classify_sqlx_error)?;
+        let started_at: DateTime<Utc> = row.try_get("started_at").map_err(classify_sqlx_error)?;
+        let delivery_attempt: i64 = row
+            .try_get("delivery_attempt")
+            .map_err(classify_sqlx_error)?;
+        let evidence_bytes = serde_json::to_vec(&evidence).map_err(|_| StoreError::Integrity)?;
+        if classification != EngineClassification::TransientDependencyFailure
+            || detail_class
+                .as_deref()
+                .is_some_and(|value| !bounded_text(value, 1, 128))
+            || !evidence.is_object()
+            || evidence_bytes.len() > MAX_EVIDENCE_BYTES
+            || delivery_attempt < 1
+        {
+            return Err(StoreError::Integrity);
+        }
+        Ok(Some(DependencyFailureContext {
+            classification,
+            detail_class,
+            evidence,
+            started_at,
+            delivery_attempt: delivery_attempt as u64,
+        }))
     }
 
     async fn persist_classification(
@@ -849,6 +914,7 @@ pub fn validate_schema_snapshot(snapshot: &SchemaSnapshot) -> Result<(), StoreEr
     for required in [
         "chain_id=42161",
         "classification=any",
+        "'dependency_exhausted'::text",
         "octet_lengthevidence::text<=1048576",
         "delivery_attempt>=1",
         "execution_eligible=false",
@@ -933,6 +999,9 @@ pub(crate) fn validate_record(record: &ClassificationRecord) -> Result<(), Store
         ) && !record.evaluations.is_empty())
     {
         return Err(StoreError::Integrity);
+    }
+    if record.classification == EngineClassification::DependencyExhausted {
+        validate_dependency_exhausted_evidence(record)?;
     }
     let mut opportunity_ids = HashSet::new();
     let mut route_fingerprints = HashSet::new();
@@ -1065,6 +1134,103 @@ fn bounded_text(value: &str, minimum: usize, maximum: usize) -> bool {
     value.len() >= minimum && value.len() <= maximum && !value.chars().any(char::is_control)
 }
 
+fn validate_dependency_exhausted_evidence(record: &ClassificationRecord) -> Result<(), StoreError> {
+    let evidence = &record.evidence;
+    let first_failure_at = evidence
+        .get("first_failure_at")
+        .and_then(Value::as_str)
+        .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
+        .ok_or(StoreError::Integrity)?;
+    let final_failure_at = evidence
+        .get("final_failure_at")
+        .and_then(Value::as_str)
+        .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
+        .ok_or(StoreError::Integrity)?;
+    let provider_identifier = evidence
+        .get("provider_identifier")
+        .and_then(Value::as_str)
+        .ok_or(StoreError::Integrity)?;
+    let route_fingerprints = evidence
+        .get("route_fingerprints")
+        .and_then(Value::as_array)
+        .ok_or(StoreError::Integrity)?;
+    let original_evidence_retained = evidence
+        .get("original_evidence")
+        .is_some_and(Value::is_object)
+        || evidence
+            .get("original_evidence_reference")
+            .and_then(Value::as_object)
+            .is_some_and(|reference| {
+                reference.get("ledger").and_then(Value::as_str)
+                    == Some("shadow_engine_processing_attempts")
+                    && reference
+                        .get("delivery_attempt")
+                        .and_then(Value::as_u64)
+                        .is_some_and(|attempt| attempt >= 1)
+            });
+    if record.detail_class != Some("dependency_retries_exhausted")
+        || evidence
+            .get("source_event_identity")
+            .and_then(Value::as_str)
+            != Some(record.identity.source_event_identity.as_str())
+        || evidence.get("source_sequence").and_then(Value::as_u64)
+            != Some(record.identity.source_sequence)
+        || evidence.get("tx_hash").and_then(Value::as_str) != Some(record.identity.tx_hash.as_str())
+        || evidence
+            .get("original_classification")
+            .and_then(Value::as_str)
+            != Some(EngineClassification::TransientDependencyFailure.as_str())
+        || evidence
+            .get("original_failure_class")
+            .and_then(Value::as_str)
+            .map_or(true, |value| !bounded_text(value, 1, 128))
+        || evidence
+            .get("final_failure_class")
+            .and_then(Value::as_str)
+            .map_or(true, |value| !bounded_text(value, 1, 128))
+        || first_failure_at > final_failure_at
+        || evidence
+            .get("first_failure_delivery_attempt")
+            .and_then(Value::as_u64)
+            .map_or(true, |attempt| {
+                attempt < 1 || attempt > record.delivery_attempt
+            })
+        || evidence.get("delivery_attempts").and_then(Value::as_u64)
+            != Some(record.delivery_attempt)
+        || evidence.get("retry_count").and_then(Value::as_u64)
+            != Some(record.delivery_attempt.saturating_sub(1))
+        || evidence
+            .get("exhaustion_limit")
+            .and_then(Value::as_u64)
+            .map_or(true, |limit| limit < 2 || limit > record.delivery_attempt)
+        || evidence.get("quarantine_reason").and_then(Value::as_str)
+            != Some("bounded_dependency_retries_exhausted")
+        || !bounded_text(provider_identifier, 1, 128)
+        || provider_identifier.contains("://")
+        || evidence
+            .get("bounded_error_hash")
+            .and_then(Value::as_str)
+            .map_or(true, |value| !valid_evidence_hash(value))
+        || evidence.get("shadow_only").and_then(Value::as_bool) != Some(true)
+        || evidence.get("execution_mode").and_then(Value::as_str) != Some("SHADOW")
+        || evidence.get("execution_eligible").and_then(Value::as_bool) != Some(false)
+        || evidence
+            .get("execution_request_created")
+            .and_then(Value::as_bool)
+            != Some(false)
+        || route_fingerprints.len() > 256
+        || route_fingerprints.iter().any(|value| {
+            value
+                .as_str()
+                .map_or(true, |fingerprint| !bounded_text(fingerprint, 1, 256))
+        })
+        || !original_evidence_retained
+    {
+        return Err(StoreError::Integrity);
+    }
+    Ok(())
+}
+
 fn parse_ssl_mode(value: &str) -> Result<PgSslMode, StoreError> {
     match value.trim().to_ascii_lowercase().as_str() {
         "disable" => Ok(PgSslMode::Disable),
@@ -1080,6 +1246,11 @@ fn parse_ssl_mode(value: &str) -> Result<PgSslMode, StoreError> {
 fn classify_sqlx_error(error: sqlx::Error) -> StoreError {
     match error {
         sqlx::Error::Configuration(_) => StoreError::Configuration,
+        sqlx::Error::Database(database)
+            if database.code().is_some_and(|code| code.starts_with("23")) =>
+        {
+            StoreError::Integrity
+        }
         sqlx::Error::Io(_)
         | sqlx::Error::Tls(_)
         | sqlx::Error::PoolTimedOut
@@ -1135,7 +1306,7 @@ mod tests {
             "shadow_engine_classifications".to_string(),
             vec![
                 "CHECK ((chain_id = 42161))".to_string(),
-                "CHECK ((classification = ANY (...)))".to_string(),
+                "CHECK ((classification = ANY (... 'dependency_exhausted'::text ...)))".to_string(),
                 "CHECK ((octet_length((evidence)::text) <= 1048576))".to_string(),
             ],
         );
@@ -1249,5 +1420,10 @@ mod tests {
         ));
         assert!(identity_migration.contains("DROP CONSTRAINT"));
         assert!(identity_migration.contains("shadow_decisions_source_event_route_idx"));
+        let exhaustion_migration =
+            include_str!("../../migrations/006_dependency_exhaustion_quarantine.sql");
+        assert!(exhaustion_migration.contains("'dependency_exhausted'"));
+        assert!(exhaustion_migration.contains("shadow_engine_classification_value_check"));
+        assert!(exhaustion_migration.contains("shadow_engine_attempt_classification_check"));
     }
 }

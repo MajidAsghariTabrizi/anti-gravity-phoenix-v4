@@ -384,6 +384,7 @@ feed_before=$(sql_count 'SELECT count(*) FROM feed_events')
 outbox_before=$(sql_count 'SELECT count(*) FROM engine_outbox')
 published_before=$(sql_count 'SELECT count(*) FROM engine_outbox WHERE published_at IS NOT NULL AND jetstream_ack_sequence IS NOT NULL')
 classifications_before=$(sql_count 'SELECT count(*) FROM shadow_engine_classifications')
+dependency_exhausted_before=$(sql_count "SELECT count(*) FROM shadow_engine_classifications WHERE classification = 'dependency_exhausted'")
 execution_attempts_before=$(sql_count 'SELECT count(*) FROM execution_attempts')
 executions_before=$(sql_count 'SELECT count(*) FROM executions')
 realized_before=$(sql_count 'SELECT count(*) FROM realized_pnl')
@@ -435,7 +436,7 @@ done
 assert_bounded_pending
 
 rpc_failure_before=$(sql_count "SELECT count(*) FROM shadow_engine_processing_attempts WHERE error_class = 'rpc_gateway_unavailable'")
-rpc_recovery_before=$(sql_count "SELECT count(DISTINCT attempt.source_event_identity) FROM shadow_engine_processing_attempts attempt JOIN shadow_engine_classifications classification USING (source_event_identity) WHERE attempt.error_class = 'rpc_gateway_unavailable' AND classification.classification <> 'transient_dependency_failure'")
+rpc_recovery_before=$(sql_count "SELECT count(DISTINCT attempt.source_event_identity) FROM shadow_engine_processing_attempts attempt JOIN shadow_engine_classifications classification USING (source_event_identity) WHERE attempt.error_class = 'rpc_gateway_unavailable' AND classification.classification NOT IN ('transient_dependency_failure', 'dependency_exhausted')")
 compose stop rpc-gateway || fail "RPC Gateway could not be stopped for failure classification"
 wait_unready phoenix-engine 9200 30 || fail "Engine readiness did not fail closed during the RPC outage"
 rpc_deadline=$(( $(date +%s) + evidence_timeout ))
@@ -454,7 +455,7 @@ wait_ready phoenix-engine 9200 "$recovery_timeout" || fail "Engine did not recov
 rpc_recovery_deadline=$(( $(date +%s) + recovery_timeout ))
 rpc_recovered=0
 while [ "$(date +%s)" -lt "$rpc_recovery_deadline" ]; do
-  rpc_recovery_after=$(sql_count "SELECT count(DISTINCT attempt.source_event_identity) FROM shadow_engine_processing_attempts attempt JOIN shadow_engine_classifications classification USING (source_event_identity) WHERE attempt.error_class = 'rpc_gateway_unavailable' AND classification.classification <> 'transient_dependency_failure'")
+  rpc_recovery_after=$(sql_count "SELECT count(DISTINCT attempt.source_event_identity) FROM shadow_engine_processing_attempts attempt JOIN shadow_engine_classifications classification USING (source_event_identity) WHERE attempt.error_class = 'rpc_gateway_unavailable' AND classification.classification NOT IN ('transient_dependency_failure', 'dependency_exhausted')")
   if [ "$rpc_recovery_after" -gt "$rpc_recovery_before" ]; then
     rpc_recovered=1
     break
@@ -518,6 +519,7 @@ execution_attempts_after=$(sql_count 'SELECT count(*) FROM execution_attempts')
 executions_after=$(sql_count 'SELECT count(*) FROM executions')
 realized_after=$(sql_count 'SELECT count(*) FROM realized_pnl')
 execution_eligible=$(sql_count "SELECT count(*) FROM shadow_decisions WHERE created_at >= '$smoke_started'::timestamptz AND execution_eligible")
+dependency_exhausted_after=$(sql_count "SELECT count(*) FROM shadow_engine_classifications WHERE classification = 'dependency_exhausted'")
 [ "$execution_attempts_after" -eq "$execution_attempts_before" ] || fail "execution attempts changed during SHADOW smoke"
 [ "$executions_after" -eq "$executions_before" ] || fail "executions changed during SHADOW smoke"
 [ "$realized_after" -eq "$realized_before" ] || fail "realized PnL rows changed during SHADOW smoke"
@@ -529,3 +531,4 @@ wait_runtime || fail "runtime did not return to ready after controlled drain"
 echo "SHADOW_ENGINE_LIVE_SMOKE_PASS: atomic outbox, Dispatcher ACKs, durable Engine replay, outage recovery, idempotency, and fail-closed SHADOW evidence observed"
 echo "pipeline_counts=feed:$feed_before->$feed_now,outbox:$outbox_before->$outbox_now,published:$published_before->$published_now,classifications:$classifications_before->$classifications_now"
 echo "restart_pending=$pending_before_restart->$pending_during_restart rpc_failure_attempts=$rpc_failure_before->$rpc_failure_after"
+echo "dependency_exhausted=$dependency_exhausted_before->$dependency_exhausted_after"

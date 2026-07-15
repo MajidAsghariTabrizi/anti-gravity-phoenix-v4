@@ -1,0 +1,11 @@
+{
+  "schema_version": "phoenix.engine.dependency-soak.v1",
+  "normal_before": 64,
+  "route_candidates": 32,
+  "recovered_failures": 24,
+  "exhaustion_limit": 2,
+  "normal_after": 64,
+  "duplicate_exhausted": true,
+  "expected_deliveries": 211,
+  "expected_persisted_attempts": 210
+}

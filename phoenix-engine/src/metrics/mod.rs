@@ -22,6 +22,7 @@ struct RuntimeMetricValues {
     shadow_accepted: AtomicU64,
     shadow_rejected: AtomicU64,
     processing_failures: AtomicU64,
+    dependency_exhausted: AtomicU64,
     redeliveries: AtomicU64,
     duplicate_skips: AtomicU64,
     rpc_primary_screen_rejected: AtomicU64,
@@ -79,6 +80,12 @@ impl RuntimeMetrics {
     pub fn processing_failure(&self) {
         self.inner
             .processing_failures
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn dependency_exhausted(&self) {
+        self.inner
+            .dependency_exhausted
             .fetch_add(1, Ordering::Relaxed);
     }
 
@@ -145,6 +152,8 @@ impl RuntimeMetrics {
                 "phoenix_engine_shadow_rejected_total {}\n",
                 "# TYPE phoenix_engine_processing_failures_total counter\n",
                 "phoenix_engine_processing_failures_total {}\n",
+                "# TYPE phoenix_engine_dependency_exhausted_total counter\n",
+                "phoenix_engine_dependency_exhausted_total {}\n",
                 "# TYPE phoenix_engine_redeliveries_total counter\n",
                 "phoenix_engine_redeliveries_total {}\n",
                 "# TYPE phoenix_engine_duplicate_skips_total counter\n",
@@ -183,6 +192,7 @@ impl RuntimeMetrics {
             self.inner.shadow_accepted.load(Ordering::Relaxed),
             self.inner.shadow_rejected.load(Ordering::Relaxed),
             self.inner.processing_failures.load(Ordering::Relaxed),
+            self.inner.dependency_exhausted.load(Ordering::Relaxed),
             self.inner.redeliveries.load(Ordering::Relaxed),
             self.inner.duplicate_skips.load(Ordering::Relaxed),
             self.inner
@@ -402,6 +412,7 @@ mod tests {
         metrics.shadow_accepted(1);
         metrics.shadow_rejected(1);
         metrics.processing_failure();
+        metrics.dependency_exhausted();
         metrics.duplicate_skip();
         metrics.set_consumer_state(7, 3);
         let rendered = metrics.render(&RuntimeReadiness::new());
@@ -413,6 +424,7 @@ mod tests {
             "phoenix_engine_shadow_accepted_total 1",
             "phoenix_engine_shadow_rejected_total 1",
             "phoenix_engine_processing_failures_total 1",
+            "phoenix_engine_dependency_exhausted_total 1",
             "phoenix_engine_redeliveries_total 1",
             "phoenix_engine_duplicate_skips_total 1",
             "phoenix_engine_consumer_pending 7",
