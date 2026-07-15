@@ -151,6 +151,28 @@ func TestCanonicalProfitabilityMigrationIsAdditiveBoundedAndFailClosed(t *testin
 	}
 }
 
+func TestShadowRouteDiscoveryIndexesAreAdditive(t *testing.T) {
+	migrationPath := filepath.Join("..", "..", "..", "migrations", "008_shadow_route_discovery_indexes.sql")
+	content, err := os.ReadFile(migrationPath)
+	if err != nil {
+		t.Fatalf("read shadow route discovery index migration: %v", err)
+	}
+	sqlText := strings.ToUpper(string(content))
+	for _, required := range []string{
+		"CREATE INDEX IF NOT EXISTS RPC_QUALITY_RECORDS_SHADOW_DECISION_IDX",
+		"CREATE INDEX IF NOT EXISTS POOL_STATE_CHECKPOINTS_LATEST_POOL_IDX",
+	} {
+		if !strings.Contains(sqlText, required) {
+			t.Fatalf("migration missing %q", required)
+		}
+	}
+	for _, destructive := range []string{"DROP", "TRUNCATE", "DELETE", "UPDATE", "ALTER"} {
+		if strings.Contains(sqlText, destructive) {
+			t.Fatalf("migration contains destructive statement %q", destructive)
+		}
+	}
+}
+
 func TestLoadMigrationsOrdersByVersion(t *testing.T) {
 	dir := t.TempDir()
 	writeMigration(t, dir, "002_second.sql", "SELECT 2;")

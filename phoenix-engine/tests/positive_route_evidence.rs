@@ -1,7 +1,7 @@
 use ethabi::{ParamType, Token};
 use phoenix_engine::positive_route_evidence::{
     analyze_stored_transaction, DiscoveryStatistics, StoredTransactionEvidence,
-    TransactionProvenance, POSITIVE_ROUTE_EVIDENCE_NOT_FOUND,
+    TransactionProvenance, POSITIVE_ROUTE_EVIDENCE_NOT_FOUND, POSTGRES_FEED_EVENT_SOURCE,
 };
 use phoenix_engine::shadow_processor::RouteRegistry;
 use primitive_types::{H160, U256};
@@ -177,6 +177,8 @@ fn all_reviewed_official_router_families_reach_the_configured_route() {
         assert_eq!(summary.router_kind.as_deref(), Some(expected_kind));
         assert!(summary.supported);
         assert_eq!(summary.exact_input, Some(true));
+        assert_eq!(summary.recorded_at, "2026-01-01T00:00:00Z");
+        assert_eq!(summary.input_amount.as_deref(), Some("1000000"));
         assert_eq!(summary.decoded_token_path, [WETH, USDC]);
         assert_eq!(summary.decoded_fee_path, [500]);
         assert_eq!(summary.candidate_count, 1);
@@ -187,6 +189,7 @@ fn all_reviewed_official_router_families_reach_the_configured_route() {
         );
         assert!(summary.shadow_only);
         assert!(!summary.execution_request_created);
+        assert!(!summary.trusted_persisted_source);
         assert!(!summary.production_evidence);
     }
 }
@@ -200,6 +203,7 @@ fn exact_output_unknown_router_and_malformed_calldata_remain_fail_closed() {
     .unwrap();
     assert!(exact_output.exact_output);
     assert!(!exact_output.supported);
+    assert!(exact_output.input_amount.is_none());
     assert_eq!(exact_output.route_match_result, "unsupported_exact_output");
 
     let unknown = analyze_stored_transaction(
@@ -266,4 +270,17 @@ fn synthetic_candidate_tests_cannot_claim_real_positive_evidence() {
         statistics.terminal_result(),
         POSITIVE_ROUTE_EVIDENCE_NOT_FOUND
     );
+}
+
+#[test]
+fn trusted_postgres_history_remains_distinct_from_configured_route_evidence() {
+    let mut evidence = stored(ROUTER_02, router02_single(WETH, USDC, 10_000), '5');
+    evidence.provenance.source = POSTGRES_FEED_EVENT_SOURCE.to_string();
+    let summary = analyze_stored_transaction(&evidence, &registry()).unwrap();
+
+    assert!(summary.supported);
+    assert!(summary.trusted_persisted_source);
+    assert!(!summary.candidate_produced);
+    assert!(!summary.production_evidence);
+    assert_eq!(summary.route_match_result, "decoded_but_irrelevant_pool");
 }

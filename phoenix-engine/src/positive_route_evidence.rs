@@ -36,6 +36,7 @@ pub struct TransactionProvenance {
 pub struct PositiveRouteSummary {
     pub transaction_hash: String,
     pub source_sequence: u64,
+    pub recorded_at: String,
     pub source_block_number: Option<u64>,
     pub source_block_hash: Option<String>,
     pub router_address: Option<String>,
@@ -45,6 +46,7 @@ pub struct PositiveRouteSummary {
     pub supported: bool,
     pub exact_input: Option<bool>,
     pub exact_output: bool,
+    pub input_amount: Option<String>,
     pub decoded_token_path: Vec<String>,
     pub decoded_fee_path: Vec<u32>,
     pub decoded_pool_ids: Vec<String>,
@@ -55,6 +57,7 @@ pub struct PositiveRouteSummary {
     pub rejection_detail_class: Option<String>,
     pub candidate_count: usize,
     pub candidate_produced: bool,
+    pub trusted_persisted_source: bool,
     pub production_evidence: bool,
     pub shadow_only: bool,
     pub execution_request_created: bool,
@@ -151,6 +154,7 @@ pub fn analyze_stored_transaction(
     let mut summary = PositiveRouteSummary {
         transaction_hash: input.identity.tx_hash.clone(),
         source_sequence: input.identity.source_sequence,
+        recorded_at: stored.provenance.recorded_at.clone(),
         source_block_number: stored.provenance.source_block_number,
         source_block_hash: stored.provenance.source_block_hash.clone(),
         router_address,
@@ -160,6 +164,7 @@ pub fn analyze_stored_transaction(
         supported: false,
         exact_input: None,
         exact_output: false,
+        input_amount: None,
         decoded_token_path: Vec::new(),
         decoded_fee_path: Vec::new(),
         decoded_pool_ids: Vec::new(),
@@ -170,6 +175,7 @@ pub fn analyze_stored_transaction(
         rejection_detail_class: Some("irrelevant_origin".to_string()),
         candidate_count: 0,
         candidate_produced: false,
+        trusted_persisted_source: trusted_source,
         production_evidence: false,
         shadow_only: true,
         execution_request_created: false,
@@ -186,6 +192,7 @@ pub fn analyze_stored_transaction(
             summary.command_family = origin.decoded_commands;
             summary.supported = true;
             summary.exact_input = Some(origin.exact_in);
+            summary.input_amount = Some(origin.amount.0.to_string());
             summary.decoded_token_path = origin
                 .swap_path
                 .iter()

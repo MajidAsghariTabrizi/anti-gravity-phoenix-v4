@@ -61,10 +61,17 @@ install -m 0640 -o phoenix -g phoenix "$repo_root/compose.prod.yml" /opt/phoenix
 install -m 0644 -o phoenix -g phoenix "$repo_root/deploy/nats-server.conf" /opt/phoenix/deploy/nats-server.conf
 install -d -m 0750 -o phoenix -g phoenix /opt/phoenix/deploy/prometheus
 install -d -m 0750 -o phoenix -g phoenix /opt/phoenix/deploy/sql
+install -d -m 0750 -o phoenix -g phoenix /opt/phoenix/deploy/routes
 install -m 0640 -o phoenix -g phoenix "$repo_root/prometheus/prometheus.yml" /opt/phoenix/deploy/prometheus/prometheus.yml
 install -m 0640 -o phoenix -g phoenix \
   "$repo_root/scripts/sql/shadow-profitability-report.sql" \
   /opt/phoenix/deploy/sql/shadow-profitability-report.sql
+install -m 0640 -o phoenix -g phoenix \
+  "$repo_root/scripts/sql/shadow-route-discovery-enrichment.sql" \
+  /opt/phoenix/deploy/sql/shadow-route-discovery-enrichment.sql
+install -m 0640 -o phoenix -g phoenix \
+  "$repo_root/fixtures/routes/arbitrum_uniswap_v3_pool_proofs.json" \
+  /opt/phoenix/deploy/routes/arbitrum_uniswap_v3_pool_proofs.json
 for script in \
   production_context.py \
   render-production-compose.sh \
@@ -76,6 +83,8 @@ for script in \
   shadow-positive-route-evidence.sh \
   shadow-profitability-report.sh \
   shadow_profitability_report.py \
+  shadow-route-discovery.sh \
+  shadow_route_discovery.py \
   rollback-release.sh \
   deploy-release.sh
 do
