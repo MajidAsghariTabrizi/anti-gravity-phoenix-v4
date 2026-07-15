@@ -7,7 +7,8 @@
 - Foundry local verification is blocked on this machine by missing `forge`.
 - Live Nitro relay operation, Arbitrum fork tests, and simulator/quoter parity tests require a Linux host and RPC credentials.
 - Production latency benchmarks are not measured.
-- The production Engine binary does not yet consume JetStream, reconstruct live pool state, call the economic RPC contract, run contract/fork simulation, or persist SHADOW decisions. The profitability foundation is library and deterministic replay code.
+- The production Engine consumes its durable JetStream input, evaluates configured routes with block-pinned RPC state, and persists SHADOW decisions and canonical profitability facts. Its current V3 state model remains bounded to the reconciled tick, and it does not run contract or fork simulation in the production decision path; those missing execution proofs remain fail-closed rejection evidence.
+- Gas and L1 fee inputs must already be expressed in the route settlement-asset unit. No cross-asset fee conversion service is implemented, so routes without a valid unit conversion cannot support complete profitability evidence.
 - The committed replay cases are synthetic test coverage and are not profitability evidence.
 - No wallet, signer, contract deployment, or LIVE submission service is configured.
 - Recorder delivery uses a single-node, one-replica JetStream work queue. It supports restart replay and confirmed acknowledgements after PostgreSQL commit, but host or Docker-volume loss is not replicated and messages older than the bounded 24-hour stream age can expire.

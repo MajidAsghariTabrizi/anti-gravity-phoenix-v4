@@ -11,7 +11,7 @@ Production default:
 - no GitHub-held signer key
 - release by immutable manifest
 
-Production operations use `/opt/phoenix/deploy/deploy-release.sh <sha>`, `/opt/phoenix/deploy/rollback-release.sh`, and `/opt/phoenix/deploy/production-healthcheck.sh`.
+Production operations use `/opt/phoenix/deploy/deploy-release.sh <sha>`, `/opt/phoenix/deploy/rollback-release.sh`, and `/opt/phoenix/deploy/production-healthcheck.sh`. Bounded read-only profitability reporting is documented in [`SHADOW_PROFITABILITY_REPORTS.md`](SHADOW_PROFITABILITY_REPORTS.md).
 
 ## Bounded Engine Canary
 
