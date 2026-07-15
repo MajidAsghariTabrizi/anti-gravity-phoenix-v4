@@ -5,10 +5,11 @@ use crate::economics::{evaluate_scenarios, EconomicInput};
 use crate::engine_input::EngineInput;
 use crate::metrics::RuntimeMetrics;
 use crate::opportunity::{
-    BasisPoints, DecisionEvidence, MarketEvidence, Opportunity, OpportunityIdentity,
-    OutcomeEvidence, PoolStateEvidence, RejectionReason, RouteEvidence, ScenarioEconomics,
-    ShadowDisposition, SignedAmount, SimulationClassification, SimulationEvidence, SimulationKind,
-    StateSource, Strategy,
+    AgreementState, BasisPoints, DecisionEvidence, MarketEvidence, Opportunity,
+    OpportunityIdentity, OutcomeEvidence, PoolStateEvidence, RejectionReason, RouteEvidence,
+    ScenarioEconomics, ShadowDisposition, SignedAmount, SimulationClassification,
+    SimulationEvidence, SimulationKind, StateSource, Strategy, VerificationSkipReason,
+    VerificationStatus as OpportunityVerificationStatus,
 };
 use crate::optimizer::{optimize, CandidateEvaluation, OptimizerConfig};
 use crate::origin::OriginEvent;
@@ -23,8 +24,8 @@ use reqwest::{Client, StatusCode, Url};
 use rpc_gateway::shadow_state::{
     canonical_block_hash, canonical_data, canonical_digest, canonical_hash_bytes, EvidenceRequest,
     GatewayErrorResponse, PoolStateRequest, RpcQualityEvidence, ShadowStateRequest,
-    ShadowStateResponse, VerificationStatus, ARBITRUM_ONE_CHAIN_ID, MAX_GATEWAY_REQUEST_BYTES,
-    MAX_GATEWAY_RESPONSE_BYTES, SHADOW_STATE_SCHEMA_VERSION,
+    ShadowStateResponse, VerificationStatus as GatewayVerificationStatus, ARBITRUM_ONE_CHAIN_ID,
+    MAX_GATEWAY_REQUEST_BYTES, MAX_GATEWAY_RESPONSE_BYTES, SHADOW_STATE_SCHEMA_VERSION,
 };
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -247,6 +248,10 @@ impl CandidateEvaluator for RpcCandidateEvaluator {
             })?;
         let now_ms = unix_time_ms();
         validate_response(&request, &primary_response, now_ms)?;
+        let primary_response_hash =
+            canonical_hash_bytes(&serde_json::to_vec(&primary_response).map_err(|_| {
+                EvaluationError::Terminal("rpc_gateway_response_integrity_failure")
+            })?);
         let pools = decode_pools(route, &primary_response)?;
         let gas_price_wei = parse_decimal_u128(&input.normalized.max_fee_per_gas)
             .ok_or(EvaluationError::Terminal("economic_input_out_of_range"))?;
@@ -261,7 +266,7 @@ impl CandidateEvaluator for RpcCandidateEvaluator {
             |amount| match evaluate_amount(route, &pools, amount, gas_price_wei) {
                 Ok(value) => Ok(CandidateEvaluation {
                     amount,
-                    gross_profit: value.gross_profit,
+                    gross_profit: value.gross_profit.0,
                     flash_premium: value.economics.base.flash_loan_fee,
                     expected_execution_cost: value
                         .economics
@@ -269,12 +274,13 @@ impl CandidateEvaluator for RpcCandidateEvaluator {
                         .arbitrum_execution_fee
                         .checked_add(value.economics.base.l1_data_fee)?
                         .checked_add(value.economics.base.contract_overhead)?,
-                    expected_ordering_cost: value.economics.base.failure_cost_reserve,
+                    expected_ordering_cost: value
+                        .economics
+                        .base
+                        .failure_cost_reserve
+                        .checked_add(value.economics.base.ordering_reserve)?,
                     uncertainty_reserve: value.economics.base.uncertainty_reserve,
-                    expected_net_profit: Amount(
-                        u128::try_from(value.economics.base.expected_net_pnl.0)
-                            .map_err(|_| DomainError::ArithmeticUnderflow)?,
-                    ),
+                    expected_net_profit: value.economics.base.expected_net_pnl.0,
                 }),
                 Err(ModelError::NotViable) => Err(DomainError::ArithmeticUnderflow),
                 Err(ModelError::StateIncomplete) => {
@@ -305,6 +311,50 @@ impl CandidateEvaluator for RpcCandidateEvaluator {
                 }),
             });
         };
+        if !optimized.meets_minimum {
+            self.metrics.rpc_primary_screen_rejected();
+            self.metrics.rpc_secondary_skipped();
+            let selected = evaluate_amount(route, &pools, optimized.best_amount, gas_price_wei)
+                .map_err(|_| EvaluationError::Terminal("shadow_model_recalculation_failure"))?;
+            let opportunity = build_opportunity(
+                input,
+                origin,
+                route,
+                &primary_response,
+                &pools,
+                primary_response_hash.clone(),
+                selected,
+                Some(VerificationSkipReason::PrimaryBelowMinimum),
+                requested_at.elapsed(),
+                now_ms,
+                &self.code_version,
+            )?;
+            let primary_evidence = json!({
+                "state": {
+                    "state_block": primary_response.block_number,
+                    "state_block_hash": &primary_response.block_hash,
+                    "state_hash": &primary_response.state_hash,
+                    "primary_response_hash": primary_response_hash,
+                    "primary_provider_id": &primary_response.primary_provider_id,
+                    "verification_status": primary_response.verification_status,
+                    "verification_skip_reason": "primary_below_minimum",
+                    "rpc_quality_record_count": primary_response.quality.len(),
+                    "state_model_tick_crossings_supported": 0,
+                    "incomplete_state_seen": incomplete_state_seen,
+                    "primary_screen_rejected": true,
+                    "secondary_skipped": true
+                },
+                "optimizer_evaluated_amount_count": optimized.evaluated_amount_count,
+                "selected_input_amount": optimized.best_amount.0.to_string()
+            });
+            return Ok(CandidateBatch {
+                evaluations: vec![EvaluatedOpportunity {
+                    opportunity,
+                    rpc_quality: primary_response.quality,
+                }],
+                evidence: primary_evidence,
+            });
+        }
         let verification_request = verification_request(&request, &primary_response)?;
         let (response, secondary_transport_unavailable) =
             match self.client.fetch(&verification_request).await {
@@ -315,8 +365,10 @@ impl CandidateEvaluator for RpcCandidateEvaluator {
                         .canonical_hash()
                         .map_err(|_| EvaluationError::Terminal("route_state_request_invalid"))?;
                     unavailable.agreement_provider_id = None;
+                    unavailable.secondary_state_hash = None;
                     unavailable.provider_agreement = false;
-                    unavailable.verification_status = VerificationStatus::SecondaryUnavailable;
+                    unavailable.verification_status =
+                        GatewayVerificationStatus::SecondaryUnavailable;
                     (unavailable, true)
                 }
                 Err(GatewayClientError::Integrity) => {
@@ -328,7 +380,7 @@ impl CandidateEvaluator for RpcCandidateEvaluator {
         let now_ms = unix_time_ms();
         validate_response(&verification_request, &response, now_ms)?;
         let verified_pools = decode_pools(route, &response)?;
-        let response_hash =
+        let verification_response_hash =
             canonical_hash_bytes(&serde_json::to_vec(&response).map_err(|_| {
                 EvaluationError::Terminal("rpc_gateway_response_integrity_failure")
             })?);
@@ -336,9 +388,11 @@ impl CandidateEvaluator for RpcCandidateEvaluator {
             "state_block": response.block_number,
             "state_block_hash": response.block_hash,
             "state_hash": response.state_hash,
-            "rpc_response_hash": response_hash,
+            "primary_response_hash": primary_response_hash,
+            "verification_response_hash": verification_response_hash,
             "primary_provider_id": response.primary_provider_id,
             "agreement_provider_id": response.agreement_provider_id,
+            "secondary_state_hash": response.secondary_state_hash,
             "provider_agreement": response.provider_agreement,
             "verification_status": response.verification_status,
             "secondary_verification_transport_unavailable": secondary_transport_unavailable,
@@ -355,8 +409,9 @@ impl CandidateEvaluator for RpcCandidateEvaluator {
             route,
             &response,
             &verified_pools,
-            response_hash,
+            primary_response_hash,
             selected,
+            None,
             requested_at.elapsed(),
             now_ms,
             &self.code_version,
@@ -463,9 +518,10 @@ fn validate_response(
     }
     let stage_valid = match &request.evidence {
         EvidenceRequest::Primary => {
-            response.verification_status == VerificationStatus::PrimaryOnly
+            response.verification_status == GatewayVerificationStatus::PrimaryOnly
                 && !response.provider_agreement
                 && response.agreement_provider_id.is_none()
+                && response.secondary_state_hash.is_none()
         }
         EvidenceRequest::Verify {
             block_number,
@@ -475,18 +531,28 @@ fn validate_response(
             response.block_number == *block_number
                 && response.block_hash == *block_hash
                 && response.state_hash == *primary_state_hash
-                && response.verification_status != VerificationStatus::PrimaryOnly
+                && response.verification_status != GatewayVerificationStatus::PrimaryOnly
         }
     };
     let verification_valid = match response.verification_status {
-        VerificationStatus::PrimaryOnly | VerificationStatus::SecondaryUnavailable => {
-            !response.provider_agreement && response.agreement_provider_id.is_none()
+        GatewayVerificationStatus::PrimaryOnly
+        | GatewayVerificationStatus::SecondaryUnavailable => {
+            !response.provider_agreement
+                && response.agreement_provider_id.is_none()
+                && response.secondary_state_hash.is_none()
         }
-        VerificationStatus::Agreed => {
-            response.provider_agreement && response.agreement_provider_id.is_some()
+        GatewayVerificationStatus::Agreed => {
+            response.provider_agreement
+                && response.agreement_provider_id.is_some()
+                && response.secondary_state_hash.as_deref() == Some(response.state_hash.as_str())
         }
-        VerificationStatus::Disagreed => {
-            !response.provider_agreement && response.agreement_provider_id.is_some()
+        GatewayVerificationStatus::Disagreed => {
+            !response.provider_agreement
+                && response.agreement_provider_id.is_some()
+                && response
+                    .secondary_state_hash
+                    .as_deref()
+                    .is_some_and(|value| value != response.state_hash.as_str())
         }
     };
     if !stage_valid || !verification_valid {
@@ -504,6 +570,15 @@ fn validate_response(
             ));
         }
     } else if response.provider_agreement {
+        return Err(EvaluationError::Terminal(
+            "rpc_gateway_response_integrity_failure",
+        ));
+    }
+    if response
+        .secondary_state_hash
+        .as_deref()
+        .is_some_and(|value| !canonical_digest(value))
+    {
         return Err(EvaluationError::Terminal(
             "rpc_gateway_response_integrity_failure",
         ));
@@ -543,7 +618,7 @@ fn validate_response(
     }
     if matches!(
         response.verification_status,
-        VerificationStatus::Agreed | VerificationStatus::Disagreed
+        GatewayVerificationStatus::Agreed | GatewayVerificationStatus::Disagreed
     ) {
         let agreement_provider = response
             .agreement_provider_id
@@ -671,7 +746,7 @@ fn decode_liquidity(value: &str) -> Result<Liquidity, EvaluationError> {
 struct AmountEvaluation {
     input: Amount,
     output: Amount,
-    gross_profit: Amount,
+    gross_profit: SignedAmount,
     economics: ScenarioEconomics,
 }
 
@@ -693,9 +768,6 @@ fn evaluate_amount(
     let pool_fees = no_fee_output
         .checked_sub(output)
         .map_err(|_| ModelError::Integrity)?;
-    let gross_profit = no_fee_output
-        .checked_sub(amount)
-        .map_err(|_| ModelError::NotViable)?;
     let economics = evaluate_scenarios(&EconomicInput {
         principal: amount,
         gross_output: no_fee_output,
@@ -717,15 +789,16 @@ fn evaluate_amount(
         uncertainty_reserve: route.strategy.uncertainty_reserve,
         replacement_transaction_cost: route.strategy.replacement_transaction_cost,
         probability_of_success_bps: route.strategy.probability_of_success_bps,
+        minimum_required_net_pnl: SignedAmount(
+            i128::try_from(route.strategy.minimum_net_profit.0)
+                .map_err(|_| ModelError::Integrity)?,
+        ),
     })
     .map_err(|_| ModelError::Integrity)?;
-    if economics.base.expected_net_pnl <= SignedAmount(0) {
-        return Err(ModelError::NotViable);
-    }
     Ok(AmountEvaluation {
         input: amount,
         output,
-        gross_profit,
+        gross_profit: economics.base.gross_profit,
         economics,
     })
 }
@@ -777,6 +850,7 @@ fn build_opportunity(
     pools: &[PoolState],
     response_hash: String,
     selected: AmountEvaluation,
+    verification_skip_reason: Option<VerificationSkipReason>,
     evaluation_latency: Duration,
     now_ms: u64,
     code_version: &str,
@@ -854,8 +928,14 @@ fn build_opportunity(
             quote_block: response.block_number,
             quote_age_ms: now_ms.saturating_sub(response.resolved_at_unix_ms),
             state_source: StateSource::BlockPinnedRpc,
-            rpc_provider_id: Some(response.primary_provider_id.clone()),
-            rpc_response_hash: Some(response_hash),
+            primary_provider_id: Some(response.primary_provider_id.clone()),
+            primary_response_hash: Some(response_hash),
+            primary_state_hash: Some(response.state_hash.clone()),
+            secondary_provider_id: response.agreement_provider_id.clone(),
+            secondary_state_hash: response.secondary_state_hash.clone(),
+            verification_status: opportunity_verification_status(response.verification_status),
+            agreement_state: opportunity_agreement_state(response.verification_status),
+            verification_skip_reason,
             feed_to_detection_latency_ns: feed_latency_ns,
         },
         economics: selected.economics,
@@ -884,10 +964,15 @@ fn build_opportunity(
                 .any(|quality| quality.success && quality.stale_result)
             {
                 SimulationClassification::StaleState
-            } else if response.provider_agreement {
-                SimulationClassification::Passed
             } else {
-                SimulationClassification::ProviderDisagreement
+                match response.verification_status {
+                    GatewayVerificationStatus::PrimaryOnly => SimulationClassification::NotRun,
+                    GatewayVerificationStatus::Agreed => SimulationClassification::Passed,
+                    GatewayVerificationStatus::Disagreed
+                    | GatewayVerificationStatus::SecondaryUnavailable => {
+                        SimulationClassification::ProviderDisagreement
+                    }
+                }
             },
         },
         decision: DecisionEvidence {
@@ -897,7 +982,9 @@ fn build_opportunity(
             risk_flags: Vec::new(),
             confidence_bps: 0,
             policy_version: POLICY_VERSION.to_string(),
+            shadow_only: true,
             execution_eligible: false,
+            execution_request_created: false,
             decided_at_unix_ms: now_ms,
         },
         outcome: OutcomeEvidence {
@@ -907,7 +994,7 @@ fn build_opportunity(
             ..OutcomeEvidence::default()
         },
     };
-    let minimum = SignedAmount(route.strategy.minimum_net_profit.0 as i128);
+    let minimum = opportunity.economics.minimum_required_net_pnl;
     let policy = ShadowPolicy {
         version: POLICY_VERSION.to_string(),
         allowed_tokens: opportunity
@@ -933,7 +1020,11 @@ fn build_opportunity(
             duplicate: false,
             sequence_contiguous: true,
             liquidity_sufficient: false,
-            rpc_state_agrees: response.provider_agreement,
+            rpc_state_agrees: !matches!(
+                response.verification_status,
+                GatewayVerificationStatus::Disagreed
+                    | GatewayVerificationStatus::SecondaryUnavailable
+            ),
             contract_path_available: false,
             risk_budget_available: false,
             confidence_bps: STATE_MODEL_CONFIDENCE_BPS,
@@ -943,6 +1034,28 @@ fn build_opportunity(
         .validate_traceability()
         .map_err(|_| EvaluationError::Terminal("opportunity_traceability_failure"))?;
     Ok(opportunity)
+}
+
+fn opportunity_verification_status(
+    status: GatewayVerificationStatus,
+) -> OpportunityVerificationStatus {
+    match status {
+        GatewayVerificationStatus::PrimaryOnly => OpportunityVerificationStatus::PrimaryOnly,
+        GatewayVerificationStatus::Agreed => OpportunityVerificationStatus::Agreed,
+        GatewayVerificationStatus::Disagreed => OpportunityVerificationStatus::Disagreed,
+        GatewayVerificationStatus::SecondaryUnavailable => {
+            OpportunityVerificationStatus::SecondaryUnavailable
+        }
+    }
+}
+
+fn opportunity_agreement_state(status: GatewayVerificationStatus) -> AgreementState {
+    match status {
+        GatewayVerificationStatus::PrimaryOnly => AgreementState::NotChecked,
+        GatewayVerificationStatus::Agreed => AgreementState::Agreed,
+        GatewayVerificationStatus::Disagreed => AgreementState::Disagreed,
+        GatewayVerificationStatus::SecondaryUnavailable => AgreementState::Unavailable,
+    }
 }
 
 fn deterministic_opportunity_id(
@@ -1025,6 +1138,7 @@ mod tests {
     use crate::domain::{Address, ChainId, PoolId, RouteId, SequenceNumber, TokenAddress, TxHash};
     use crate::graph::{PoolEdge, Route};
     use crate::messaging::NormalizedTx;
+    use crate::opportunity::PrimaryProfitabilityStatus;
     use crate::origin::{
         DecodedSwapKind, OriginEvidence, OuterSelectorKind, RouterKind, UnsupportedReason,
         WrapperKind,
@@ -1259,23 +1373,32 @@ mod tests {
                 retry_count: 0,
             })
             .collect();
+        let state_hash = canonical_hash_bytes(&serde_json::to_vec(&pools).unwrap());
+        let secondary_state_hash = (!primary_only).then(|| {
+            if agreement {
+                state_hash.clone()
+            } else {
+                "f".repeat(64)
+            }
+        });
         ShadowStateResponse {
             schema_version: SHADOW_STATE_SCHEMA_VERSION.to_string(),
             chain_id: ARBITRUM_ONE_CHAIN_ID,
             request_hash: request.canonical_hash().unwrap(),
             block_number: 100,
             block_hash: BLOCK_HASH.to_string(),
-            state_hash: canonical_hash_bytes(&serde_json::to_vec(&pools).unwrap()),
+            state_hash,
             pools,
             primary_provider_id: "provider_0".to_string(),
             agreement_provider_id: (!primary_only).then(|| "provider_1".to_string()),
+            secondary_state_hash,
             provider_agreement: !primary_only && agreement,
             verification_status: if primary_only {
-                VerificationStatus::PrimaryOnly
+                GatewayVerificationStatus::PrimaryOnly
             } else if agreement {
-                VerificationStatus::Agreed
+                GatewayVerificationStatus::Agreed
             } else {
-                VerificationStatus::Disagreed
+                GatewayVerificationStatus::Disagreed
             },
             quality,
             resolved_at_unix_ms: unix_time_ms(),
@@ -1341,8 +1464,32 @@ mod tests {
             .evaluate(&input(now), &origin(), &route())
             .await
             .unwrap();
-        assert!(batch.evaluations.is_empty());
+        assert_eq!(batch.evaluations.len(), 1);
         assert_eq!(client.calls.load(Ordering::Relaxed), 1);
+        let opportunity = &batch.evaluations[0].opportunity;
+        assert_eq!(
+            opportunity.economics.primary_status,
+            PrimaryProfitabilityStatus::BelowMinimum
+        );
+        assert_eq!(
+            opportunity.market.verification_status,
+            OpportunityVerificationStatus::PrimaryOnly
+        );
+        assert_eq!(
+            opportunity.market.agreement_state,
+            AgreementState::NotChecked
+        );
+        assert_eq!(
+            opportunity.market.verification_skip_reason,
+            Some(VerificationSkipReason::PrimaryBelowMinimum)
+        );
+        assert_eq!(
+            opportunity.simulation.classification,
+            SimulationClassification::NotRun
+        );
+        assert!(opportunity.decision.shadow_only);
+        assert!(!opportunity.decision.execution_eligible);
+        assert!(!opportunity.decision.execution_request_created);
         let rendered = metrics.render(&crate::runtime_state::RuntimeReadiness::new());
         assert!(rendered.contains("rpc_primary_screen_rejected_total 1"));
         assert!(rendered.contains("rpc_secondary_skipped_total 1"));
@@ -1359,6 +1506,13 @@ mod tests {
             .unwrap();
         assert_eq!(batch.evaluations.len(), 1);
         assert_eq!(client.calls.load(Ordering::Relaxed), 2);
+        let market = &batch.evaluations[0].opportunity.market;
+        assert_eq!(
+            market.verification_status,
+            OpportunityVerificationStatus::Agreed
+        );
+        assert_eq!(market.agreement_state, AgreementState::Agreed);
+        assert_eq!(market.secondary_state_hash, market.primary_state_hash);
     }
 
     #[tokio::test]
@@ -1380,6 +1534,15 @@ mod tests {
             opportunity.decision.primary_rejection_reason,
             Some(RejectionReason::RpcStateDisagreement)
         );
+        assert_eq!(
+            opportunity.market.verification_status,
+            OpportunityVerificationStatus::SecondaryUnavailable
+        );
+        assert_eq!(
+            opportunity.market.agreement_state,
+            AgreementState::Unavailable
+        );
+        assert!(opportunity.market.secondary_state_hash.is_none());
         assert_eq!(
             batch.evidence["state"]["secondary_verification_transport_unavailable"],
             json!(true)
@@ -1431,6 +1594,18 @@ mod tests {
         assert_eq!(
             opportunity.decision.disposition,
             ShadowDisposition::Rejected
+        );
+        assert_eq!(
+            opportunity.market.verification_status,
+            OpportunityVerificationStatus::Disagreed
+        );
+        assert_eq!(
+            opportunity.market.agreement_state,
+            AgreementState::Disagreed
+        );
+        assert_ne!(
+            opportunity.market.secondary_state_hash,
+            opportunity.market.primary_state_hash
         );
     }
 

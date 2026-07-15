@@ -4,10 +4,11 @@ use phoenix_engine::execution::{
 };
 use phoenix_engine::graph::{PoolEdge, PoolGraph, Route};
 use phoenix_engine::opportunity::{
-    BasisPoints, CostBreakdown, DecisionEvidence, MarketEvidence, OpportunityIdentity,
-    OutcomeEvidence, PoolStateEvidence, RouteEvidence, ScenarioEconomics, ShadowDisposition,
-    SignedAmount, SimulationClassification, SimulationEvidence, SimulationKind, StateSource,
-    Strategy,
+    AgreementState, BasisPoints, CostBreakdown, DecisionEvidence, MarketEvidence,
+    OpportunityIdentity, OutcomeEvidence, PoolStateEvidence, PrimaryProfitabilityStatus,
+    RouteEvidence, ScenarioEconomics, ShadowDisposition, SignedAmount, SimulationClassification,
+    SimulationEvidence, SimulationKind, StateSource, Strategy, VerificationSkipReason,
+    VerificationStatus, PROFITABILITY_MODEL_VERSION,
 };
 use phoenix_engine::optimizer::{optimize, CandidateEvaluation, OptimizerConfig};
 use phoenix_engine::origin::{OriginClassification, OriginDetector};
@@ -129,12 +130,14 @@ fn profitable_fixture_reaches_shadow_sink_and_dynamic_sizing() {
             })?;
             Ok(CandidateEvaluation {
                 amount,
-                gross_profit: breakdown.gross_profit,
+                gross_profit: i128::try_from(breakdown.gross_profit.0)
+                    .map_err(|_| DomainError::ArithmeticOverflow)?,
                 flash_premium: Amount(1),
                 expected_execution_cost: Amount(2),
                 expected_ordering_cost: Amount(0),
                 uncertainty_reserve: Amount(1),
-                expected_net_profit: breakdown.expected_net_profit,
+                expected_net_profit: i128::try_from(breakdown.expected_net_profit.0)
+                    .map_err(|_| DomainError::ArithmeticOverflow)?,
             })
         },
     )
@@ -143,19 +146,26 @@ fn profitable_fixture_reaches_shadow_sink_and_dynamic_sizing() {
 
     assert_eq!(optimized.best_amount, Amount(500));
     assert_ne!(optimized.best_amount, Amount(100));
-    assert!(optimized.expected_net_profit > Amount(10));
+    assert!(optimized.expected_net_profit > 10);
 
     let base = CostBreakdown {
-        gross_spread: SignedAmount(optimized.gross_profit.0 as i128),
+        gross_spread: SignedAmount(optimized.gross_profit),
+        gross_profit: SignedAmount(optimized.gross_profit),
         flash_loan_fee: optimized.flash_premium,
+        estimated_execution_gas: 2,
+        gas_price_wei: 1,
         arbitrum_execution_fee: optimized.expected_execution_cost,
         uncertainty_reserve: optimized.uncertainty_reserve,
-        expected_net_pnl: SignedAmount(optimized.expected_net_profit.0 as i128),
+        total_cost: optimized
+            .flash_premium
+            .checked_add(optimized.expected_execution_cost)
+            .unwrap()
+            .checked_add(optimized.uncertainty_reserve)
+            .unwrap(),
+        expected_net_pnl: SignedAmount(optimized.expected_net_profit),
         expected_roi_bps: BasisPoints(100),
         probability_of_success_bps: 9_000,
-        expected_value_after_success_probability: SignedAmount(
-            optimized.expected_net_profit.0 as i128,
-        ),
+        expected_value_after_success_probability: SignedAmount(optimized.expected_net_profit),
         ..CostBreakdown::default()
     };
     let opportunity = Opportunity {
@@ -194,7 +204,13 @@ fn profitable_fixture_reaches_shadow_sink_and_dynamic_sizing() {
             input_token: routes[0].legs[0].token_in.clone(),
             output_token: routes[0].legs[1].token_out.clone(),
             input_amount: optimized.best_amount,
-            expected_output: Amount(optimized.best_amount.0 + optimized.gross_profit.0),
+            expected_output: Amount(
+                optimized
+                    .best_amount
+                    .0
+                    .checked_add(u128::try_from(optimized.gross_profit).unwrap())
+                    .unwrap(),
+            ),
             exact_ordered_legs: routes[0].legs.clone(),
         },
         market: MarketEvidence {
@@ -208,14 +224,23 @@ fn profitable_fixture_reaches_shadow_sink_and_dynamic_sizing() {
             quote_block: 1,
             quote_age_ms: 1,
             state_source: StateSource::RecordedCheckpoint,
-            rpc_provider_id: None,
-            rpc_response_hash: None,
+            primary_provider_id: None,
+            primary_response_hash: None,
+            primary_state_hash: Some("fixture-primary-state-hash".to_string()),
+            secondary_provider_id: None,
+            secondary_state_hash: None,
+            verification_status: VerificationStatus::HistoricalEvidence,
+            agreement_state: AgreementState::NotChecked,
+            verification_skip_reason: Some(VerificationSkipReason::HistoricalEvidence),
             feed_to_detection_latency_ns: 1,
         },
         economics: ScenarioEconomics {
             base: base.clone(),
             conservative: base.clone(),
             severe: base,
+            minimum_required_net_pnl: SignedAmount(10),
+            primary_status: PrimaryProfitabilityStatus::MeetsMinimum,
+            model_version: PROFITABILITY_MODEL_VERSION.to_string(),
         },
         simulation: SimulationEvidence {
             kind: SimulationKind::HistoricalReplay,
@@ -229,7 +254,7 @@ fn profitable_fixture_reaches_shadow_sink_and_dynamic_sizing() {
             gas_estimate: Some(1),
             gas_used: Some(1),
             simulated_output: Some(optimized.best_amount),
-            simulated_net_pnl: Some(SignedAmount(optimized.expected_net_profit.0 as i128)),
+            simulated_net_pnl: Some(SignedAmount(optimized.expected_net_profit)),
             revert_reason: None,
             state_overrides_hash: None,
             provider_id: None,
@@ -245,7 +270,9 @@ fn profitable_fixture_reaches_shadow_sink_and_dynamic_sizing() {
             risk_flags: Vec::new(),
             confidence_bps: 9_000,
             policy_version: "fixture-policy-v1".to_string(),
+            shadow_only: true,
             execution_eligible: false,
+            execution_request_created: false,
             decided_at_unix_ms: 1_700_000_000_003,
         },
         outcome: OutcomeEvidence {
@@ -278,7 +305,7 @@ fn unsupported_router_fixture_is_measured_not_guessed() {
 }
 
 #[test]
-fn non_profitable_fixture_does_not_create_opportunity() {
+fn non_profitable_fixture_retains_below_minimum_evidence() {
     let result = optimize(
         OptimizerConfig {
             min_amount: Amount(100),
@@ -289,15 +316,17 @@ fn non_profitable_fixture_does_not_create_opportunity() {
         |amount| {
             Ok(CandidateEvaluation {
                 amount,
-                gross_profit: Amount(1),
+                gross_profit: 1,
                 flash_premium: Amount(1),
                 expected_execution_cost: Amount(1),
                 expected_ordering_cost: Amount(0),
                 uncertainty_reserve: Amount(0),
-                expected_net_profit: Amount(0),
+                expected_net_profit: 0,
             })
         },
     )
+    .unwrap()
     .unwrap();
-    assert!(result.is_none());
+    assert_eq!(result.expected_net_profit, 0);
+    assert!(!result.meets_minimum);
 }

@@ -2,6 +2,8 @@ use crate::domain::{Amount, OpportunityId, PoolId, RouteId, TokenAddress, TxHash
 use crate::graph::PoolEdge;
 use serde::Serialize;
 
+pub const PROFITABILITY_MODEL_VERSION: &str = "shadow-profitability-v2";
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 #[serde(transparent)]
 pub struct SignedAmount(pub i128);
@@ -76,14 +78,83 @@ pub struct MarketEvidence {
     pub quote_block: u64,
     pub quote_age_ms: u64,
     pub state_source: StateSource,
-    pub rpc_provider_id: Option<String>,
-    pub rpc_response_hash: Option<String>,
+    pub primary_provider_id: Option<String>,
+    pub primary_response_hash: Option<String>,
+    pub primary_state_hash: Option<String>,
+    pub secondary_provider_id: Option<String>,
+    pub secondary_state_hash: Option<String>,
+    pub verification_status: VerificationStatus,
+    pub agreement_state: AgreementState,
+    pub verification_skip_reason: Option<VerificationSkipReason>,
     pub feed_to_detection_latency_ns: u128,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VerificationStatus {
+    #[default]
+    Incomplete,
+    PrimaryOnly,
+    Agreed,
+    Disagreed,
+    SecondaryUnavailable,
+    HistoricalEvidence,
+}
+
+impl VerificationStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Incomplete => "incomplete",
+            Self::PrimaryOnly => "primary_only",
+            Self::Agreed => "agreed",
+            Self::Disagreed => "disagreed",
+            Self::SecondaryUnavailable => "secondary_unavailable",
+            Self::HistoricalEvidence => "historical_evidence",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgreementState {
+    #[default]
+    NotChecked,
+    Agreed,
+    Disagreed,
+    Unavailable,
+}
+
+impl AgreementState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::NotChecked => "not_checked",
+            Self::Agreed => "agreed",
+            Self::Disagreed => "disagreed",
+            Self::Unavailable => "unavailable",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VerificationSkipReason {
+    PrimaryBelowMinimum,
+    HistoricalEvidence,
+}
+
+impl VerificationSkipReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::PrimaryBelowMinimum => "primary_below_minimum",
+            Self::HistoricalEvidence => "historical_evidence",
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
 pub struct CostBreakdown {
     pub gross_spread: SignedAmount,
+    pub gross_profit: SignedAmount,
     pub protocol_fees: Amount,
     pub pool_fees: Amount,
     pub price_impact: Amount,
@@ -96,18 +167,57 @@ pub struct CostBreakdown {
     pub contract_overhead: Amount,
     pub failure_cost_reserve: Amount,
     pub stale_state_penalty: Amount,
+    pub ordering_reserve: Amount,
+    pub state_drift_reserve: Amount,
+    pub latency_reserve: Amount,
     pub uncertainty_reserve: Amount,
+    pub total_cost: Amount,
     pub expected_net_pnl: SignedAmount,
     pub expected_roi_bps: BasisPoints,
     pub probability_of_success_bps: u16,
     pub expected_value_after_success_probability: SignedAmount,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct ScenarioEconomics {
     pub base: CostBreakdown,
     pub conservative: CostBreakdown,
     pub severe: CostBreakdown,
+    pub minimum_required_net_pnl: SignedAmount,
+    pub primary_status: PrimaryProfitabilityStatus,
+    pub model_version: String,
+}
+
+impl Default for ScenarioEconomics {
+    fn default() -> Self {
+        Self {
+            base: CostBreakdown::default(),
+            conservative: CostBreakdown::default(),
+            severe: CostBreakdown::default(),
+            minimum_required_net_pnl: SignedAmount::default(),
+            primary_status: PrimaryProfitabilityStatus::Incomplete,
+            model_version: PROFITABILITY_MODEL_VERSION.to_string(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PrimaryProfitabilityStatus {
+    #[default]
+    Incomplete,
+    MeetsMinimum,
+    BelowMinimum,
+}
+
+impl PrimaryProfitabilityStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Incomplete => "incomplete",
+            Self::MeetsMinimum => "meets_minimum",
+            Self::BelowMinimum => "below_minimum",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -231,7 +341,9 @@ pub struct DecisionEvidence {
     pub risk_flags: Vec<RiskFlag>,
     pub confidence_bps: u16,
     pub policy_version: String,
+    pub shadow_only: bool,
     pub execution_eligible: bool,
+    pub execution_request_created: bool,
     pub decided_at_unix_ms: u64,
 }
 
@@ -272,8 +384,11 @@ impl Opportunity {
         {
             return Err("rejected decision missing primary reason");
         }
-        if self.decision.execution_eligible {
-            return Err("shadow opportunity cannot be execution eligible");
+        if !self.decision.shadow_only
+            || self.decision.execution_eligible
+            || self.decision.execution_request_created
+        {
+            return Err("shadow opportunity violated execution safety");
         }
         Ok(())
     }

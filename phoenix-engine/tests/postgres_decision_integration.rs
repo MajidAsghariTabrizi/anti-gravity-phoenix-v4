@@ -5,10 +5,11 @@ use phoenix_engine::domain::{
 use phoenix_engine::engine_input::{EngineClassification, InputIdentity};
 use phoenix_engine::graph::PoolEdge;
 use phoenix_engine::opportunity::{
-    BasisPoints, CostBreakdown, DecisionEvidence, MarketEvidence, Opportunity, OpportunityIdentity,
-    OutcomeEvidence, PoolStateEvidence, RejectionReason, RiskFlag, RouteEvidence,
-    ScenarioEconomics, ShadowDisposition, SignedAmount, SimulationClassification,
-    SimulationEvidence, SimulationKind, StateSource, Strategy,
+    AgreementState, BasisPoints, CostBreakdown, DecisionEvidence, MarketEvidence, Opportunity,
+    OpportunityIdentity, OutcomeEvidence, PoolStateEvidence, PrimaryProfitabilityStatus,
+    RejectionReason, RiskFlag, RouteEvidence, ScenarioEconomics, ShadowDisposition, SignedAmount,
+    SimulationClassification, SimulationEvidence, SimulationKind, StateSource, Strategy,
+    VerificationSkipReason, VerificationStatus, PROFITABILITY_MODEL_VERSION,
 };
 use phoenix_engine::persistence::{
     ClassificationRecord, PersistOutcome, PostgresShadowStore, ShadowStore, StoreError,
@@ -38,6 +39,7 @@ async fn apply_migrations(pool: &PgPool) {
         include_str!("../../migrations/004_shadow_engine_runtime.sql"),
         include_str!("../../migrations/005_shadow_decision_identity.sql"),
         include_str!("../../migrations/006_dependency_exhaustion_quarantine.sql"),
+        include_str!("../../migrations/007_canonical_profitability_truth.sql"),
     ] {
         sqlx::raw_sql(migration)
             .execute(pool)
@@ -57,13 +59,16 @@ fn evaluation(hash_byte: char, opportunity_id: &str) -> EvaluatedOpportunity {
     let second_pool = PoolId("comparison-pool".to_string());
     let economics = CostBreakdown {
         gross_spread: SignedAmount(100),
+        gross_profit: SignedAmount(95),
         pool_fees: Amount(5),
         estimated_execution_gas: 1,
         gas_price_wei: 1,
-        expected_net_pnl: SignedAmount(50),
-        expected_roi_bps: BasisPoints(500),
+        arbitrum_execution_fee: Amount(1),
+        total_cost: Amount(6),
+        expected_net_pnl: SignedAmount(94),
+        expected_roi_bps: BasisPoints(9_400),
         probability_of_success_bps: 8_000,
-        expected_value_after_success_probability: SignedAmount(40),
+        expected_value_after_success_probability: SignedAmount(75),
         ..CostBreakdown::default()
     };
     let tx_hash = format!("0x{}", hash_byte.to_string().repeat(64));
@@ -130,14 +135,23 @@ fn evaluation(hash_byte: char, opportunity_id: &str) -> EvaluatedOpportunity {
                 quote_block: 100,
                 quote_age_ms: 1,
                 state_source: StateSource::BlockPinnedRpc,
-                rpc_provider_id: Some("provider_0".to_string()),
-                rpc_response_hash: Some("d".repeat(64)),
+                primary_provider_id: Some("provider_0".to_string()),
+                primary_response_hash: Some("d".repeat(64)),
+                primary_state_hash: Some("e".repeat(64)),
+                secondary_provider_id: None,
+                secondary_state_hash: None,
+                verification_status: VerificationStatus::PrimaryOnly,
+                agreement_state: AgreementState::NotChecked,
+                verification_skip_reason: Some(VerificationSkipReason::PrimaryBelowMinimum),
                 feed_to_detection_latency_ns: 1,
             },
             economics: ScenarioEconomics {
                 base: economics.clone(),
                 conservative: economics.clone(),
                 severe: economics,
+                minimum_required_net_pnl: SignedAmount(100),
+                primary_status: PrimaryProfitabilityStatus::BelowMinimum,
+                model_version: PROFITABILITY_MODEL_VERSION.to_string(),
             },
             simulation: SimulationEvidence {
                 kind: SimulationKind::StateBased,
@@ -151,7 +165,7 @@ fn evaluation(hash_byte: char, opportunity_id: &str) -> EvaluatedOpportunity {
                 gas_estimate: Some(1),
                 gas_used: None,
                 simulated_output: Some(Amount(200)),
-                simulated_net_pnl: Some(SignedAmount(50)),
+                simulated_net_pnl: Some(SignedAmount(94)),
                 revert_reason: None,
                 state_overrides_hash: None,
                 provider_id: Some("provider_0".to_string()),
@@ -167,7 +181,9 @@ fn evaluation(hash_byte: char, opportunity_id: &str) -> EvaluatedOpportunity {
                 risk_flags: vec![RiskFlag::IncompleteLiquidity],
                 confidence_bps: 7_000,
                 policy_version: "shadow-state-policy-v1".to_string(),
+                shadow_only: true,
                 execution_eligible: false,
+                execution_request_created: false,
                 decided_at_unix_ms: 1_700_000_000_002,
             },
             outcome: OutcomeEvidence {
@@ -224,7 +240,7 @@ async fn full_decision_commit_is_atomic_idempotent_and_source_scoped() {
         .expect("connect Engine integration PostgreSQL");
     apply_migrations(&pool).await;
     sqlx::query(
-        "TRUNCATE rpc_quality_records, shadow_decisions, \
+        "TRUNCATE shadow_profitability_facts, rpc_quality_records, shadow_decisions, \
          shadow_engine_processing_attempts, shadow_engine_classifications CASCADE",
     )
     .execute(&pool)
@@ -262,8 +278,13 @@ async fn full_decision_commit_is_atomic_idempotent_and_source_scoped() {
 SELECT
     (SELECT count(*) FROM shadow_engine_classifications) AS classifications,
     (SELECT count(*) FROM shadow_decisions) AS decisions,
+    (SELECT count(*) FROM shadow_profitability_facts) AS profitability_facts,
+    (SELECT count(*) FROM shadow_profitability_facts
+        WHERE evidence_completeness_status = 'complete') AS complete_facts,
     (SELECT count(*) FROM rpc_quality_records) AS quality,
-    (SELECT count(*) FROM shadow_decisions WHERE execution_eligible) AS executable
+    (SELECT count(*) FROM shadow_decisions WHERE execution_eligible) AS executable,
+    (SELECT count(*) FROM shadow_profitability_facts
+        WHERE NOT shadow_only OR execution_eligible OR execution_request_created) AS unsafe_facts
 "#,
     )
     .fetch_one(&pool)
@@ -271,8 +292,86 @@ SELECT
     .expect("load Engine integration counts");
     assert_eq!(counts.try_get::<i64, _>("classifications").unwrap(), 2);
     assert_eq!(counts.try_get::<i64, _>("decisions").unwrap(), 2);
+    assert_eq!(counts.try_get::<i64, _>("profitability_facts").unwrap(), 2);
+    assert_eq!(counts.try_get::<i64, _>("complete_facts").unwrap(), 2);
     assert_eq!(counts.try_get::<i64, _>("quality").unwrap(), 2);
     assert_eq!(counts.try_get::<i64, _>("executable").unwrap(), 0);
+    assert_eq!(counts.try_get::<i64, _>("unsafe_facts").unwrap(), 0);
+
+    let canonical = sqlx::query(
+        r#"
+SELECT gross_spread::text AS gross_spread,
+       gross_profit::text AS gross_profit,
+       total_cost::text AS total_cost,
+       expected_net_pnl::text AS expected_net_pnl,
+       minimum_required_net_pnl::text AS minimum_required_net_pnl,
+       primary_profitability_status,
+       verification_status
+FROM shadow_profitability_facts
+WHERE shadow_decision_id = CAST($1 AS uuid)
+"#,
+    )
+    .bind("11111111-1111-8111-8111-111111111111")
+    .fetch_one(&pool)
+    .await
+    .expect("load canonical profitability fact");
+    assert_eq!(
+        canonical.try_get::<String, _>("gross_spread").unwrap(),
+        "100"
+    );
+    assert_eq!(
+        canonical.try_get::<String, _>("gross_profit").unwrap(),
+        "95"
+    );
+    assert_eq!(canonical.try_get::<String, _>("total_cost").unwrap(), "6");
+    assert_eq!(
+        canonical.try_get::<String, _>("expected_net_pnl").unwrap(),
+        "94"
+    );
+    assert_eq!(
+        canonical
+            .try_get::<String, _>("minimum_required_net_pnl")
+            .unwrap(),
+        "100"
+    );
+    assert_eq!(
+        canonical
+            .try_get::<String, _>("primary_profitability_status")
+            .unwrap(),
+        "below_minimum"
+    );
+    assert_eq!(
+        canonical
+            .try_get::<String, _>("verification_status")
+            .unwrap(),
+        "primary_only"
+    );
+
+    let mut plan_transaction = pool.begin().await.expect("begin query-plan check");
+    sqlx::query("SET LOCAL enable_seqscan = off")
+        .execute(&mut *plan_transaction)
+        .await
+        .expect("prefer index for query-plan check");
+    let plan_rows = sqlx::query(
+        "EXPLAIN (COSTS OFF) SELECT shadow_decision_id FROM shadow_profitability_facts \
+         ORDER BY evaluated_at DESC, shadow_decision_id DESC LIMIT 100",
+    )
+    .fetch_all(&mut *plan_transaction)
+    .await
+    .expect("explain bounded profitability query");
+    let plan = plan_rows
+        .iter()
+        .map(|row| row.try_get::<String, _>(0).unwrap())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        plan.contains("shadow_profitability_evaluated_idx"),
+        "{plan}"
+    );
+    plan_transaction
+        .rollback()
+        .await
+        .expect("rollback query-plan check");
 
     sqlx::raw_sql(
         r#"
@@ -309,6 +408,17 @@ FOR EACH ROW EXECUTE FUNCTION phoenix_test_reject_rpc_quality();
     .try_get("count")
     .unwrap();
     assert_eq!(rolled_back, 0);
+    let rolled_back_fact: i64 = sqlx::query(
+        "SELECT count(*) AS count FROM shadow_profitability_facts \
+         WHERE shadow_decision_id = CAST($1 AS uuid)",
+    )
+    .bind("33333333-3333-8333-8333-333333333333")
+    .fetch_one(&pool)
+    .await
+    .expect("verify canonical fact rollback")
+    .try_get("count")
+    .unwrap();
+    assert_eq!(rolled_back_fact, 0);
 
     sqlx::raw_sql(
         r#"
@@ -350,5 +460,26 @@ DROP FUNCTION phoenix_test_reject_rpc_quality();
     assert_eq!(
         context.evidence["dependency_failure_class"],
         "rpc_gateway_unavailable"
+    );
+    let incomplete = sqlx::query(
+        "SELECT evidence_completeness_status, expected_net_pnl::text AS expected_net_pnl \
+         FROM shadow_profitability_report_rows \
+         WHERE source_event_identity = $1 AND route_fingerprint = 'two-pool-v1'",
+    )
+    .bind(&transient.identity.source_event_identity)
+    .fetch_one(&pool)
+    .await
+    .expect("load incomplete candidate reporting row");
+    assert_eq!(
+        incomplete
+            .try_get::<String, _>("evidence_completeness_status")
+            .unwrap(),
+        "incomplete"
+    );
+    assert_eq!(
+        incomplete
+            .try_get::<Option<String>, _>("expected_net_pnl")
+            .unwrap(),
+        None
     );
 }

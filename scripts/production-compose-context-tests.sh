@@ -424,7 +424,14 @@ for release_script in "$script_dir/deploy-release.sh" "$script_dir/rollback-rele
     fail "release script conflates cleanup and interrupt handling: $release_script"
   fi
 done
-for installed_script in production_context.py render-production-compose.sh validate-production-release-context.sh; do
+for installed_script in \
+  production_context.py \
+  render-production-compose.sh \
+  validate-production-release-context.sh \
+  shadow-profitability-report.sh \
+  shadow_profitability_report.py \
+  shadow-profitability-report.sql
+do
   grep -F "$installed_script" "$script_dir/bootstrap-production.sh" >/dev/null ||
     fail "bootstrap does not install $installed_script"
 done

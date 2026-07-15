@@ -38,6 +38,8 @@ powershell -ExecutionPolicy Bypass -File .\scripts\forbidden-file-check.ps1
 cd feed-ingestor && go test ./...
 cd migration-runner && go test ./...
 python -m py_compile dashboard/app.py
+python -m py_compile scripts/shadow_profitability_report.py
+sh scripts/shadow-profitability-report-tests.sh
 ```
 
 ## Shadow Production

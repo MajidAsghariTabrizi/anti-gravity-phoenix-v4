@@ -232,6 +232,7 @@ impl RuntimeMetrics {
 pub struct Metrics {
     counters: BTreeMap<&'static str, u64>,
     gauges: BTreeMap<&'static str, f64>,
+    financial_gauges: BTreeMap<&'static str, i128>,
     rejection_reasons: BTreeMap<&'static str, u64>,
 }
 
@@ -252,6 +253,10 @@ impl Metrics {
         self.gauges.get(name).copied().unwrap_or(0.0)
     }
 
+    fn set_financial_gauge(&mut self, name: &'static str, value: i128) {
+        self.financial_gauges.insert(name, value);
+    }
+
     pub fn record_candidate(&mut self, opportunity: &Opportunity) {
         self.inc("phoenix_candidates_total");
         self.inc("phoenix_opportunities_total");
@@ -268,29 +273,29 @@ impl Metrics {
                 }
             }
         }
-        self.set_gauge(
+        self.set_financial_gauge(
             "phoenix_expected_gross_pnl",
-            opportunity.economics.base.gross_spread.0 as f64,
+            opportunity.economics.base.gross_spread.0,
         );
-        self.set_gauge(
+        self.set_financial_gauge(
             "phoenix_expected_net_pnl",
-            opportunity.economics.base.expected_net_pnl.0 as f64,
+            opportunity.economics.base.expected_net_pnl.0,
         );
-        self.set_gauge(
+        self.set_financial_gauge(
             "phoenix_conservative_net_pnl",
-            opportunity.economics.conservative.expected_net_pnl.0 as f64,
+            opportunity.economics.conservative.expected_net_pnl.0,
         );
-        self.set_gauge(
+        self.set_financial_gauge(
             "phoenix_severe_net_pnl",
-            opportunity.economics.severe.expected_net_pnl.0 as f64,
+            opportunity.economics.severe.expected_net_pnl.0,
         );
-        self.set_gauge(
-            "phoenix_hypothetical_realized_pnl",
+        self.set_financial_gauge(
+            "phoenix_counterfactual_pnl",
             opportunity
                 .outcome
                 .replay_pnl
-                .map(|value| value.0 as f64)
-                .unwrap_or(0.0),
+                .map(|value| value.0)
+                .unwrap_or(0),
         );
         self.set_gauge(
             "phoenix_opportunity_age_seconds",
@@ -324,7 +329,11 @@ impl Metrics {
             let _ = writeln!(output, "{name} {}", self.get(name));
         }
         for name in REQUIRED_GAUGES {
-            let _ = writeln!(output, "{name} {}", self.gauge(name));
+            if let Some(value) = self.financial_gauges.get(name) {
+                let _ = writeln!(output, "{name} {value}");
+            } else {
+                let _ = writeln!(output, "{name} {}", self.gauge(name));
+            }
         }
         for (reason, count) in &self.rejection_reasons {
             let _ = writeln!(
@@ -360,7 +369,7 @@ pub const REQUIRED_GAUGES: &[&str] = &[
     "phoenix_expected_net_pnl",
     "phoenix_conservative_net_pnl",
     "phoenix_severe_net_pnl",
-    "phoenix_hypothetical_realized_pnl",
+    "phoenix_counterfactual_pnl",
     "phoenix_opportunity_age_seconds",
     "phoenix_detection_latency_seconds",
     "phoenix_simulation_latency_seconds",
@@ -400,6 +409,15 @@ mod tests {
         for forbidden in ["tx_hash=", "wallet=", "opportunity_id=", "pool_address="] {
             assert!(!rendered.contains(forbidden));
         }
+    }
+
+    #[test]
+    fn financial_gauges_preserve_integer_precision() {
+        let mut metrics = Metrics::default();
+        metrics.set_financial_gauge("phoenix_expected_net_pnl", 9_007_199_254_740_993);
+        assert!(metrics
+            .render()
+            .contains("phoenix_expected_net_pnl 9007199254740993"));
     }
 
     #[test]

@@ -411,6 +411,7 @@ impl GatewayRuntime {
             quality.extend(resolution.failed_quality);
             return Ok(VerificationEvidence {
                 agreement_provider_id: None,
+                secondary_state_hash: None,
                 provider_agreement: false,
                 status: VerificationStatus::SecondaryUnavailable,
                 quality,
@@ -433,6 +434,7 @@ impl GatewayRuntime {
         }
         Ok(VerificationEvidence {
             agreement_provider_id: Some(secondary.provider_id),
+            secondary_state_hash: Some(secondary.state_hash),
             provider_agreement: agreement,
             status: if agreement {
                 VerificationStatus::Agreed
@@ -449,21 +451,28 @@ impl GatewayRuntime {
         primary: ProviderBundle,
         verification: Option<VerificationEvidence>,
     ) -> Result<ShadowStateResponse, GatewayError> {
-        let (agreement_provider_id, provider_agreement, verification_status, quality) =
-            match verification {
-                Some(verification) => (
-                    verification.agreement_provider_id,
-                    verification.provider_agreement,
-                    verification.status,
-                    verification.quality,
-                ),
-                None => (
-                    None,
-                    false,
-                    VerificationStatus::PrimaryOnly,
-                    primary.quality.clone(),
-                ),
-            };
+        let (
+            agreement_provider_id,
+            secondary_state_hash,
+            provider_agreement,
+            verification_status,
+            quality,
+        ) = match verification {
+            Some(verification) => (
+                verification.agreement_provider_id,
+                verification.secondary_state_hash,
+                verification.provider_agreement,
+                verification.status,
+                verification.quality,
+            ),
+            None => (
+                None,
+                None,
+                false,
+                VerificationStatus::PrimaryOnly,
+                primary.quality.clone(),
+            ),
+        };
         let response = ShadowStateResponse {
             schema_version: SHADOW_STATE_SCHEMA_VERSION.to_string(),
             chain_id: ARBITRUM_ONE_CHAIN_ID,
@@ -474,6 +483,7 @@ impl GatewayRuntime {
             pools: primary.pools,
             primary_provider_id: primary.provider_id,
             agreement_provider_id,
+            secondary_state_hash,
             provider_agreement,
             verification_status,
             quality,
@@ -1128,6 +1138,7 @@ impl ProviderBundle {
 #[derive(Clone, Debug)]
 struct VerificationEvidence {
     agreement_provider_id: Option<String>,
+    secondary_state_hash: Option<String>,
     provider_agreement: bool,
     status: VerificationStatus,
     quality: Vec<RpcQualityEvidence>,
@@ -1616,6 +1627,10 @@ mod tests {
             .unwrap();
         assert_eq!(verified.verification_status, VerificationStatus::Agreed);
         assert!(verified.provider_agreement);
+        assert_eq!(
+            verified.secondary_state_hash.as_deref(),
+            Some(verified.state_hash.as_str())
+        );
         assert_eq!(verified.block_number, 100);
         assert_eq!(verified.block_hash, BLOCK_HASH);
         let calls = client.calls();
@@ -1801,6 +1816,11 @@ mod tests {
             .unwrap();
         assert_eq!(verified.verification_status, VerificationStatus::Disagreed);
         assert!(!verified.provider_agreement);
+        assert!(verified.secondary_state_hash.is_some());
+        assert_ne!(
+            verified.secondary_state_hash.as_deref(),
+            Some(verified.state_hash.as_str())
+        );
         assert!(verified
             .quality
             .iter()

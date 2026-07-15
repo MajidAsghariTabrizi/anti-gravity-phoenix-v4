@@ -45,6 +45,7 @@ async fn apply_migrations(pool: &PgPool) {
         include_str!("../../migrations/004_shadow_engine_runtime.sql"),
         include_str!("../../migrations/005_shadow_decision_identity.sql"),
         include_str!("../../migrations/006_dependency_exhaustion_quarantine.sql"),
+        include_str!("../../migrations/007_canonical_profitability_truth.sql"),
     ] {
         sqlx::raw_sql(migration)
             .execute(pool)

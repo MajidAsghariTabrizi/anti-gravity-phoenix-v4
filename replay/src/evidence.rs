@@ -45,6 +45,10 @@ impl EvidenceReport {
         let _ = writeln!(output, "evidence_schema=shadow-evidence-v1");
         let _ = writeln!(
             output,
+            "financial_label=SHADOW_expected realization_status=not_realized"
+        );
+        let _ = writeln!(
+            output,
             "sample_size={} independent_opportunities={} accepted={} rejected={} simulation_success_rate_bps={}",
             self.sample_size,
             self.independent_opportunity_count,
@@ -100,13 +104,22 @@ pub fn build(input: &str) -> Result<EvidenceReport, ReplayError> {
     let baseline = replay_cases(cases.clone())?;
     let decisions = &baseline.decisions;
     let base_values: Vec<i128> = decisions.iter().map(|item| item.base_net_pnl).collect();
-    let hypothetical_values: Vec<i128> = decisions
+    let counterfactual_values: Vec<i128> = decisions
         .iter()
-        .map(|item| item.hypothetical_realized_pnl)
+        .map(|item| item.counterfactual_pnl)
         .collect();
-    let split = ((base_values.len() * 7) / 10).clamp(1, base_values.len());
-    let cluster_values = cluster_pnl(decisions);
-    let (ci_low, ci_high) = cluster_bootstrap_mean_ci(&cluster_values);
+    let split = if base_values.is_empty() {
+        0
+    } else {
+        (base_values
+            .len()
+            .checked_mul(7)
+            .ok_or(ReplayError::ArithmeticOverflow)?
+            / 10)
+            .clamp(1, base_values.len())
+    };
+    let cluster_values = cluster_pnl(decisions)?;
+    let (ci_low, ci_high) = cluster_bootstrap_mean_ci(&cluster_values)?;
 
     Ok(EvidenceReport {
         sample_size: decisions.len(),
@@ -119,28 +132,28 @@ pub fn build(input: &str) -> Result<EvidenceReport, ReplayError> {
                 .filter(|item| item.simulation_passed)
                 .count(),
             decisions.len(),
-        ),
-        mean_net_pnl: mean(&base_values),
-        median_net_pnl: quantile(&base_values, 50),
-        p25_net_pnl: quantile(&base_values, 25),
-        p75_net_pnl: quantile(&base_values, 75),
-        p95_net_pnl: quantile(&base_values, 95),
+        )?,
+        mean_net_pnl: mean(&base_values)?,
+        median_net_pnl: quantile(&base_values, 50)?,
+        p25_net_pnl: quantile(&base_values, 25)?,
+        p75_net_pnl: quantile(&base_values, 75)?,
+        p95_net_pnl: quantile(&base_values, 95)?,
         worst_case_pnl: base_values.iter().copied().min().unwrap_or(0),
-        maximum_drawdown: maximum_drawdown(&hypothetical_values),
+        maximum_drawdown: maximum_drawdown(&counterfactual_values)?,
         positive_outcome_rate_bps: rate_bps(
-            hypothetical_values
+            counterfactual_values
                 .iter()
                 .filter(|value| **value > 0)
                 .count(),
-            hypothetical_values.len(),
-        ),
-        largest_opportunity_contribution_bps: largest_contribution_bps(&hypothetical_values),
+            counterfactual_values.len(),
+        )?,
+        largest_opportunity_contribution_bps: largest_contribution_bps(&counterfactual_values)?,
         protocol_concentration_bps: concentration_bps(
             decisions.iter().map(|item| item.protocol.as_str()),
-        ),
+        )?,
         token_concentration_bps: concentration_bps(
             decisions.iter().map(|item| item.token_pair.as_str()),
-        ),
+        )?,
         hourly_bucket_count: decisions
             .iter()
             .map(|item| item.observed_at_unix_ms / 3_600_000)
@@ -151,11 +164,13 @@ pub fn build(input: &str) -> Result<EvidenceReport, ReplayError> {
             .map(|item| item.observed_at_unix_ms / 86_400_000)
             .collect::<BTreeSet<_>>()
             .len(),
-        base_aggregate_pnl: sum(&base_values),
-        conservative_aggregate_pnl: decisions.iter().map(|item| item.conservative_net_pnl).sum(),
-        severe_aggregate_pnl: decisions.iter().map(|item| item.severe_net_pnl).sum(),
-        in_sample_median_pnl: quantile(&base_values[..split], 50),
-        out_of_sample_median_pnl: quantile(&base_values[split..], 50),
+        base_aggregate_pnl: checked_sum(base_values.iter().copied())?,
+        conservative_aggregate_pnl: checked_sum(
+            decisions.iter().map(|item| item.conservative_net_pnl),
+        )?,
+        severe_aggregate_pnl: checked_sum(decisions.iter().map(|item| item.severe_net_pnl))?,
+        in_sample_median_pnl: quantile(&base_values[..split], 50)?,
+        out_of_sample_median_pnl: quantile(&base_values[split..], 50)?,
         cluster_bootstrap_mean_ci_low: ci_low,
         cluster_bootstrap_mean_ci_high: ci_high,
         gas_sensitivity_delta: sensitivity_delta(&cases, Sensitivity::Gas)?,
@@ -176,43 +191,51 @@ fn sensitivity_delta(cases: &[ReplayCase], kind: Sensitivity) -> Result<i128, Re
         .decisions
         .iter()
         .map(|item| item.base_net_pnl)
-        .sum::<i128>();
+        .try_fold(0_i128, i128::checked_add)
+        .ok_or(ReplayError::ArithmeticOverflow)?;
     let mut stressed = cases.to_vec();
     for case in &mut stressed {
         match kind {
-            Sensitivity::Gas => case.gas_price_wei = scale_up(case.gas_price_wei, 12_500),
-            Sensitivity::Slippage => case.slippage_buffer = scale_up(case.slippage_buffer, 15_000),
-            Sensitivity::Latency => case.latency_reserve = scale_up(case.latency_reserve, 15_000),
+            Sensitivity::Gas => case.gas_price_wei = scale_up(case.gas_price_wei, 12_500)?,
+            Sensitivity::Slippage => case.slippage_buffer = scale_up(case.slippage_buffer, 15_000)?,
+            Sensitivity::Latency => case.latency_reserve = scale_up(case.latency_reserve, 15_000)?,
         }
     }
     let stressed = replay_cases(stressed)?
         .decisions
         .iter()
         .map(|item| item.base_net_pnl)
-        .sum::<i128>();
-    Ok(stressed.saturating_sub(baseline))
+        .try_fold(0_i128, i128::checked_add)
+        .ok_or(ReplayError::ArithmeticOverflow)?;
+    stressed
+        .checked_sub(baseline)
+        .ok_or(ReplayError::ArithmeticOverflow)
 }
 
-fn scale_up(value: u128, multiplier_bps: u128) -> u128 {
+fn scale_up(value: u128, multiplier_bps: u128) -> Result<u128, ReplayError> {
     value
-        .saturating_mul(multiplier_bps)
-        .saturating_add(BPS_DENOMINATOR as u128 - 1)
-        / BPS_DENOMINATOR as u128
+        .checked_mul(multiplier_bps)
+        .and_then(|scaled| scaled.checked_add(BPS_DENOMINATOR as u128 - 1))
+        .map(|scaled| scaled / BPS_DENOMINATOR as u128)
+        .ok_or(ReplayError::ArithmeticOverflow)
 }
 
-fn cluster_pnl(decisions: &[ReplayDecision]) -> Vec<i128> {
+fn cluster_pnl(decisions: &[ReplayDecision]) -> Result<Vec<i128>, ReplayError> {
     let mut clusters = BTreeMap::<(u64, &str), i128>::new();
     for decision in decisions {
-        *clusters
+        let value = clusters
             .entry((decision.observed_block, &decision.route_fingerprint))
-            .or_insert(0) += decision.hypothetical_realized_pnl;
+            .or_insert(0);
+        *value = value
+            .checked_add(decision.counterfactual_pnl)
+            .ok_or(ReplayError::ArithmeticOverflow)?;
     }
-    clusters.into_values().collect()
+    Ok(clusters.into_values().collect())
 }
 
-fn cluster_bootstrap_mean_ci(clusters: &[i128]) -> (i128, i128) {
+fn cluster_bootstrap_mean_ci(clusters: &[i128]) -> Result<(i128, i128), ReplayError> {
     if clusters.is_empty() {
-        return (0, 0);
+        return Ok((0, 0));
     }
     let mut rng = DeterministicRng::new(BOOTSTRAP_SEED);
     let mut means = Vec::with_capacity(BOOTSTRAP_ROUNDS);
@@ -221,9 +244,9 @@ fn cluster_bootstrap_mean_ci(clusters: &[i128]) -> (i128, i128) {
         for _ in 0..clusters.len() {
             sampled.push(clusters[rng.next_index(clusters.len())]);
         }
-        means.push(mean(&sampled));
+        means.push(mean(&sampled)?);
     }
-    (quantile(&means, 2), quantile(&means, 97))
+    Ok((quantile(&means, 2)?, quantile(&means, 97)?))
 }
 
 struct DeterministicRng {
@@ -244,64 +267,98 @@ impl DeterministicRng {
     }
 }
 
-fn mean(values: &[i128]) -> i128 {
+fn mean(values: &[i128]) -> Result<i128, ReplayError> {
     if values.is_empty() {
-        0
+        Ok(0)
     } else {
-        sum(values) / values.len() as i128
+        let denominator =
+            i128::try_from(values.len()).map_err(|_| ReplayError::ArithmeticOverflow)?;
+        Ok(checked_sum(values.iter().copied())? / denominator)
     }
 }
 
-fn sum(values: &[i128]) -> i128 {
-    values.iter().copied().sum()
+fn checked_sum(mut values: impl Iterator<Item = i128>) -> Result<i128, ReplayError> {
+    values
+        .try_fold(0_i128, i128::checked_add)
+        .ok_or(ReplayError::ArithmeticOverflow)
 }
 
-fn quantile(values: &[i128], percentile: usize) -> i128 {
+fn quantile(values: &[i128], percentile: usize) -> Result<i128, ReplayError> {
     if values.is_empty() {
-        return 0;
+        return Ok(0);
     }
     let mut ordered = values.to_vec();
     ordered.sort_unstable();
-    let index = ((ordered.len() - 1) * percentile) / 100;
-    ordered[index]
+    let index = (ordered.len() - 1)
+        .checked_mul(percentile)
+        .ok_or(ReplayError::ArithmeticOverflow)?
+        / 100;
+    ordered
+        .get(index)
+        .copied()
+        .ok_or(ReplayError::ArithmeticOverflow)
 }
 
-fn rate_bps(numerator: usize, denominator: usize) -> i128 {
+fn rate_bps(numerator: usize, denominator: usize) -> Result<i128, ReplayError> {
     if denominator == 0 {
-        0
+        Ok(0)
     } else {
-        numerator as i128 * BPS_DENOMINATOR / denominator as i128
+        let numerator = i128::try_from(numerator).map_err(|_| ReplayError::ArithmeticOverflow)?;
+        let denominator =
+            i128::try_from(denominator).map_err(|_| ReplayError::ArithmeticOverflow)?;
+        numerator
+            .checked_mul(BPS_DENOMINATOR)
+            .map(|scaled| scaled / denominator)
+            .ok_or(ReplayError::ArithmeticOverflow)
     }
 }
 
-fn maximum_drawdown(values: &[i128]) -> i128 {
+fn maximum_drawdown(values: &[i128]) -> Result<i128, ReplayError> {
     let mut cumulative = 0i128;
     let mut peak = 0i128;
     let mut worst = 0i128;
     for value in values {
-        cumulative = cumulative.saturating_add(*value);
+        cumulative = cumulative
+            .checked_add(*value)
+            .ok_or(ReplayError::ArithmeticOverflow)?;
         peak = peak.max(cumulative);
-        worst = worst.max(peak.saturating_sub(cumulative));
+        worst = worst.max(
+            peak.checked_sub(cumulative)
+                .ok_or(ReplayError::ArithmeticOverflow)?,
+        );
     }
-    worst
+    Ok(worst)
 }
 
-fn largest_contribution_bps(values: &[i128]) -> i128 {
+fn largest_contribution_bps(values: &[i128]) -> Result<i128, ReplayError> {
     let positives: Vec<i128> = values.iter().copied().filter(|value| *value > 0).collect();
-    let total = sum(&positives);
+    let total = checked_sum(positives.iter().copied())?;
     if total == 0 {
-        0
+        Ok(0)
     } else {
-        positives.iter().copied().max().unwrap_or(0) * BPS_DENOMINATOR / total
+        positives
+            .iter()
+            .copied()
+            .max()
+            .unwrap_or(0)
+            .checked_mul(BPS_DENOMINATOR)
+            .map(|scaled| scaled / total)
+            .ok_or(ReplayError::ArithmeticOverflow)
     }
 }
 
-fn concentration_bps<'a>(values: impl Iterator<Item = &'a str>) -> i128 {
+fn concentration_bps<'a>(values: impl Iterator<Item = &'a str>) -> Result<i128, ReplayError> {
     let mut counts = BTreeMap::<&str, usize>::new();
     for value in values {
-        *counts.entry(value).or_insert(0) += 1;
+        let count = counts.entry(value).or_insert(0);
+        *count = count
+            .checked_add(1)
+            .ok_or(ReplayError::ArithmeticOverflow)?;
     }
-    let total: usize = counts.values().sum();
+    let total = counts
+        .values()
+        .try_fold(0_usize, |total, count| total.checked_add(*count))
+        .ok_or(ReplayError::ArithmeticOverflow)?;
     rate_bps(counts.values().copied().max().unwrap_or(0), total)
 }
 
@@ -329,5 +386,17 @@ mod tests {
         assert!(report.gas_sensitivity_delta < 0);
         assert!(report.slippage_sensitivity_delta < 0);
         assert!(report.latency_sensitivity_delta < 0);
+    }
+
+    #[test]
+    fn financial_statistics_fail_on_integer_overflow() {
+        assert_eq!(
+            checked_sum([i128::MAX, 1].into_iter()),
+            Err(ReplayError::ArithmeticOverflow)
+        );
+        assert_eq!(
+            scale_up(u128::MAX, 12_500),
+            Err(ReplayError::ArithmeticOverflow)
+        );
     }
 }

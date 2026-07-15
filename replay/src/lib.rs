@@ -8,9 +8,10 @@ use phoenix_engine::domain::{
 use phoenix_engine::economics::{evaluate_scenarios, EconomicError, EconomicInput};
 use phoenix_engine::graph::PoolEdge;
 use phoenix_engine::opportunity::{
-    BasisPoints, DecisionEvidence, MarketEvidence, Opportunity, OpportunityIdentity,
-    OutcomeEvidence, PoolStateEvidence, RejectionReason, RouteEvidence, ShadowDisposition,
-    SimulationClassification, SimulationEvidence, SimulationKind, StateSource, Strategy,
+    AgreementState, BasisPoints, DecisionEvidence, MarketEvidence, Opportunity,
+    OpportunityIdentity, OutcomeEvidence, PoolStateEvidence, RejectionReason, RouteEvidence,
+    ShadowDisposition, SimulationClassification, SimulationEvidence, SimulationKind, StateSource,
+    Strategy, VerificationSkipReason, VerificationStatus,
 };
 use serde::Deserialize;
 
@@ -107,7 +108,7 @@ pub struct ReplayDecision {
     pub base_net_pnl: i128,
     pub conservative_net_pnl: i128,
     pub severe_net_pnl: i128,
-    pub hypothetical_realized_pnl: i128,
+    pub counterfactual_pnl: i128,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -131,7 +132,7 @@ impl ReplayReport {
         let mut output = String::new();
         let _ = writeln!(
             output,
-            "schema={REPLAY_SCHEMA_VERSION} code_version={code_version} config_version={config_version} strategy_version={STRATEGY_VERSION} policy_version={POLICY_VERSION}"
+            "schema={REPLAY_SCHEMA_VERSION} code_version={code_version} config_version={config_version} strategy_version={STRATEGY_VERSION} policy_version={POLICY_VERSION} financial_label=SHADOW_expected realization_status=not_realized"
         );
         for decision in &self.decisions {
             let reason = decision
@@ -145,7 +146,7 @@ impl ReplayReport {
             };
             let _ = writeln!(
                 output,
-                "case={} block={} sequence={} disposition={} primary_reason={} base_net_pnl={} conservative_net_pnl={} severe_net_pnl={} hypothetical_realized_pnl={}",
+                "case={} block={} sequence={} disposition={} primary_reason={} base_net_pnl={} conservative_net_pnl={} severe_net_pnl={} counterfactual_pnl={} realization_status=not_realized",
                 decision.case_id,
                 decision.observed_block,
                 decision.source_sequence,
@@ -154,7 +155,7 @@ impl ReplayReport {
                 decision.base_net_pnl,
                 decision.conservative_net_pnl,
                 decision.severe_net_pnl,
-                decision.hypothetical_realized_pnl,
+                decision.counterfactual_pnl,
             );
         }
         let _ = writeln!(
@@ -232,6 +233,7 @@ fn evaluate_case(case: &ReplayCase) -> Result<ReplayDecision, ReplayError> {
         uncertainty_reserve: Amount(case.uncertainty_reserve),
         replacement_transaction_cost: Amount(case.replacement_transaction_cost),
         probability_of_success_bps: case.probability_of_success_bps,
+        minimum_required_net_pnl: phoenix_engine::opportunity::SignedAmount(1),
     })
     .map_err(ReplayError::Economics)?;
     let mut opportunity = build_opportunity(case, economics)?;
@@ -250,7 +252,7 @@ fn evaluate_case(case: &ReplayCase) -> Result<ReplayDecision, ReplayError> {
             confidence_bps: case.confidence_bps,
         },
     );
-    let hypothetical_realized_pnl = opportunity
+    let counterfactual_pnl = opportunity
         .economics
         .base
         .expected_net_pnl
@@ -279,7 +281,7 @@ fn evaluate_case(case: &ReplayCase) -> Result<ReplayDecision, ReplayError> {
         base_net_pnl: opportunity.economics.base.expected_net_pnl.0,
         conservative_net_pnl: opportunity.economics.conservative.expected_net_pnl.0,
         severe_net_pnl: opportunity.economics.severe.expected_net_pnl.0,
-        hypothetical_realized_pnl,
+        counterfactual_pnl,
     })
 }
 
@@ -336,8 +338,14 @@ fn build_opportunity(
             quote_block: case.observed_block,
             quote_age_ms: case.quote_age_ms,
             state_source: StateSource::RecordedCheckpoint,
-            rpc_provider_id: Some(case.rpc_provider_id.clone()),
-            rpc_response_hash: Some(case.rpc_response_hash.clone()),
+            primary_provider_id: Some(case.rpc_provider_id.clone()),
+            primary_response_hash: Some(case.rpc_response_hash.clone()),
+            primary_state_hash: Some(case.state_hash.clone()),
+            secondary_provider_id: None,
+            secondary_state_hash: None,
+            verification_status: VerificationStatus::HistoricalEvidence,
+            agreement_state: AgreementState::NotChecked,
+            verification_skip_reason: Some(VerificationSkipReason::HistoricalEvidence),
             feed_to_detection_latency_ns: (case
                 .detected_at_unix_ms
                 .saturating_sub(case.observed_at_unix_ms)
@@ -390,7 +398,9 @@ fn pending_decision(now_unix_ms: u64) -> DecisionEvidence {
         risk_flags: Vec::new(),
         confidence_bps: 0,
         policy_version: POLICY_VERSION.to_string(),
+        shadow_only: true,
         execution_eligible: false,
+        execution_request_created: false,
         decided_at_unix_ms: now_unix_ms,
     }
 }
@@ -510,6 +520,6 @@ mod tests {
             .find(|decision| decision.case_id == "pre-inclusion-movement")
             .unwrap();
         assert_eq!(movement.decision.disposition, ShadowDisposition::Accepted);
-        assert!(movement.hypothetical_realized_pnl < 0);
+        assert!(movement.counterfactual_pnl < 0);
     }
 }

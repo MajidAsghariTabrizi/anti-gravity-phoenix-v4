@@ -53,6 +53,7 @@ pub struct ShadowStateResponse {
     pub pools: Vec<PoolStateResponse>,
     pub primary_provider_id: String,
     pub agreement_provider_id: Option<String>,
+    pub secondary_state_hash: Option<String>,
     pub provider_agreement: bool,
     pub verification_status: VerificationStatus,
     pub quality: Vec<RpcQualityEvidence>,
