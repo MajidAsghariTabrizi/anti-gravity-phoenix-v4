@@ -263,8 +263,14 @@ if grep -E 'LIVE_EXECUTION=(true|1)|eth_sendRawTransaction|transaction submissio
 fi
 grep -F 'execution eligibility changed during SHADOW evidence run' "$workflow" >/dev/null ||
   fail 'SHADOW execution-eligibility guard is missing'
-grep -F 'isolated_canary_route_registry_preflight' "$workflow" >/dev/null ||
-  fail 'route-registry preservation preflight is missing'
+grep -F 'positive_evidence_render_preflight' "$workflow" >/dev/null ||
+  fail 'canonical production rendering preflight is missing'
+grep -F -- '--release-manifest "$release_manifest"' "$workflow" >/dev/null ||
+  fail 'evidence workflow does not bind the release manifest'
+if grep -F '$repo_dir/deploy/current-release.env' "$workflow" >/dev/null ||
+  grep -F '$repo_dir/current-release.env' "$workflow" >/dev/null; then
+  fail 'evidence workflow retains a repository-local release fallback'
+fi
 grep -F 'timeout_seconds=${SHADOW_POSITIVE_ROUTE_TIMEOUT_SECONDS:-900}' "$workflow" >/dev/null ||
   fail 'default timeout is not 15 minutes'
 grep -F 'POSITIVE_ROUTE_EVIDENCE_FOUND' "$workflow" >/dev/null || fail 'positive terminal result is missing'

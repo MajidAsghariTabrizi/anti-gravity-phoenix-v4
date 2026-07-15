@@ -36,6 +36,7 @@ fi
 install -d -m 0750 -o phoenix -g phoenix /opt/phoenix
 install -d -m 0750 -o phoenix -g phoenix /opt/phoenix/deploy
 install -d -m 0750 -o phoenix -g phoenix /opt/phoenix/deploy/manifests
+install -d -m 0750 -o phoenix -g phoenix /opt/phoenix/deploy/.runtime
 install -d -m 0750 -o phoenix -g phoenix /opt/phoenix/data
 install -d -m 0750 -o phoenix -g phoenix /opt/phoenix/data/postgres
 install -d -m 0750 -o phoenix -g phoenix /opt/phoenix/data/prometheus
@@ -60,7 +61,18 @@ install -m 0640 -o phoenix -g phoenix "$repo_root/compose.prod.yml" /opt/phoenix
 install -m 0644 -o phoenix -g phoenix "$repo_root/deploy/nats-server.conf" /opt/phoenix/deploy/nats-server.conf
 install -d -m 0750 -o phoenix -g phoenix /opt/phoenix/deploy/prometheus
 install -m 0640 -o phoenix -g phoenix "$repo_root/prometheus/prometheus.yml" /opt/phoenix/deploy/prometheus/prometheus.yml
-for script in validate-production-env.sh production-healthcheck.sh rollback-release.sh deploy-release.sh; do
+for script in \
+  production_context.py \
+  render-production-compose.sh \
+  verify-compose-route-registry.py \
+  validate-production-release-context.sh \
+  validate-production-env.sh \
+  production-healthcheck.sh \
+  shadow-engine-isolated-canary.sh \
+  shadow-positive-route-evidence.sh \
+  rollback-release.sh \
+  deploy-release.sh
+do
   install -m 0750 -o phoenix -g phoenix "$repo_root/scripts/$script" "/opt/phoenix/deploy/$script"
 done
 

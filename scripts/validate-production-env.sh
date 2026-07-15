@@ -268,13 +268,9 @@ validate_rpc_providers
 validate_engine_routers
 validate_postgres_consistency
 
-if [ -n "${SIGNER_PRIVATE_KEY:-}" ]; then
-  warn "SIGNER_PRIVATE_KEY is LIVE-only and is not required for SHADOW startup"
-fi
-
-if [ -n "${EXECUTOR_ADDRESS:-}" ] && ! printf '%s' "$EXECUTOR_ADDRESS" | grep -Eq '^0x[0-9a-fA-F]{40}$'; then
-  fail "EXECUTOR_ADDRESS has invalid shape"
-fi
+[ -z "${SIGNER_PRIVATE_KEY:-}" ] || fail "SIGNER_PRIVATE_KEY must be empty in SHADOW production"
+[ -z "${WALLET_ADDRESS:-}" ] || fail "WALLET_ADDRESS must be empty in SHADOW production"
+[ -z "${EXECUTOR_ADDRESS:-}" ] || fail "EXECUTOR_ADDRESS must be empty in SHADOW production"
 
 if [ "$failed" -ne 0 ]; then
   exit 1
@@ -294,5 +290,5 @@ ok "$(csv_count "${ENGINE_ROUTER_ADDRESSES:-}") reviewed Engine routers configur
 ok "Parent-chain RPC configured"
 ok "Arbitrum RPC configured"
 ok "PostgreSQL configuration consistent"
-ok "LIVE-only signer configuration not required in SHADOW"
+ok "LIVE-only signer, wallet, and executor configuration empty"
 echo "ENV_VALID: required SHADOW variables are present and shaped correctly"

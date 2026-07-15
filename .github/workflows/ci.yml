@@ -48,6 +48,7 @@ jobs:
           sh ./scripts/shadow-engine-canary-control-tests.sh
           sh ./scripts/shadow-engine-isolated-canary-tests.sh
           sh ./scripts/shadow-positive-route-evidence-tests.sh
+          sh ./scripts/production-compose-context-tests.sh
 
       - name: Validate tracked hygiene
         shell: bash
@@ -122,7 +123,7 @@ jobs:
     timeout-minutes: 15
     services:
       postgres:
-        image: postgres:16-alpine
+        image: postgres@sha256:57c72fd2a128e416c7fcc499958864df5301e940bca0a56f58fddf30ffc07777
         env:
           POSTGRES_USER: phoenix_test
           POSTGRES_PASSWORD: phoenix_test_password
@@ -175,7 +176,7 @@ jobs:
     timeout-minutes: 15
     services:
       postgres:
-        image: postgres:16-alpine
+        image: postgres@sha256:57c72fd2a128e416c7fcc499958864df5301e940bca0a56f58fddf30ffc07777
         env:
           POSTGRES_USER: phoenix_test
           POSTGRES_PASSWORD: phoenix_test_password
@@ -297,14 +298,32 @@ jobs:
           RPC_STATE_REQUESTS_PER_MINUTE=12
           RPC_PROVIDER_PROBE_INTERVAL_SECONDS=60
           ENGINE_ROUTER_ADDRESSES=0xe592427a0aece92de3edee1f18e0157c05861564,0x68b3465833fb72a70ecdf485e0e4c7bd8665fc45,0xa51afafe0263b40edaef0df8781ea9aa03e381a3
-          FEED_INGESTOR_IMAGE=ghcr.io/majidasgharitabrizi/feed-ingestor:sha-0000000000000000000000000000000000000000
-          PHOENIX_ENGINE_IMAGE=ghcr.io/majidasgharitabrizi/phoenix-engine:sha-0000000000000000000000000000000000000000
-          RPC_GATEWAY_IMAGE=ghcr.io/majidasgharitabrizi/rpc-gateway:sha-0000000000000000000000000000000000000000
-          RECORDER_IMAGE=ghcr.io/majidasgharitabrizi/recorder:sha-0000000000000000000000000000000000000000
-          DASHBOARD_IMAGE=ghcr.io/majidasgharitabrizi/dashboard:sha-0000000000000000000000000000000000000000
+          SIGNER_PRIVATE_KEY=
+          WALLET_ADDRESS=
+          EXECUTOR_ADDRESS=
+          FEED_INGESTOR_IMAGE=ghcr.io/majidasgharitabrizi/feed-ingestor@sha256:1111111111111111111111111111111111111111111111111111111111111111
+          PHOENIX_ENGINE_IMAGE=ghcr.io/majidasgharitabrizi/phoenix-engine@sha256:2222222222222222222222222222222222222222222222222222222222222222
+          RPC_GATEWAY_IMAGE=ghcr.io/majidasgharitabrizi/rpc-gateway@sha256:3333333333333333333333333333333333333333333333333333333333333333
+          RECORDER_IMAGE=ghcr.io/majidasgharitabrizi/recorder@sha256:4444444444444444444444444444444444444444444444444444444444444444
+          DASHBOARD_IMAGE=ghcr.io/majidasgharitabrizi/dashboard@sha256:5555555555555555555555555555555555555555555555555555555555555555
           EOF
           docker compose config
           PHOENIX_ENV_FILE=.ci-prod.env docker compose --env-file .ci-prod.env -f compose.prod.yml config
+          printf 'ENGINE_ROUTE_REGISTRY_JSON=%s\n' "$(python3 -c 'import json; print(json.dumps(json.load(open("fixtures/routes/weth_usdc_uniswap_v3.json")), separators=(",", ":")))')" >> .ci-prod.env
+          cat > .ci-release.env <<'EOF'
+          FEED_INGESTOR_IMAGE=ghcr.io/majidasgharitabrizi/feed-ingestor@sha256:1111111111111111111111111111111111111111111111111111111111111111
+          PHOENIX_ENGINE_IMAGE=ghcr.io/majidasgharitabrizi/phoenix-engine@sha256:2222222222222222222222222222222222222222222222222222222222222222
+          RPC_GATEWAY_IMAGE=ghcr.io/majidasgharitabrizi/rpc-gateway@sha256:3333333333333333333333333333333333333333333333333333333333333333
+          RECORDER_IMAGE=ghcr.io/majidasgharitabrizi/recorder@sha256:4444444444444444444444444444444444444444444444444444444444444444
+          DASHBOARD_IMAGE=ghcr.io/majidasgharitabrizi/dashboard@sha256:5555555555555555555555555555555555555555555555555555555555555555
+          PHOENIX_RELEASE_SHA=0000000000000000000000000000000000000000
+          EOF
+          ./scripts/render-production-compose.sh \
+            --compose-file "$PWD/compose.prod.yml" \
+            --env-file "$PWD/.ci-prod.env" \
+            --release-env "$PWD/.ci-release.env" \
+            --output "$PWD/.ci-rendered.json" \
+            --metadata-output "$PWD/.ci-render-metadata.json" >/dev/null
 
       - name: Validate Compose route registry preservation
         shell: bash
@@ -318,7 +337,7 @@ jobs:
           set -euo pipefail
           docker run --rm \
             -v "$PWD/deploy/nats-server.conf:/etc/nats/nats-server.conf:ro" \
-            nats:2.10-alpine -t -c /etc/nats/nats-server.conf
+            nats@sha256:b83efabe3e7def1e0a4a31ec6e078999bb17c80363f881df35edc70fcb6bb927 -t -c /etc/nats/nats-server.conf
       - name: Build Phoenix-owned Dockerfiles
         shell: bash
         run: |
@@ -371,7 +390,7 @@ jobs:
           docker run --detach --name phoenix-ci-nats \
             --publish 127.0.0.1:4222:4222 \
             --volume "$PWD/deploy/nats-server.conf:/etc/nats/nats-server.conf:ro" \
-            nats:2.10-alpine -c /etc/nats/nats-server.conf
+            nats@sha256:b83efabe3e7def1e0a4a31ec6e078999bb17c80363f881df35edc70fcb6bb927 -c /etc/nats/nats-server.conf
           trap 'docker rm --force phoenix-ci-nats >/dev/null 2>&1 || true' EXIT
 
           for attempt in $(seq 1 30); do

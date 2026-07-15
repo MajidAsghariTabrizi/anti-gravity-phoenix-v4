@@ -16,8 +16,8 @@ Run a bounded future-traffic scan inside the already-running SHADOW Engine conta
 
 ```sh
 docker compose --env-file /etc/phoenix/phoenix.env \
-  --env-file deploy/current-release.env \
-  -f compose.prod.yml exec -T phoenix-engine \
+  --env-file /opt/phoenix/deploy/current-release.env \
+  -f /opt/phoenix/deploy/compose.prod.yml exec -T phoenix-engine \
   /usr/local/bin/shadow-positive-route-evidence scan-postgres \
   --dsn-env POSTGRES_DSN \
   --route-registry-env ENGINE_ROUTE_REGISTRY_JSON \
@@ -32,8 +32,8 @@ An explicit export preserves real normalized payloads and provenance for offline
 
 ```sh
 docker compose --env-file /etc/phoenix/phoenix.env \
-  --env-file deploy/current-release.env \
-  -f compose.prod.yml exec -T phoenix-engine \
+  --env-file /opt/phoenix/deploy/current-release.env \
+  -f /opt/phoenix/deploy/compose.prod.yml exec -T phoenix-engine \
   /usr/local/bin/shadow-positive-route-evidence scan-postgres \
   --dsn-env POSTGRES_DSN \
   --route-registry-env ENGINE_ROUTE_REGISTRY_JSON \
@@ -59,11 +59,18 @@ The host workflow defaults to 900 seconds and accepts an explicit timeout:
 
 ```sh
 PHOENIX_ENV_FILE=/etc/phoenix/phoenix.env \
-PHOENIX_RELEASE_ENV=deploy/current-release.env \
-sh scripts/shadow-positive-route-evidence.sh --timeout-seconds 900
+PHOENIX_DEPLOY_ROOT=/opt/phoenix \
+sh /opt/phoenix/deploy/shadow-positive-route-evidence.sh --timeout-seconds 900
 ```
 
-The script validates exact route JSON rendering, requires `PHOENIX_MODE=SHADOW` and `LIVE_EXECUTION=false`, snapshots all protected services, and verifies Feed, Recorder, NATS, PostgreSQL, and relay health. It stops only `rpc-gateway` and `phoenix-engine`, captures `RUN_STARTED_AT_UTC` from the PostgreSQL server clock while both are down, and then starts only those services with `--no-deps`. It performs no pull or build.
+Before touching runtime, the script uses the canonical renderer with the active
+release env and matching manifest. It rejects missing context, local images,
+mutable images, malformed/empty/mismatched routes, route-hash drift, non-SHADOW
+settings, non-empty LIVE-only settings, and an insufficient RPC budget. It then
+snapshots all protected services and verifies Feed, Recorder, NATS, PostgreSQL,
+and relay health. It stops only `rpc-gateway` and `phoenix-engine`, captures
+`RUN_STARTED_AT_UTC` from the PostgreSQL server clock while both are down, and
+starts only those services with `--no-deps`. It performs no pull or build.
 
 Every success query requires `classified_at` or `completed_at` to be at or after that run baseline. Candidate discovery also requires a positive candidate count, a configured route fingerprint paired with its evaluation, a current final processing attempt, and the exact source-event identity and transaction hash. A source sequence alone is insufficient because one Nitro sequence can contain multiple transactions. Historical rows cannot be used as a fallback; a run with no matching current evidence returns `POSITIVE_ROUTE_EVIDENCE_NOT_FOUND`.
 
