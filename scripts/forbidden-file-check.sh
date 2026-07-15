@@ -16,6 +16,7 @@ check_path() {
 git ls-files --cached --others --exclude-standard | while IFS= read -r path; do
   case "$path" in
     .env.example|fixtures/*) continue ;;
+    FETCH_HEAD) check_path "$path" "accidental Git runtime state" ;;
     .env|.env.local|.env.*.local) check_path "$path" "environment file" ;;
     *.pem|*.key|*.pfx|*.p12|*.jks|*.keystore) check_path "$path" "private key or certificate" ;;
     keystore/*|keystores/*|wallets/*|*UTC--*|*wallet*.json|*.wallet) check_path "$path" "keystore or wallet export" ;;

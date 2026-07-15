@@ -1,6 +1,7 @@
 $ErrorActionPreference = "Stop"
 
 $patterns = @(
+    @{ Category = "accidental Git runtime state"; Pattern = '^FETCH_HEAD$' },
     @{ Category = "environment file"; Pattern = '(^|[\\/])\.env($|[\\/])|(^|[\\/])\.env\.local$|(^|[\\/])\.env\..*\.local$' },
     @{ Category = "private key or certificate"; Pattern = '\.(pem|key|pfx|p12|jks|keystore)$' },
     @{ Category = "keystore directory"; Pattern = '(^|[\\/])(keystore|keystores|wallets)([\\/]|$)' },

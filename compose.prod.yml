@@ -10,7 +10,7 @@ x-logging: &bounded-logging
 
 services:
   nitro-feed-relay:
-    image: offchainlabs/nitro-node:v3.11.2-3599aca
+    image: offchainlabs/nitro-node@sha256:ebc985e3b105980734630744981e1542001c22d74cba57509fe0d5ed8bb84c14
     entrypoint: ["relay"]
     command:
       - --chain.id=42161
@@ -29,7 +29,7 @@ services:
       start_period: 10s
 
   nats:
-    image: nats:2.10-alpine
+    image: nats@sha256:b83efabe3e7def1e0a4a31ec6e078999bb17c80363f881df35edc70fcb6bb927
     command: ["-c", "/etc/nats/nats-server.conf"]
     environment:
       GOMEMLIMIT: 512MiB
@@ -46,7 +46,7 @@ services:
       retries: 5
 
   postgres:
-    image: postgres:16-alpine
+    image: postgres@sha256:57c72fd2a128e416c7fcc499958864df5301e940bca0a56f58fddf30ffc07777
     <<: *common-env
     environment:
       POSTGRES_USER: ${POSTGRES_USER:?POSTGRES_USER is required}
@@ -245,7 +245,7 @@ services:
       retries: 5
 
   prometheus:
-    image: prom/prometheus:v2.53.0
+    image: prom/prometheus@sha256:075b1ba2c4ebb04bc3a6ab86c06ec8d8099f8fda1c96ef6d104d9bb1def1d8bc
     command:
       - --config.file=/etc/prometheus/prometheus.yml
       - --storage.tsdb.path=/prometheus

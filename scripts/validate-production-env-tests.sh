@@ -32,6 +32,7 @@ RPC_PROVIDER_PROBE_INTERVAL_SECONDS=60
 ENGINE_ROUTER_ADDRESSES=0xe592427a0aece92de3edee1f18e0157c05861564,0x68b3465833fb72a70ecdf485e0e4c7bd8665fc45,0xa51afafe0263b40edaef0df8781ea9aa03e381a3
 EXECUTOR_ADDRESS=
 SIGNER_PRIVATE_KEY=
+WALLET_ADDRESS=
 ENV
 
 assert_redacted() {
@@ -84,5 +85,16 @@ if output=$("$validator" "$bad_router" 2>&1); then
 fi
 assert_redacted "$output"
 printf '%s' "$output" | grep -q 'ENGINE_ROUTER_ADDRESSES contains an unreviewed router'
+
+for live_only_name in SIGNER_PRIVATE_KEY WALLET_ADDRESS EXECUTOR_ADDRESS; do
+  live_only_env="$tmp_dir/nonempty-$live_only_name.env"
+  sed "s/^$live_only_name=/$live_only_name=forbidden/" "$valid_env" >"$live_only_env"
+  if output=$("$validator" "$live_only_env" 2>&1); then
+    echo "expected non-empty $live_only_name to fail"
+    exit 1
+  fi
+  assert_redacted "$output"
+  printf '%s' "$output" | grep -q "$live_only_name must be empty in SHADOW production"
+done
 
 echo "validate-production-env-tests: ok"

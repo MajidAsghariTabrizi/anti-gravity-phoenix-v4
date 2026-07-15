@@ -3,9 +3,13 @@ set -eu
 
 script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 repo_dir=$(CDPATH= cd -- "$script_dir/.." && pwd)
-compose_file=${PHOENIX_COMPOSE_FILE:-$repo_dir/compose.prod.yml}
+deploy_root=${PHOENIX_DEPLOY_ROOT:-/opt/phoenix}
+deploy_dir=$deploy_root/deploy
+compose_file=${PHOENIX_COMPOSE_FILE:-$deploy_dir/compose.prod.yml}
 env_file=${PHOENIX_ENV_FILE:-/etc/phoenix/phoenix.env}
-release_env=${PHOENIX_RELEASE_ENV:-$repo_dir/deploy/current-release.env}
+release_env=${PHOENIX_RELEASE_ENV:-$deploy_dir/current-release.env}
+release_manifest=${PHOENIX_RELEASE_MANIFEST:-}
+current_release_file=${PHOENIX_CURRENT_RELEASE_FILE:-$deploy_dir/current-release}
 timeout_seconds=${SHADOW_POSITIVE_ROUTE_TIMEOUT_SECONDS:-900}
 poll_seconds=${SHADOW_POSITIVE_ROUTE_POLL_SECONDS:-3}
 engine_stream=PHOENIX_ENGINE_INPUT
@@ -430,6 +434,16 @@ raise SystemExit(0 if budget >= 12 else 1)
 ' "$positive_rendered_config"
 }
 
+positive_evidence_render_preflight() {
+  "$script_dir/render-production-compose.sh" \
+    --compose-file "$compose_file" \
+    --env-file "$env_file" \
+    --release-env "$release_env" \
+    --release-manifest "$release_manifest" \
+    --output "$isolated_canary_state_dir/compose.rendered.json" \
+    --metadata-output "$isolated_canary_state_dir/render.metadata.json" >/dev/null
+}
+
 positive_evidence_verify_preflight() {
   for positive_service in $isolated_canary_required_services; do
     isolated_canary_container_is_healthy "$positive_service" || return 1
@@ -517,10 +531,17 @@ positive_evidence_main() {
   command -v docker >/dev/null 2>&1 || positive_evidence_blocked 'docker is unavailable'
   command -v python3 >/dev/null 2>&1 || positive_evidence_blocked 'python3 is unavailable'
   [ -f "$env_file" ] || positive_evidence_blocked 'production environment file is missing'
-  if [ ! -f "$release_env" ] && [ -f "$repo_dir/current-release.env" ]; then
-    release_env="$repo_dir/current-release.env"
-  fi
   [ -f "$release_env" ] || positive_evidence_blocked 'release environment file is missing'
+  if [ -z "$release_manifest" ]; then
+    [ -f "$current_release_file" ] || positive_evidence_blocked 'current release pointer is missing'
+    positive_release_sha=$(tr -d '\r\n' <"$current_release_file")
+    case "$positive_release_sha" in
+      *[!0-9a-f]*|"") positive_evidence_blocked 'current release pointer is invalid' ;;
+    esac
+    [ "${#positive_release_sha}" -eq 40 ] || positive_evidence_blocked 'current release pointer is invalid'
+    release_manifest=$deploy_dir/manifests/$positive_release_sha.json
+  fi
+  [ -f "$release_manifest" ] || positive_evidence_blocked 'release manifest is missing'
 
   set -a
   # shellcheck disable=SC1090
@@ -540,7 +561,7 @@ positive_evidence_main() {
   positive_finalized=0
   trap positive_evidence_exit_guard EXIT HUP INT TERM
 
-  isolated_canary_route_registry_preflight || positive_evidence_fail 'route-registry preflight failed'
+  positive_evidence_render_preflight || positive_evidence_fail 'canonical production render failed'
   positive_evidence_rpc_budget_preflight ||
     positive_evidence_fail 'RPC_STATE_REQUESTS_PER_MINUTE must be at least 12'
   positive_evidence_verify_preflight || positive_evidence_fail 'dependency preflight failed'
