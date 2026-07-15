@@ -202,9 +202,7 @@ impl Metrics {
             self.inner.decode_failures.load(Ordering::Relaxed),
             self.inner.database_failures.load(Ordering::Relaxed),
             self.inner.database_retries.load(Ordering::Relaxed),
-            self.inner
-                .database_retry_recoveries
-                .load(Ordering::Relaxed),
+            self.inner.database_retry_recoveries.load(Ordering::Relaxed),
             self.inner.nats_reconnects.load(Ordering::Relaxed),
             self.inner.jetstream_fetch_failures.load(Ordering::Relaxed),
             self.inner.jetstream_ack_failures.load(Ordering::Relaxed),

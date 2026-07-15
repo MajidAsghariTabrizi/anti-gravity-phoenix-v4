@@ -140,9 +140,7 @@ impl RuntimeMetrics {
     }
 
     pub fn retry_recovered(&self) {
-        self.inner
-            .recovered_retries
-            .fetch_add(1, Ordering::Relaxed);
+        self.inner.recovered_retries.fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn candidates(&self, count: usize) {
@@ -254,10 +252,7 @@ impl RuntimeMetrics {
             .bounded
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        *bounded
-            .route_exclusions
-            .entry(reason.as_str())
-            .or_insert(0) += 1;
+        *bounded.route_exclusions.entry(reason.as_str()).or_insert(0) += 1;
     }
 
     pub fn profitability_without_candidate(&self, incomplete: bool) {
@@ -585,14 +580,12 @@ impl RuntimeMetrics {
         write_gauge(
             &mut output,
             "phoenix_engine_processing_latency_seconds",
-            self.inner.processing_latency_nanos.load(Ordering::Relaxed) as f64
-                / 1_000_000_000.0,
+            self.inner.processing_latency_nanos.load(Ordering::Relaxed) as f64 / 1_000_000_000.0,
         );
         write_gauge(
             &mut output,
             "phoenix_engine_persistence_latency_seconds",
-            self.inner.persistence_latency_nanos.load(Ordering::Relaxed) as f64
-                / 1_000_000_000.0,
+            self.inner.persistence_latency_nanos.load(Ordering::Relaxed) as f64 / 1_000_000_000.0,
         );
         write_integer_gauge(
             &mut output,

@@ -105,9 +105,7 @@ impl DispatcherMetrics {
     }
 
     pub fn retry_recovered(&self) {
-        self.inner
-            .retry_recoveries
-            .fetch_add(1, Ordering::Relaxed);
+        self.inner.retry_recoveries.fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn terminal_integrity_failure(&self) {
@@ -602,11 +600,9 @@ mod tests {
             readiness.ready(),
             Err("terminal Shadow Dispatcher integrity condition detected")
         );
-        assert!(
-            metrics
-                .render(&readiness)
-                .contains("shadow_dispatcher_terminal_integrity_failures_total 1")
-        );
+        assert!(metrics
+            .render(&readiness)
+            .contains("shadow_dispatcher_terminal_integrity_failures_total 1"));
     }
 
     #[tokio::test]
@@ -670,10 +666,7 @@ mod tests {
         let mut retried_event = event.clone();
         retried_event.publish_attempts = 2;
         let store = FakeStore {
-            claims: Mutex::new(VecDeque::from([
-                Ok(vec![event]),
-                Ok(vec![retried_event]),
-            ])),
+            claims: Mutex::new(VecDeque::from([Ok(vec![event]), Ok(vec![retried_event])])),
             mark_result: Mutex::new(Ok(())),
             release_result: Mutex::new(Ok(())),
             events: events.clone(),

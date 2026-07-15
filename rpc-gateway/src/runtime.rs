@@ -222,10 +222,7 @@ impl GatewayRuntime {
         let started = Instant::now();
         let result = self.resolve_shadow_state_inner(request).await;
         self.metrics.state_request_latency(started.elapsed());
-        if matches!(
-            result.as_ref(),
-            Err(GatewayError::ProviderUnavailable)
-        ) {
+        if matches!(result.as_ref(), Err(GatewayError::ProviderUnavailable)) {
             self.metrics.provider_unavailable();
         }
         result

@@ -391,8 +391,7 @@ fn record_result_metrics(metrics: &RuntimeMetrics, result: &ProcessResult) {
             metrics.processing_failure();
             metrics.route_ranking_exclusion(RouteExclusionMetric::DependencyUnavailable);
         }
-        EngineClassification::MalformedInternalEvent
-        | EngineClassification::UnsupportedSchema => {
+        EngineClassification::MalformedInternalEvent | EngineClassification::UnsupportedSchema => {
             metrics.processing_failure();
             metrics.route_ranking_exclusion(RouteExclusionMetric::IntegrityFailure);
         }
@@ -1568,8 +1567,7 @@ mod tests {
         assert_eq!(readiness.ready(), Ok(()));
         let rendered = metrics.render(&readiness);
         assert!(rendered.contains("phoenix_engine_dependency_exhausted_total 1"));
-        assert!(rendered
-            .contains("phoenix_engine_later_message_progress_after_quarantine_total 1"));
+        assert!(rendered.contains("phoenix_engine_later_message_progress_after_quarantine_total 1"));
     }
 
     #[tokio::test]

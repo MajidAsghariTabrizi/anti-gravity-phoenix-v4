@@ -159,9 +159,7 @@ impl RuntimeRpcMetrics {
     }
 
     pub fn secondary_agreed(&self) {
-        self.inner
-            .secondary_agreed
-            .fetch_add(1, Ordering::Relaxed);
+        self.inner.secondary_agreed.fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn secondary_disagreed(&self) {
@@ -346,8 +344,7 @@ impl RuntimeRpcMetrics {
         let _ = writeln!(
             output,
             "rpc_state_freshness_seconds {:.9}",
-            self.inner.state_freshness_nanos.load(Ordering::Relaxed) as f64
-                / 1_000_000_000.0
+            self.inner.state_freshness_nanos.load(Ordering::Relaxed) as f64 / 1_000_000_000.0
         );
         output.push_str("# TYPE rpc_state_request_latency_seconds histogram\n");
         for (index, label) in LATENCY_BUCKET_LABELS.iter().enumerate() {
@@ -456,9 +453,7 @@ mod tests {
         assert!(rendered.contains("rpc_secondary_agreed_total 1"));
         assert!(rendered.contains("rpc_primary_success_total 1"));
         assert!(rendered.contains("rpc_state_freshness_seconds 0.075000000"));
-        assert!(rendered.contains(
-            "rpc_state_request_latency_seconds_bucket{le=\"0.025\"} 1"
-        ));
+        assert!(rendered.contains("rpc_state_request_latency_seconds_bucket{le=\"0.025\"} 1"));
         assert!(rendered.contains("rpc_state_request_latency_seconds_count 1"));
         for forbidden in ["provider_url=", "tx_hash=", "pool_address=", "route="] {
             assert!(!rendered.contains(forbidden));
