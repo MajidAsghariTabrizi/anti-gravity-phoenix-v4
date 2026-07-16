@@ -132,6 +132,49 @@ tree all agree.
 
 Database migrations are forward-only. Rollbacks require backward-compatible migrations until a dedicated manual data rollback plan exists.
 
+## Protected-Service Maintenance
+
+Normal `deploy-shadow` behavior remains unchanged: a Feed Ingestor or Recorder
+digest difference fails before SSH. The separate
+`deploy-prelive-protected-maintenance.yml` workflow is pinned to
+`phoenix-prelive-shadow-v3` and `phoenix-prelive-shadow-v2`.
+
+Its pre-SSH gate verifies the exact tag targets and build runs, both complete
+asset bundles and checksum files, immutable image references and OCI revision
+labels, unchanged Compose/NATS/route/migration contracts, exact SHADOW renders,
+blank execution configuration, and the reviewed allowlist:
+
+```text
+feed-ingestor
+recorder
+```
+
+Remote preflight requires the v2 pointer, asset marker, manifest, state, and
+immutable release tree to agree. It also requires all optional services to be
+stopped and all five protected services to be healthy. Redacted evidence
+captures container, mount, network, JetStream, migration, database,
+progress, restart, OOM, disk, and non-execution state.
+
+The maintenance sequence is:
+
+1. Stop Feed Ingestor so no new application publications enter JetStream.
+2. Wait for the Recorder durable consumer to reach zero pending and
+   ACK-pending messages.
+3. Replace only Recorder with the exact v3 digest and wait for health.
+4. Replace only Feed Ingestor with the exact v3 digest and wait for health.
+5. Require Feed sequence, JetStream publication, Recorder persistence, and
+   PostgreSQL feed-event progress with no sequence regression or unbounded
+   redelivery.
+6. Install the exact v3 release-assets bundle and atomically promote its
+   release environment, state, maintenance context, and pointer. Optional
+   containers remain stopped.
+
+Any failure after mutation automatically restores only Feed Ingestor and
+Recorder with exact v2 digests, restores the immutable v2 release context, and
+repeats the same continuity, progress, and zero-execution checks. PostgreSQL,
+NATS, Nitro Relay, networks, volumes, streams, and consumers are never
+recreated by this path.
+
 ## Host Migration
 
 Before the first release using this contract, install the merged exact-SHA

@@ -64,6 +64,13 @@ Production bootstrap, GHCR authentication, environment validation, release, and 
 
 Current live-evidence gap: real Nitro feed relay ingestion is implemented for first SHADOW runtime verification but not live-verified. A Linux VPS validation run must still prove the pinned relay can observe and decode real Arbitrum feed messages before any production-readiness or LIVE claim.
 
-Current deployment gate: feed-ingestor and Recorder changed in this milestone but are protected against recreation. The manual workflow blocks before SSH when either candidate digest differs from the active rollback manifest. A separately approved maintenance gate is required before those protected images can be replaced; optional-service deployment must not be used to bypass that restriction.
+Current deployment gate: feed-ingestor and Recorder changed in this milestone
+but remain protected against recreation by normal deployment. The normal
+workflow still blocks before SSH when either candidate digest differs from the
+active rollback manifest. The separate protected-maintenance workflow is the
+only repository-supported path for the reviewed v3/v2 pair. It updates
+Recorder and Feed Ingestor one at a time while optional services remain stopped,
+then promotes the v3 release context for later controlled SHADOW startup. It
+has not been dispatched by repository preparation.
 
 Recorder durability configuration and single-node storage limits are documented in `docs/RECORDER_DURABLE_DELIVERY.md`.

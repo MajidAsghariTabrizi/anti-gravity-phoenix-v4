@@ -66,3 +66,12 @@ This change cannot recover Core NATS messages dropped before JetStream was enabl
 The deployment is a single JetStream server with one replica. It survives application restarts and NATS container replacement while the Docker volume remains intact, but it does not survive host or volume loss. A rollback to a Core-NATS Recorder does not consume queued JetStream messages; retain the volume and use a reviewed forward recovery plan. Do not delete the stream, durable consumer, or named volume during rollback.
 
 Production durability remains unproven until `scripts/recorder-live-smoke.sh` passes against real Nitro traffic on the VPS for the full observation and restart/replay sequence.
+
+The reviewed protected-maintenance gate applies the same delivery contract:
+stop Feed Ingestor, wait for `PHOENIX_RECORDER` pending and ACK-pending counts
+to reach zero, replace and health-check Recorder, then replace and health-check
+Feed Ingestor. This order prevents new application publications during the
+Recorder cutover while preserving relay backlog, the JetStream volume, stream,
+consumer, and PostgreSQL contents. The gate fails closed if the durable
+consumer does not drain or if post-restart sequence and persistence progress
+are not observed.

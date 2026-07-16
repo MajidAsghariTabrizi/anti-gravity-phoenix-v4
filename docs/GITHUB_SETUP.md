@@ -30,6 +30,13 @@ Create a dedicated deploy SSH key on the production host. Grant it only the acce
 
 Deployment remains manual even after the image workflow succeeds. The operator must supply current-main release evidence, an active rollback release, and the exact `DEPLOY_PRELIVE_SHADOW` acknowledgement. A release that changes protected feed-ingestor or Recorder digests is blocked before SSH.
 
+The separately reviewed `Deploy PRE-LIVE Protected Maintenance` workflow uses
+the same `production-shadow` environment and five deployment secrets. It also
+requires exact release and rollback SHAs and build runs, plus
+`DEPLOY_PRELIVE_PROTECTED_MAINTENANCE`. It is pinned to the immutable v3/v2
+maintenance pair and is not a generic protected-service override. Keep
+environment approval enabled for this workflow as well.
+
 ## Merge Settings
 
 In `Settings -> General -> Pull Requests`:

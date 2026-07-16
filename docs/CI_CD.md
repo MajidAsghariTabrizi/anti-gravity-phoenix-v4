@@ -1,10 +1,11 @@
 # CI/CD
 
-Phoenix uses four GitHub workflows:
+Phoenix uses five GitHub workflows:
 
 - `Phoenix CI`: pull requests to `main` and manual dispatch.
 - `Build Phoenix Images`: pushes to `main` and manual dispatch.
 - `Deploy Shadow Production`: acknowledged manual dispatch for an already validated release and rollback pair.
+- `Deploy PRE-LIVE Protected Maintenance`: acknowledged manual dispatch for the separately reviewed v3 Feed Ingestor and Recorder maintenance.
 - `Live Readiness Report`: manual-only report generation for a proposed LIVE release.
 
 ## CI Checks
@@ -78,6 +79,36 @@ The workflow uses strict host key checking. It requires only:
 - `PROD_KNOWN_HOSTS`
 
 It never receives `SIGNER_PRIVATE_KEY`.
+
+## Protected Maintenance
+
+`Deploy PRE-LIVE Protected Maintenance` is separate from normal deployment and
+does not weaken its protected-image refusal. It accepts `release_sha`,
+`build_run_id`, `rollback_sha`, `rollback_build_run_id`, and the exact
+acknowledgement `DEPLOY_PRELIVE_PROTECTED_MAINTENANCE`. The reviewed v3 and v2
+SHAs, build runs, and immutable tag targets are pinned in the workflow.
+
+Before SSH material is installed, the workflow verifies both successful build
+runs, downloads and verifies both complete release-asset bundles, validates the
+exact protected allowlist, renders both release contracts in SHADOW with blank
+execution configuration, pulls every digest-pinned image, and checks each OCI
+revision label against its source SHA.
+
+On the host, optional services must already be stopped. Feed Ingestor is
+quiesced first so Recorder can drain `PHOENIX_RECORDER` to zero pending and
+ACK-pending messages. Recorder is then replaced and health-checked before Feed
+Ingestor is replaced and health-checked. PostgreSQL, NATS, Nitro Relay,
+networks, mounts, streams, and durable consumers must retain their identities.
+Only after live Feed and Recorder progress is proven does the gate install and
+promote the exact v3 release context. Optional containers remain stopped and
+unchanged for the later controlled SHADOW startup.
+
+Any failed mutation invokes the same bounded sequence with exact v2
+Feed Ingestor and Recorder digests, restores the v2 immutable release context,
+and re-runs health, identity, progress, and zero-execution checks. Evidence is
+retained under `/opt/phoenix/evidence/protected-maintenance`. This workflow has
+no automatic trigger and must not be dispatched as part of repository release
+preparation.
 
 ## LIVE Gate
 

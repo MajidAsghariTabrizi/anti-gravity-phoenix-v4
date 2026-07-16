@@ -33,6 +33,7 @@ Phoenix v4 is shadow-first and secrets-clean by default.
 | Mutable release assets | A deterministic exact-SHA bundle records every allowed path, mode, size, and digest; archive and extracted-tree verification reject symlinks, traversal, extras, and drift before bootstrap promotes the asset marker. |
 | Automatic production rollout | Image publication cannot trigger deployment. Manual dispatch requires current-main release evidence, prepared rollback evidence, an explicit acknowledgement, and the production environment gate. |
 | Protected service recreation | Deploy and rollback fingerprint relay, feed-ingestor, NATS, PostgreSQL, and Recorder IDs. Candidate protected-image digest changes fail before SSH; optional services start individually with `--no-deps`. |
+| Authorized protected maintenance | A separate environment-gated workflow is pinned to the reviewed v3/v2 SHAs and build runs. It permits only Feed Ingestor and Recorder replacement, one service at a time, while fixed identities, mounts, volumes, JetStream resources, database integrity, and zero-execution evidence fail closed. |
 | Migration tampering | Migration runner stores SHA-256 checksums and fails if an already-applied migration changes. |
 | NATS network exposure | NATS is only on the Docker network and not published to the host. |
 | PostgreSQL exposure | PostgreSQL is only on the Docker network and uses production env credentials, not local defaults. |
