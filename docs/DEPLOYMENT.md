@@ -24,6 +24,10 @@ Production host layout:
         prometheus/
         feed/
         # Docker volume phoenix-nats-jetstream stores JetStream data.
+    evidence/
+        dashboard/
+            latest-dashboard.json
+            # Bounded redacted report artifacts only.
     logs/
 
 /etc/phoenix/
@@ -43,6 +47,10 @@ Explicit loopback bindings:
 
 - Dashboard on `127.0.0.1:8501`
 - Prometheus on `127.0.0.1:9090`
+
+The Dashboard bind-mounts only `/opt/phoenix/evidence/dashboard` read-only. It
+does not receive `/etc/phoenix/phoenix.env`, a database connection string,
+Prometheus access, or the Docker socket. Access it through an SSH tunnel.
 
 Production bootstrap, GHCR authentication, environment validation, release, and rollback are documented in:
 
