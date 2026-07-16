@@ -1,0 +1,301 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://anti-gravity-phoenix.invalid/schemas/prelive-shadow-control-evidence.schema.json",
+  "title": "Phoenix PRE-LIVE SHADOW control-plane evidence",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "run_id",
+    "mode",
+    "planned_duration_seconds",
+    "started_at",
+    "ended_at",
+    "status",
+    "database_clock",
+    "release",
+    "safety",
+    "preflight",
+    "protected_identity",
+    "service_states",
+    "samples",
+    "funnels",
+    "metrics",
+    "bounded_errors",
+    "artifacts"
+  ],
+  "properties": {
+    "schema_version": {"const": "phoenix.prelive.shadow-control-evidence.v1"},
+    "run_id": {"type": "string", "pattern": "^shadow-(15m|1h|6h|24h|continuous)-[0-9a-f]{12}$"},
+    "mode": {"enum": ["15m", "1h", "6h", "24h", "continuous"]},
+    "planned_duration_seconds": {"type": ["integer", "null"], "minimum": 900, "maximum": 86400},
+    "started_at": {"type": "string", "format": "date-time"},
+    "ended_at": {"type": ["string", "null"], "format": "date-time"},
+    "status": {"enum": ["preflight_passed", "completed", "interrupted", "failed"]},
+    "database_clock": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["preflight_baseline", "first_sample", "last_sample"],
+      "properties": {
+        "preflight_baseline": {"type": "string", "format": "date-time"},
+        "first_sample": {"type": ["string", "null"], "format": "date-time"},
+        "last_sample": {"type": ["string", "null"], "format": "date-time"}
+      }
+    },
+    "release": {"$ref": "#/$defs/release"},
+    "safety": {"$ref": "#/$defs/safety"},
+    "preflight": {
+      "type": "array",
+      "minItems": 18,
+      "maxItems": 18,
+      "items": {"$ref": "#/$defs/preflight"}
+    },
+    "protected_identity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["before_sha256", "after_sha256", "stable"],
+      "properties": {
+        "before_sha256": {"$ref": "#/$defs/digest"},
+        "after_sha256": {"$ref": "#/$defs/digest"},
+        "stable": {"type": "boolean"}
+      }
+    },
+    "service_states": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["before", "during", "after"],
+      "properties": {
+        "before": {"$ref": "#/$defs/serviceStates"},
+        "during": {"$ref": "#/$defs/serviceStates"},
+        "after": {"$ref": "#/$defs/serviceStates"}
+      }
+    },
+    "samples": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["count", "first_observed_at", "last_observed_at"],
+      "properties": {
+        "count": {"type": "integer", "minimum": 0, "maximum": 10000000},
+        "first_observed_at": {"type": ["string", "null"], "format": "date-time"},
+        "last_observed_at": {"type": ["string", "null"], "format": "date-time"}
+      }
+    },
+    "funnels": {"$ref": "#/$defs/funnels"},
+    "metrics": {"$ref": "#/$defs/metrics"},
+    "bounded_errors": {
+      "type": "array",
+      "maxItems": 100,
+      "items": {"$ref": "#/$defs/error"}
+    },
+    "artifacts": {
+      "type": "array",
+      "maxItems": 16,
+      "items": {"$ref": "#/$defs/artifact"}
+    }
+  },
+  "$defs": {
+    "digest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+    "count": {"type": "string", "pattern": "^(0|[1-9][0-9]*)$"},
+    "signedCount": {"type": "string", "pattern": "^(0|-?[1-9][0-9]*)$"},
+    "release": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["git_sha", "release_manifest_sha256", "release_checksum_sha256", "route_registry_hash", "images"],
+      "properties": {
+        "git_sha": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+        "release_manifest_sha256": {"$ref": "#/$defs/digest"},
+        "release_checksum_sha256": {"$ref": "#/$defs/digest"},
+        "route_registry_hash": {"$ref": "#/$defs/digest"},
+        "images": {
+          "type": "array",
+          "minItems": 10,
+          "maxItems": 10,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["service", "digest"],
+            "properties": {
+              "service": {"type": "string"},
+              "digest": {"$ref": "#/$defs/digest"}
+            }
+          }
+        }
+      }
+    },
+    "safety": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["mode", "live_execution", "execution_eligible", "execution_request_created", "signer_configured", "wallet_configured", "executor_configured", "execution_request_count_before", "execution_request_count_after", "submission_method_invocations"],
+      "properties": {
+        "mode": {"const": "SHADOW"},
+        "live_execution": {"const": false},
+        "execution_eligible": {"const": false},
+        "execution_request_created": {"const": false},
+        "signer_configured": {"const": false},
+        "wallet_configured": {"const": false},
+        "executor_configured": {"const": false},
+        "execution_request_count_before": {"const": "0"},
+        "execution_request_count_after": {"const": "0"},
+        "submission_method_invocations": {"const": "0"}
+      }
+    },
+    "funnels": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["candidate", "profitability", "verification", "fork"],
+      "properties": {
+        "candidate": {"$ref": "#/$defs/candidateFunnel"},
+        "profitability": {"$ref": "#/$defs/profitabilityFunnel"},
+        "verification": {"$ref": "#/$defs/verificationFunnel"},
+        "fork": {"$ref": "#/$defs/forkFunnel"}
+      }
+    },
+    "candidateFunnel": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["feed_inputs", "supported_swaps", "route_matches", "candidates"],
+      "properties": {
+        "feed_inputs": {"$ref": "#/$defs/count"},
+        "supported_swaps": {"$ref": "#/$defs/count"},
+        "route_matches": {"$ref": "#/$defs/count"},
+        "candidates": {"$ref": "#/$defs/count"}
+      }
+    },
+    "profitabilityFunnel": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["candidates", "complete", "primary_profitable", "accepted"],
+      "properties": {
+        "candidates": {"$ref": "#/$defs/count"},
+        "complete": {"$ref": "#/$defs/count"},
+        "primary_profitable": {"$ref": "#/$defs/count"},
+        "accepted": {"$ref": "#/$defs/count"}
+      }
+    },
+    "verificationFunnel": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["requested", "agreed", "disagreed", "unavailable"],
+      "properties": {
+        "requested": {"$ref": "#/$defs/count"},
+        "agreed": {"$ref": "#/$defs/count"},
+        "disagreed": {"$ref": "#/$defs/count"},
+        "unavailable": {"$ref": "#/$defs/count"}
+      }
+    },
+    "forkFunnel": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["planned", "simulated", "passed", "profitable", "reverted"],
+      "properties": {
+        "planned": {"$ref": "#/$defs/count"},
+        "simulated": {"$ref": "#/$defs/count"},
+        "passed": {"$ref": "#/$defs/count"},
+        "profitable": {"$ref": "#/$defs/count"},
+        "reverted": {"$ref": "#/$defs/count"}
+      }
+    },
+    "metrics": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["rpc", "jetstream", "database", "feed"],
+      "properties": {
+        "rpc": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["requests", "success", "timeouts", "rate_limited", "unavailable", "disagreements"],
+          "properties": {
+            "requests": {"$ref": "#/$defs/count"},
+            "success": {"$ref": "#/$defs/count"},
+            "timeouts": {"$ref": "#/$defs/count"},
+            "rate_limited": {"$ref": "#/$defs/count"},
+            "unavailable": {"$ref": "#/$defs/count"},
+            "disagreements": {"$ref": "#/$defs/count"}
+          }
+        },
+        "jetstream": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["streams", "consumers", "pending", "ack_pending", "redeliveries"],
+          "properties": {
+            "streams": {"$ref": "#/$defs/count"},
+            "consumers": {"$ref": "#/$defs/count"},
+            "pending": {"$ref": "#/$defs/count"},
+            "ack_pending": {"$ref": "#/$defs/count"},
+            "redeliveries": {"$ref": "#/$defs/count"}
+          }
+        },
+        "database": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["size_start_bytes", "size_end_bytes", "growth_bytes"],
+          "properties": {
+            "size_start_bytes": {"$ref": "#/$defs/count"},
+            "size_end_bytes": {"$ref": "#/$defs/count"},
+            "growth_bytes": {"$ref": "#/$defs/signedCount"}
+          }
+        },
+        "feed": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["messages", "gaps", "missing_sequences", "decode_failures"],
+          "properties": {
+            "messages": {"$ref": "#/$defs/count"},
+            "gaps": {"$ref": "#/$defs/count"},
+            "missing_sequences": {"$ref": "#/$defs/count"},
+            "decode_failures": {"$ref": "#/$defs/count"}
+          }
+        }
+      }
+    },
+    "preflight": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["check", "status", "observed_at"],
+      "properties": {
+        "check": {"type": "string", "pattern": "^[a-z][a-z0-9_]{0,63}$"},
+        "status": {"enum": ["pass", "fail"]},
+        "observed_at": {"type": "string", "format": "date-time"}
+      }
+    },
+    "serviceStates": {
+      "type": "array",
+      "minItems": 10,
+      "maxItems": 10,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["service", "state", "image_digest", "restart_count", "observed_at"],
+        "properties": {
+          "service": {"type": "string"},
+          "state": {"type": "string"},
+          "image_digest": {"$ref": "#/$defs/digest"},
+          "restart_count": {"type": "integer", "minimum": 0, "maximum": 1000000},
+          "observed_at": {"type": "string", "format": "date-time"}
+        }
+      }
+    },
+    "error": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["observed_at", "service", "class", "message"],
+      "properties": {
+        "observed_at": {"type": "string", "format": "date-time"},
+        "service": {"type": "string"},
+        "class": {"type": "string"},
+        "message": {"type": "string", "maxLength": 256}
+      }
+    },
+    "artifact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "path", "sha256", "size_bytes"],
+      "properties": {
+        "kind": {"type": "string"},
+        "path": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$"},
+        "sha256": {"$ref": "#/$defs/digest"},
+        "size_bytes": {"type": "integer", "minimum": 1, "maximum": 2097152}
+      }
+    }
+  }
+}

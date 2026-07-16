@@ -56,6 +56,8 @@ jobs:
           python3 -m py_compile scripts/prelive_money_path_report.py
           sh ./scripts/prelive-money-path-report-tests.sh
           python3 -m py_compile scripts/prelive_dashboard_snapshot.py scripts/verify_dashboard_compose.py
+          python3 -m py_compile scripts/prelive_shadow_control.py scripts/prelive_dashboard_live.py
+          sh ./scripts/prelive-shadow-control-tests.sh
 
       - name: Validate tracked hygiene
         shell: bash
@@ -158,6 +160,26 @@ jobs:
           PHOENIX_TEST_POSTGRES_DSN=postgres://phoenix_test:phoenix_test_password@127.0.0.1:5432/phoenix_test \
             cargo test --locked --manifest-path phoenix-engine/Cargo.toml \
               --test postgres_decision_integration -- --nocapture
+          docker run --rm --network host \
+            -e PGPASSWORD=phoenix_test_password \
+            postgres@sha256:57c72fd2a128e416c7fcc499958864df5301e940bca0a56f58fddf30ffc07777 \
+            psql -X -qAt -v ON_ERROR_STOP=1 \
+              -h 127.0.0.1 -U phoenix_test -d phoenix_test \
+              -c "INSERT INTO schema_migrations(version, checksum) VALUES ('010_fork_simulation_evidence', repeat('a', 64)) ON CONFLICT (version) DO UPDATE SET checksum = EXCLUDED.checksum" \
+            >/dev/null
+          docker run --rm --network host \
+            -e PGPASSWORD=phoenix_test_password \
+            -v "$PWD/scripts/sql:/sql:ro" \
+            postgres@sha256:57c72fd2a128e416c7fcc499958864df5301e940bca0a56f58fddf30ffc07777 \
+            psql -X -qAt -v ON_ERROR_STOP=1 \
+              -v window_hours=24 \
+              -v route_hash=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
+              -v evidence_start=1970-01-01T00:00:00Z \
+              -h 127.0.0.1 -U phoenix_test -d phoenix_test \
+              -f /sql/prelive-dashboard-source.sql \
+            > /tmp/prelive-dashboard-source.json
+          python3 scripts/prelive_dashboard_live.py validate-source \
+            --input /tmp/prelive-dashboard-source.json
 
   rust-rpc-gateway:
     name: rust-rpc-gateway
@@ -303,8 +325,9 @@ jobs:
           set -euo pipefail
           python -m pip install --upgrade pip
           python -m pip install -r dashboard/requirements.txt
-          python -m py_compile dashboard/app.py dashboard/snapshot_model.py scripts/prelive_dashboard_snapshot.py scripts/verify_dashboard_compose.py
+          python -m py_compile dashboard/app.py dashboard/snapshot_model.py scripts/prelive_dashboard_snapshot.py scripts/prelive_dashboard_live.py scripts/prelive_shadow_control.py scripts/verify_dashboard_compose.py
           python -m unittest discover -s dashboard/tests -p 'test_*.py' -v
+          python -m unittest scripts.tests.test_prelive_dashboard_live scripts.tests.test_prelive_shadow_control -v
           python scripts/prelive_dashboard_snapshot.py \
             --input fixtures/dashboard/latest-dashboard.json \
             --output fixtures/dashboard/checked-dashboard.json \

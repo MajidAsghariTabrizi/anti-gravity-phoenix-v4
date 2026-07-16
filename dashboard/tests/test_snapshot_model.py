@@ -77,6 +77,32 @@ class SnapshotModelTests(unittest.TestCase):
         self.assertEqual(snapshot.alerts, ())
         self.assertEqual(snapshot.data["feed"]["gap_count"], "0")
 
+    def test_unavailable_observations_are_null_and_blocking(self) -> None:
+        data = copy.deepcopy(self.fixture)
+        data["rpc"]["providers"][0]["success_rate_bps"] = None
+        data["rpc"]["providers"][0]["budget_utilization_bps"] = None
+        data["jetstream"]["persistence"]["throughput_per_second"] = None
+        data["jetstream"]["persistence"]["backlog_growth"] = None
+        data["jetstream"]["persistence"]["database_write_latency_ms"] = {
+            "p50": None,
+            "p95": None,
+            "p99": None,
+        }
+        data["postgres"]["growth_bytes_1h"] = None
+        data["postgres"]["growth_bytes_6h"] = None
+        data["postgres"]["growth_bytes_24h"] = None
+        snapshot = load_snapshot(self.write_snapshot(data), now=FIXTURE_NOW)
+        self.assertEqual(snapshot.gate_status, "blocked")
+        self.assertTrue(
+            {
+                "database_growth_evidence_unavailable",
+                "jetstream_rate_evidence_unavailable",
+                "recorder_latency_distribution_unavailable",
+                "rpc_provider_observation_unavailable",
+            }.issubset(snapshot.gate_reasons)
+        )
+        self.assertIsNone(snapshot.data["postgres"]["growth_bytes_1h"])
+
     def test_missing_snapshot_is_not_rendered_as_zero(self) -> None:
         self.assert_snapshot_error(
             "snapshot_missing",
@@ -171,6 +197,15 @@ class SnapshotModelTests(unittest.TestCase):
                 self.assert_snapshot_error(
                     "snapshot_accounting_invalid", self.write_snapshot(data)
                 )
+
+    def test_on_demand_fork_image_may_be_unavailable(self) -> None:
+        data = copy.deepcopy(self.fixture)
+        fork = next(
+            row for row in data["services"] if row["service"] == "fork-sandbox"
+        )
+        fork["image_digest"] = "not_available"
+        snapshot = load_snapshot(self.write_snapshot(data), now=FIXTURE_NOW)
+        self.assertEqual(snapshot.data["governance"]["image_manifest_matches"], True)
 
     def test_safety_breaches_are_visible_and_blocking_without_values(self) -> None:
         data = copy.deepcopy(self.fixture)

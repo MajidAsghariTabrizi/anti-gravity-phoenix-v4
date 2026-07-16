@@ -1,6 +1,6 @@
 SHELL := /bin/sh
 
-.PHONY: verify go-test rust-test contract-test python-smoke secret-scan integration bench
+.PHONY: verify go-test rust-test contract-test python-smoke prelive-control-test secret-scan integration bench
 
 verify: go-test rust-test contract-test python-smoke secret-scan
 
@@ -32,10 +32,14 @@ contract-test:
 	fi
 
 python-smoke:
-	python -m py_compile dashboard/app.py dashboard/snapshot_model.py scripts/prelive_dashboard_snapshot.py scripts/verify_dashboard_compose.py
+	python -m py_compile dashboard/app.py dashboard/snapshot_model.py scripts/prelive_dashboard_snapshot.py scripts/prelive_dashboard_live.py scripts/prelive_shadow_control.py scripts/verify_dashboard_compose.py
 	python -m unittest discover -s dashboard/tests -p 'test_*.py' -v
+	python -m unittest scripts.tests.test_prelive_dashboard_live scripts.tests.test_prelive_shadow_control -v
 	python scripts/prelive_dashboard_snapshot.py --input fixtures/dashboard/latest-dashboard.json --output fixtures/dashboard/checked-dashboard.json --check
 	python dashboard/smoke_import.py
+
+prelive-control-test:
+	sh scripts/prelive-shadow-control-tests.sh
 
 secret-scan:
 	./scripts/secret-scan.sh

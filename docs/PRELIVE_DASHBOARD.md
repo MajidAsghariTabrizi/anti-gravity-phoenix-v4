@@ -90,8 +90,9 @@ python3 /opt/phoenix/deploy/prelive_dashboard_snapshot.py \
 ```
 
 The command emits only a bounded status code, gate state, and alert count. It
-does not print snapshot contents. Phase 9 owns live source collection and
-continuous snapshot production. Until that control plane supplies valid
+does not print snapshot contents. The Phase 9 host controller owns live source
+collection and continuous snapshot production; the Dashboard still receives no
+data-plane or Docker access. Until an authorized controller run supplies valid
 evidence, the production Dashboard remains `UNAVAILABLE` and blocked.
 
 ## Verification

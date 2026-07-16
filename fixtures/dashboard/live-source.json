@@ -1,0 +1,92 @@
+{
+  "schema_version": "phoenix.prelive.dashboard-source.v1",
+  "generated_at": "2026-07-16T12:00:00Z",
+  "database_clock": "2026-07-16T12:00:00Z",
+  "evidence_window_started_at": "2026-07-15T12:00:00Z",
+  "window_hours": "24",
+  "database": {
+    "size_bytes": "524288000",
+    "active_connections": "7",
+    "checkpoints_timed": "12",
+    "checkpoints_requested": "1",
+    "wal_bytes": "33554432",
+    "oldest_relevant_event": "2026-07-15T12:10:00Z",
+    "newest_relevant_event": "2026-07-16T11:59:30Z",
+    "migration_version": "010_fork_simulation_evidence",
+    "migration_checksum": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+    "retention_status": "not_configured"
+  },
+  "route_registry": {
+    "fact_count": "10",
+    "mismatch_count": "0",
+    "self_verification_collisions": "0"
+  },
+  "routes": [
+    {
+      "route_key": "arb1-weth-usdc-uni500-uni3000-canary",
+      "sample_count": "10",
+      "primary_profitable_count": "7",
+      "independently_verified_count": "7",
+      "verification_disagreed_count": "1",
+      "verification_unavailable_count": "1",
+      "gross_profit": "7100",
+      "total_cost": "2100",
+      "gas_cost": "1000",
+      "flash_premium": "500",
+      "ordering_cost": "300",
+      "safety_cost": "300",
+      "expected": "5000",
+      "conservative": "3200",
+      "severe": "1900",
+      "minimum_shortfall": "120",
+      "first_observed_at": "2026-07-15T12:10:00Z",
+      "last_observed_at": "2026-07-16T11:59:30Z",
+      "liquidity_score_bps": null,
+      "provider_requests": "30",
+      "provider_failures": "4",
+      "fork_unsigned_plans": "7",
+      "fork_simulations": "6",
+      "fork_success": "5",
+      "fork_reverted": "1",
+      "fork_profitable": "4",
+      "fork_gas_used": "2400000",
+      "fork_balance_delta": "8600",
+      "fork_simulated_net_pnl": "4100",
+      "fork_absolute_prediction_error": "900",
+      "fork_block": "360000000",
+      "fork_guard_failures": "0"
+    }
+  ],
+  "distribution": [
+    {"scenario": "expected", "bucket": "positive", "count": "7"},
+    {"scenario": "expected", "bucket": "near_zero", "count": "0"},
+    {"scenario": "expected", "bucket": "negative", "count": "3"},
+    {"scenario": "conservative", "bucket": "positive", "count": "6"},
+    {"scenario": "conservative", "bucket": "near_zero", "count": "0"},
+    {"scenario": "conservative", "bucket": "negative", "count": "4"},
+    {"scenario": "severe", "bucket": "positive", "count": "5"},
+    {"scenario": "severe", "bucket": "near_zero", "count": "0"},
+    {"scenario": "severe", "bucket": "negative", "count": "5"},
+    {"scenario": "fork_simulated", "bucket": "positive", "count": "4"},
+    {"scenario": "fork_simulated", "bucket": "negative", "count": "1"},
+    {"scenario": "fork_simulated", "bucket": "reverted", "count": "1"}
+  ],
+  "prediction_error": [
+    {"bucket": "under_100", "count": "2"},
+    {"bucket": "100_to_500", "count": "3"},
+    {"bucket": "over_500", "count": "1"}
+  ],
+  "daily_trend": [
+    {"period": "2026-07-16", "expected": "5000", "conservative": "3200", "severe": "1900", "fork_simulated": "4100", "sample_count": "10"}
+  ],
+  "weekly_trend": [
+    {"period": "2026-W29", "expected": "5000", "conservative": "3200", "severe": "1900", "fork_simulated": "4100", "sample_count": "10"}
+  ],
+  "model_comparison": [
+    {"model_version": "profitability-v3", "sample_count": "10", "expected": "5000", "conservative": "3200", "absolute_fork_error": "900"}
+  ],
+  "providers": [
+    {"provider_key": "primary-slot-a", "role": "primary", "requests": "20", "success": "18", "timeouts": "1", "unavailable": "1", "p50_latency_ms": "45", "p95_latency_ms": "130", "p99_latency_ms": "220"},
+    {"provider_key": "secondary-slot-b", "role": "secondary", "requests": "10", "success": "8", "timeouts": "1", "unavailable": "1", "p50_latency_ms": "60", "p95_latency_ms": "180", "p99_latency_ms": "290"}
+  ]
+}
