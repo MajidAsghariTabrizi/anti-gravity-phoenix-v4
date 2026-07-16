@@ -1,5 +1,6 @@
 import hashlib
 import json
+import tarfile
 import tempfile
 import unittest
 from pathlib import Path
@@ -65,6 +66,17 @@ class ReleaseAssetsTests(unittest.TestCase):
                 )
             )
             release_assets.verify_release_assets(archive, manifest_path, checksums, RELEASE_SHA)
+
+    def test_extracted_tree_is_exact_and_integrity_checked(self) -> None:
+        with tempfile.TemporaryDirectory() as raw, tempfile.TemporaryDirectory() as tree_raw:
+            archive, manifest, _ = self.build(Path(raw))
+            with tarfile.open(archive, mode="r:gz") as bundle:
+                bundle.extractall(tree_raw, filter="data")
+            root = Path(tree_raw) / f"phoenix-release-{RELEASE_SHA}"
+            release_assets.verify_release_tree(root, manifest, RELEASE_SHA)
+            (root / "unexpected.txt").write_text("unexpected", encoding="ascii")
+            with self.assertRaisesRegex(release_assets.ReleaseAssetError, "member set"):
+                release_assets.verify_release_tree(root, manifest, RELEASE_SHA)
 
     def test_archive_corruption_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as raw:

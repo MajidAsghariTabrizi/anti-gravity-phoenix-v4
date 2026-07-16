@@ -33,6 +33,7 @@ STATIC_PATHS = (
     "prometheus/prometheus.yml",
     "scripts/bootstrap-production.sh",
     "scripts/deploy-release.sh",
+    "scripts/install-release-assets.sh",
     "scripts/prelive-money-path-report.sh",
     "scripts/prelive-shadow-control.sh",
     "scripts/prelive_dashboard_live.py",
@@ -359,6 +360,37 @@ def verify_release_assets(
         raise ReleaseAssetError("release-assets archive is incomplete")
 
 
+def verify_release_tree(root: Path, manifest_path: Path, expected_sha: str) -> None:
+    expected_sha = _validate_release_sha(expected_sha)
+    manifest_bytes, files = _load_manifest(manifest_path, expected_sha)
+    if root.is_symlink():
+        raise ReleaseAssetError("release-assets tree root is invalid")
+    root = root.resolve(strict=True)
+    if not root.is_dir():
+        raise ReleaseAssetError("release-assets tree root is invalid")
+
+    observed: dict[str, Path] = {}
+    for candidate in root.rglob("*"):
+        if candidate.is_symlink():
+            raise ReleaseAssetError("release-assets tree contains a symbolic link")
+        if candidate.is_dir():
+            continue
+        if not candidate.is_file():
+            raise ReleaseAssetError("release-assets tree contains a non-file entry")
+        relative = _validate_relative_path(candidate.relative_to(root).as_posix())
+        observed[relative] = candidate
+
+    expected = set(files) | {MANIFEST_NAME}
+    if set(observed) != expected:
+        raise ReleaseAssetError("release-assets tree member set is invalid")
+    if _read_bounded(observed[MANIFEST_NAME]) != manifest_bytes:
+        raise ReleaseAssetError("release-assets tree manifest mismatch")
+    for relative, item in files.items():
+        payload = _read_bounded(observed[relative])
+        if len(payload) != item["size_bytes"] or _sha256(payload) != item["sha256"]:
+            raise ReleaseAssetError("release-assets tree payload mismatch")
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     subcommands = parser.add_subparsers(dest="command", required=True)
@@ -374,6 +406,11 @@ def _parser() -> argparse.ArgumentParser:
     verify.add_argument("--manifest", required=True, type=Path)
     verify.add_argument("--checksums", required=True, type=Path)
     verify.add_argument("--expected-sha", required=True)
+
+    verify_tree = subcommands.add_parser("verify-tree")
+    verify_tree.add_argument("--root", required=True, type=Path)
+    verify_tree.add_argument("--manifest", required=True, type=Path)
+    verify_tree.add_argument("--expected-sha", required=True)
     return parser
 
 
@@ -396,8 +433,11 @@ def main() -> None:
                     separators=(",", ":"),
                 )
             )
-        else:
+        elif args.command == "verify":
             verify_release_assets(args.archive, args.manifest, args.checksums, args.expected_sha)
+            print('{"status":"ok"}')
+        else:
+            verify_release_tree(args.root, args.manifest, args.expected_sha)
             print('{"status":"ok"}')
     except (OSError, ReleaseAssetError) as exc:
         print(json.dumps({"error": str(exc), "status": "error"}, sort_keys=True), file=sys.stderr)
