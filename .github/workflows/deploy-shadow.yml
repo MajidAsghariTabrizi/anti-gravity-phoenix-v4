@@ -1,10 +1,28 @@
 name: Deploy Shadow Production
 
 on:
-  workflow_run:
-    workflows: ["Build Phoenix Images"]
-    types: [completed]
-    branches: [main]
+  workflow_dispatch:
+    inputs:
+      release_sha:
+        description: Exact current main SHA to deploy
+        required: true
+        type: string
+      build_run_id:
+        description: Successful Build Phoenix Images run for release_sha
+        required: true
+        type: string
+      rollback_sha:
+        description: Exact currently active SHA prepared for rollback
+        required: true
+        type: string
+      rollback_build_run_id:
+        description: Successful Build Phoenix Images run for rollback_sha
+        required: true
+        type: string
+      acknowledgement:
+        description: Type DEPLOY_PRELIVE_SHADOW
+        required: true
+        type: string
 
 permissions:
   contents: read
@@ -17,37 +35,128 @@ concurrency:
 jobs:
   deploy-shadow:
     name: deploy-shadow
-    if: ${{ github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.head_branch == 'main' }}
     runs-on: ubuntu-24.04
-    timeout-minutes: 20
+    timeout-minutes: 30
+    environment: production-shadow
     steps:
+      - name: Validate deployment request shape
+        shell: bash
+        env:
+          RELEASE_SHA: ${{ inputs.release_sha }}
+          BUILD_RUN_ID: ${{ inputs.build_run_id }}
+          ROLLBACK_SHA: ${{ inputs.rollback_sha }}
+          ROLLBACK_BUILD_RUN_ID: ${{ inputs.rollback_build_run_id }}
+          ACKNOWLEDGEMENT: ${{ inputs.acknowledgement }}
+        run: |
+          set -euo pipefail
+          for value in "$RELEASE_SHA" "$ROLLBACK_SHA"; do
+            case "$value" in
+              *[!0-9a-f]*|"") echo "release inputs must be lowercase hexadecimal"; exit 1 ;;
+            esac
+            [ "${#value}" -eq 40 ] || { echo "release inputs must be 40 characters"; exit 1; }
+          done
+          [ "$RELEASE_SHA" != "$ROLLBACK_SHA" ] || { echo "rollback SHA must differ from release SHA"; exit 1; }
+          case "$BUILD_RUN_ID:$ROLLBACK_BUILD_RUN_ID" in
+            *[!0-9:]*|:*|*:|*::* ) echo "build run IDs must be decimal integers"; exit 1 ;;
+          esac
+          [ "$ACKNOWLEDGEMENT" = DEPLOY_PRELIVE_SHADOW ] || { echo "deployment acknowledgement is invalid"; exit 1; }
+
+      - name: Checkout exact release
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          ref: ${{ inputs.release_sha }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Verify release is current main
+        shell: bash
+        env:
+          RELEASE_SHA: ${{ inputs.release_sha }}
+        run: |
+          set -euo pipefail
+          [ "$(git rev-parse HEAD)" = "$RELEASE_SHA" ] || { echo "checkout does not match release SHA"; exit 1; }
+          git fetch --no-tags --depth=1 origin main
+          [ "$(git rev-parse FETCH_HEAD)" = "$RELEASE_SHA" ] || { echo "release SHA is not current main"; exit 1; }
+
       - name: Download release manifest
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
         with:
-          name: phoenix-release-manifest-${{ github.event.workflow_run.head_sha }}
-          run-id: ${{ github.event.workflow_run.id }}
+          name: phoenix-release-manifest-${{ inputs.release_sha }}
+          run-id: ${{ inputs.build_run_id }}
           github-token: ${{ secrets.GITHUB_TOKEN }}
           path: release
 
-      - name: Validate manifest SHA
+      - name: Download release assets
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: phoenix-release-assets-${{ inputs.release_sha }}
+          run-id: ${{ inputs.build_run_id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          path: release-assets
+
+      - name: Download rollback manifest
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: phoenix-release-manifest-${{ inputs.rollback_sha }}
+          run-id: ${{ inputs.rollback_build_run_id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          path: rollback
+
+      - name: Validate immutable release and rollback evidence
         shell: bash
         env:
-          RELEASE_SHA: ${{ github.event.workflow_run.head_sha }}
+          RELEASE_SHA: ${{ inputs.release_sha }}
+          ROLLBACK_SHA: ${{ inputs.rollback_sha }}
         run: |
           set -euo pipefail
+          python3 scripts/release_assets.py verify \
+            --archive "release-assets/phoenix-release-assets-${RELEASE_SHA}.tar.gz" \
+            --manifest release-assets/release-assets-manifest.json \
+            --checksums release-assets/release-assets-checksums.txt \
+            --expected-sha "$RELEASE_SHA"
           python3 - <<'PY'
           import json
           import os
+          import re
           from pathlib import Path
-          manifest = json.loads(Path("release/release-manifest.json").read_text())
-          expected = os.environ["RELEASE_SHA"]
-          if manifest.get("release_sha") != expected:
-              raise SystemExit("release manifest SHA does not match workflow_run head SHA")
-          for image in manifest.get("images", {}).values():
-              if image.get("tag") != f"sha-{expected}":
-                  raise SystemExit("release manifest image tag does not match exact SHA")
-              if not image.get("digest", "").startswith("sha256:"):
-                  raise SystemExit("release manifest image digest is missing")
+
+          production = {"dashboard", "feed-ingestor", "phoenix-engine", "recorder", "rpc-gateway"}
+          release = production | {"fork-sandbox"}
+
+          def validate(path, expected_sha, expected_sets):
+              value = json.loads(Path(path).read_text(encoding="utf-8"))
+              if set(value) != {"schema", "release_sha", "created_at", "images"}:
+                  raise SystemExit(f"invalid manifest contract: {path}")
+              if value["schema"] != "phoenix.release.v1" or value["release_sha"] != expected_sha:
+                  raise SystemExit(f"invalid manifest identity: {path}")
+              images = value["images"]
+              if not isinstance(images, dict) or set(images) not in expected_sets:
+                  raise SystemExit(f"invalid manifest image set: {path}")
+              for name, image in images.items():
+                  if set(image) != {"repository", "tag", "digest"}:
+                      raise SystemExit(f"invalid image contract for {name}")
+                  if image["repository"] != f"ghcr.io/majidasgharitabrizi/{name}":
+                      raise SystemExit(f"invalid image repository for {name}")
+                  if image["tag"] != f"sha-{expected_sha}":
+                      raise SystemExit(f"invalid immutable image tag for {name}")
+                  if not re.fullmatch(r"sha256:[0-9a-f]{64}", image["digest"]):
+                      raise SystemExit(f"invalid image digest for {name}")
+              return images
+
+          candidate = validate(
+              "release/release-manifest.json", os.environ["RELEASE_SHA"], (release,)
+          )
+          rollback = validate(
+              "rollback/release-manifest.json",
+              os.environ["ROLLBACK_SHA"],
+              (production, release),
+          )
+          for protected in ("feed-ingestor", "recorder"):
+              if candidate[protected]["digest"] != rollback[protected]["digest"]:
+                  raise SystemExit(
+                      f"protected image digest changed for {protected}; "
+                      "a separately authorized maintenance gate is required"
+                  )
           PY
 
       - name: Install SSH material
@@ -57,6 +166,8 @@ jobs:
           PROD_KNOWN_HOSTS: ${{ secrets.PROD_KNOWN_HOSTS }}
         run: |
           set -euo pipefail
+          [ -n "$PROD_SSH_PRIVATE_KEY" ] || { echo "production SSH key is not configured"; exit 1; }
+          [ -n "$PROD_KNOWN_HOSTS" ] || { echo "production known-hosts data is not configured"; exit 1; }
           install -d -m 700 "$HOME/.ssh"
           printf '%s\n' "$PROD_SSH_PRIVATE_KEY" > "$HOME/.ssh/id_ed25519"
           chmod 600 "$HOME/.ssh/id_ed25519"
@@ -69,19 +180,51 @@ jobs:
           PROD_HOST: ${{ secrets.PROD_HOST }}
           PROD_PORT: ${{ secrets.PROD_PORT }}
           PROD_USER: ${{ secrets.PROD_USER }}
-          RELEASE_SHA: ${{ github.event.workflow_run.head_sha }}
+          RELEASE_SHA: ${{ inputs.release_sha }}
+          ROLLBACK_SHA: ${{ inputs.rollback_sha }}
         run: |
           set -euo pipefail
-          case "$RELEASE_SHA" in
-            *[!0-9a-f]*|"") echo "invalid release SHA"; exit 1 ;;
-          esac
-          if [ "${#RELEASE_SHA}" -ne 40 ]; then
-            echo "release SHA must be 40 lowercase hex characters"
-            exit 1
-          fi
+          printf '%s' "$PROD_HOST" | grep -Eq '^[A-Za-z0-9._-]+$' || { echo "production host is invalid"; exit 1; }
+          printf '%s' "$PROD_USER" | grep -Eq '^[A-Za-z_][A-Za-z0-9_-]*$' || { echo "production user is invalid"; exit 1; }
           port="${PROD_PORT:-22}"
+          case "$port" in *[!0-9]*|"") echo "production port is invalid"; exit 1 ;; esac
+          [ "$port" -ge 1 ] && [ "$port" -le 65535 ] || { echo "production port is invalid"; exit 1; }
           remote="${PROD_USER}@${PROD_HOST}"
           ssh_opts=(-i "$HOME/.ssh/id_ed25519" -p "$port" -o UserKnownHostsFile="$HOME/.ssh/known_hosts" -o StrictHostKeyChecking=yes -o IdentitiesOnly=yes)
-          ssh "${ssh_opts[@]}" "$remote" "install -d -m 0750 /opt/phoenix/deploy/manifests"
-          scp -i "$HOME/.ssh/id_ed25519" -P "$port" -o UserKnownHostsFile="$HOME/.ssh/known_hosts" -o StrictHostKeyChecking=yes -o IdentitiesOnly=yes release/release-manifest.json "$remote:/opt/phoenix/deploy/manifests/${RELEASE_SHA}.json"
-          ssh "${ssh_opts[@]}" "$remote" "/opt/phoenix/deploy/deploy-release.sh ${RELEASE_SHA}"
+          scp_opts=(-i "$HOME/.ssh/id_ed25519" -P "$port" -o UserKnownHostsFile="$HOME/.ssh/known_hosts" -o StrictHostKeyChecking=yes -o IdentitiesOnly=yes)
+          remote_stage=$(ssh "${ssh_opts[@]}" "$remote" "mktemp -d '/tmp/phoenix-release-${RELEASE_SHA}.XXXXXX'")
+          case "$remote_stage" in
+            "/tmp/phoenix-release-${RELEASE_SHA}."*) ;;
+            *) echo "remote release staging path is invalid"; exit 1 ;;
+          esac
+          scp "${scp_opts[@]}" release/release-manifest.json "$remote:$remote_stage/release-manifest.json"
+          scp "${scp_opts[@]}" rollback/release-manifest.json "$remote:$remote_stage/rollback-manifest.json"
+          scp "${scp_opts[@]}" \
+            release-assets/release-assets-manifest.json \
+            release-assets/release-assets-checksums.txt \
+            "release-assets/phoenix-release-assets-${RELEASE_SHA}.tar.gz" \
+            scripts/install-release-assets.sh \
+            "$remote:$remote_stage/"
+          ssh "${ssh_opts[@]}" "$remote" sudo /bin/sh -s -- "$ROLLBACK_SHA" <<'REMOTE'
+          set -eu
+          expected=$1
+          [ -s /opt/phoenix/deploy/current-release ]
+          actual=$(tr -d '\r\n' </opt/phoenix/deploy/current-release)
+          [ "$actual" = "$expected" ]
+          [ -s /opt/phoenix/deploy/release-assets.sha ]
+          asset_sha=$(tr -d '\r\n' </opt/phoenix/deploy/release-assets.sha)
+          [ "$asset_sha" = "$expected" ]
+          rollback_root=/opt/phoenix/releases/$expected
+          [ -d "$rollback_root" ]
+          python3 /opt/phoenix/deploy/release_assets.py verify-tree \
+            --root "$rollback_root" \
+            --manifest "$rollback_root/release-assets-manifest.json" \
+            --expected-sha "$expected" >/dev/null
+          REMOTE
+          ssh "${ssh_opts[@]}" "$remote" \
+            "sudo /bin/sh '$remote_stage/install-release-assets.sh' '$RELEASE_SHA' '$remote_stage/phoenix-release-assets-${RELEASE_SHA}.tar.gz' '$remote_stage/release-assets-manifest.json' '$remote_stage/release-assets-checksums.txt'"
+          ssh "${ssh_opts[@]}" "$remote" \
+            "sudo install -d -m 0750 -o phoenix -g phoenix /opt/phoenix/deploy/manifests && sudo install -m 0640 -o phoenix -g phoenix '$remote_stage/release-manifest.json' '/opt/phoenix/deploy/manifests/${RELEASE_SHA}.json' && sudo install -m 0640 -o phoenix -g phoenix '$remote_stage/rollback-manifest.json' '/opt/phoenix/deploy/manifests/${ROLLBACK_SHA}.json'"
+          ssh "${ssh_opts[@]}" "$remote" \
+            "rm -f '$remote_stage/release-manifest.json' '$remote_stage/rollback-manifest.json' '$remote_stage/release-assets-manifest.json' '$remote_stage/release-assets-checksums.txt' '$remote_stage/phoenix-release-assets-${RELEASE_SHA}.tar.gz' '$remote_stage/install-release-assets.sh' && rmdir '$remote_stage'"
+          ssh "${ssh_opts[@]}" "$remote" "sudo /opt/phoenix/deploy/deploy-release.sh '$RELEASE_SHA'"

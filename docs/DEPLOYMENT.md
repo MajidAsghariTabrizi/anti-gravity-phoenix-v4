@@ -14,10 +14,14 @@ Production host layout:
 
 ```text
 /opt/phoenix/
+    releases/
+        <release-sha>/
+            release-assets-manifest.json
     deploy/
         compose.prod.yml
         current-release
         previous-release
+        release-assets.sha
         manifests/
     data/
         postgres/
@@ -34,7 +38,7 @@ Production host layout:
     phoenix.env
 ```
 
-The production host pulls prebuilt GHCR images. It does not build Phoenix application source.
+The production host pulls prebuilt GHCR images. It does not build Phoenix application source. Canonical host scripts, schemas, route proofs, and the compiled contract artifact come only from the verified exact-SHA release-assets bundle.
 
 Do not expose internal services publicly:
 
@@ -59,5 +63,7 @@ Production bootstrap, GHCR authentication, environment validation, release, and 
 - `docs/CI_CD.md`
 
 Current live-evidence gap: real Nitro feed relay ingestion is implemented for first SHADOW runtime verification but not live-verified. A Linux VPS validation run must still prove the pinned relay can observe and decode real Arbitrum feed messages before any production-readiness or LIVE claim.
+
+Current deployment gate: feed-ingestor and Recorder changed in this milestone but are protected against recreation. The manual workflow blocks before SSH when either candidate digest differs from the active rollback manifest. A separately approved maintenance gate is required before those protected images can be replaced; optional-service deployment must not be used to bypass that restriction.
 
 Recorder durability configuration and single-node storage limits are documented in `docs/RECORDER_DURABLE_DELIVERY.md`.

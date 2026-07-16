@@ -21,9 +21,35 @@
 
 Production deploys image references from this manifest only. Mutable tags are rejected.
 
+The manifest contains six immutable images: feed-ingestor, phoenix-engine,
+rpc-gateway, recorder, fork-sandbox, and dashboard. The production renderer
+uses the five production image entries; fork-sandbox remains isolated and is
+published for controlled fork evidence only.
+
 Nitro Relay, NATS, PostgreSQL, and Prometheus are pinned directly in
 `compose.prod.yml` by multi-platform manifest digest. Phoenix-owned image
 digests come only from the release manifest.
+
+## Release Assets
+
+`Build Phoenix Images` also creates:
+
+- `phoenix-release-assets-<sha>.tar.gz`
+- `release-assets-manifest.json`
+- `release-assets-checksums.txt`
+
+The bundle is deterministic for the same inputs, contains no environment file
+or credential material, and is bounded to 512 files, 8 MiB per file, and 64
+MiB of payload. The strict `phoenix.release-assets.v1` manifest records each
+relative path, mode, size, and SHA-256 digest. Archive members must be regular
+files beneath the exact release root; symlinks, traversal, extra files,
+non-canonical JSON, checksum drift, and extracted-tree drift fail closed.
+
+`install-release-assets.sh` verifies the archive before extraction, promotes
+it under `/opt/phoenix/releases/<sha>`, verifies the immutable extracted tree,
+and invokes bootstrap with that exact SHA. Bootstrap installs canonical host
+assets and promotes `/opt/phoenix/deploy/release-assets.sha` only after the
+production environment and Docker tooling validate.
 
 ## Canonical Production Context
 
@@ -35,6 +61,8 @@ operator env:    /etc/phoenix/phoenix.env
 release env:     /opt/phoenix/deploy/current-release.env
 release pointer: /opt/phoenix/deploy/current-release
 release state:   /opt/phoenix/deploy/current-release.json
+asset marker:    /opt/phoenix/deploy/release-assets.sha
+release source:  /opt/phoenix/releases/<release-sha>/
 ```
 
 There is no production override file. `/opt/phoenix/app/compose.prod.yml`, a
@@ -71,17 +99,20 @@ forbidden rather than ignored.
 `deploy-release.sh <release_sha>`:
 
 1. Validates the 40-character SHA.
-2. Loads `/opt/phoenix/deploy/manifests/<sha>.json`.
-3. Validates manifest SHA, tags, and digests.
-4. Writes a candidate per-release digest env under `manifests/`.
-5. Validates `/etc/phoenix/phoenix.env` and the canonical render before runtime mutation.
-6. Saves the current release as `previous-release`.
-7. Pulls exact digest-backed images.
-8. Runs the migration runner.
-9. Starts or updates SHADOW services without broad orphan removal.
-10. Runs `production-healthcheck.sh` against the candidate release env.
-11. Compares manifest, render, checksums, route hash, and running images.
-12. Atomically replaces each active state file, with `current-release` promoted
+2. Requires the installed release-assets marker to match that SHA.
+3. Loads `/opt/phoenix/deploy/manifests/<sha>.json`.
+4. Validates manifest SHA, tags, and digests.
+5. Writes a candidate per-release digest env under `manifests/`.
+6. Validates `/etc/phoenix/phoenix.env` and the canonical render before runtime mutation.
+7. Captures healthy relay, feed-ingestor, NATS, PostgreSQL, and Recorder container IDs.
+8. Saves the current release as `previous-release`.
+9. Pulls exact digest-backed images without recreating services.
+10. Runs the migration runner with `--no-deps`.
+11. Starts Prometheus, RPC Gateway, Shadow Dispatcher, Phoenix Engine, and Dashboard one at a time with `--no-deps` and bounded health waits.
+12. Verifies every protected container ID is unchanged.
+13. Runs `production-healthcheck.sh` against the candidate release env.
+14. Compares manifest, render, checksums, route hash, and running images.
+15. Atomically replaces each active state file, with `current-release` promoted
     last as the activation pointer, only after every gate passes.
 
 After candidate preflight, any failed deployment or interrupt exits through
@@ -90,14 +121,24 @@ candidate state.
 
 ## Rollback
 
-`rollback-release.sh` reads `previous-release`, validates that manifest, restores exact previous image refs, updates services, and runs the production health check. It reports rollback success only after health passes.
+`rollback-release.sh` reads `previous-release`, validates that manifest, and
+integrity-checks and restores the immutable release-assets tree for that exact
+SHA before restoring the five optional SHADOW services one at a time. It
+fingerprints the same protected container IDs before and after, uses bounded
+health waits, and reports rollback success only after health and
+release-context validation pass. Deployment is blocked before asset
+installation unless the active rollback pointer, asset marker, and immutable
+tree all agree.
 
 Database migrations are forward-only. Rollbacks require backward-compatible migrations until a dedicated manual data rollback plan exists.
 
 ## Host Migration
 
 Before the first release using this contract, install the merged exact-SHA
-assets with `bootstrap-production.sh` or the reviewed release-asset workflow.
+bundle with `install-release-assets.sh`. A direct bootstrap from a trusted
+checkout remains available for initial host preparation, but deployment is
+blocked until bootstrap receives the exact release SHA and promotes the asset
+marker.
 Do not copy generated release state into a source checkout. Existing manifests
 remain compatible; their digest env is regenerated with an added
 `PHOENIX_RELEASE_SHA` field. Existing plain `current-release` and
@@ -109,6 +150,16 @@ runtime mutation. Reinstall the canonical assets and validate the existing
 project/container migration explicitly; do not let a second Compose project
 duplicate protected data-plane services.
 
-## Known Current Gate
+## Known Current Gates
 
-Linux VPS validation must still prove the Nitro relay adapter against the real Arbitrum sequencer feed. A production deploy must fail health and rollback if relay/feed readiness cannot be established, and it must never silently consume fixtures.
+Linux VPS validation must still prove the Nitro relay adapter against the real
+Arbitrum sequencer feed. A production deploy must fail health and rollback if
+relay/feed readiness cannot be established, and it must never silently consume
+fixtures.
+
+This pre-live milestone changes feed-ingestor and Recorder while classifying
+both as protected data-plane services. The manual deployment workflow compares
+their candidate and rollback digests before SSH and blocks any difference.
+Deploying those changed images therefore requires a separate, explicitly
+authorized maintenance gate that reconciles protected-service continuity; this
+milestone does not silently recreate them.

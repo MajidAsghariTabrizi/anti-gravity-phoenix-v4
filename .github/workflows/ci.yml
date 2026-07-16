@@ -58,6 +58,9 @@ jobs:
           python3 -m py_compile scripts/prelive_dashboard_snapshot.py scripts/verify_dashboard_compose.py
           python3 -m py_compile scripts/prelive_shadow_control.py scripts/prelive_dashboard_live.py
           sh ./scripts/prelive-shadow-control-tests.sh
+          python3 -m py_compile scripts/release_assets.py
+          python3 -m unittest scripts.tests.test_release_assets
+          sh ./scripts/prelive-release-gate-tests.sh
 
       - name: Validate tracked hygiene
         shell: bash

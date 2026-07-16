@@ -3,6 +3,7 @@ set -eu
 
 deploy_root="${PHOENIX_DEPLOY_ROOT:-/opt/phoenix}"
 deploy_dir="$deploy_root/deploy"
+release_root="${PHOENIX_RELEASE_ROOT:-$deploy_root/releases}"
 env_file="${PHOENIX_ENV_FILE:-/etc/phoenix/phoenix.env}"
 compose_file="$deploy_dir/compose.prod.yml"
 current_file="$deploy_dir/current-release"
@@ -11,6 +12,9 @@ current_state="$deploy_dir/current-release.json"
 current_context="$deploy_dir/current-release-context.json"
 previous_file="$deploy_dir/previous-release"
 runtime_dir="$deploy_dir/.runtime"
+protected_services='nitro-feed-relay feed-ingestor nats postgres recorder'
+optional_services='prometheus rpc-gateway shadow-dispatcher phoenix-engine dashboard'
+service_wait_seconds=${PHOENIX_DEPLOY_SERVICE_WAIT_SECONDS:-300}
 
 fail() {
   echo "ROLLBACK_FAILED: $1"
@@ -24,6 +28,7 @@ case "$release_sha" in
 esac
 [ "${#release_sha}" -eq 40 ] || fail "previous release SHA is invalid"
 
+release_assets_root="$release_root/$release_sha"
 manifest="$deploy_dir/manifests/$release_sha.json"
 release_env="$deploy_dir/manifests/$release_sha.env"
 release_metadata="$deploy_dir/manifests/$release_sha.render.json"
@@ -31,8 +36,27 @@ release_state="$deploy_dir/manifests/$release_sha.state.json"
 [ -f "$manifest" ] || fail "release manifest is missing"
 [ -f "$compose_file" ] || fail "production compose file is missing"
 [ -f "$env_file" ] || fail "production environment file is missing"
+[ -d "$release_assets_root" ] || fail "immutable rollback release assets are missing"
+[ -f "$release_assets_root/release-assets-manifest.json" ] ||
+  fail "rollback release-assets manifest is missing"
+case "$service_wait_seconds" in
+  ''|*[!0-9]*) fail "service wait seconds must be an integer" ;;
+esac
+[ "$service_wait_seconds" -ge 30 ] && [ "$service_wait_seconds" -le 900 ] ||
+  fail "service wait seconds must be from 30 through 900"
 
 command -v python3 >/dev/null 2>&1 || fail "python3 is unavailable"
+command -v cmp >/dev/null 2>&1 || fail "cmp is unavailable"
+python3 "$deploy_dir/release_assets.py" verify-tree \
+  --root "$release_assets_root" \
+  --manifest "$release_assets_root/release-assets-manifest.json" \
+  --expected-sha "$release_sha" >/dev/null ||
+  fail "immutable rollback release assets failed integrity validation"
+"$release_assets_root/scripts/bootstrap-production.sh" "$release_sha" ||
+  fail "rollback release assets could not be restored"
+[ -s "$deploy_dir/release-assets.sha" ] || fail "rollback release-assets marker is missing"
+installed_assets_sha=$(tr -d '\r\n' <"$deploy_dir/release-assets.sha")
+[ "$installed_assets_sha" = "$release_sha" ] || fail "rollback release-assets marker is invalid"
 mkdir -p "$runtime_dir"
 chmod 0750 "$runtime_dir"
 python3 "$deploy_dir/production_context.py" manifest-env \
@@ -57,6 +81,8 @@ pointer_candidate="$state_dir/current-release"
 context_candidate="$state_dir/release-context.json"
 context_rendered="$state_dir/context.compose.json"
 context_metadata="$state_dir/context.metadata.json"
+protected_before="$state_dir/protected.before.tsv"
+protected_after="$state_dir/protected.after.tsv"
 
 "$deploy_dir/render-production-compose.sh" \
   --compose-file "$compose_file" \
@@ -73,6 +99,32 @@ compose() {
       --env-file "$env_file" \
       --env-file "$release_env" \
       -f "$compose_file" "$@"
+}
+
+capture_protected_ids() {
+  output=$1
+  : >"$output"
+  for service in $protected_services; do
+    id=$(compose ps -a -q "$service" | awk 'NF { print; exit }')
+    [ -n "$id" ] || return 1
+    state=$(docker inspect --format '{{.State.Status}}|{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "$id") || return 1
+    [ "$state" = 'running|healthy' ] || return 1
+    printf '%s\t%s\n' "$service" "$id" >>"$output"
+  done
+}
+
+wait_service_healthy() {
+  service=$1
+  deadline=$(( $(date +%s) + service_wait_seconds ))
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    id=$(compose ps -a -q "$service" | awk 'NF { print; exit }')
+    if [ -n "$id" ]; then
+      state=$(docker inspect --format '{{.State.Status}}|{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "$id" 2>/dev/null || true)
+      [ "$state" = 'running|healthy' ] && return 0
+    fi
+    sleep 3
+  done
+  return 1
 }
 
 install_active_file() {
@@ -94,8 +146,14 @@ if [ -s "$current_file" ]; then
   rollback_from=$(tr -d '\r\n' <"$current_file")
 fi
 
+capture_protected_ids "$protected_before" || fail "protected services are not ready before rollback"
 compose pull
-compose up -d
+for service in $optional_services; do
+  compose up -d --no-deps "$service"
+  wait_service_healthy "$service" || fail "optional service did not become healthy during rollback: $service"
+done
+capture_protected_ids "$protected_after" || fail "protected services are not ready after rollback"
+cmp "$protected_before" "$protected_after" >/dev/null || fail "protected service identity changed during rollback"
 PHOENIX_RELEASE_ENV="$release_env" "$deploy_dir/production-healthcheck.sh"
 
 printf '%s\n' "$release_sha" >"$pointer_candidate"
