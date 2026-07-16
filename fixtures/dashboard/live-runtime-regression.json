@@ -1,0 +1,131 @@
+{
+  "positive_route_evidence": {
+    "classification": "candidate_rejected",
+    "rejection_reason": "liquidity_insufficient",
+    "candidate_count": 1,
+    "matched_route_id": "arb1-weth-usdc-uni500-uni3000-canary",
+    "pinned_block_number": "483792695",
+    "pinned_block_hash": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "primary_state_hash": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "route_config_hash": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+    "primary_provider_result": "publicnode",
+    "verification_status": "primary_only",
+    "primary_screen_rejected": true,
+    "secondary_skipped": true,
+    "independent_verification_status": "not_requested",
+    "independent_verification_lifecycle": ["not_requested"],
+    "independent_verification_skip_reason": "primary_screen_no_profitable_candidate",
+    "fork_simulation_status": "not_requested",
+    "shadow_only": true,
+    "execution_eligible": false,
+    "execution_request_created": false
+  },
+  "dashboard_source": {
+    "schema_version": "phoenix.prelive.dashboard-source.v1",
+    "generated_at": "2026-07-16T12:00:10Z",
+    "database_clock": "2026-07-16T12:00:10Z",
+    "evidence_window_started_at": "2026-07-16T12:00:00Z",
+    "window_hours": "24",
+    "database": {
+      "size_bytes": "524288000",
+      "active_connections": "7",
+      "checkpoints_timed": "12",
+      "checkpoints_requested": "1",
+      "wal_bytes": "0",
+      "oldest_relevant_event": "2026-07-16T12:00:05Z",
+      "newest_relevant_event": "2026-07-16T12:00:05Z",
+      "migration_version": "010_fork_simulation_evidence",
+      "migration_checksum": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+      "retention_status": "not_configured"
+    },
+    "route_registry": {
+      "fact_count": "1",
+      "mismatch_count": "0",
+      "self_verification_collisions": "0"
+    },
+    "routes": [
+      {
+        "route_key": "arb1-weth-usdc-uni500-uni3000-canary",
+        "sample_count": "1",
+        "primary_profitable_count": "0",
+        "independently_verified_count": "0",
+        "verification_disagreed_count": "0",
+        "verification_unavailable_count": "0",
+        "gross_profit": "0",
+        "total_cost": "10",
+        "gas_cost": "4",
+        "flash_premium": "1",
+        "ordering_cost": "2",
+        "safety_cost": "3",
+        "expected": "-10",
+        "conservative": "-12",
+        "severe": "-15",
+        "minimum_shortfall": null,
+        "first_observed_at": "2026-07-16T12:00:05Z",
+        "last_observed_at": "2026-07-16T12:00:05Z",
+        "liquidity_score_bps": "0",
+        "provider_requests": "1",
+        "provider_failures": "0",
+        "fork_unsigned_plans": "0",
+        "fork_simulations": "0",
+        "fork_success": "0",
+        "fork_reverted": "0",
+        "fork_profitable": "0",
+        "fork_gas_used": "0",
+        "fork_balance_delta": "0",
+        "fork_simulated_net_pnl": "0",
+        "fork_absolute_prediction_error": "0",
+        "fork_block": "0",
+        "fork_guard_failures": "0"
+      }
+    ],
+    "distribution": [
+      {"scenario": "expected", "bucket": "negative", "count": "1"},
+      {"scenario": "conservative", "bucket": "negative", "count": "1"},
+      {"scenario": "severe", "bucket": "negative", "count": "1"}
+    ],
+    "prediction_error": [],
+    "daily_trend": [
+      {
+        "period": "2026-07-16",
+        "expected": "-10",
+        "conservative": "-12",
+        "severe": "-15",
+        "fork_simulated": "0",
+        "sample_count": "1"
+      }
+    ],
+    "weekly_trend": [
+      {
+        "period": "2026-W29",
+        "expected": "-10",
+        "conservative": "-12",
+        "severe": "-15",
+        "fork_simulated": "0",
+        "sample_count": "1"
+      }
+    ],
+    "model_comparison": [
+      {
+        "model_version": "shadow-profitability-v2",
+        "sample_count": "1",
+        "expected": "-10",
+        "conservative": "-12",
+        "absolute_fork_error": "0"
+      }
+    ],
+    "providers": [
+      {
+        "provider_key": "publicnode",
+        "role": "primary",
+        "requests": "1",
+        "success": "1",
+        "timeouts": "0",
+        "unavailable": "0",
+        "p50_latency_ms": "45",
+        "p95_latency_ms": null,
+        "p99_latency_ms": null
+      }
+    ]
+  }
+}

@@ -113,7 +113,7 @@
   },
   "metrics": {
     "rpc": {"requests": "25", "success": "22", "timeouts": "1", "rate_limited": "1", "unavailable": "1", "disagreements": "1"},
-    "jetstream": {"streams": "2", "consumers": "3", "pending": "4", "ack_pending": "1", "redeliveries": "0"},
+    "jetstream": {"streams": "2", "consumers": "2", "pending": "4", "ack_pending": "1", "redeliveries": "0"},
     "database": {"size_start_bytes": "1000", "size_end_bytes": "1200", "growth_bytes": "200"},
     "feed": {"messages": "100", "gaps": "1", "missing_sequences": "2", "decode_failures": "0"}
   },

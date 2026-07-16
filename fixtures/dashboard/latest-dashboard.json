@@ -230,8 +230,7 @@
     ],
     "consumers": [
       {"consumer_id": "PHOENIX_RECORDER", "exists": true, "ack_pending": "1", "pending": "2", "redeliveries": "0", "oldest_pending_age_seconds": "4"},
-      {"consumer_id": "PHOENIX_ENGINE_SHADOW", "exists": true, "ack_pending": "1", "pending": "3", "redeliveries": "1", "oldest_pending_age_seconds": "6"},
-      {"consumer_id": "PHOENIX_SHADOW_DISPATCH", "exists": true, "ack_pending": "0", "pending": "3", "redeliveries": "0", "oldest_pending_age_seconds": "15"}
+      {"consumer_id": "PHOENIX_ENGINE_SHADOW", "exists": true, "ack_pending": "1", "pending": "3", "redeliveries": "1", "oldest_pending_age_seconds": "6"}
     ],
     "persistence": {
       "throughput_per_second": "12.5",

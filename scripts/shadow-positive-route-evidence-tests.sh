@@ -1,8 +1,10 @@
 #!/usr/bin/env sh
+# Literal grep patterns and variables consumed by the sourced workflow are intentional.
+# shellcheck disable=SC2016,SC2034,SC2329
 set -eu
 
-script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
-repo_dir=$(CDPATH= cd -- "$script_dir/.." && pwd)
+script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
+repo_dir=$(CDPATH='' cd -- "$script_dir/.." && pwd)
 workflow=$script_dir/shadow-positive-route-evidence.sh
 test_root=$(mktemp -d)
 test_log=$test_root/compose.log
@@ -22,12 +24,17 @@ export SHADOW_POSITIVE_ROUTE_EVIDENCE_LIBRARY_ONLY
 test_tx_a=0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 test_tx_b=0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
 test_sequence=461219428
-test_identity_a=phoenix.engine.input.v1:$test_sequence:$test_tx_a
 test_identity_b=phoenix.engine.input.v1:$test_sequence:$test_tx_b
 test_route=arb1-weth-usdc-uni500-uni3000-canary-v2
 RUN_STARTED_AT_UTC=2026-07-14T14:20:00.000000Z
 
-primary_report='{"source_event_identity":"'$test_identity_b'","source_sequence":"'$test_sequence'","source_transaction_hash":"'$test_tx_b'","classification":"candidate_rejected","rejection_reason":"no_profitable_candidate","candidate_count":1,"matched_route_id":"'$test_route'","processing_attempt_id":20931,"delivery_attempt":4,"processing_attempt_completed_at":"2026-07-14T14:24:02.000000+00:00","persisted_timestamp":"2026-07-14T14:24:02.000000+00:00","pinned_block_number":"483792695","pinned_block_hash":"0xfdb4b9a0a59ecf4c675b725390d41cb2820fe59a89caa0b7359b47eb644dda45","primary_state_hash":"1397b50a50d7b6128075572a6c730d731e0a5512c2463999cb509b7c989aa013","route_config_hash":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","primary_provider_result":"publicnode","verification_status":"primary_only","independent_verification_status":"not_requested","independent_verification_lifecycle":["not_requested"],"independent_verification_skip_reason":"primary_screen_no_profitable_candidate","shadow_only":true,"execution_request_created":false}'
+primary_report='{"source_event_identity":"'$test_identity_b'","source_sequence":"'$test_sequence'","source_transaction_hash":"'$test_tx_b'","classification":"candidate_rejected","rejection_reason":"liquidity_insufficient","candidate_count":1,"matched_route_id":"'$test_route'","processing_attempt_id":20931,"delivery_attempt":4,"processing_attempt_completed_at":"2026-07-14T14:24:02.000000+00:00","persisted_timestamp":"2026-07-14T14:24:02.000000+00:00","pinned_block_number":"483792695","pinned_block_hash":"0xfdb4b9a0a59ecf4c675b725390d41cb2820fe59a89caa0b7359b47eb644dda45","primary_state_hash":"1397b50a50d7b6128075572a6c730d731e0a5512c2463999cb509b7c989aa013","route_config_hash":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","primary_provider_result":"publicnode","verification_status":"primary_only","primary_screen_rejected":true,"secondary_skipped":true,"independent_verification_status":"not_requested","independent_verification_lifecycle":["not_requested"],"independent_verification_skip_reason":"primary_screen_no_profitable_candidate","shadow_only":true,"execution_request_created":false}'
+primary_no_profit_report=$(printf '%s' "$primary_report" | python3 -c '
+import json, sys
+report = json.load(sys.stdin)
+report["rejection_reason"] = "no_profitable_candidate"
+print(json.dumps(report, separators=(",", ":")))
+')
 agreed_report='{"source_event_identity":"'$test_identity_b'","source_sequence":"'$test_sequence'","source_transaction_hash":"'$test_tx_b'","classification":"shadow_accepted","rejection_reason":"shadow_policy_accepted","candidate_count":1,"matched_route_id":"'$test_route'","processing_attempt_id":20932,"delivery_attempt":5,"processing_attempt_completed_at":"2026-07-14T14:25:02.000000+00:00","persisted_timestamp":"2026-07-14T14:25:02.000000+00:00","pinned_block_number":"483792696","pinned_block_hash":"0xcccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","primary_state_hash":"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd","route_config_hash":"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff","rpc_response_hash":"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee","primary_provider_result":"publicnode","verification_status":"agreed","independent_verification_status":"agreed","independent_verification_lifecycle":["requested","agreed"],"independent_provider_result":"secondary","verification_agreement":"agreed","secondary_state_hash":"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd","secondary_block_number":"483792696","secondary_block_hash":"0xcccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","secondary_route_config_hash":"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff","shadow_disposition":"accepted","shadow_only":true,"execution_request_created":false}'
 
 fake_psql_mode=historical_only
@@ -40,6 +47,7 @@ sql_query() {
       printf '%s|%s|%s|%s\n' "$test_identity_b" "$test_tx_b" "$test_sequence" "$test_route"
       ;;
     primary_report) printf '%s\n' "$primary_report" ;;
+    primary_no_profit_report) printf '%s\n' "$primary_no_profit_report" ;;
     agreed_report) printf '%s\n' "$agreed_report" ;;
     *) return 1 ;;
   esac
@@ -91,6 +99,21 @@ assert report["delivery_attempt"] == 4
 assert report["source_transaction_hash"].endswith("b" * 64)
 ' || fail 'newest fake attempt tuple was not preserved'
 
+fake_psql_mode=primary_no_profit_report
+no_profit_report=$(positive_evidence_runtime_report) || fail 'fake no-profit report query failed'
+positive_evidence_validate_runtime_report "$no_profit_report" ||
+  fail 'no-profitable-candidate primary-only report validation failed'
+grep -F "normalized.rejection_reason IN ('no_profitable_candidate', 'liquidity_insufficient')" \
+  "$fake_psql_query" >/dev/null || fail 'primary-only rejection allowlist is missing from SQL'
+grep -F "THEN jsonb_build_array('not_requested')" "$fake_psql_query" >/dev/null ||
+  fail 'not-requested lifecycle is not built structurally'
+grep -F "THEN jsonb_build_array('requested', 'provider_unavailable')" \
+  "$fake_psql_query" >/dev/null || fail 'provider-unavailable lifecycle is not built structurally'
+if grep -F "'[\"not_requested\"]'::jsonb" "$workflow" >/dev/null ||
+  grep -F "'[\"requested\", \"provider_unavailable\"]'::jsonb" "$workflow" >/dev/null; then
+  fail 'runtime SQL still uses quoted JSON array literals'
+fi
+
 # 4, 5 and 6. Identity fields describe the schema honestly.
 printf '%s' "$runtime_report" | python3 -c '
 import json, sys
@@ -111,6 +134,10 @@ printf '%s' "$runtime_report" | python3 -c '
 import json, sys
 report = json.load(sys.stdin)
 assert report["verification_status"] == "primary_only"
+assert report["classification"] == "candidate_rejected"
+assert report["rejection_reason"] == "liquidity_insufficient"
+assert report["primary_screen_rejected"] is True
+assert report["secondary_skipped"] is True
 assert report["independent_verification_status"] == "not_requested"
 assert report["independent_verification_lifecycle"] == ["not_requested"]
 assert report["independent_verification_skip_reason"] == "primary_screen_no_profitable_candidate"
@@ -118,6 +145,55 @@ assert "independent_provider_result" not in report
 assert "verification_agreement" not in report
 assert "rpc_response_hash" not in report
 ' || fail 'primary-only skip semantics are ambiguous'
+
+assert_primary_report_rejected() {
+  rejected_report=$1
+  rejected_label=$2
+  if positive_evidence_validate_runtime_report "$rejected_report"; then
+    fail "$rejected_label was accepted"
+  fi
+}
+
+mutate_primary_report() {
+  mutation=$1
+  printf '%s' "$primary_report" | python3 -c '
+import json
+import sys
+
+mutation = sys.argv[1]
+report = json.load(sys.stdin)
+if mutation == "unknown_reason":
+    report["rejection_reason"] = "unreviewed_reason"
+elif mutation == "accepted_primary_only":
+    report["classification"] = "shadow_accepted"
+elif mutation == "secondary_evidence":
+    report["secondary_state_hash"] = "d" * 64
+elif mutation == "old_baseline":
+    report["processing_attempt_completed_at"] = "2026-07-14T14:19:59+00:00"
+elif mutation == "execution_request":
+    report["execution_request_created"] = True
+elif mutation == "primary_screen_not_rejected":
+    report["primary_screen_rejected"] = False
+elif mutation == "secondary_not_skipped":
+    report["secondary_skipped"] = False
+else:
+    raise SystemExit(2)
+print(json.dumps(report, separators=(",", ":")))
+' "$mutation"
+}
+
+for rejected_case in \
+  unknown_reason \
+  accepted_primary_only \
+  secondary_evidence \
+  old_baseline \
+  execution_request \
+  primary_screen_not_rejected \
+  secondary_not_skipped; do
+  rejected_report=$(mutate_primary_report "$rejected_case") ||
+    fail "could not construct $rejected_case report"
+  assert_primary_report_rejected "$rejected_report" "$rejected_case"
+done
 
 # 9. A genuine independent-provider agreement remains distinct and explicit.
 fake_psql_mode=agreed_report
