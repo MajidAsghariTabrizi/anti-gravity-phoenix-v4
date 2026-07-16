@@ -76,6 +76,9 @@ install -m 0640 -o phoenix -g phoenix \
   "$repo_root/scripts/sql/prelive-money-path-report.sql" \
   /opt/phoenix/deploy/sql/prelive-money-path-report.sql
 install -m 0640 -o phoenix -g phoenix \
+  "$repo_root/scripts/sql/prelive-dashboard-source.sql" \
+  /opt/phoenix/deploy/sql/prelive-dashboard-source.sql
+install -m 0640 -o phoenix -g phoenix \
   "$repo_root/schemas/prelive-money-path-summary.schema.json" \
   /opt/phoenix/deploy/schemas/prelive-money-path-summary.schema.json
 install -m 0640 -o phoenix -g phoenix \
@@ -100,6 +103,10 @@ for script in \
   prelive-money-path-report.sh \
   prelive_money_path_report.py \
   prelive_dashboard_snapshot.py \
+  prelive_dashboard_live.py \
+  prelive_shadow_control.py \
+  prelive-shadow-control.sh \
+  verify_dashboard_compose.py \
   rollback-release.sh \
   deploy-release.sh
 do

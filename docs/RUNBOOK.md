@@ -25,6 +25,23 @@ The command fails closed when a production scrape, PostgreSQL, Prometheus, the d
 context, or any SHADOW safety invariant is unavailable. Treat a failed report as missing evidence,
 not as a zero observation. Preserve the JSON form with the release SHA when collecting soak evidence.
 
+## Continuous SHADOW Control Plane
+
+The complete controller contract is documented in
+[`PRELIVE_SHADOW_CONTROL_PLANE.md`](PRELIVE_SHADOW_CONTROL_PLANE.md). Inspect a
+deterministic plan before any authorized host run:
+
+```sh
+/opt/phoenix/deploy/prelive-shadow-control.sh plan 15m
+```
+
+Run preflight separately, then run exactly one reviewed mode. The controller
+must never operate on the protected relay, Feed Ingestor, NATS, PostgreSQL, or
+Recorder lifecycle. A failure, missing snapshot, shortened duration, identity
+change, non-zero execution activity, or missing historical evidence is a
+blocked state. Do not substitute fixtures, manually edit evidence, or relabel a
+Dashboard gate as a readiness decision.
+
 ## Bounded Engine Canary
 
 Set `SHADOW_ENGINE_CANARY_INPUT_LIMIT` only for a manually reviewed SHADOW smoke run:

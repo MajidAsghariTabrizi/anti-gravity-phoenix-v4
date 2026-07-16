@@ -45,6 +45,8 @@ sh scripts/shadow-route-discovery-tests.sh
 python -m py_compile scripts/prelive_money_path_report.py
 sh scripts/prelive-money-path-report-tests.sh
 python -m unittest discover -s dashboard/tests -p "test_*.py" -v
+python -m unittest scripts.tests.test_prelive_shadow_control scripts.tests.test_prelive_dashboard_live -v
+sh scripts/prelive-shadow-control-tests.sh
 python scripts/prelive_dashboard_snapshot.py --input fixtures/dashboard/latest-dashboard.json --output fixtures/dashboard/checked-dashboard.json --check
 ```
 
@@ -65,6 +67,7 @@ Bounded read-only route discovery and its evidence limits are documented in `doc
 Profit-triggered independent RPC verification is documented in `docs/SHADOW_SECONDARY_VERIFICATION.md`.
 Bounded technical and business money-path evidence is documented in `docs/PRELIVE_MONEY_PATH_OBSERVABILITY.md`.
 The evidence-only technical and business Dashboard is documented in `docs/PRELIVE_DASHBOARD.md`.
+The protected-service-safe continuous SHADOW control plane is documented in `docs/PRELIVE_SHADOW_CONTROL_PLANE.md`.
 
 Current real Nitro feed status: Nitro relay parsing is implemented for first SHADOW runtime verification but not live-verified. Production relay mode can start for Linux VPS validation, but real-feed evidence is still required before any production-readiness or LIVE claim.
 
