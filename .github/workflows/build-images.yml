@@ -38,6 +38,9 @@ jobs:
           - image: recorder
             dockerfile: deploy/rust.Dockerfile
             build_args: "CRATE=recorder"
+          - image: fork-sandbox
+            dockerfile: deploy/fork-sandbox.Dockerfile
+            build_args: ""
           - image: dashboard
             dockerfile: deploy/dashboard.Dockerfile
             build_args: ""
@@ -99,9 +102,49 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
+  assets:
+    name: release-assets
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+
+      - name: Install Foundry
+        uses: foundry-rs/foundry-toolchain@b00af27efadbc7b4ca8b82abbd903b17cc874d2a
+        with:
+          version: stable
+
+      - name: Build and verify immutable release assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          forge build --root contracts
+          python3 -m unittest scripts.tests.test_release_assets
+          python3 scripts/release_assets.py build \
+            --repo-root . \
+            --release-sha "$GITHUB_SHA" \
+            --contract-artifact contracts/out/PhoenixExecutor.sol/PhoenixExecutor.json \
+            --output-dir release-assets
+          python3 scripts/release_assets.py verify \
+            --archive "release-assets/phoenix-release-assets-${GITHUB_SHA}.tar.gz" \
+            --manifest release-assets/release-assets-manifest.json \
+            --checksums release-assets/release-assets-checksums.txt \
+            --expected-sha "$GITHUB_SHA"
+
+      - name: Upload immutable release assets
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: phoenix-release-assets-${{ github.sha }}
+          path: release-assets/
+          if-no-files-found: error
+          retention-days: 90
+
   manifest:
     name: release-manifest
-    needs: [build]
+    needs: [build, assets]
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
@@ -127,6 +170,10 @@ jobs:
           images = {}
           for path in sorted(Path("manifest-fragments").glob("*.json")):
               item = json.loads(path.read_text())
+              if set(item) != {"name", "repository", "tag", "digest"}:
+                  raise SystemExit(f"invalid release fragment contract in {path}")
+              if item["name"] in images:
+                  raise SystemExit(f"duplicate release image fragment for {item['name']}")
               if not item["tag"].startswith("sha-") or len(item["tag"]) != 44:
                   raise SystemExit(f"mutable or invalid tag in {path}")
               if not item["digest"].startswith("sha256:"):
@@ -136,6 +183,16 @@ jobs:
                   "tag": item["tag"],
                   "digest": item["digest"],
               }
+          expected = {
+              "dashboard",
+              "feed-ingestor",
+              "fork-sandbox",
+              "phoenix-engine",
+              "recorder",
+              "rpc-gateway",
+          }
+          if set(images) != expected:
+              raise SystemExit("release manifest image set is incomplete or unexpected")
           manifest = {
               "schema": "phoenix.release.v1",
               "release_sha": os.environ["GITHUB_SHA"],

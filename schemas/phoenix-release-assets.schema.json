@@ -1,0 +1,59 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://phoenix.invalid/schemas/phoenix-release-assets.schema.json",
+  "title": "Phoenix immutable release assets",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "release_sha",
+    "files"
+  ],
+  "properties": {
+    "schema": {
+      "const": "phoenix.release-assets.v1"
+    },
+    "release_sha": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{40}$"
+    },
+    "files": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 512,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "mode",
+          "path",
+          "sha256",
+          "size_bytes"
+        ],
+        "properties": {
+          "mode": {
+            "enum": [
+              "0644",
+              "0755"
+            ]
+          },
+          "path": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 255,
+            "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.(?:/|$))[A-Za-z0-9._/-]+$"
+          },
+          "sha256": {
+            "type": "string",
+            "pattern": "^sha256:[0-9a-f]{64}$"
+          },
+          "size_bytes": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 8388608
+          }
+        }
+      }
+    }
+  }
+}
