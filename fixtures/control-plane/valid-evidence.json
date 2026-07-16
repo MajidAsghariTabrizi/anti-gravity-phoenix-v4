@@ -1,0 +1,128 @@
+{
+  "schema_version": "phoenix.prelive.shadow-control-evidence.v1",
+  "run_id": "shadow-15m-111111111111",
+  "mode": "15m",
+  "planned_duration_seconds": 900,
+  "started_at": "2026-07-16T00:00:00Z",
+  "ended_at": "2026-07-16T00:15:00Z",
+  "status": "completed",
+  "database_clock": {
+    "preflight_baseline": "2026-07-15T23:59:59Z",
+    "first_sample": "2026-07-16T00:00:00Z",
+    "last_sample": "2026-07-16T00:15:00Z"
+  },
+  "release": {
+    "git_sha": "1111111111111111111111111111111111111111",
+    "release_manifest_sha256": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+    "release_checksum_sha256": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+    "route_registry_hash": "sha256:3333333333333333333333333333333333333333333333333333333333333333",
+    "images": [
+      {"service": "nitro-feed-relay", "digest": "sha256:0101010101010101010101010101010101010101010101010101010101010101"},
+      {"service": "feed-ingestor", "digest": "sha256:0202020202020202020202020202020202020202020202020202020202020202"},
+      {"service": "nats", "digest": "sha256:0303030303030303030303030303030303030303030303030303030303030303"},
+      {"service": "postgres", "digest": "sha256:0404040404040404040404040404040404040404040404040404040404040404"},
+      {"service": "recorder", "digest": "sha256:0505050505050505050505050505050505050505050505050505050505050505"},
+      {"service": "prometheus", "digest": "sha256:0606060606060606060606060606060606060606060606060606060606060606"},
+      {"service": "rpc-gateway", "digest": "sha256:0707070707070707070707070707070707070707070707070707070707070707"},
+      {"service": "shadow-dispatcher", "digest": "sha256:0808080808080808080808080808080808080808080808080808080808080808"},
+      {"service": "phoenix-engine", "digest": "sha256:0909090909090909090909090909090909090909090909090909090909090909"},
+      {"service": "dashboard", "digest": "sha256:1010101010101010101010101010101010101010101010101010101010101010"}
+    ]
+  },
+  "safety": {
+    "mode": "SHADOW",
+    "live_execution": false,
+    "execution_eligible": false,
+    "execution_request_created": false,
+    "signer_configured": false,
+    "wallet_configured": false,
+    "executor_configured": false,
+    "execution_request_count_before": "0",
+    "execution_request_count_after": "0",
+    "submission_method_invocations": "0"
+  },
+  "preflight": [
+    {"check": "canonical_render", "status": "pass", "observed_at": "2026-07-16T00:00:00Z"},
+    {"check": "immutable_images", "status": "pass", "observed_at": "2026-07-16T00:00:00Z"},
+    {"check": "release_manifest", "status": "pass", "observed_at": "2026-07-16T00:00:00Z"},
+    {"check": "route_registry", "status": "pass", "observed_at": "2026-07-16T00:00:00Z"},
+    {"check": "chain_id", "status": "pass", "observed_at": "2026-07-16T00:00:00Z"},
+    {"check": "shadow_mode", "status": "pass", "observed_at": "2026-07-16T00:00:00Z"},
+    {"check": "live_execution_disabled", "status": "pass", "observed_at": "2026-07-16T00:00:00Z"},
+    {"check": "execution_configuration_blank", "status": "pass", "observed_at": "2026-07-16T00:00:00Z"},
+    {"check": "broadcast_disabled", "status": "pass", "observed_at": "2026-07-16T00:00:00Z"},
+    {"check": "rpc_state_budget", "status": "pass", "observed_at": "2026-07-16T00:00:00Z"},
+    {"check": "rpc_upstream_budget", "status": "pass", "observed_at": "2026-07-16T00:00:00Z"},
+    {"check": "postgres_connectivity", "status": "pass", "observed_at": "2026-07-16T00:00:00Z"},
+    {"check": "nats_connectivity", "status": "pass", "observed_at": "2026-07-16T00:00:00Z"},
+    {"check": "jetstream_resources", "status": "pass", "observed_at": "2026-07-16T00:00:00Z"},
+    {"check": "migrations", "status": "pass", "observed_at": "2026-07-16T00:00:00Z"},
+    {"check": "dashboard_read_only", "status": "pass", "observed_at": "2026-07-16T00:00:00Z"},
+    {"check": "prometheus_config", "status": "pass", "observed_at": "2026-07-16T00:00:00Z"},
+    {"check": "execution_requests_zero", "status": "pass", "observed_at": "2026-07-16T00:00:00Z"}
+  ],
+  "protected_identity": {
+    "before_sha256": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "after_sha256": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "stable": true
+  },
+  "service_states": {
+    "before": [
+      {"service": "nitro-feed-relay", "state": "running_healthy", "image_digest": "sha256:0101010101010101010101010101010101010101010101010101010101010101", "restart_count": 0, "observed_at": "2026-07-16T00:00:00Z"},
+      {"service": "feed-ingestor", "state": "running_healthy", "image_digest": "sha256:0202020202020202020202020202020202020202020202020202020202020202", "restart_count": 0, "observed_at": "2026-07-16T00:00:00Z"},
+      {"service": "nats", "state": "running_healthy", "image_digest": "sha256:0303030303030303030303030303030303030303030303030303030303030303", "restart_count": 0, "observed_at": "2026-07-16T00:00:00Z"},
+      {"service": "postgres", "state": "running_healthy", "image_digest": "sha256:0404040404040404040404040404040404040404040404040404040404040404", "restart_count": 0, "observed_at": "2026-07-16T00:00:00Z"},
+      {"service": "recorder", "state": "running_healthy", "image_digest": "sha256:0505050505050505050505050505050505050505050505050505050505050505", "restart_count": 0, "observed_at": "2026-07-16T00:00:00Z"},
+      {"service": "prometheus", "state": "stopped_clean", "image_digest": "sha256:0606060606060606060606060606060606060606060606060606060606060606", "restart_count": 0, "observed_at": "2026-07-16T00:00:00Z"},
+      {"service": "rpc-gateway", "state": "stopped_clean", "image_digest": "sha256:0707070707070707070707070707070707070707070707070707070707070707", "restart_count": 0, "observed_at": "2026-07-16T00:00:00Z"},
+      {"service": "shadow-dispatcher", "state": "stopped_clean", "image_digest": "sha256:0808080808080808080808080808080808080808080808080808080808080808", "restart_count": 0, "observed_at": "2026-07-16T00:00:00Z"},
+      {"service": "phoenix-engine", "state": "stopped_clean", "image_digest": "sha256:0909090909090909090909090909090909090909090909090909090909090909", "restart_count": 0, "observed_at": "2026-07-16T00:00:00Z"},
+      {"service": "dashboard", "state": "stopped_clean", "image_digest": "sha256:1010101010101010101010101010101010101010101010101010101010101010", "restart_count": 0, "observed_at": "2026-07-16T00:00:00Z"}
+    ],
+    "during": [
+      {"service": "nitro-feed-relay", "state": "running_healthy", "image_digest": "sha256:0101010101010101010101010101010101010101010101010101010101010101", "restart_count": 0, "observed_at": "2026-07-16T00:07:30Z"},
+      {"service": "feed-ingestor", "state": "running_healthy", "image_digest": "sha256:0202020202020202020202020202020202020202020202020202020202020202", "restart_count": 0, "observed_at": "2026-07-16T00:07:30Z"},
+      {"service": "nats", "state": "running_healthy", "image_digest": "sha256:0303030303030303030303030303030303030303030303030303030303030303", "restart_count": 0, "observed_at": "2026-07-16T00:07:30Z"},
+      {"service": "postgres", "state": "running_healthy", "image_digest": "sha256:0404040404040404040404040404040404040404040404040404040404040404", "restart_count": 0, "observed_at": "2026-07-16T00:07:30Z"},
+      {"service": "recorder", "state": "running_healthy", "image_digest": "sha256:0505050505050505050505050505050505050505050505050505050505050505", "restart_count": 0, "observed_at": "2026-07-16T00:07:30Z"},
+      {"service": "prometheus", "state": "running_healthy", "image_digest": "sha256:0606060606060606060606060606060606060606060606060606060606060606", "restart_count": 0, "observed_at": "2026-07-16T00:07:30Z"},
+      {"service": "rpc-gateway", "state": "running_healthy", "image_digest": "sha256:0707070707070707070707070707070707070707070707070707070707070707", "restart_count": 0, "observed_at": "2026-07-16T00:07:30Z"},
+      {"service": "shadow-dispatcher", "state": "running_healthy", "image_digest": "sha256:0808080808080808080808080808080808080808080808080808080808080808", "restart_count": 0, "observed_at": "2026-07-16T00:07:30Z"},
+      {"service": "phoenix-engine", "state": "running_healthy", "image_digest": "sha256:0909090909090909090909090909090909090909090909090909090909090909", "restart_count": 0, "observed_at": "2026-07-16T00:07:30Z"},
+      {"service": "dashboard", "state": "running_healthy", "image_digest": "sha256:1010101010101010101010101010101010101010101010101010101010101010", "restart_count": 0, "observed_at": "2026-07-16T00:07:30Z"}
+    ],
+    "after": [
+      {"service": "nitro-feed-relay", "state": "running_healthy", "image_digest": "sha256:0101010101010101010101010101010101010101010101010101010101010101", "restart_count": 0, "observed_at": "2026-07-16T00:15:00Z"},
+      {"service": "feed-ingestor", "state": "running_healthy", "image_digest": "sha256:0202020202020202020202020202020202020202020202020202020202020202", "restart_count": 0, "observed_at": "2026-07-16T00:15:00Z"},
+      {"service": "nats", "state": "running_healthy", "image_digest": "sha256:0303030303030303030303030303030303030303030303030303030303030303", "restart_count": 0, "observed_at": "2026-07-16T00:15:00Z"},
+      {"service": "postgres", "state": "running_healthy", "image_digest": "sha256:0404040404040404040404040404040404040404040404040404040404040404", "restart_count": 0, "observed_at": "2026-07-16T00:15:00Z"},
+      {"service": "recorder", "state": "running_healthy", "image_digest": "sha256:0505050505050505050505050505050505050505050505050505050505050505", "restart_count": 0, "observed_at": "2026-07-16T00:15:00Z"},
+      {"service": "prometheus", "state": "stopped_clean", "image_digest": "sha256:0606060606060606060606060606060606060606060606060606060606060606", "restart_count": 0, "observed_at": "2026-07-16T00:15:00Z"},
+      {"service": "rpc-gateway", "state": "stopped_clean", "image_digest": "sha256:0707070707070707070707070707070707070707070707070707070707070707", "restart_count": 0, "observed_at": "2026-07-16T00:15:00Z"},
+      {"service": "shadow-dispatcher", "state": "stopped_clean", "image_digest": "sha256:0808080808080808080808080808080808080808080808080808080808080808", "restart_count": 0, "observed_at": "2026-07-16T00:15:00Z"},
+      {"service": "phoenix-engine", "state": "stopped_clean", "image_digest": "sha256:0909090909090909090909090909090909090909090909090909090909090909", "restart_count": 0, "observed_at": "2026-07-16T00:15:00Z"},
+      {"service": "dashboard", "state": "stopped_clean", "image_digest": "sha256:1010101010101010101010101010101010101010101010101010101010101010", "restart_count": 0, "observed_at": "2026-07-16T00:15:00Z"}
+    ]
+  },
+  "samples": {"count": 31, "first_observed_at": "2026-07-16T00:00:00Z", "last_observed_at": "2026-07-16T00:15:00Z"},
+  "funnels": {
+    "candidate": {"feed_inputs": "100", "supported_swaps": "80", "route_matches": "50", "candidates": "10"},
+    "profitability": {"candidates": "10", "complete": "8", "primary_profitable": "3", "accepted": "2"},
+    "verification": {"requested": "3", "agreed": "2", "disagreed": "1", "unavailable": "0"},
+    "fork": {"planned": "3", "simulated": "2", "passed": "1", "profitable": "1", "reverted": "1"}
+  },
+  "metrics": {
+    "rpc": {"requests": "25", "success": "22", "timeouts": "1", "rate_limited": "1", "unavailable": "1", "disagreements": "1"},
+    "jetstream": {"streams": "2", "consumers": "3", "pending": "4", "ack_pending": "1", "redeliveries": "0"},
+    "database": {"size_start_bytes": "1000", "size_end_bytes": "1200", "growth_bytes": "200"},
+    "feed": {"messages": "100", "gaps": "1", "missing_sequences": "2", "decode_failures": "0"}
+  },
+  "bounded_errors": [
+    {"observed_at": "2026-07-16T00:08:00Z", "service": "rpc-gateway", "class": "verification_disagreement", "message": "Independent verification disagreed for one bounded evaluation"}
+  ],
+  "artifacts": [
+    {"kind": "technical_json", "path": "technical.json", "sha256": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "size_bytes": 128},
+    {"kind": "business_json", "path": "business.json", "sha256": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc", "size_bytes": 128},
+    {"kind": "dashboard_snapshot", "path": "latest-dashboard.json", "sha256": "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd", "size_bytes": 512}
+  ]
+}
