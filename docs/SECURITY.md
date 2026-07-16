@@ -18,7 +18,7 @@ Phoenix v4 is shadow-first and secrets-clean by default.
 | Threat | Control |
 | --- | --- |
 | GitHub Actions token overreach | Workflows default to `contents: read`; image publishing alone grants `packages: write`; deployment grants `actions: read` for artifact download. |
-| Pull request secret exposure | CI pull-request workflows do not use production secrets. Deployment secrets are only used by the workflow-run deployment from `main`. |
+| Pull request secret exposure | CI pull-request workflows do not use production secrets. Deployment secrets are available only to an acknowledged manual job in the `production-shadow` environment. |
 | Malicious dependency action | Third-party and official actions are pinned to full commit SHAs and documented in `docs/GITHUB_ACTIONS_DEPENDENCIES.md`. |
 | Unpinned actions | Workflows must not use floating tags; Dependabot updates require review. |
 | SSH key leakage | Deploy SSH key is a GitHub secret, written to `~/.ssh/id_ed25519` with mode `0600`, and never printed. Use a dedicated production deploy key. |
@@ -30,6 +30,9 @@ Phoenix v4 is shadow-first and secrets-clean by default.
 | Fixture accidentally used in production | `feed-ingestor` fails startup if `PHOENIX_ENV=production` and `PHOENIX_FEED_FIXTURE` is set. |
 | LIVE accidentally enabled | Production Compose forces `PHOENIX_MODE=SHADOW` and `LIVE_EXECUTION=false`; release-live workflow cannot edit env or restart LIVE. |
 | Mutable image deployment | Build workflow emits `sha-<full git sha>` tags and digests; deploy scripts reject missing digests and never consume `latest`. |
+| Mutable release assets | A deterministic exact-SHA bundle records every allowed path, mode, size, and digest; archive and extracted-tree verification reject symlinks, traversal, extras, and drift before bootstrap promotes the asset marker. |
+| Automatic production rollout | Image publication cannot trigger deployment. Manual dispatch requires current-main release evidence, prepared rollback evidence, an explicit acknowledgement, and the production environment gate. |
+| Protected service recreation | Deploy and rollback fingerprint relay, feed-ingestor, NATS, PostgreSQL, and Recorder IDs. Candidate protected-image digest changes fail before SSH; optional services start individually with `--no-deps`. |
 | Migration tampering | Migration runner stores SHA-256 checksums and fails if an already-applied migration changes. |
 | NATS network exposure | NATS is only on the Docker network and not published to the host. |
 | PostgreSQL exposure | PostgreSQL is only on the Docker network and uses production env credentials, not local defaults. |
