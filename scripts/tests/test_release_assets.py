@@ -1,5 +1,6 @@
 import hashlib
 import json
+import os
 import tarfile
 import tempfile
 import unittest
@@ -76,6 +77,18 @@ class ReleaseAssetsTests(unittest.TestCase):
             release_assets.verify_release_tree(root, manifest, RELEASE_SHA)
             (root / "unexpected.txt").write_text("unexpected", encoding="ascii")
             with self.assertRaisesRegex(release_assets.ReleaseAssetError, "member set"):
+                release_assets.verify_release_tree(root, manifest, RELEASE_SHA)
+
+    @unittest.skipUnless(os.name == "posix", "POSIX mode enforcement")
+    def test_extracted_tree_rejects_mode_drift(self) -> None:
+        with tempfile.TemporaryDirectory() as raw, tempfile.TemporaryDirectory() as tree_raw:
+            archive, manifest, _ = self.build(Path(raw))
+            with tarfile.open(archive, mode="r:gz") as bundle:
+                bundle.extractall(tree_raw, filter="data")
+            root = Path(tree_raw) / f"phoenix-release-{RELEASE_SHA}"
+            target = root / "scripts" / "deploy-release.sh"
+            target.chmod(0o644)
+            with self.assertRaisesRegex(release_assets.ReleaseAssetError, "mode mismatch"):
                 release_assets.verify_release_tree(root, manifest, RELEASE_SHA)
 
     def test_archive_corruption_is_rejected(self) -> None:

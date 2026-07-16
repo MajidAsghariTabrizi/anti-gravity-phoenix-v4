@@ -122,10 +122,13 @@ candidate state.
 ## Rollback
 
 `rollback-release.sh` reads `previous-release`, validates that manifest, and
-restores only the five optional SHADOW services one at a time. It fingerprints
-the same protected container IDs before and after, uses bounded health waits,
-and reports rollback success only after health and release-context validation
-pass.
+integrity-checks and restores the immutable release-assets tree for that exact
+SHA before restoring the five optional SHADOW services one at a time. It
+fingerprints the same protected container IDs before and after, uses bounded
+health waits, and reports rollback success only after health and
+release-context validation pass. Deployment is blocked before asset
+installation unless the active rollback pointer, asset marker, and immutable
+tree all agree.
 
 Database migrations are forward-only. Rollbacks require backward-compatible migrations until a dedicated manual data rollback plan exists.
 

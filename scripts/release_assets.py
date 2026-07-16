@@ -10,6 +10,7 @@ import io
 import json
 import os
 import re
+import stat
 import sys
 import tarfile
 import tempfile
@@ -385,10 +386,16 @@ def verify_release_tree(root: Path, manifest_path: Path, expected_sha: str) -> N
         raise ReleaseAssetError("release-assets tree member set is invalid")
     if _read_bounded(observed[MANIFEST_NAME]) != manifest_bytes:
         raise ReleaseAssetError("release-assets tree manifest mismatch")
+    if os.name == "posix" and stat.S_IMODE(observed[MANIFEST_NAME].stat().st_mode) != 0o644:
+        raise ReleaseAssetError("release-assets tree manifest mode mismatch")
     for relative, item in files.items():
         payload = _read_bounded(observed[relative])
         if len(payload) != item["size_bytes"] or _sha256(payload) != item["sha256"]:
             raise ReleaseAssetError("release-assets tree payload mismatch")
+        if os.name == "posix" and stat.S_IMODE(observed[relative].stat().st_mode) != int(
+            str(item["mode"]), 8
+        ):
+            raise ReleaseAssetError("release-assets tree mode mismatch")
 
 
 def _parser() -> argparse.ArgumentParser:

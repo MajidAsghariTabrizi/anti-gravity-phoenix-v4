@@ -3,6 +3,7 @@ set -eu
 
 deploy_root="${PHOENIX_DEPLOY_ROOT:-/opt/phoenix}"
 deploy_dir="$deploy_root/deploy"
+release_root="${PHOENIX_RELEASE_ROOT:-$deploy_root/releases}"
 env_file="${PHOENIX_ENV_FILE:-/etc/phoenix/phoenix.env}"
 compose_file="$deploy_dir/compose.prod.yml"
 current_file="$deploy_dir/current-release"
@@ -27,6 +28,7 @@ case "$release_sha" in
 esac
 [ "${#release_sha}" -eq 40 ] || fail "previous release SHA is invalid"
 
+release_assets_root="$release_root/$release_sha"
 manifest="$deploy_dir/manifests/$release_sha.json"
 release_env="$deploy_dir/manifests/$release_sha.env"
 release_metadata="$deploy_dir/manifests/$release_sha.render.json"
@@ -34,6 +36,9 @@ release_state="$deploy_dir/manifests/$release_sha.state.json"
 [ -f "$manifest" ] || fail "release manifest is missing"
 [ -f "$compose_file" ] || fail "production compose file is missing"
 [ -f "$env_file" ] || fail "production environment file is missing"
+[ -d "$release_assets_root" ] || fail "immutable rollback release assets are missing"
+[ -f "$release_assets_root/release-assets-manifest.json" ] ||
+  fail "rollback release-assets manifest is missing"
 case "$service_wait_seconds" in
   ''|*[!0-9]*) fail "service wait seconds must be an integer" ;;
 esac
@@ -42,6 +47,16 @@ esac
 
 command -v python3 >/dev/null 2>&1 || fail "python3 is unavailable"
 command -v cmp >/dev/null 2>&1 || fail "cmp is unavailable"
+python3 "$deploy_dir/release_assets.py" verify-tree \
+  --root "$release_assets_root" \
+  --manifest "$release_assets_root/release-assets-manifest.json" \
+  --expected-sha "$release_sha" >/dev/null ||
+  fail "immutable rollback release assets failed integrity validation"
+"$release_assets_root/scripts/bootstrap-production.sh" "$release_sha" ||
+  fail "rollback release assets could not be restored"
+[ -s "$deploy_dir/release-assets.sha" ] || fail "rollback release-assets marker is missing"
+installed_assets_sha=$(tr -d '\r\n' <"$deploy_dir/release-assets.sha")
+[ "$installed_assets_sha" = "$release_sha" ] || fail "rollback release-assets marker is invalid"
 mkdir -p "$runtime_dir"
 chmod 0750 "$runtime_dir"
 python3 "$deploy_dir/production_context.py" manifest-env \

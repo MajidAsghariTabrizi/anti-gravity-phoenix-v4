@@ -32,6 +32,10 @@ grep -F 'phoenix-release-manifest-${{ inputs.rollback_sha }}' "$deploy_workflow"
   fail 'rollback manifest is not downloaded by exact SHA'
 grep -F 'protected image digest changed for {protected}' "$deploy_workflow" >/dev/null ||
   fail 'protected image changes do not fail before SSH'
+grep -F 'asset_sha=$(tr -d' "$deploy_workflow" >/dev/null ||
+  fail 'active rollback release-assets identity is not checked before installation'
+grep -F 'release_assets.py verify-tree' "$deploy_workflow" >/dev/null ||
+  fail 'active rollback release-assets integrity is not checked before installation'
 if grep -E 'SIGNER_PRIVATE_KEY|WALLET_ADDRESS|EXECUTOR_ADDRESS|eth_send(Raw)?Transaction' "$deploy_workflow" >/dev/null; then
   fail 'deployment workflow contains forbidden LIVE configuration or submission methods'
 fi
@@ -62,6 +66,10 @@ grep -F 'compose run --rm --no-deps migration-runner' "$deploy_script" >/dev/nul
   fail 'migration runner can still start dependencies'
 grep -F 'installed release assets do not match release SHA' "$deploy_script" >/dev/null ||
   fail 'deploy script does not require exact release assets'
+grep -F 'immutable rollback release assets failed integrity validation' "$rollback_script" >/dev/null ||
+  fail 'rollback does not validate its immutable release-assets tree'
+grep -F 'rollback release assets could not be restored' "$rollback_script" >/dev/null ||
+  fail 'rollback does not restore its exact release assets'
 
 grep -F 'not member.isfile()' "$installer" >/dev/null ||
   fail 'release installer does not reject non-file archive members'

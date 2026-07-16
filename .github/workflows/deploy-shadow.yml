@@ -211,6 +211,15 @@ jobs:
           [ -s /opt/phoenix/deploy/current-release ]
           actual=$(tr -d '\r\n' </opt/phoenix/deploy/current-release)
           [ "$actual" = "$expected" ]
+          [ -s /opt/phoenix/deploy/release-assets.sha ]
+          asset_sha=$(tr -d '\r\n' </opt/phoenix/deploy/release-assets.sha)
+          [ "$asset_sha" = "$expected" ]
+          rollback_root=/opt/phoenix/releases/$expected
+          [ -d "$rollback_root" ]
+          python3 /opt/phoenix/deploy/release_assets.py verify-tree \
+            --root "$rollback_root" \
+            --manifest "$rollback_root/release-assets-manifest.json" \
+            --expected-sha "$expected" >/dev/null
           REMOTE
           ssh "${ssh_opts[@]}" "$remote" \
             "sudo /bin/sh '$remote_stage/install-release-assets.sh' '$RELEASE_SHA' '$remote_stage/phoenix-release-assets-${RELEASE_SHA}.tar.gz' '$remote_stage/release-assets-manifest.json' '$remote_stage/release-assets-checksums.txt'"
