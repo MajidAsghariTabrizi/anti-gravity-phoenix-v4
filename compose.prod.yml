@@ -224,18 +224,17 @@ services:
 
   dashboard:
     image: ${DASHBOARD_IMAGE:?DASHBOARD_IMAGE is required}
-    <<: *common-env
-    environment:
-      POSTGRES_DSN: ${POSTGRES_DSN:?POSTGRES_DSN is required}
-      PROMETHEUS_METRICS_URL: http://prometheus:9090
+    volumes:
+      - /opt/phoenix/evidence/dashboard:/evidence:ro
     ports:
       - "127.0.0.1:8501:8501"
-    depends_on:
-      postgres:
-        condition: service_healthy
-      prometheus:
-        condition: service_healthy
     networks: [phoenix-internal]
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,mode=1777,noexec,nosuid,nodev
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
     restart: unless-stopped
     logging: *bounded-logging
     healthcheck:

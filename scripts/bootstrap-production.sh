@@ -42,6 +42,8 @@ install -d -m 0750 -o phoenix -g phoenix /opt/phoenix/data/postgres
 install -d -m 0750 -o phoenix -g phoenix /opt/phoenix/data/prometheus
 install -d -m 0750 -o phoenix -g phoenix /opt/phoenix/data/feed
 install -d -m 0750 -o phoenix -g phoenix /opt/phoenix/logs
+install -d -m 0755 -o phoenix -g phoenix /opt/phoenix/evidence
+install -d -m 0755 -o phoenix -g phoenix /opt/phoenix/evidence/dashboard
 install -d -m 0750 -o root -g root /etc/phoenix
 
 if [ ! -f /etc/phoenix/phoenix.env ]; then
@@ -77,6 +79,9 @@ install -m 0640 -o phoenix -g phoenix \
   "$repo_root/schemas/prelive-money-path-summary.schema.json" \
   /opt/phoenix/deploy/schemas/prelive-money-path-summary.schema.json
 install -m 0640 -o phoenix -g phoenix \
+  "$repo_root/dashboard/snapshot_model.py" \
+  /opt/phoenix/deploy/snapshot_model.py
+install -m 0640 -o phoenix -g phoenix \
   "$repo_root/fixtures/routes/arbitrum_uniswap_v3_pool_proofs.json" \
   /opt/phoenix/deploy/routes/arbitrum_uniswap_v3_pool_proofs.json
 for script in \
@@ -94,6 +99,7 @@ for script in \
   shadow_route_discovery.py \
   prelive-money-path-report.sh \
   prelive_money_path_report.py \
+  prelive_dashboard_snapshot.py \
   rollback-release.sh \
   deploy-release.sh
 do

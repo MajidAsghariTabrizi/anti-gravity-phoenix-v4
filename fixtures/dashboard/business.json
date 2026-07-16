@@ -1,0 +1,5 @@
+{
+  "projection": "counterfactual_not_realized",
+  "sample_count": "120",
+  "schema_version": "phoenix.prelive.business.v1"
+}
