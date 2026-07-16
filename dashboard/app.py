@@ -54,14 +54,16 @@ def _metric_grid(items: list[tuple[str, Any]], width: int = 4) -> None:
         columns = st.columns(width)
         for column, item in zip(columns, items[offset : offset + width]):
             with column:
-                kpi(item[0], item[1])
+                kpi(item[0], item[1] if item[1] is not None else "Unavailable")
 
 
 def _projection(value: str, sample_count: Decimal) -> str:
     return value if sample_count > 0 else "Unavailable"
 
 
-def _percent_from_bps(value: str) -> str:
+def _percent_from_bps(value: str | None) -> str:
+    if value is None:
+        return "Unavailable"
     return f"{Decimal(value) / Decimal(100):f}%"
 
 

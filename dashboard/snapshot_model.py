@@ -186,6 +186,18 @@ def _basis_points(value: Any) -> Decimal:
     return parsed
 
 
+def _optional_decimal(value: Any, *, signed: bool = False) -> Decimal | None:
+    if value is None:
+        return None
+    return _decimal(value, signed=signed)
+
+
+def _optional_basis_points(value: Any) -> Decimal | None:
+    if value is None:
+        return None
+    return _basis_points(value)
+
+
 def _timestamp(value: Any) -> datetime:
     text = _text(value, maximum=40)
     try:
@@ -411,7 +423,7 @@ def _validate_profitability(value: Any) -> None:
         },
     )
     for key, nested in summary.items():
-        _decimal(nested, signed=key != "total_cost" and key != "gross_profit")
+        _decimal(nested, signed=key != "total_cost")
 
     for row in _array(item["cost_breakdown"], 12):
         cost = _object(row, {"component", "amount"})
@@ -639,13 +651,13 @@ def _validate_rpc(value: Any) -> None:
             _fail("snapshot_duplicate_identity")
         seen.add(provider_id)
         roles.add(_text(provider["role"], choices={"primary", "secondary"}))
-        _basis_points(provider["success_rate_bps"])
+        _optional_basis_points(provider["success_rate_bps"])
         for key in ("timeouts", "rate_limits", "unavailable"):
             _decimal(provider[key])
         for key in ("p50_latency_ms", "p95_latency_ms", "p99_latency_ms"):
             if provider[key] is not None:
                 _decimal(provider[key])
-        _basis_points(provider["budget_utilization_bps"])
+        _optional_basis_points(provider["budget_utilization_bps"])
         _boolean(provider["self_verification_prevented"])
     if roles != {"primary", "secondary"}:
         _fail()
@@ -678,7 +690,7 @@ def _validate_jetstream(value: Any) -> None:
         _decimal(stream["messages"])
         _decimal(stream["bytes"])
         _text(stream["configured_storage"], choices={"file", "memory", "unknown"})
-        _basis_points(stream["storage_used_bps"])
+        _optional_basis_points(stream["storage_used_bps"])
     for row in _array(item["consumers"], 16):
         consumer = _object(
             row,
@@ -693,13 +705,9 @@ def _validate_jetstream(value: Any) -> None:
         )
         _text(consumer["consumer_id"], maximum=64, pattern=_SAFE_ID_RE)
         _boolean(consumer["exists"])
-        for key in (
-            "ack_pending",
-            "pending",
-            "redeliveries",
-            "oldest_pending_age_seconds",
-        ):
+        for key in ("ack_pending", "pending", "redeliveries"):
             _decimal(consumer[key])
+        _optional_decimal(consumer["oldest_pending_age_seconds"])
     persistence = _object(
         item["persistence"],
         {
@@ -709,12 +717,12 @@ def _validate_jetstream(value: Any) -> None:
             "database_write_latency_ms",
         },
     )
-    for key in ("throughput_per_second", "batch_size"):
-        _decimal(persistence[key])
-    _decimal(persistence["backlog_growth"], signed=True)
+    _optional_decimal(persistence["throughput_per_second"])
+    _optional_decimal(persistence["batch_size"])
+    _optional_decimal(persistence["backlog_growth"], signed=True)
     latency = _object(persistence["database_write_latency_ms"], {"p50", "p95", "p99"})
     for nested in latency.values():
-        _decimal(nested)
+        _optional_decimal(nested)
 
 
 def _validate_postgres(value: Any) -> None:
@@ -741,9 +749,6 @@ def _validate_postgres(value: Any) -> None:
     _boolean(item["readiness"])
     for key in (
         "database_size_bytes",
-        "growth_bytes_1h",
-        "growth_bytes_6h",
-        "growth_bytes_24h",
         "projected_disk_headroom_bytes",
         "active_connections",
         "checkpoints_timed",
@@ -751,6 +756,8 @@ def _validate_postgres(value: Any) -> None:
         "wal_bytes",
     ):
         _decimal(item[key])
+    for key in ("growth_bytes_1h", "growth_bytes_6h", "growth_bytes_24h"):
+        _optional_decimal(item[key], signed=True)
     _optional_timestamp(item["oldest_relevant_event"])
     _optional_timestamp(item["newest_relevant_event"])
     _text(item["migration_version"], maximum=64, pattern=_SAFE_ID_RE)
@@ -1014,7 +1021,9 @@ def _validate_semantics(data: dict[str, Any]) -> None:
             if service["started_at"] is None or service["exit_code"] is not None:
                 _fail("snapshot_accounting_invalid")
     if data["governance"]["image_manifest_matches"] and any(
-        service["image_digest"] == "not_available" for service in data["services"]
+        service["expected_state"] == "running"
+        and service["image_digest"] == "not_available"
+        for service in data["services"]
     ):
         _fail("snapshot_accounting_invalid")
 
@@ -1162,8 +1171,27 @@ def derive_alerts(data: dict[str, Any], age_seconds: int) -> tuple[dict[str, str
             )
 
     persistence = data["jetstream"]["persistence"]
-    if _number(persistence["backlog_growth"]) > 0:
+    if (
+        persistence["backlog_growth"] is None
+        or persistence["throughput_per_second"] is None
+        or persistence["batch_size"] is None
+    ):
+        add(
+            "jetstream_rate_evidence_unavailable",
+            "high",
+            "JetStream rate evidence has not reached a measurable interval",
+        )
+    elif _number(persistence["backlog_growth"]) > 0:
         add("jetstream_backlog_growth", "warning", "JetStream backlog is growing")
+    if any(
+        value is None
+        for value in persistence["database_write_latency_ms"].values()
+    ):
+        add(
+            "recorder_latency_distribution_unavailable",
+            "high",
+            "Recorder latency distribution evidence is unavailable",
+        )
     if any(
         not row["exists"]
         for row in data["jetstream"]["streams"] + data["jetstream"]["consumers"]
@@ -1172,6 +1200,21 @@ def derive_alerts(data: dict[str, Any], age_seconds: int) -> tuple[dict[str, str
             "jetstream_resource_missing",
             "high",
             "A required JetStream resource is missing",
+        )
+    if any(row["storage_used_bps"] is None for row in data["jetstream"]["streams"]):
+        add(
+            "jetstream_storage_capacity_unavailable",
+            "high",
+            "JetStream storage capacity evidence is unavailable",
+        )
+    if any(
+        _number(row["pending"]) > 0 and row["oldest_pending_age_seconds"] is None
+        for row in data["jetstream"]["consumers"]
+    ):
+        add(
+            "jetstream_pending_age_unavailable",
+            "high",
+            "JetStream pending age evidence is unavailable",
         )
 
     postgres = data["postgres"]
@@ -1184,6 +1227,15 @@ def derive_alerts(data: dict[str, Any], age_seconds: int) -> tuple[dict[str, str
             "database_headroom_low",
             "high",
             "Projected database disk headroom is below policy",
+        )
+    if any(
+        postgres[key] is None
+        for key in ("growth_bytes_1h", "growth_bytes_6h", "growth_bytes_24h")
+    ):
+        add(
+            "database_growth_evidence_unavailable",
+            "high",
+            "Database growth evidence has not covered every required window",
         )
 
     feed = data["feed"]
@@ -1204,6 +1256,16 @@ def derive_alerts(data: dict[str, Any], age_seconds: int) -> tuple[dict[str, str
         )
 
     rpc = data["rpc"]
+    if any(
+        provider["success_rate_bps"] is None
+        or provider["budget_utilization_bps"] is None
+        for provider in rpc["providers"]
+    ):
+        add(
+            "rpc_provider_observation_unavailable",
+            "high",
+            "RPC provider observation evidence is unavailable",
+        )
     if _number(rpc["disagreed"]) > 0:
         add(
             "verification_disagreement",
