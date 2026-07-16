@@ -23,4 +23,9 @@
 - SHADOW route discovery ranks only reviewed official Uniswap V3-compatible, exact-input, two-pool, two-token cycles supported by persisted decoder history. Missing source-block metadata, liquidity checkpoints, profitability facts, RPC-quality rows, or feed-gap overlap remain explicit unavailable evidence; a suggestion is not a profitability, execution, or LIVE-readiness claim.
 - PRE-LIVE money-path runtime counters reset with their owning process and are not durable history. The bounded report pairs them with read-only PostgreSQL aggregates, but no real production soak or realized-profit evidence exists until the later controlled runtime phases complete.
 - The PRE-LIVE Dashboard consumes only validated, bounded, redacted snapshots. The Phase 9 controller can produce continuous snapshots without giving the Dashboard data-plane or Docker access, but no real VPS control-plane run or staged soak has yet occurred. Missing history, rate intervals, percentile evidence, stale data, or failed collection remains visibly blocked rather than falling back to fixtures or invented zeroes.
-- The pre-live integration changes feed-ingestor and Recorder, while both are protected against container recreation during deployment and soak. Exact release and rollback manifests must prove identical protected image digests before the manual workflow can reach SSH. A separately authorized protected-service maintenance gate is therefore required before this release can be deployed; optional-service rollout cannot bypass that blocker.
+- Normal deployment still rejects a release whose feed-ingestor or Recorder
+  digest differs from rollback. A separate manual gate now exists only for the
+  reviewed immutable v3/v2 pair; it has not been dispatched or proven on the
+  VPS. It intentionally leaves optional containers stopped after promoting the
+  v3 release context, so later controlled SHADOW startup and soak evidence
+  remain required.
