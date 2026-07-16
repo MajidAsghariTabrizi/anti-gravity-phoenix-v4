@@ -1,0 +1,363 @@
+name: Deploy PRE-LIVE Protected Maintenance
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_sha:
+        description: Exact phoenix-prelive-shadow-v3 source SHA
+        required: true
+        type: string
+      build_run_id:
+        description: Exact successful v3 Build Phoenix Images run
+        required: true
+        type: string
+      rollback_sha:
+        description: Exact phoenix-prelive-shadow-v2 rollback SHA
+        required: true
+        type: string
+      rollback_build_run_id:
+        description: Exact successful v2 Build Phoenix Images run
+        required: true
+        type: string
+      acknowledgement:
+        description: Type DEPLOY_PRELIVE_PROTECTED_MAINTENANCE
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  actions: read
+  packages: read
+
+concurrency:
+  group: production-shadow
+  cancel-in-progress: false
+
+env:
+  RELEASE_TAG: phoenix-prelive-shadow-v3
+  ROLLBACK_TAG: phoenix-prelive-shadow-v2
+  REVIEWED_RELEASE_SHA: ddbc3e6820f565b41d0d0a2323f67a4187b3dd45
+  REVIEWED_BUILD_RUN_ID: "29519008274"
+  REVIEWED_ROLLBACK_SHA: e84aa5eb69a749da1a01e308422d76a34f0409e8
+  REVIEWED_ROLLBACK_BUILD_RUN_ID: "29487710804"
+
+jobs:
+  deploy-prelive-protected-maintenance:
+    name: deploy-prelive-protected-maintenance
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    environment: production-shadow
+    steps:
+      - name: Validate protected maintenance request
+        shell: bash
+        env:
+          RELEASE_SHA: ${{ inputs.release_sha }}
+          BUILD_RUN_ID: ${{ inputs.build_run_id }}
+          ROLLBACK_SHA: ${{ inputs.rollback_sha }}
+          ROLLBACK_BUILD_RUN_ID: ${{ inputs.rollback_build_run_id }}
+          ACKNOWLEDGEMENT: ${{ inputs.acknowledgement }}
+        run: |
+          set -euo pipefail
+          for value in "$RELEASE_SHA" "$ROLLBACK_SHA"; do
+            case "$value" in
+              *[!0-9a-f]*|"") echo "release inputs must be lowercase hexadecimal"; exit 1 ;;
+            esac
+            [ "${#value}" -eq 40 ] || { echo "release inputs must be 40 characters"; exit 1; }
+          done
+          case "$BUILD_RUN_ID:$ROLLBACK_BUILD_RUN_ID" in
+            *[!0-9:]*|:*|*:|*::* ) echo "build run IDs must be decimal integers"; exit 1 ;;
+          esac
+          [ "$RELEASE_SHA" = "$REVIEWED_RELEASE_SHA" ] || { echo "release SHA is not the reviewed v3 source"; exit 1; }
+          [ "$ROLLBACK_SHA" = "$REVIEWED_ROLLBACK_SHA" ] || { echo "rollback SHA is not the reviewed v2 source"; exit 1; }
+          [ "$BUILD_RUN_ID" = "$REVIEWED_BUILD_RUN_ID" ] || { echo "release build run is not the reviewed v3 run"; exit 1; }
+          [ "$ROLLBACK_BUILD_RUN_ID" = "$REVIEWED_ROLLBACK_BUILD_RUN_ID" ] || { echo "rollback build run is not the reviewed v2 run"; exit 1; }
+          [ "$ACKNOWLEDGEMENT" = DEPLOY_PRELIVE_PROTECTED_MAINTENANCE ] || {
+            echo "protected maintenance acknowledgement is invalid"
+            exit 1
+          }
+
+      - name: Checkout current maintenance gate
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          ref: main
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Verify current gate and immutable tag targets
+        shell: bash
+        env:
+          RELEASE_SHA: ${{ inputs.release_sha }}
+          ROLLBACK_SHA: ${{ inputs.rollback_sha }}
+        run: |
+          set -euo pipefail
+          git fetch --no-tags --depth=1 origin main
+          [ "$(git rev-parse HEAD)" = "$(git rev-parse FETCH_HEAD)" ] || {
+            echo "maintenance workflow checkout is not current main"
+            exit 1
+          }
+          git fetch --no-tags origin \
+            "refs/tags/${RELEASE_TAG}:refs/tags/${RELEASE_TAG}" \
+            "refs/tags/${ROLLBACK_TAG}:refs/tags/${ROLLBACK_TAG}"
+          [ "$(git rev-parse "${RELEASE_TAG}^{commit}")" = "$RELEASE_SHA" ] || {
+            echo "release SHA does not equal the exact v3 tag target"
+            exit 1
+          }
+          [ "$(git rev-parse "${ROLLBACK_TAG}^{commit}")" = "$ROLLBACK_SHA" ] || {
+            echo "rollback SHA does not equal the exact v2 tag target"
+            exit 1
+          }
+
+      - name: Verify exact build run evidence
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_SHA: ${{ inputs.release_sha }}
+          BUILD_RUN_ID: ${{ inputs.build_run_id }}
+          ROLLBACK_SHA: ${{ inputs.rollback_sha }}
+          ROLLBACK_BUILD_RUN_ID: ${{ inputs.rollback_build_run_id }}
+        run: |
+          set -euo pipefail
+          gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${BUILD_RUN_ID}" > release-run.json
+          gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${ROLLBACK_BUILD_RUN_ID}" > rollback-run.json
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          for role, path, expected_sha in (
+              ("release", "release-run.json", os.environ["RELEASE_SHA"]),
+              ("rollback", "rollback-run.json", os.environ["ROLLBACK_SHA"]),
+          ):
+              run = json.loads(Path(path).read_text(encoding="utf-8"))
+              if (
+                  run.get("status") != "completed"
+                  or run.get("conclusion") != "success"
+                  or run.get("head_sha") != expected_sha
+                  or run.get("path") != ".github/workflows/build-images.yml"
+              ):
+                  raise SystemExit(f"{role} build run evidence is invalid")
+          PY
+
+      - name: Download exact release manifest
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: phoenix-release-manifest-${{ inputs.release_sha }}
+          run-id: ${{ inputs.build_run_id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          path: release
+
+      - name: Download exact release assets
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: phoenix-release-assets-${{ inputs.release_sha }}
+          run-id: ${{ inputs.build_run_id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          path: release-assets
+
+      - name: Download exact rollback manifest
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: phoenix-release-manifest-${{ inputs.rollback_sha }}
+          run-id: ${{ inputs.rollback_build_run_id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          path: rollback
+
+      - name: Download complete rollback assets
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: phoenix-release-assets-${{ inputs.rollback_sha }}
+          run-id: ${{ inputs.rollback_build_run_id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          path: rollback-assets
+
+      - name: Verify manifests checksums and reviewed allowlist
+        shell: bash
+        env:
+          RELEASE_SHA: ${{ inputs.release_sha }}
+          ROLLBACK_SHA: ${{ inputs.rollback_sha }}
+        run: |
+          set -euo pipefail
+          python3 scripts/release_assets.py verify \
+            --archive "release-assets/phoenix-release-assets-${RELEASE_SHA}.tar.gz" \
+            --manifest release-assets/release-assets-manifest.json \
+            --checksums release-assets/release-assets-checksums.txt \
+            --expected-sha "$RELEASE_SHA"
+          python3 scripts/release_assets.py verify \
+            --archive "rollback-assets/phoenix-release-assets-${ROLLBACK_SHA}.tar.gz" \
+            --manifest rollback-assets/release-assets-manifest.json \
+            --checksums rollback-assets/release-assets-checksums.txt \
+            --expected-sha "$ROLLBACK_SHA"
+          python3 scripts/prelive_protected_maintenance.py plan \
+            --release-manifest release/release-manifest.json \
+            --rollback-manifest rollback/release-manifest.json \
+            --release-assets-manifest release-assets/release-assets-manifest.json \
+            --rollback-assets-manifest rollback-assets/release-assets-manifest.json \
+            --release-sha "$RELEASE_SHA" \
+            --rollback-sha "$ROLLBACK_SHA" \
+            --output protected-maintenance-plan.json
+
+      - name: Validate exact release and rollback render contracts
+        shell: bash
+        env:
+          RELEASE_SHA: ${{ inputs.release_sha }}
+          ROLLBACK_SHA: ${{ inputs.rollback_sha }}
+        run: |
+          set -euo pipefail
+          mkdir -p release-tree rollback-tree
+          tar -xzf "release-assets/phoenix-release-assets-${RELEASE_SHA}.tar.gz" \
+            -C release-tree
+          tar -xzf "rollback-assets/phoenix-release-assets-${ROLLBACK_SHA}.tar.gz" \
+            -C rollback-tree
+          release_root="release-tree/phoenix-release-${RELEASE_SHA}"
+          rollback_root="rollback-tree/phoenix-release-${ROLLBACK_SHA}"
+          route_json="$(python3 -c 'import json; print(json.dumps(json.load(open("fixtures/routes/weth_usdc_uniswap_v3.json")), separators=(",", ":")))')"
+          cat > maintenance-validation.env <<'EOF'
+          PHOENIX_ENV=production
+          PHOENIX_MODE=SHADOW
+          LIVE_EXECUTION=false
+          CHAIN_ID=42161
+          POSTGRES_USER=phoenix_maintenance_validation
+          POSTGRES_PASSWORD=ci-test-only-maintenance-password
+          POSTGRES_DB=phoenix
+          POSTGRES_DSN=postgres://phoenix_maintenance_validation:ci-test-only-maintenance-password@postgres:5432/phoenix
+          NATS_URL=nats://nats:4222
+          PHOENIX_FEED_SOURCE=relay
+          PHOENIX_FEED_RELAY_URL=ws://nitro-feed-relay:9642/feed
+          ARBITRUM_SEQUENCER_FEED_URL=wss://sequencer-validation.invalid/feed
+          ARBITRUM_RPC_URL=https://arbitrum-validation.invalid
+          PARENT_CHAIN_RPC_URL=https://parent-chain-validation.invalid
+          RPC_PROVIDER_URLS=https://rpc-validation.invalid
+          RPC_PROVIDER_WEIGHTS=1
+          RPC_UPSTREAM_CALLS_PER_SECOND=1
+          RPC_UPSTREAM_CALL_BURST=4
+          RPC_STATE_REQUESTS_PER_MINUTE=12
+          RPC_PROVIDER_PROBE_INTERVAL_SECONDS=60
+          ENGINE_ROUTER_ADDRESSES=0xe592427a0aece92de3edee1f18e0157c05861564,0x68b3465833fb72a70ecdf485e0e4c7bd8665fc45,0xa51afafe0263b40edaef0df8781ea9aa03e381a3
+          SIGNER_PRIVATE_KEY=
+          WALLET_ADDRESS=
+          EXECUTOR_ADDRESS=
+          PUBLIC_TRANSACTION_SUBMISSION=
+          PRIVATE_RELAY_SUBMISSION=
+          TRANSACTION_BROADCAST_URL=
+          EOF
+          printf 'ENGINE_ROUTE_REGISTRY_JSON=%s\n' "$route_json" >> maintenance-validation.env
+          "$release_root/scripts/validate-production-env.sh" maintenance-validation.env
+          "$rollback_root/scripts/validate-production-env.sh" maintenance-validation.env
+          python3 "$release_root/scripts/production_context.py" manifest-env \
+            --manifest release/release-manifest.json \
+            --expected-sha "$RELEASE_SHA" \
+            --output release-validation.env
+          python3 "$rollback_root/scripts/production_context.py" manifest-env \
+            --manifest rollback/release-manifest.json \
+            --expected-sha "$ROLLBACK_SHA" \
+            --output rollback-validation.env
+          "$release_root/scripts/render-production-compose.sh" \
+            --compose-file "$release_root/compose.prod.yml" \
+            --env-file maintenance-validation.env \
+            --release-env release-validation.env \
+            --release-manifest release/release-manifest.json \
+            --output release-render.json \
+            --metadata-output release-render-metadata.json >/dev/null
+          "$rollback_root/scripts/render-production-compose.sh" \
+            --compose-file "$rollback_root/compose.prod.yml" \
+            --env-file maintenance-validation.env \
+            --release-env rollback-validation.env \
+            --release-manifest rollback/release-manifest.json \
+            --output rollback-render.json \
+            --metadata-output rollback-render-metadata.json >/dev/null
+          python3 scripts/prelive_protected_maintenance.py validate-render-pair \
+            --plan protected-maintenance-plan.json \
+            --release-metadata release-render-metadata.json \
+            --rollback-metadata rollback-render-metadata.json
+
+      - name: Login to GHCR for immutable inspection
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Verify every image digest and OCI revision before SSH
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/prelive_protected_maintenance.py image-refs \
+            --plan protected-maintenance-plan.json > image-refs.tsv
+          while IFS=$'\t' read -r role name reference expected_sha; do
+            docker pull "$reference" >/dev/null
+            revision="$(docker image inspect --format \
+              '{{index .Config.Labels "org.opencontainers.image.revision"}}' \
+              "$reference")"
+            [ "$revision" = "$expected_sha" ] || {
+              echo "OCI revision mismatch for ${role}/${name}"
+              exit 1
+            }
+          done < image-refs.tsv
+
+      - name: Install SSH material
+        shell: bash
+        env:
+          PROD_SSH_PRIVATE_KEY: ${{ secrets.PROD_SSH_PRIVATE_KEY }}
+          PROD_KNOWN_HOSTS: ${{ secrets.PROD_KNOWN_HOSTS }}
+        run: |
+          set -euo pipefail
+          [ -n "$PROD_SSH_PRIVATE_KEY" ] || { echo "production SSH key is not configured"; exit 1; }
+          [ -n "$PROD_KNOWN_HOSTS" ] || { echo "production known-hosts data is not configured"; exit 1; }
+          install -d -m 700 "$HOME/.ssh"
+          printf '%s\n' "$PROD_SSH_PRIVATE_KEY" > "$HOME/.ssh/id_ed25519"
+          chmod 600 "$HOME/.ssh/id_ed25519"
+          printf '%s\n' "$PROD_KNOWN_HOSTS" > "$HOME/.ssh/known_hosts"
+          chmod 600 "$HOME/.ssh/known_hosts"
+
+      - name: Run bounded protected maintenance
+        shell: bash
+        env:
+          PROD_HOST: ${{ secrets.PROD_HOST }}
+          PROD_PORT: ${{ secrets.PROD_PORT }}
+          PROD_USER: ${{ secrets.PROD_USER }}
+          RELEASE_SHA: ${{ inputs.release_sha }}
+          ROLLBACK_SHA: ${{ inputs.rollback_sha }}
+        run: |
+          set -euo pipefail
+          printf '%s' "$PROD_HOST" | grep -Eq '^[A-Za-z0-9._-]+$' || { echo "production host is invalid"; exit 1; }
+          printf '%s' "$PROD_USER" | grep -Eq '^[A-Za-z_][A-Za-z0-9_-]*$' || { echo "production user is invalid"; exit 1; }
+          port="${PROD_PORT:-22}"
+          case "$port" in *[!0-9]*|"") echo "production port is invalid"; exit 1 ;; esac
+          [ "$port" -ge 1 ] && [ "$port" -le 65535 ] || { echo "production port is invalid"; exit 1; }
+          remote="${PROD_USER}@${PROD_HOST}"
+          ssh_opts=(-i "$HOME/.ssh/id_ed25519" -p "$port" -o UserKnownHostsFile="$HOME/.ssh/known_hosts" -o StrictHostKeyChecking=yes -o IdentitiesOnly=yes)
+          scp_opts=(-i "$HOME/.ssh/id_ed25519" -P "$port" -o UserKnownHostsFile="$HOME/.ssh/known_hosts" -o StrictHostKeyChecking=yes -o IdentitiesOnly=yes)
+          remote_stage="$(ssh "${ssh_opts[@]}" "$remote" \
+            "mktemp -d '/tmp/phoenix-protected-maintenance-${RELEASE_SHA}.XXXXXX'")"
+          case "$remote_stage" in
+            "/tmp/phoenix-protected-maintenance-${RELEASE_SHA}."*) ;;
+            *) echo "remote maintenance staging path is invalid"; exit 1 ;;
+          esac
+          cleanup_remote() {
+            ssh "${ssh_opts[@]}" "$remote" \
+              "rm -f '$remote_stage/release-manifest.json' '$remote_stage/rollback-manifest.json' '$remote_stage/phoenix-release-assets-${RELEASE_SHA}.tar.gz' '$remote_stage/release-assets-manifest.json' '$remote_stage/release-assets-checksums.txt' '$remote_stage/protected-maintenance-plan.json' '$remote_stage/prelive_protected_maintenance.py' '$remote_stage/prelive-protected-maintenance.sh' '$remote_stage/install-release-assets.sh' && rmdir '$remote_stage'" \
+              >/dev/null 2>&1 || true
+          }
+          trap cleanup_remote EXIT
+          scp "${scp_opts[@]}" release/release-manifest.json \
+            "$remote:$remote_stage/release-manifest.json"
+          scp "${scp_opts[@]}" rollback/release-manifest.json \
+            "$remote:$remote_stage/rollback-manifest.json"
+          scp "${scp_opts[@]}" \
+            "release-assets/phoenix-release-assets-${RELEASE_SHA}.tar.gz" \
+            "$remote:$remote_stage/phoenix-release-assets-${RELEASE_SHA}.tar.gz"
+          scp "${scp_opts[@]}" release-assets/release-assets-manifest.json \
+            "$remote:$remote_stage/release-assets-manifest.json"
+          scp "${scp_opts[@]}" release-assets/release-assets-checksums.txt \
+            "$remote:$remote_stage/release-assets-checksums.txt"
+          scp "${scp_opts[@]}" protected-maintenance-plan.json \
+            "$remote:$remote_stage/protected-maintenance-plan.json"
+          scp "${scp_opts[@]}" \
+            scripts/prelive_protected_maintenance.py \
+            scripts/prelive-protected-maintenance.sh \
+            scripts/install-release-assets.sh \
+            "$remote:$remote_stage/"
+          ssh "${ssh_opts[@]}" "$remote" \
+            "sudo /bin/sh '$remote_stage/prelive-protected-maintenance.sh' '$RELEASE_SHA' '$ROLLBACK_SHA' '$remote_stage/release-manifest.json' '$remote_stage/rollback-manifest.json' '$remote_stage/phoenix-release-assets-${RELEASE_SHA}.tar.gz' '$remote_stage/release-assets-manifest.json' '$remote_stage/release-assets-checksums.txt' '$remote_stage/protected-maintenance-plan.json'"
+          cleanup_remote
+          trap - EXIT

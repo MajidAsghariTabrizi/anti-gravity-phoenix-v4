@@ -61,6 +61,9 @@ jobs:
           python3 -m py_compile scripts/release_assets.py
           python3 -m unittest scripts.tests.test_release_assets
           sh ./scripts/prelive-release-gate-tests.sh
+          python3 -m py_compile scripts/prelive_protected_maintenance.py
+          python3 -m unittest scripts.tests.test_prelive_protected_maintenance
+          sh ./scripts/prelive-protected-maintenance-tests.sh
 
       - name: Validate tracked hygiene
         shell: bash

@@ -117,6 +117,8 @@ for script in \
   shadow_route_discovery.py \
   prelive-money-path-report.sh \
   prelive_money_path_report.py \
+  prelive-protected-maintenance.sh \
+  prelive_protected_maintenance.py \
   prelive_dashboard_snapshot.py \
   prelive_dashboard_live.py \
   prelive_shadow_control.py \

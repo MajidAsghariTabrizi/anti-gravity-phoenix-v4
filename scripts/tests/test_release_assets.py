@@ -54,6 +54,8 @@ class ReleaseAssetsTests(unittest.TestCase):
             self.assertIn("contracts/PhoenixExecutor.compiled.json", paths)
             self.assertIn("schemas/phoenix-release-assets.schema.json", paths)
             self.assertIn("scripts/prelive-shadow-control.sh", paths)
+            self.assertIn("scripts/prelive-protected-maintenance.sh", paths)
+            self.assertIn("scripts/prelive_protected_maintenance.py", paths)
             self.assertTrue(
                 all(
                     item["size_bytes"] <= release_assets.MAX_FILE_BYTES
