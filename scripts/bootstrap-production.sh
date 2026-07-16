@@ -61,6 +61,7 @@ install -m 0640 -o phoenix -g phoenix "$repo_root/compose.prod.yml" /opt/phoenix
 install -m 0644 -o phoenix -g phoenix "$repo_root/deploy/nats-server.conf" /opt/phoenix/deploy/nats-server.conf
 install -d -m 0750 -o phoenix -g phoenix /opt/phoenix/deploy/prometheus
 install -d -m 0750 -o phoenix -g phoenix /opt/phoenix/deploy/sql
+install -d -m 0750 -o phoenix -g phoenix /opt/phoenix/deploy/schemas
 install -d -m 0750 -o phoenix -g phoenix /opt/phoenix/deploy/routes
 install -m 0640 -o phoenix -g phoenix "$repo_root/prometheus/prometheus.yml" /opt/phoenix/deploy/prometheus/prometheus.yml
 install -m 0640 -o phoenix -g phoenix \
@@ -69,6 +70,12 @@ install -m 0640 -o phoenix -g phoenix \
 install -m 0640 -o phoenix -g phoenix \
   "$repo_root/scripts/sql/shadow-route-discovery-enrichment.sql" \
   /opt/phoenix/deploy/sql/shadow-route-discovery-enrichment.sql
+install -m 0640 -o phoenix -g phoenix \
+  "$repo_root/scripts/sql/prelive-money-path-report.sql" \
+  /opt/phoenix/deploy/sql/prelive-money-path-report.sql
+install -m 0640 -o phoenix -g phoenix \
+  "$repo_root/schemas/prelive-money-path-summary.schema.json" \
+  /opt/phoenix/deploy/schemas/prelive-money-path-summary.schema.json
 install -m 0640 -o phoenix -g phoenix \
   "$repo_root/fixtures/routes/arbitrum_uniswap_v3_pool_proofs.json" \
   /opt/phoenix/deploy/routes/arbitrum_uniswap_v3_pool_proofs.json
@@ -85,6 +92,8 @@ for script in \
   shadow_profitability_report.py \
   shadow-route-discovery.sh \
   shadow_route_discovery.py \
+  prelive-money-path-report.sh \
+  prelive_money_path_report.py \
   rollback-release.sh \
   deploy-release.sh
 do

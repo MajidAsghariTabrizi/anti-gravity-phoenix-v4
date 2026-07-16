@@ -219,6 +219,19 @@ impl GatewayRuntime {
         &self,
         request: ShadowStateRequest,
     ) -> Result<ShadowStateResponse, GatewayError> {
+        let started = Instant::now();
+        let result = self.resolve_shadow_state_inner(request).await;
+        self.metrics.state_request_latency(started.elapsed());
+        if matches!(result.as_ref(), Err(GatewayError::ProviderUnavailable)) {
+            self.metrics.provider_unavailable();
+        }
+        result
+    }
+
+    async fn resolve_shadow_state_inner(
+        &self,
+        request: ShadowStateRequest,
+    ) -> Result<ShadowStateResponse, GatewayError> {
         request
             .validate()
             .map_err(|_| GatewayError::InvalidRequest)?;
@@ -237,10 +250,12 @@ impl GatewayRuntime {
         match request.evidence.clone() {
             EvidenceRequest::Primary => {
                 let head = self.current_head().await?;
+                self.metrics.state_freshness(head.observed_at.elapsed());
                 let cache_key = route_block_key(&route_config_hash, &head.block);
                 let primary = self
                     .resolve_primary(&request, &route_config_hash, &cache_key, &head)
                     .await?;
+                self.metrics.primary_success();
                 self.build_response(request_hash, route_config_hash, primary, None)
             }
             EvidenceRequest::Verify {
@@ -408,6 +423,7 @@ impl GatewayRuntime {
             .await?;
         let mut quality = primary.quality.clone();
         let Some(secondary) = resolution.bundle else {
+            self.metrics.secondary_unavailable();
             quality.extend(resolution.failed_quality);
             return Ok(VerificationEvidence {
                 agreement_provider_id: None,
@@ -433,12 +449,15 @@ impl GatewayRuntime {
         )
         .is_ok();
         if !agreement {
+            self.metrics.secondary_disagreed();
             self.metrics.provider_disagreement();
             for entry in &mut quality {
                 if entry.success {
                     entry.disagreement = true;
                 }
             }
+        } else {
+            self.metrics.secondary_agreed();
         }
         Ok(VerificationEvidence {
             agreement_provider_id: Some(secondary.provider_id),
@@ -1715,6 +1734,10 @@ mod tests {
             .iter()
             .filter(|call| call.method == RpcMethod::EthCall)
             .all(|call| call.params[1] == "0x64"));
+        let rendered = runtime.metrics().render(&runtime.readiness());
+        assert!(rendered.contains("rpc_primary_success_total 1"));
+        assert!(rendered.contains("rpc_secondary_requested_total 1"));
+        assert!(rendered.contains("rpc_secondary_agreed_total 1"));
     }
 
     #[tokio::test]
@@ -1898,6 +1921,10 @@ mod tests {
             .iter()
             .filter(|quality| quality.success)
             .all(|quality| quality.disagreement));
+        let rendered = runtime.metrics().render(&runtime.readiness());
+        assert!(rendered.contains("rpc_secondary_requested_total 1"));
+        assert!(rendered.contains("rpc_secondary_disagreed_total 1"));
+        assert!(rendered.contains("rpc_provider_disagreement_total 1"));
     }
 
     #[tokio::test]
@@ -1928,6 +1955,10 @@ mod tests {
         assert!(verified.secondary_block_hash.is_none());
         assert!(verified.secondary_route_config_hash.is_none());
         assert!(!verified.provider_agreement);
+        assert!(runtime
+            .metrics()
+            .render(&runtime.readiness())
+            .contains("rpc_secondary_unavailable_total 1"));
     }
 
     #[tokio::test]

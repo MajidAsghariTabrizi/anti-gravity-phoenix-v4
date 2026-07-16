@@ -7,13 +7,17 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"anti-gravity-phoenix-v4/feed-ingestor/internal/nitro"
 )
 
 type Registry struct {
-	mu           sync.Mutex
-	counters     map[string]uint64
-	gauges       map[string]float64
-	observations map[string]observation
+	mu               sync.Mutex
+	counters         map[string]uint64
+	gauges           map[string]float64
+	observations     map[string]observation
+	unsupportedKinds [2][256]uint64
+	ignoredKinds     [2][256]uint64
 }
 
 type observation struct {
@@ -39,11 +43,15 @@ var defaultCounters = []string{
 	"feed_jetstream_publish_failures_total",
 	"feed_jetstream_stream_unavailable_total",
 	"feed_unsupported_messages_total",
+	"feed_ignored_messages_total",
+	"feed_missing_sequences_total",
 }
 
 var defaultGauges = []string{
 	"feed_last_sequence",
 	"feed_last_message_timestamp",
+	"feed_last_gap_timestamp_seconds",
+	"feed_data_completeness",
 	"feed_readiness",
 }
 
@@ -95,6 +103,35 @@ func (r *Registry) ObserveDuration(name string, duration time.Duration) {
 	r.observations[name] = value
 }
 
+func (r *Registry) IncUnsupportedMessageKind(kind nitro.MessageKind) {
+	r.incMessageKind(&r.unsupportedKinds, kind)
+}
+
+func (r *Registry) IncIgnoredMessageKind(kind nitro.MessageKind) {
+	r.incMessageKind(&r.ignoredKinds, kind)
+}
+
+func (r *Registry) incMessageKind(counters *[2][256]uint64, kind nitro.MessageKind) {
+	index, ok := messageLayerIndex(kind.Layer)
+	if !ok {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	counters[index][kind.Kind]++
+}
+
+func messageLayerIndex(layer nitro.MessageLayer) (int, bool) {
+	switch layer {
+	case nitro.MessageLayerL1:
+		return 0, true
+	case nitro.MessageLayerL2:
+		return 1, true
+	default:
+		return 0, false
+	}
+}
+
 func (r *Registry) Handler() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "text/plain; version=0.0.4")
@@ -113,6 +150,30 @@ func (r *Registry) Render() string {
 	sort.Strings(keys)
 	for _, k := range keys {
 		fmt.Fprintf(&b, "%s %d\n", k, r.counters[k])
+	}
+	fmt.Fprintln(&b, "# TYPE feed_message_kind_total counter")
+	for _, classification := range []struct {
+		name   string
+		values *[2][256]uint64
+	}{
+		{name: "unsupported", values: &r.unsupportedKinds},
+		{name: "ignored", values: &r.ignoredKinds},
+	} {
+		for layerIndex, layer := range []string{"l1", "l2"} {
+			for kind, count := range classification.values[layerIndex] {
+				if count == 0 {
+					continue
+				}
+				fmt.Fprintf(
+					&b,
+					"feed_message_kind_total{classification=\"%s\",layer=\"%s\",kind=\"%d\"} %d\n",
+					classification.name,
+					layer,
+					kind,
+					count,
+				)
+			}
+		}
 	}
 	gaugeKeys := make([]string, 0, len(r.gauges))
 	for k := range r.gauges {

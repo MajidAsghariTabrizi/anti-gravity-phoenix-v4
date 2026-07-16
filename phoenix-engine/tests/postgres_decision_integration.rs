@@ -586,4 +586,48 @@ DROP FUNCTION phoenix_test_reject_rpc_quality();
             .unwrap(),
         None
     );
+
+    let report_script = include_str!("../../scripts/sql/prelive-money-path-report.sql");
+    let query_start = report_script
+        .find("WITH params AS")
+        .expect("money-path report query starts with its aggregate CTEs");
+    let query_end = report_script
+        .rfind("\n\nCOMMIT;")
+        .expect("money-path report query ends before COMMIT");
+    let report_query = report_script[query_start..query_end]
+        .trim_end_matches(';')
+        .replace(":window_hours", "24")
+        .replace(":reason_limit", "17");
+    let report_json: String = sqlx::query_scalar(&report_query)
+        .fetch_one(&pool)
+        .await
+        .expect("execute bounded read-only money-path report query");
+    let report: serde_json::Value =
+        serde_json::from_str(&report_json).expect("money-path report source is JSON");
+    assert_eq!(
+        report["schema_version"],
+        "phoenix.prelive.money-path-source.v1"
+    );
+    assert_eq!(report["mode"], "SHADOW");
+    assert_eq!(report["live_execution"], false);
+    assert_eq!(report["execution_eligible"], false);
+    assert_eq!(report["execution_request_created"], false);
+    assert_eq!(report["window_hours"], "24");
+    assert_eq!(report["database"]["relations"].as_array().unwrap().len(), 6);
+    assert!(report["engine"]["classifications_total"].is_string());
+    assert!(report["profitability"]["facts_total"].is_string());
+    assert!(report["fork"]["simulations_total"].is_string());
+    for forbidden in [
+        "tx_hash",
+        "source_event_identity",
+        "route_id",
+        "provider_id",
+        "provider_url",
+        "address",
+    ] {
+        assert!(
+            !report_json.contains(&format!("\"{forbidden}\"")),
+            "money-path report leaked identity field {forbidden}"
+        );
+    }
 }

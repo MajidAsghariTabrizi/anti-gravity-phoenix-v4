@@ -1,0 +1,312 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://phoenix.invalid/schemas/prelive-money-path-summary.schema.json",
+  "title": "Phoenix PRE-LIVE SHADOW money-path summary",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "generated_at",
+    "window_hours",
+    "metric_counter_scope",
+    "mode",
+    "live_execution",
+    "execution_eligible",
+    "execution_request_created",
+    "technical",
+    "business",
+    "metric_series"
+  ],
+  "properties": {
+    "schema_version": {"const": "phoenix.prelive.money-path-summary.v1"},
+    "generated_at": {"type": "string", "minLength": 20, "maxLength": 40},
+    "window_hours": {"type": "string", "pattern": "^(?:[1-9]|[1-9][0-9]|1[0-5][0-9]|16[0-8])$"},
+    "metric_counter_scope": {"const": "process_lifetime"},
+    "mode": {"const": "SHADOW"},
+    "live_execution": {"const": false},
+    "execution_eligible": {"const": false},
+    "execution_request_created": {"const": false},
+    "technical": {"$ref": "#/definitions/technical"},
+    "business": {"$ref": "#/definitions/business"},
+    "metric_series": {
+      "type": "array",
+      "maxItems": 2048,
+      "items": {"$ref": "#/definitions/metricSeries"}
+    }
+  },
+  "definitions": {
+    "nonNegative": {
+      "type": "string",
+      "pattern": "^(?:0|[1-9][0-9]*)(?:\\.[0-9]+)?$",
+      "maxLength": 128
+    },
+    "integer": {
+      "type": "string",
+      "pattern": "^(?:0|[1-9][0-9]*|-[1-9][0-9]*)$",
+      "maxLength": 79
+    },
+    "scrapeHealth": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["feed-ingestor", "phoenix-engine", "recorder", "rpc-gateway", "shadow-dispatcher"],
+      "properties": {
+        "feed-ingestor": {"$ref": "#/definitions/nonNegative"},
+        "phoenix-engine": {"$ref": "#/definitions/nonNegative"},
+        "recorder": {"$ref": "#/definitions/nonNegative"},
+        "rpc-gateway": {"$ref": "#/definitions/nonNegative"},
+        "shadow-dispatcher": {"$ref": "#/definitions/nonNegative"}
+      }
+    },
+    "feed": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["connections_total", "data_completeness", "decode_failures_total", "missing_sequences_total", "reconnects_total", "sequence_gaps_total"],
+      "properties": {
+        "connections_total": {"$ref": "#/definitions/nonNegative"},
+        "data_completeness": {"$ref": "#/definitions/nonNegative"},
+        "decode_failures_total": {"$ref": "#/definitions/nonNegative"},
+        "missing_sequences_total": {"$ref": "#/definitions/nonNegative"},
+        "reconnects_total": {"$ref": "#/definitions/nonNegative"},
+        "sequence_gaps_total": {"$ref": "#/definitions/nonNegative"}
+      }
+    },
+    "rpcRuntime": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["primary_success_total", "provider_disagreement_total", "provider_rate_limited_total", "provider_unavailable_total", "secondary_agreed_total", "secondary_disagreed_total", "secondary_requested_total", "secondary_unavailable_total", "state_freshness_seconds", "state_requests_total"],
+      "properties": {
+        "primary_success_total": {"$ref": "#/definitions/nonNegative"},
+        "provider_disagreement_total": {"$ref": "#/definitions/nonNegative"},
+        "provider_rate_limited_total": {"$ref": "#/definitions/nonNegative"},
+        "provider_unavailable_total": {"$ref": "#/definitions/nonNegative"},
+        "secondary_agreed_total": {"$ref": "#/definitions/nonNegative"},
+        "secondary_disagreed_total": {"$ref": "#/definitions/nonNegative"},
+        "secondary_requested_total": {"$ref": "#/definitions/nonNegative"},
+        "secondary_unavailable_total": {"$ref": "#/definitions/nonNegative"},
+        "state_freshness_seconds": {"$ref": "#/definitions/nonNegative"},
+        "state_requests_total": {"$ref": "#/definitions/nonNegative"}
+      }
+    },
+    "reliability": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["engine_recovered_retries_total", "engine_retries_total", "engine_terminal_integrity_total", "recorder_database_recoveries_total", "recorder_database_retries_total", "shadow_dispatcher_retries_total", "shadow_dispatcher_retry_recoveries_total", "shadow_dispatcher_terminal_integrity_total"],
+      "properties": {
+        "engine_recovered_retries_total": {"$ref": "#/definitions/nonNegative"},
+        "engine_retries_total": {"$ref": "#/definitions/nonNegative"},
+        "engine_terminal_integrity_total": {"$ref": "#/definitions/nonNegative"},
+        "recorder_database_recoveries_total": {"$ref": "#/definitions/nonNegative"},
+        "recorder_database_retries_total": {"$ref": "#/definitions/nonNegative"},
+        "shadow_dispatcher_retries_total": {"$ref": "#/definitions/nonNegative"},
+        "shadow_dispatcher_retry_recoveries_total": {"$ref": "#/definitions/nonNegative"},
+        "shadow_dispatcher_terminal_integrity_total": {"$ref": "#/definitions/nonNegative"}
+      }
+    },
+    "jetstream": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["dispatcher_oldest_pending_age_seconds", "dispatcher_pending_rows", "engine_ack_pending", "engine_pending", "recorder_ack_pending", "recorder_pending"],
+      "properties": {
+        "dispatcher_oldest_pending_age_seconds": {"$ref": "#/definitions/nonNegative"},
+        "dispatcher_pending_rows": {"$ref": "#/definitions/nonNegative"},
+        "engine_ack_pending": {"$ref": "#/definitions/nonNegative"},
+        "engine_pending": {"$ref": "#/definitions/nonNegative"},
+        "recorder_ack_pending": {"$ref": "#/definitions/nonNegative"},
+        "recorder_pending": {"$ref": "#/definitions/nonNegative"}
+      }
+    },
+    "relation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "size_bytes"],
+      "properties": {
+        "name": {"enum": ["engine_outbox", "fork_simulation_results", "rpc_quality_records", "shadow_engine_classifications", "shadow_engine_processing_attempts", "shadow_profitability_facts"]},
+        "size_bytes": {"$ref": "#/definitions/nonNegative"}
+      }
+    },
+    "database": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["size_bytes", "relations"],
+      "properties": {
+        "size_bytes": {"$ref": "#/definitions/nonNegative"},
+        "relations": {"type": "array", "minItems": 6, "maxItems": 6, "items": {"$ref": "#/definitions/relation"}}
+      }
+    },
+    "engineDatabase": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["candidate_count", "classifications_total", "decisions_total", "dependency_exhausted_total", "processing_attempts_total", "processing_latency_ns_max", "processing_latency_ns_sum", "redeliveries_total", "terminal_integrity_total"],
+      "properties": {
+        "candidate_count": {"$ref": "#/definitions/nonNegative"},
+        "classifications_total": {"$ref": "#/definitions/nonNegative"},
+        "decisions_total": {"$ref": "#/definitions/nonNegative"},
+        "dependency_exhausted_total": {"$ref": "#/definitions/nonNegative"},
+        "processing_attempts_total": {"$ref": "#/definitions/nonNegative"},
+        "processing_latency_ns_max": {"$ref": "#/definitions/nonNegative"},
+        "processing_latency_ns_sum": {"$ref": "#/definitions/nonNegative"},
+        "redeliveries_total": {"$ref": "#/definitions/nonNegative"},
+        "terminal_integrity_total": {"$ref": "#/definitions/nonNegative"}
+      }
+    },
+    "outboxDatabase": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["backlog_growth", "oldest_pending_age_seconds", "pending_at_window_start", "pending_rows", "publish_attempts_total", "published_in_window", "retry_rows"],
+      "properties": {
+        "backlog_growth": {"$ref": "#/definitions/nonNegative"},
+        "oldest_pending_age_seconds": {"$ref": "#/definitions/nonNegative"},
+        "pending_at_window_start": {"$ref": "#/definitions/nonNegative"},
+        "pending_rows": {"$ref": "#/definitions/nonNegative"},
+        "publish_attempts_total": {"$ref": "#/definitions/nonNegative"},
+        "published_in_window": {"$ref": "#/definitions/nonNegative"},
+        "retry_rows": {"$ref": "#/definitions/nonNegative"}
+      }
+    },
+    "rpcDatabase": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["disagreements_total", "latency_ns_max", "latency_ns_sum", "records_total", "retries_total", "stale_total", "success_total", "timeouts_total"],
+      "properties": {
+        "disagreements_total": {"$ref": "#/definitions/nonNegative"},
+        "latency_ns_max": {"$ref": "#/definitions/nonNegative"},
+        "latency_ns_sum": {"$ref": "#/definitions/nonNegative"},
+        "records_total": {"$ref": "#/definitions/nonNegative"},
+        "retries_total": {"$ref": "#/definitions/nonNegative"},
+        "stale_total": {"$ref": "#/definitions/nonNegative"},
+        "success_total": {"$ref": "#/definitions/nonNegative"},
+        "timeouts_total": {"$ref": "#/definitions/nonNegative"}
+      }
+    },
+    "fork": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["gas_utilization_at_most_50_total", "gas_utilization_at_most_90_total", "gas_utilization_over_90_total", "passed_total", "prediction_error_negative_total", "prediction_error_non_negative_total", "reverted_total", "simulated_not_profitable_total", "simulated_profitable_total", "simulations_total", "sum_absolute_prediction_error", "sum_gas_used"],
+      "properties": {
+        "gas_utilization_at_most_50_total": {"$ref": "#/definitions/nonNegative"},
+        "gas_utilization_at_most_90_total": {"$ref": "#/definitions/nonNegative"},
+        "gas_utilization_over_90_total": {"$ref": "#/definitions/nonNegative"},
+        "passed_total": {"$ref": "#/definitions/nonNegative"},
+        "prediction_error_negative_total": {"$ref": "#/definitions/nonNegative"},
+        "prediction_error_non_negative_total": {"$ref": "#/definitions/nonNegative"},
+        "reverted_total": {"$ref": "#/definitions/nonNegative"},
+        "simulated_not_profitable_total": {"$ref": "#/definitions/nonNegative"},
+        "simulated_profitable_total": {"$ref": "#/definitions/nonNegative"},
+        "simulations_total": {"$ref": "#/definitions/nonNegative"},
+        "sum_absolute_prediction_error": {"$ref": "#/definitions/nonNegative"},
+        "sum_gas_used": {"$ref": "#/definitions/nonNegative"}
+      }
+    },
+    "reasonCount": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["reason", "count"],
+      "properties": {
+        "reason": {"type": "string", "pattern": "^[a-z][a-z0-9_]{0,63}$"},
+        "count": {"$ref": "#/definitions/nonNegative"}
+      }
+    },
+    "profitability": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["accepted_total", "complete_total", "facts_total", "incomplete_total", "near_profitable_total", "not_profitable_total", "profitable_total", "rejected_total", "rejection_reasons", "sum_conservative_net_pnl", "sum_expected_net_pnl", "sum_severe_net_pnl", "sum_total_cost"],
+      "properties": {
+        "accepted_total": {"$ref": "#/definitions/nonNegative"},
+        "complete_total": {"$ref": "#/definitions/nonNegative"},
+        "facts_total": {"$ref": "#/definitions/nonNegative"},
+        "incomplete_total": {"$ref": "#/definitions/nonNegative"},
+        "near_profitable_total": {"$ref": "#/definitions/nonNegative"},
+        "not_profitable_total": {"$ref": "#/definitions/nonNegative"},
+        "profitable_total": {"$ref": "#/definitions/nonNegative"},
+        "rejected_total": {"$ref": "#/definitions/nonNegative"},
+        "rejection_reasons": {"type": "array", "maxItems": 17, "items": {"$ref": "#/definitions/reasonCount"}},
+        "sum_conservative_net_pnl": {"$ref": "#/definitions/integer"},
+        "sum_expected_net_pnl": {"$ref": "#/definitions/integer"},
+        "sum_severe_net_pnl": {"$ref": "#/definitions/integer"},
+        "sum_total_cost": {"$ref": "#/definitions/integer"}
+      }
+    },
+    "technical": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["scrape_health", "feed", "rpc", "reliability", "jetstream", "database", "engine_database", "outbox_database", "rpc_database", "fork"],
+      "properties": {
+        "scrape_health": {"$ref": "#/definitions/scrapeHealth"},
+        "feed": {"$ref": "#/definitions/feed"},
+        "rpc": {"$ref": "#/definitions/rpcRuntime"},
+        "reliability": {"$ref": "#/definitions/reliability"},
+        "jetstream": {"$ref": "#/definitions/jetstream"},
+        "database": {"$ref": "#/definitions/database"},
+        "engine_database": {"$ref": "#/definitions/engineDatabase"},
+        "outbox_database": {"$ref": "#/definitions/outboxDatabase"},
+        "rpc_database": {"$ref": "#/definitions/rpcDatabase"},
+        "fork": {"$ref": "#/definitions/fork"}
+      }
+    },
+    "funnel": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["configured_route_matches", "feed_inputs", "fork_passed", "normalized_transactions", "official_router_inputs", "primary_profitable", "shadow_accepted", "supported_exact_input_inputs"],
+      "properties": {
+        "configured_route_matches": {"$ref": "#/definitions/nonNegative"},
+        "feed_inputs": {"$ref": "#/definitions/nonNegative"},
+        "fork_passed": {"$ref": "#/definitions/nonNegative"},
+        "normalized_transactions": {"$ref": "#/definitions/nonNegative"},
+        "official_router_inputs": {"$ref": "#/definitions/nonNegative"},
+        "primary_profitable": {"$ref": "#/definitions/nonNegative"},
+        "shadow_accepted": {"$ref": "#/definitions/nonNegative"},
+        "supported_exact_input_inputs": {"$ref": "#/definitions/nonNegative"}
+      }
+    },
+    "routeIntelligence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["candidate_count", "configured_route_matches", "no_route_total", "route_discovery_eligible_total"],
+      "properties": {
+        "candidate_count": {"$ref": "#/definitions/nonNegative"},
+        "configured_route_matches": {"$ref": "#/definitions/nonNegative"},
+        "no_route_total": {"$ref": "#/definitions/nonNegative"},
+        "route_discovery_eligible_total": {"$ref": "#/definitions/nonNegative"}
+      }
+    },
+    "business": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["profitability_funnel", "profitability", "route_intelligence"],
+      "properties": {
+        "profitability_funnel": {"$ref": "#/definitions/funnel"},
+        "profitability": {"$ref": "#/definitions/profitability"},
+        "route_intelligence": {"$ref": "#/definitions/routeIntelligence"}
+      }
+    },
+    "metricSeries": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "labels", "value"],
+      "properties": {
+        "name": {"type": "string", "pattern": "^(?:feed|phoenix|recorder|rpc|shadow_dispatcher)_[a-zA-Z0-9_]+$|^up$", "maxLength": 128},
+        "labels": {
+          "type": "object",
+          "additionalProperties": false,
+          "maxProperties": 3,
+          "properties": {
+            "bucket": {"type": "string", "maxLength": 64},
+            "class": {"type": "string", "maxLength": 64},
+            "classification": {"type": "string", "maxLength": 64},
+            "job": {"enum": ["feed-ingestor", "phoenix-engine", "recorder", "rpc-gateway", "shadow-dispatcher"]},
+            "kind": {"type": "string", "pattern": "^(?:[0-9]|[1-9][0-9]|1[0-9][0-9]|2[0-4][0-9]|25[0-5])$"},
+            "layer": {"enum": ["l1", "l2"]},
+            "le": {"type": "string", "maxLength": 16},
+            "method": {"type": "string", "maxLength": 64},
+            "outcome": {"type": "string", "maxLength": 64},
+            "provider_slot": {"type": "string", "maxLength": 16},
+            "reason": {"type": "string", "maxLength": 64},
+            "scenario": {"type": "string", "maxLength": 16},
+            "status": {"type": "string", "maxLength": 32}
+          }
+        },
+        "value": {"$ref": "#/definitions/nonNegative"}
+      }
+    }
+  }
+}

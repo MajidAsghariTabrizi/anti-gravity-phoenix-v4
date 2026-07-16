@@ -268,6 +268,7 @@ async fn connect_postgres_until_ready(
     retry: RetryPolicy,
 ) -> Option<PostgresStore> {
     let mut delay = retry.initial;
+    let mut failed_attempts = 0_u64;
     loop {
         match PostgresStore::connect(&config.postgres_dsn, &config.pg_ssl_mode).await {
             Ok(store) => {
@@ -276,11 +277,16 @@ async fn connect_postgres_until_ready(
                 match store.verify_schema().await {
                     Ok(()) => {
                         readiness.set_schema_verified(true);
+                        if failed_attempts > 0 {
+                            metrics.database_retry_recovered();
+                        }
                         tracing::info!(event = "recorder_schema_verified");
                         return Some(store);
                     }
                     Err(error) => {
+                        failed_attempts = failed_attempts.saturating_add(1);
                         metrics.database_failure();
+                        metrics.database_retry();
                         readiness.set_schema_verified(false);
                         if let Some(suppressed) = sampler.sample("initial_schema_failure") {
                             tracing::error!(
@@ -294,7 +300,9 @@ async fn connect_postgres_until_ready(
                 }
             }
             Err(error) => {
+                failed_attempts = failed_attempts.saturating_add(1);
                 metrics.database_failure();
+                metrics.database_retry();
                 readiness.set_postgres_connected(false);
                 if let Some(suppressed) = sampler.sample("initial_postgres_failure") {
                     tracing::warn!(

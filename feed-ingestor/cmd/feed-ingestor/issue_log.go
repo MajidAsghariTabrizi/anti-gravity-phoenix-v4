@@ -104,6 +104,13 @@ func (l *sampledIssueLogger) sample(key string) (uint64, bool) {
 func recordFrameIssues(registry *metrics.Registry, issueLogger *sampledIssueLogger, frame nitro.Frame) {
 	registry.Add("feed_unsupported_messages_total", uint64(len(frame.Unsupported)))
 	registry.Add("feed_decode_failures_total", uint64(len(frame.Malformed)))
+	registry.Add("feed_ignored_messages_total", uint64(len(frame.Ignored)))
+	for _, kind := range frame.UnsupportedKinds {
+		registry.IncUnsupportedMessageKind(kind)
+	}
+	for _, kind := range frame.IgnoredKinds {
+		registry.IncIgnoredMessageKind(kind)
+	}
 	for _, reason := range frame.Unsupported {
 		issueLogger.Log("unsupported", frame.Sequence, reason)
 	}

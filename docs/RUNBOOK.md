@@ -11,7 +11,19 @@ Production default:
 - no GitHub-held signer key
 - release by immutable manifest
 
-Production operations use `/opt/phoenix/deploy/deploy-release.sh <sha>`, `/opt/phoenix/deploy/rollback-release.sh`, and `/opt/phoenix/deploy/production-healthcheck.sh`. Bounded read-only profitability reporting is documented in [`SHADOW_PROFITABILITY_REPORTS.md`](SHADOW_PROFITABILITY_REPORTS.md). Bounded official-router route discovery is documented in [`SHADOW_ROUTE_DISCOVERY.md`](SHADOW_ROUTE_DISCOVERY.md).
+Production operations use `/opt/phoenix/deploy/deploy-release.sh <sha>`, `/opt/phoenix/deploy/rollback-release.sh`, and `/opt/phoenix/deploy/production-healthcheck.sh`. Bounded read-only profitability reporting is documented in [`SHADOW_PROFITABILITY_REPORTS.md`](SHADOW_PROFITABILITY_REPORTS.md). Bounded official-router route discovery is documented in [`SHADOW_ROUTE_DISCOVERY.md`](SHADOW_ROUTE_DISCOVERY.md). The combined technical and business evidence contract is documented in [`PRELIVE_MONEY_PATH_OBSERVABILITY.md`](PRELIVE_MONEY_PATH_OBSERVABILITY.md).
+
+## Money-Path Evidence
+
+Generate a bounded 24-hour report without changing service state:
+
+```sh
+/opt/phoenix/deploy/prelive-money-path-report.sh --format text --window-hours 24
+```
+
+The command fails closed when a production scrape, PostgreSQL, Prometheus, the digest-pinned release
+context, or any SHADOW safety invariant is unavailable. Treat a failed report as missing evidence,
+not as a zero observation. Preserve the JSON form with the release SHA when collecting soak evidence.
 
 ## Bounded Engine Canary
 
@@ -154,6 +166,7 @@ After stopping, the script waits up to `SHADOW_ENGINE_CANARY_SETTLE_TIMEOUT_SECO
 - Dashboard metrics may degrade.
 - Health gate fails until Prometheus readiness recovers.
 - Inspect `/opt/phoenix/data/prometheus`.
+- The bounded money-path report must fail; do not replace missing samples with zeros.
 
 ### Dashboard unavailable
 

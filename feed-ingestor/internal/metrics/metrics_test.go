@@ -4,6 +4,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"anti-gravity-phoenix-v4/feed-ingestor/internal/nitro"
 )
 
 func TestRegistryRendersCountersAndLatency(t *testing.T) {
@@ -34,6 +36,28 @@ func TestRegistryRendersCountersAndLatency(t *testing.T) {
 	} {
 		if !strings.Contains(rendered, required) {
 			t.Fatalf("missing sequence counter %q: %s", required, rendered)
+		}
+	}
+}
+
+func TestRegistryRendersOnlyBoundedStructuredMessageKindLabels(t *testing.T) {
+	reg := NewRegistry()
+	reg.IncUnsupportedMessageKind(nitro.MessageKind{Layer: nitro.MessageLayerL2, Kind: 0x7f})
+	reg.IncIgnoredMessageKind(nitro.MessageKind{Layer: nitro.MessageLayerL1, Kind: nitro.L1MessageTypeEndOfBlock})
+	reg.IncUnsupportedMessageKind(nitro.MessageKind{Layer: 99, Kind: 1})
+
+	rendered := reg.Render()
+	for _, expected := range []string{
+		`feed_message_kind_total{classification="unsupported",layer="l2",kind="127"} 1`,
+		`feed_message_kind_total{classification="ignored",layer="l1",kind="6"} 1`,
+	} {
+		if !strings.Contains(rendered, expected) {
+			t.Fatalf("missing bounded message-kind metric %q: %s", expected, rendered)
+		}
+	}
+	for _, forbidden := range []string{"reason=", "payload=", "tx_hash=", `layer="unknown"`} {
+		if strings.Contains(rendered, forbidden) {
+			t.Fatalf("message-kind metric contains unbounded label %q: %s", forbidden, rendered)
 		}
 	}
 }

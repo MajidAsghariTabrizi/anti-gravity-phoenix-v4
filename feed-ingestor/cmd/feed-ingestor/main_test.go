@@ -160,12 +160,17 @@ func TestRelayForwardGapIsCountedOnceAdvancesAndReadinessRecovers(t *testing.T) 
 	for _, expected := range []string{
 		"feed_sequence_gaps_total 1",
 		"feed_sequence_gap_messages_total 2",
+		"feed_missing_sequences_total 2",
 		"feed_decode_failures_total 0",
+		"feed_data_completeness 1",
 		"feed_readiness 1",
 	} {
 		if !strings.Contains(rendered, expected) {
 			t.Fatalf("gap metrics missing %q: %s", expected, rendered)
 		}
+	}
+	if strings.Contains(rendered, "feed_last_gap_timestamp_seconds 0") {
+		t.Fatalf("gap timestamp was not recorded: %s", rendered)
 	}
 }
 

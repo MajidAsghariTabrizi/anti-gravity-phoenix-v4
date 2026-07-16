@@ -42,6 +42,8 @@ python -m py_compile scripts/shadow_profitability_report.py
 sh scripts/shadow-profitability-report-tests.sh
 python -m py_compile scripts/shadow_route_discovery.py
 sh scripts/shadow-route-discovery-tests.sh
+python -m py_compile scripts/prelive_money_path_report.py
+sh scripts/prelive-money-path-report-tests.sh
 ```
 
 ## Shadow Production
@@ -59,6 +61,7 @@ Default production safety:
 Production deployment is documented in `docs/PRODUCTION_BOOTSTRAP.md` and `docs/RELEASE_AND_ROLLBACK.md`.
 Bounded read-only route discovery and its evidence limits are documented in `docs/SHADOW_ROUTE_DISCOVERY.md`.
 Profit-triggered independent RPC verification is documented in `docs/SHADOW_SECONDARY_VERIFICATION.md`.
+Bounded technical and business money-path evidence is documented in `docs/PRELIVE_MONEY_PATH_OBSERVABILITY.md`.
 
 Current real Nitro feed status: Nitro relay parsing is implemented for first SHADOW runtime verification but not live-verified. Production relay mode can start for Linux VPS validation, but real-feed evidence is still required before any production-readiness or LIVE claim.
 

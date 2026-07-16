@@ -434,6 +434,10 @@ for installed_script in \
   shadow-route-discovery.sh \
   shadow_route_discovery.py \
   shadow-route-discovery-enrichment.sql \
+  prelive-money-path-report.sh \
+  prelive_money_path_report.py \
+  prelive-money-path-report.sql \
+  prelive-money-path-summary.schema.json \
   arbitrum_uniswap_v3_pool_proofs.json
 do
   grep -F "$installed_script" "$script_dir/bootstrap-production.sh" >/dev/null ||

@@ -2,7 +2,7 @@ use phoenix_engine::config::EngineConfig;
 use phoenix_engine::domain::Address;
 use phoenix_engine::engine_jetstream::{JetStreamFetcher, MessageFetcher};
 use phoenix_engine::execution::ExecutionMode;
-use phoenix_engine::metrics::RuntimeMetrics;
+use phoenix_engine::metrics::{RuntimeExitMetric, RuntimeMetrics};
 use phoenix_engine::origin::{reviewed_router_kind, REVIEWED_ROUTER_ADDRESSES};
 use phoenix_engine::persistence::{PostgresShadowStore, ShadowStore};
 use phoenix_engine::readiness::initialize_runtime;
@@ -260,6 +260,13 @@ async fn run_daemon() -> Result<(), &'static str> {
         )
         .await;
         readiness.set_nats_connected(false);
+        metrics.runtime_exit(match exit {
+            RuntimeExit::Shutdown => RuntimeExitMetric::Shutdown,
+            RuntimeExit::FetchFailed => RuntimeExitMetric::FetchFailed,
+            RuntimeExit::StoreFailed => RuntimeExitMetric::StoreFailed,
+            RuntimeExit::AcknowledgementFailed => RuntimeExitMetric::AcknowledgementFailed,
+            RuntimeExit::IntegrityFailure => RuntimeExitMetric::IntegrityFailure,
+        });
         match exit {
             RuntimeExit::Shutdown => break,
             RuntimeExit::IntegrityFailure => {

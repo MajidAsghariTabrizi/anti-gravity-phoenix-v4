@@ -18,6 +18,8 @@ struct MetricValues {
     duplicate_skips: AtomicU64,
     decode_failures: AtomicU64,
     database_failures: AtomicU64,
+    database_retries: AtomicU64,
+    database_retry_recoveries: AtomicU64,
     nats_reconnects: AtomicU64,
     jetstream_fetch_failures: AtomicU64,
     jetstream_ack_failures: AtomicU64,
@@ -66,6 +68,16 @@ impl Metrics {
 
     pub fn database_failure(&self) {
         self.inner.database_failures.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn database_retry(&self) {
+        self.inner.database_retries.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn database_retry_recovered(&self) {
+        self.inner
+            .database_retry_recoveries
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn nats_reconnect(&self) {
@@ -147,6 +159,10 @@ impl Metrics {
                 "recorder_decode_failures_total {}\n",
                 "# TYPE recorder_database_failures_total counter\n",
                 "recorder_database_failures_total {}\n",
+                "# TYPE recorder_database_retries_total counter\n",
+                "recorder_database_retries_total {}\n",
+                "# TYPE recorder_database_retry_recoveries_total counter\n",
+                "recorder_database_retry_recoveries_total {}\n",
                 "# TYPE recorder_nats_reconnects_total counter\n",
                 "recorder_nats_reconnects_total {}\n",
                 "# TYPE recorder_jetstream_fetch_failures_total counter\n",
@@ -165,6 +181,8 @@ impl Metrics {
                 "recorder_batch_messages_total {}\n",
                 "# TYPE recorder_batch_persist_latency gauge\n",
                 "recorder_batch_persist_latency {:.9}\n",
+                "# TYPE recorder_batch_persist_latency_seconds gauge\n",
+                "recorder_batch_persist_latency_seconds {:.9}\n",
                 "# TYPE recorder_consumer_pending_messages gauge\n",
                 "recorder_consumer_pending_messages {}\n",
                 "# TYPE recorder_consumer_ack_pending gauge\n",
@@ -183,6 +201,8 @@ impl Metrics {
             self.inner.duplicate_skips.load(Ordering::Relaxed),
             self.inner.decode_failures.load(Ordering::Relaxed),
             self.inner.database_failures.load(Ordering::Relaxed),
+            self.inner.database_retries.load(Ordering::Relaxed),
+            self.inner.database_retry_recoveries.load(Ordering::Relaxed),
             self.inner.nats_reconnects.load(Ordering::Relaxed),
             self.inner.jetstream_fetch_failures.load(Ordering::Relaxed),
             self.inner.jetstream_ack_failures.load(Ordering::Relaxed),
@@ -191,6 +211,7 @@ impl Metrics {
             self.inner.batches_persisted.load(Ordering::Relaxed),
             self.inner.batch_messages_latest.load(Ordering::Relaxed),
             self.inner.batch_messages_total.load(Ordering::Relaxed),
+            latency_seconds,
             latency_seconds,
             self.inner.consumer_pending.load(Ordering::Relaxed),
             self.inner.consumer_ack_pending.load(Ordering::Relaxed),
@@ -211,6 +232,8 @@ mod tests {
         metrics.jetstream_fetch_failure();
         metrics.jetstream_ack_failure();
         metrics.jetstream_redelivery();
+        metrics.database_retry();
+        metrics.database_retry_recovered();
         metrics.batch_persisted(17, Duration::from_millis(25));
         metrics.set_consumer_state(ConsumerState {
             pending: 31,
@@ -221,9 +244,12 @@ mod tests {
         assert!(rendered.contains("recorder_jetstream_fetch_failures_total 1"));
         assert!(rendered.contains("recorder_jetstream_ack_failures_total 1"));
         assert!(rendered.contains("recorder_jetstream_redeliveries_total 1"));
+        assert!(rendered.contains("recorder_database_retries_total 1"));
+        assert!(rendered.contains("recorder_database_retry_recoveries_total 1"));
         assert!(rendered.contains("recorder_batches_persisted_total 1"));
         assert!(rendered.contains("recorder_batch_messages 17"));
         assert!(rendered.contains("recorder_batch_persist_latency 0.025000000"));
+        assert!(rendered.contains("recorder_batch_persist_latency_seconds 0.025000000"));
         assert!(rendered.contains("recorder_consumer_pending_messages 31"));
         assert!(rendered.contains("recorder_consumer_ack_pending 7"));
     }
