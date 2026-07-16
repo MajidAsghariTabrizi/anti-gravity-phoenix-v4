@@ -44,6 +44,8 @@ python -m py_compile scripts/shadow_route_discovery.py
 sh scripts/shadow-route-discovery-tests.sh
 python -m py_compile scripts/prelive_money_path_report.py
 sh scripts/prelive-money-path-report-tests.sh
+python -m unittest discover -s dashboard/tests -p "test_*.py" -v
+python scripts/prelive_dashboard_snapshot.py --input fixtures/dashboard/latest-dashboard.json --output fixtures/dashboard/checked-dashboard.json --check
 ```
 
 ## Shadow Production
@@ -62,6 +64,7 @@ Production deployment is documented in `docs/PRODUCTION_BOOTSTRAP.md` and `docs/
 Bounded read-only route discovery and its evidence limits are documented in `docs/SHADOW_ROUTE_DISCOVERY.md`.
 Profit-triggered independent RPC verification is documented in `docs/SHADOW_SECONDARY_VERIFICATION.md`.
 Bounded technical and business money-path evidence is documented in `docs/PRELIVE_MONEY_PATH_OBSERVABILITY.md`.
+The evidence-only technical and business Dashboard is documented in `docs/PRELIVE_DASHBOARD.md`.
 
 Current real Nitro feed status: Nitro relay parsing is implemented for first SHADOW runtime verification but not live-verified. Production relay mode can start for Linux VPS validation, but real-feed evidence is still required before any production-readiness or LIVE claim.
 
@@ -80,7 +83,7 @@ Merging to `main` can deploy SHADOW. It cannot enable LIVE. The manual `Live Rea
 - `replay`: deterministic offline replay CLI.
 - `postgres`: durable storage.
 - `prometheus`: metrics.
-- `dashboard`: Streamlit dashboard from PostgreSQL and metrics only.
+- `dashboard`: evidence-only Streamlit view with bounded redacted snapshots and no data-plane credentials or Docker access.
 
 ## Release Gate Before LIVE
 

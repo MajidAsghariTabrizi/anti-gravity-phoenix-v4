@@ -438,6 +438,8 @@ for installed_script in \
   prelive_money_path_report.py \
   prelive-money-path-report.sql \
   prelive-money-path-summary.schema.json \
+  prelive_dashboard_snapshot.py \
+  snapshot_model.py \
   arbitrum_uniswap_v3_pool_proofs.json
 do
   grep -F "$installed_script" "$script_dir/bootstrap-production.sh" >/dev/null ||

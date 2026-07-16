@@ -1,5 +1,3 @@
-streamlit>=1.36
-psycopg[binary]>=3.2
-pandas>=2.2
-requests>=2.32
+streamlit>=1.59,<2
+pandas>=2.2,<3
 

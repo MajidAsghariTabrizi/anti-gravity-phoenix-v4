@@ -1,0 +1,298 @@
+{
+  "schema_version": "phoenix.prelive.dashboard.v1",
+  "generated_at": "2026-07-16T00:00:00Z",
+  "window_hours": 24,
+  "safety": {
+    "mode": "SHADOW",
+    "live_execution": false,
+    "prelive_lock": true,
+    "execution_eligible": false,
+    "execution_request_created": false,
+    "signer_configured": false,
+    "wallet_configured": false,
+    "executor_configured": false,
+    "submission_method_invocations": "0"
+  },
+  "governance": {
+    "model_version": "profitability-v3",
+    "policy_version": "prelive-v2",
+    "route_configuration_hash": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+    "route_registry_matches": true,
+    "image_manifest_matches": true,
+    "freshness_threshold_seconds": "300",
+    "fork_prediction_error_limit": "1000",
+    "database_headroom_min_bytes": "1073741824",
+    "unsupported_message_alert_threshold": "5"
+  },
+  "business": {
+    "sample_count": "120",
+    "active_shadow_routes": "3",
+    "nearest_to_profitable_count": "2",
+    "independently_verified_count": "7",
+    "fork_successful_count": "5"
+  },
+  "funnel": [
+    {
+      "stage": "feed_inputs",
+      "count": "1000",
+      "dropoff_reasons": []
+    },
+    {
+      "stage": "supported_swaps",
+      "count": "800",
+      "dropoff_reasons": [
+        {"reason": "unsupported_entrypoint", "count": "150"},
+        {"reason": "malformed_payload", "count": "50"}
+      ]
+    },
+    {
+      "stage": "route_matches",
+      "count": "500",
+      "dropoff_reasons": [
+        {"reason": "no_configured_route", "count": "300"}
+      ]
+    },
+    {
+      "stage": "candidates",
+      "count": "120",
+      "dropoff_reasons": [
+        {"reason": "state_incomplete", "count": "380"}
+      ]
+    },
+    {
+      "stage": "primary_profitable",
+      "count": "20",
+      "dropoff_reasons": [
+        {"reason": "net_pnl_non_positive", "count": "100"}
+      ]
+    },
+    {
+      "stage": "independently_verified",
+      "count": "7",
+      "dropoff_reasons": [
+        {"reason": "verification_unavailable", "count": "12"},
+        {"reason": "verification_disagreed", "count": "1"}
+      ]
+    },
+    {
+      "stage": "fork_simulated",
+      "count": "6",
+      "dropoff_reasons": [
+        {"reason": "fork_evidence_incomplete", "count": "1"}
+      ]
+    },
+    {
+      "stage": "fork_profitable",
+      "count": "4",
+      "dropoff_reasons": [
+        {"reason": "fork_not_profitable", "count": "1"},
+        {"reason": "fork_reverted", "count": "1"}
+      ]
+    }
+  ],
+  "profitability": {
+    "summary": {
+      "gross_profit": "15000",
+      "total_cost": "10000",
+      "net_pnl": "5000",
+      "expected_net_pnl": "5000",
+      "conservative_net_pnl": "3200",
+      "severe_net_pnl": "1900",
+      "fork_simulated_net_pnl": "4100"
+    },
+    "cost_breakdown": [
+      {"component": "gas", "amount": "6400"},
+      {"component": "flash_premium", "amount": "2100"},
+      {"component": "ordering", "amount": "1000"},
+      {"component": "safety_margin", "amount": "500"}
+    ],
+    "route_pnl": [
+      {"route_id": "route-111111111111", "expected": "2500", "conservative": "1700", "severe": "1000", "fork_simulated": "2100", "sample_count": "52"},
+      {"route_id": "route-222222222222", "expected": "1700", "conservative": "1000", "severe": "600", "fork_simulated": "1400", "sample_count": "41"},
+      {"route_id": "route-333333333333", "expected": "800", "conservative": "500", "severe": "300", "fork_simulated": "600", "sample_count": "27"}
+    ],
+    "nearest_opportunities": [
+      {"route_id": "route-222222222222", "shortfall": "120", "reason": "gas_margin"},
+      {"route_id": "route-333333333333", "shortfall": "240", "reason": "verification_margin"}
+    ],
+    "distribution": [
+      {"scenario": "expected", "bucket": "positive", "count": "20"},
+      {"scenario": "expected", "bucket": "near_zero", "count": "12"},
+      {"scenario": "expected", "bucket": "negative", "count": "88"},
+      {"scenario": "conservative", "bucket": "positive", "count": "14"},
+      {"scenario": "conservative", "bucket": "near_zero", "count": "10"},
+      {"scenario": "conservative", "bucket": "negative", "count": "96"},
+      {"scenario": "severe", "bucket": "positive", "count": "9"},
+      {"scenario": "severe", "bucket": "near_zero", "count": "8"},
+      {"scenario": "severe", "bucket": "negative", "count": "103"},
+      {"scenario": "fork_simulated", "bucket": "positive", "count": "4"},
+      {"scenario": "fork_simulated", "bucket": "negative", "count": "1"},
+      {"scenario": "fork_simulated", "bucket": "reverted", "count": "1"}
+    ],
+    "prediction_error": [
+      {"bucket": "under_100", "count": "2"},
+      {"bucket": "100_to_500", "count": "3"},
+      {"bucket": "over_500", "count": "1"}
+    ],
+    "daily_trend": [
+      {"period": "2026-07-14", "expected": "1200", "conservative": "700", "severe": "400", "fork_simulated": "900", "sample_count": "30"},
+      {"period": "2026-07-15", "expected": "1800", "conservative": "1200", "severe": "700", "fork_simulated": "1500", "sample_count": "42"},
+      {"period": "2026-07-16", "expected": "2000", "conservative": "1300", "severe": "800", "fork_simulated": "1700", "sample_count": "48"}
+    ],
+    "weekly_trend": [
+      {"period": "2026-W28", "expected": "2100", "conservative": "1300", "severe": "800", "fork_simulated": "1700", "sample_count": "54"},
+      {"period": "2026-W29", "expected": "2900", "conservative": "1900", "severe": "1100", "fork_simulated": "2400", "sample_count": "66"}
+    ],
+    "model_comparison": [
+      {"model_version": "profitability-v2", "sample_count": "45", "expected": "1700", "conservative": "900", "absolute_fork_error": "700"},
+      {"model_version": "profitability-v3", "sample_count": "75", "expected": "3300", "conservative": "2300", "absolute_fork_error": "200"}
+    ]
+  },
+  "routes": [
+    {
+      "route_id": "route-111111111111",
+      "rank": 1,
+      "active_shadow": true,
+      "candidate_count": "52",
+      "ranking_score_bps": "9200",
+      "score_components": {"liquidity": "9400", "freshness": "9000", "confidence": "9300", "reliability": "9100"},
+      "data_quality_warnings": [],
+      "expected_net_pnl": "2500",
+      "conservative_net_pnl": "1700",
+      "provider_failure_contribution_bps": "250",
+      "fork_success_rate_bps": "8000"
+    },
+    {
+      "route_id": "route-222222222222",
+      "rank": 2,
+      "active_shadow": true,
+      "candidate_count": "41",
+      "ranking_score_bps": "8400",
+      "score_components": {"liquidity": "8700", "freshness": "8200", "confidence": "8500", "reliability": "8200"},
+      "data_quality_warnings": ["limited_fork_sample"],
+      "expected_net_pnl": "1700",
+      "conservative_net_pnl": "1000",
+      "provider_failure_contribution_bps": "600",
+      "fork_success_rate_bps": "7500"
+    },
+    {
+      "route_id": "route-333333333333",
+      "rank": 3,
+      "active_shadow": true,
+      "candidate_count": "27",
+      "ranking_score_bps": "7600",
+      "score_components": {"liquidity": "7900", "freshness": "7600", "confidence": "7400", "reliability": "7500"},
+      "data_quality_warnings": ["feed_gap_affected"],
+      "expected_net_pnl": "800",
+      "conservative_net_pnl": "500",
+      "provider_failure_contribution_bps": "900",
+      "fork_success_rate_bps": "5000"
+    }
+  ],
+  "services": [
+    {"service": "nitro-feed-relay", "state": "running_healthy", "expected_state": "running", "image_digest": "sha256:1111111111111111111111111111111111111111111111111111111111111111", "git_sha": "not_available", "started_at": "2026-07-15T23:30:00Z", "exit_code": null, "oom": false, "restart_count": 0, "readiness_freshness_seconds": "8"},
+    {"service": "feed-ingestor", "state": "running_healthy", "expected_state": "running", "image_digest": "sha256:2222222222222222222222222222222222222222222222222222222222222222", "git_sha": "1111111111111111111111111111111111111111", "started_at": "2026-07-15T23:31:00Z", "exit_code": null, "oom": false, "restart_count": 0, "readiness_freshness_seconds": "5"},
+    {"service": "nats", "state": "running_healthy", "expected_state": "running", "image_digest": "sha256:3333333333333333333333333333333333333333333333333333333333333333", "git_sha": "not_available", "started_at": "2026-07-15T23:30:00Z", "exit_code": null, "oom": false, "restart_count": 0, "readiness_freshness_seconds": "4"},
+    {"service": "recorder", "state": "running_healthy", "expected_state": "running", "image_digest": "sha256:4444444444444444444444444444444444444444444444444444444444444444", "git_sha": "1111111111111111111111111111111111111111", "started_at": "2026-07-15T23:32:00Z", "exit_code": null, "oom": false, "restart_count": 0, "readiness_freshness_seconds": "6"},
+    {"service": "postgres", "state": "running_healthy", "expected_state": "running", "image_digest": "sha256:5555555555555555555555555555555555555555555555555555555555555555", "git_sha": "not_available", "started_at": "2026-07-15T23:30:00Z", "exit_code": null, "oom": false, "restart_count": 0, "readiness_freshness_seconds": "3"},
+    {"service": "rpc-gateway", "state": "running_healthy", "expected_state": "running", "image_digest": "sha256:6666666666666666666666666666666666666666666666666666666666666666", "git_sha": "1111111111111111111111111111111111111111", "started_at": "2026-07-15T23:32:00Z", "exit_code": null, "oom": false, "restart_count": 0, "readiness_freshness_seconds": "7"},
+    {"service": "phoenix-engine", "state": "running_healthy", "expected_state": "running", "image_digest": "sha256:7777777777777777777777777777777777777777777777777777777777777777", "git_sha": "1111111111111111111111111111111111111111", "started_at": "2026-07-15T23:33:00Z", "exit_code": null, "oom": false, "restart_count": 0, "readiness_freshness_seconds": "6"},
+    {"service": "shadow-dispatcher", "state": "running_healthy", "expected_state": "running", "image_digest": "sha256:8888888888888888888888888888888888888888888888888888888888888888", "git_sha": "1111111111111111111111111111111111111111", "started_at": "2026-07-15T23:32:00Z", "exit_code": null, "oom": false, "restart_count": 0, "readiness_freshness_seconds": "5"},
+    {"service": "prometheus", "state": "running_healthy", "expected_state": "running", "image_digest": "sha256:9999999999999999999999999999999999999999999999999999999999999999", "git_sha": "not_available", "started_at": "2026-07-15T23:30:00Z", "exit_code": null, "oom": false, "restart_count": 0, "readiness_freshness_seconds": "2"},
+    {"service": "dashboard", "state": "running_healthy", "expected_state": "running", "image_digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "git_sha": "1111111111111111111111111111111111111111", "started_at": "2026-07-15T23:34:00Z", "exit_code": null, "oom": false, "restart_count": 0, "readiness_freshness_seconds": "1"},
+    {"service": "fork-sandbox", "state": "stopped_clean", "expected_state": "on_demand", "image_digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "git_sha": "1111111111111111111111111111111111111111", "started_at": null, "exit_code": 0, "oom": false, "restart_count": 0, "readiness_freshness_seconds": null}
+  ],
+  "feed": {
+    "gap_count": "2",
+    "missing_sequences": "3",
+    "most_recent_gap_at": "2026-07-15T23:50:00Z",
+    "unsupported_kinds": [{"kind": 9, "count": "2"}],
+    "ignored_kinds": [{"kind": 6, "count": "4"}],
+    "reconnects": "1",
+    "completeness_status": "incomplete",
+    "affected_windows": ["2026-07-15T23:45Z_to_2026-07-15T23:51Z"]
+  },
+  "rpc": {
+    "providers": [
+      {"provider_id": "provider-primary-a", "role": "primary", "success_rate_bps": "9600", "timeouts": "2", "rate_limits": "1", "unavailable": "1", "p50_latency_ms": "45", "p95_latency_ms": "130", "p99_latency_ms": "220", "budget_utilization_bps": "6400", "self_verification_prevented": true},
+      {"provider_id": "provider-secondary-b", "role": "secondary", "success_rate_bps": "9200", "timeouts": "1", "rate_limits": "2", "unavailable": "1", "p50_latency_ms": "60", "p95_latency_ms": "180", "p99_latency_ms": "290", "budget_utilization_bps": "4200", "self_verification_prevented": true}
+    ],
+    "secondary_requested": "10",
+    "agreed": "8",
+    "disagreed": "1",
+    "state_freshness_seconds": "0.25",
+    "pinned_block_status": "pinned"
+  },
+  "jetstream": {
+    "streams": [
+      {"stream_id": "PHOENIX_FEED_TX", "exists": true, "messages": "110", "bytes": "88000", "configured_storage": "file", "storage_used_bps": "400"},
+      {"stream_id": "PHOENIX_ENGINE_INPUT", "exists": true, "messages": "22", "bytes": "44000", "configured_storage": "file", "storage_used_bps": "300"}
+    ],
+    "consumers": [
+      {"consumer_id": "PHOENIX_RECORDER", "exists": true, "ack_pending": "1", "pending": "2", "redeliveries": "0", "oldest_pending_age_seconds": "4"},
+      {"consumer_id": "PHOENIX_ENGINE_SHADOW", "exists": true, "ack_pending": "1", "pending": "3", "redeliveries": "1", "oldest_pending_age_seconds": "6"},
+      {"consumer_id": "PHOENIX_SHADOW_DISPATCH", "exists": true, "ack_pending": "0", "pending": "3", "redeliveries": "0", "oldest_pending_age_seconds": "15"}
+    ],
+    "persistence": {
+      "throughput_per_second": "12.5",
+      "batch_size": "64",
+      "backlog_growth": "2",
+      "database_write_latency_ms": {"p50": "8", "p95": "22", "p99": "48"}
+    }
+  },
+  "postgres": {
+    "readiness": true,
+    "database_size_bytes": "524288000",
+    "growth_bytes_1h": "1048576",
+    "growth_bytes_6h": "6291456",
+    "growth_bytes_24h": "25165824",
+    "projected_disk_headroom_bytes": "10737418240",
+    "active_connections": "7",
+    "checkpoints_timed": "12",
+    "checkpoints_requested": "1",
+    "wal_bytes": "33554432",
+    "oldest_relevant_event": "2026-07-15T00:00:00Z",
+    "newest_relevant_event": "2026-07-15T23:59:30Z",
+    "migration_version": "010_fork_simulation_evidence",
+    "migration_checksum": "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+    "retention_status": "not_configured"
+  },
+  "reliability": {
+    "retry_attempts": "8",
+    "recovered_retries": "6",
+    "exhausted_or_quarantined": "1",
+    "terminal_integrity_failures": "0",
+    "runtime_exits": [{"class": "clean_shutdown", "count": "1"}],
+    "restart_loops": "0",
+    "later_message_progress_after_quarantine": "42",
+    "protected_service_identity_status": "stable"
+  },
+  "fork": {
+    "unsigned_plan_count": "7",
+    "simulations": "6",
+    "success": "5",
+    "reverted": "1",
+    "gas_used": "2400000",
+    "balance_delta": "8600",
+    "simulated_net_pnl": "4100",
+    "absolute_prediction_error": "900",
+    "fork_block": "360000000",
+    "contract_guard_failures": "0"
+  },
+  "artifacts": [
+    {"kind": "technical_json", "label": "Technical JSON", "available": true, "path": "technical.json", "sha256": "sha256:831a7239dd5e42596e6a532377e1f301affc393a532b5fffed326861f52477e4", "size_bytes": 132, "generated_at": "2026-07-16T00:00:00Z", "content_type": "application/json"},
+    {"kind": "business_json", "label": "Business JSON", "available": true, "path": "business.json", "sha256": "sha256:a319e8673644ed8edf04e9ca94752598cd0576b6896781c3d107be563bf5633f", "size_bytes": 126, "generated_at": "2026-07-16T00:00:00Z", "content_type": "application/json"},
+    {"kind": "preflight_report", "label": "Preflight report", "available": false, "path": null, "sha256": null, "size_bytes": null, "generated_at": null, "content_type": null},
+    {"kind": "evidence_bundle", "label": "Evidence bundle", "available": false, "path": null, "sha256": null, "size_bytes": null, "generated_at": null, "content_type": null},
+    {"kind": "soak_report", "label": "Soak report", "available": false, "path": null, "sha256": null, "size_bytes": null, "generated_at": null, "content_type": null},
+    {"kind": "route_ranking", "label": "Route ranking", "available": false, "path": null, "sha256": null, "size_bytes": null, "generated_at": null, "content_type": null},
+    {"kind": "profitability_report", "label": "Profitability report", "available": false, "path": null, "sha256": null, "size_bytes": null, "generated_at": null, "content_type": null},
+    {"kind": "fork_simulation_report", "label": "Fork simulation report", "available": false, "path": null, "sha256": null, "size_bytes": null, "generated_at": null, "content_type": null},
+    {"kind": "release_manifest_checksum", "label": "Release manifest checksum", "available": false, "path": null, "sha256": null, "size_bytes": null, "generated_at": null, "content_type": null}
+  ],
+  "logs": [
+    {"timestamp": "2026-07-15T23:59:40Z", "service": "feed-ingestor", "severity": "warning", "event_class": "sequence_gap", "message": "Bounded feed gap evidence recorded; affected window marked incomplete"},
+    {"timestamp": "2026-07-15T23:59:45Z", "service": "rpc-gateway", "severity": "warning", "event_class": "verification_disagreement", "message": "Independent provider evidence disagreed for one bounded evaluation"},
+    {"timestamp": "2026-07-15T23:59:50Z", "service": "phoenix-engine", "severity": "info", "event_class": "shadow_decision", "message": "Counterfactual decision persisted without execution eligibility"}
+  ]
+}

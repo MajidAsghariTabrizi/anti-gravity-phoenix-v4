@@ -55,6 +55,7 @@ jobs:
           sh ./scripts/shadow-route-discovery-tests.sh
           python3 -m py_compile scripts/prelive_money_path_report.py
           sh ./scripts/prelive-money-path-report-tests.sh
+          python3 -m py_compile scripts/prelive_dashboard_snapshot.py scripts/verify_dashboard_compose.py
 
       - name: Validate tracked hygiene
         shell: bash
@@ -302,7 +303,12 @@ jobs:
           set -euo pipefail
           python -m pip install --upgrade pip
           python -m pip install -r dashboard/requirements.txt
-          python -m py_compile dashboard/app.py
+          python -m py_compile dashboard/app.py dashboard/snapshot_model.py scripts/prelive_dashboard_snapshot.py scripts/verify_dashboard_compose.py
+          python -m unittest discover -s dashboard/tests -p 'test_*.py' -v
+          python scripts/prelive_dashboard_snapshot.py \
+            --input fixtures/dashboard/latest-dashboard.json \
+            --output fixtures/dashboard/checked-dashboard.json \
+            --check
           python dashboard/smoke_import.py
 
   docker-validation:
@@ -350,6 +356,8 @@ jobs:
           EOF
           docker compose config
           PHOENIX_ENV_FILE=.ci-prod.env docker compose --env-file .ci-prod.env -f compose.prod.yml config
+          PHOENIX_ENV_FILE=.ci-prod.env docker compose --env-file .ci-prod.env -f compose.prod.yml config --format json > .ci-prod-config.json
+          python3 scripts/verify_dashboard_compose.py .ci-prod-config.json
           cat > .ci-fork.env <<'EOF'
           FORK_ANVIL_DIGEST=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
           FORK_POSTGRES_PASSWORD=ci-fork-placeholder

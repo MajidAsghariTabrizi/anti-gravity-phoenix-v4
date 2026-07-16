@@ -163,7 +163,7 @@ After stopping, the script waits up to `SHADOW_ENGINE_CANARY_SETTLE_TIMEOUT_SECO
 
 ### Prometheus unavailable
 
-- Dashboard metrics may degrade.
+- The Dashboard may retain its last validated snapshot, which becomes visibly stale after the configured freshness threshold.
 - Health gate fails until Prometheus readiness recovers.
 - Inspect `/opt/phoenix/data/prometheus`.
 - The bounded money-path report must fail; do not replace missing samples with zeros.
@@ -171,6 +171,9 @@ After stopping, the script waits up to `SHADOW_ENGINE_CANARY_SETTLE_TIMEOUT_SECO
 ### Dashboard unavailable
 
 - Check Streamlit health on loopback.
+- Check that `/opt/phoenix/evidence/dashboard/latest-dashboard.json` exists and was atomically promoted by the bounded snapshot compiler.
+- Treat `snapshot_missing`, stale evidence, integrity failure, and schema failure as blocked states. Do not copy fixture evidence into production.
+- Confirm the Dashboard has no production env file, data-plane endpoint, or Docker socket before restarting only the Dashboard service.
 - Dashboard failure must not cause hot-path RPC reads or engine restarts.
 
 ## Recovery Order

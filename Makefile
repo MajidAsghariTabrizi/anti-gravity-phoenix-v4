@@ -32,7 +32,10 @@ contract-test:
 	fi
 
 python-smoke:
-	python -m py_compile dashboard/app.py
+	python -m py_compile dashboard/app.py dashboard/snapshot_model.py scripts/prelive_dashboard_snapshot.py scripts/verify_dashboard_compose.py
+	python -m unittest discover -s dashboard/tests -p 'test_*.py' -v
+	python scripts/prelive_dashboard_snapshot.py --input fixtures/dashboard/latest-dashboard.json --output fixtures/dashboard/checked-dashboard.json --check
+	python dashboard/smoke_import.py
 
 secret-scan:
 	./scripts/secret-scan.sh
