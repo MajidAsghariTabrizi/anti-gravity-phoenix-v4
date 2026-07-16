@@ -44,6 +44,8 @@ except ModuleNotFoundError:  # pragma: no cover - installed host layout
     )
 from prelive_shadow_control import (  # noqa: E402
     FULL_SERVICES,
+    JETSTREAM_CONSUMER_NAMES,
+    JETSTREAM_STREAM_NAMES,
     PREFLIGHT_CHECKS,
     load_json as load_control_json,
     sample_from_money_path,
@@ -75,12 +77,8 @@ PROJECT_SERVICES = {
     "shadow-dispatcher",
     "dashboard",
 }
-STREAM_NAMES = ("PHOENIX_FEED_TX", "PHOENIX_ENGINE_INPUT")
-CONSUMER_NAMES = (
-    "PHOENIX_RECORDER",
-    "PHOENIX_ENGINE_SHADOW",
-    "PHOENIX_SHADOW_DISPATCH",
-)
+STREAM_NAMES = JETSTREAM_STREAM_NAMES
+CONSUMER_NAMES = JETSTREAM_CONSUMER_NAMES
 ARTIFACT_LABELS = {
     "technical_json": "Technical JSON",
     "business_json": "Business JSON",
@@ -221,46 +219,76 @@ def _array(value: Any, maximum: int, code: str = "source_shape_invalid") -> list
     return value
 
 
-def _text(value: Any, maximum: int = 256) -> str:
+def _source_value_code(path: str | None) -> str:
+    if path is None:
+        return "source_value_invalid"
+    if len(path) > 160 or re.fullmatch(r"[A-Za-z0-9_.\[\]-]+", path) is None:
+        _fail("source_path_invalid")
+    return f"source_value_invalid:{path}"
+
+
+def _text(value: Any, maximum: int = 256, *, path: str | None = None) -> str:
     if not isinstance(value, str) or not value or len(value) > maximum:
-        _fail("source_value_invalid")
+        _fail(_source_value_code(path))
     return value
 
 
-def _integer_text(value: Any, *, signed: bool = False) -> str:
+def _integer_text(
+    value: Any, *, signed: bool = False, path: str | None = None
+) -> str:
     pattern = SIGNED_INTEGER_RE if signed else INTEGER_RE
     if not isinstance(value, str) or len(value) > 96 or pattern.fullmatch(value) is None:
-        _fail("source_value_invalid")
+        _fail(_source_value_code(path))
     return value
 
 
-def _number(value: Any, *, signed: bool = False) -> Decimal:
-    text = _integer_text(value, signed=signed)
+def _number(value: Any, *, signed: bool = False, path: str | None = None) -> Decimal:
+    text = _integer_text(value, signed=signed, path=path)
     try:
         return Decimal(text)
     except InvalidOperation as exc:  # pragma: no cover - guarded by regex
-        raise LiveDashboardError("source_value_invalid") from exc
+        raise LiveDashboardError(_source_value_code(path)) from exc
 
 
-def _optional_number(value: Any, *, signed: bool = False) -> Decimal | None:
+def _optional_number(
+    value: Any, *, signed: bool = False, path: str | None = None
+) -> Decimal | None:
     if value is None:
         return None
-    return _number(value, signed=signed)
+    return _number(value, signed=signed, path=path)
 
 
-def _timestamp(value: Any) -> datetime:
-    text = _text(value, 40)
+def _timestamp(value: Any, *, path: str | None = None) -> datetime:
+    text = _text(value, 40, path=path)
     try:
         parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
     except ValueError as exc:
-        raise LiveDashboardError("timestamp_invalid") from exc
+        code = _source_value_code(path) if path is not None else "timestamp_invalid"
+        raise LiveDashboardError(code) from exc
     if parsed.tzinfo is None:
-        _fail("timestamp_invalid")
+        _fail(_source_value_code(path) if path is not None else "timestamp_invalid")
     return parsed.astimezone(timezone.utc)
 
 
-def _optional_timestamp(value: Any) -> datetime | None:
-    return None if value is None else _timestamp(value)
+def _optional_timestamp(value: Any, *, path: str | None = None) -> datetime | None:
+    return None if value is None else _timestamp(value, path=path)
+
+
+def _period(value: Any, pattern: str, format_string: str, path: str) -> str:
+    text = _text(value, 16, path=path)
+    if re.fullmatch(pattern, text) is None:
+        _fail(_source_value_code(path))
+    try:
+        parsed = datetime.strptime(
+            text + ("-1" if format_string == "%G-W%V" else ""),
+            format_string + ("-%u" if format_string == "%G-W%V" else ""),
+        )
+    except ValueError as exc:
+        raise LiveDashboardError(_source_value_code(path)) from exc
+    rendered = parsed.strftime(format_string)
+    if rendered != text:
+        _fail(_source_value_code(path))
+    return text
 
 
 def _canonical_timestamp(value: datetime) -> str:
@@ -305,14 +333,16 @@ def validate_source(value: Any) -> dict[str, Any]:
     source = _object(value, SOURCE_KEYS)
     if source["schema_version"] != SOURCE_SCHEMA:
         _fail("source_schema_invalid")
-    generated = _timestamp(source["generated_at"])
-    clock = _timestamp(source["database_clock"])
+    generated = _timestamp(source["generated_at"], path="generated_at")
+    clock = _timestamp(source["database_clock"], path="database_clock")
     if abs((generated - clock).total_seconds()) > 120:
         _fail("database_clock_mismatch")
-    window = int(_integer_text(source["window_hours"]))
+    window = int(_integer_text(source["window_hours"], path="window_hours"))
     if window not in {1, 6, 24, 168}:
         _fail("source_window_invalid")
-    evidence_start = _timestamp(source["evidence_window_started_at"])
+    evidence_start = _timestamp(
+        source["evidence_window_started_at"], path="evidence_window_started_at"
+    )
     evidence_age = (generated - evidence_start).total_seconds()
     if evidence_age < 0 or evidence_age > window * 3600 + 120:
         _fail("source_window_invalid")
@@ -325,120 +355,164 @@ def validate_source(value: Any) -> dict[str, Any]:
         "checkpoints_requested",
         "wal_bytes",
     ):
-        _number(database[key])
-    _optional_timestamp(database["oldest_relevant_event"])
-    _optional_timestamp(database["newest_relevant_event"])
-    _text(database["migration_version"], 64)
-    checksum = _text(database["migration_checksum"], 71)
+        _number(database[key], path=f"database.{key}")
+    _optional_timestamp(
+        database["oldest_relevant_event"], path="database.oldest_relevant_event"
+    )
+    _optional_timestamp(
+        database["newest_relevant_event"], path="database.newest_relevant_event"
+    )
+    _text(database["migration_version"], 64, path="database.migration_version")
+    checksum = _text(
+        database["migration_checksum"], 71, path="database.migration_checksum"
+    )
     if not re.fullmatch(r"(?:sha256:)?[0-9a-f]{64}", checksum):
-        _fail("migration_checksum_invalid")
+        _fail(_source_value_code("database.migration_checksum"))
     if database["retention_status"] not in {"configured", "not_configured", "unknown"}:
-        _fail("source_value_invalid")
+        _fail(_source_value_code("database.retention_status"))
 
     registry = _object(source["route_registry"], ROUTE_REGISTRY_KEYS)
-    for value in registry.values():
-        _number(value)
+    for key, nested in registry.items():
+        _number(nested, path=f"route_registry.{key}")
 
     route_keys: set[str] = set()
-    for raw in _array(source["routes"], MAX_ROUTES):
+    for route_index, raw in enumerate(_array(source["routes"], MAX_ROUTES)):
         route = _object(raw, ROUTE_KEYS)
-        route_key = _text(route["route_key"])
+        route_path = f"routes[{route_index}]"
+        route_key = _text(route["route_key"], path=f"{route_path}.route_key")
         if route_key in route_keys:
             _fail("source_duplicate_identity")
         route_keys.add(route_key)
-        for key in ROUTE_KEYS - {
+        signed_fields = {
+            "expected",
+            "conservative",
+            "severe",
+            "gross_profit",
+            "fork_balance_delta",
+            "fork_simulated_net_pnl",
+        }
+        numeric_fields = ROUTE_KEYS - {
             "route_key",
             "minimum_shortfall",
             "first_observed_at",
             "last_observed_at",
             "liquidity_score_bps",
-            "fork_balance_delta",
-            "fork_simulated_net_pnl",
-            "expected",
-            "conservative",
-            "severe",
-            "gross_profit",
-        }:
-            _number(route[key])
-        _optional_number(route["minimum_shortfall"])
-        _timestamp(route["first_observed_at"])
-        _timestamp(route["last_observed_at"])
-        liquidity = _optional_number(route["liquidity_score_bps"])
+        }
+        route_numbers = {
+            key: _number(
+                route[key],
+                signed=key in signed_fields,
+                path=f"{route_path}.{key}",
+            )
+            for key in numeric_fields
+        }
+        minimum_shortfall = _optional_number(
+            route["minimum_shortfall"], path=f"{route_path}.minimum_shortfall"
+        )
+        _timestamp(
+            route["first_observed_at"], path=f"{route_path}.first_observed_at"
+        )
+        _timestamp(route["last_observed_at"], path=f"{route_path}.last_observed_at")
+        liquidity = _optional_number(
+            route["liquidity_score_bps"], path=f"{route_path}.liquidity_score_bps"
+        )
         if liquidity is not None and liquidity > 10_000:
-            _fail("source_value_invalid")
-        _number(route["fork_balance_delta"], signed=True)
-        _number(route["fork_simulated_net_pnl"], signed=True)
-        for key in ("expected", "conservative", "severe", "gross_profit"):
-            _number(route[key], signed=True)
-        if _number(route["fork_success"]) + _number(route["fork_reverted"]) != _number(
-            route["fork_simulations"]
+            _fail(_source_value_code(f"{route_path}.liquidity_score_bps"))
+        if (
+            route_numbers["fork_success"] + route_numbers["fork_reverted"]
+            != route_numbers["fork_simulations"]
         ):
             _fail("source_accounting_invalid")
-        if _number(route["fork_profitable"]) > _number(route["fork_success"]):
+        if route_numbers["fork_profitable"] > route_numbers["fork_success"]:
             _fail("source_accounting_invalid")
         costs = sum(
-            (_number(route[key]) for key in ("gas_cost", "flash_premium", "ordering_cost", "safety_cost")),
+            (
+                route_numbers[key]
+                for key in ("gas_cost", "flash_premium", "ordering_cost", "safety_cost")
+            ),
             Decimal(0),
         )
-        if costs != _number(route["total_cost"]):
+        if costs != route_numbers["total_cost"]:
             _fail("source_accounting_invalid")
-        if _number(route["gross_profit"]) - _number(route["total_cost"]) != _number(
-            route["expected"], signed=True
+        if (
+            route_numbers["gross_profit"] - route_numbers["total_cost"]
+            != route_numbers["expected"]
         ):
             _fail("source_accounting_invalid")
+        if minimum_shortfall is not None and minimum_shortfall < 0:
+            _fail(_source_value_code(f"{route_path}.minimum_shortfall"))
 
-    for raw in _array(source["distribution"], 30):
+    for row_index, raw in enumerate(_array(source["distribution"], 30)):
         row = _object(raw, {"scenario", "bucket", "count"})
+        row_path = f"distribution[{row_index}]"
         if row["scenario"] not in {"expected", "conservative", "severe", "fork_simulated"}:
-            _fail("source_value_invalid")
-        _text(row["bucket"], 32)
-        _number(row["count"])
-    for raw in _array(source["prediction_error"], 20):
+            _fail(_source_value_code(f"{row_path}.scenario"))
+        _text(row["bucket"], 32, path=f"{row_path}.bucket")
+        _number(row["count"], path=f"{row_path}.count")
+    for row_index, raw in enumerate(_array(source["prediction_error"], 20)):
         row = _object(raw, {"bucket", "count"})
-        _text(row["bucket"], 32)
-        _number(row["count"])
-    for name, maximum, period_pattern in (
-        ("daily_trend", 31, r"^[0-9]{4}-[0-9]{2}-[0-9]{2}$"),
-        ("weekly_trend", 12, r"^[0-9]{4}-W[0-9]{2}$"),
+        row_path = f"prediction_error[{row_index}]"
+        _text(row["bucket"], 32, path=f"{row_path}.bucket")
+        _number(row["count"], path=f"{row_path}.count")
+    for name, maximum, period_pattern, period_format in (
+        ("daily_trend", 31, r"^[0-9]{4}-[0-9]{2}-[0-9]{2}$", "%Y-%m-%d"),
+        ("weekly_trend", 12, r"^[0-9]{4}-W[0-9]{2}$", "%G-W%V"),
     ):
-        for raw in _array(source[name], maximum):
+        for row_index, raw in enumerate(_array(source[name], maximum)):
             row = _object(
                 raw,
                 {"period", "expected", "conservative", "severe", "fork_simulated", "sample_count"},
             )
-            if not isinstance(row["period"], str) or re.fullmatch(period_pattern, row["period"]) is None:
-                _fail("source_value_invalid")
+            row_path = f"{name}[{row_index}]"
+            _period(
+                row["period"],
+                period_pattern,
+                period_format,
+                f"{row_path}.period",
+            )
             for key in ("expected", "conservative", "severe", "fork_simulated"):
-                _number(row[key], signed=True)
-            _number(row["sample_count"])
-    for raw in _array(source["model_comparison"], 10):
+                _number(row[key], signed=True, path=f"{row_path}.{key}")
+            _number(row["sample_count"], path=f"{row_path}.sample_count")
+    for row_index, raw in enumerate(_array(source["model_comparison"], 10)):
         row = _object(
             raw,
             {"model_version", "sample_count", "expected", "conservative", "absolute_fork_error"},
         )
-        _text(row["model_version"], 64)
-        _number(row["sample_count"])
-        _number(row["expected"], signed=True)
-        _number(row["conservative"], signed=True)
-        _number(row["absolute_fork_error"])
+        row_path = f"model_comparison[{row_index}]"
+        _text(row["model_version"], 64, path=f"{row_path}.model_version")
+        _number(row["sample_count"], path=f"{row_path}.sample_count")
+        _number(row["expected"], signed=True, path=f"{row_path}.expected")
+        _number(row["conservative"], signed=True, path=f"{row_path}.conservative")
+        _number(row["absolute_fork_error"], path=f"{row_path}.absolute_fork_error")
 
     provider_keys: set[tuple[str, str]] = set()
-    for raw in _array(source["providers"], MAX_PROVIDERS):
+    for provider_index, raw in enumerate(_array(source["providers"], MAX_PROVIDERS)):
         provider = _object(raw, PROVIDER_KEYS)
-        key = _text(provider["provider_key"])
+        provider_path = f"providers[{provider_index}]"
+        key = _text(
+            provider["provider_key"], path=f"{provider_path}.provider_key"
+        )
         role = provider["role"]
-        if role not in {"primary", "secondary"} or (role, key) in provider_keys:
+        if role not in {"primary", "secondary"}:
+            _fail(_source_value_code(f"{provider_path}.role"))
+        if (role, key) in provider_keys:
             _fail("source_duplicate_identity")
         provider_keys.add((role, key))
+        provider_numbers: dict[str, Decimal] = {}
         for field in ("requests", "success", "timeouts", "unavailable"):
-            _number(provider[field])
+            provider_numbers[field] = _number(
+                provider[field], path=f"{provider_path}.{field}"
+            )
         if sum(
-            (_number(provider[field]) for field in ("success", "timeouts", "unavailable")),
+            (
+                provider_numbers[field]
+                for field in ("success", "timeouts", "unavailable")
+            ),
             Decimal(0),
-        ) != _number(provider["requests"]):
+        ) != provider_numbers["requests"]:
             _fail("source_accounting_invalid")
         for field in ("p50_latency_ms", "p95_latency_ms", "p99_latency_ms"):
-            _optional_number(provider[field])
+            _optional_number(provider[field], path=f"{provider_path}.{field}")
     return source
 
 

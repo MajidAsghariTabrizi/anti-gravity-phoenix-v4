@@ -3,11 +3,14 @@ from __future__ import annotations
 from copy import deepcopy
 from datetime import datetime, timedelta, timezone
 import json
+import os
 from pathlib import Path
+import stat
 import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 
 REPO = Path(__file__).resolve().parents[2]
@@ -244,7 +247,6 @@ class RuntimeNormalizationTests(unittest.TestCase):
             "consumers": [
                 {"name": "PHOENIX_RECORDER", "config": {"durable_name": "PHOENIX_RECORDER", "ack_policy": "explicit", "deliver_policy": "all", "filter_subject": "phoenix.feed.tx.v1", "max_ack_pending": 512}},
                 {"name": "PHOENIX_ENGINE_SHADOW", "config": {"durable_name": "PHOENIX_ENGINE_SHADOW", "ack_policy": "explicit", "deliver_policy": "all", "filter_subject": "phoenix.engine.input.v1", "max_ack_pending": 512}},
-                {"name": "PHOENIX_SHADOW_DISPATCH", "config": {"durable_name": "PHOENIX_SHADOW_DISPATCH", "ack_policy": "explicit", "deliver_policy": "all", "filter_subject": "phoenix.engine.decision.v1", "max_ack_pending": 512}},
             ],
         }
         with tempfile.TemporaryDirectory() as directory:
@@ -261,16 +263,48 @@ class RuntimeNormalizationTests(unittest.TestCase):
         self.assertNotIn(f"{1:064x}", serialized)
         self.assertRegex(first["fingerprint_sha256"], r"^sha256:[0-9a-f]{64}$")
 
-    def test_missing_jetstream_consumer_is_rejected(self) -> None:
-        jsz = {"streams": [], "consumers": []}
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            services = root / "services.txt"
-            services.write_text("\n".join("invalid" for _ in control.PROTECTED_SERVICES) + "\n")
-            jetstream = root / "jsz.json"
-            jetstream.write_text(json.dumps(jsz))
-            with self.assertRaises(control.ControlEvidenceError):
-                control.protected_identity(services, jetstream)
+    def test_jetstream_contract_has_exact_real_resources(self) -> None:
+        self.assertEqual(
+            control.JETSTREAM_STREAM_NAMES,
+            ("PHOENIX_FEED_TX", "PHOENIX_ENGINE_INPUT"),
+        )
+        self.assertEqual(
+            control.JETSTREAM_CONSUMER_NAMES,
+            ("PHOENIX_RECORDER", "PHOENIX_ENGINE_SHADOW"),
+        )
+        self.assertNotIn("PHOENIX_SHADOW_DISPATCH", control.JETSTREAM_CONSUMER_NAMES)
+        jsz = control.load_json(REPO / "fixtures" / "control-plane" / "jetstream.json")
+        identity = control._nats_resource_identity(jsz)
+        metrics = control.jetstream_runtime_metrics(jsz)
+        self.assertEqual(
+            [row["name"] for row in identity["streams"]],
+            list(control.JETSTREAM_STREAM_NAMES),
+        )
+        self.assertEqual(
+            [row["name"] for row in identity["consumers"]],
+            list(control.JETSTREAM_CONSUMER_NAMES),
+        )
+        self.assertEqual(metrics["streams"], "2")
+        self.assertEqual(metrics["consumers"], "2")
+
+    def test_missing_required_jetstream_resource_is_rejected(self) -> None:
+        fixture = control.load_json(REPO / "fixtures" / "control-plane" / "jetstream.json")
+        for resource_type, names in (
+            ("streams", control.JETSTREAM_STREAM_NAMES),
+            ("consumers", control.JETSTREAM_CONSUMER_NAMES),
+        ):
+            for name in names:
+                with self.subTest(resource_type=resource_type, name=name):
+                    jsz = deepcopy(fixture)
+                    jsz[resource_type] = [
+                        row
+                        for row in jsz[resource_type]
+                        if row.get("name") != name
+                    ]
+                    with self.assertRaises(control.ControlEvidenceError):
+                        control._nats_resource_identity(jsz)
+                    with self.assertRaises(control.ControlEvidenceError):
+                        control.jetstream_runtime_metrics(jsz)
 
     def test_malformed_jetstream_config_is_rejected_without_type_error(self) -> None:
         jsz = control.load_json(REPO / "fixtures" / "control-plane" / "jetstream.json")
@@ -284,6 +318,69 @@ class RuntimeNormalizationTests(unittest.TestCase):
         del jsz["consumers"][0]["num_pending"]
         with self.assertRaisesRegex(control.ControlEvidenceError, "jetstream_metrics_invalid"):
             control.jetstream_runtime_metrics(jsz)
+
+
+class AttemptLogTests(unittest.TestCase):
+    def test_attempt_log_is_bounded_private_and_redacted(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "runtime.log"
+            output = root / "positive-route-test.log"
+            secret = "runtime-test-only-value"
+            source.write_text(
+                "dial https://rpc.invalid/private-token\n"
+                "POSTGRES_DSN=postgres://phoenix:placeholder@postgres/phoenix\n"
+                'ENGINE_ROUTE_REGISTRY_JSON=[{"route_id":"private"}]\n'
+                "wallet=0x1111111111111111111111111111111111111111\n"
+                f"opaque {secret}\n"
+                "POSITIVE_ROUTE_EVIDENCE_FOUND\n",
+                encoding="utf-8",
+            )
+            with mock.patch.dict(
+                os.environ, {"PHOENIX_TEST_SECRET": secret}, clear=False
+            ):
+                metadata = control.retain_attempt_log(
+                    source,
+                    output,
+                    "positive-route-test",
+                    "evidence_found",
+                    0,
+                )
+            retained = output.read_text(encoding="utf-8")
+            self.assertEqual(metadata["terminal_reason"], "evidence_found")
+            self.assertLessEqual(output.stat().st_size, control.MAX_ATTEMPT_LOG_BYTES)
+            if os.name != "nt":
+                self.assertEqual(stat.S_IMODE(output.stat().st_mode), 0o600)
+            self.assertIn("terminal_reason=evidence_found", retained)
+            self.assertIn("POSITIVE_ROUTE_EVIDENCE_FOUND", retained)
+            self.assertNotIn(secret, retained)
+            self.assertNotIn("rpc.invalid", retained)
+            self.assertNotIn("postgres://", retained)
+            self.assertNotIn("route_id", retained)
+            self.assertNotIn("0x1111111111111111111111111111111111111111", retained)
+
+    def test_attempt_log_retains_failure_reason_when_input_is_truncated(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "runtime.log"
+            output = root / "positive-route-failure.log"
+            source.write_bytes(
+                (b"bounded runtime failure evidence\n" * 40_000)
+                + b"terminal child failure\n"
+            )
+            metadata = control.retain_attempt_log(
+                source,
+                output,
+                "positive-route-failure",
+                "child_exit",
+                1,
+            )
+            retained = output.read_text(encoding="utf-8")
+            self.assertTrue(metadata["input_truncated"])
+            self.assertTrue(metadata["output_truncated"])
+            self.assertIn("terminal_reason=child_exit", retained)
+            self.assertIn("source_exit_code=1", retained)
+            self.assertLessEqual(output.stat().st_size, control.MAX_ATTEMPT_LOG_BYTES)
 
 
 class SampleTests(unittest.TestCase):
@@ -317,6 +414,7 @@ class SampleTests(unittest.TestCase):
         self.assertEqual(sample["funnels"]["profitability"]["complete"], "8")
         self.assertEqual(sample["funnels"]["profitability"]["primary_profitable"], "7")
         self.assertEqual(sample["metrics"]["jetstream"]["streams"], "2")
+        self.assertEqual(sample["metrics"]["jetstream"]["consumers"], "2")
         self.assertFalse(sample["safety"]["execution_request_created"])
 
     def test_sample_append_rejects_non_monotonic_time(self) -> None:
@@ -344,7 +442,7 @@ class SampleTests(unittest.TestCase):
                 },
                 "metrics": {
                     "rpc": {"requests": "1", "success": "1", "timeouts": "0", "rate_limited": "0", "unavailable": "0", "disagreements": "0"},
-                    "jetstream": {"streams": "2", "consumers": "3", "pending": "0", "ack_pending": "0", "redeliveries": "0"},
+                    "jetstream": {"streams": "2", "consumers": "2", "pending": "0", "ack_pending": "0", "redeliveries": "0"},
                     "database": {"size_bytes": "1"},
                     "feed": {"messages": "1", "gaps": "0", "missing_sequences": "0", "decode_failures": "0"},
                 },

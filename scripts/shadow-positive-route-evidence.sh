@@ -1,8 +1,7 @@
 #!/usr/bin/env sh
 set -eu
 
-script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
-repo_dir=$(CDPATH= cd -- "$script_dir/.." && pwd)
+script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 deploy_root=${PHOENIX_DEPLOY_ROOT:-/opt/phoenix}
 deploy_dir=$deploy_root/deploy
 compose_file=${PHOENIX_COMPOSE_FILE:-$deploy_dir/compose.prod.yml}
@@ -277,9 +276,17 @@ SELECT jsonb_strip_nulls(jsonb_build_object(
   'rpc_response_hash', normalized.rpc_response_hash,
   'primary_provider_result', normalized.state_evidence->>'primary_provider_id',
   'verification_status', normalized.verification_status,
+  'primary_screen_rejected', CASE
+    WHEN normalized.primary_screen_rejected IS NULL THEN NULL
+    ELSE normalized.primary_screen_rejected::boolean
+  END,
+  'secondary_skipped', CASE
+    WHEN normalized.secondary_skipped IS NULL THEN NULL
+    ELSE normalized.secondary_skipped::boolean
+  END,
   'independent_verification_status', COALESCE(normalized.explicit_independent_status, CASE
     WHEN normalized.verification_status = 'primary_only'
-      AND normalized.rejection_reason = 'no_profitable_candidate'
+      AND normalized.rejection_reason IN ('no_profitable_candidate', 'liquidity_insufficient')
       AND normalized.primary_screen_rejected = 'true'
       AND normalized.secondary_skipped = 'true'
       THEN 'not_requested'
@@ -290,16 +297,20 @@ SELECT jsonb_strip_nulls(jsonb_build_object(
   'independent_verification_lifecycle', COALESCE(
     normalized.independent_lifecycle,
     CASE
-      WHEN normalized.verification_status = 'primary_only' THEN '["not_requested"]'::jsonb
+      WHEN normalized.verification_status = 'primary_only'
+        AND normalized.rejection_reason IN ('no_profitable_candidate', 'liquidity_insufficient')
+        AND normalized.primary_screen_rejected = 'true'
+        AND normalized.secondary_skipped = 'true'
+        THEN jsonb_build_array('not_requested')
       WHEN normalized.verification_status IN ('agreed', 'disagreed')
         THEN jsonb_build_array('requested', normalized.verification_status)
       WHEN normalized.verification_status = 'secondary_unavailable'
-        THEN '["requested", "provider_unavailable"]'::jsonb
+        THEN jsonb_build_array('requested', 'provider_unavailable')
     END
   ),
   'independent_verification_skip_reason', COALESCE(normalized.explicit_skip_reason, CASE
     WHEN normalized.verification_status = 'primary_only'
-      AND normalized.rejection_reason = 'no_profitable_candidate'
+      AND normalized.rejection_reason IN ('no_profitable_candidate', 'liquidity_insufficient')
       AND normalized.primary_screen_rejected = 'true'
       AND normalized.secondary_skipped = 'true'
       THEN 'primary_screen_no_profitable_candidate'
@@ -345,6 +356,7 @@ import re
 import sys
 
 identity, tx_hash, route_id, baseline = sys.argv[1:]
+primary_only_rejections = {"no_profitable_candidate", "liquidity_insufficient"}
 try:
     report = json.load(sys.stdin)
 except Exception:
@@ -430,7 +442,13 @@ status = report["verification_status"]
 independent = report["independent_verification_status"]
 lifecycle = report["independent_verification_lifecycle"]
 if status == "primary_only":
-    if report["rejection_reason"] != "no_profitable_candidate":
+    if report["classification"] != "candidate_rejected":
+        raise SystemExit(1)
+    if report["rejection_reason"] not in primary_only_rejections:
+        raise SystemExit(1)
+    if report.get("primary_screen_rejected") is not True:
+        raise SystemExit(1)
+    if report.get("secondary_skipped") is not True:
         raise SystemExit(1)
     if independent != "not_requested":
         raise SystemExit(1)
@@ -523,6 +541,8 @@ positive_evidence_render_preflight() {
 }
 
 positive_evidence_verify_preflight() {
+  # Defined by the sourced isolated-canary helper.
+  # shellcheck disable=SC2154
   for positive_service in $isolated_canary_required_services; do
     isolated_canary_container_is_healthy "$positive_service" || return 1
   done
@@ -544,6 +564,8 @@ positive_evidence_finish() {
   positive_runtime_touched=0
   positive_ack_after=$(engine_js_value ack_pending)
   positive_pending_after=$(engine_js_value pending)
+  # Populated by isolated_canary_verify_snapshot in the sourced helper.
+  # shellcheck disable=SC2154
   isolated_canary_verify_snapshot || positive_evidence_fail "protected service changed: $isolated_canary_changed_service"
 
   positive_execution_attempts_after=$(sql_count 'SELECT count(*) FROM execution_attempts') || positive_evidence_fail 'execution evidence query failed'
@@ -692,6 +714,8 @@ positive_evidence_main() {
 }
 
 if [ "${SHADOW_POSITIVE_ROUTE_EVIDENCE_LIBRARY_ONLY:-0}" = 1 ]; then
+  # The exit fallback is used only when the script is executed instead of sourced.
+  # shellcheck disable=SC2317
   return 0 2>/dev/null || exit 0
 fi
 

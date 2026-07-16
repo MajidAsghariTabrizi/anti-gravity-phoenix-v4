@@ -7,6 +7,7 @@ import argparse
 from datetime import datetime, timezone
 import hashlib
 import json
+import os
 from pathlib import Path
 import re
 import sys
@@ -21,6 +22,9 @@ MAX_INPUT_BYTES = 2 * 1024 * 1024
 MAX_ERRORS = 100
 MAX_ARTIFACTS = 16
 MAX_SAMPLES = 3_000
+MAX_ATTEMPT_LOG_INPUT_BYTES = 1024 * 1024
+MAX_ATTEMPT_LOG_BYTES = 64 * 1024
+MAX_ATTEMPT_LOG_LINE_BYTES = 2 * 1024
 
 MODE_DURATIONS = {
     "15m": 15 * 60,
@@ -46,6 +50,14 @@ OPTIONAL_SERVICES = (
 FULL_SERVICES = PROTECTED_SERVICES + OPTIONAL_SERVICES
 START_ORDER = OPTIONAL_SERVICES
 STOP_ORDER = tuple(reversed(OPTIONAL_SERVICES))
+JETSTREAM_STREAM_NAMES = ("PHOENIX_FEED_TX", "PHOENIX_ENGINE_INPUT")
+JETSTREAM_CONSUMER_NAMES = ("PHOENIX_RECORDER", "PHOENIX_ENGINE_SHADOW")
+ATTEMPT_LOG_TERMINAL_REASONS = {
+    "child_exit",
+    "evidence_found",
+    "evidence_not_found",
+    "terminal_marker_missing",
+}
 
 PREFLIGHT_CHECKS = (
     "canonical_render",
@@ -98,11 +110,22 @@ SAFE_FILE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
 CANONICAL_COUNT_RE = re.compile(r"^(?:0|[1-9][0-9]*)$")
 SIGNED_COUNT_RE = re.compile(r"^(?:0|-?[1-9][0-9]*)$")
 URL_RE = re.compile(r"(?i)(?:https?|wss?|postgres(?:ql)?|nats)://")
+URL_VALUE_RE = re.compile(r"(?i)(?:https?|wss?|postgres(?:ql)?|nats)://[^\s\"']+")
 ADDRESS_RE = re.compile(r"(?i)0x[0-9a-f]{40}")
 SECRET_RE = re.compile(
     r"(?i)(?:password|passwd|private[_ -]?key|mnemonic|authorization|bearer|"
     r"credential|secret)\s*[:=]|\b(?:RPC_PROVIDER_URLS|POSTGRES_DSN|"
     r"SIGNER_PRIVATE_KEY|WALLET_ADDRESS|EXECUTOR_ADDRESS)\b"
+)
+SECRET_LINE_RE = re.compile(
+    r"(?i)(?:password|passwd|private[_ -]?key|mnemonic|authorization|bearer|"
+    r"credential|secret)[\"']?\s*[:=]|\b(?:RPC_PROVIDER_URLS|POSTGRES_DSN|"
+    r"SIGNER_PRIVATE_KEY|WALLET_ADDRESS|EXECUTOR_ADDRESS)\b"
+)
+ENV_ASSIGNMENT_LINE_RE = re.compile(r"(?:^|\s)[A-Z][A-Z0-9_]{2,63}\s*[:=]")
+SENSITIVE_ENV_NAME_RE = re.compile(
+    r"(?i)(?:URL|URI|DSN|PASSWORD|PASSWD|TOKEN|SECRET|PRIVATE|KEY|MNEMONIC|"
+    r"WALLET|EXECUTOR|CREDENTIAL|AUTH)"
 )
 CONTAINER_ID_RE = re.compile(r"^[0-9a-f]{64}$")
 
@@ -379,14 +402,8 @@ def _nats_resource_identity(root: Any) -> dict[str, Any]:
     if not isinstance(root, dict):
         _fail("jetstream_identity_invalid")
     objects = list(_walk_objects(root))
-    stream_names = ("PHOENIX_FEED_TX", "PHOENIX_ENGINE_INPUT")
-    consumer_names = (
-        "PHOENIX_RECORDER",
-        "PHOENIX_ENGINE_SHADOW",
-        "PHOENIX_SHADOW_DISPATCH",
-    )
     streams: list[dict[str, str]] = []
-    for name in stream_names:
+    for name in JETSTREAM_STREAM_NAMES:
         matches = []
         for item in objects:
             config = _jetstream_config(item)
@@ -408,7 +425,7 @@ def _nats_resource_identity(root: Any) -> dict[str, Any]:
         streams.append({"name": name, "config_sha256": _sha256(canonical_bytes(stable))})
 
     consumers: list[dict[str, str]] = []
-    for name in consumer_names:
+    for name in JETSTREAM_CONSUMER_NAMES:
         matches = []
         for item in objects:
             config = _jetstream_config(item)
@@ -437,14 +454,8 @@ def jetstream_runtime_metrics(root: Any) -> dict[str, str]:
     if not isinstance(root, dict):
         _fail("jetstream_metrics_invalid")
     objects = list(_walk_objects(root))
-    stream_names = ("PHOENIX_FEED_TX", "PHOENIX_ENGINE_INPUT")
-    consumer_names = (
-        "PHOENIX_RECORDER",
-        "PHOENIX_ENGINE_SHADOW",
-        "PHOENIX_SHADOW_DISPATCH",
-    )
     stream_count = 0
-    for name in stream_names:
+    for name in JETSTREAM_STREAM_NAMES:
         match = None
         for item in objects:
             config = _jetstream_config(item)
@@ -458,7 +469,7 @@ def jetstream_runtime_metrics(root: Any) -> dict[str, str]:
     pending = 0
     ack_pending = 0
     redeliveries = 0
-    for name in consumer_names:
+    for name in JETSTREAM_CONSUMER_NAMES:
         match = None
         for item in objects:
             config = _jetstream_config(item)
@@ -488,7 +499,7 @@ def jetstream_runtime_metrics(root: Any) -> dict[str, str]:
         redeliveries += values[2]
     return {
         "streams": str(stream_count),
-        "consumers": str(len(consumer_names)),
+        "consumers": str(len(JETSTREAM_CONSUMER_NAMES)),
         "pending": str(pending),
         "ack_pending": str(ack_pending),
         "redeliveries": str(redeliveries),
@@ -1298,10 +1309,108 @@ def render_image_digests(metadata: Any) -> list[tuple[str, str, str]]:
     return result
 
 
-def write_atomic(path: Path, payload: bytes) -> None:
-    import os
+def _redact_attempt_log(raw: bytes) -> str:
+    text = raw.decode("utf-8", errors="replace")
+    sensitive_values = sorted(
+        {
+            value
+            for name, value in os.environ.items()
+            if SENSITIVE_ENV_NAME_RE.search(name) and len(value) >= 4
+        },
+        key=len,
+        reverse=True,
+    )
+    for value in sensitive_values:
+        text = text.replace(value, "[redacted-env]")
+
+    lines: list[str] = []
+    for raw_line in text.splitlines():
+        line = "".join(
+            character
+            if character == "\t" or ord(character) >= 32 and ord(character) != 127
+            else "?"
+            for character in raw_line
+        )
+        if SECRET_LINE_RE.search(line):
+            line = "[redacted-sensitive-line]"
+        elif ENV_ASSIGNMENT_LINE_RE.search(line):
+            line = "[redacted-environment-line]"
+        else:
+            line = URL_VALUE_RE.sub("[redacted-url]", line)
+            line = ADDRESS_RE.sub("[redacted-address]", line)
+        encoded = line.encode("utf-8")
+        if len(encoded) > MAX_ATTEMPT_LOG_LINE_BYTES:
+            line = (
+                encoded[: MAX_ATTEMPT_LOG_LINE_BYTES - 20]
+                .decode("utf-8", errors="ignore")
+                + "[line-truncated]"
+            )
+        lines.append(line)
+    return "\n".join(lines) + ("\n" if lines else "")
+
+
+def _bounded_attempt_log_body(body: bytes, maximum: int) -> tuple[bytes, bool]:
+    if len(body) <= maximum:
+        return body, False
+    marker = b"\n[... log truncated ...]\n"
+    available = maximum - len(marker)
+    head_size = available * 2 // 3
+    tail_size = available - head_size
+    head = body[:head_size].decode("utf-8", errors="ignore").encode("utf-8")
+    tail = body[-tail_size:].decode("utf-8", errors="ignore").encode("utf-8")
+    return head + marker + tail, True
+
+
+def retain_attempt_log(
+    input_path: Path,
+    output_path: Path,
+    attempt_id: str,
+    terminal_reason: str,
+    source_exit_code: int,
+) -> dict[str, Any]:
+    _text(attempt_id, maximum=64, pattern=SAFE_ID_RE)
+    _text(terminal_reason, maximum=32, choices=ATTEMPT_LOG_TERMINAL_REASONS)
+    _integer(source_exit_code, 0, 255)
+    if SAFE_FILE_RE.fullmatch(output_path.name) is None or output_path.suffix != ".log":
+        _fail("output_path_invalid")
+    try:
+        with input_path.open("rb") as handle:
+            raw = handle.read(MAX_ATTEMPT_LOG_INPUT_BYTES + 1)
+    except OSError as exc:
+        raise ControlEvidenceError("attempt_log_unavailable") from exc
+
+    input_truncated = len(raw) > MAX_ATTEMPT_LOG_INPUT_BYTES
+    redacted = _redact_attempt_log(raw[:MAX_ATTEMPT_LOG_INPUT_BYTES]).encode("utf-8")
+    bounded, output_truncated = _bounded_attempt_log_body(
+        redacted, MAX_ATTEMPT_LOG_BYTES - 1024
+    )
+    header = (
+        f"attempt_id={attempt_id}\n"
+        f"terminal_reason={terminal_reason}\n"
+        f"source_exit_code={source_exit_code}\n"
+        f"input_truncated={'true' if input_truncated else 'false'}\n"
+        f"output_truncated={'true' if output_truncated else 'false'}\n"
+        "--- begin redacted log ---\n"
+    ).encode("ascii")
+    payload = header + bounded + b"--- end redacted log ---\n"
+    if len(payload) > MAX_ATTEMPT_LOG_BYTES:
+        _fail("attempt_log_bounds_invalid")
+    write_atomic(output_path, payload, mode=0o600)
+    return {
+        "attempt_id": attempt_id,
+        "terminal_reason": terminal_reason,
+        "source_exit_code": source_exit_code,
+        "input_truncated": input_truncated,
+        "output_truncated": output_truncated,
+        "size_bytes": len(payload),
+    }
+
+
+def write_atomic(path: Path, payload: bytes, *, mode: int = 0o640) -> None:
     import tempfile
 
+    if mode not in {0o600, 0o640}:
+        _fail("output_mode_invalid")
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary: Path | None = None
     try:
@@ -1312,7 +1421,7 @@ def write_atomic(path: Path, payload: bytes) -> None:
             handle.write(payload)
             handle.flush()
             os.fsync(handle.fileno())
-        os.chmod(temporary, 0o640)
+        os.chmod(temporary, mode)
         os.replace(temporary, path)
         temporary = None
     finally:
@@ -1369,6 +1478,20 @@ def command_assemble_evidence(args: argparse.Namespace) -> None:
 def command_render_image_digests(args: argparse.Namespace) -> None:
     for service, digest, reference in render_image_digests(load_json(Path(args.metadata))):
         print(f"{service}\t{digest}\t{reference}")
+
+
+def command_retain_attempt_log(args: argparse.Namespace) -> None:
+    payload = retain_attempt_log(
+        Path(args.input),
+        Path(args.output),
+        args.attempt_id,
+        args.terminal_reason,
+        args.source_exit_code,
+    )
+    print(
+        "PRELIVE_SHADOW_ATTEMPT_LOG_OK: "
+        f"id={payload['attempt_id']} reason={payload['terminal_reason']}"
+    )
 
 
 def command_promote_evidence(args: argparse.Namespace) -> None:
@@ -1451,6 +1574,18 @@ def parser() -> argparse.ArgumentParser:
     image_digests = commands.add_parser("render-image-digests")
     image_digests.add_argument("--metadata", required=True)
     image_digests.set_defaults(handler=command_render_image_digests)
+
+    attempt_log = commands.add_parser("retain-attempt-log")
+    attempt_log.add_argument("--input", required=True)
+    attempt_log.add_argument("--output", required=True)
+    attempt_log.add_argument("--attempt-id", required=True)
+    attempt_log.add_argument(
+        "--terminal-reason",
+        choices=tuple(sorted(ATTEMPT_LOG_TERMINAL_REASONS)),
+        required=True,
+    )
+    attempt_log.add_argument("--source-exit-code", type=int, required=True)
+    attempt_log.set_defaults(handler=command_retain_attempt_log)
 
     promote = commands.add_parser("promote-evidence")
     promote.add_argument("--input", required=True)

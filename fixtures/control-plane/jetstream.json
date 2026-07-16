@@ -41,13 +41,6 @@
       "num_pending": 3,
       "num_ack_pending": 1,
       "num_redelivered": 1
-    },
-    {
-      "name": "PHOENIX_SHADOW_DISPATCH",
-      "config": {"durable_name": "PHOENIX_SHADOW_DISPATCH", "ack_policy": "explicit", "deliver_policy": "all", "filter_subject": "phoenix.engine.decision.v1", "max_ack_pending": 512},
-      "num_pending": 3,
-      "num_ack_pending": 0,
-      "num_redelivered": 0
     }
   ]
 }

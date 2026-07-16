@@ -2,7 +2,7 @@
 set -eu
 umask 077
 
-script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 deploy_root=${PHOENIX_DEPLOY_ROOT:-/opt/phoenix}
 deploy_dir=$deploy_root/deploy
 compose_file=${PHOENIX_COMPOSE_FILE:-$deploy_dir/compose.prod.yml}
@@ -31,6 +31,7 @@ state_dir=
 optional_started=0
 finalized=0
 stop_requested=0
+runtime_sampling_baseline=
 
 blocked() {
   echo "PRELIVE_SHADOW_CONTROL_BLOCKED: $1" >&2
@@ -94,6 +95,17 @@ sql_count() {
   printf '%s\n' "$result"
 }
 
+database_clock_utc() {
+  database_clock_utc_value=$(compose exec -T postgres psql -X -qAt \
+    -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d "$POSTGRES_DB" \
+    -c "SELECT to_char(clock_timestamp() AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"')") \
+    || return 1
+  printf '%s' "$database_clock_utc_value" |
+    grep -Eq '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$' ||
+    return 1
+  printf '%s\n' "$database_clock_utc_value"
+}
+
 container_id() {
   compose ps -a -q "$1" 2>/dev/null | awk 'NF { print; exit }'
 }
@@ -116,107 +128,125 @@ wait_service_healthy() {
 }
 
 configured_digest() {
-  service=$1
-  awk -F '\t' -v service="$service" '$1 == service { print $2; exit }' "$state_dir/image-digests.tsv"
+  configured_digest_service=$1
+  awk -F '\t' -v service="$configured_digest_service" '$1 == service { print $2; exit }' "$state_dir/image-digests.tsv"
 }
 
 configured_reference() {
-  service=$1
-  awk -F '\t' -v service="$service" '$1 == service { print $3; exit }' "$state_dir/image-digests.tsv"
+  configured_reference_service=$1
+  awk -F '\t' -v service="$configured_reference_service" '$1 == service { print $3; exit }' "$state_dir/image-digests.tsv"
 }
 
 capture_service_states() {
-  output=$1
-  observed_at=$(utc_now)
-  raw=$state_dir/service-states.raw
-  : >"$raw"
-  for service in $full_services; do
-    digest=$(configured_digest "$service")
-    reference=$(configured_reference "$service")
-    [ -n "$digest" ] && [ -n "$reference" ] || return 1
-    id=$(container_id "$service")
-    if [ -z "$id" ]; then
-      printf '%s\tmissing\tmissing\t%s\t0\t0\n' "$service" "$digest" >>"$raw"
+  capture_states_output=$1
+  capture_states_observed_at=$(utc_now)
+  capture_states_raw=$state_dir/service-states.raw
+  : >"$capture_states_raw"
+  for capture_states_service in $full_services; do
+    capture_states_digest=$(configured_digest "$capture_states_service")
+    capture_states_reference=$(configured_reference "$capture_states_service")
+    [ -n "$capture_states_digest" ] && [ -n "$capture_states_reference" ] || return 1
+    capture_states_id=$(container_id "$capture_states_service")
+    if [ -z "$capture_states_id" ]; then
+      printf '%s\tmissing\tmissing\t%s\t0\t0\n' \
+        "$capture_states_service" "$capture_states_digest" >>"$capture_states_raw"
       continue
     fi
-    selected=$("$docker_bin" inspect --format '{{.State.Status}}|{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}|{{.Config.Image}}|{{.Image}}|{{.RestartCount}}|{{.State.ExitCode}}' "$id" 2>/dev/null) || return 1
-    status=${selected%%|*}
-    selected=${selected#*|}
-    health=${selected%%|*}
-    selected=${selected#*|}
-    configured_image=${selected%%|*}
-    selected=${selected#*|}
-    local_image_id=${selected%%|*}
-    selected=${selected#*|}
-    restart_count=${selected%%|*}
-    exit_code=${selected##*|}
-    [ "$configured_image" = "$reference" ] || return 1
-    printf '%s' "$local_image_id" | grep -Eq '^sha256:[0-9a-f]{64}$' || return 1
-    printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$service" "$status" "$health" "$digest" "$restart_count" "$exit_code" >>"$raw"
+    capture_states_selected=$("$docker_bin" inspect --format '{{.State.Status}}|{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}|{{.Config.Image}}|{{.Image}}|{{.RestartCount}}|{{.State.ExitCode}}' "$capture_states_id" 2>/dev/null) || return 1
+    capture_states_status=${capture_states_selected%%|*}
+    capture_states_selected=${capture_states_selected#*|}
+    capture_states_health=${capture_states_selected%%|*}
+    capture_states_selected=${capture_states_selected#*|}
+    capture_states_configured_image=${capture_states_selected%%|*}
+    capture_states_selected=${capture_states_selected#*|}
+    capture_states_local_image_id=${capture_states_selected%%|*}
+    capture_states_selected=${capture_states_selected#*|}
+    capture_states_restart_count=${capture_states_selected%%|*}
+    capture_states_exit_code=${capture_states_selected##*|}
+    [ "$capture_states_configured_image" = "$capture_states_reference" ] || return 1
+    printf '%s' "$capture_states_local_image_id" | grep -Eq '^sha256:[0-9a-f]{64}$' || return 1
+    printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
+      "$capture_states_service" "$capture_states_status" "$capture_states_health" \
+      "$capture_states_digest" "$capture_states_restart_count" "$capture_states_exit_code" \
+      >>"$capture_states_raw"
   done
   "$python_bin" "$helper" normalize-service-states \
-    --input "$raw" --observed-at "$observed_at" --output "$output" >/dev/null
+    --input "$capture_states_raw" \
+    --observed-at "$capture_states_observed_at" \
+    --output "$capture_states_output" >/dev/null
 }
 
 capture_dashboard_services() {
-  output=$1
-  observed_at=$(utc_now)
-  raw=$state_dir/dashboard-services.raw
-  : >"$raw"
-  for service in $full_services; do
-    digest=$(configured_digest "$service")
-    reference=$(configured_reference "$service")
-    [ -n "$digest" ] && [ -n "$reference" ] || return 1
-    id=$(container_id "$service")
-    if [ -z "$id" ]; then
-      printf '%s\tmissing\tmissing\t%s\t0\tnull\tnull\tfalse\n' "$service" "$digest" >>"$raw"
+  capture_dashboard_output=$1
+  capture_dashboard_observed_at=$(utc_now)
+  capture_dashboard_raw=$state_dir/dashboard-services.raw
+  : >"$capture_dashboard_raw"
+  for capture_dashboard_service in $full_services; do
+    capture_dashboard_digest=$(configured_digest "$capture_dashboard_service")
+    capture_dashboard_reference=$(configured_reference "$capture_dashboard_service")
+    [ -n "$capture_dashboard_digest" ] && [ -n "$capture_dashboard_reference" ] || return 1
+    capture_dashboard_id=$(container_id "$capture_dashboard_service")
+    if [ -z "$capture_dashboard_id" ]; then
+      printf '%s\tmissing\tmissing\t%s\t0\tnull\tnull\tfalse\n' \
+        "$capture_dashboard_service" "$capture_dashboard_digest" >>"$capture_dashboard_raw"
       continue
     fi
-    selected=$("$docker_bin" inspect --format '{{.State.Status}}|{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}|{{.Config.Image}}|{{.Image}}|{{.RestartCount}}|{{.State.ExitCode}}|{{.State.StartedAt}}|{{.State.OOMKilled}}' "$id" 2>/dev/null) || return 1
-    old_ifs=$IFS
+    capture_dashboard_selected=$("$docker_bin" inspect --format '{{.State.Status}}|{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}|{{.Config.Image}}|{{.Image}}|{{.RestartCount}}|{{.State.ExitCode}}|{{.State.StartedAt}}|{{.State.OOMKilled}}' "$capture_dashboard_id" 2>/dev/null) || return 1
+    capture_dashboard_old_ifs=$IFS
     IFS='|'
-    set -- $selected
-    IFS=$old_ifs
+    # Intentional field splitting against the temporary pipe delimiter.
+    # shellcheck disable=SC2086
+    set -- $capture_dashboard_selected
+    IFS=$capture_dashboard_old_ifs
     [ "$#" -eq 8 ] || return 1
-    status=$1
-    health=$2
-    configured_image=$3
-    local_image_id=$4
-    restart_count=$5
-    exit_code=$6
-    started_at=$7
-    oom_killed=$8
-    [ "$configured_image" = "$reference" ] || return 1
-    printf '%s' "$local_image_id" | grep -Eq '^sha256:[0-9a-f]{64}$' || return 1
-    case "$oom_killed" in true|false) ;; *) return 1 ;; esac
+    capture_dashboard_status=$1
+    capture_dashboard_health=$2
+    capture_dashboard_configured_image=$3
+    capture_dashboard_local_image_id=$4
+    capture_dashboard_restart_count=$5
+    capture_dashboard_exit_code=$6
+    capture_dashboard_started_at=$7
+    capture_dashboard_oom_killed=$8
+    [ "$capture_dashboard_configured_image" = "$capture_dashboard_reference" ] || return 1
+    printf '%s' "$capture_dashboard_local_image_id" | grep -Eq '^sha256:[0-9a-f]{64}$' || return 1
+    case "$capture_dashboard_oom_killed" in true|false) ;; *) return 1 ;; esac
     printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
-      "$service" "$status" "$health" "$digest" "$restart_count" "$exit_code" "$started_at" "$oom_killed" >>"$raw"
+      "$capture_dashboard_service" "$capture_dashboard_status" "$capture_dashboard_health" \
+      "$capture_dashboard_digest" "$capture_dashboard_restart_count" \
+      "$capture_dashboard_exit_code" "$capture_dashboard_started_at" \
+      "$capture_dashboard_oom_killed" >>"$capture_dashboard_raw"
   done
   "$python_bin" "$dashboard_collector" normalize-services \
-    --input "$raw" --observed-at "$observed_at" --output "$output" >/dev/null
+    --input "$capture_dashboard_raw" \
+    --observed-at "$capture_dashboard_observed_at" \
+    --output "$capture_dashboard_output" >/dev/null
 }
 
 capture_jetstream() {
-  output=$1
+  capture_jetstream_output=$1
   compose exec -T nats wget -q -O - \
-    'http://127.0.0.1:8222/jsz?streams=true&consumers=true&config=true' >"$output"
-  [ -s "$output" ]
+    'http://127.0.0.1:8222/jsz?streams=true&consumers=true&config=true' \
+    >"$capture_jetstream_output"
+  [ -s "$capture_jetstream_output" ]
 }
 
 capture_protected_identity() {
-  output=$1
-  services_file=$state_dir/protected.raw
-  jetstream_file=$state_dir/jetstream.identity.json
-  : >"$services_file"
-  for service in $protected_services; do
-    id=$(container_id "$service")
-    [ -n "$id" ] || return 1
-    selected=$("$docker_bin" inspect --format '{{.Id}}|{{.Image}}|{{.Created}}|{{.State.StartedAt}}|{{.RestartCount}}|{{json .Mounts}}' "$id" 2>/dev/null) || return 1
-    printf '%s|%s\n' "$service" "$selected" >>"$services_file"
+  capture_identity_output=$1
+  capture_identity_services_file=$state_dir/protected.raw
+  capture_identity_jetstream_file=$state_dir/jetstream.identity.json
+  : >"$capture_identity_services_file"
+  for capture_identity_service in $protected_services; do
+    capture_identity_id=$(container_id "$capture_identity_service")
+    [ -n "$capture_identity_id" ] || return 1
+    capture_identity_selected=$("$docker_bin" inspect --format '{{.Id}}|{{.Image}}|{{.Created}}|{{.State.StartedAt}}|{{.RestartCount}}|{{json .Mounts}}' "$capture_identity_id" 2>/dev/null) || return 1
+    printf '%s|%s\n' "$capture_identity_service" "$capture_identity_selected" \
+      >>"$capture_identity_services_file"
   done
-  capture_jetstream "$jetstream_file" || return 1
+  capture_jetstream "$capture_identity_jetstream_file" || return 1
   "$python_bin" "$helper" protected-identity \
-    --services "$services_file" --jetstream "$jetstream_file" --output "$output" >/dev/null
+    --services "$capture_identity_services_file" \
+    --jetstream "$capture_identity_jetstream_file" \
+    --output "$capture_identity_output" >/dev/null
 }
 
 protected_runtime_healthy() {
@@ -242,6 +272,8 @@ start_optional_runtime() {
 }
 
 stop_optional_runtime() {
+  # The reviewed service list is intentionally expanded into Compose arguments.
+  # shellcheck disable=SC2086
   compose stop $stop_services >/dev/null
   optional_started=0
 }
@@ -261,6 +293,8 @@ execution_request_count() {
 
 assert_runtime_safety() {
   [ "$(execution_activity_count)" -eq 0 ] || return 1
+  # Expansion must occur inside the target containers.
+  # shellcheck disable=SC2016
   container_check='[ "${PHOENIX_MODE:-}" = "SHADOW" ] && [ "${LIVE_EXECUTION:-}" = "false" ] && [ -z "${SIGNER_PRIVATE_KEY:-}" ] && [ -z "${WALLET_ADDRESS:-}" ] && [ -z "${EXECUTOR_ADDRESS:-}" ]'
   compose exec -T phoenix-engine sh -c "$container_check" >/dev/null 2>&1 || return 1
   compose exec -T shadow-dispatcher sh -c "$container_check" >/dev/null 2>&1
@@ -305,7 +339,7 @@ run_preflight() {
   bounded_integer "${RPC_UPSTREAM_CALL_BURST:-}" 1 1000000 || fail 'RPC upstream burst must be positive'
   record_preflight rpc_upstream_budget
   compose exec -T postgres pg_isready -U "$POSTGRES_USER" -d "$POSTGRES_DB" >/dev/null 2>&1 || fail 'PostgreSQL is unavailable'
-  database_clock_baseline=$(compose exec -T postgres psql -X -qAt -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "SELECT to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"')") || fail 'database clock query failed'
+  database_clock_baseline=$(database_clock_utc) || fail 'database clock query failed'
   record_preflight postgres_connectivity
   compose exec -T nats wget -q -O - 'http://127.0.0.1:8222/healthz?js-enabled-only=true' >/dev/null || fail 'NATS is unavailable'
   record_preflight nats_connectivity
@@ -341,13 +375,47 @@ verify_active_release() {
 }
 
 run_positive_route_evidence() {
+  positive_route_raw_log=$state_dir/positive-route.log
+  positive_route_child_exit=0
   PHOENIX_COMPOSE_FILE="$compose_file" \
   PHOENIX_ENV_FILE="$env_file" \
   PHOENIX_RELEASE_ENV="$release_env" \
   PHOENIX_RELEASE_MANIFEST="$release_manifest" \
     "$script_dir/shadow-positive-route-evidence.sh" \
-      --timeout-seconds "$positive_timeout" >"$state_dir/positive-route.log" 2>&1 || return 1
-  grep -Fx 'POSITIVE_ROUTE_EVIDENCE_FOUND' "$state_dir/positive-route.log" >/dev/null
+      --timeout-seconds "$positive_timeout" >"$positive_route_raw_log" 2>&1 ||
+    positive_route_child_exit=$?
+
+  positive_route_result=1
+  if [ "$positive_route_child_exit" -ne 0 ]; then
+    positive_route_terminal_reason=child_exit
+  elif grep -Fx 'POSITIVE_ROUTE_EVIDENCE_FOUND' "$positive_route_raw_log" >/dev/null; then
+    positive_route_terminal_reason=evidence_found
+    positive_route_result=0
+  elif grep -Fx 'POSITIVE_ROUTE_EVIDENCE_NOT_FOUND' "$positive_route_raw_log" >/dev/null; then
+    positive_route_terminal_reason=evidence_not_found
+  else
+    positive_route_terminal_reason=terminal_marker_missing
+  fi
+
+  positive_route_attempt_dir=$evidence_root/positive-route-attempts
+  mkdir -p "$positive_route_attempt_dir" || return 1
+  chmod 0750 "$positive_route_attempt_dir" || return 1
+  positive_route_attempt_path=$(mktemp \
+    "$positive_route_attempt_dir/positive-route-$(date -u +%Y%m%dT%H%M%SZ)-XXXXXX.log") ||
+    return 1
+  positive_route_attempt_name=${positive_route_attempt_path##*/}
+  positive_route_attempt_id=${positive_route_attempt_name%.log}
+  if ! "$python_bin" "$helper" retain-attempt-log \
+    --input "$positive_route_raw_log" \
+    --output "$positive_route_attempt_path" \
+    --attempt-id "$positive_route_attempt_id" \
+    --terminal-reason "$positive_route_terminal_reason" \
+    --source-exit-code "$positive_route_child_exit" >/dev/null; then
+    rm -f -- "$positive_route_attempt_path"
+    return 1
+  fi
+  echo "PRELIVE_SHADOW_POSITIVE_ROUTE_ATTEMPT: id=$positive_route_attempt_id reason=$positive_route_terminal_reason path=$positive_route_attempt_path"
+  [ "$positive_route_result" -eq 0 ]
 }
 
 collect_sample() {
@@ -373,14 +441,17 @@ collect_sample() {
 }
 
 collect_dashboard_snapshot() {
+  [ -n "$runtime_sampling_baseline" ] || return 1
   capture_dashboard_services "$state_dir/dashboard-services.json" || return 1
   route_hash_value=${route_hash#sha256:}
+  # Expansion must occur inside the PostgreSQL container.
+  # shellcheck disable=SC2016
+  dashboard_psql_command='psql -X -qAt -v ON_ERROR_STOP=1 -v window_hours="$PHOENIX_DASHBOARD_WINDOW_HOURS" -v route_hash="$PHOENIX_DASHBOARD_ROUTE_HASH" -v evidence_start="$PHOENIX_DASHBOARD_EVIDENCE_START" -U "$POSTGRES_USER" -d "$POSTGRES_DB"'
   compose exec -T \
     -e PHOENIX_DASHBOARD_WINDOW_HOURS="$window_hours" \
     -e PHOENIX_DASHBOARD_ROUTE_HASH="$route_hash_value" \
-    -e PHOENIX_DASHBOARD_EVIDENCE_START="$database_clock_baseline" \
-    postgres sh -c \
-      'psql -X -qAt -v ON_ERROR_STOP=1 -v window_hours="$PHOENIX_DASHBOARD_WINDOW_HOURS" -v route_hash="$PHOENIX_DASHBOARD_ROUTE_HASH" -v evidence_start="$PHOENIX_DASHBOARD_EVIDENCE_START" -U "$POSTGRES_USER" -d "$POSTGRES_DB"' \
+    -e PHOENIX_DASHBOARD_EVIDENCE_START="$runtime_sampling_baseline" \
+    postgres sh -c "$dashboard_psql_command" \
       <"$dashboard_sql" >"$state_dir/dashboard-source.json" || return 1
   postgres_data_dir=${PHOENIX_POSTGRES_DATA_DIR:-$deploy_root/data/postgres}
   [ -d "$postgres_data_dir" ] || return 1
@@ -452,6 +523,8 @@ run_main() {
   wait_service_healthy rpc-gateway || fail 'RPC Gateway did not become healthy after positive evidence'
   compose up -d --no-deps phoenix-engine >/dev/null || fail 'Engine restart after positive evidence failed'
   wait_service_healthy phoenix-engine || fail 'Engine did not become healthy after positive evidence'
+  runtime_sampling_baseline=$(database_clock_utc) || fail 'runtime sampling clock query failed'
+  echo "PRELIVE_SHADOW_SAMPLING_BASELINE=$runtime_sampling_baseline"
   verify_active_release || fail 'active release context validation failed'
   capture_service_states "$state_dir/states.during.json" || fail 'runtime service-state recapture failed'
 
@@ -594,6 +667,8 @@ control_main() {
 }
 
 if [ "${PHOENIX_SHADOW_CONTROL_LIBRARY_ONLY:-0}" = 1 ]; then
+  # The exit fallback is used only when the script is executed instead of sourced.
+  # shellcheck disable=SC2317
   return 0 2>/dev/null || exit 0
 fi
 

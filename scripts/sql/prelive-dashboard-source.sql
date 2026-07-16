@@ -164,6 +164,40 @@ route_rows AS (
     JOIN route_fork AS fork USING (route_fingerprint)
     JOIN route_rpc AS rpc USING (route_fingerprint)
 ),
+canonical_route_rows AS (
+    SELECT route.*,
+           CASE WHEN route.gross_profit = trunc(route.gross_profit)
+                THEN route.gross_profit::numeric(78,0)::text END AS gross_profit_text,
+           CASE WHEN route.total_cost = trunc(route.total_cost)
+                THEN route.total_cost::numeric(78,0)::text END AS total_cost_text,
+           CASE WHEN route.gas_cost = trunc(route.gas_cost)
+                THEN route.gas_cost::numeric(78,0)::text END AS gas_cost_text,
+           CASE WHEN route.flash_premium = trunc(route.flash_premium)
+                THEN route.flash_premium::numeric(78,0)::text END AS flash_premium_text,
+           CASE WHEN route.ordering_cost = trunc(route.ordering_cost)
+                THEN route.ordering_cost::numeric(78,0)::text END AS ordering_cost_text,
+           CASE WHEN route.safety_cost = trunc(route.safety_cost)
+                THEN route.safety_cost::numeric(78,0)::text END AS safety_cost_text,
+           CASE WHEN route.expected = trunc(route.expected)
+                THEN route.expected::numeric(78,0)::text END AS expected_text,
+           CASE WHEN route.conservative = trunc(route.conservative)
+                THEN route.conservative::numeric(78,0)::text END AS conservative_text,
+           CASE WHEN route.severe = trunc(route.severe)
+                THEN route.severe::numeric(78,0)::text END AS severe_text,
+           CASE WHEN route.minimum_shortfall = trunc(route.minimum_shortfall)
+                THEN route.minimum_shortfall::numeric(78,0)::text END AS minimum_shortfall_text,
+           CASE WHEN route.gas_used = trunc(route.gas_used)
+                THEN route.gas_used::numeric(78,0)::text END AS gas_used_text,
+           CASE WHEN route.balance_delta = trunc(route.balance_delta)
+                THEN route.balance_delta::numeric(78,0)::text END AS balance_delta_text,
+           CASE WHEN route.simulated_net_pnl = trunc(route.simulated_net_pnl)
+                THEN route.simulated_net_pnl::numeric(78,0)::text END AS simulated_net_pnl_text,
+           CASE WHEN route.absolute_prediction_error = trunc(route.absolute_prediction_error)
+                THEN route.absolute_prediction_error::numeric(78,0)::text END AS absolute_prediction_error_text,
+           CASE WHEN route.fork_block = trunc(route.fork_block)
+                THEN route.fork_block::numeric(78,0)::text END AS fork_block_text
+    FROM route_rows AS route
+),
 provider_roles AS (
     SELECT fact.shadow_decision_id, fact.primary_provider_id AS provider_key, 'primary'::text AS role
     FROM selected_facts AS fact
@@ -282,6 +316,40 @@ model_rows AS (
     ORDER BY count(*) DESC, fact.model_version
     LIMIT 10
 ),
+canonical_daily_rows AS (
+    SELECT daily.*,
+           CASE WHEN daily.expected = trunc(daily.expected)
+                THEN daily.expected::numeric(78,0)::text END AS expected_text,
+           CASE WHEN daily.conservative = trunc(daily.conservative)
+                THEN daily.conservative::numeric(78,0)::text END AS conservative_text,
+           CASE WHEN daily.severe = trunc(daily.severe)
+                THEN daily.severe::numeric(78,0)::text END AS severe_text,
+           CASE WHEN daily.fork_simulated = trunc(daily.fork_simulated)
+                THEN daily.fork_simulated::numeric(78,0)::text END AS fork_simulated_text
+    FROM daily_rows AS daily
+),
+canonical_weekly_rows AS (
+    SELECT weekly.*,
+           CASE WHEN weekly.expected = trunc(weekly.expected)
+                THEN weekly.expected::numeric(78,0)::text END AS expected_text,
+           CASE WHEN weekly.conservative = trunc(weekly.conservative)
+                THEN weekly.conservative::numeric(78,0)::text END AS conservative_text,
+           CASE WHEN weekly.severe = trunc(weekly.severe)
+                THEN weekly.severe::numeric(78,0)::text END AS severe_text,
+           CASE WHEN weekly.fork_simulated = trunc(weekly.fork_simulated)
+                THEN weekly.fork_simulated::numeric(78,0)::text END AS fork_simulated_text
+    FROM weekly_rows AS weekly
+),
+canonical_model_rows AS (
+    SELECT model.*,
+           CASE WHEN model.expected = trunc(model.expected)
+                THEN model.expected::numeric(78,0)::text END AS expected_text,
+           CASE WHEN model.conservative = trunc(model.conservative)
+                THEN model.conservative::numeric(78,0)::text END AS conservative_text,
+           CASE WHEN model.absolute_fork_error = trunc(model.absolute_fork_error)
+                THEN model.absolute_fork_error::numeric(78,0)::text END AS absolute_fork_error_text
+    FROM model_rows AS model
+),
 database_stats AS (
     SELECT pg_database_size(current_database()) AS size_bytes,
            (SELECT count(*) FROM pg_stat_activity WHERE datname = current_database()) AS active_connections,
@@ -293,6 +361,12 @@ database_stats AS (
            (SELECT version FROM schema_migrations ORDER BY applied_at DESC, version DESC LIMIT 1) AS migration_version,
            (SELECT checksum FROM schema_migrations ORDER BY applied_at DESC, version DESC LIMIT 1) AS migration_checksum
     FROM pg_stat_bgwriter AS bgwriter
+),
+canonical_database_stats AS (
+    SELECT database_stats.*,
+           CASE WHEN database_stats.wal_bytes = trunc(database_stats.wal_bytes)
+                THEN database_stats.wal_bytes::numeric(78,0)::text END AS wal_bytes_text
+    FROM database_stats
 ),
 route_registry_stats AS (
     SELECT count(*) AS fact_count,
@@ -322,7 +396,7 @@ SELECT jsonb_build_object(
                'active_connections', database_stats.active_connections::text,
                'checkpoints_timed', database_stats.checkpoints_timed::text,
                'checkpoints_requested', database_stats.checkpoints_requested::text,
-               'wal_bytes', database_stats.wal_bytes::text,
+               'wal_bytes', database_stats.wal_bytes_text,
                'oldest_relevant_event', CASE WHEN database_stats.oldest_relevant_event IS NULL THEN NULL ELSE to_char(database_stats.oldest_relevant_event AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"') END,
                'newest_relevant_event', CASE WHEN database_stats.newest_relevant_event IS NULL THEN NULL ELSE to_char(database_stats.newest_relevant_event AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"') END,
                'migration_version', database_stats.migration_version,
@@ -342,16 +416,16 @@ SELECT jsonb_build_object(
                    'independently_verified_count', row.independently_verified_count::text,
                    'verification_disagreed_count', row.verification_disagreed_count::text,
                    'verification_unavailable_count', row.verification_unavailable_count::text,
-                   'gross_profit', row.gross_profit::text,
-                   'total_cost', row.total_cost::text,
-                   'gas_cost', row.gas_cost::text,
-                   'flash_premium', row.flash_premium::text,
-                   'ordering_cost', row.ordering_cost::text,
-                   'safety_cost', row.safety_cost::text,
-                   'expected', row.expected::text,
-                   'conservative', row.conservative::text,
-                   'severe', row.severe::text,
-                   'minimum_shortfall', row.minimum_shortfall::text,
+                   'gross_profit', row.gross_profit_text,
+                   'total_cost', row.total_cost_text,
+                   'gas_cost', row.gas_cost_text,
+                   'flash_premium', row.flash_premium_text,
+                   'ordering_cost', row.ordering_cost_text,
+                   'safety_cost', row.safety_cost_text,
+                   'expected', row.expected_text,
+                   'conservative', row.conservative_text,
+                   'severe', row.severe_text,
+                   'minimum_shortfall', row.minimum_shortfall_text,
                    'first_observed_at', to_char(row.first_observed_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"'),
                    'last_observed_at', to_char(row.last_observed_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"'),
                    'liquidity_score_bps', NULL,
@@ -362,14 +436,14 @@ SELECT jsonb_build_object(
                    'fork_success', row.success::text,
                    'fork_reverted', row.reverted::text,
                    'fork_profitable', row.profitable::text,
-                   'fork_gas_used', row.gas_used::text,
-                   'fork_balance_delta', row.balance_delta::text,
-                   'fork_simulated_net_pnl', row.simulated_net_pnl::text,
-                   'fork_absolute_prediction_error', row.absolute_prediction_error::text,
-                   'fork_block', row.fork_block::text,
+                   'fork_gas_used', row.gas_used_text,
+                   'fork_balance_delta', row.balance_delta_text,
+                   'fork_simulated_net_pnl', row.simulated_net_pnl_text,
+                   'fork_absolute_prediction_error', row.absolute_prediction_error_text,
+                   'fork_block', row.fork_block_text,
                    'fork_guard_failures', row.guard_failures::text
                ) ORDER BY row.sample_count DESC, row.expected DESC, row.route_fingerprint)
-               FROM route_rows AS row
+               FROM canonical_route_rows AS row
            ), '[]'::jsonb),
            'distribution', coalesce((
                SELECT jsonb_agg(jsonb_build_object('scenario', scenario, 'bucket', bucket, 'count', count::text) ORDER BY scenario, bucket)
@@ -380,16 +454,16 @@ SELECT jsonb_build_object(
                FROM prediction_rows
            ), '[]'::jsonb),
            'daily_trend', coalesce((
-               SELECT jsonb_agg(jsonb_build_object('period', period, 'expected', expected::text, 'conservative', conservative::text, 'severe', severe::text, 'fork_simulated', fork_simulated::text, 'sample_count', sample_count::text) ORDER BY period)
-               FROM daily_rows
+               SELECT jsonb_agg(jsonb_build_object('period', period, 'expected', expected_text, 'conservative', conservative_text, 'severe', severe_text, 'fork_simulated', fork_simulated_text, 'sample_count', sample_count::text) ORDER BY period)
+               FROM canonical_daily_rows
            ), '[]'::jsonb),
            'weekly_trend', coalesce((
-               SELECT jsonb_agg(jsonb_build_object('period', period, 'expected', expected::text, 'conservative', conservative::text, 'severe', severe::text, 'fork_simulated', fork_simulated::text, 'sample_count', sample_count::text) ORDER BY period)
-               FROM weekly_rows
+               SELECT jsonb_agg(jsonb_build_object('period', period, 'expected', expected_text, 'conservative', conservative_text, 'severe', severe_text, 'fork_simulated', fork_simulated_text, 'sample_count', sample_count::text) ORDER BY period)
+               FROM canonical_weekly_rows
            ), '[]'::jsonb),
            'model_comparison', coalesce((
-               SELECT jsonb_agg(jsonb_build_object('model_version', model_version, 'sample_count', sample_count::text, 'expected', expected::text, 'conservative', conservative::text, 'absolute_fork_error', absolute_fork_error::text) ORDER BY sample_count DESC, model_version)
-               FROM model_rows
+               SELECT jsonb_agg(jsonb_build_object('model_version', model_version, 'sample_count', sample_count::text, 'expected', expected_text, 'conservative', conservative_text, 'absolute_fork_error', absolute_fork_error_text) ORDER BY sample_count DESC, model_version)
+               FROM canonical_model_rows
            ), '[]'::jsonb),
            'providers', coalesce((
                SELECT jsonb_agg(jsonb_build_object(
@@ -406,6 +480,6 @@ SELECT jsonb_build_object(
                FROM provider_rows
            ), '[]'::jsonb)
        )::text
-FROM params, database_stats, route_registry_stats;
+FROM params, canonical_database_stats AS database_stats, route_registry_stats;
 
 COMMIT;
