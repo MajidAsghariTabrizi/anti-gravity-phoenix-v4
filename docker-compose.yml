@@ -5,6 +5,7 @@ services:
     command:
       - --chain.id=42161
       - --parent-chain.connection.url=${PARENT_CHAIN_RPC_URL:-}
+      - --node.feed.input.url=${ARBITRUM_SEQUENCER_FEED_URL:-}
       - --node.feed.input.require-chain-id=true
       - --node.feed.input.require-feed-version=true
       - --node.feed.output.enable=true

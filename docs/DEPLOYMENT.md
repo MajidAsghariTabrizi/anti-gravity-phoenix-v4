@@ -14,22 +14,31 @@ Production host layout:
 
 ```text
 /opt/phoenix/
+    releases/
+        <release-sha>/
+            release-assets-manifest.json
     deploy/
         compose.prod.yml
         current-release
         previous-release
+        release-assets.sha
         manifests/
     data/
         postgres/
         prometheus/
         feed/
+        # Docker volume phoenix-nats-jetstream stores JetStream data.
+    evidence/
+        dashboard/
+            latest-dashboard.json
+            # Bounded redacted report artifacts only.
     logs/
 
 /etc/phoenix/
     phoenix.env
 ```
 
-The production host pulls prebuilt GHCR images. It does not build Phoenix application source.
+The production host pulls prebuilt GHCR images. It does not build Phoenix application source. Canonical host scripts, schemas, route proofs, and the compiled contract artifact come only from the verified exact-SHA release-assets bundle.
 
 Do not expose internal services publicly:
 
@@ -43,10 +52,18 @@ Explicit loopback bindings:
 - Dashboard on `127.0.0.1:8501`
 - Prometheus on `127.0.0.1:9090`
 
+The Dashboard bind-mounts only `/opt/phoenix/evidence/dashboard` read-only. It
+does not receive `/etc/phoenix/phoenix.env`, a database connection string,
+Prometheus access, or the Docker socket. Access it through an SSH tunnel.
+
 Production bootstrap, GHCR authentication, environment validation, release, and rollback are documented in:
 
 - `docs/PRODUCTION_BOOTSTRAP.md`
 - `docs/RELEASE_AND_ROLLBACK.md`
 - `docs/CI_CD.md`
 
-Current blocker: real Nitro feed relay ingestion is implemented for first runtime verification but not live-verified. Production feed startup fails intentionally until `docs/NITRO_FEED_INTEGRATION.md` is resolved with real-feed evidence.
+Current live-evidence gap: real Nitro feed relay ingestion is implemented for first SHADOW runtime verification but not live-verified. A Linux VPS validation run must still prove the pinned relay can observe and decode real Arbitrum feed messages before any production-readiness or LIVE claim.
+
+Current deployment gate: feed-ingestor and Recorder changed in this milestone but are protected against recreation. The manual workflow blocks before SSH when either candidate digest differs from the active rollback manifest. A separately approved maintenance gate is required before those protected images can be replaced; optional-service deployment must not be used to bypass that restriction.
+
+Recorder durability configuration and single-node storage limits are documented in `docs/RECORDER_DURABLE_DELIVERY.md`.

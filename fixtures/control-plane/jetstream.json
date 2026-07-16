@@ -1,0 +1,53 @@
+{
+  "streams": [
+    {
+      "name": "PHOENIX_FEED_TX",
+      "config": {
+        "name": "PHOENIX_FEED_TX",
+        "subjects": ["phoenix.feed.tx.v1"],
+        "storage": "file",
+        "retention": "workqueue",
+        "max_age": 86400000000000,
+        "max_bytes": 10737418240,
+        "max_msgs": -1
+      },
+      "state": {"messages": 10, "bytes": 1024}
+    },
+    {
+      "name": "PHOENIX_ENGINE_INPUT",
+      "config": {
+        "name": "PHOENIX_ENGINE_INPUT",
+        "subjects": ["phoenix.engine.input.v1"],
+        "storage": "file",
+        "retention": "workqueue",
+        "max_age": 86400000000000,
+        "max_bytes": 10737418240,
+        "max_msgs": -1
+      },
+      "state": {"messages": 20, "bytes": 2048}
+    }
+  ],
+  "consumers": [
+    {
+      "name": "PHOENIX_RECORDER",
+      "config": {"durable_name": "PHOENIX_RECORDER", "ack_policy": "explicit", "deliver_policy": "all", "filter_subject": "phoenix.feed.tx.v1", "max_ack_pending": 512},
+      "num_pending": 2,
+      "num_ack_pending": 1,
+      "num_redelivered": 0
+    },
+    {
+      "name": "PHOENIX_ENGINE_SHADOW",
+      "config": {"durable_name": "PHOENIX_ENGINE_SHADOW", "ack_policy": "explicit", "deliver_policy": "all", "filter_subject": "phoenix.engine.input.v1", "max_ack_pending": 512},
+      "num_pending": 3,
+      "num_ack_pending": 1,
+      "num_redelivered": 1
+    },
+    {
+      "name": "PHOENIX_SHADOW_DISPATCH",
+      "config": {"durable_name": "PHOENIX_SHADOW_DISPATCH", "ack_policy": "explicit", "deliver_policy": "all", "filter_subject": "phoenix.engine.decision.v1", "max_ack_pending": 512},
+      "num_pending": 3,
+      "num_ack_pending": 0,
+      "num_redelivered": 0
+    }
+  ]
+}

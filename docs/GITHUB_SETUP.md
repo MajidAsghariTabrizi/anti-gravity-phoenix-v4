@@ -24,7 +24,11 @@ Create only these production deployment Actions secrets:
 
 Do not create `SIGNER_PRIVATE_KEY` in GitHub.
 
-Create a dedicated deploy SSH key on the production host. Grant it only the access needed to run `/opt/phoenix/deploy/deploy-release.sh` as the deployment user. Verify the production host key out-of-band, then store the trusted host key text in `PROD_KNOWN_HOSTS`. Do not use deployment-time `ssh-keyscan` as identity verification.
+Create a protected GitHub environment named `production-shadow`. Require manual approval where the repository plan supports environment reviewers, and scope the five deployment secrets to that environment where possible.
+
+Create a dedicated deploy SSH key on the production host. Grant it only the access needed to stage release artifacts and use non-interactive `sudo` for the reviewed asset installer, bootstrap, and deploy scripts. Do not grant a general interactive root shell. Verify the production host key out-of-band, then store the trusted host key text in `PROD_KNOWN_HOSTS`. Do not use deployment-time `ssh-keyscan` as identity verification.
+
+Deployment remains manual even after the image workflow succeeds. The operator must supply current-main release evidence, an active rollback release, and the exact `DEPLOY_PRELIVE_SHADOW` acknowledgement. A release that changes protected feed-ingestor or Recorder digests is blocked before SSH.
 
 ## Merge Settings
 
@@ -50,9 +54,11 @@ After the `Phoenix CI` workflow has run once and the checks exist in GitHub, cre
   - `rust-rpc-gateway`
   - `rust-recorder`
   - `rust-replay`
+  - `rust-fork-sandbox`
   - `solidity`
   - `python-dashboard`
   - `docker-validation`
   - `integration-fixtures`
+  - `jetstream-integration`
 
 Require branches to be up to date only if the resulting queue/merge behavior does not deadlock the sole-owner workflow.

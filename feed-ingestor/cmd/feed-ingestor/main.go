@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -65,8 +66,22 @@ func run(ctx context.Context) error {
 	defer input.Close()
 
 	natsURL := env("NATS_URL", "nats://127.0.0.1:4222")
-	pub, err := publisher.DialNATSCore(natsURL, 2*time.Second)
+	pub, err := publisher.DialJetStream(natsURL, 2*time.Second, publisher.ConnectionEvents{
+		Disconnected: func() {
+			readiness.MarkNATSUnavailable()
+			registry.SetGauge("feed_readiness", 0)
+			log.Printf("feed_jetstream_disconnected")
+		},
+		Reconnected: func() {
+			readiness.MarkNATSReachable()
+			registry.SetGauge("feed_readiness", readinessGauge(readiness))
+			log.Printf("feed_jetstream_reconnected")
+		},
+	})
 	if err != nil {
+		if errors.Is(err, publisher.ErrStreamUnavailable) {
+			registry.Inc("feed_jetstream_stream_unavailable_total")
+		}
 		wrapped := fmt.Errorf("connect nats: %w", err)
 		readiness.MarkFatal(wrapped.Error())
 		return wrapped
@@ -106,21 +121,21 @@ func runLineSource(ctx context.Context, input io.Reader, pub publisher.Publisher
 		}
 		if result.Duplicate {
 			registry.Inc("feed_duplicates_total")
+			registry.Inc("feed_sequence_duplicates_total")
 			continue
 		}
 		if result.Gap {
-			registry.Inc("feed_sequence_gaps_total")
+			recordSequenceGap(registry, result.GapTo-result.GapFrom+1)
 			readiness.MarkSequenceGap()
 			log.Printf("feed_sequence_gap source=line gap_from=%d gap_to=%d", result.GapFrom, result.GapTo)
 		} else {
 			readiness.ClearSequenceGap()
+			registry.SetGauge("feed_data_completeness", 1)
 		}
-		readiness.MarkValidFeedMessage()
 		registry.SetGauge("feed_last_sequence", float64(result.Sequence))
 		registry.SetGauge("feed_last_message_timestamp", float64(result.TimestampUnixMS))
-		registry.SetGauge("feed_readiness", readinessGauge(readiness))
-		if err := publishTransactions(pub, registry, result.Transactions, start); err != nil {
-			readiness.MarkFatal(err.Error())
+		registry.Add("feed_normalized_transactions_total", uint64(len(result.Transactions)))
+		if err := publishAndUpdateReadiness(ctx, pub, registry, readiness, result.Transactions, start); err != nil {
 			return err
 		}
 	}
@@ -128,7 +143,17 @@ func runLineSource(ctx context.Context, input io.Reader, pub publisher.Publisher
 
 func runRelaySource(ctx context.Context, sourceCfg sourceConfig, pub publisher.Publisher, registry *metrics.Registry, readiness *metrics.Readiness) error {
 	state := sequence.New()
-	source, err := feed.NewRelaySource(sourceCfg.relayURL, nitro.ArbitrumOneChainID, state.NextExpected, 30*time.Second)
+	reconnect := reconnectBaseline{}
+	source, err := feed.NewRelaySource(
+		sourceCfg.relayURL,
+		nitro.ArbitrumOneChainID,
+		state.NextExpected,
+		feed.RelaySourceOptions{
+			Timeout: 30 * time.Second,
+			Logger:  log.Default(),
+			OnEvent: relayLifecycleHandler(registry, readiness),
+		},
+	)
 	if err != nil {
 		readiness.MarkFatal(err.Error())
 		return err
@@ -136,6 +161,7 @@ func runRelaySource(ctx context.Context, sourceCfg sourceConfig, pub publisher.P
 	defer source.Close()
 	readiness.MarkSourceInitialized()
 	readiness.MarkAdapterInitialized()
+	issueLogger := newSampledIssueLogger(log.Default(), defaultIssueLogInterval, nil)
 
 	for {
 		start := time.Now()
@@ -144,79 +170,28 @@ func runRelaySource(ctx context.Context, sourceCfg sourceConfig, pub publisher.P
 			readiness.MarkFatal(err.Error())
 			return err
 		}
-		if message.Connected {
-			readiness.MarkSourceConnected()
-			registry.Inc("feed_connections_total")
-		}
-		if message.AfterReconnect {
-			registry.Inc("feed_reconnects_total")
-		}
 		registry.Inc("feed_messages_total")
-		frames, _, err := nitro.DecodeBroadcast(message.Data)
+		reconnect.ObserveMessage(message.AfterReconnect)
+		frames, _, err := nitro.DecodeBroadcastContext(ctx, message.Data)
 		if err != nil {
-			registry.Inc("feed_decode_failures_total")
-			log.Printf("feed_decode_failure source=relay error=%q", err.Error())
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			recordRelayDecodeFailure(registry, readiness, issueLogger, err)
 			continue
 		}
-		for index, frame := range frames {
-			if len(frame.Unsupported) > 0 {
-				registry.Add("feed_unsupported_messages_total", uint64(len(frame.Unsupported)))
-				readiness.MarkUnsupportedCoverage()
-				log.Printf("unsupported Nitro feed message sequence=%d reasons=%s", frame.Sequence, strings.Join(frame.Unsupported, "; "))
-			}
-			if len(frame.Ignored) > 0 {
-				log.Printf("ignored Nitro feed message sequence=%d reasons=%s", frame.Sequence, strings.Join(frame.Ignored, "; "))
-			}
-			observation := state.Observe(frame.Sequence, message.AfterReconnect && index == 0)
-			switch observation.Event {
-			case sequence.Duplicate:
-				registry.Inc("feed_duplicates_total")
-				continue
-			case sequence.Gap:
-				registry.Inc("feed_sequence_gaps_total")
-				readiness.MarkSequenceGap()
-				log.Printf("feed_sequence_gap source=relay gap_from=%d gap_to=%d", observation.GapFrom, observation.GapTo)
-				continue
-			case sequence.FeedReset:
-				registry.Inc("feed_out_of_order_total")
-				readiness.MarkSequenceGap()
-				log.Printf("feed_reset source=relay sequence=%d", observation.Sequence)
-				continue
-			case sequence.OutOfOrder:
-				registry.Inc("feed_out_of_order_total")
-				log.Printf("feed_out_of_order source=relay sequence=%d", observation.Sequence)
-				continue
-			}
-			if state.HasUnresolvedGap() {
-				readiness.MarkSequenceGap()
-			} else {
-				readiness.ClearSequenceGap()
-			}
-			readiness.MarkSequenceKnown()
-			registry.SetGauge("feed_last_sequence", float64(frame.Sequence))
-			registry.SetGauge("feed_last_message_timestamp", float64(frame.TimestampUnixMS))
-			if len(frame.Unsupported) > 0 {
-				registry.SetGauge("feed_readiness", readinessGauge(readiness))
-				continue
-			}
-			if len(frame.Ignored) > 0 {
-				registry.SetGauge("feed_readiness", readinessGauge(readiness))
-				continue
-			}
-
-			normalized, ok := normalizeRelayTransactions(frame, registry)
-			if !ok {
-				readiness.MarkUnsupportedCoverage()
-				registry.SetGauge("feed_readiness", readinessGauge(readiness))
-				continue
-			}
-			if len(normalized) == 0 {
-				continue
-			}
-			readiness.MarkValidFeedMessage()
-			registry.SetGauge("feed_readiness", readinessGauge(readiness))
-			if err := publishTransactions(pub, registry, normalized, start); err != nil {
-				readiness.MarkFatal(err.Error())
+		for _, frame := range frames {
+			if err := processRelayFrame(
+				ctx,
+				frame,
+				reconnect.ConsumeForFrame(),
+				state,
+				pub,
+				registry,
+				readiness,
+				issueLogger,
+				start,
+			); err != nil {
 				return err
 			}
 		}
@@ -224,31 +199,176 @@ func runRelaySource(ctx context.Context, sourceCfg sourceConfig, pub publisher.P
 	}
 }
 
-func normalizeRelayTransactions(frame nitro.Frame, registry *metrics.Registry) ([]normalizer.NormalizedTx, bool) {
+type reconnectBaseline struct {
+	pending bool
+}
+
+func (r *reconnectBaseline) ObserveMessage(afterReconnect bool) {
+	if afterReconnect {
+		r.pending = true
+	}
+}
+
+func (r *reconnectBaseline) ConsumeForFrame() bool {
+	pending := r.pending
+	r.pending = false
+	return pending
+}
+
+func recordRelayDecodeFailure(registry *metrics.Registry, readiness *metrics.Readiness, issueLogger *sampledIssueLogger, err error) {
+	registry.Inc("feed_decode_failures_total")
+	readiness.MarkIntegrityFailure("Nitro broadcast decoding integrity failure")
+	registry.SetGauge("feed_readiness", 0)
+	issueLogger.Log("malformed", 0, "decode Nitro broadcast: "+err.Error())
+}
+
+func processRelayFrame(
+	ctx context.Context,
+	frame nitro.Frame,
+	afterReconnect bool,
+	state *sequence.State,
+	pub publisher.Publisher,
+	registry *metrics.Registry,
+	readiness *metrics.Readiness,
+	issueLogger *sampledIssueLogger,
+	start time.Time,
+) error {
+	recordFrameIssues(registry, issueLogger, frame)
+	if len(frame.Malformed) > 0 {
+		readiness.MarkIntegrityFailure("malformed Nitro feed message")
+	}
+
+	observation := state.Observe(frame.Sequence, afterReconnect)
+	switch observation.Event {
+	case sequence.Duplicate:
+		registry.Inc("feed_duplicates_total")
+		registry.Inc("feed_sequence_duplicates_total")
+		issueLogger.LogSequence(observation)
+		registry.SetGauge("feed_readiness", readinessGauge(readiness))
+		return nil
+	case sequence.Regression:
+		registry.Inc("feed_out_of_order_total")
+		registry.Inc("feed_sequence_regressions_total")
+		readiness.MarkIntegrityFailure("Nitro feed sequence regression")
+		issueLogger.LogSequence(observation)
+		registry.SetGauge("feed_readiness", 0)
+		return nil
+	case sequence.Gap:
+		recordSequenceGap(registry, observation.Missing)
+		readiness.MarkSequenceGap()
+		issueLogger.LogSequence(observation)
+	case sequence.Reconnect:
+		issueLogger.LogSequence(observation)
+	}
+
+	if state.HasUnresolvedGap() {
+		readiness.MarkSequenceGap()
+		registry.SetGauge("feed_data_completeness", 0)
+	} else {
+		readiness.ClearSequenceGap()
+		registry.SetGauge("feed_data_completeness", 1)
+	}
+	readiness.MarkSequenceKnown()
+	registry.SetGauge("feed_last_sequence", float64(frame.Sequence))
+	registry.SetGauge("feed_last_message_timestamp", float64(frame.TimestampUnixMS))
+
+	normalized, normalizationFailures := normalizeRelayTransactions(frame)
+	registry.Add("feed_decode_failures_total", uint64(len(normalizationFailures)))
+	if len(normalizationFailures) > 0 {
+		readiness.MarkIntegrityFailure("normalized Nitro transaction integrity failure")
+	}
+	for _, reason := range normalizationFailures {
+		issueLogger.Log("malformed", frame.Sequence, reason)
+	}
+	registry.Add("feed_normalized_transactions_total", uint64(len(normalized)))
+	if len(normalized) == 0 {
+		registry.SetGauge("feed_readiness", readinessGauge(readiness))
+		return nil
+	}
+	return publishAndUpdateReadiness(ctx, pub, registry, readiness, normalized, start)
+}
+
+func relayLifecycleHandler(registry *metrics.Registry, readiness *metrics.Readiness) func(feed.RelayEvent) {
+	return func(event feed.RelayEvent) {
+		switch event.Kind {
+		case feed.RelayEventConnected:
+			readiness.MarkSourceConnected()
+			registry.Inc("feed_connections_total")
+		case feed.RelayEventDisconnected:
+			readiness.MarkSourceDisconnected()
+			registry.SetGauge("feed_data_completeness", 0)
+			registry.SetGauge("feed_readiness", 0)
+		case feed.RelayEventReconnectAttempt:
+			readiness.MarkSourceDisconnected()
+			registry.SetGauge("feed_data_completeness", 0)
+			registry.SetGauge("feed_readiness", 0)
+			registry.Inc("feed_reconnects_total")
+		}
+	}
+}
+
+func recordSequenceGap(registry *metrics.Registry, missing uint64) {
+	registry.Inc("feed_sequence_gaps_total")
+	registry.Add("feed_sequence_gap_messages_total", missing)
+	registry.Add("feed_missing_sequences_total", missing)
+	registry.SetGauge("feed_last_gap_timestamp_seconds", float64(time.Now().Unix()))
+	registry.SetGauge("feed_data_completeness", 0)
+}
+
+func normalizeRelayTransactions(frame nitro.Frame) ([]normalizer.NormalizedTx, []string) {
 	normalized := make([]normalizer.NormalizedTx, 0, len(frame.Transactions))
-	for _, tx := range frame.Transactions {
+	failures := make([]string, 0)
+	for index, tx := range frame.Transactions {
 		n, err := normalizer.Normalize(frame.Sequence, frame.TimestampUnixMS, tx, time.Now())
 		if err != nil {
-			registry.Inc("feed_decode_failures_total")
-			log.Printf("feed_decode_failure source=relay sequence=%d error=%q", frame.Sequence, err.Error())
-			return nil, false
+			failures = append(failures, fmt.Sprintf("normalize transaction %d: %s", index, err.Error()))
+			continue
 		}
 		normalized = append(normalized, n)
 	}
-	return normalized, true
+	return normalized, failures
 }
 
-func publishTransactions(pub publisher.Publisher, registry *metrics.Registry, transactions []normalizer.NormalizedTx, start time.Time) error {
+func publishTransactions(ctx context.Context, pub publisher.Publisher, registry *metrics.Registry, transactions []normalizer.NormalizedTx, start time.Time) (uint64, error) {
+	var published uint64
 	for _, tx := range transactions {
-		if err := pub.Publish(txSubject, tx); err != nil {
+		ackStarted := time.Now()
+		if err := pub.Publish(ctx, txSubject, tx); err != nil {
 			registry.Inc("feed_publish_failures_total")
+			registry.Inc("feed_jetstream_publish_failures_total")
+			if errors.Is(err, publisher.ErrStreamUnavailable) {
+				registry.Inc("feed_jetstream_stream_unavailable_total")
+			}
 			log.Printf("feed_publish_failure subject=%s error=%q", txSubject, err.Error())
-			return err
+			return published, err
 		}
 		registry.Inc("feed_publish_success_total")
-		registry.Inc("feed_normalized_transactions_total")
+		registry.Inc("feed_jetstream_publish_success_total")
+		registry.ObserveJetStreamPublishLatency(ackStarted)
 		registry.ObserveIngestLatency(start)
+		published++
 	}
+	return published, nil
+}
+
+func publishAndUpdateReadiness(
+	ctx context.Context,
+	pub publisher.Publisher,
+	registry *metrics.Registry,
+	readiness *metrics.Readiness,
+	transactions []normalizer.NormalizedTx,
+	start time.Time,
+) error {
+	published, err := publishTransactions(ctx, pub, registry, transactions, start)
+	if err != nil {
+		readiness.MarkNATSUnavailable()
+		registry.SetGauge("feed_readiness", readinessGauge(readiness))
+		return err
+	}
+	if published > 0 {
+		readiness.MarkSuccessfulPublish()
+	}
+	registry.SetGauge("feed_readiness", readinessGauge(readiness))
 	return nil
 }
 
@@ -275,7 +395,7 @@ func resolveSourceConfig(getenv func(string) string) (sourceConfig, error) {
 		if relayURL == "" {
 			return sourceConfig{}, fmt.Errorf("production feed readiness blocked: PHOENIX_FEED_RELAY_URL is required")
 		}
-		return sourceConfig{}, fmt.Errorf("production feed readiness blocked: Nitro relay adapter is implemented but not live-verified for production")
+		return sourceConfig{kind: "relay", relayURL: relayURL}, nil
 	}
 	switch source {
 	case "relay":

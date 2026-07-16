@@ -1,0 +1,82 @@
+{
+  "schema_version": "phoenix.prelive.money-path-source.v1",
+  "generated_at": "2026-07-16T12:00:00.000000Z",
+  "window_hours": "24",
+  "mode": "SHADOW",
+  "live_execution": false,
+  "execution_eligible": false,
+  "execution_request_created": false,
+  "database": {
+    "size_bytes": "104857600",
+    "relations": [
+      {"name": "engine_outbox", "size_bytes": "8192"},
+      {"name": "fork_simulation_results", "size_bytes": "16384"},
+      {"name": "rpc_quality_records", "size_bytes": "32768"},
+      {"name": "shadow_engine_classifications", "size_bytes": "65536"},
+      {"name": "shadow_engine_processing_attempts", "size_bytes": "32768"},
+      {"name": "shadow_profitability_facts", "size_bytes": "131072"}
+    ]
+  },
+  "engine": {
+    "candidate_count": "30",
+    "classifications_total": "80",
+    "decisions_total": "12",
+    "dependency_exhausted_total": "2",
+    "processing_attempts_total": "82",
+    "processing_latency_ns_max": "30000000",
+    "processing_latency_ns_sum": "800000000",
+    "redeliveries_total": "2",
+    "terminal_integrity_total": "0"
+  },
+  "outbox": {
+    "backlog_growth": "2",
+    "oldest_pending_age_seconds": "15",
+    "pending_at_window_start": "1",
+    "pending_rows": "3",
+    "publish_attempts_total": "85",
+    "published_in_window": "79",
+    "retry_rows": "2"
+  },
+  "rpc": {
+    "disagreements_total": "1",
+    "latency_ns_max": "250000000",
+    "latency_ns_sum": "1200000000",
+    "records_total": "30",
+    "retries_total": "2",
+    "stale_total": "1",
+    "success_total": "27",
+    "timeouts_total": "2"
+  },
+  "profitability": {
+    "accepted_total": "5",
+    "complete_total": "10",
+    "facts_total": "12",
+    "incomplete_total": "2",
+    "near_profitable_total": "2",
+    "not_profitable_total": "3",
+    "profitable_total": "7",
+    "rejected_total": "5",
+    "sum_conservative_net_pnl": "3200",
+    "sum_expected_net_pnl": "5000",
+    "sum_severe_net_pnl": "1900",
+    "sum_total_cost": "2100",
+    "rejection_reasons": [
+      {"reason": "net_pnl_negative", "count": "3"},
+      {"reason": "rpc_state_disagreement", "count": "1"}
+    ]
+  },
+  "fork": {
+    "gas_utilization_at_most_50_total": "1",
+    "gas_utilization_at_most_90_total": "3",
+    "gas_utilization_over_90_total": "1",
+    "passed_total": "5",
+    "prediction_error_negative_total": "3",
+    "prediction_error_non_negative_total": "2",
+    "reverted_total": "1",
+    "simulated_not_profitable_total": "1",
+    "simulated_profitable_total": "4",
+    "simulations_total": "6",
+    "sum_absolute_prediction_error": "900",
+    "sum_gas_used": "2400000"
+  }
+}

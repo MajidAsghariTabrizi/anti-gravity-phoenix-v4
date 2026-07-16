@@ -1,13 +1,18 @@
 package nitro
 
 import (
+	"context"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math/big"
 	"strconv"
 
 	"anti-gravity-phoenix-v4/feed-ingestor/internal/normalizer"
+
+	"github.com/ethereum/go-ethereum/core/types"
 )
 
 const (
@@ -33,21 +38,19 @@ const (
 	L1MessageTypeBatchPostingReport    uint8 = 13
 	L1MessageTypeInvalid               uint8 = 0xff
 
-	LegacyTxType     byte = 0x00
-	AccessListTxType byte = 0x01
-	DynamicFeeTxType byte = 0x02
-	BlobTxType       byte = 0x03
-	SetCodeTxType    byte = 0x04
+	L2MessageKindUnsignedUserTx   byte = 0
+	L2MessageKindContractTx       byte = 1
+	L2MessageKindNonmutatingCall  byte = 2
+	L2MessageKindBatch            byte = 3
+	L2MessageKindSignedTx         byte = 4
+	L2MessageKindHeartbeat        byte = 6
+	L2MessageKindSignedCompressed byte = 7
 
-	ArbitrumDepositTxType         byte = 0x64
-	ArbitrumUnsignedTxType        byte = 0x65
-	ArbitrumContractTxType        byte = 0x66
-	ArbitrumRetryTxType           byte = 0x68
-	ArbitrumSubmitRetryableTxType byte = 0x69
-	ArbitrumInternalTxType        byte = 0x6a
-	ArbitrumLegacyTxType          byte = 0x78
-
-	ArbitrumOneChainID uint64 = 42161
+	ArbitrumOneChainID      uint64 = 42161
+	MaxL2MessageSize               = 256 * 1024
+	MaxL2BatchDepth                = 16
+	MaxBroadcastMessageSize        = 64 * 1024 * 1024
+	maxL2BatchItems                = MaxL2MessageSize/9 + 1
 )
 
 type BroadcastMessage struct {
@@ -72,35 +75,95 @@ type L1IncomingMessage struct {
 }
 
 type L1IncomingMessageHeader struct {
-	Kind        uint8  `json:"kind"`
-	Sender      string `json:"sender,omitempty"`
-	BlockNumber uint64 `json:"blockNumber,omitempty"`
-	Timestamp   uint64 `json:"timestamp,omitempty"`
-	RequestID   string `json:"requestId,omitempty"`
-	BaseFeeL1   string `json:"baseFeeL1,omitempty"`
+	Kind        uint8        `json:"kind"`
+	Sender      string       `json:"sender,omitempty"`
+	BlockNumber uint64       `json:"blockNumber,omitempty"`
+	Timestamp   uint64       `json:"timestamp,omitempty"`
+	RequestID   string       `json:"requestId,omitempty"`
+	BaseFeeL1   *jsonUint256 `json:"baseFeeL1,omitempty"`
 }
 
 type ConfirmedSequenceNumberMessage struct {
 	SequenceNumber uint64 `json:"sequenceNumber"`
 }
 
+type MessageLayer uint8
+
+const (
+	MessageLayerL1 MessageLayer = iota + 1
+	MessageLayerL2
+)
+
+func (l MessageLayer) String() string {
+	switch l {
+	case MessageLayerL1:
+		return "l1"
+	case MessageLayerL2:
+		return "l2"
+	default:
+		return "unknown"
+	}
+}
+
+type MessageKind struct {
+	Layer MessageLayer
+	Kind  uint8
+}
+
 type Frame struct {
-	Sequence        uint64
-	TimestampUnixMS uint64
-	Transactions    []normalizer.RelayTx
-	Unsupported     []string
-	Ignored         []string
+	Sequence         uint64
+	TimestampUnixMS  uint64
+	Transactions     []normalizer.RelayTx
+	Unsupported      []string
+	Malformed        []string
+	Ignored          []string
+	UnsupportedKinds []MessageKind
+	IgnoredKinds     []MessageKind
 }
 
 type DecodeReport struct {
 	ConfirmedSequence *uint64
 	Unsupported       []string
+	Malformed         []string
 	Ignored           []string
+	UnsupportedKinds  []MessageKind
+	IgnoredKinds      []MessageKind
 }
 
+type l2DecodeResult struct {
+	transactions     []normalizer.RelayTx
+	unsupported      []string
+	malformed        []string
+	ignored          []string
+	unsupportedKinds []MessageKind
+	ignoredKinds     []MessageKind
+}
+
+type issueClass uint8
+
+const (
+	issueNone issueClass = iota
+	issueUnsupported
+	issueMalformed
+)
+
 func DecodeBroadcast(raw []byte) ([]Frame, DecodeReport, error) {
+	return DecodeBroadcastContext(context.Background(), raw)
+}
+
+func DecodeBroadcastContext(ctx context.Context, raw []byte) ([]Frame, DecodeReport, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, DecodeReport{}, err
+	}
+	if len(raw) > MaxBroadcastMessageSize {
+		return nil, DecodeReport{}, fmt.Errorf("Nitro broadcast message exceeds %d bytes", MaxBroadcastMessageSize)
+	}
+
 	var message BroadcastMessage
 	if err := json.Unmarshal(raw, &message); err != nil {
+		return nil, DecodeReport{}, err
+	}
+	if err := ctx.Err(); err != nil {
 		return nil, DecodeReport{}, err
 	}
 	if message.Version != BroadcastVersion {
@@ -115,125 +178,246 @@ func DecodeBroadcast(raw []byte) ([]Frame, DecodeReport, error) {
 
 	frames := make([]Frame, 0, len(message.Messages))
 	for _, feedMessage := range message.Messages {
-		frame := decodeFeedMessage(feedMessage)
-		if len(frame.Unsupported) > 0 {
-			report.Unsupported = append(report.Unsupported, frame.Unsupported...)
+		if err := ctx.Err(); err != nil {
+			return nil, DecodeReport{}, err
 		}
-		if len(frame.Ignored) > 0 {
-			report.Ignored = append(report.Ignored, frame.Ignored...)
+		frame, err := decodeFeedMessage(ctx, feedMessage)
+		if err != nil {
+			return nil, DecodeReport{}, err
 		}
-		if frame.Sequence != 0 || len(frame.Transactions) > 0 || len(frame.Unsupported) > 0 || len(frame.Ignored) > 0 {
+		report.Unsupported = append(report.Unsupported, frame.Unsupported...)
+		report.Malformed = append(report.Malformed, frame.Malformed...)
+		report.Ignored = append(report.Ignored, frame.Ignored...)
+		report.UnsupportedKinds = append(report.UnsupportedKinds, frame.UnsupportedKinds...)
+		report.IgnoredKinds = append(report.IgnoredKinds, frame.IgnoredKinds...)
+		if frame.Sequence != 0 || len(frame.Transactions) > 0 || len(frame.Unsupported) > 0 || len(frame.Malformed) > 0 || len(frame.Ignored) > 0 {
 			frames = append(frames, frame)
 		}
 	}
 	return frames, report, nil
 }
 
-func decodeFeedMessage(feedMessage *BroadcastFeedMessage) Frame {
+func decodeFeedMessage(ctx context.Context, feedMessage *BroadcastFeedMessage) (Frame, error) {
 	if feedMessage == nil {
-		return Frame{Unsupported: []string{"nil broadcast feed message"}}
+		return Frame{Malformed: []string{"nil broadcast feed message"}}, nil
 	}
 	frame := Frame{Sequence: feedMessage.SequenceNumber}
 	incoming := feedMessage.Message.Message
 	if incoming == nil {
-		frame.Unsupported = append(frame.Unsupported, "missing incoming message")
-		return frame
+		frame.Malformed = append(frame.Malformed, "missing incoming message")
+		return frame, nil
 	}
 	if incoming.Header == nil {
-		frame.Unsupported = append(frame.Unsupported, "missing incoming message header")
-		return frame
+		frame.Malformed = append(frame.Malformed, "missing incoming message header")
+		return frame, nil
 	}
 	frame.TimestampUnixMS = incoming.Header.Timestamp * 1000
 	if incoming.Header.Kind != L1MessageTypeL2Message {
 		reason := fmt.Sprintf("L1 message kind %d", incoming.Header.Kind)
+		kind := MessageKind{Layer: MessageLayerL1, Kind: incoming.Header.Kind}
 		if isIgnoredNonTransactionKind(incoming.Header.Kind) {
 			frame.Ignored = append(frame.Ignored, reason)
+			frame.IgnoredKinds = append(frame.IgnoredKinds, kind)
 		} else {
 			frame.Unsupported = append(frame.Unsupported, "unsupported "+reason)
+			frame.UnsupportedKinds = append(frame.UnsupportedKinds, kind)
 		}
-		return frame
+		return frame, nil
 	}
-	tx, err := decodeL2Message(incoming.L2msg)
+
+	result, err := decodeL2Message(ctx, incoming.L2msg, 0)
 	if err != nil {
-		frame.Unsupported = append(frame.Unsupported, err.Error())
-		return frame
+		return Frame{}, err
 	}
-	frame.Transactions = append(frame.Transactions, tx)
-	return frame
+	frame.Transactions = append(frame.Transactions, result.transactions...)
+	frame.Unsupported = append(frame.Unsupported, result.unsupported...)
+	frame.Malformed = append(frame.Malformed, result.malformed...)
+	frame.Ignored = append(frame.Ignored, result.ignored...)
+	frame.UnsupportedKinds = append(frame.UnsupportedKinds, result.unsupportedKinds...)
+	frame.IgnoredKinds = append(frame.IgnoredKinds, result.ignoredKinds...)
+	return frame, nil
 }
 
-func decodeL2Message(raw []byte) (normalizer.RelayTx, error) {
+func decodeL2Message(ctx context.Context, raw []byte, depth int) (l2DecodeResult, error) {
+	if err := ctx.Err(); err != nil {
+		return l2DecodeResult{}, err
+	}
 	if len(raw) == 0 {
-		return normalizer.RelayTx{}, errors.New("empty L2 message")
+		return l2DecodeResult{malformed: []string{"empty L2 message"}}, nil
 	}
-	if raw[0] != ArbitrumUnsignedTxType {
-		return normalizer.RelayTx{}, fmt.Errorf("unsupported L2 transaction payload type 0x%02x", raw[0])
+	if len(raw) > MaxL2MessageSize {
+		return l2DecodeResult{malformed: []string{fmt.Sprintf("L2 message exceeds %d bytes", MaxL2MessageSize)}}, nil
 	}
-	return decodeArbitrumUnsignedTx(raw)
+
+	switch raw[0] {
+	case L2MessageKindBatch:
+		return decodeL2Batch(ctx, raw[1:], depth)
+	case L2MessageKindSignedTx:
+		tx, class, err := decodeSignedEthereumTx(raw[1:])
+		if err == nil {
+			return l2DecodeResult{transactions: []normalizer.RelayTx{tx}}, nil
+		}
+		if class == issueUnsupported {
+			return l2DecodeResult{
+				unsupported:      []string{err.Error()},
+				unsupportedKinds: []MessageKind{{Layer: MessageLayerL2, Kind: raw[0]}},
+			}, nil
+		}
+		return l2DecodeResult{malformed: []string{err.Error()}}, nil
+	case L2MessageKindHeartbeat:
+		return l2DecodeResult{
+			ignored:      []string{"heartbeat L2 message"},
+			ignoredKinds: []MessageKind{{Layer: MessageLayerL2, Kind: raw[0]}},
+		}, nil
+	case L2MessageKindUnsignedUserTx,
+		L2MessageKindContractTx,
+		L2MessageKindNonmutatingCall,
+		L2MessageKindSignedCompressed:
+		return l2DecodeResult{
+			unsupported:      []string{fmt.Sprintf("unsupported L2 message kind 0x%02x", raw[0])},
+			unsupportedKinds: []MessageKind{{Layer: MessageLayerL2, Kind: raw[0]}},
+		}, nil
+	default:
+		return l2DecodeResult{
+			unsupported:      []string{fmt.Sprintf("unknown L2 message kind 0x%02x", raw[0])},
+			unsupportedKinds: []MessageKind{{Layer: MessageLayerL2, Kind: raw[0]}},
+		}, nil
+	}
 }
 
-func decodeArbitrumUnsignedTx(raw []byte) (normalizer.RelayTx, error) {
-	value, rest, err := parseRLP(raw[1:])
+func decodeL2Batch(ctx context.Context, payload []byte, depth int) (l2DecodeResult, error) {
+	if depth >= MaxL2BatchDepth {
+		return l2DecodeResult{malformed: []string{fmt.Sprintf("L2 message batches exceed max depth %d", MaxL2BatchDepth)}}, nil
+	}
+	nested, err := splitL2Batch(ctx, payload)
 	if err != nil {
-		return normalizer.RelayTx{}, fmt.Errorf("decode arbitrum unsigned tx rlp: %w", err)
+		if ctx.Err() != nil {
+			return l2DecodeResult{}, ctx.Err()
+		}
+		return l2DecodeResult{malformed: []string{"malformed L2 batch: " + err.Error()}}, nil
 	}
-	if len(rest) != 0 {
-		return normalizer.RelayTx{}, errors.New("trailing bytes after arbitrum unsigned tx rlp")
-	}
-	if !value.isList {
-		return normalizer.RelayTx{}, errors.New("arbitrum unsigned tx payload is not an rlp list")
-	}
-	if len(value.list) != 8 {
-		return normalizer.RelayTx{}, fmt.Errorf("arbitrum unsigned tx has %d fields", len(value.list))
+	if len(nested) == 0 {
+		return l2DecodeResult{ignored: []string{"empty L2 message batch"}}, nil
 	}
 
-	chainID, err := rlpUint(value.list[0])
-	if err != nil {
-		return normalizer.RelayTx{}, fmt.Errorf("decode chain id: %w", err)
+	result := l2DecodeResult{}
+	for index, nestedMessage := range nested {
+		if err := ctx.Err(); err != nil {
+			return l2DecodeResult{}, err
+		}
+		nestedResult, err := decodeL2Message(ctx, nestedMessage, depth+1)
+		if err != nil {
+			return l2DecodeResult{}, err
+		}
+		result.transactions = append(result.transactions, nestedResult.transactions...)
+		result.unsupported = appendPrefixed(result.unsupported, nestedResult.unsupported, index)
+		result.malformed = appendPrefixed(result.malformed, nestedResult.malformed, index)
+		result.ignored = appendPrefixed(result.ignored, nestedResult.ignored, index)
+		result.unsupportedKinds = append(result.unsupportedKinds, nestedResult.unsupportedKinds...)
+		result.ignoredKinds = append(result.ignoredKinds, nestedResult.ignoredKinds...)
 	}
-	from, err := rlpAddress(value.list[1])
-	if err != nil {
-		return normalizer.RelayTx{}, fmt.Errorf("decode from address: %w", err)
+	return result, nil
+}
+
+func splitL2Batch(ctx context.Context, payload []byte) ([][]byte, error) {
+	messages := make([][]byte, 0)
+	for offset := 0; offset < len(payload); {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		if len(messages) >= maxL2BatchItems {
+			return nil, errors.New("too many batch items")
+		}
+		if len(payload)-offset < 8 {
+			return nil, errors.New("truncated uint64 batch item length")
+		}
+		size := binary.BigEndian.Uint64(payload[offset : offset+8])
+		offset += 8
+		if size == 0 {
+			return nil, errors.New("empty batch item")
+		}
+		if size > MaxL2MessageSize {
+			return nil, fmt.Errorf("batch item length %d exceeds %d", size, MaxL2MessageSize)
+		}
+		if size > uint64(len(payload)-offset) {
+			return nil, fmt.Errorf("batch item length %d exceeds remaining %d bytes", size, len(payload)-offset)
+		}
+		end := offset + int(size)
+		messages = append(messages, payload[offset:end])
+		offset = end
 	}
-	nonce, err := rlpUint(value.list[2])
-	if err != nil {
-		return normalizer.RelayTx{}, fmt.Errorf("decode nonce: %w", err)
+	return messages, nil
+}
+
+func decodeSignedEthereumTx(raw []byte) (normalizer.RelayTx, issueClass, error) {
+	if len(raw) == 0 {
+		return normalizer.RelayTx{}, issueMalformed, errors.New("signed Ethereum transaction payload is empty")
 	}
-	gasFeeCap, err := rlpBig(value.list[3])
-	if err != nil {
-		return normalizer.RelayTx{}, fmt.Errorf("decode gas fee cap: %w", err)
-	}
-	gas, err := rlpUint(value.list[4])
-	if err != nil {
-		return normalizer.RelayTx{}, fmt.Errorf("decode gas limit: %w", err)
-	}
-	to, err := rlpOptionalAddress(value.list[5])
-	if err != nil {
-		return normalizer.RelayTx{}, fmt.Errorf("decode to address: %w", err)
-	}
-	amount, err := rlpBig(value.list[6])
-	if err != nil {
-		return normalizer.RelayTx{}, fmt.Errorf("decode value: %w", err)
-	}
-	if value.list[7].isList {
-		return normalizer.RelayTx{}, errors.New("decode calldata: rlp list is not bytes")
+	if raw[0] <= 0x7f {
+		switch raw[0] {
+		case types.AccessListTxType, types.DynamicFeeTxType, types.SetCodeTxType:
+		case types.BlobTxType:
+			return normalizer.RelayTx{}, issueUnsupported, errors.New("unsupported signed Ethereum blob transaction")
+		default:
+			return normalizer.RelayTx{}, issueUnsupported, fmt.Errorf("unsupported signed Ethereum transaction type 0x%02x", raw[0])
+		}
 	}
 
-	hash := keccak256(raw)
+	tx := new(types.Transaction)
+	if err := tx.UnmarshalBinary(raw); err != nil {
+		if errors.Is(err, types.ErrTxTypeNotSupported) {
+			return normalizer.RelayTx{}, issueUnsupported, errors.New("unsupported signed Ethereum transaction type")
+		}
+		return normalizer.RelayTx{}, issueMalformed, fmt.Errorf("decode signed Ethereum transaction: %w", err)
+	}
+	if tx.Type() == types.BlobTxType {
+		return normalizer.RelayTx{}, issueUnsupported, errors.New("unsupported signed Ethereum blob transaction")
+	}
+
+	expectedChainID := new(big.Int).SetUint64(ArbitrumOneChainID)
+	actualChainID := tx.ChainId()
+	if tx.Type() != types.LegacyTxType || tx.Protected() {
+		if actualChainID == nil || actualChainID.Cmp(expectedChainID) != 0 {
+			return normalizer.RelayTx{}, issueMalformed, fmt.Errorf("signed Ethereum transaction chain id is not %d", ArbitrumOneChainID)
+		}
+	}
+
+	var signer types.Signer
+	if tx.Type() == types.LegacyTxType && !tx.Protected() {
+		signer = types.HomesteadSigner{}
+	} else {
+		signer = types.LatestSignerForChainID(expectedChainID)
+	}
+	from, err := types.Sender(signer, tx)
+	if err != nil {
+		return normalizer.RelayTx{}, issueMalformed, fmt.Errorf("recover signed Ethereum transaction sender: %w", err)
+	}
+
+	to := ""
+	if destination := tx.To(); destination != nil {
+		to = destination.Hex()
+	}
 	return normalizer.RelayTx{
-		Hash:                 "0x" + hexLower(hash[:]),
-		Type:                 "0x65",
-		ChainID:              chainID,
-		From:                 from,
+		Hash:                 tx.Hash().Hex(),
+		Type:                 fmt.Sprintf("0x%02x", tx.Type()),
+		ChainID:              ArbitrumOneChainID,
+		From:                 from.Hex(),
 		To:                   to,
-		Nonce:                nonce,
-		Value:                amount.String(),
-		Calldata:             "0x" + hexLower(value.list[7].payload),
-		GasLimit:             strconv.FormatUint(gas, 10),
-		MaxFeePerGas:         gasFeeCap.String(),
-		MaxPriorityFeePerGas: "0",
+		Nonce:                tx.Nonce(),
+		Value:                tx.Value().String(),
+		Calldata:             "0x" + hexLower(tx.Data()),
+		GasLimit:             strconv.FormatUint(tx.Gas(), 10),
+		MaxFeePerGas:         tx.GasFeeCap().String(),
+		MaxPriorityFeePerGas: tx.GasTipCap().String(),
 		RawTx:                "0x" + hexLower(raw),
-	}, nil
+	}, issueNone, nil
+}
+
+func appendPrefixed(destination, reasons []string, index int) []string {
+	for _, reason := range reasons {
+		destination = append(destination, fmt.Sprintf("batch item %d: %s", index, reason))
+	}
+	return destination
 }
 
 func hexLower(input []byte) string {

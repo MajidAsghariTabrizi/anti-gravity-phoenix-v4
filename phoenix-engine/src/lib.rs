@@ -1,13 +1,26 @@
 pub mod amm;
 pub mod config;
+pub mod decision;
 pub mod domain;
+pub mod economics;
+pub mod engine_input;
+pub mod engine_jetstream;
 pub mod execution;
 pub mod graph;
 pub mod messaging;
 pub mod metrics;
+pub mod opportunity;
 pub mod optimizer;
 pub mod origin;
+pub mod persistence;
+pub mod positive_route_evidence;
 pub mod profit;
+pub mod readiness;
+pub mod rpc_evaluator;
+pub mod runtime;
+pub mod runtime_state;
+pub mod shadow_processor;
+pub mod simulation;
 pub mod state;
 
 pub use domain::*;

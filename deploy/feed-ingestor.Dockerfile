@@ -11,6 +11,7 @@ WORKDIR /src/migration-runner
 COPY migration-runner/go.mod migration-runner/go.sum ./
 RUN go mod download
 COPY migration-runner ./
+COPY migrations /src/migrations
 RUN go test ./...
 RUN go build -o /out/migration-runner ./cmd/migration-runner
 

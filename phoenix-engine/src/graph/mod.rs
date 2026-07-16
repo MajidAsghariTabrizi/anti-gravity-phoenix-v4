@@ -1,8 +1,9 @@
 use std::collections::HashMap;
 
 use crate::domain::{Direction, PoolId, RouteId, TokenAddress};
+use serde::Serialize;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct PoolEdge {
     pub pool_id: PoolId,
     pub protocol: String,
@@ -12,7 +13,7 @@ pub struct PoolEdge {
     pub direction: Direction,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct Route {
     pub route_id: RouteId,
     pub legs: Vec<PoolEdge>,

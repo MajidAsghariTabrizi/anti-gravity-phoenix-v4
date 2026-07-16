@@ -38,6 +38,16 @@ powershell -ExecutionPolicy Bypass -File .\scripts\forbidden-file-check.ps1
 cd feed-ingestor && go test ./...
 cd migration-runner && go test ./...
 python -m py_compile dashboard/app.py
+python -m py_compile scripts/shadow_profitability_report.py
+sh scripts/shadow-profitability-report-tests.sh
+python -m py_compile scripts/shadow_route_discovery.py
+sh scripts/shadow-route-discovery-tests.sh
+python -m py_compile scripts/prelive_money_path_report.py
+sh scripts/prelive-money-path-report-tests.sh
+python -m unittest discover -s dashboard/tests -p "test_*.py" -v
+python -m unittest scripts.tests.test_prelive_shadow_control scripts.tests.test_prelive_dashboard_live -v
+sh scripts/prelive-shadow-control-tests.sh
+python scripts/prelive_dashboard_snapshot.py --input fixtures/dashboard/latest-dashboard.json --output fixtures/dashboard/checked-dashboard.json --check
 ```
 
 ## Shadow Production
@@ -53,8 +63,13 @@ Default production safety:
 - no production source builds on the VPS
 
 Production deployment is documented in `docs/PRODUCTION_BOOTSTRAP.md` and `docs/RELEASE_AND_ROLLBACK.md`.
+Bounded read-only route discovery and its evidence limits are documented in `docs/SHADOW_ROUTE_DISCOVERY.md`.
+Profit-triggered independent RPC verification is documented in `docs/SHADOW_SECONDARY_VERIFICATION.md`.
+Bounded technical and business money-path evidence is documented in `docs/PRELIVE_MONEY_PATH_OBSERVABILITY.md`.
+The evidence-only technical and business Dashboard is documented in `docs/PRELIVE_DASHBOARD.md`.
+The protected-service-safe continuous SHADOW control plane is documented in `docs/PRELIVE_SHADOW_CONTROL_PLANE.md`.
 
-Current real Nitro feed status: Nitro relay parsing is implemented for first runtime verification but not live-verified. Production feed startup is blocked by design until real-feed evidence exists.
+Current real Nitro feed status: Nitro relay parsing is implemented for first SHADOW runtime verification but not live-verified. Production relay mode can start for Linux VPS validation, but real-feed evidence is still required before any production-readiness or LIVE claim.
 
 ## Live Release Gate
 
@@ -64,14 +79,14 @@ Merging to `main` can deploy SHADOW. It cannot enable LIVE. The manual `Live Rea
 
 - `nitro-feed-relay`: one internal Nitro feed ingress.
 - `feed-ingestor`: Go ordered feed normalizer, NATS publisher, metrics, health, readiness.
-- `nats`: NATS Core, no JetStream in hot path.
+- `nats`: file-backed JetStream for durable normalized-feed delivery; internal network only.
 - `phoenix-engine`: Rust strategy engine.
 - `rpc-gateway`: single cold read-RPC gateway.
 - `recorder`: feed/opportunity recorder.
 - `replay`: deterministic offline replay CLI.
 - `postgres`: durable storage.
 - `prometheus`: metrics.
-- `dashboard`: Streamlit dashboard from PostgreSQL and metrics only.
+- `dashboard`: evidence-only Streamlit view with bounded redacted snapshots and no data-plane credentials or Docker access.
 
 ## Release Gate Before LIVE
 

@@ -36,13 +36,30 @@ SHADOW startup must not require `SIGNER_PRIVATE_KEY`.
 
 ## Bootstrap
 
-Run from a trusted Phoenix release checkout or deployment asset bundle:
+Initial host preparation may run from a trusted Phoenix release checkout:
 
 ```bash
 sudo sh scripts/bootstrap-production.sh
 ```
 
-The script validates Linux, Ubuntu compatibility, amd64 architecture, Docker Engine, Docker Compose plugin, production directories, `/etc/phoenix/phoenix.env` ownership and permissions, and required environment variable shape. It installs Compose, Prometheus, and deployment scripts into `/opt/phoenix/deploy`.
+Every deployable release must instead use the three artifacts emitted by the
+successful exact-SHA image workflow:
+
+```bash
+sudo sh scripts/install-release-assets.sh \
+  <release-sha> \
+  phoenix-release-assets-<release-sha>.tar.gz \
+  release-assets-manifest.json \
+  release-assets-checksums.txt
+```
+
+The installer rejects unbounded, non-canonical, linked, traversing, or
+checksum-mismatched content, retains the immutable source under
+`/opt/phoenix/releases/<release-sha>`, and invokes bootstrap with the exact
+release SHA. Deployment remains blocked until
+`/opt/phoenix/deploy/release-assets.sha` matches the candidate release.
+
+The bootstrap script validates Linux, Ubuntu compatibility, amd64 architecture, Docker Engine, Docker Compose plugin, production directories, `/etc/phoenix/phoenix.env` ownership and permissions, and required environment variable shape. It installs Compose, the bounded NATS JetStream server configuration, Prometheus, deployment/control scripts, report schemas, route proofs, and the compiled contract artifact into `/opt/phoenix/deploy`. When given a release SHA, it promotes the asset marker last.
 
 It does not request the Ethereum signer key. It does not start LIVE.
 

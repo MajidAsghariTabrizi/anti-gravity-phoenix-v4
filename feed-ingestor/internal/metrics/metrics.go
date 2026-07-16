@@ -7,13 +7,22 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"anti-gravity-phoenix-v4/feed-ingestor/internal/nitro"
 )
 
 type Registry struct {
-	mu       sync.Mutex
-	counters map[string]uint64
-	gauges   map[string]float64
-	latency  []float64
+	mu               sync.Mutex
+	counters         map[string]uint64
+	gauges           map[string]float64
+	observations     map[string]observation
+	unsupportedKinds [2][256]uint64
+	ignoredKinds     [2][256]uint64
+}
+
+type observation struct {
+	count uint64
+	sum   float64
 }
 
 var defaultCounters = []string{
@@ -23,23 +32,34 @@ var defaultCounters = []string{
 	"feed_reconnects_total",
 	"feed_normalized_transactions_total",
 	"feed_sequence_gaps_total",
+	"feed_sequence_gap_messages_total",
+	"feed_sequence_regressions_total",
+	"feed_sequence_duplicates_total",
 	"feed_duplicates_total",
 	"feed_out_of_order_total",
 	"feed_publish_success_total",
 	"feed_publish_failures_total",
+	"feed_jetstream_publish_success_total",
+	"feed_jetstream_publish_failures_total",
+	"feed_jetstream_stream_unavailable_total",
 	"feed_unsupported_messages_total",
+	"feed_ignored_messages_total",
+	"feed_missing_sequences_total",
 }
 
 var defaultGauges = []string{
 	"feed_last_sequence",
 	"feed_last_message_timestamp",
+	"feed_last_gap_timestamp_seconds",
+	"feed_data_completeness",
 	"feed_readiness",
 }
 
 func NewRegistry() *Registry {
 	r := &Registry{
-		counters: make(map[string]uint64),
-		gauges:   make(map[string]float64),
+		counters:     make(map[string]uint64),
+		gauges:       make(map[string]float64),
+		observations: make(map[string]observation),
 	}
 	for _, name := range defaultCounters {
 		r.counters[name] = 0
@@ -67,9 +87,49 @@ func (r *Registry) SetGauge(name string, value float64) {
 }
 
 func (r *Registry) ObserveIngestLatency(start time.Time) {
+	r.ObserveDuration("feed_ingest_latency_seconds", time.Since(start))
+}
+
+func (r *Registry) ObserveJetStreamPublishLatency(start time.Time) {
+	r.ObserveDuration("feed_jetstream_publish_latency", time.Since(start))
+}
+
+func (r *Registry) ObserveDuration(name string, duration time.Duration) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	r.latency = append(r.latency, time.Since(start).Seconds())
+	value := r.observations[name]
+	value.count++
+	value.sum += duration.Seconds()
+	r.observations[name] = value
+}
+
+func (r *Registry) IncUnsupportedMessageKind(kind nitro.MessageKind) {
+	r.incMessageKind(&r.unsupportedKinds, kind)
+}
+
+func (r *Registry) IncIgnoredMessageKind(kind nitro.MessageKind) {
+	r.incMessageKind(&r.ignoredKinds, kind)
+}
+
+func (r *Registry) incMessageKind(counters *[2][256]uint64, kind nitro.MessageKind) {
+	index, ok := messageLayerIndex(kind.Layer)
+	if !ok {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	counters[index][kind.Kind]++
+}
+
+func messageLayerIndex(layer nitro.MessageLayer) (int, bool) {
+	switch layer {
+	case nitro.MessageLayerL1:
+		return 0, true
+	case nitro.MessageLayerL2:
+		return 1, true
+	default:
+		return 0, false
+	}
 }
 
 func (r *Registry) Handler() http.Handler {
@@ -91,6 +151,30 @@ func (r *Registry) Render() string {
 	for _, k := range keys {
 		fmt.Fprintf(&b, "%s %d\n", k, r.counters[k])
 	}
+	fmt.Fprintln(&b, "# TYPE feed_message_kind_total counter")
+	for _, classification := range []struct {
+		name   string
+		values *[2][256]uint64
+	}{
+		{name: "unsupported", values: &r.unsupportedKinds},
+		{name: "ignored", values: &r.ignoredKinds},
+	} {
+		for layerIndex, layer := range []string{"l1", "l2"} {
+			for kind, count := range classification.values[layerIndex] {
+				if count == 0 {
+					continue
+				}
+				fmt.Fprintf(
+					&b,
+					"feed_message_kind_total{classification=\"%s\",layer=\"%s\",kind=\"%d\"} %d\n",
+					classification.name,
+					layer,
+					kind,
+					count,
+				)
+			}
+		}
+	}
 	gaugeKeys := make([]string, 0, len(r.gauges))
 	for k := range r.gauges {
 		gaugeKeys = append(gaugeKeys, k)
@@ -99,23 +183,31 @@ func (r *Registry) Render() string {
 	for _, k := range gaugeKeys {
 		fmt.Fprintf(&b, "%s %.0f\n", k, r.gauges[k])
 	}
-	for _, v := range r.latency {
-		fmt.Fprintf(&b, "feed_ingest_latency_seconds %.9f\n", v)
+	observationKeys := make([]string, 0, len(r.observations))
+	for name := range r.observations {
+		observationKeys = append(observationKeys, name)
+	}
+	sort.Strings(observationKeys)
+	for _, name := range observationKeys {
+		value := r.observations[name]
+		fmt.Fprintf(&b, "# TYPE %s summary\n", name)
+		fmt.Fprintf(&b, "%s_count %d\n", name, value.count)
+		fmt.Fprintf(&b, "%s_sum %.9f\n", name, value.sum)
 	}
 	return b.String()
 }
 
 type Readiness struct {
-	mu                  sync.RWMutex
-	sourceInitialized   bool
-	adapterInitialized  bool
-	sourceConnected     bool
-	validFeedObserved   bool
-	sequenceKnown       bool
-	unresolvedGap       bool
-	unsupportedCoverage bool
-	natsReachable       bool
-	fatal               string
+	mu                 sync.RWMutex
+	sourceInitialized  bool
+	adapterInitialized bool
+	sourceConnected    bool
+	successfulPublish  bool
+	sequenceKnown      bool
+	unresolvedGap      bool
+	natsReachable      bool
+	integrityFailure   string
+	fatal              string
 }
 
 func (r *Readiness) MarkSourceInitialized() {
@@ -136,23 +228,23 @@ func (r *Readiness) MarkSourceConnected() {
 	r.sourceConnected = true
 }
 
-func (r *Readiness) MarkValidFeedMessage() {
+func (r *Readiness) MarkSourceDisconnected() {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	r.validFeedObserved = true
+	r.sourceConnected = false
+	r.sequenceKnown = false
+}
+
+func (r *Readiness) MarkSuccessfulPublish() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.successfulPublish = true
 	r.sequenceKnown = true
 }
 
 func (r *Readiness) MarkSequenceKnown() {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	r.sequenceKnown = true
-}
-
-func (r *Readiness) MarkUnsupportedCoverage() {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	r.unsupportedCoverage = true
 	r.sequenceKnown = true
 }
 
@@ -174,6 +266,20 @@ func (r *Readiness) MarkNATSReachable() {
 	r.natsReachable = true
 }
 
+func (r *Readiness) MarkNATSUnavailable() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.natsReachable = false
+}
+
+func (r *Readiness) MarkIntegrityFailure(reason string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.integrityFailure == "" {
+		r.integrityFailure = reason
+	}
+}
+
 func (r *Readiness) MarkFatal(reason string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -185,6 +291,9 @@ func (r *Readiness) Ready() (bool, string) {
 	defer r.mu.RUnlock()
 	if r.fatal != "" {
 		return false, r.fatal
+	}
+	if r.integrityFailure != "" {
+		return false, r.integrityFailure
 	}
 	if !r.sourceInitialized {
 		return false, "source not initialized"
@@ -198,11 +307,8 @@ func (r *Readiness) Ready() (bool, string) {
 	if !r.natsReachable {
 		return false, "NATS not reachable"
 	}
-	if r.unsupportedCoverage {
-		return false, "unsupported feed coverage observed"
-	}
-	if !r.validFeedObserved {
-		return false, "no valid feed message observed"
+	if !r.successfulPublish {
+		return false, "no successful feed transaction published"
 	}
 	if !r.sequenceKnown {
 		return false, "feed sequence unknown"

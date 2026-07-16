@@ -1,8 +1,8 @@
 # Nitro Feed Integration
 
-Status: relay adapter implemented for first runtime verification; production relay ingestion remains blocked until live validation passes.
+Status: relay adapter implemented for first runtime verification; production relay mode can start in SHADOW, but real feed validation evidence is still required before claiming production readiness.
 
-Phoenix supports deterministic fixture JSON frames, stdin line input, and non-production relay mode in `feed-ingestor`.
+Phoenix supports deterministic fixture JSON frames, stdin line input, and relay mode in `feed-ingestor`.
 
 The relay adapter is pinned to Offchain Labs Nitro `v3.11.2` semantics recorded in `docs/DEPENDENCIES.md`. It implements:
 
@@ -23,7 +23,7 @@ Primary Nitro source references used for the local adapter:
 - `wsbroadcastserver/wsbroadcastserver.go`: feed protocol version and WebSocket headers.
 - Nitro `go-ethereum` submodule `f3a977ddf30b138da2fe673ac5cbff2bc6dd4c88`: transaction type identifiers and Arbitrum unsigned transaction type `0x65`.
 
-The adapter intentionally does not claim broad production coverage for every Nitro payload shape. Ignored non-transaction feed messages can advance sequence state when the envelope is valid, but they do not publish to `phoenix.feed.tx`. Unsupported transaction-like or unknown messages advance sequence state only after the envelope sequence is accepted, increment unsupported metrics, and keep readiness unhealthy.
+The adapter intentionally does not claim broad production coverage for every Nitro payload shape. Ignored non-transaction feed messages can advance sequence state when the envelope is valid, but they do not publish to `phoenix.feed.tx`. Unsupported transaction-like or unknown messages advance sequence state only after the envelope sequence is accepted, increment unsupported metrics, and are rejected without being misclassified as decoder corruption or failing readiness by themselves.
 
 Unsupported cases:
 
@@ -78,13 +78,13 @@ This matrix is deliberately conservative. Phoenix must not claim broad Arbitrum 
 
 The local RLP helper exists only because the workspace could not fetch the desired Nitro/go-ethereum dependency graph. It is a minimal canonical RLP parser for the supported Arbitrum unsigned transaction payload subset. Tests cover single bytes, short/long strings, short/long lists, nested lists, empty string/list, trailing bytes, truncation, non-canonical length encodings, length overflow, integer leading-zero rejection, and malformed nested values.
 
-Production readiness stays blocked until either this subset is proven against real feed fixtures or replaced with official go-ethereum/Nitro decoding.
+Production readiness claims remain blocked until either this subset is proven against real feed fixtures or replaced with official go-ethereum/Nitro decoding.
 
 ## Custom Keccak Status
 
 The local Keccak helper implements Ethereum legacy Keccak-256 using rate `136`, Keccak padding suffix `0x01`, and Keccak-f[1600] constants/rotations. Tests cover Keccak-256 of empty input, `abc`, binary bytes `000102030405`, and a multi-block 256-byte input. These vectors distinguish Ethereum Keccak from SHA3-256.
 
-Production readiness still remains blocked because custom crypto should be replaced with or verified against an official dependency before a live release gate is lifted.
+Production readiness claims still require custom crypto to be replaced with or verified against an official dependency before a live release gate is lifted.
 
 ## WebSocket Source Status
 
@@ -95,28 +95,31 @@ Compressed feed frames are not negotiated. Fragmentation is explicitly rejected 
 ## Runtime Modes
 
 - `PHOENIX_FEED_SOURCE=fixture`: deterministic development and CI mode. Requires `PHOENIX_FEED_FIXTURE`.
-- `PHOENIX_FEED_SOURCE=relay`: non-production runtime verification mode. Requires `PHOENIX_FEED_RELAY_URL`.
+- `PHOENIX_FEED_SOURCE=relay`: SHADOW runtime verification mode. Requires `PHOENIX_FEED_RELAY_URL`.
 - `PHOENIX_FEED_SOURCE=stdin`: line-oriented deterministic input for local tooling.
 
-Production rejects any configured fixture path and refuses startup until real relay validation has passed.
+Production rejects any configured fixture path and requires relay mode. Relay startup is allowed for SHADOW runtime verification, but readiness still depends on real source connection, NATS reachability, sequence integrity, and at least one valid normalized transaction-bearing message.
 
 ## Sequence Integrity Policy
 
-The relay path uses an explicit state machine:
+The sequence number belongs to each Nitro `BroadcastFeedMessage`, not to a WebSocket frame or an individual transaction. One WebSocket broadcast may contain multiple feed messages. One feed message contains one L1 incoming message whose L2 payload may normalize to zero, one, or multiple transactions; sequence state advances exactly once for that feed message.
+
+Pinned Nitro `v3.11.2-3599aca` expects messages within one delivered batch to be contiguous. Its relay backlog can nevertheless discard older segments when an upstream jump occurs, and the official broadcast client advances its requested next sequence to every accepted feed message. Phoenix therefore records a received forward discontinuity once and advances its bounded local baseline instead of waiting indefinitely for messages the relay will not send later.
+
+The relay path uses this explicit state machine:
 
 - `FIRST_MESSAGE`: the first observed feed sequence establishes local sequence state.
 - `IN_ORDER`: `sequence == previous + 1`; the message is publishable after normalization.
-- `DUPLICATE`: an already seen sequence is ignored and never republished.
-- `GAP`: a future sequence is observed before the expected next sequence; readiness is degraded and the future message is not published.
-- `OUT_OF_ORDER`: an older unseen sequence is observed without a reconnect reset signal; readiness remains degraded and the message is not published.
+- `DUPLICATE`: `sequence == previous`; the message is ignored and never republished.
+- `GAP`: `sequence > previous + 1`; the missing range and count are recorded once, the received current message remains publishable, and it becomes the new baseline.
+- `REGRESSION`: `sequence < previous`; the message is not published and integrity readiness fails for the process lifetime.
 - `RECONNECT`: the first message after reconnect is accepted only if it continues the expected next sequence.
-- `FEED_RESET`: the first message after reconnect is older than the expected next sequence and not already seen; Phoenix does not reset local sequence state or publish the message.
 
-Unresolved gaps and feed resets keep readiness unhealthy until ordered sequence evidence recovers. This preserves SHADOW observation evidence without presenting degraded feed data as trustworthy opportunity input.
+A forward gap makes readiness transiently unhealthy. The next contiguous message re-establishes local continuity and recovers readiness, but the gap and missing-message count remain durable metrics and smoke evidence. A regression or malformed supported payload is a terminal integrity condition until operator restart; unsupported payload coverage is counted and rejected without being misclassified as decoder corruption.
 
 ## Reconnect Policy
 
-Relay mode reconnects to the local Nitro feed WebSocket with bounded exponential backoff from 250 ms to 5 seconds. On reconnect, Phoenix requests the next expected sequence from the relay and does not blindly reset sequence state. A continuing sequence is accepted as `RECONNECT`; a forward discontinuity is `GAP`; a backward discontinuity is `FEED_RESET`.
+Relay mode reconnects to the local Nitro feed WebSocket with bounded exponential backoff from 250 ms to 5 seconds. Disconnect immediately clears source and sequence readiness. On reconnect, Phoenix requests the next expected sequence and does not blindly reset sequence state. A continuing sequence is `RECONNECT`, a forward discontinuity is `GAP`, and a backward discontinuity is a terminal `REGRESSION`. Fresh sequence evidence is required before readiness recovers.
 
 ## Normalized Message Contract
 
@@ -136,7 +139,7 @@ If a field cannot be derived honestly from a supported payload, normalization fa
 
 ## NATS Publishing
 
-Valid normalized transactions publish synchronously to NATS Core subject `phoenix.feed.tx`. The publisher uses the existing NATS Core TCP protocol implementation, applies a write deadline, records publish success/failure counters, and returns errors instead of dropping failed publishes silently. JetStream is not introduced into the hot path.
+Valid normalized transactions publish synchronously to JetStream subject `phoenix.feed.tx` using `nats.go`. The publisher idempotently creates or updates stream `PHOENIX_FEED_TX`, supplies a stable sequence-plus-transaction-hash message ID, expects the configured stream, and counts success only after the server returns a valid persistence acknowledgement. A timeout, missing stream, disconnected server, or invalid acknowledgement increments durable publish failure metrics and clears readiness. No public RPC read or fixture fallback is part of this path.
 
 ## Readiness Policy
 
@@ -148,17 +151,26 @@ Liveness only reports that the process is alive. Readiness requires:
 - NATS reachable
 - at least one valid normalized transaction-bearing feed message observed
 - sequence state known
-- no unresolved sequence gap or feed reset condition
-- no unsupported transaction-like or unknown feed coverage observed
+- no currently unresolved forward gap
+- no terminal decoder, normalization, or sequence-regression integrity condition
 
-The production guard is deliberate:
+Readiness effects are explicit:
+
+- Decoder corruption or malformed supported data: terminal integrity failure; no malformed transaction is published.
+- Unsupported message: counted and rejected; no readiness failure by itself.
+- Forward sequence gap: transient readiness failure until the next contiguous feed message.
+- Duplicate: counted and ignored; no readiness failure by itself.
+- Sequence regression: terminal integrity failure.
+- Disconnect or reconnect attempt: not ready until a new accepted sequence is observed.
+- JetStream unavailable or Publish ACK timeout: not ready; publication returns an error.
+
+The production guard is deliberately limited to source selection:
 
 - If `PHOENIX_ENV=production` and `PHOENIX_FEED_FIXTURE` is set, startup fails.
 - If `PHOENIX_ENV=production` and `PHOENIX_FEED_SOURCE` is not `relay`, startup fails.
 - If `PHOENIX_ENV=production` and `PHOENIX_FEED_RELAY_URL` is missing, startup fails.
-- If production relay mode is requested, startup fails until the relay adapter has been live-verified against the real Arbitrum sequencer feed.
 
-This is the truthful outcome for the current repository. Do not claim live relay testing has passed.
+Do not claim live relay testing has passed until a real relay smoke test has actually run.
 
 ## Required Adapter Behavior
 
@@ -183,10 +195,17 @@ Required metrics:
 - `feed_decode_failures_total`
 - `feed_reconnects_total`
 - `feed_sequence_gaps_total`
+- `feed_sequence_gap_messages_total`
+- `feed_sequence_regressions_total`
+- `feed_sequence_duplicates_total`
 - `feed_duplicates_total`
 - `feed_out_of_order_total`
 - `feed_publish_success_total`
 - `feed_publish_failures_total`
+- `feed_jetstream_publish_success_total`
+- `feed_jetstream_publish_failures_total`
+- `feed_jetstream_publish_latency`
+- `feed_jetstream_stream_unavailable_total`
 - `feed_unsupported_messages_total`
 - `feed_last_sequence`
 - `feed_last_message_timestamp`

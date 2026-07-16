@@ -1,5 +1,9 @@
 # Runbook
 
+Engine dependency retry exhaustion is handled by the bounded SHADOW quarantine contract in
+[`ENGINE_DEPENDENCY_EXHAUSTION.md`](ENGINE_DEPENDENCY_EXHAUSTION.md). Treat
+`dependency_exhausted` as an unresolved dependency outcome, never as recovery or profitability.
+
 Production default:
 
 - `PHOENIX_MODE=SHADOW`
@@ -7,7 +11,52 @@ Production default:
 - no GitHub-held signer key
 - release by immutable manifest
 
-Production operations use `/opt/phoenix/deploy/deploy-release.sh <sha>`, `/opt/phoenix/deploy/rollback-release.sh`, and `/opt/phoenix/deploy/production-healthcheck.sh`.
+Production operations use `/opt/phoenix/deploy/deploy-release.sh <sha>`, `/opt/phoenix/deploy/rollback-release.sh`, and `/opt/phoenix/deploy/production-healthcheck.sh`. Bounded read-only profitability reporting is documented in [`SHADOW_PROFITABILITY_REPORTS.md`](SHADOW_PROFITABILITY_REPORTS.md). Bounded official-router route discovery is documented in [`SHADOW_ROUTE_DISCOVERY.md`](SHADOW_ROUTE_DISCOVERY.md). The combined technical and business evidence contract is documented in [`PRELIVE_MONEY_PATH_OBSERVABILITY.md`](PRELIVE_MONEY_PATH_OBSERVABILITY.md).
+
+## Money-Path Evidence
+
+Generate a bounded 24-hour report without changing service state:
+
+```sh
+/opt/phoenix/deploy/prelive-money-path-report.sh --format text --window-hours 24
+```
+
+The command fails closed when a production scrape, PostgreSQL, Prometheus, the digest-pinned release
+context, or any SHADOW safety invariant is unavailable. Treat a failed report as missing evidence,
+not as a zero observation. Preserve the JSON form with the release SHA when collecting soak evidence.
+
+## Continuous SHADOW Control Plane
+
+The complete controller contract is documented in
+[`PRELIVE_SHADOW_CONTROL_PLANE.md`](PRELIVE_SHADOW_CONTROL_PLANE.md). Inspect a
+deterministic plan before any authorized host run:
+
+```sh
+/opt/phoenix/deploy/prelive-shadow-control.sh plan 15m
+```
+
+Run preflight separately, then run exactly one reviewed mode. The controller
+must never operate on the protected relay, Feed Ingestor, NATS, PostgreSQL, or
+Recorder lifecycle. A failure, missing snapshot, shortened duration, identity
+change, non-zero execution activity, or missing historical evidence is a
+blocked state. Do not substitute fixtures, manually edit evidence, or relabel a
+Dashboard gate as a readiness decision.
+
+## Bounded Engine Canary
+
+Set `SHADOW_ENGINE_CANARY_INPUT_LIMIT` only for a manually reviewed SHADOW smoke run:
+
+```sh
+SHADOW_ENGINE_CANARY_INPUT_LIMIT=500 ./scripts/shadow-engine-live-smoke.sh
+```
+
+The default value is `0`, which leaves the existing full smoke workflow unchanged. A positive limit selects isolated canary mode: the durable Nitro relay, NATS, PostgreSQL, Feed Ingestor, and Recorder must already be healthy, and their readiness, JetStream stream/consumer, and PostgreSQL connectivity are checked before any optional runtime starts. Migrations must be run separately before the canary. The canary never starts, recreates, stops, or modifies those core services, the Shadow Dispatcher, Prometheus, or Dashboard; monitoring is not required. It starts only RPC Gateway and Phoenix Engine with explicit `--no-deps` service names.
+
+The isolated path records protected container identity, image, creation/start timestamps, and restart count before startup and verifies them again after cleanup. A missing or unhealthy dependency fails closed without starting RPC Gateway or Engine, and a protected identity change fails the canary. Failure does not alter the durable Feed path.
+
+The canary watches `phoenix_engine_inputs_processed_total` immediately before Engine startup and stops the Engine automatically when the requested persisted-input threshold is observed. Post-stop accounting uses the larger of that metric and new persisted classifications; the run fails if the accounted total exceeds the requested limit by more than the fixed 64-message Engine pull batch.
+
+After stopping, the script waits up to `SHADOW_ENGINE_CANARY_SETTLE_TIMEOUT_SECONDS` (default 180 seconds) for ACK-pending to remain at zero. It verifies that `PHOENIX_ENGINE_INPUT` and durable consumer `PHOENIX_ENGINE_SHADOW` still exist, leaves the Engine stopped, and leaves any pending messages replayable. The canary path requires the same `PHOENIX_MODE=SHADOW`, `LIVE_EXECUTION=false`, and blank signer, executor, and wallet settings as the full smoke.
 
 ## Incidents
 
@@ -34,7 +83,9 @@ Production operations use `/opt/phoenix/deploy/deploy-release.sh <sha>`, `/opt/p
 ### NATS unavailable
 
 - Check NATS health endpoint and Docker network.
-- Expect feed-ingestor, engine, and recorder readiness to fail.
+- Confirm `/healthz?js-enabled-only=true`, stream `PHOENIX_FEED_TX`, durable consumer `PHOENIX_RECORDER`, and Docker volume `phoenix-nats-jetstream` still exist.
+- Expect feed-ingestor and Recorder readiness to fail. Do not delete or recreate the volume as a recovery shortcut.
+- Inspect `recorder_consumer_pending_messages`, `recorder_consumer_ack_pending`, publish acknowledgement failures, and disk capacity. Restore service before the 24-hour stream age limit.
 - Restore NATS before restarting dependent services.
 
 ### RPC gateway degraded
@@ -42,6 +93,17 @@ Production operations use `/opt/phoenix/deploy/deploy-release.sh <sha>`, `/opt/p
 - Inspect provider budget and circuit breaker metrics.
 - Reduce cold-path pressure.
 - Hot path must not add direct public RPC reads.
+
+### Independent verification failures
+
+- Keep SHADOW and inspect bounded `independent_verification_status` evidence.
+- Treat `provider_unavailable` as an availability or budget incident and
+  `integrity_failure` as a response-contract incident; do not relabel either as
+  agreement.
+- For `disagreed`, compare logical provider inventory and the persisted primary
+  and secondary block, block-hash, route-hash, and state-hash evidence.
+- A same-provider result or block/route mismatch is invalid evidence. Do not
+  bypass the gateway or relax the Engine/database checks.
 
 ### All RPC providers circuit-open
 
@@ -52,7 +114,7 @@ Production operations use `/opt/phoenix/deploy/deploy-release.sh <sha>`, `/opt/p
 ### PostgreSQL unavailable
 
 - Check `pg_isready`, disk, and volume permissions.
-- Recorder/dashboard may degrade.
+- Recorder readiness fails. The bounded in-flight batch remains unacknowledged and sends work-in-progress signals while PostgreSQL retries; a Recorder restart replays it from JetStream.
 - Hot decision path must not block on database recovery.
 
 ### Migration failure
@@ -65,7 +127,7 @@ Production operations use `/opt/phoenix/deploy/deploy-release.sh <sha>`, `/opt/p
 ### Phoenix engine unhealthy
 
 - Check `/readyz`.
-- In production, not-ready is expected until NATS subscription and state bootstrap are implemented.
+- In production, not-ready means engine-owned runtime initialization failed or is still initializing. The response body is sanitized and should be one of the engine readiness detail constants.
 - Do not override health gates to force a deploy.
 
 ### State incomplete spike
@@ -111,19 +173,24 @@ Production operations use `/opt/phoenix/deploy/deploy-release.sh <sha>`, `/opt/p
 
 ### Production disk pressure
 
-- Check `/opt/phoenix/data`, Docker image cache, logs, and PostgreSQL volume.
+- Check `/opt/phoenix/data`, Docker image cache, logs, PostgreSQL, and `docker volume inspect phoenix-nats-jetstream`.
+- If JetStream reaches its bound, `DiscardNew` rejects publication and feed readiness must fail. Do not purge unacknowledged data to force readiness.
 - Preserve critical database and release artifacts.
 - Prune only reviewed caches/images.
 
 ### Prometheus unavailable
 
-- Dashboard metrics may degrade.
+- The Dashboard may retain its last validated snapshot, which becomes visibly stale after the configured freshness threshold.
 - Health gate fails until Prometheus readiness recovers.
 - Inspect `/opt/phoenix/data/prometheus`.
+- The bounded money-path report must fail; do not replace missing samples with zeros.
 
 ### Dashboard unavailable
 
 - Check Streamlit health on loopback.
+- Check that `/opt/phoenix/evidence/dashboard/latest-dashboard.json` exists and was atomically promoted by the bounded snapshot compiler.
+- Treat `snapshot_missing`, stale evidence, integrity failure, and schema failure as blocked states. Do not copy fixture evidence into production.
+- Confirm the Dashboard has no production env file, data-plane endpoint, or Docker socket before restarting only the Dashboard service.
 - Dashboard failure must not cause hot-path RPC reads or engine restarts.
 
 ## Recovery Order

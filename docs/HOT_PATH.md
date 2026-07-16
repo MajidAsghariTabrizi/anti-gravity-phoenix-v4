@@ -7,15 +7,18 @@ Phoenix v4 hot path:
 3. Phoenix engine decodes supported origin calldata.
 4. Engine maps deterministic paths to touched configured pools.
 5. Pool graph returns only affected two-pool cross-DEX cycles.
-6. Engine clones the relevant state snapshot and locally simulates the origin.
-7. Engine locally simulates backrun routes with integer AMM math.
-8. Optimizer evaluates dynamic amounts.
-9. Profit model gates expected net profit.
-10. Execution coordinator records or submits depending on mode.
+6. Engine requests bounded primary evidence only for the matched route and canonical block.
+7. RPC Gateway reads both pools through one explicit-block Multicall3 and verifies the block hash.
+8. Engine locally simulates the route with integer AMM math and evaluates dynamic amounts.
+9. Routes clearly below the existing economics threshold stop without secondary RPC evidence.
+10. Potentially policy-passing routes receive one same-block secondary Multicall3 verification.
+11. SHADOW policy records accepted or fail-closed evidence; state-only evidence remains non-executable.
 
 Forbidden in the synchronous hot decision path:
 
-- external public RPC reads
+- direct external public RPC reads outside the bounded RPC Gateway evidence verifier
+- RPC-based opportunity discovery or broad pool scanning
+- per-candidate chain-ID, static metadata, or unpinned `latest` reads
 - database calls
 - dashboard calls
 - blocking filesystem writes
@@ -34,4 +37,3 @@ If simulation enters unknown tick coverage, the candidate is rejected with `STAT
 Metric guard:
 
 - `hot_path_external_rpc_calls_total` must stay at zero in production.
-

@@ -6,11 +6,243 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
 	_ "github.com/lib/pq"
 )
+
+func TestShadowProfitabilityMigrationIsAdditiveAndFailClosed(t *testing.T) {
+	migrationPath := filepath.Join("..", "..", "..", "migrations", "003_shadow_profitability_evidence.sql")
+	content, err := os.ReadFile(migrationPath)
+	if err != nil {
+		t.Fatalf("read shadow profitability migration: %v", err)
+	}
+	sqlText := strings.ToUpper(string(content))
+	for _, required := range []string{
+		"CREATE TABLE IF NOT EXISTS SHADOW_DECISIONS",
+		"CREATE TABLE IF NOT EXISTS RPC_QUALITY_RECORDS",
+		"CREATE TABLE IF NOT EXISTS SHADOW_REPLAY_RUNS",
+		"CHECK (EXECUTION_ELIGIBLE = FALSE)",
+	} {
+		if !strings.Contains(sqlText, required) {
+			t.Fatalf("migration missing %q", required)
+		}
+	}
+	for _, destructive := range []string{"DROP TABLE", "DROP COLUMN", "TRUNCATE TABLE"} {
+		if strings.Contains(sqlText, destructive) {
+			t.Fatalf("migration contains destructive statement %q", destructive)
+		}
+	}
+}
+
+func TestShadowEngineRuntimeMigrationIsAdditiveBoundedAndIdempotent(t *testing.T) {
+	migrationPath := filepath.Join("..", "..", "..", "migrations", "004_shadow_engine_runtime.sql")
+	content, err := os.ReadFile(migrationPath)
+	if err != nil {
+		t.Fatalf("read shadow Engine runtime migration: %v", err)
+	}
+	sqlText := strings.ToUpper(string(content))
+	for _, required := range []string{
+		"CREATE TABLE IF NOT EXISTS ENGINE_OUTBOX",
+		"SOURCE_EVENT_IDENTITY TEXT NOT NULL UNIQUE",
+		"OCTET_LENGTH(PAYLOAD::TEXT) <= 1048576",
+		"ENGINE_OUTBOX_PENDING_IDX",
+		"ENGINE_OUTBOX_RETRY_IDX",
+		"CREATE TABLE IF NOT EXISTS SHADOW_ENGINE_CLASSIFICATIONS",
+		"CREATE TABLE IF NOT EXISTS SHADOW_ENGINE_PROCESSING_ATTEMPTS",
+	} {
+		if !strings.Contains(sqlText, required) {
+			t.Fatalf("migration missing %q", required)
+		}
+	}
+	for _, destructive := range []string{"DROP TABLE", "DROP COLUMN", "TRUNCATE TABLE", "DELETE FROM"} {
+		if strings.Contains(sqlText, destructive) {
+			t.Fatalf("migration contains destructive statement %q", destructive)
+		}
+	}
+}
+
+func TestShadowDecisionIdentityMigrationRemovesOnlyLegacyCollisionKey(t *testing.T) {
+	migrationPath := filepath.Join("..", "..", "..", "migrations", "005_shadow_decision_identity.sql")
+	content, err := os.ReadFile(migrationPath)
+	if err != nil {
+		t.Fatalf("read shadow decision identity migration: %v", err)
+	}
+	sqlText := strings.ToUpper(string(content))
+	for _, required := range []string{
+		"UNIQUE (STRATEGY_VERSION, ROUTE_FINGERPRINT, SOURCE_SEQUENCE, OBSERVED_BLOCK)",
+		"ALTER TABLE PUBLIC.SHADOW_DECISIONS DROP CONSTRAINT",
+		"CREATE UNIQUE INDEX IF NOT EXISTS SHADOW_DECISIONS_SOURCE_EVENT_ROUTE_IDX",
+		"SOURCE_EVENT_IDENTITY, STRATEGY_VERSION, ROUTE_FINGERPRINT",
+	} {
+		if !strings.Contains(sqlText, required) {
+			t.Fatalf("migration missing %q", required)
+		}
+	}
+	for _, destructive := range []string{"DROP TABLE", "DROP COLUMN", "TRUNCATE TABLE", "DELETE FROM"} {
+		if strings.Contains(sqlText, destructive) {
+			t.Fatalf("migration contains destructive statement %q", destructive)
+		}
+	}
+}
+
+func TestDependencyExhaustionMigrationOnlyExtendsClassificationChecks(t *testing.T) {
+	migrationPath := filepath.Join("..", "..", "..", "migrations", "006_dependency_exhaustion_quarantine.sql")
+	content, err := os.ReadFile(migrationPath)
+	if err != nil {
+		t.Fatalf("read dependency exhaustion migration: %v", err)
+	}
+	sqlText := strings.ToUpper(string(content))
+	for _, required := range []string{
+		"ALTER TABLE SHADOW_ENGINE_CLASSIFICATIONS",
+		"ALTER TABLE SHADOW_ENGINE_PROCESSING_ATTEMPTS",
+		"DEPENDENCY_EXHAUSTED",
+		"TRANSIENT_DEPENDENCY_FAILURE",
+		"TERMINAL_INTEGRITY_FAILURE",
+	} {
+		if !strings.Contains(sqlText, required) {
+			t.Fatalf("migration missing %q", required)
+		}
+	}
+	for _, destructive := range []string{"DROP TABLE", "DROP COLUMN", "TRUNCATE TABLE", "DELETE FROM"} {
+		if strings.Contains(sqlText, destructive) {
+			t.Fatalf("migration contains destructive statement %q", destructive)
+		}
+	}
+}
+
+func TestCanonicalProfitabilityMigrationIsAdditiveBoundedAndFailClosed(t *testing.T) {
+	migrationPath := filepath.Join("..", "..", "..", "migrations", "007_canonical_profitability_truth.sql")
+	content, err := os.ReadFile(migrationPath)
+	if err != nil {
+		t.Fatalf("read canonical profitability migration: %v", err)
+	}
+	sqlText := strings.ToUpper(string(content))
+	for _, required := range []string{
+		"CREATE TABLE IF NOT EXISTS SHADOW_PROFITABILITY_FACTS",
+		"EVIDENCE_COMPLETENESS_STATUS <> 'COMPLETE'",
+		"GROSS_PROFIT = GROSS_SPREAD - PROTOCOL_FEES - DEX_FEES - PRICE_IMPACT",
+		"ARBITRUM_EXECUTION_FEE = EXECUTION_GAS * GAS_PRICE",
+		"EXPECTED_NET_PNL = GROSS_SPREAD - TOTAL_COST",
+		"VERIFICATION_SKIP_REASON = 'PRIMARY_BELOW_MINIMUM'",
+		"SHADOW_ONLY = TRUE",
+		"EXECUTION_ELIGIBLE = FALSE",
+		"EXECUTION_REQUEST_CREATED = FALSE",
+		"CREATE INDEX IF NOT EXISTS SHADOW_PROFITABILITY_EVALUATED_IDX",
+		"CREATE OR REPLACE VIEW SHADOW_PROFITABILITY_REPORT_ROWS",
+		"NULL::NUMERIC AS EXPECTED_NET_PNL",
+	} {
+		if !strings.Contains(sqlText, required) {
+			t.Fatalf("migration missing %q", required)
+		}
+	}
+	for _, destructive := range []string{
+		"DROP TABLE",
+		"DROP COLUMN",
+		"TRUNCATE TABLE",
+		"DELETE FROM",
+		"UPDATE SHADOW_DECISIONS",
+	} {
+		if strings.Contains(sqlText, destructive) {
+			t.Fatalf("migration contains destructive statement %q", destructive)
+		}
+	}
+}
+
+func TestShadowRouteDiscoveryIndexesAreAdditive(t *testing.T) {
+	migrationPath := filepath.Join("..", "..", "..", "migrations", "008_shadow_route_discovery_indexes.sql")
+	content, err := os.ReadFile(migrationPath)
+	if err != nil {
+		t.Fatalf("read shadow route discovery index migration: %v", err)
+	}
+	sqlText := strings.ToUpper(string(content))
+	for _, required := range []string{
+		"CREATE INDEX IF NOT EXISTS RPC_QUALITY_RECORDS_SHADOW_DECISION_IDX",
+		"CREATE INDEX IF NOT EXISTS POOL_STATE_CHECKPOINTS_LATEST_POOL_IDX",
+	} {
+		if !strings.Contains(sqlText, required) {
+			t.Fatalf("migration missing %q", required)
+		}
+	}
+	for _, destructive := range []string{"DROP", "TRUNCATE", "DELETE", "UPDATE", "ALTER"} {
+		if strings.Contains(sqlText, destructive) {
+			t.Fatalf("migration contains destructive statement %q", destructive)
+		}
+	}
+}
+
+func TestProfitTriggeredVerificationMigrationIsForwardOnlyAndFailClosed(t *testing.T) {
+	migrationPath := filepath.Join("..", "..", "..", "migrations", "009_profit_triggered_secondary_verification.sql")
+	content, err := os.ReadFile(migrationPath)
+	if err != nil {
+		t.Fatalf("read profit-triggered verification migration: %v", err)
+	}
+	sqlText := strings.ToUpper(string(content))
+	for _, required := range []string{
+		"ADD COLUMN IF NOT EXISTS ROUTE_CONFIG_HASH",
+		"INDEPENDENT_VERIFICATION_STATUS IN",
+		"'NOT_REQUESTED'",
+		"'REQUESTED'",
+		"'AGREED'",
+		"'DISAGREED'",
+		"'PROVIDER_UNAVAILABLE'",
+		"'INTEGRITY_FAILURE'",
+		"SECONDARY_PROVIDER_ID <> PRIMARY_PROVIDER_ID",
+		"SECONDARY_BLOCK_NUMBER = PINNED_BLOCK_NUMBER",
+		"SECONDARY_BLOCK_HASH = PINNED_BLOCK_HASH",
+		"SECONDARY_ROUTE_CONFIG_HASH = ROUTE_CONFIG_HASH",
+		"EXECUTION_REQUEST_CREATED",
+		"CREATE INDEX IF NOT EXISTS SHADOW_PROFITABILITY_INDEPENDENT_VERIFICATION_IDX",
+	} {
+		if !strings.Contains(sqlText, required) {
+			t.Fatalf("migration missing %q", required)
+		}
+	}
+	for _, destructive := range []string{"DROP TABLE", "DROP COLUMN", "TRUNCATE TABLE", "DELETE FROM", "UPDATE SHADOW_PROFITABILITY_FACTS"} {
+		if strings.Contains(sqlText, destructive) {
+			t.Fatalf("migration contains destructive statement %q", destructive)
+		}
+	}
+}
+
+func TestForkSimulationEvidenceMigrationIsAdditiveAndForkOnly(t *testing.T) {
+	migrationPath := filepath.Join("..", "..", "..", "migrations", "010_fork_simulation_evidence.sql")
+	content, err := os.ReadFile(migrationPath)
+	if err != nil {
+		t.Fatalf("read fork simulation evidence migration: %v", err)
+	}
+	sqlText := strings.ToUpper(string(content))
+	for _, required := range []string{
+		"ADD COLUMN IF NOT EXISTS FORK_EVIDENCE_SCHEMA_VERSION",
+		"CREATE TABLE IF NOT EXISTS FORK_SIMULATION_RESULTS",
+		"PHOENIX.UNSIGNED-FORK-PLAN.V1",
+		"PHOENIX.FORK-RESULT.V1",
+		"FORK_ONLY = TRUE",
+		"SHADOW_ONLY = TRUE",
+		"LIVE_EXECUTION = FALSE",
+		"EXECUTION_ELIGIBLE = FALSE",
+		"EXECUTION_REQUEST_CREATED = FALSE",
+		"PUBLIC_BROADCAST = FALSE",
+		"SIGNER_USED = FALSE",
+	} {
+		if !strings.Contains(sqlText, required) {
+			t.Fatalf("migration missing %q", required)
+		}
+	}
+	for _, destructive := range []string{
+		"DROP TABLE",
+		"DROP COLUMN",
+		"TRUNCATE TABLE",
+		"DELETE FROM",
+		"UPDATE SHADOW_PROFITABILITY_FACTS",
+	} {
+		if strings.Contains(sqlText, destructive) {
+			t.Fatalf("migration contains destructive statement %q", destructive)
+		}
+	}
+}
 
 func TestLoadMigrationsOrdersByVersion(t *testing.T) {
 	dir := t.TempDir()

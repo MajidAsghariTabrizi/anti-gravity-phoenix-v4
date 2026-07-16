@@ -1,5 +1,4 @@
-use crate::domain::{Amount, OpportunityId, RouteId};
-use crate::graph::PoolEdge;
+pub use crate::opportunity::Opportunity;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ExecutionMode {
@@ -24,26 +23,6 @@ impl ExecutionMode {
             Self::Live => "LIVE",
         }
     }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Opportunity {
-    pub opportunity_id: OpportunityId,
-    pub route_id: RouteId,
-    pub origin_tx_hash: String,
-    pub origin_sequence: u64,
-    pub snapshot_id: String,
-    pub flash_asset: String,
-    pub optimized_amount: Amount,
-    pub expected_gross_profit: Amount,
-    pub expected_flash_premium: Amount,
-    pub expected_execution_cost: Amount,
-    pub expected_net_profit: Amount,
-    pub exact_ordered_legs: Vec<PoolEdge>,
-    pub min_profit: Amount,
-    pub expires_at_unix_ms: u64,
-    pub created_at_monotonic_ns: u128,
-    pub simulation_latency_ns: u128,
 }
 
 pub struct ExecutionCoordinator {

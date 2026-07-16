@@ -1,4 +1,4 @@
-use crate::domain::{DomainError, Liquidity, PoolId, Tick, TokenAddress};
+use crate::domain::{DomainError, Liquidity, PoolId, SqrtPriceX96, Tick, TokenAddress};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StateCompleteness {
@@ -20,8 +20,7 @@ pub struct PoolState {
     pub fee: u32,
     pub tick: Tick,
     pub liquidity: Liquidity,
-    pub price_numerator: u128,
-    pub price_denominator: u128,
+    pub sqrt_price_x96: SqrtPriceX96,
     pub completeness: StateCompleteness,
     pub last_reconciled_block: u64,
 }

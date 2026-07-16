@@ -61,6 +61,17 @@ pgdata/
 prometheus-data/
 prometheus_data/
 
+# Generated release state (tracked examples and schemas remain allowed)
+/deploy/current-release
+/deploy/current-release.env
+/deploy/current-release.json
+/deploy/current-release-context.json
+/deploy/previous-release
+/deploy/release-manifest.json
+/deploy/manifests/
+/deploy/.runtime/
+/current-release.env
+
 # Logs and local databases
 logs/
 *.log

@@ -1,16 +1,11 @@
 package feed
 
 import (
-	"bufio"
 	"context"
-	"crypto/rand"
-	"crypto/sha1"
-	"encoding/base64"
-	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
-	"net"
+	"log"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -18,35 +13,83 @@ import (
 	"time"
 
 	"anti-gravity-phoenix-v4/feed-ingestor/internal/nitro"
+
+	"github.com/gorilla/websocket"
 )
 
-const websocketGUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+const (
+	defaultRelayTimeout     = 30 * time.Second
+	defaultRelayMinBackoff  = 250 * time.Millisecond
+	defaultRelayMaxBackoff  = 5 * time.Second
+	defaultRelayMessageSize = 64 * 1024 * 1024
+)
 
 type RelayMessage struct {
 	Data           []byte
-	Connected      bool
 	AfterReconnect bool
 }
 
-type RelaySource struct {
-	url          *url.URL
-	chainID      uint64
-	nextSequence func() uint64
-	timeout      time.Duration
-	minBackoff   time.Duration
-	maxBackoff   time.Duration
+type RelayEventKind string
 
-	conn          net.Conn
-	reader        *bufio.Reader
-	hadConnection bool
+const (
+	RelayEventConnected        RelayEventKind = "connected"
+	RelayEventDisconnected     RelayEventKind = "disconnected"
+	RelayEventReconnectAttempt RelayEventKind = "reconnect_attempt"
+)
+
+type RelayEvent struct {
+	Kind        RelayEventKind
+	Reconnected bool
+	Attempt     uint64
+	Backoff     time.Duration
 }
 
-func NewRelaySource(rawURL string, chainID uint64, nextSequence func() uint64, timeout time.Duration) (*RelaySource, error) {
+type RelaySourceOptions struct {
+	Timeout        time.Duration
+	MinBackoff     time.Duration
+	MaxBackoff     time.Duration
+	MaxMessageSize int64
+	Logger         *log.Logger
+	OnEvent        func(RelayEvent)
+}
+
+type RelaySource struct {
+	url            *url.URL
+	chainID        uint64
+	nextSequence   func() uint64
+	timeout        time.Duration
+	minBackoff     time.Duration
+	maxBackoff     time.Duration
+	maxMessageSize int64
+	logger         *log.Logger
+	onEvent        func(RelayEvent)
+
+	conn                      *websocket.Conn
+	hadConnection             bool
+	nextMessageAfterReconnect bool
+	connectAttempts           uint64
+}
+
+type relayTransportError struct {
+	kind       string
+	statusCode int
+	err        error
+}
+
+func (e *relayTransportError) Error() string {
+	return e.err.Error()
+}
+
+func (e *relayTransportError) Unwrap() error {
+	return e.err
+}
+
+func NewRelaySource(rawURL string, chainID uint64, nextSequence func() uint64, options RelaySourceOptions) (*RelaySource, error) {
 	parsed, err := url.Parse(rawURL)
 	if err != nil {
 		return nil, err
 	}
-	if parsed.Scheme != "ws" {
+	if parsed.Scheme != "ws" && parsed.Scheme != "wss" {
 		return nil, fmt.Errorf("unsupported relay websocket scheme %q", parsed.Scheme)
 	}
 	if parsed.Host == "" {
@@ -55,47 +98,86 @@ func NewRelaySource(rawURL string, chainID uint64, nextSequence func() uint64, t
 	if nextSequence == nil {
 		nextSequence = func() uint64 { return 0 }
 	}
-	if timeout <= 0 {
-		timeout = 30 * time.Second
+	if options.Timeout <= 0 {
+		options.Timeout = defaultRelayTimeout
 	}
+	if options.MinBackoff <= 0 {
+		options.MinBackoff = defaultRelayMinBackoff
+	}
+	if options.MaxBackoff <= 0 {
+		options.MaxBackoff = defaultRelayMaxBackoff
+	}
+	if options.MaxBackoff < options.MinBackoff {
+		options.MaxBackoff = options.MinBackoff
+	}
+	if options.MaxMessageSize <= 0 {
+		options.MaxMessageSize = defaultRelayMessageSize
+	}
+	if options.Logger == nil {
+		options.Logger = log.Default()
+	}
+
 	return &RelaySource{
-		url:          parsed,
-		chainID:      chainID,
-		nextSequence: nextSequence,
-		timeout:      timeout,
-		minBackoff:   250 * time.Millisecond,
-		maxBackoff:   5 * time.Second,
+		url:            parsed,
+		chainID:        chainID,
+		nextSequence:   nextSequence,
+		timeout:        options.Timeout,
+		minBackoff:     options.MinBackoff,
+		maxBackoff:     options.MaxBackoff,
+		maxMessageSize: options.MaxMessageSize,
+		logger:         options.Logger,
+		onEvent:        options.OnEvent,
 	}, nil
 }
 
 func (s *RelaySource) Next(ctx context.Context) (RelayMessage, error) {
 	backoff := s.minBackoff
 	for {
-		connected := false
-		afterReconnect := false
 		if s.conn == nil {
-			afterReconnect = s.hadConnection
-			if err := s.connect(ctx); err != nil {
+			if s.connectAttempts > 0 {
 				if err := sleepContext(ctx, backoff); err != nil {
 					return RelayMessage{}, err
 				}
+				s.emitEvent(RelayEvent{
+					Kind:    RelayEventReconnectAttempt,
+					Attempt: s.connectAttempts + 1,
+					Backoff: backoff,
+				})
+			}
+
+			s.connectAttempts++
+			afterReconnect := s.hadConnection
+			if err := s.connect(ctx); err != nil {
+				if ctx.Err() != nil {
+					return RelayMessage{}, ctx.Err()
+				}
+				s.logTransportError(err)
 				backoff = nextBackoff(backoff, s.maxBackoff)
 				continue
 			}
 			s.hadConnection = true
-			connected = true
+			s.nextMessageAfterReconnect = afterReconnect
 			backoff = s.minBackoff
+			s.emitEvent(RelayEvent{
+				Kind:        RelayEventConnected,
+				Reconnected: afterReconnect,
+				Attempt:     s.connectAttempts,
+			})
 		}
 
-		payload, err := s.readDataFrame(ctx)
+		payload, err := s.readMessage(ctx)
 		if err == nil {
-			return RelayMessage{Data: payload, Connected: connected, AfterReconnect: afterReconnect}, nil
+			afterReconnect := s.nextMessageAfterReconnect
+			s.nextMessageAfterReconnect = false
+			return RelayMessage{Data: payload, AfterReconnect: afterReconnect}, nil
 		}
-		s.closeConn()
-		if err := sleepContext(ctx, backoff); err != nil {
-			return RelayMessage{}, err
+		if ctx.Err() != nil {
+			_ = s.Close()
+			return RelayMessage{}, ctx.Err()
 		}
-		backoff = nextBackoff(backoff, s.maxBackoff)
+		s.logTransportError(err)
+		s.emitEvent(RelayEvent{Kind: RelayEventDisconnected})
+		s.dropConn()
 	}
 }
 
@@ -105,68 +187,66 @@ func (s *RelaySource) Close() error {
 	}
 	conn := s.conn
 	s.conn = nil
-	s.reader = nil
-	return conn.Close()
+	deadline := time.Now().Add(time.Second)
+	writeErr := conn.WriteControl(
+		websocket.CloseMessage,
+		websocket.FormatCloseMessage(websocket.CloseNormalClosure, "shutdown"),
+		deadline,
+	)
+	closeErr := conn.Close()
+	if closeErr != nil {
+		return closeErr
+	}
+	return writeErr
 }
 
 func (s *RelaySource) connect(ctx context.Context) error {
-	dialer := net.Dialer{Timeout: s.timeout}
-	conn, err := dialer.DialContext(ctx, "tcp", s.url.Host)
+	dialCtx, cancel := context.WithTimeout(ctx, s.timeout)
+	defer cancel()
+
+	headers := http.Header{}
+	headers.Set(nitro.HeaderFeedClientVersion, strconv.Itoa(nitro.FeedClientVersion))
+	headers.Set(nitro.HeaderRequestedSequence, strconv.FormatUint(s.nextSequence(), 10))
+	headers.Set(nitro.HeaderChainID, strconv.FormatUint(s.chainID, 10))
+
+	dialer := websocket.Dialer{
+		Proxy:            http.ProxyFromEnvironment,
+		HandshakeTimeout: s.timeout,
+	}
+	conn, response, err := dialer.DialContext(dialCtx, s.url.String(), headers)
 	if err != nil {
-		return err
+		kind := "websocket_dial_failure"
+		statusCode := 0
+		if errors.Is(err, websocket.ErrBadHandshake) || response != nil {
+			kind = "websocket_handshake_failure"
+			if response != nil {
+				statusCode = response.StatusCode
+			}
+		}
+		return &relayTransportError{kind: kind, statusCode: statusCode, err: err}
 	}
+
+	if err := s.validateHandshake(response); err != nil {
+		_ = conn.Close()
+		statusCode := 0
+		if response != nil {
+			statusCode = response.StatusCode
+		}
+		return &relayTransportError{
+			kind:       "websocket_handshake_failure",
+			statusCode: statusCode,
+			err:        err,
+		}
+	}
+
+	conn.SetReadLimit(s.maxMessageSize)
 	s.conn = conn
-	s.reader = bufio.NewReader(conn)
-	if err := s.handshake(); err != nil {
-		s.closeConn()
-		return err
-	}
 	return nil
 }
 
-func (s *RelaySource) handshake() error {
-	key, err := websocketKey()
-	if err != nil {
-		return err
-	}
-	path := s.url.EscapedPath()
-	if path == "" {
-		path = "/"
-	}
-	if s.url.RawQuery != "" {
-		path += "?" + s.url.RawQuery
-	}
-	request := strings.Builder{}
-	fmt.Fprintf(&request, "GET %s HTTP/1.1\r\n", path)
-	fmt.Fprintf(&request, "Host: %s\r\n", s.url.Host)
-	request.WriteString("Upgrade: websocket\r\n")
-	request.WriteString("Connection: Upgrade\r\n")
-	fmt.Fprintf(&request, "Sec-WebSocket-Key: %s\r\n", key)
-	request.WriteString("Sec-WebSocket-Version: 13\r\n")
-	fmt.Fprintf(&request, "%s: %d\r\n", nitro.HeaderFeedClientVersion, nitro.FeedClientVersion)
-	fmt.Fprintf(&request, "%s: %d\r\n", nitro.HeaderRequestedSequence, s.nextSequence())
-	fmt.Fprintf(&request, "%s: %d\r\n", nitro.HeaderChainID, s.chainID)
-	request.WriteString("\r\n")
-	if _, err := io.WriteString(s.conn, request.String()); err != nil {
-		return err
-	}
-
-	response, err := http.ReadResponse(s.reader, &http.Request{Method: http.MethodGet})
-	if err != nil {
-		return err
-	}
-	defer response.Body.Close()
-	if response.StatusCode != http.StatusSwitchingProtocols {
-		return fmt.Errorf("relay websocket handshake returned %s", response.Status)
-	}
-	if !strings.EqualFold(response.Header.Get("Upgrade"), "websocket") {
-		return errors.New("relay websocket handshake missing upgrade header")
-	}
-	if !strings.Contains(strings.ToLower(response.Header.Get("Connection")), "upgrade") {
-		return errors.New("relay websocket handshake missing connection upgrade header")
-	}
-	if got := response.Header.Get("Sec-WebSocket-Accept"); got != websocketAccept(key) {
-		return errors.New("relay websocket handshake accept mismatch")
+func (s *RelaySource) validateHandshake(response *http.Response) error {
+	if response == nil {
+		return errors.New("relay websocket handshake returned no response")
 	}
 	if got := response.Header.Get(nitro.HeaderFeedServerVersion); got != strconv.Itoa(nitro.FeedServerVersion) {
 		return fmt.Errorf("relay feed server version mismatch: %q", got)
@@ -177,123 +257,123 @@ func (s *RelaySource) handshake() error {
 	return nil
 }
 
-func (s *RelaySource) readDataFrame(ctx context.Context) ([]byte, error) {
-	for {
-		if deadline, ok := ctx.Deadline(); ok {
-			_ = s.conn.SetReadDeadline(deadline)
-		} else {
-			_ = s.conn.SetReadDeadline(time.Now().Add(s.timeout))
-		}
-		payload, opcode, err := s.readFrame()
-		if err != nil {
-			if netErr, ok := err.(net.Error); ok && netErr.Timeout() && ctx.Err() == nil {
-				continue
-			}
-			return nil, err
-		}
-		switch opcode {
-		case 0x1, 0x2:
-			return payload, nil
-		case 0x8:
-			return nil, io.EOF
-		case 0x9:
-			if err := s.writeClientFrame(0xA, payload); err != nil {
-				return nil, err
-			}
-		case 0xA:
-			continue
-		default:
-			return nil, fmt.Errorf("unsupported websocket opcode 0x%x", opcode)
-		}
+func (s *RelaySource) readMessage(ctx context.Context) ([]byte, error) {
+	conn := s.conn
+	deadline := time.Now().Add(s.timeout)
+	if contextDeadline, ok := ctx.Deadline(); ok && contextDeadline.Before(deadline) {
+		deadline = contextDeadline
+	}
+	if err := conn.SetReadDeadline(deadline); err != nil {
+		return nil, err
+	}
+
+	cancelFinished := make(chan struct{})
+	stopCancellation := context.AfterFunc(ctx, func() {
+		_ = conn.SetReadDeadline(time.Now())
+		close(cancelFinished)
+	})
+	messageType, payload, err := conn.ReadMessage()
+	if !stopCancellation() {
+		<-cancelFinished
+	}
+	if ctx.Err() != nil {
+		return nil, ctx.Err()
+	}
+	if err != nil {
+		return nil, err
+	}
+	if messageType != websocket.TextMessage && messageType != websocket.BinaryMessage {
+		return nil, fmt.Errorf("unsupported websocket message type %d", messageType)
+	}
+	return payload, nil
+}
+
+func (s *RelaySource) emitEvent(event RelayEvent) {
+	switch event.Kind {
+	case RelayEventConnected:
+		s.logger.Printf(
+			"event=feed_websocket_connected source=relay attempt=%d reconnected=%t",
+			event.Attempt,
+			event.Reconnected,
+		)
+	case RelayEventReconnectAttempt:
+		s.logger.Printf(
+			"event=feed_websocket_reconnect_attempt source=relay attempt=%d backoff=%q",
+			event.Attempt,
+			event.Backoff.String(),
+		)
+	case RelayEventDisconnected:
+		s.logger.Printf("event=feed_websocket_disconnected source=relay")
+	}
+	if s.onEvent != nil {
+		s.onEvent(event)
 	}
 }
 
-func (s *RelaySource) readFrame() ([]byte, byte, error) {
-	header := make([]byte, 2)
-	if _, err := io.ReadFull(s.reader, header); err != nil {
-		return nil, 0, err
+func (s *RelaySource) logTransportError(err error) {
+	kind, statusCode := classifyTransportError(err)
+	var closeErr *websocket.CloseError
+	if errors.As(err, &closeErr) {
+		s.logger.Printf(
+			"event=feed_websocket_transport_error source=relay type=%s close_code=%d close_reason=%q error=%q",
+			kind,
+			closeErr.Code,
+			closeErr.Text,
+			err.Error(),
+		)
+		return
 	}
-	if header[0]&0x70 != 0 {
-		return nil, 0, errors.New("relay websocket frame uses unsupported reserved bits")
+	if statusCode != 0 {
+		s.logger.Printf(
+			"event=feed_websocket_transport_error source=relay type=%s status_code=%d error=%q",
+			kind,
+			statusCode,
+			err.Error(),
+		)
+		return
 	}
-	if header[0]&0x80 == 0 {
-		return nil, 0, errors.New("fragmented relay websocket frames are not supported")
-	}
-	opcode := header[0] & 0x0f
-	switch opcode {
-	case 0x1, 0x2, 0x8, 0x9, 0xA:
-	default:
-		return nil, 0, fmt.Errorf("unsupported websocket opcode 0x%x", opcode)
-	}
-	masked := header[1]&0x80 != 0
-	length := uint64(header[1] & 0x7f)
-	switch length {
-	case 126:
-		var extended [2]byte
-		if _, err := io.ReadFull(s.reader, extended[:]); err != nil {
-			return nil, 0, err
-		}
-		length = uint64(binary.BigEndian.Uint16(extended[:]))
-	case 127:
-		var extended [8]byte
-		if _, err := io.ReadFull(s.reader, extended[:]); err != nil {
-			return nil, 0, err
-		}
-		length = binary.BigEndian.Uint64(extended[:])
-	}
-	if length > 16*1024*1024 {
-		return nil, 0, fmt.Errorf("relay websocket frame too large: %d", length)
-	}
-	if masked {
-		return nil, 0, errors.New("relay websocket server frame must not be masked")
-	}
-	if opcode >= 0x8 && length > 125 {
-		return nil, 0, errors.New("relay websocket control frame too large")
-	}
-
-	payload := make([]byte, length)
-	if _, err := io.ReadFull(s.reader, payload); err != nil {
-		return nil, 0, err
-	}
-	return payload, opcode, nil
+	s.logger.Printf(
+		"event=feed_websocket_transport_error source=relay type=%s error=%q",
+		kind,
+		err.Error(),
+	)
 }
 
-func (s *RelaySource) writeClientFrame(opcode byte, payload []byte) error {
-	if len(payload) > 125 {
-		return errors.New("control frame payload too large")
+func classifyTransportError(err error) (string, int) {
+	var transportErr *relayTransportError
+	if errors.As(err, &transportErr) {
+		return transportErr.kind, transportErr.statusCode
 	}
-	var mask [4]byte
-	if _, err := rand.Read(mask[:]); err != nil {
-		return err
+	if errors.Is(err, websocket.ErrReadLimit) {
+		return "oversized_payload", 0
 	}
-	frame := []byte{0x80 | opcode, 0x80 | byte(len(payload))}
-	frame = append(frame, mask[:]...)
-	for i, b := range payload {
-		frame = append(frame, b^mask[i%4])
+
+	message := strings.ToLower(err.Error())
+	if errors.Is(err, io.ErrUnexpectedEOF) || strings.Contains(message, "unexpected eof") {
+		return "unexpected_eof", 0
 	}
-	_, err := s.conn.Write(frame)
-	return err
+	if strings.Contains(message, "bad mask") || strings.Contains(message, "masked server frame") {
+		return "unexpected_masked_server_frame", 0
+	}
+	if strings.Contains(message, "bad opcode") || strings.Contains(message, "unknown opcode") || strings.Contains(message, "unsupported websocket message") {
+		return "unsupported_opcode", 0
+	}
+	if strings.Contains(message, "continuation") || strings.Contains(message, "data before fin") || strings.Contains(message, "fin not set on control") || strings.Contains(message, "fragment") {
+		return "fragmented_frame_failure", 0
+	}
+
+	var closeErr *websocket.CloseError
+	if errors.As(err, &closeErr) {
+		return "connection_close", 0
+	}
+	return "frame_read_failure", 0
 }
 
-func (s *RelaySource) closeConn() {
+func (s *RelaySource) dropConn() {
 	if s.conn != nil {
 		_ = s.conn.Close()
 	}
 	s.conn = nil
-	s.reader = nil
-}
-
-func websocketKey() (string, error) {
-	var b [16]byte
-	if _, err := rand.Read(b[:]); err != nil {
-		return "", err
-	}
-	return base64.StdEncoding.EncodeToString(b[:]), nil
-}
-
-func websocketAccept(key string) string {
-	hash := sha1.Sum([]byte(key + websocketGUID))
-	return base64.StdEncoding.EncodeToString(hash[:])
 }
 
 func nextBackoff(current, max time.Duration) time.Duration {
