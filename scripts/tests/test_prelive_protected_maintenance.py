@@ -407,6 +407,184 @@ class ProtectedMaintenanceTests(unittest.TestCase):
                 self.candidate_start(),
             )
 
+    def test_progress_allows_database_snapshot_to_trail_later_metrics(self) -> None:
+        final = self.candidate_final()
+        final["database"] = database(110, 1010)
+        final["metrics"] = metrics(1013, 10)
+        self.assertGreater(
+            final["metrics"]["recorder"]["recorder_last_persisted_feed_sequence"],
+            final["database"]["max_feed_sequence"],
+        )
+        maintenance.validate_transition(
+            self.plan,
+            self.baseline(),
+            final,
+            "final",
+            self.candidate_start(),
+        )
+
+    def test_progress_requires_database_sequence_and_feed_events(self) -> None:
+        start = self.candidate_start()
+        unchanged_sequence = self.candidate_final()
+        unchanged_sequence["database"]["max_feed_sequence"] = start["database"][
+            "max_feed_sequence"
+        ]
+        with self.assertRaisesRegex(
+            maintenance.MaintenanceError,
+            "database_feed_sequence_not_progressing",
+        ):
+            maintenance.validate_transition(
+                self.plan, self.baseline(), unchanged_sequence, "final", start
+            )
+
+        unchanged_events = self.candidate_final()
+        unchanged_events["database"]["counts"]["feed_events"] = start["database"][
+            "counts"
+        ]["feed_events"]
+        with self.assertRaisesRegex(
+            maintenance.MaintenanceError,
+            "database_feed_events_not_progressing",
+        ):
+            maintenance.validate_transition(
+                self.plan, self.baseline(), unchanged_events, "final", start
+            )
+
+    def test_progress_rejects_database_sequence_regression(self) -> None:
+        start = self.candidate_start()
+        start["database"]["max_feed_sequence"] = 990
+        final = self.candidate_final()
+        final["database"]["max_feed_sequence"] = 995
+        with self.assertRaisesRegex(
+            maintenance.MaintenanceError,
+            "database_feed_sequence_regressed",
+        ):
+            maintenance.validate_transition(
+                self.plan, self.baseline(), final, "final", start
+            )
+
+    def test_progress_requires_recorder_and_feed_counters(self) -> None:
+        start = self.candidate_start()
+        stalled_metrics = (
+            ("feed", "feed_last_sequence", "feed_sequence_not_progressing"),
+            (
+                "feed",
+                "feed_jetstream_publish_success_total",
+                "feed_publish_not_progressing",
+            ),
+            (
+                "recorder",
+                "recorder_messages_persisted_total",
+                "recorder_persist_count_not_progressing",
+            ),
+            (
+                "recorder",
+                "recorder_last_persisted_feed_sequence",
+                "recorder_sequence_not_progressing",
+            ),
+        )
+        for group, metric, expected in stalled_metrics:
+            with self.subTest(metric=metric):
+                stalled = self.candidate_final()
+                stalled["metrics"][group][metric] = start["metrics"][group][metric]
+                with self.assertRaisesRegex(
+                    maintenance.MaintenanceError, expected
+                ):
+                    maintenance.validate_transition(
+                        self.plan, self.baseline(), stalled, "final", start
+                    )
+
+    def test_progress_requires_readiness(self) -> None:
+        for group, metric, expected in (
+            ("feed", "feed_readiness", "feed_readiness_not_ready"),
+            ("recorder", "recorder_readiness", "recorder_readiness_not_ready"),
+        ):
+            with self.subTest(group=group):
+                final = self.candidate_final()
+                final["metrics"][group][metric] = 0
+                with self.assertRaisesRegex(
+                    maintenance.MaintenanceError, expected
+                ):
+                    maintenance.validate_transition(
+                        self.plan,
+                        self.baseline(),
+                        final,
+                        "final",
+                        self.candidate_start(),
+                    )
+
+    def test_progress_rejects_every_runtime_error_counter(self) -> None:
+        error_metrics = (
+            (
+                "feed",
+                "feed_sequence_regressions_total",
+            ),
+            ("feed", "feed_sequence_gaps_total"),
+            ("feed", "feed_decode_failures_total"),
+            ("recorder", "recorder_database_failures_total"),
+            ("recorder", "recorder_jetstream_ack_failures_total"),
+            ("recorder", "recorder_poison_messages_total"),
+        )
+        for group, metric in error_metrics:
+            with self.subTest(metric=metric):
+                final = self.candidate_final()
+                final["metrics"][group][metric] = 1
+                with self.assertRaisesRegex(
+                    maintenance.MaintenanceError, "runtime_integrity_failed"
+                ):
+                    maintenance.validate_transition(
+                        self.plan,
+                        self.baseline(),
+                        final,
+                        "final",
+                        self.candidate_start(),
+                    )
+
+    def test_progress_rejects_consumer_backlog_above_bounds(self) -> None:
+        for field, value in (
+            ("pending", maintenance.MAX_RECORDER_PENDING + 1),
+            ("ack_pending", maintenance.MAX_ACK_PENDING + 1),
+        ):
+            with self.subTest(field=field):
+                final = self.candidate_final()
+                final["jetstream"]["consumers"]["PHOENIX_RECORDER"][field] = value
+                with self.assertRaisesRegex(
+                    maintenance.MaintenanceError, "consumer_backlog_unbounded"
+                ):
+                    maintenance.validate_transition(
+                        self.plan,
+                        self.baseline(),
+                        final,
+                        "final",
+                        self.candidate_start(),
+                    )
+
+    def test_progress_rejects_storage_or_fixed_service_identity_change(self) -> None:
+        storage_changed = self.candidate_final()
+        storage_changed["protected_storage_identity_sha256"] = digest(999)
+        with self.assertRaisesRegex(
+            maintenance.MaintenanceError, "protected_storage_metadata_changed"
+        ):
+            maintenance.validate_transition(
+                self.plan,
+                self.baseline(),
+                storage_changed,
+                "final",
+                self.candidate_start(),
+            )
+
+        identity_changed = self.candidate_final()
+        identity_changed["services"]["postgres"]["container_id"] = f"{99:064x}"
+        with self.assertRaisesRegex(
+            maintenance.MaintenanceError, "fixed_service_identity_changed"
+        ):
+            maintenance.validate_transition(
+                self.plan,
+                self.baseline(),
+                identity_changed,
+                "final",
+                self.candidate_start(),
+            )
+
     def test_fixed_identity_mount_and_execution_drift_fail(self) -> None:
         baseline = self.baseline()
         for service_name in maintenance.FIXED_SERVICES:
@@ -448,7 +626,11 @@ class ProtectedMaintenanceTests(unittest.TestCase):
         final["observed_at"] = "2026-07-16T00:04:00Z"
         final["jetstream"] = jetstream(1020)
         final["database"] = database(120, 1020)
-        final["metrics"] = metrics(1020, 10)
+        final["metrics"] = metrics(1022, 10)
+        self.assertGreater(
+            final["metrics"]["recorder"]["recorder_last_persisted_feed_sequence"],
+            final["database"]["max_feed_sequence"],
+        )
         maintenance.validate_transition(
             self.plan, baseline, final, "rollback", start
         )

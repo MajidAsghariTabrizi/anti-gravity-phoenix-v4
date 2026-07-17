@@ -1120,34 +1120,62 @@ def _assert_progress(
 ) -> None:
     feed_start = progress_baseline["metrics"]["feed"]
     recorder_start = progress_baseline["metrics"]["recorder"]
+    database_start = progress_baseline["database"]
     feed = current["metrics"]["feed"]
     recorder = current["metrics"]["recorder"]
+    database = current["database"]
     if any(value is None for value in feed.values()):
-        _fail("progress_not_observed")
+        _fail("feed_metrics_unavailable")
+    if feed["feed_readiness"] != 1:
+        _fail("feed_readiness_not_ready")
+    if recorder["recorder_readiness"] != 1:
+        _fail("recorder_readiness_not_ready")
+    if feed["feed_last_sequence"] <= feed_start["feed_last_sequence"]:
+        _fail("feed_sequence_not_progressing")
     if (
-        feed["feed_readiness"] != 1
-        or recorder["recorder_readiness"] != 1
-        or feed["feed_last_sequence"] <= feed_start["feed_last_sequence"]
-        or feed["feed_last_sequence"]
+        feed["feed_last_sequence"]
         < baseline["metrics"]["feed"]["feed_last_sequence"]
-        or feed["feed_jetstream_publish_success_total"]
-        <= feed_start["feed_jetstream_publish_success_total"]
-        or recorder["recorder_messages_persisted_total"]
-        <= recorder_start["recorder_messages_persisted_total"]
-        or recorder["recorder_last_persisted_feed_sequence"]
-        <= recorder_start["recorder_last_persisted_feed_sequence"]
-        or recorder["recorder_last_persisted_feed_sequence"]
-        < baseline["metrics"]["recorder"]["recorder_last_persisted_feed_sequence"]
-        or current["database"]["counts"]["feed_events"]
-        <= progress_baseline["database"]["counts"]["feed_events"]
-        or current["database"]["counts"]["feed_events"]
-        < baseline["database"]["counts"]["feed_events"]
-        or current["database"]["counts"]["origin_transactions"]
-        < baseline["database"]["counts"]["origin_transactions"]
-        or current["database"]["max_feed_sequence"]
-        < recorder["recorder_last_persisted_feed_sequence"]
     ):
-        _fail("progress_not_observed")
+        _fail("feed_sequence_regressed")
+    if (
+        feed["feed_jetstream_publish_success_total"]
+        <= feed_start["feed_jetstream_publish_success_total"]
+    ):
+        _fail("feed_publish_not_progressing")
+    if (
+        recorder["recorder_messages_persisted_total"]
+        <= recorder_start["recorder_messages_persisted_total"]
+    ):
+        _fail("recorder_persist_count_not_progressing")
+    if (
+        recorder["recorder_last_persisted_feed_sequence"]
+        <= recorder_start["recorder_last_persisted_feed_sequence"]
+    ):
+        _fail("recorder_sequence_not_progressing")
+    if (
+        recorder["recorder_last_persisted_feed_sequence"]
+        < baseline["metrics"]["recorder"]["recorder_last_persisted_feed_sequence"]
+    ):
+        _fail("recorder_sequence_regressed")
+    if (
+        database["counts"]["feed_events"]
+        <= database_start["counts"]["feed_events"]
+    ):
+        _fail("database_feed_events_not_progressing")
+    if (
+        database["counts"]["feed_events"]
+        < baseline["database"]["counts"]["feed_events"]
+    ):
+        _fail("database_feed_events_regressed")
+    if (
+        database["counts"]["origin_transactions"]
+        < baseline["database"]["counts"]["origin_transactions"]
+    ):
+        _fail("database_origin_transactions_regressed")
+    if database["max_feed_sequence"] <= database_start["max_feed_sequence"]:
+        _fail("database_feed_sequence_not_progressing")
+    if database["max_feed_sequence"] < baseline["database"]["max_feed_sequence"]:
+        _fail("database_feed_sequence_regressed")
     if any(
         feed[name] != 0
         for name in (
