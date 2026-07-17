@@ -208,10 +208,20 @@ jobs:
             -C release-tree
           tar -xzf "rollback-assets/phoenix-release-assets-${ROLLBACK_SHA}.tar.gz" \
             -C rollback-tree
-          release_root="release-tree/phoenix-release-${RELEASE_SHA}"
-          rollback_root="rollback-tree/phoenix-release-${ROLLBACK_SHA}"
+          release_root="$PWD/release-tree/phoenix-release-${RELEASE_SHA}"
+          rollback_root="$PWD/rollback-tree/phoenix-release-${ROLLBACK_SHA}"
+          release_manifest="$PWD/release/release-manifest.json"
+          rollback_manifest="$PWD/rollback/release-manifest.json"
+          maintenance_plan="$PWD/protected-maintenance-plan.json"
+          validation_env="$PWD/maintenance-validation.env"
+          release_validation_env="$PWD/release-validation.env"
+          rollback_validation_env="$PWD/rollback-validation.env"
+          release_render="$PWD/release-render.json"
+          rollback_render="$PWD/rollback-render.json"
+          release_render_metadata="$PWD/release-render-metadata.json"
+          rollback_render_metadata="$PWD/rollback-render-metadata.json"
           route_json="$(python3 -c 'import json; print(json.dumps(json.load(open("fixtures/routes/weth_usdc_uniswap_v3.json")), separators=(",", ":")))')"
-          cat > maintenance-validation.env <<'EOF'
+          cat >"$validation_env" <<'EOF'
           PHOENIX_ENV=production
           PHOENIX_MODE=SHADOW
           LIVE_EXECUTION=false
@@ -240,35 +250,35 @@ jobs:
           PRIVATE_RELAY_SUBMISSION=
           TRANSACTION_BROADCAST_URL=
           EOF
-          printf 'ENGINE_ROUTE_REGISTRY_JSON=%s\n' "$route_json" >> maintenance-validation.env
-          "$release_root/scripts/validate-production-env.sh" maintenance-validation.env
-          "$rollback_root/scripts/validate-production-env.sh" maintenance-validation.env
+          printf 'ENGINE_ROUTE_REGISTRY_JSON=%s\n' "$route_json" >>"$validation_env"
+          "$release_root/scripts/validate-production-env.sh" "$validation_env"
+          "$rollback_root/scripts/validate-production-env.sh" "$validation_env"
           python3 "$release_root/scripts/production_context.py" manifest-env \
-            --manifest release/release-manifest.json \
+            --manifest "$release_manifest" \
             --expected-sha "$RELEASE_SHA" \
-            --output release-validation.env
+            --output "$release_validation_env"
           python3 "$rollback_root/scripts/production_context.py" manifest-env \
-            --manifest rollback/release-manifest.json \
+            --manifest "$rollback_manifest" \
             --expected-sha "$ROLLBACK_SHA" \
-            --output rollback-validation.env
+            --output "$rollback_validation_env"
           "$release_root/scripts/render-production-compose.sh" \
             --compose-file "$release_root/compose.prod.yml" \
-            --env-file maintenance-validation.env \
-            --release-env release-validation.env \
-            --release-manifest release/release-manifest.json \
-            --output release-render.json \
-            --metadata-output release-render-metadata.json >/dev/null
+            --env-file "$validation_env" \
+            --release-env "$release_validation_env" \
+            --release-manifest "$release_manifest" \
+            --output "$release_render" \
+            --metadata-output "$release_render_metadata" >/dev/null
           "$rollback_root/scripts/render-production-compose.sh" \
             --compose-file "$rollback_root/compose.prod.yml" \
-            --env-file maintenance-validation.env \
-            --release-env rollback-validation.env \
-            --release-manifest rollback/release-manifest.json \
-            --output rollback-render.json \
-            --metadata-output rollback-render-metadata.json >/dev/null
+            --env-file "$validation_env" \
+            --release-env "$rollback_validation_env" \
+            --release-manifest "$rollback_manifest" \
+            --output "$rollback_render" \
+            --metadata-output "$rollback_render_metadata" >/dev/null
           python3 scripts/prelive_protected_maintenance.py validate-render-pair \
-            --plan protected-maintenance-plan.json \
-            --release-metadata release-render-metadata.json \
-            --rollback-metadata rollback-render-metadata.json
+            --plan "$maintenance_plan" \
+            --release-metadata "$release_render_metadata" \
+            --rollback-metadata "$rollback_render_metadata"
 
       - name: Login to GHCR for immutable inspection
         uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9
