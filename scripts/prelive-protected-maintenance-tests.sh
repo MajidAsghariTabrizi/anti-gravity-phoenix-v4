@@ -8,13 +8,24 @@ workflow=$repo_root/.github/workflows/deploy-prelive-protected-maintenance.yml
 normal_workflow=$repo_root/.github/workflows/deploy-shadow.yml
 runtime=$script_dir/prelive-protected-maintenance.sh
 helper=$script_dir/prelive_protected_maintenance.py
+context_installer=$script_dir/install-production-release-context.sh
+launcher=$script_dir/prelive-protected-maintenance-launch.sh
+unit_runner=$script_dir/prelive-protected-maintenance-unit.sh
 
 fail() {
   echo "prelive-protected-maintenance-tests: $1" >&2
   exit 1
 }
 
-for required in "$workflow" "$normal_workflow" "$runtime" "$helper"; do
+for required in \
+  "$workflow" \
+  "$normal_workflow" \
+  "$runtime" \
+  "$helper" \
+  "$context_installer" \
+  "$launcher" \
+  "$unit_runner"
+do
   [ -s "$required" ] || fail "required file is missing: $required"
 done
 
@@ -452,6 +463,31 @@ grep -F 'rollback_protected' "$runtime" >/dev/null ||
   fail 'protected rollback implementation is missing'
 grep -F 'PROTECTED_MAINTENANCE_ROLLBACK_OK' "$runtime" >/dev/null ||
   fail 'rollback completion gate is missing'
+if grep -F 'bootstrap-production.sh' "$runtime" >/dev/null; then
+  fail 'maintenance rollback still calls general host bootstrap'
+fi
+grep -F '/bin/sh "$context_installer" "$rollback_sha"' "$runtime" >/dev/null ||
+  fail 'rollback does not use the scoped release-context installer'
+grep -F 'capture_protected_storage' "$runtime" >/dev/null ||
+  fail 'protected storage ownership and volume metadata are not captured'
+grep -F -- '--storage-metadata "$snapshot_dir/storage.metadata"' "$runtime" \
+  >/dev/null ||
+  fail 'protected storage metadata is absent from snapshots'
+grep -F 'protected_storage_identity_sha256' "$helper" >/dev/null ||
+  fail 'protected storage identity is absent from the evidence contract'
+grep -F 'protected_storage_metadata_changed' "$helper" >/dev/null ||
+  fail 'protected storage drift does not fail closed'
+promoted_validation_line=$(
+  grep -n -- '--stage promoted' "$runtime" | tail -n 1 | cut -d: -f1
+)
+release_pointer_line=$(
+  grep -n 'write_active_value "$release_sha" "$current_release"' "$runtime" |
+    tail -n 1 |
+    cut -d: -f1
+)
+[ -n "$promoted_validation_line" ] && [ -n "$release_pointer_line" ] &&
+  [ "$promoted_validation_line" -lt "$release_pointer_line" ] ||
+  fail 'candidate release can be marked current before continuity validation'
 grep -F 'sha256sum -c "$(basename -- "$release_checksums")"' "$runtime" >/dev/null ||
   fail 'remote checksum verification is missing before mutation'
 grep -F 'cmp "$state_dir/remote-plan.json" "$plan_file"' "$runtime" >/dev/null ||
@@ -472,7 +508,13 @@ grep -F '"execution_request_created"' "$helper" >/dev/null ||
 grep -F 'optional_services_stopped' "$helper" >/dev/null ||
   fail 'optional-service state is absent from evidence'
 
-for candidate in "$workflow" "$runtime"; do
+for candidate in \
+  "$workflow" \
+  "$runtime" \
+  "$context_installer" \
+  "$launcher" \
+  "$unit_runner"
+do
   if grep -Eiq \
     'docker[[:space:]]+compose[[:space:]]+down|docker[[:space:]]+system[[:space:]]+prune|docker[[:space:]]+volume[[:space:]]+(prune|rm)|nats[^[:space:]]*[[:space:]]+(delete|purge|reset)|jetstream[^[:space:]]*[[:space:]]+(delete|purge|reset)|DROP[[:space:]]+DATABASE|TRUNCATE[[:space:]]|migration[[:space:]_-]*rollback' \
     "$candidate"

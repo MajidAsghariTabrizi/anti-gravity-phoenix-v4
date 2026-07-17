@@ -204,6 +204,12 @@ jobs:
             release-assets/release-assets-checksums.txt \
             "release-assets/phoenix-release-assets-${RELEASE_SHA}.tar.gz" \
             scripts/install-release-assets.sh \
+            scripts/install-production-release-context.sh \
+            scripts/prelive-protected-maintenance.sh \
+            scripts/prelive_protected_maintenance.py \
+            scripts/prelive-protected-maintenance-launch.sh \
+            scripts/prelive-protected-maintenance-unit.sh \
+            scripts/rollback-release.sh \
             "$remote:$remote_stage/"
           ssh "${ssh_opts[@]}" "$remote" sudo /bin/sh -s -- "$ROLLBACK_SHA" <<'REMOTE'
           set -eu
@@ -226,5 +232,5 @@ jobs:
           ssh "${ssh_opts[@]}" "$remote" \
             "sudo install -d -m 0750 -o phoenix -g phoenix /opt/phoenix/deploy/manifests && sudo install -m 0640 -o phoenix -g phoenix '$remote_stage/release-manifest.json' '/opt/phoenix/deploy/manifests/${RELEASE_SHA}.json' && sudo install -m 0640 -o phoenix -g phoenix '$remote_stage/rollback-manifest.json' '/opt/phoenix/deploy/manifests/${ROLLBACK_SHA}.json'"
           ssh "${ssh_opts[@]}" "$remote" \
-            "rm -f '$remote_stage/release-manifest.json' '$remote_stage/rollback-manifest.json' '$remote_stage/release-assets-manifest.json' '$remote_stage/release-assets-checksums.txt' '$remote_stage/phoenix-release-assets-${RELEASE_SHA}.tar.gz' '$remote_stage/install-release-assets.sh' && rmdir '$remote_stage'"
+            "rm -f '$remote_stage/release-manifest.json' '$remote_stage/rollback-manifest.json' '$remote_stage/release-assets-manifest.json' '$remote_stage/release-assets-checksums.txt' '$remote_stage/phoenix-release-assets-${RELEASE_SHA}.tar.gz' '$remote_stage/install-release-assets.sh' '$remote_stage/install-production-release-context.sh' '$remote_stage/prelive-protected-maintenance.sh' '$remote_stage/prelive_protected_maintenance.py' '$remote_stage/prelive-protected-maintenance-launch.sh' '$remote_stage/prelive-protected-maintenance-unit.sh' '$remote_stage/rollback-release.sh' && rmdir '$remote_stage'"
           ssh "${ssh_opts[@]}" "$remote" "sudo /opt/phoenix/deploy/deploy-release.sh '$RELEASE_SHA'"

@@ -64,6 +64,8 @@ jobs:
           python3 -m py_compile scripts/prelive_protected_maintenance.py
           python3 -m unittest scripts.tests.test_prelive_protected_maintenance
           sh ./scripts/prelive-protected-maintenance-tests.sh
+          sh ./scripts/prelive-protected-maintenance-supervisor-tests.sh
+          sh ./scripts/production-bootstrap-safety-tests.sh
 
       - name: Validate tracked hygiene
         shell: bash

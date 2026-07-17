@@ -45,7 +45,7 @@ jobs:
   deploy-prelive-protected-maintenance:
     name: deploy-prelive-protected-maintenance
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
+    timeout-minutes: 60
     environment: production-shadow
     steps:
       - name: Validate protected maintenance request
@@ -335,17 +335,64 @@ jobs:
           case "$port" in *[!0-9]*|"") echo "production port is invalid"; exit 1 ;; esac
           [ "$port" -ge 1 ] && [ "$port" -le 65535 ] || { echo "production port is invalid"; exit 1; }
           remote="${PROD_USER}@${PROD_HOST}"
-          ssh_opts=(-i "$HOME/.ssh/id_ed25519" -p "$port" -o UserKnownHostsFile="$HOME/.ssh/known_hosts" -o StrictHostKeyChecking=yes -o IdentitiesOnly=yes)
-          scp_opts=(-i "$HOME/.ssh/id_ed25519" -P "$port" -o UserKnownHostsFile="$HOME/.ssh/known_hosts" -o StrictHostKeyChecking=yes -o IdentitiesOnly=yes)
+          ssh_opts=(-i "$HOME/.ssh/id_ed25519" -p "$port" -o UserKnownHostsFile="$HOME/.ssh/known_hosts" -o StrictHostKeyChecking=yes -o IdentitiesOnly=yes -o ConnectTimeout=15 -o ConnectionAttempts=1 -o ServerAliveInterval=15 -o ServerAliveCountMax=2)
+          scp_opts=(-i "$HOME/.ssh/id_ed25519" -P "$port" -o UserKnownHostsFile="$HOME/.ssh/known_hosts" -o StrictHostKeyChecking=yes -o IdentitiesOnly=yes -o ConnectTimeout=15 -o ConnectionAttempts=1 -o ServerAliveInterval=15 -o ServerAliveCountMax=2)
+          for numeric_value in "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT"; do
+            case "$numeric_value" in
+              *[!0-9]*|"") echo "GitHub run identity is invalid"; exit 1 ;;
+            esac
+          done
+          unit_name="phoenix-protected-maintenance-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.service"
+
+          remote_exec() {
+            local remote_command=$1
+            local attempt output
+            for attempt in 1 2 3 4 5 6; do
+              if output="$(ssh "${ssh_opts[@]}" "$remote" "$remote_command")"; then
+                printf '%s\n' "$output"
+                return 0
+              fi
+              sleep $((attempt * 5))
+            done
+            return 1
+          }
+
+          remote_to_file() {
+            local remote_command=$1
+            local target=$2
+            local temporary="${target}.partial"
+            local attempt
+            for attempt in 1 2 3 4 5 6; do
+              rm -f "$temporary"
+              if ssh "${ssh_opts[@]}" "$remote" "$remote_command" >"$temporary"; then
+                [ -s "$temporary" ] || return 1
+                mv "$temporary" "$target"
+                return 0
+              fi
+              sleep $((attempt * 5))
+            done
+            rm -f "$temporary"
+            return 1
+          }
+
           remote_stage="$(ssh "${ssh_opts[@]}" "$remote" \
             "mktemp -d '/tmp/phoenix-protected-maintenance-${RELEASE_SHA}.XXXXXX'")"
           case "$remote_stage" in
             "/tmp/phoenix-protected-maintenance-${RELEASE_SHA}."*) ;;
             *) echo "remote maintenance staging path is invalid"; exit 1 ;;
           esac
+          unit_started=0
+          unit_terminal=0
+          preserve_remote=0
           cleanup_remote() {
-            ssh "${ssh_opts[@]}" "$remote" \
-              "rm -f '$remote_stage/release-manifest.json' '$remote_stage/rollback-manifest.json' '$remote_stage/phoenix-release-assets-${RELEASE_SHA}.tar.gz' '$remote_stage/release-assets-manifest.json' '$remote_stage/release-assets-checksums.txt' '$remote_stage/protected-maintenance-plan.json' '$remote_stage/prelive_protected_maintenance.py' '$remote_stage/prelive-protected-maintenance.sh' '$remote_stage/install-release-assets.sh' && rmdir '$remote_stage'" \
+            if [ "$preserve_remote" -eq 1 ] ||
+              { [ "$unit_started" -eq 1 ] && [ "$unit_terminal" -ne 1 ]; }
+            then
+              echo "Remote maintenance state retained for detached-unit recovery: $remote_stage"
+              return
+            fi
+            remote_exec \
+              "sudo rm -f '$remote_stage/release-manifest.json' '$remote_stage/rollback-manifest.json' '$remote_stage/phoenix-release-assets-${RELEASE_SHA}.tar.gz' '$remote_stage/release-assets-manifest.json' '$remote_stage/release-assets-checksums.txt' '$remote_stage/protected-maintenance-plan.json' '$remote_stage/prelive_protected_maintenance.py' '$remote_stage/prelive-protected-maintenance.sh' '$remote_stage/install-release-assets.sh' '$remote_stage/install-production-release-context.sh' '$remote_stage/prelive-protected-maintenance-launch.sh' '$remote_stage/prelive-protected-maintenance-unit.sh' '$remote_stage/rollback-release.sh' '$remote_stage/maintenance.unit' '$remote_stage/maintenance.log' '$remote_stage/maintenance.exit' '$remote_stage/maintenance.result' && sudo rmdir '$remote_stage'" \
               >/dev/null 2>&1 || true
           }
           trap cleanup_remote EXIT
@@ -366,8 +413,138 @@ jobs:
             scripts/prelive_protected_maintenance.py \
             scripts/prelive-protected-maintenance.sh \
             scripts/install-release-assets.sh \
+            scripts/install-production-release-context.sh \
+            scripts/prelive-protected-maintenance-launch.sh \
+            scripts/prelive-protected-maintenance-unit.sh \
+            scripts/rollback-release.sh \
             "$remote:$remote_stage/"
-          ssh "${ssh_opts[@]}" "$remote" \
-            "sudo /bin/sh '$remote_stage/prelive-protected-maintenance.sh' '$RELEASE_SHA' '$ROLLBACK_SHA' '$remote_stage/release-manifest.json' '$remote_stage/rollback-manifest.json' '$remote_stage/phoenix-release-assets-${RELEASE_SHA}.tar.gz' '$remote_stage/release-assets-manifest.json' '$remote_stage/release-assets-checksums.txt' '$remote_stage/protected-maintenance-plan.json'"
+
+          unit_started=1
+          remote_exec \
+            "sudo /bin/sh '$remote_stage/prelive-protected-maintenance-launch.sh' '${unit_name%.service}' '$remote_stage' '$RELEASE_SHA' '$ROLLBACK_SHA' '$remote_stage/release-manifest.json' '$remote_stage/rollback-manifest.json' '$remote_stage/phoenix-release-assets-${RELEASE_SHA}.tar.gz' '$remote_stage/release-assets-manifest.json' '$remote_stage/release-assets-checksums.txt' '$remote_stage/protected-maintenance-plan.json'" \
+            >/dev/null || {
+              echo "detached maintenance launch could not be confirmed"
+              exit 1
+            }
+
+          poll_deadline=$((SECONDS + 2520))
+          terminal_state=
+          while [ "$SECONDS" -lt "$poll_deadline" ]; do
+            if unit_state="$(remote_exec \
+              "sudo systemctl show '$unit_name' --no-pager --property=LoadState --property=ActiveState --property=SubState --property=Result --property=ExecMainStatus")"
+            then
+              load_state="$(printf '%s\n' "$unit_state" | awk -F= '$1 == "LoadState" { print $2 }')"
+              active_state="$(printf '%s\n' "$unit_state" | awk -F= '$1 == "ActiveState" { print $2 }')"
+              sub_state="$(printf '%s\n' "$unit_state" | awk -F= '$1 == "SubState" { print $2 }')"
+              unit_result="$(printf '%s\n' "$unit_state" | awk -F= '$1 == "Result" { print $2 }')"
+              main_status="$(printf '%s\n' "$unit_state" | awk -F= '$1 == "ExecMainStatus" { print $2 }')"
+              if [ "$load_state:$active_state:$sub_state:$unit_result:$main_status" = \
+                "loaded:active:exited:success:0" ]
+              then
+                terminal_state=success
+                break
+              fi
+              case "$active_state" in
+                failed|inactive)
+                  terminal_state=failure
+                  break
+                  ;;
+              esac
+            fi
+            sleep 10
+          done
+
+          [ -n "$terminal_state" ] || {
+            echo "detached maintenance unit did not reach a terminal state"
+            exit 1
+          }
+          unit_terminal=1
+          printf '%s\n' "$unit_state" > protected-maintenance-unit-status.txt
+          remote_to_file \
+            "sudo cat '$remote_stage/maintenance.log'" \
+            protected-maintenance.log || {
+              preserve_remote=1
+              echo "detached maintenance log is unavailable"
+              exit 1
+            }
+          remote_to_file \
+            "sudo journalctl --unit '$unit_name' --no-pager --output=short-iso" \
+            protected-maintenance-journal.txt || true
+          remote_to_file \
+            "sudo cat '$remote_stage/maintenance.exit'" \
+            protected-maintenance.exit || {
+              preserve_remote=1
+              echo "detached maintenance exit evidence is unavailable"
+              exit 1
+            }
+
+          if [ "$terminal_state" != success ] ||
+            [ "$(tr -d '\r\n' < protected-maintenance.exit)" != 0 ]
+          then
+            preserve_remote=1
+            echo "detached maintenance failed; rollback and unit evidence were retained"
+            exit 1
+          fi
+
+          remote_to_file \
+            "sudo cat '$remote_stage/maintenance.result'" \
+            protected-maintenance.result || {
+              preserve_remote=1
+              echo "successful maintenance result evidence is unavailable"
+              exit 1
+            }
+          result_line="$(tr -d '\r\n' < protected-maintenance.result)"
+          expected_prefix="PROTECTED_MAINTENANCE_OK: release=${RELEASE_SHA} rollback=${ROLLBACK_SHA} evidence="
+          case "$result_line" in
+            "$expected_prefix"*) ;;
+            *)
+              preserve_remote=1
+              echo "maintenance result does not match the reviewed release pair"
+              exit 1
+              ;;
+          esac
+          evidence_dir="${result_line#"$expected_prefix"}"
+          printf '%s' "$evidence_dir" |
+            grep -Eq '^/opt/phoenix/evidence/protected-maintenance/[A-Za-z0-9][A-Za-z0-9._-]*$' || {
+              preserve_remote=1
+              echo "maintenance evidence path is invalid"
+              exit 1
+            }
+          evidence_name="${evidence_dir##*/}"
+          remote_to_file \
+            "sudo tar -C '/opt/phoenix/evidence/protected-maintenance' -czf - -- '$evidence_name'" \
+            protected-maintenance-evidence.tar.gz || {
+              preserve_remote=1
+              echo "final protected-maintenance evidence could not be retrieved"
+              exit 1
+            }
+          tar -tzf protected-maintenance-evidence.tar.gz >/dev/null
+          sha256sum \
+            protected-maintenance-unit-status.txt \
+            protected-maintenance.log \
+            protected-maintenance.exit \
+            protected-maintenance.result \
+            protected-maintenance-evidence.tar.gz \
+            > protected-maintenance-runner-checksums.txt
+
+          remote_exec \
+            "sudo systemctl stop '$unit_name'" \
+            >/dev/null
           cleanup_remote
           trap - EXIT
+
+      - name: Upload protected maintenance evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: protected-maintenance-evidence-${{ inputs.release_sha }}-${{ github.run_id }}
+          path: |
+            protected-maintenance-unit-status.txt
+            protected-maintenance.log
+            protected-maintenance-journal.txt
+            protected-maintenance.exit
+            protected-maintenance.result
+            protected-maintenance-evidence.tar.gz
+            protected-maintenance-runner-checksums.txt
+          if-no-files-found: error
+          retention-days: 30

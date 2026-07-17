@@ -98,7 +98,8 @@ On the host, optional services must already be stopped. Feed Ingestor is
 quiesced first so Recorder can drain `PHOENIX_RECORDER` to zero pending and
 ACK-pending messages. Recorder is then replaced and health-checked before Feed
 Ingestor is replaced and health-checked. PostgreSQL, NATS, Nitro Relay,
-networks, mounts, streams, and durable consumers must retain their identities.
+networks, mounts, streams, durable consumers, PostgreSQL owner/group/mode
+evidence, and NATS volume metadata must retain their identities.
 Only after live Feed and Recorder progress is proven does the gate install and
 promote the exact v3 release context. Optional containers remain stopped and
 unchanged for the later controlled SHADOW startup.
@@ -106,8 +107,15 @@ unchanged for the later controlled SHADOW startup.
 Any failed mutation invokes the same bounded sequence with exact v2
 Feed Ingestor and Recorder digests, restores the v2 immutable release context,
 and re-runs health, identity, progress, and zero-execution checks. Evidence is
-retained under `/opt/phoenix/evidence/protected-maintenance`. This workflow has
-no automatic trigger and must not be dispatched as part of repository release
+retained under `/opt/phoenix/evidence/protected-maintenance`.
+
+The remote operation runs in a bounded transient systemd oneshot unit with a
+stable GitHub run identity. SSH launches and polls the unit but does not own its
+lifetime, so transport loss cannot send HUP or initiate rollback. Actual unit
+or maintenance failure still invokes automatic rollback. Completion requires
+the exact unit status, exit file, result line, log, and bounded evidence archive
+to be retrieved. Incomplete evidence fails the workflow. This workflow has no
+automatic trigger and must not be dispatched as part of repository release
 preparation.
 
 ## LIVE Gate

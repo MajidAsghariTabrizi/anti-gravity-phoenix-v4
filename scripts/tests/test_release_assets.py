@@ -56,6 +56,10 @@ class ReleaseAssetsTests(unittest.TestCase):
             self.assertIn("scripts/prelive-shadow-control.sh", paths)
             self.assertIn("scripts/prelive-protected-maintenance.sh", paths)
             self.assertIn("scripts/prelive_protected_maintenance.py", paths)
+            self.assertIn("scripts/provision-production-host.sh", paths)
+            self.assertIn("scripts/install-production-release-context.sh", paths)
+            self.assertIn("scripts/prelive-protected-maintenance-launch.sh", paths)
+            self.assertIn("scripts/prelive-protected-maintenance-unit.sh", paths)
             self.assertTrue(
                 all(
                     item["size_bytes"] <= release_assets.MAX_FILE_BYTES

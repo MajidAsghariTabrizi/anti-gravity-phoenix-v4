@@ -21,6 +21,7 @@ evidence_root=$deploy_root/evidence/protected-maintenance
 script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 helper=$script_dir/prelive_protected_maintenance.py
 installer=$script_dir/install-release-assets.sh
+context_installer=$script_dir/install-production-release-context.sh
 
 protected_services='nitro-feed-relay feed-ingestor nats postgres recorder'
 optional_services='migration-runner prometheus rpc-gateway shadow-dispatcher phoenix-engine dashboard'
@@ -59,12 +60,13 @@ for maintenance_file in \
   "$plan_file" \
   "$helper" \
   "$installer" \
+  "$context_installer" \
   "$compose_file" \
   "$env_file"
 do
   [ -s "$maintenance_file" ] || fail "required maintenance file is missing"
 done
-for maintenance_command in python3 docker cmp df awk grep install mktemp sha256sum; do
+for maintenance_command in python3 docker cmp df awk grep install mktemp sha256sum stat; do
   command -v "$maintenance_command" >/dev/null 2>&1 ||
     fail "required command is unavailable: $maintenance_command"
 done
@@ -236,6 +238,72 @@ capture_metrics() (
   [ -s "$metrics_output" ]
 )
 
+capture_protected_storage() (
+  storage_release_env=$1
+  storage_output=$2
+
+  postgres_id=$(container_id "$storage_release_env" postgres) || exit 1
+  postgres_mount=$(docker inspect --format \
+    '{{range .Mounts}}{{if eq .Destination "/var/lib/postgresql/data"}}{{.Type}}|{{.Source}}|{{.RW}}{{"\n"}}{{end}}{{end}}' \
+    "$postgres_id") || exit 1
+  [ "$(printf '%s\n' "$postgres_mount" | awk 'NF { count += 1 } END { print count + 0 }')" -eq 1 ] ||
+    exit 1
+  old_ifs=$IFS
+  IFS='|' read -r postgres_mount_type postgres_source postgres_rw <<EOF
+$postgres_mount
+EOF
+  IFS=$old_ifs
+  [ "$postgres_mount_type" = bind ] || exit 1
+  [ "$postgres_source" = "$deploy_root/data/postgres" ] || exit 1
+  [ "$postgres_rw" = true ] || exit 1
+  [ -d "$postgres_source" ] && [ ! -L "$postgres_source" ] || exit 1
+
+  nats_id=$(container_id "$storage_release_env" nats) || exit 1
+  nats_mount=$(docker inspect --format \
+    '{{range .Mounts}}{{if eq .Destination "/data/jetstream"}}{{.Type}}|{{.Name}}|{{.RW}}{{"\n"}}{{end}}{{end}}' \
+    "$nats_id") || exit 1
+  [ "$(printf '%s\n' "$nats_mount" | awk 'NF { count += 1 } END { print count + 0 }')" -eq 1 ] ||
+    exit 1
+  IFS='|' read -r nats_mount_type nats_volume nats_rw <<EOF
+$nats_mount
+EOF
+  IFS=$old_ifs
+  [ "$nats_mount_type" = volume ] || exit 1
+  [ -n "$nats_volume" ] || exit 1
+  [ "$nats_rw" = true ] || exit 1
+  nats_volume_metadata=$(docker volume inspect --format \
+    '{{.Name}}|{{.Driver}}|{{.Scope}}|{{.Mountpoint}}|{{json .Labels}}|{{json .Options}}' \
+    "$nats_volume") || exit 1
+  nats_mountpoint=$(docker volume inspect --format '{{.Mountpoint}}' "$nats_volume") ||
+    exit 1
+  [ -d "$nats_mountpoint" ] && [ ! -L "$nats_mountpoint" ] || exit 1
+
+  {
+    printf 'postgres-mount|%s|%s|%s\n' \
+      "$postgres_mount_type" "$postgres_source" "$postgres_rw"
+    for storage_path in \
+      . \
+      PG_VERSION \
+      base \
+      global \
+      pg_wal \
+      global/pg_control \
+      global/pg_filenode.map \
+      postmaster.pid
+    do
+      storage_target=$postgres_source
+      [ "$storage_path" = . ] || storage_target=$postgres_source/$storage_path
+      [ -e "$storage_target" ] && [ ! -L "$storage_target" ] || exit 1
+      printf 'postgres-path|%s|%s\n' \
+        "$storage_path" "$(stat -c '%u|%g|%f' "$storage_target")"
+    done
+    printf 'nats-volume|%s\n' "$nats_volume_metadata"
+    printf 'nats-mountpoint|%s\n' \
+      "$(stat -c '%u|%g|%f' "$nats_mountpoint")"
+  } >"$storage_output"
+  [ -s "$storage_output" ]
+)
+
 capture_snapshot() (
   snapshot_phase=$1
   snapshot_sha=$2
@@ -266,6 +334,8 @@ capture_snapshot() (
   capture_metrics \
     "$snapshot_release_env" recorder 9400 "$snapshot_dir/recorder.metrics" ||
     exit 1
+  capture_protected_storage \
+    "$snapshot_release_env" "$snapshot_dir/storage.metadata" || exit 1
   snapshot_disk_free=$(df -Pk "$deploy_root" | awk 'NR == 2 { printf "%.0f\n", $4 * 1024 }')
   case "$snapshot_disk_free" in
     ''|*[!0-9]*) exit 1 ;;
@@ -277,6 +347,7 @@ capture_snapshot() (
     --feed-metrics "$snapshot_dir/feed.metrics" \
     --recorder-metrics "$snapshot_dir/recorder.metrics" \
     --safety "$state_dir/safety.json" \
+    --storage-metadata "$snapshot_dir/storage.metadata" \
     --disk-free-bytes "$snapshot_disk_free" \
     --output "$snapshot_output" >/dev/null
 )
@@ -356,7 +427,9 @@ write_active_value() (
 )
 
 restore_release_context() {
-  "$release_root/$rollback_sha/scripts/bootstrap-production.sh" "$rollback_sha" ||
+  PHOENIX_DEPLOY_ROOT="$deploy_root" \
+  PHOENIX_ENV_FILE="$env_file" \
+    /bin/sh "$context_installer" "$rollback_sha" "$release_root/$rollback_sha" ||
     return 1
   install_active_file \
     "$state_dir/backup/current-release.env" "$deploy_dir/current-release.env" 0640 ||
@@ -471,7 +544,7 @@ for current_file in \
   "$asset_marker" \
   "$rollback_host_manifest" \
   "$rollback_tree/release-assets-manifest.json" \
-  "$rollback_tree/scripts/bootstrap-production.sh"
+  "$rollback_tree/compose.prod.yml"
 do
   [ -s "$current_file" ] || fail 'current canonical release state is incomplete'
 done
@@ -688,7 +761,11 @@ install -m 0640 -o phoenix -g phoenix \
   "$release_manifest" "$deploy_dir/manifests/$release_sha.json"
 install -m 0640 -o phoenix -g phoenix \
   "$rollback_manifest" "$deploy_dir/manifests/$rollback_sha.json"
-/bin/sh "$installer" \
+PHOENIX_RELEASE_ROOT="$release_root" \
+PHOENIX_DEPLOY_ROOT="$deploy_root" \
+PHOENIX_ENV_FILE="$env_file" \
+PHOENIX_CONTEXT_INSTALLER="$context_installer" \
+  /bin/sh "$installer" \
   "$release_sha" "$release_archive" "$release_assets_manifest" "$release_checksums" ||
   fail 'candidate immutable release assets could not be installed'
 

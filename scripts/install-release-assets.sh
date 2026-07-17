@@ -7,6 +7,8 @@ archive=${2:-}
 manifest=${3:-}
 checksums=${4:-}
 release_root=${PHOENIX_RELEASE_ROOT:-/opt/phoenix/releases}
+script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
+context_installer=${PHOENIX_CONTEXT_INSTALLER:-$script_dir/install-production-release-context.sh}
 
 fail() {
   echo "RELEASE_ASSET_INSTALL_FAILED: $1" >&2
@@ -27,6 +29,8 @@ command -v tar >/dev/null 2>&1 || fail 'tar is unavailable'
 command -v sha256sum >/dev/null 2>&1 || fail 'sha256sum is unavailable'
 command -v cmp >/dev/null 2>&1 || fail 'cmp is unavailable'
 command -v readlink >/dev/null 2>&1 || fail 'readlink is unavailable'
+[ -f "$context_installer" ] && [ ! -L "$context_installer" ] ||
+  fail 'release-context installer is missing or unsafe'
 
 archive=$(readlink -f "$archive") || fail 'release archive path is invalid'
 manifest=$(readlink -f "$manifest") || fail 'release-assets manifest path is invalid'
@@ -100,7 +104,8 @@ python3 "$final_root/scripts/release_assets.py" verify-tree \
   --manifest "$manifest" \
   --expected-sha "$release_sha" >/dev/null || fail 'immutable release tree verification failed'
 
-"$final_root/scripts/bootstrap-production.sh" "$release_sha" || fail 'canonical production asset installation failed'
+/bin/sh "$context_installer" "$release_sha" "$final_root" ||
+  fail 'canonical release-context installation failed'
 trap - EXIT HUP INT TERM
 rm -rf -- "$candidate"
 echo "RELEASE_ASSET_INSTALL_OK: $release_sha"

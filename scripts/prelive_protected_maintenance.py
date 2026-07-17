@@ -16,8 +16,8 @@ from typing import Any
 
 
 PLAN_SCHEMA = "phoenix.protected-maintenance-plan.v1"
-SNAPSHOT_SCHEMA = "phoenix.protected-maintenance-snapshot.v1"
-CONTEXT_SCHEMA = "phoenix.protected-maintenance-context.v1"
+SNAPSHOT_SCHEMA = "phoenix.protected-maintenance-snapshot.v2"
+CONTEXT_SCHEMA = "phoenix.protected-maintenance-context.v2"
 RELEASE_SCHEMA = "phoenix.release.v1"
 ASSET_SCHEMA = "phoenix.release-assets.v1"
 
@@ -132,6 +132,7 @@ IMAGE_RE = re.compile(r"^[^\s@]+@sha256:[0-9a-f]{64}$")
 SAFE_NAME_RE = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
 INTEGER_METRIC_RE = re.compile(r"^(?:0|[1-9][0-9]*)(?:\.0+)?$")
 MAX_JSON_BYTES = 4 * 1024 * 1024
+MAX_STORAGE_METADATA_BYTES = 64 * 1024
 MIN_DISK_FREE_BYTES = 5 * 1024 * 1024 * 1024
 MAX_RECORDER_PENDING = 100_000
 MAX_ACK_PENDING = 1_024
@@ -183,6 +184,18 @@ def canonical_bytes(value: Any) -> bytes:
 
 def sha256_value(value: Any) -> str:
     return f"sha256:{hashlib.sha256(canonical_bytes(value)).hexdigest()}"
+
+
+def sha256_file(path: Path) -> str:
+    if not path.is_file() or path.is_symlink():
+        _fail("protected_storage_evidence_missing")
+    try:
+        raw = path.read_bytes()
+    except OSError:
+        _fail("protected_storage_evidence_missing")
+    if not raw or len(raw) > MAX_STORAGE_METADATA_BYTES:
+        _fail("protected_storage_evidence_invalid")
+    return f"sha256:{hashlib.sha256(raw).hexdigest()}"
 
 
 def write_atomic(path: Path, value: Any, mode: int = 0o640) -> None:
@@ -784,6 +797,7 @@ def build_snapshot(
     feed_metrics_path: Path,
     recorder_metrics_path: Path,
     safety_path: Path,
+    storage_metadata_path: Path,
     disk_free_bytes: int,
 ) -> dict[str, Any]:
     if phase not in {
@@ -829,6 +843,7 @@ def build_snapshot(
             "recorder": parse_metrics(recorder_metrics_path, RECORDER_METRICS),
         },
         "safety": normalize_safety(load_json(safety_path)),
+        "protected_storage_identity_sha256": sha256_file(storage_metadata_path),
     }
 
 
@@ -846,6 +861,7 @@ def validate_snapshot(value: Any) -> dict[str, Any]:
             "database",
             "metrics",
             "safety",
+            "protected_storage_identity_sha256",
         },
         "snapshot_invalid",
     )
@@ -866,6 +882,11 @@ def validate_snapshot(value: Any) -> dict[str, Any]:
         _fail("snapshot_invalid")
     _timestamp(snapshot["observed_at"])
     _count(snapshot["disk_free_bytes"])
+    _text(
+        snapshot["protected_storage_identity_sha256"],
+        DIGEST_RE,
+        "snapshot_invalid",
+    )
     services = snapshot["services"]
     if not isinstance(services, dict) or set(services) != set(PROTECTED_SERVICES):
         _fail("snapshot_invalid")
@@ -1012,6 +1033,11 @@ def _assert_continuity(
         _fail("disk_headroom_insufficient")
     if current["database"]["migrations"] != baseline["database"]["migrations"]:
         _fail("migration_state_changed")
+    if (
+        current["protected_storage_identity_sha256"]
+        != baseline["protected_storage_identity_sha256"]
+    ):
+        _fail("protected_storage_metadata_changed")
     _assert_no_execution(baseline)
     _assert_no_execution(current)
 
@@ -1234,6 +1260,9 @@ def build_context(
             service: snapshot["services"][service]["container_id"]
             for service in FIXED_SERVICES
         },
+        "protected_storage_identity_sha256": snapshot[
+            "protected_storage_identity_sha256"
+        ],
         "optional_services_stopped": True,
         "execution_eligible": False,
         "execution_request_created": False,
@@ -1295,6 +1324,7 @@ def command_snapshot(args: argparse.Namespace) -> None:
         Path(args.feed_metrics),
         Path(args.recorder_metrics),
         Path(args.safety),
+        Path(args.storage_metadata),
         disk_free_bytes,
     )
     write_atomic(Path(args.output), value)
@@ -1378,6 +1408,7 @@ def parser() -> argparse.ArgumentParser:
     snapshot.add_argument("--feed-metrics", required=True)
     snapshot.add_argument("--recorder-metrics", required=True)
     snapshot.add_argument("--safety", required=True)
+    snapshot.add_argument("--storage-metadata", required=True)
     snapshot.add_argument("--disk-free-bytes", required=True)
     snapshot.add_argument("--output", required=True)
     snapshot.set_defaults(handler=command_snapshot)

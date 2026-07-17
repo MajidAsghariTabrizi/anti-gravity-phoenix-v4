@@ -242,6 +242,7 @@ class ProtectedMaintenanceTests(unittest.TestCase):
             "database": database(100, 1000),
             "metrics": metrics(1000, 100),
             "safety": safety(),
+            "protected_storage_identity_sha256": digest(802),
         }
 
     def candidate_start(self) -> dict:
@@ -377,6 +378,14 @@ class ProtectedMaintenanceTests(unittest.TestCase):
         maintenance.validate_transition(
             self.plan, baseline, recorder_stage, "recorder", None
         )
+        recorder_storage_drift = json.loads(json.dumps(recorder_stage))
+        recorder_storage_drift["protected_storage_identity_sha256"] = digest(998)
+        with self.assertRaisesRegex(
+            maintenance.MaintenanceError, "protected_storage_metadata_changed"
+        ):
+            maintenance.validate_transition(
+                self.plan, baseline, recorder_storage_drift, "recorder", None
+            )
         maintenance.validate_transition(
             self.plan,
             baseline,
@@ -384,6 +393,19 @@ class ProtectedMaintenanceTests(unittest.TestCase):
             "final",
             self.candidate_start(),
         )
+
+        changed_storage = self.candidate_final()
+        changed_storage["protected_storage_identity_sha256"] = digest(999)
+        with self.assertRaisesRegex(
+            maintenance.MaintenanceError, "protected_storage_metadata_changed"
+        ):
+            maintenance.validate_transition(
+                self.plan,
+                baseline,
+                changed_storage,
+                "final",
+                self.candidate_start(),
+            )
 
     def test_fixed_identity_mount_and_execution_drift_fail(self) -> None:
         baseline = self.baseline()
@@ -430,6 +452,15 @@ class ProtectedMaintenanceTests(unittest.TestCase):
         maintenance.validate_transition(
             self.plan, baseline, final, "rollback", start
         )
+
+        changed_storage = json.loads(json.dumps(final))
+        changed_storage["protected_storage_identity_sha256"] = digest(999)
+        with self.assertRaisesRegex(
+            maintenance.MaintenanceError, "protected_storage_metadata_changed"
+        ):
+            maintenance.validate_transition(
+                self.plan, baseline, changed_storage, "rollback", start
+            )
 
         wrong = json.loads(json.dumps(final))
         wrong["services"]["recorder"]["configured_image"] = self.plan["images"][
@@ -617,6 +648,12 @@ class ProtectedMaintenanceTests(unittest.TestCase):
             ),
             encoding="utf-8",
         )
+        storage_metadata = self.root / "storage.metadata"
+        storage_metadata.write_text(
+            "postgres-path|.|999|999|41c0\n"
+            "nats-volume|phoenix-nats-jetstream|local|local\n",
+            encoding="ascii",
+        )
         snapshot = maintenance.build_snapshot(
             "pre",
             ROLLBACK_SHA,
@@ -626,12 +663,22 @@ class ProtectedMaintenanceTests(unittest.TestCase):
             feed_metrics,
             recorder_metrics,
             safety_path,
+            storage_metadata,
             maintenance.MIN_DISK_FREE_BYTES * 2,
         )
         serialized = json.dumps(snapshot)
         self.assertNotIn("/secret/host/path", serialized)
         self.assertIn("identity_sha256", serialized)
+        self.assertIn("protected_storage_identity_sha256", snapshot)
         maintenance.validate_snapshot(snapshot)
+
+    def test_incomplete_storage_evidence_blocks_snapshot_validation(self) -> None:
+        snapshot = self.baseline()
+        snapshot.pop("protected_storage_identity_sha256")
+        with self.assertRaisesRegex(
+            maintenance.MaintenanceError, "snapshot_invalid"
+        ):
+            maintenance.validate_snapshot(snapshot)
 
     def test_context_is_truthful_and_non_executing(self) -> None:
         metadata = {
@@ -646,6 +693,9 @@ class ProtectedMaintenanceTests(unittest.TestCase):
         self.assertTrue(context["optional_services_stopped"])
         self.assertFalse(context["execution_eligible"])
         self.assertFalse(context["execution_request_created"])
+        self.assertEqual(
+            context["protected_storage_identity_sha256"], digest(802)
+        )
 
 
 if __name__ == "__main__":

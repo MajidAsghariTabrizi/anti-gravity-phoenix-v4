@@ -1,8 +1,8 @@
 #!/usr/bin/env sh
 set -eu
 
-script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
-repo_dir=$(CDPATH= cd -- "$script_dir/.." && pwd)
+script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
+repo_dir=$(CDPATH='' cd -- "$script_dir/.." && pwd)
 renderer=$script_dir/render-production-compose.sh
 context_validator=$script_dir/validate-production-release-context.sh
 helper=$script_dir/production_context.py
@@ -442,8 +442,9 @@ for installed_script in \
   snapshot_model.py \
   arbitrum_uniswap_v3_pool_proofs.json
 do
-  grep -F "$installed_script" "$script_dir/bootstrap-production.sh" >/dev/null ||
-    fail "bootstrap does not install $installed_script"
+  grep -F "$installed_script" \
+    "$script_dir/install-production-release-context.sh" >/dev/null ||
+    fail "release-context installer does not install $installed_script"
 done
 
 sh "$script_dir/validate-production-env-tests.sh" >/dev/null || fail "production env validator tests failed"
