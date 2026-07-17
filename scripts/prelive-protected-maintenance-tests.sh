@@ -496,6 +496,26 @@ grep -F 'compose_with "$rollback_env" up -d --no-deps recorder' "$runtime" >/dev
   fail 'rollback does not restore exact v2 Recorder'
 grep -F 'compose_with "$rollback_env" up -d --no-deps feed-ingestor' "$runtime" >/dev/null ||
   fail 'rollback does not restore exact v2 Feed Ingestor'
+grep -F 'database["max_feed_sequence"] <= database_start["max_feed_sequence"]' \
+  "$helper" >/dev/null ||
+  fail 'database progress is not compared with its progress baseline'
+grep -F 'database["max_feed_sequence"] < baseline["database"]["max_feed_sequence"]' \
+  "$helper" >/dev/null ||
+  fail 'database sequence regression is not rejected'
+if grep -F 'max_feed_sequence"] < recorder["recorder_last_persisted_feed_sequence"]' \
+  "$helper" >/dev/null
+then
+  fail 'cross-source same-snapshot database/Recorder comparison remains'
+fi
+grep -F '[ "$timeout_stage" != final ] || timeout_role=candidate' "$runtime" \
+  >/dev/null ||
+  fail 'final-stage timeout evidence is not identified as candidate evidence'
+grep -F '$timeout_role-progress-timeout-snapshot.json' "$runtime" >/dev/null ||
+  fail 'candidate and rollback timeout snapshots are not retained'
+grep -F 'last_validate_transition_error_code' "$runtime" >/dev/null ||
+  fail 'last transition-validation error is not retained'
+grep -F 'PROTECTED_MAINTENANCE_PROGRESS_TIMEOUT:' "$runtime" >/dev/null ||
+  fail 'exact progress-timeout diagnostic is not logged'
 
 grep -F '"execution_attempts"' "$helper" >/dev/null ||
   fail 'execution-attempt validation is missing'
@@ -507,6 +527,139 @@ grep -F '"execution_request_created"' "$helper" >/dev/null ||
   fail 'execution-request validation is missing'
 grep -F 'optional_services_stopped' "$helper" >/dev/null ||
   fail 'optional-service state is absent from evidence'
+
+progress_fixture=$tmp_dir/progress-timeout-fixture
+progress_bin=$progress_fixture/bin
+progress_state=$progress_fixture/state
+progress_evidence=$progress_fixture/evidence
+progress_functions=$progress_fixture/progress-functions.sh
+progress_harness=$progress_fixture/progress-harness.sh
+mkdir -p "$progress_bin" "$progress_state" "$progress_evidence"
+awk '
+  /^read_validation_error_code\(\) \(/ {
+    copy = 1
+  }
+  /^install_active_file\(\) \(/ {
+    copy = 0
+  }
+  copy {
+    print
+  }
+' "$runtime" >"$progress_functions"
+[ -s "$progress_functions" ] ||
+  fail 'progress timeout functions could not be extracted'
+
+cat >"$progress_bin/date" <<'SH'
+#!/usr/bin/env sh
+set -eu
+count=$(cat "$PROGRESS_DATE_STATE")
+case "$count" in
+  0|1) now=100 ;;
+  *) now=101 ;;
+esac
+printf '%s\n' "$((count + 1))" >"$PROGRESS_DATE_STATE"
+printf '%s\n' "$now"
+SH
+cat >"$progress_bin/sleep" <<'SH'
+#!/usr/bin/env sh
+exit 0
+SH
+cat >"$progress_bin/install" <<'SH'
+#!/usr/bin/env sh
+set -eu
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    -m|-o|-g) shift 2 ;;
+    *) break ;;
+  esac
+done
+[ "$#" -eq 2 ]
+cp "$1" "$2"
+SH
+cat >"$progress_bin/python3" <<'SH'
+#!/usr/bin/env sh
+set -eu
+[ "$#" -ge 2 ]
+[ "$2" = validate-transition ]
+printf '{"code":"%s","status":"error"}\n' "$PROGRESS_ERROR_CODE" >&2
+exit 1
+SH
+chmod +x \
+  "$progress_bin/date" \
+  "$progress_bin/sleep" \
+  "$progress_bin/install" \
+  "$progress_bin/python3"
+
+cat >"$progress_harness" <<'SH'
+#!/usr/bin/env sh
+set -eu
+. "$PROGRESS_FUNCTIONS"
+
+capture_snapshot() {
+  printf '{"phase":"%s"}\n' "$1" >"$4"
+}
+
+progress_stage=$1
+if wait_for_progress \
+  "$progress_stage" \
+  1111111111111111111111111111111111111111 \
+  "$PROGRESS_STATE/release.env" \
+  "$PROGRESS_STATE/progress-baseline.json" \
+  "$PROGRESS_STATE/progress-output.json"
+then
+  exit 0
+fi
+exit 1
+SH
+chmod +x "$progress_harness"
+: >"$progress_state/pre.json"
+: >"$progress_state/progress-baseline.json"
+: >"$progress_state/release.env"
+: >"$progress_state/helper.py"
+: >"$progress_state/plan.json"
+
+run_progress_timeout_fixture() {
+  progress_stage=$1
+  progress_role=$2
+  progress_code=$3
+  progress_date_state=$progress_fixture/$progress_stage-date.state
+  progress_log=$progress_fixture/$progress_stage-maintenance.log
+  printf '0\n' >"$progress_date_state"
+  if PATH="$progress_bin:$PATH" \
+    PROGRESS_DATE_STATE="$progress_date_state" \
+    PROGRESS_ERROR_CODE="$progress_code" \
+    PROGRESS_FUNCTIONS="$progress_functions" \
+    PROGRESS_STATE="$progress_state" \
+    state_dir="$progress_state" \
+    evidence_dir="$progress_evidence" \
+    helper="$progress_state/helper.py" \
+    plan_file="$progress_state/plan.json" \
+    progress_wait_seconds=1 \
+    sh "$progress_harness" "$progress_stage" \
+    >"$progress_fixture/$progress_stage.stdout" 2>"$progress_log"
+  then
+    fail "$progress_stage timeout fixture unexpectedly succeeded"
+  fi
+  [ -s "$progress_evidence/$progress_role-progress-timeout-snapshot.json" ] ||
+    fail "$progress_stage final candidate snapshot was not retained"
+  diagnostic=$progress_evidence/$progress_role-progress-timeout-diagnostic.json
+  [ -s "$diagnostic" ] ||
+    fail "$progress_stage timeout diagnostic was not retained"
+  grep -F "\"failed_predicate\":\"$progress_code\"" "$diagnostic" >/dev/null ||
+    fail "$progress_stage diagnostic omitted the exact failed predicate"
+  grep -F "\"last_validate_transition_error_code\":\"$progress_code\"" \
+    "$diagnostic" >/dev/null ||
+    fail "$progress_stage diagnostic omitted the last validation error code"
+  grep -F \
+    "PROTECTED_MAINTENANCE_PROGRESS_TIMEOUT: stage=$progress_stage failed_predicate=$progress_code last_validate_transition_error_code=$progress_code" \
+    "$progress_log" >/dev/null ||
+    fail "$progress_stage maintenance log omitted the exact timeout reason"
+}
+
+run_progress_timeout_fixture \
+  final candidate database_feed_sequence_not_progressing
+run_progress_timeout_fixture \
+  rollback rollback feed_publish_not_progressing
 
 for candidate in \
   "$workflow" \

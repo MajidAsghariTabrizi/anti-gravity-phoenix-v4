@@ -373,31 +373,96 @@ wait_recorder_drain() (
   exit 1
 )
 
+read_validation_error_code() (
+  validation_error=$1
+  awk -F '"' '
+    NR == 1 && $2 == "code" && $4 ~ /^[a-z][a-z0-9_]*$/ {
+      print $4
+      found = 1
+      exit
+    }
+    END {
+      if (!found) {
+        exit 1
+      }
+    }
+  ' "$validation_error"
+)
+
+preserve_progress_timeout() (
+  timeout_stage=$1
+  timeout_candidate=$2
+  timeout_failed_predicate=$3
+  timeout_validation_code=$4
+  timeout_role=$timeout_stage
+  [ "$timeout_stage" != final ] || timeout_role=candidate
+  timeout_snapshot=$evidence_dir/$timeout_role-progress-timeout-snapshot.json
+  timeout_diagnostic=$state_dir/$timeout_role-progress-timeout-diagnostic.json
+
+  if [ -s "$timeout_candidate" ]; then
+    install -m 0640 -o root -g phoenix \
+      "$timeout_candidate" "$timeout_snapshot" ||
+      echo "PROTECTED_MAINTENANCE_PROGRESS_EVIDENCE_FAILED: stage=$timeout_stage artifact=snapshot" >&2
+  fi
+  printf \
+    '{"failed_predicate":"%s","last_validate_transition_error_code":"%s","stage":"%s","status":"timeout"}\n' \
+    "$timeout_failed_predicate" "$timeout_validation_code" "$timeout_stage" \
+    >"$timeout_diagnostic"
+  install -m 0640 -o root -g phoenix \
+    "$timeout_diagnostic" \
+    "$evidence_dir/$timeout_role-progress-timeout-diagnostic.json" ||
+    echo "PROTECTED_MAINTENANCE_PROGRESS_EVIDENCE_FAILED: stage=$timeout_stage artifact=diagnostic" >&2
+  echo \
+    "PROTECTED_MAINTENANCE_PROGRESS_TIMEOUT: stage=$timeout_stage failed_predicate=$timeout_failed_predicate last_validate_transition_error_code=$timeout_validation_code" \
+    >&2
+)
+
 wait_for_progress() (
   progress_stage=$1
   progress_sha=$2
   progress_release_env=$3
   progress_baseline=$4
   progress_output=$5
+  case "$progress_stage" in
+    final|rollback) ;;
+    *) exit 1 ;;
+  esac
   progress_phase=$progress_stage
   [ "$progress_stage" != rollback ] || progress_phase=rollback-final
   progress_deadline=$(( $(date +%s) + progress_wait_seconds ))
   progress_candidate=$state_dir/progress-$progress_stage.json
+  progress_validation_error=$state_dir/progress-$progress_stage.error.json
+  progress_failed_predicate=snapshot_capture_failed
+  progress_validation_code=not_run
   while [ "$(date +%s)" -lt "$progress_deadline" ]; do
     if capture_snapshot \
-      "$progress_phase" "$progress_sha" "$progress_release_env" "$progress_candidate" &&
-      python3 "$helper" validate-transition \
+      "$progress_phase" "$progress_sha" "$progress_release_env" "$progress_candidate"
+    then
+      if python3 "$helper" validate-transition \
         --plan "$plan_file" \
         --baseline "$state_dir/pre.json" \
         --current "$progress_candidate" \
         --stage "$progress_stage" \
-        --progress-baseline "$progress_baseline" >/dev/null 2>&1
-    then
-      cp "$progress_candidate" "$progress_output"
-      exit 0
+        --progress-baseline "$progress_baseline" \
+        >/dev/null 2>"$progress_validation_error"
+      then
+        cp "$progress_candidate" "$progress_output"
+        exit 0
+      fi
+      progress_validation_code=$(
+        read_validation_error_code "$progress_validation_error"
+      ) || progress_validation_code=transition_validation_error_unparseable
+      progress_failed_predicate=$progress_validation_code
+    else
+      progress_failed_predicate=snapshot_capture_failed
     fi
     sleep 3
   done
+  preserve_progress_timeout \
+    "$progress_stage" \
+    "$progress_candidate" \
+    "$progress_failed_predicate" \
+    "$progress_validation_code"
   exit 1
 )
 
