@@ -55,11 +55,24 @@ sudo sh scripts/install-release-assets.sh \
 
 The installer rejects unbounded, non-canonical, linked, traversing, or
 checksum-mismatched content, retains the immutable source under
-`/opt/phoenix/releases/<release-sha>`, and invokes bootstrap with the exact
-release SHA. Deployment remains blocked until
+`/opt/phoenix/releases/<release-sha>`, and invokes the scoped
+`install-production-release-context.sh` operation with the exact release SHA
+and verified release tree. It never invokes general host provisioning.
+Deployment remains blocked until
 `/opt/phoenix/deploy/release-assets.sha` matches the candidate release.
 
-The bootstrap script validates Linux, Ubuntu compatibility, amd64 architecture, Docker Engine, Docker Compose plugin, production directories, `/etc/phoenix/phoenix.env` ownership and permissions, and required environment variable shape. It installs Compose, the bounded NATS JetStream server configuration, Prometheus, deployment/control scripts, report schemas, route proofs, and the compiled contract artifact into `/opt/phoenix/deploy`. When given a release SHA, it promotes the asset marker last.
+The bootstrap script is only for first-host preparation. It validates Linux,
+Ubuntu compatibility, amd64 architecture, Docker Engine, and Docker Compose,
+then delegates persistent-directory creation to
+`provision-production-host.sh`. Existing directories are never chowned or
+chmodded. A non-empty PostgreSQL directory must contain a regular `PG_VERSION`,
+must not be group- or world-writable, and must have consistent ownership across
+the directory and critical PostgreSQL files; unsafe ownership fails closed.
+
+Release-context installation separately updates only canonical files under
+`/opt/phoenix/deploy`, validates `/etc/phoenix/phoenix.env`, and promotes the
+asset marker last. It does not access PostgreSQL data, JetStream storage, or any
+protected volume.
 
 It does not request the Ethereum signer key. It does not start LIVE.
 

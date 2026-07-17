@@ -33,12 +33,15 @@ manifest="$deploy_dir/manifests/$release_sha.json"
 release_env="$deploy_dir/manifests/$release_sha.env"
 release_metadata="$deploy_dir/manifests/$release_sha.render.json"
 release_state="$deploy_dir/manifests/$release_sha.state.json"
+context_installer="$deploy_dir/install-production-release-context.sh"
 [ -f "$manifest" ] || fail "release manifest is missing"
 [ -f "$compose_file" ] || fail "production compose file is missing"
 [ -f "$env_file" ] || fail "production environment file is missing"
 [ -d "$release_assets_root" ] || fail "immutable rollback release assets are missing"
 [ -f "$release_assets_root/release-assets-manifest.json" ] ||
   fail "rollback release-assets manifest is missing"
+[ -f "$context_installer" ] && [ ! -L "$context_installer" ] ||
+  fail "release-context installer is missing or unsafe"
 case "$service_wait_seconds" in
   ''|*[!0-9]*) fail "service wait seconds must be an integer" ;;
 esac
@@ -52,7 +55,9 @@ python3 "$deploy_dir/release_assets.py" verify-tree \
   --manifest "$release_assets_root/release-assets-manifest.json" \
   --expected-sha "$release_sha" >/dev/null ||
   fail "immutable rollback release assets failed integrity validation"
-"$release_assets_root/scripts/bootstrap-production.sh" "$release_sha" ||
+PHOENIX_DEPLOY_ROOT="$deploy_root" \
+PHOENIX_ENV_FILE="$env_file" \
+  /bin/sh "$context_installer" "$release_sha" "$release_assets_root" ||
   fail "rollback release assets could not be restored"
 [ -s "$deploy_dir/release-assets.sha" ] || fail "rollback release-assets marker is missing"
 installed_assets_sha=$(tr -d '\r\n' <"$deploy_dir/release-assets.sha")

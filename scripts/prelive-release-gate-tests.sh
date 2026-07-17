@@ -1,14 +1,16 @@
 #!/usr/bin/env sh
 set -eu
 
-script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
-repo_root=$(CDPATH= cd -- "$script_dir/.." && pwd)
+script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
+repo_root=$(CDPATH='' cd -- "$script_dir/.." && pwd)
 deploy_workflow=$repo_root/.github/workflows/deploy-shadow.yml
 build_workflow=$repo_root/.github/workflows/build-images.yml
 deploy_script=$script_dir/deploy-release.sh
 rollback_script=$script_dir/rollback-release.sh
 installer=$script_dir/install-release-assets.sh
 bootstrap=$script_dir/bootstrap-production.sh
+context_installer=$script_dir/install-production-release-context.sh
+provisioner=$script_dir/provision-production-host.sh
 
 fail() {
   echo "prelive-release-gate-tests: $1" >&2
@@ -36,6 +38,8 @@ grep -F 'asset_sha=$(tr -d' "$deploy_workflow" >/dev/null ||
   fail 'active rollback release-assets identity is not checked before installation'
 grep -F 'release_assets.py verify-tree' "$deploy_workflow" >/dev/null ||
   fail 'active rollback release-assets integrity is not checked before installation'
+grep -F 'scripts/install-production-release-context.sh' "$deploy_workflow" >/dev/null ||
+  fail 'deployment does not stage the scoped release-context installer'
 if grep -E 'SIGNER_PRIVATE_KEY|WALLET_ADDRESS|EXECUTOR_ADDRESS|eth_send(Raw)?Transaction' "$deploy_workflow" >/dev/null; then
   fail 'deployment workflow contains forbidden LIVE configuration or submission methods'
 fi
@@ -70,16 +74,32 @@ grep -F 'immutable rollback release assets failed integrity validation' "$rollba
   fail 'rollback does not validate its immutable release-assets tree'
 grep -F 'rollback release assets could not be restored' "$rollback_script" >/dev/null ||
   fail 'rollback does not restore its exact release assets'
+if grep -F 'bootstrap-production.sh' "$rollback_script" >/dev/null; then
+  fail 'rollback still invokes general host bootstrap'
+fi
+grep -F '/bin/sh "$context_installer" "$release_sha" "$release_assets_root"' \
+  "$rollback_script" >/dev/null ||
+  fail 'rollback does not use the scoped release-context installer'
 
 grep -F 'not member.isfile()' "$installer" >/dev/null ||
   fail 'release installer does not reject non-file archive members'
 grep -F 'release_assets.py" verify' "$installer" >/dev/null ||
   fail 'release installer does not run the canonical verifier'
-grep -F 'bootstrap-production.sh" "$release_sha"' "$installer" >/dev/null ||
-  fail 'release installer does not bind bootstrap to the exact SHA'
+grep -F '/bin/sh "$context_installer" "$release_sha" "$final_root"' "$installer" \
+  >/dev/null ||
+  fail 'release installer does not bind scoped context installation to the exact tree'
+if grep -F 'bootstrap-production.sh' "$installer" >/dev/null; then
+  fail 'release installer still invokes general host bootstrap'
+fi
+grep -F 'provision-production-host.sh' "$bootstrap" >/dev/null ||
+  fail 'bootstrap does not separate first-host provisioning'
+grep -F 'install-production-release-context.sh' "$bootstrap" >/dev/null ||
+  fail 'bootstrap does not separate release-context installation'
+grep -F 'validate_existing_postgres' "$provisioner" >/dev/null ||
+  fail 'first-host provisioning lacks fail-closed PostgreSQL ownership validation'
 
-validation_line=$(grep -n 'validate-production-env.sh" /etc/phoenix/phoenix.env' "$bootstrap" | tail -n 1 | cut -d: -f1)
-marker_line=$(grep -n 'mv "$marker" /opt/phoenix/deploy/release-assets.sha' "$bootstrap" | cut -d: -f1)
+validation_line=$(grep -n 'validate-production-env.sh" "$env_file"' "$context_installer" | tail -n 1 | cut -d: -f1)
+marker_line=$(grep -n 'mv "$marker" "$deploy_dir/release-assets.sha"' "$context_installer" | cut -d: -f1)
 [ -n "$validation_line" ] && [ -n "$marker_line" ] && [ "$marker_line" -gt "$validation_line" ] ||
   fail 'release-assets marker is not promoted after production validation'
 

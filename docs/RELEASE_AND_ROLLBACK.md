@@ -47,9 +47,11 @@ non-canonical JSON, checksum drift, and extracted-tree drift fail closed.
 
 `install-release-assets.sh` verifies the archive before extraction, promotes
 it under `/opt/phoenix/releases/<sha>`, verifies the immutable extracted tree,
-and invokes bootstrap with that exact SHA. Bootstrap installs canonical host
-assets and promotes `/opt/phoenix/deploy/release-assets.sha` only after the
-production environment and Docker tooling validate.
+and invokes the narrowly scoped release-context installer with that exact SHA
+and tree. The installer updates canonical files under `/opt/phoenix/deploy`
+and promotes `/opt/phoenix/deploy/release-assets.sha` only after the production
+environment and Docker tooling validate. It never invokes host provisioning or
+changes persistent-data ownership or permissions.
 
 ## Canonical Production Context
 
@@ -173,15 +175,25 @@ Any failure after mutation automatically restores only Feed Ingestor and
 Recorder with exact v2 digests, restores the immutable v2 release context, and
 repeats the same continuity, progress, and zero-execution checks. PostgreSQL,
 NATS, Nitro Relay, networks, volumes, streams, and consumers are never
-recreated by this path.
+recreated by this path. Every snapshot also hashes stable PostgreSQL
+owner/group/mode evidence and NATS volume metadata; any missing or changed
+storage identity blocks release promotion.
+
+The workflow starts maintenance as a bounded transient systemd oneshot unit.
+The SSH session only launches and polls the unit. An SSH reset or HUP cannot
+signal the maintenance process and therefore cannot trigger rollback.
+Internal maintenance failures still trigger automatic rollback. The workflow
+accepts completion only after the unit result, exit status, log, and bounded
+host evidence bundle are retrieved.
 
 ## Host Migration
 
 Before the first release using this contract, install the merged exact-SHA
 bundle with `install-release-assets.sh`. A direct bootstrap from a trusted
 checkout remains available for initial host preparation, but deployment is
-blocked until bootstrap receives the exact release SHA and promotes the asset
-marker.
+blocked until the scoped release-context installer receives the exact release
+SHA and promotes the asset marker. Bootstrap must not be used as a release or
+rollback restore operation.
 Do not copy generated release state into a source checkout. Existing manifests
 remain compatible; their digest env is regenerated with an added
 `PHOENIX_RELEASE_SHA` field. Existing plain `current-release` and
