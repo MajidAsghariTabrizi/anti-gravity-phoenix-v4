@@ -192,13 +192,13 @@ sudo env \
 snapshot_metadata "$after"
 cmp "$before" "$after" >/dev/null ||
   fail 'first-host provisioning changed existing protected metadata or contents'
-[ "$(stat -c '%u:%g:%a' "$prometheus_dir")" = 65534:65534:750 ] ||
+[ "$(sudo stat -c '%u:%g:%a' "$prometheus_dir")" = 65534:65534:750 ] ||
   fail 'Prometheus data directory runtime ownership or mode is incorrect'
-[ "$(stat -c '%u:%g:%a' "$prometheus_dir/chunks")" = 65534:65534:750 ] ||
+[ "$(sudo stat -c '%u:%g:%a' "$prometheus_dir/chunks")" = 65534:65534:750 ] ||
   fail 'nested Prometheus directory runtime ownership or mode is incorrect'
-[ "$(stat -c '%u:%g:%a' "$prometheus_payload")" = 65534:65534:640 ] ||
+[ "$(sudo stat -c '%u:%g:%a' "$prometheus_payload")" = 65534:65534:640 ] ||
   fail 'Prometheus data file runtime ownership or mode is incorrect'
-[ "$prometheus_payload_sha" = "$(sha256sum "$prometheus_payload")" ] ||
+[ "$prometheus_payload_sha" = "$(sudo sha256sum "$prometheus_payload")" ] ||
   fail 'Prometheus provisioning changed existing data contents'
 sudo -u '#65534' -g '#65534' /bin/sh -c \
   ': >"$1/.runtime-write-probe" && rm -f -- "$1/.runtime-write-probe"' \
@@ -230,7 +230,7 @@ chmod 0755 "$host_root/deploy" "$host_root/deploy/prometheus"
 sudo -u '#65534' -g '#65534' test -r "$prometheus_config" ||
   fail 'mode 0644 Prometheus configuration is unreadable by the runtime identity'
 chmod 0750 "$host_root/deploy" "$host_root/deploy/prometheus"
-[ "$prometheus_payload_sha" = "$(sha256sum "$prometheus_payload")" ] ||
+[ "$prometheus_payload_sha" = "$(sudo sha256sum "$prometheus_payload")" ] ||
   fail 'release-context installation changed Prometheus data contents'
 
 compose_target=$host_root/deploy/compose.prod.yml
@@ -261,9 +261,9 @@ sudo env \
 snapshot_metadata "$after"
 cmp "$before" "$after" >/dev/null ||
   fail 'idempotent bootstrap changed protected metadata or contents'
-[ "$(stat -c '%u:%g:%a' "$prometheus_payload")" = 65534:65534:640 ] ||
+[ "$(sudo stat -c '%u:%g:%a' "$prometheus_payload")" = 65534:65534:640 ] ||
   fail 'idempotent bootstrap changed the Prometheus runtime contract'
-[ "$prometheus_payload_sha" = "$(sha256sum "$prometheus_payload")" ] ||
+[ "$prometheus_payload_sha" = "$(sudo sha256sum "$prometheus_payload")" ] ||
   fail 'idempotent bootstrap changed Prometheus data contents'
 
 rollback_sha=2222222222222222222222222222222222222222
