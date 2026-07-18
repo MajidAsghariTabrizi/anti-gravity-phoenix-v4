@@ -113,7 +113,7 @@ install_source \
   "$source_root/deploy/nats-server.conf" "$deploy_dir/nats-server.conf" 0644
 install_source \
   "$source_root/prometheus/prometheus.yml" \
-  "$deploy_dir/prometheus/prometheus.yml" 0640
+  "$deploy_dir/prometheus/prometheus.yml" 0644
 install_source \
   "$source_root/dashboard/snapshot_model.py" "$deploy_dir/snapshot_model.py" 0640
 install_source \

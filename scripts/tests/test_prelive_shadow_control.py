@@ -15,9 +15,11 @@ from unittest import mock
 
 REPO = Path(__file__).resolve().parents[2]
 SCRIPTS = REPO / "scripts"
+sys.path.insert(0, str(REPO))
 sys.path.insert(0, str(SCRIPTS))
 
 import prelive_shadow_control as control  # noqa: E402
+from dashboard import snapshot_model as dashboard_model  # noqa: E402
 
 
 FIXTURE = REPO / "fixtures" / "control-plane" / "valid-evidence.json"
@@ -154,6 +156,45 @@ class EvidenceTests(unittest.TestCase):
         value["artifacts"].append(deepcopy(value["artifacts"][0]))
         self.assert_code("duplicate_identity", value)
 
+    def test_unknown_artifact_identifies_exact_field_and_kind(self) -> None:
+        value = deepcopy(self.evidence)
+        value["artifacts"][0]["kind"] = "future_simulation_report"
+        self.assert_code(
+            "artifact_kind_invalid:artifacts.kind:future_simulation_report",
+            value,
+        )
+
+    def test_unsafe_artifact_kind_is_rejected_without_echoing_value(self) -> None:
+        for unsafe_kind in (
+            "https://private.invalid/report",
+            "WALLET_ADDRESS",
+        ):
+            with self.subTest(unsafe_kind=unsafe_kind):
+                value = deepcopy(self.evidence)
+                value["artifacts"][0]["kind"] = unsafe_kind
+                with self.assertRaises(control.ControlEvidenceError) as raised:
+                    control.validate_evidence(value)
+                self.assertEqual(
+                    raised.exception.code,
+                    "artifact_kind_invalid:artifacts.kind",
+                )
+                self.assertNotIn(unsafe_kind, raised.exception.code)
+
+    def test_unsafe_artifact_path_is_rejected(self) -> None:
+        value = deepcopy(self.evidence)
+        value["artifacts"][0]["path"] = "../technical.json"
+        self.assert_code("evidence_shape_invalid", value)
+
+    def test_oversized_artifact_is_rejected(self) -> None:
+        value = deepcopy(self.evidence)
+        value["artifacts"][0]["size_bytes"] = control.MAX_INPUT_BYTES + 1
+        self.assert_code("evidence_shape_invalid", value)
+
+    def test_malformed_artifact_is_rejected(self) -> None:
+        value = deepcopy(self.evidence)
+        del value["artifacts"][0]["sha256"]
+        self.assert_code("evidence_shape_invalid", value)
+
     def test_duplicate_json_key_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "duplicate.json"
@@ -196,6 +237,146 @@ class EvidenceTests(unittest.TestCase):
         self.assertEqual(
             schema["properties"]["schema_version"]["const"], control.EVIDENCE_SCHEMA
         )
+
+    def test_fork_report_is_canonical_across_contracts_and_fixture(self) -> None:
+        schema = json.loads(
+            (REPO / "schemas" / "prelive-shadow-control-evidence.schema.json").read_text()
+        )
+        schema_kinds = schema["$defs"]["artifact"]["properties"]["kind"]["enum"]
+        fixture_kinds = {row["kind"] for row in self.evidence["artifacts"]}
+        self.assertEqual(schema_kinds, sorted(control.ARTIFACT_KINDS))
+        self.assertIn("fork_simulation_report", dashboard_model.ARTIFACT_KINDS)
+        self.assertIn("fork_simulation_report", fixture_kinds)
+
+    def test_final_assembly_accepts_dashboard_fork_simulation_report(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            release = self.evidence["release"]
+            metadata = {
+                "schema": "phoenix.production-render.v1",
+                "status": "ok",
+                "mode": "SHADOW",
+                "live_execution": False,
+                "release_sha": release["git_sha"],
+                "route_registry_hash": release["route_registry_hash"],
+                "images": {
+                    row["service"]: (
+                        f"ghcr.io/phoenix/{row['service']}@{row['digest']}"
+                    )
+                    for row in release["images"]
+                },
+            }
+            identity = {
+                "schema_version": control.PROTECTED_IDENTITY_SCHEMA,
+                "services": [],
+                "jetstream_sha256": "sha256:" + "a" * 64,
+                "fingerprint_sha256": "sha256:" + "b" * 64,
+            }
+            sample_safety = {
+                key: nested
+                for key, nested in self.evidence["safety"].items()
+                if key
+                not in {
+                    "execution_request_count_before",
+                    "execution_request_count_after",
+                }
+            }
+            samples = []
+            for observed_at, database_size, errors in (
+                (self.evidence["started_at"], "1000", []),
+                (
+                    self.evidence["ended_at"],
+                    "1200",
+                    self.evidence["bounded_errors"],
+                ),
+            ):
+                metrics = deepcopy(self.evidence["metrics"])
+                metrics["database"] = {"size_bytes": database_size}
+                samples.append(
+                    {
+                        "schema_version": control.SAMPLE_SCHEMA,
+                        "observed_at": observed_at,
+                        "safety": sample_safety,
+                        "funnels": self.evidence["funnels"],
+                        "metrics": metrics,
+                        "bounded_errors": errors,
+                    }
+                )
+
+            json_inputs = {
+                "release-metadata.json": metadata,
+                "identity-before.json": identity,
+                "identity-after.json": identity,
+                "states-before.json": self.evidence["service_states"]["before"],
+                "states-during.json": self.evidence["service_states"]["during"],
+                "states-after.json": self.evidence["service_states"]["after"],
+                "artifacts.json": self.evidence["artifacts"],
+            }
+            for filename, payload in json_inputs.items():
+                (root / filename).write_bytes(control.canonical_bytes(payload))
+            (root / "release-manifest.json").write_text('{"release":"bounded"}\n')
+            (root / "release-checksum.txt").write_text("bounded-checksum\n")
+            (root / "preflight.tsv").write_text(
+                "".join(
+                    f"{row['check']}\t{row['status']}\t{row['observed_at']}\n"
+                    for row in self.evidence["preflight"]
+                )
+            )
+            (root / "samples.ndjson").write_bytes(
+                b"".join(control.canonical_bytes(sample) for sample in samples)
+            )
+            output = root / "evidence.json"
+            command = [
+                sys.executable,
+                str(SCRIPTS / "prelive_shadow_control.py"),
+                "assemble-evidence",
+                "--mode",
+                "15m",
+                "--status",
+                "completed",
+                "--started-at",
+                self.evidence["started_at"],
+                "--ended-at",
+                self.evidence["ended_at"],
+                "--database-clock-baseline",
+                self.evidence["database_clock"]["preflight_baseline"],
+                "--execution-request-count-before",
+                "0",
+                "--execution-request-count-after",
+                "0",
+                "--release-metadata",
+                str(root / "release-metadata.json"),
+                "--release-manifest",
+                str(root / "release-manifest.json"),
+                "--release-checksum",
+                str(root / "release-checksum.txt"),
+                "--preflight",
+                str(root / "preflight.tsv"),
+                "--identity-before",
+                str(root / "identity-before.json"),
+                "--identity-after",
+                str(root / "identity-after.json"),
+                "--states-before",
+                str(root / "states-before.json"),
+                "--states-during",
+                str(root / "states-during.json"),
+                "--states-after",
+                str(root / "states-after.json"),
+                "--samples",
+                str(root / "samples.ndjson"),
+                "--artifacts",
+                str(root / "artifacts.json"),
+                "--output",
+                str(output),
+            ]
+            result = subprocess.run(command, capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            assembled = control.load_json(output)
+            self.assertEqual(assembled["status"], "completed")
+            self.assertIn(
+                "fork_simulation_report",
+                {row["kind"] for row in assembled["artifacts"]},
+            )
 
 
 class RuntimeNormalizationTests(unittest.TestCase):

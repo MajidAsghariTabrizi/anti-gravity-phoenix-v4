@@ -1,4 +1,6 @@
 #!/usr/bin/env sh
+# Literal contract patterns must retain their dollar signs.
+# shellcheck disable=SC2016
 set -eu
 
 script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
@@ -9,6 +11,7 @@ context_installer=$script_dir/install-production-release-context.sh
 release_installer=$script_dir/install-release-assets.sh
 maintenance=$script_dir/prelive-protected-maintenance.sh
 rollback=$script_dir/rollback-release.sh
+compose_file=$repo_root/compose.prod.yml
 
 fail() {
   echo "production-bootstrap-safety-tests: $1" >&2
@@ -54,6 +57,14 @@ if grep -E 'chown[[:space:]]+-R[^#]*/opt/phoenix/data|chmod[[:space:]]+-R[^#]*/o
 then
   fail 'a release or maintenance script recursively mutates protected data'
 fi
+grep -F 'user: "65534:65534"' "$compose_file" >/dev/null ||
+  fail 'Prometheus runtime UID/GID is not explicit in production Compose'
+grep -F '"$deploy_dir/prometheus/prometheus.yml" 0644' "$context_installer" >/dev/null ||
+  fail 'installed Prometheus configuration is not mode 0644'
+grep -F 'prometheus_runtime_uid=65534' "$provisioner" >/dev/null ||
+  fail 'Prometheus provisioning UID is not explicit'
+grep -F 'prometheus_runtime_gid=65534' "$provisioner" >/dev/null ||
+  fail 'Prometheus provisioning GID is not explicit'
 
 if [ "$(uname -s)" != Linux ] ||
   ! command -v sudo >/dev/null 2>&1 ||
@@ -83,11 +94,14 @@ owner_group=$(id -gn)
 host_root=$tmp_dir/host
 postgres_dir=$host_root/data/postgres
 nats_fixture=$host_root/data/nats-jetstream-volume
+prometheus_dir=$host_root/data/prometheus
+prometheus_payload=$prometheus_dir/chunks/fixture.block
 mkdir -p \
   "$postgres_dir/base/16384" \
   "$postgres_dir/global" \
   "$postgres_dir/pg_wal" \
-  "$nats_fixture/messages"
+  "$nats_fixture/messages" \
+  "$prometheus_dir/chunks"
 printf '16\n' >"$postgres_dir/PG_VERSION"
 printf 'control\n' >"$postgres_dir/global/pg_control"
 printf 'filenode\n' >"$postgres_dir/global/pg_filenode.map"
@@ -96,6 +110,8 @@ printf 'fsm\n' >"$postgres_dir/base/16384/fixture_fsm"
 printf 'jetstream\n' >"$nats_fixture/messages/fixture.blk"
 printf 'phoenix_nats_jetstream|local|local|fixture-labels|fixture-options\n' \
   >"$nats_fixture/volume.metadata"
+printf 'preserved-prometheus-block\n' >"$prometheus_payload"
+chmod 0755 "$tmp_dir" "$host_root" "$host_root/data"
 chmod 0700 "$postgres_dir"
 chmod 0710 "$postgres_dir/base" "$postgres_dir/base/16384"
 chmod 0750 "$postgres_dir/global" "$postgres_dir/pg_wal"
@@ -106,9 +122,12 @@ chmod 0600 \
   "$postgres_dir/postmaster.pid" \
   "$postgres_dir/base/16384/fixture_fsm"
 chmod 0750 "$nats_fixture" "$nats_fixture/messages"
+chmod 0750 "$prometheus_dir" "$prometheus_dir/chunks"
 chmod 0640 \
   "$nats_fixture/messages/fixture.blk" \
-  "$nats_fixture/volume.metadata"
+  "$nats_fixture/volume.metadata" \
+  "$prometheus_payload"
+prometheus_payload_sha=$(sha256sum "$prometheus_payload")
 
 valid_env=$tmp_dir/phoenix.env
 cat >"$valid_env" <<'ENV'
@@ -162,6 +181,9 @@ before=$tmp_dir/protected.before
 after=$tmp_dir/protected.after
 snapshot_metadata "$before"
 
+if sudo -u '#65534' -g '#65534' test -w "$prometheus_dir"; then
+  fail 'Prometheus fixture unexpectedly started writable by the runtime identity'
+fi
 sudo env \
   PHOENIX_DEPLOY_ROOT="$host_root" \
   PHOENIX_OWNER_USER="$owner_user" \
@@ -170,7 +192,29 @@ sudo env \
 snapshot_metadata "$after"
 cmp "$before" "$after" >/dev/null ||
   fail 'first-host provisioning changed existing protected metadata or contents'
+[ "$(sudo stat -c '%u:%g:%a' "$prometheus_dir")" = 65534:65534:750 ] ||
+  fail 'Prometheus data directory runtime ownership or mode is incorrect'
+[ "$(sudo stat -c '%u:%g:%a' "$prometheus_dir/chunks")" = 65534:65534:750 ] ||
+  fail 'nested Prometheus directory runtime ownership or mode is incorrect'
+[ "$(sudo stat -c '%u:%g:%a' "$prometheus_payload")" = 65534:65534:640 ] ||
+  fail 'Prometheus data file runtime ownership or mode is incorrect'
+[ "$prometheus_payload_sha" = "$(sudo sha256sum "$prometheus_payload")" ] ||
+  fail 'Prometheus provisioning changed existing data contents'
+sudo -u '#65534' -g '#65534' /bin/sh -c \
+  ': >"$1/.runtime-write-probe" && rm -f -- "$1/.runtime-write-probe"' \
+  sh "$prometheus_dir" ||
+  fail 'Prometheus data directory is not writable by the runtime identity'
 
+prometheus_config=$host_root/deploy/prometheus/prometheus.yml
+mkdir -p "$host_root/deploy/prometheus"
+printf 'stale-unreadable-config\n' >"$prometheus_config"
+chmod 0755 "$host_root/deploy" "$host_root/deploy/prometheus"
+chmod 0640 "$prometheus_config"
+[ "$(stat -c '%a' "$prometheus_config")" = 640 ] ||
+  fail 'Prometheus configuration regression fixture is not mode 0640'
+if sudo -u '#65534' -g '#65534' test -r "$prometheus_config"; then
+  fail 'mode 0640 Prometheus configuration fixture is unexpectedly readable'
+fi
 sudo env \
   PHOENIX_DEPLOY_ROOT="$host_root" \
   PHOENIX_ENV_FILE="$valid_env" \
@@ -180,6 +224,14 @@ sudo env \
 snapshot_metadata "$after"
 cmp "$before" "$after" >/dev/null ||
   fail 'release-context installation changed protected metadata or contents'
+[ "$(stat -c '%a' "$prometheus_config")" = 644 ] ||
+  fail 'installed Prometheus configuration is not mode 0644'
+chmod 0755 "$host_root/deploy" "$host_root/deploy/prometheus"
+sudo -u '#65534' -g '#65534' test -r "$prometheus_config" ||
+  fail 'mode 0644 Prometheus configuration is unreadable by the runtime identity'
+chmod 0750 "$host_root/deploy" "$host_root/deploy/prometheus"
+[ "$prometheus_payload_sha" = "$(sudo sha256sum "$prometheus_payload")" ] ||
+  fail 'release-context installation changed Prometheus data contents'
 
 compose_target=$host_root/deploy/compose.prod.yml
 compose_backup=$tmp_dir/compose.prod.yml.backup
@@ -209,6 +261,10 @@ sudo env \
 snapshot_metadata "$after"
 cmp "$before" "$after" >/dev/null ||
   fail 'idempotent bootstrap changed protected metadata or contents'
+[ "$(sudo stat -c '%u:%g:%a' "$prometheus_payload")" = 65534:65534:640 ] ||
+  fail 'idempotent bootstrap changed the Prometheus runtime contract'
+[ "$prometheus_payload_sha" = "$(sudo sha256sum "$prometheus_payload")" ] ||
+  fail 'idempotent bootstrap changed Prometheus data contents'
 
 rollback_sha=2222222222222222222222222222222222222222
 rollback_asset_dir=$tmp_dir/rollback-assets
@@ -311,6 +367,78 @@ fi
 snapshot_metadata "$after"
 cmp "$before" "$after" >/dev/null ||
   fail 'failure-triggered rollback changed protected metadata or contents'
+
+outside_prometheus=$tmp_dir/outside-prometheus
+mkdir -p "$outside_prometheus"
+printf 'outside-marker\n' >"$outside_prometheus/marker"
+outside_prometheus_state=$(stat -c '%u:%g:%a' "$outside_prometheus/marker")
+outside_prometheus_sha=$(sha256sum "$outside_prometheus/marker")
+
+unsafe_prometheus_root=$tmp_dir/unsafe-prometheus-host
+mkdir -p "$unsafe_prometheus_root/data"
+ln -s "$outside_prometheus" "$unsafe_prometheus_root/data/prometheus"
+if sudo env \
+  PHOENIX_DEPLOY_ROOT="$unsafe_prometheus_root" \
+  PHOENIX_OWNER_USER="$owner_user" \
+  PHOENIX_OWNER_GROUP="$owner_group" \
+  /bin/sh "$provisioner" >/dev/null 2>&1
+then
+  fail 'Prometheus data symlink was accepted'
+fi
+[ "$outside_prometheus_state" = "$(stat -c '%u:%g:%a' "$outside_prometheus/marker")" ] &&
+  [ "$outside_prometheus_sha" = "$(sha256sum "$outside_prometheus/marker")" ] ||
+  fail 'Prometheus data symlink changed an outside path'
+
+nested_prometheus_root=$tmp_dir/nested-prometheus-host
+mkdir -p "$nested_prometheus_root/data/prometheus"
+ln -s "$outside_prometheus/marker" \
+  "$nested_prometheus_root/data/prometheus/linked-marker"
+nested_prometheus_state=$(
+  stat -c '%u:%g:%a' "$nested_prometheus_root/data/prometheus"
+)
+if sudo env \
+  PHOENIX_DEPLOY_ROOT="$nested_prometheus_root" \
+  PHOENIX_OWNER_USER="$owner_user" \
+  PHOENIX_OWNER_GROUP="$owner_group" \
+  /bin/sh "$provisioner" >/dev/null 2>&1
+then
+  fail 'nested Prometheus data symlink was accepted'
+fi
+[ "$nested_prometheus_state" = "$(
+  stat -c '%u:%g:%a' "$nested_prometheus_root/data/prometheus"
+)" ] ||
+  fail 'nested Prometheus symlink failure partially changed the data directory'
+[ "$outside_prometheus_state" = "$(stat -c '%u:%g:%a' "$outside_prometheus/marker")" ] &&
+  [ "$outside_prometheus_sha" = "$(sha256sum "$outside_prometheus/marker")" ] ||
+  fail 'nested Prometheus data symlink changed an outside path'
+
+linked_prometheus_root=$tmp_dir/linked-prometheus-host
+mkdir -p "$linked_prometheus_root/data/prometheus"
+ln "$outside_prometheus/marker" \
+  "$linked_prometheus_root/data/prometheus/hard-linked-marker"
+if sudo env \
+  PHOENIX_DEPLOY_ROOT="$linked_prometheus_root" \
+  PHOENIX_OWNER_USER="$owner_user" \
+  PHOENIX_OWNER_GROUP="$owner_group" \
+  /bin/sh "$provisioner" >/dev/null 2>&1
+then
+  fail 'hard-linked Prometheus data file was accepted'
+fi
+[ "$outside_prometheus_state" = "$(stat -c '%u:%g:%a' "$outside_prometheus/marker")" ] &&
+  [ "$outside_prometheus_sha" = "$(sha256sum "$outside_prometheus/marker")" ] ||
+  fail 'Prometheus hard-link failure changed an outside path'
+
+file_prometheus_root=$tmp_dir/file-prometheus-host
+mkdir -p "$file_prometheus_root/data"
+printf 'not-a-directory\n' >"$file_prometheus_root/data/prometheus"
+if sudo env \
+  PHOENIX_DEPLOY_ROOT="$file_prometheus_root" \
+  PHOENIX_OWNER_USER="$owner_user" \
+  PHOENIX_OWNER_GROUP="$owner_group" \
+  /bin/sh "$provisioner" >/dev/null 2>&1
+then
+  fail 'non-directory Prometheus data path was accepted'
+fi
 
 unsafe_root=$tmp_dir/unsafe-host
 mkdir -p "$unsafe_root/data/postgres"

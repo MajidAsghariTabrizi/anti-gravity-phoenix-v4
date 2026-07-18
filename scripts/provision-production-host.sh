@@ -6,6 +6,9 @@ deploy_root=${PHOENIX_DEPLOY_ROOT:-/opt/phoenix}
 owner_user=${PHOENIX_OWNER_USER:-phoenix}
 owner_group=${PHOENIX_OWNER_GROUP:-phoenix}
 postgres_dir=$deploy_root/data/postgres
+prometheus_dir=$deploy_root/data/prometheus
+prometheus_runtime_uid=65534
+prometheus_runtime_gid=65534
 
 fail() {
   echo "PRODUCTION_PROVISION_FAILED: $1" >&2
@@ -19,7 +22,7 @@ case "$deploy_root" in
   *) fail 'deployment root must be absolute' ;;
 esac
 id "$owner_user" >/dev/null 2>&1 || fail 'production owner user is unavailable'
-for command_name in find install stat; do
+for command_name in chown chmod find install stat; do
   command -v "$command_name" >/dev/null 2>&1 ||
     fail "required command is unavailable: $command_name"
 done
@@ -37,6 +40,70 @@ ensure_directory() {
   fi
   install -d -m "$provision_mode" -o "$owner_user" -g "$owner_group" \
     "$provision_path"
+}
+
+provision_prometheus_directory() {
+  if [ -L "$prometheus_dir" ]; then
+    fail "Prometheus data path must not be a symlink: $prometheus_dir"
+  fi
+  if [ -e "$prometheus_dir" ]; then
+    [ -d "$prometheus_dir" ] ||
+      fail "Prometheus data path is not a directory: $prometheus_dir"
+  else
+    install -d -m 0750 \
+      -o "$prometheus_runtime_uid" -g "$prometheus_runtime_gid" \
+      "$prometheus_dir"
+  fi
+
+  unsafe_entry=$(find "$prometheus_dir" -xdev -type l -print -quit)
+  [ -z "$unsafe_entry" ] ||
+    fail 'Prometheus data directory must not contain symlinks'
+  unsafe_entry=$(
+    find "$prometheus_dir" -xdev -type f -links +1 -print -quit
+  )
+  [ -z "$unsafe_entry" ] ||
+    fail 'Prometheus data directory must not contain hard-linked files'
+  unsafe_entry=$(
+    find "$prometheus_dir" -xdev ! -type d ! -type f -print -quit
+  )
+  [ -z "$unsafe_entry" ] ||
+    fail 'Prometheus data directory contains an unsupported file type'
+
+  prometheus_device=$(stat -c '%d' "$prometheus_dir") ||
+    fail 'Prometheus data device identity is unavailable'
+  if ! find "$prometheus_dir" -xdev -mindepth 1 -exec sh -c '
+    expected_device=$1
+    shift
+    for candidate; do
+      [ "$(stat -c "%d" "$candidate")" = "$expected_device" ] || exit 1
+    done
+  ' sh "$prometheus_device" {} +
+  then
+    fail 'Prometheus data directory must not contain nested mounts'
+  fi
+
+  find "$prometheus_dir" -xdev \
+    -exec chown "$prometheus_runtime_uid:$prometheus_runtime_gid" {} +
+  find "$prometheus_dir" -xdev -type d -exec chmod 0750 {} +
+  find "$prometheus_dir" -xdev -type f -exec chmod 0640 {} +
+
+  unsafe_entry=$(
+    find "$prometheus_dir" -xdev \
+      \( ! -uid "$prometheus_runtime_uid" -o ! -gid "$prometheus_runtime_gid" \) \
+      -print -quit
+  )
+  [ -z "$unsafe_entry" ] ||
+    fail 'Prometheus data ownership could not be enforced'
+  unsafe_entry=$(
+    find "$prometheus_dir" -xdev -type d ! -perm 0750 -print -quit
+  )
+  [ -z "$unsafe_entry" ] ||
+    fail 'Prometheus directory mode could not be enforced'
+  unsafe_entry=$(
+    find "$prometheus_dir" -xdev -type f ! -perm 0640 -print -quit
+  )
+  [ -z "$unsafe_entry" ] ||
+    fail 'Prometheus file mode could not be enforced'
 }
 
 validate_existing_postgres() {
@@ -92,11 +159,11 @@ validate_existing_postgres() {
 ensure_directory "$deploy_root" 0750
 ensure_directory "$deploy_root/data" 0750
 ensure_directory "$postgres_dir" 0750
-ensure_directory "$deploy_root/data/prometheus" 0750
 ensure_directory "$deploy_root/data/feed" 0750
 ensure_directory "$deploy_root/logs" 0750
 ensure_directory "$deploy_root/evidence" 0755
 ensure_directory "$deploy_root/evidence/dashboard" 0755
 validate_existing_postgres
+provision_prometheus_directory
 
-echo "PRODUCTION_PROVISION_OK: existing persistent directories were not modified"
+echo "PRODUCTION_PROVISION_OK: protected data preserved; Prometheus runtime ownership enforced"

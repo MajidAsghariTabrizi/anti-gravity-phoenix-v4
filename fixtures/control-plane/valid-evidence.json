@@ -123,6 +123,7 @@
   "artifacts": [
     {"kind": "technical_json", "path": "technical.json", "sha256": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "size_bytes": 128},
     {"kind": "business_json", "path": "business.json", "sha256": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc", "size_bytes": 128},
-    {"kind": "dashboard_snapshot", "path": "latest-dashboard.json", "sha256": "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd", "size_bytes": 512}
+    {"kind": "dashboard_snapshot", "path": "latest-dashboard.json", "sha256": "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd", "size_bytes": 512},
+    {"kind": "fork_simulation_report", "path": "fork-simulation.json", "sha256": "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee", "size_bytes": 256}
   ]
 }
