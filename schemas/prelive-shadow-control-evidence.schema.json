@@ -291,7 +291,20 @@
       "additionalProperties": false,
       "required": ["kind", "path", "sha256", "size_bytes"],
       "properties": {
-        "kind": {"type": "string"},
+        "kind": {
+          "enum": [
+            "business_json",
+            "dashboard_snapshot",
+            "evidence_bundle",
+            "fork_simulation_report",
+            "preflight_report",
+            "profitability_report",
+            "release_manifest_checksum",
+            "route_ranking",
+            "samples_ndjson",
+            "technical_json"
+          ]
+        },
         "path": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$"},
         "sha256": {"$ref": "#/$defs/digest"},
         "size_bytes": {"type": "integer", "minimum": 1, "maximum": 2097152}

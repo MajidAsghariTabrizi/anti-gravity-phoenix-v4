@@ -94,6 +94,7 @@ ARTIFACT_KINDS = {
     "business_json",
     "dashboard_snapshot",
     "evidence_bundle",
+    "fork_simulation_report",
     "preflight_report",
     "profitability_report",
     "release_manifest_checksum",
@@ -212,6 +213,24 @@ def _text(
         _fail("evidence_shape_invalid")
     if URL_RE.search(value) or ADDRESS_RE.search(value) or SECRET_RE.search(value):
         _fail("sensitive_evidence")
+    return value
+
+
+def _artifact_kind(value: Any) -> str:
+    error = "artifact_kind_invalid:artifacts.kind"
+    if (
+        not isinstance(value, str)
+        or not value
+        or len(value) > 64
+        or URL_RE.search(value)
+        or ADDRESS_RE.search(value)
+        or SECRET_RE.search(value)
+        or SENSITIVE_ENV_NAME_RE.search(value)
+        or SAFE_ID_RE.fullmatch(value) is None
+    ):
+        _fail(error)
+    if value not in ARTIFACT_KINDS:
+        _fail(f"{error}:{value}")
     return value
 
 
@@ -748,7 +767,7 @@ def _validate_artifacts(value: Any) -> None:
     seen: set[str] = set()
     for raw in rows:
         row = _object(raw, {"kind", "path", "sha256", "size_bytes"})
-        kind = _text(row["kind"], choices=ARTIFACT_KINDS)
+        kind = _artifact_kind(row["kind"])
         if kind in seen:
             _fail("duplicate_identity")
         seen.add(kind)

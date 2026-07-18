@@ -64,10 +64,19 @@ Deployment remains blocked until
 The bootstrap script is only for first-host preparation. It validates Linux,
 Ubuntu compatibility, amd64 architecture, Docker Engine, and Docker Compose,
 then delegates persistent-directory creation to
-`provision-production-host.sh`. Existing directories are never chowned or
-chmodded. A non-empty PostgreSQL directory must contain a regular `PG_VERSION`,
-must not be group- or world-writable, and must have consistent ownership across
-the directory and critical PostgreSQL files; unsafe ownership fails closed.
+`provision-production-host.sh`. PostgreSQL, NATS, Feed, and Recorder data are
+never recursively chowned or chmodded. A non-empty PostgreSQL directory must
+contain a regular `PG_VERSION`, must not be group- or world-writable, and must
+have consistent ownership across the directory and critical PostgreSQL files;
+unsafe ownership fails closed.
+
+Prometheus is explicitly configured to run as numeric UID/GID `65534:65534`.
+Provisioning rejects symlinks, hard-linked files, nested mounts, special files,
+and non-directory paths under its dedicated
+`/opt/phoenix/data/prometheus` tree before normalizing only that tree to the
+runtime identity. Existing Prometheus file contents are preserved; directories
+use mode `0750` and regular files use mode `0640`. The installed
+`prometheus.yml` is mode `0644` so that the non-root runtime can read it.
 
 Release-context installation separately updates only canonical files under
 `/opt/phoenix/deploy`, validates `/etc/phoenix/phoenix.env`, and promotes the

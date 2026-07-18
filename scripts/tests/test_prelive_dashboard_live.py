@@ -264,6 +264,11 @@ class LiveDashboardTests(unittest.TestCase):
             ["PHOENIX_RECORDER", "PHOENIX_ENGINE_SHADOW"],
         )
         self.assertEqual(len(artifacts), 7)
+        control._validate_artifacts(artifacts)
+        self.assertIn(
+            "fork_simulation_report",
+            {artifact["kind"] for artifact in artifacts},
+        )
         serialized = json.dumps(snapshot)
         self.assertNotIn("arb1-weth", serialized)
         self.assertNotIn("registry.invalid", serialized)
