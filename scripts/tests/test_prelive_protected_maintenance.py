@@ -1,13 +1,20 @@
 import json
 import tempfile
 import unittest
+from copy import deepcopy
 from pathlib import Path
 
 from scripts import prelive_protected_maintenance as maintenance
 
 
-RELEASE_SHA = "1" * 40
-ROLLBACK_SHA = "2" * 40
+RELEASE_SHA = "a7f19ab165d93dafb4bcc20463f9d010f587281a"
+ROLLBACK_SHA = "ddbc3e6820f565b41d0d0a2323f67a4187b3dd45"
+RELEASE_COMPOSE_DIGEST = (
+    "sha256:0d2ca16746393814bb62f6555ee0aad08635cd3d3e8ec33c0bbff9103338b930"
+)
+ROLLBACK_COMPOSE_DIGEST = (
+    "sha256:e06e8644ed6eb1432630b996ec47156605f191b5dca4c80b40357cb69e87cd95"
+)
 
 
 def digest(value: int) -> str:
@@ -35,6 +42,10 @@ def manifest(release_sha: str, offset: int) -> dict:
 
 
 def asset_manifest(release_sha: str) -> dict:
+    compose_digest = {
+        RELEASE_SHA: RELEASE_COMPOSE_DIGEST,
+        ROLLBACK_SHA: ROLLBACK_COMPOSE_DIGEST,
+    }[release_sha]
     return {
         "schema": maintenance.ASSET_SCHEMA,
         "release_sha": release_sha,
@@ -43,7 +54,11 @@ def asset_manifest(release_sha: str) -> dict:
                 "path": path,
                 "mode": "0644",
                 "size_bytes": 1,
-                "sha256": digest(index),
+                "sha256": (
+                    compose_digest
+                    if path == maintenance.COMPOSE_CONTRACT_PATH
+                    else digest(index)
+                ),
             }
             for index, path in enumerate(maintenance.CONTRACT_PATHS, start=100)
         ],
@@ -183,6 +198,130 @@ def metrics(sequence: int, count: int) -> dict:
     }
 
 
+def rendered_metadata(plan: dict, role: str) -> dict:
+    return {
+        "schema": "phoenix.production-render.v1",
+        "status": "ok",
+        "release_sha": plan[f"{role}_sha"],
+        "chain_id": 42161,
+        "mode": "SHADOW",
+        "live_execution": False,
+        "expected_services": list(maintenance.COMPOSE_SERVICES),
+        "route_registry_hash": digest(600),
+        "images": maintenance._expected_compose_images(plan, role),
+    }
+
+
+def protected_compose_service(image: str) -> dict:
+    return {
+        "image": image,
+        "entrypoint": ["/usr/local/bin/service"],
+        "command": ["--serve"],
+        "environment": {
+            "PHOENIX_MODE": "SHADOW",
+            "LIVE_EXECUTION": "false",
+            "SIGNER_PRIVATE_KEY": "",
+            "WALLET_ADDRESS": "",
+            "EXECUTOR_ADDRESS": "",
+        },
+        "depends_on": {"nats": {"condition": "service_healthy"}},
+        "healthcheck": {
+            "test": ["CMD", "healthcheck"],
+            "interval": "10s",
+            "timeout": "3s",
+            "retries": 5,
+        },
+        "volumes": [
+            {
+                "type": "bind",
+                "source": "/opt/phoenix/data/protected",
+                "target": "/var/lib/phoenix",
+                "read_only": False,
+            }
+        ],
+        "networks": {"phoenix-internal": None},
+        "restart": "unless-stopped",
+        "user": "1000:1000",
+        "privileged": False,
+        "read_only": True,
+        "cap_drop": ["ALL"],
+        "security_opt": ["no-new-privileges:true"],
+        "logging": {
+            "driver": "json-file",
+            "options": {"max-file": "5", "max-size": "50m"},
+        },
+        "ports": [
+            {
+                "mode": "ingress",
+                "target": 9000,
+                "published": "9000",
+                "protocol": "tcp",
+            }
+        ],
+    }
+
+
+def optional_compose_service(image: str) -> dict:
+    return {
+        "image": image,
+        "command": ["--observe"],
+        "environment": {
+            "PHOENIX_MODE": "SHADOW",
+            "LIVE_EXECUTION": "false",
+            "SIGNER_PRIVATE_KEY": "",
+            "WALLET_ADDRESS": "",
+            "EXECUTOR_ADDRESS": "",
+        },
+        "networks": {"phoenix-internal": None},
+        "restart": "unless-stopped",
+        "logging": {
+            "driver": "json-file",
+            "options": {"max-file": "5", "max-size": "50m"},
+        },
+    }
+
+
+def rendered_compose(plan: dict, role: str) -> dict:
+    images = maintenance._expected_compose_images(plan, role)
+    services = {
+        service: protected_compose_service(images[service])
+        for service in (
+            *maintenance.FIXED_SERVICES,
+            *maintenance.MUTABLE_SERVICES,
+            maintenance.MIGRATION_SERVICE,
+        )
+    }
+    services.update(
+        {
+            service: optional_compose_service(images[service])
+            for service in maintenance.OPTIONAL_SERVICES
+        }
+    )
+    if role == "release":
+        services["prometheus"]["user"] = "65534:65534"
+    project = f"phoenix-release-{plan[f'{role}_sha']}"
+    return {
+        "name": project,
+        "x-common-env": {"env_file": ["/etc/phoenix/phoenix.env"]},
+        "x-logging": {
+            "driver": "json-file",
+            "options": {"max-file": "5", "max-size": "50m"},
+        },
+        "services": services,
+        "networks": {
+            "phoenix-internal": {
+                "name": f"{project}_phoenix-internal",
+                "driver": "bridge",
+            }
+        },
+        "volumes": {
+            "nats-jetstream": {
+                "name": "phoenix-nats-jetstream",
+            }
+        },
+    }
+
+
 class ProtectedMaintenanceTests(unittest.TestCase):
     def setUp(self) -> None:
         self.directory = tempfile.TemporaryDirectory()
@@ -277,12 +416,26 @@ class ProtectedMaintenanceTests(unittest.TestCase):
             self.plan["maintenance_order"], ["recorder", "feed-ingestor"]
         )
         self.assertEqual(self.plan["quiesce_before_update"], ["feed-ingestor"])
+        self.assertEqual(
+            set(self.plan["contract_sha256"]),
+            set(maintenance.EXACT_HASH_CONTRACT_PATHS),
+        )
+        self.assertNotIn(
+            maintenance.COMPOSE_CONTRACT_PATH, self.plan["contract_sha256"]
+        )
+        self.assertEqual(
+            self.plan["compose_source_sha256"],
+            {
+                "release": RELEASE_COMPOSE_DIGEST,
+                "rollback": ROLLBACK_COMPOSE_DIGEST,
+            },
+        )
         maintenance.validate_plan(self.plan)
 
-    def test_third_protected_contract_change_fails_before_runtime(self) -> None:
+    def test_noncompose_protected_contract_change_fails_before_runtime(self) -> None:
         changed = asset_manifest(RELEASE_SHA)
         for item in changed["files"]:
-            if item["path"] == "compose.prod.yml":
+            if item["path"] == "deploy/nats-server.conf":
                 item["sha256"] = digest(999)
         changed_path = self.write("changed-assets.json", changed)
         with self.assertRaisesRegex(
@@ -296,6 +449,19 @@ class ProtectedMaintenanceTests(unittest.TestCase):
                 RELEASE_SHA,
                 ROLLBACK_SHA,
             )
+
+    def test_exact_v4_v3_compose_source_difference_requires_render_review(self) -> None:
+        self.assertNotEqual(
+            self.plan["compose_source_sha256"]["release"],
+            self.plan["compose_source_sha256"]["rollback"],
+        )
+        maintenance.validate_render_pair(
+            self.plan,
+            rendered_metadata(self.plan, "release"),
+            rendered_metadata(self.plan, "rollback"),
+            rendered_compose(self.plan, "release"),
+            rendered_compose(self.plan, "rollback"),
+        )
 
     def test_missing_rollback_assets_fail_closed(self) -> None:
         with self.assertRaisesRegex(
@@ -327,41 +493,280 @@ class ProtectedMaintenanceTests(unittest.TestCase):
             )
 
     def test_render_pair_requires_shadow_and_fixed_images(self) -> None:
-        release_images = dict(maintenance.FIXED_IMAGES)
-        release_images.update(
-            {
-                "feed-ingestor": self.plan["images"]["release"]["feed-ingestor"],
-                "recorder": self.plan["images"]["release"]["recorder"],
-            }
+        release_metadata = rendered_metadata(self.plan, "release")
+        rollback_metadata = rendered_metadata(self.plan, "rollback")
+        release_compose = rendered_compose(self.plan, "release")
+        rollback_compose = rendered_compose(self.plan, "rollback")
+        maintenance.validate_render_pair(
+            self.plan,
+            release_metadata,
+            rollback_metadata,
+            release_compose,
+            rollback_compose,
         )
-        rollback_images = dict(maintenance.FIXED_IMAGES)
-        rollback_images.update(
-            {
-                "feed-ingestor": self.plan["images"]["rollback"]["feed-ingestor"],
-                "recorder": self.plan["images"]["rollback"]["recorder"],
-            }
-        )
-        release = {
-            "schema": "phoenix.production-render.v1",
-            "status": "ok",
-            "release_sha": RELEASE_SHA,
-            "chain_id": 42161,
-            "mode": "SHADOW",
-            "live_execution": False,
-            "route_registry_hash": digest(600),
-            "images": release_images,
-        }
-        rollback = {
-            **release,
-            "release_sha": ROLLBACK_SHA,
-            "images": rollback_images,
-        }
-        maintenance.validate_render_pair(self.plan, release, rollback)
-        release["live_execution"] = True
+        release_metadata["live_execution"] = True
         with self.assertRaisesRegex(
             maintenance.MaintenanceError, "render_contract_invalid"
         ):
-            maintenance.validate_render_pair(self.plan, release, rollback)
+            maintenance.validate_render_pair(
+                self.plan,
+                release_metadata,
+                rollback_metadata,
+                release_compose,
+                rollback_compose,
+            )
+
+    def test_every_protected_service_field_mutation_fails_closed(self) -> None:
+        release_metadata = rendered_metadata(self.plan, "release")
+        rollback_metadata = rendered_metadata(self.plan, "rollback")
+        rollback_compose = rendered_compose(self.plan, "rollback")
+        mutations = {
+            "mount": lambda service: service["volumes"][0].update(
+                source="/opt/phoenix/data/changed"
+            ),
+            "environment": lambda service: service["environment"].update(
+                NATS_URL="nats://changed.invalid:4222"
+            ),
+            "command": lambda service: service["command"].append("--changed"),
+            "entrypoint": lambda service: service["entrypoint"].append("--changed"),
+            "dependency": lambda service: service["depends_on"].update(
+                postgres={"condition": "service_started"}
+            ),
+            "healthcheck": lambda service: service["healthcheck"].update(retries=99),
+            "network": lambda service: service["networks"].update(
+                unexpected=None
+            ),
+            "restart": lambda service: service.update(restart="always"),
+            "user": lambda service: service.update(user="0:0"),
+            "privilege": lambda service: service.update(privileged=True),
+            "logging": lambda service: service["logging"].update(driver="none"),
+            "security": lambda service: service["security_opt"].append(
+                "label=disable"
+            ),
+            "ports": lambda service: service["ports"].append(
+                {
+                    "mode": "ingress",
+                    "target": 9999,
+                    "published": "9999",
+                    "protocol": "tcp",
+                }
+            ),
+        }
+        for name, mutate in mutations.items():
+            with self.subTest(name=name):
+                release_compose = rendered_compose(self.plan, "release")
+                mutate(release_compose["services"]["postgres"])
+                with self.assertRaisesRegex(
+                    maintenance.MaintenanceError,
+                    "protected_compose_service_changed:postgres",
+                ):
+                    maintenance.validate_render_pair(
+                        self.plan,
+                        release_metadata,
+                        rollback_metadata,
+                        release_compose,
+                        rollback_compose,
+                    )
+
+    def test_nats_mount_and_protected_mutable_definition_changes_fail(self) -> None:
+        release_metadata = rendered_metadata(self.plan, "release")
+        rollback_metadata = rendered_metadata(self.plan, "rollback")
+        rollback_compose = rendered_compose(self.plan, "rollback")
+        for service in ("nats", "feed-ingestor", "recorder"):
+            with self.subTest(service=service):
+                release_compose = rendered_compose(self.plan, "release")
+                release_compose["services"][service]["volumes"][0][
+                    "source"
+                ] = f"/opt/phoenix/data/{service}-changed"
+                with self.assertRaisesRegex(
+                    maintenance.MaintenanceError,
+                    f"protected_compose_service_changed:{service}",
+                ):
+                    maintenance.validate_render_pair(
+                        self.plan,
+                        release_metadata,
+                        rollback_metadata,
+                        release_compose,
+                        rollback_compose,
+                    )
+
+    def test_service_set_network_volume_and_migration_changes_fail(self) -> None:
+        release_metadata = rendered_metadata(self.plan, "release")
+        rollback_metadata = rendered_metadata(self.plan, "rollback")
+        rollback_compose = rendered_compose(self.plan, "rollback")
+        cases = []
+
+        added = rendered_compose(self.plan, "release")
+        added["services"]["unexpected"] = optional_compose_service(
+            maintenance.PROMETHEUS_IMAGE
+        )
+        cases.append(
+            ("addition", added, "protected_compose_service_set_changed")
+        )
+
+        deleted = rendered_compose(self.plan, "release")
+        del deleted["services"]["postgres"]
+        cases.append(
+            ("deletion", deleted, "protected_compose_service_set_changed")
+        )
+
+        networks = rendered_compose(self.plan, "release")
+        networks["networks"]["phoenix-internal"]["driver"] = "overlay"
+        cases.append(
+            ("networks", networks, "protected_compose_networks_changed")
+        )
+
+        volumes = rendered_compose(self.plan, "release")
+        volumes["volumes"]["nats-jetstream"]["name"] = "changed"
+        cases.append(("volumes", volumes, "protected_compose_volumes_changed"))
+
+        migration = rendered_compose(self.plan, "release")
+        migration["services"]["migration-runner"]["command"].append("--changed")
+        cases.append(
+            (
+                "migration",
+                migration,
+                "protected_compose_service_changed:migration-runner",
+            )
+        )
+
+        extensions = rendered_compose(self.plan, "release")
+        extensions["x-logging"]["options"]["max-size"] = "500m"
+        cases.append(
+            (
+                "extensions",
+                extensions,
+                "protected_compose_extensions_changed",
+            )
+        )
+
+        for name, release_compose, expected in cases:
+            with self.subTest(name=name):
+                with self.assertRaisesRegex(maintenance.MaintenanceError, expected):
+                    maintenance.validate_render_pair(
+                        self.plan,
+                        release_metadata,
+                        rollback_metadata,
+                        release_compose,
+                        rollback_compose,
+                    )
+
+    def test_unreviewed_optional_change_and_mutable_tag_fail(self) -> None:
+        release_metadata = rendered_metadata(self.plan, "release")
+        rollback_metadata = rendered_metadata(self.plan, "rollback")
+        rollback_compose = rendered_compose(self.plan, "rollback")
+
+        optional = rendered_compose(self.plan, "release")
+        optional["services"]["rpc-gateway"]["command"].append("--changed")
+        with self.assertRaisesRegex(
+            maintenance.MaintenanceError,
+            "protected_compose_service_changed:rpc-gateway",
+        ):
+            maintenance.validate_render_pair(
+                self.plan,
+                release_metadata,
+                rollback_metadata,
+                optional,
+                rollback_compose,
+            )
+
+        wrong_prometheus_user = rendered_compose(self.plan, "release")
+        wrong_prometheus_user["services"]["prometheus"]["user"] = "0:0"
+        with self.assertRaisesRegex(
+            maintenance.MaintenanceError,
+            "protected_compose_service_changed:prometheus",
+        ):
+            maintenance.validate_render_pair(
+                self.plan,
+                release_metadata,
+                rollback_metadata,
+                wrong_prometheus_user,
+                rollback_compose,
+            )
+
+        mutable = rendered_compose(self.plan, "release")
+        mutable["services"]["feed-ingestor"]["image"] = (
+            "ghcr.io/majidasgharitabrizi/feed-ingestor:latest"
+        )
+        with self.assertRaisesRegex(
+            maintenance.MaintenanceError,
+            "protected_compose_service_changed:feed-ingestor",
+        ):
+            maintenance.validate_render_pair(
+                self.plan,
+                release_metadata,
+                rollback_metadata,
+                mutable,
+                rollback_compose,
+            )
+
+        fixed = rendered_compose(self.plan, "release")
+        fixed["services"]["postgres"]["image"] = (
+            "postgres@sha256:" + ("9" * 64)
+        )
+        with self.assertRaisesRegex(
+            maintenance.MaintenanceError,
+            "protected_compose_service_changed:postgres",
+        ):
+            maintenance.validate_render_pair(
+                self.plan,
+                release_metadata,
+                rollback_metadata,
+                fixed,
+                rollback_compose,
+            )
+
+    def test_malformed_render_route_change_and_secret_diagnostics_fail_closed(
+        self,
+    ) -> None:
+        release_metadata = rendered_metadata(self.plan, "release")
+        rollback_metadata = rendered_metadata(self.plan, "rollback")
+        release_compose = rendered_compose(self.plan, "release")
+        rollback_compose = rendered_compose(self.plan, "rollback")
+
+        malformed = deepcopy(release_compose)
+        del malformed["volumes"]
+        with self.assertRaisesRegex(
+            maintenance.MaintenanceError, "protected_compose_invalid"
+        ):
+            maintenance.validate_render_pair(
+                self.plan,
+                release_metadata,
+                rollback_metadata,
+                malformed,
+                rollback_compose,
+            )
+
+        changed_route = deepcopy(release_metadata)
+        changed_route["route_registry_hash"] = digest(601)
+        with self.assertRaisesRegex(
+            maintenance.MaintenanceError, "route_contract_changed"
+        ):
+            maintenance.validate_render_pair(
+                self.plan,
+                changed_route,
+                rollback_metadata,
+                release_compose,
+                rollback_compose,
+            )
+
+        provider_value = "https://provider.invalid/redacted-test-only"
+        secret_bearing = deepcopy(release_compose)
+        secret_bearing["services"]["postgres"]["environment"][
+            "DATABASE_URL"
+        ] = provider_value
+        with self.assertRaises(maintenance.MaintenanceError) as captured:
+            maintenance.validate_render_pair(
+                self.plan,
+                release_metadata,
+                rollback_metadata,
+                secret_bearing,
+                rollback_compose,
+            )
+        self.assertEqual(
+            str(captured.exception), "protected_compose_service_changed:postgres"
+        )
+        self.assertNotIn(provider_value, str(captured.exception))
 
     def test_recorder_then_feed_transition_is_bounded(self) -> None:
         baseline = self.baseline()
@@ -607,7 +1012,7 @@ class ProtectedMaintenanceTests(unittest.TestCase):
                 self.plan, baseline, final, "final", self.candidate_start()
             )
 
-    def test_rollback_requires_exact_v2_images_and_progress(self) -> None:
+    def test_rollback_requires_exact_v3_images_and_progress(self) -> None:
         baseline = self.baseline()
         start = self.baseline()
         start["phase"] = "rollback-start"

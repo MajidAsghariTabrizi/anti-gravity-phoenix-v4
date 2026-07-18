@@ -139,12 +139,13 @@ Database migrations are forward-only. Rollbacks require backward-compatible migr
 Normal `deploy-shadow` behavior remains unchanged: a Feed Ingestor or Recorder
 digest difference fails before SSH. The separate
 `deploy-prelive-protected-maintenance.yml` workflow is pinned to
-`phoenix-prelive-shadow-v3` and `phoenix-prelive-shadow-v2`.
+`phoenix-prelive-shadow-v4` and `phoenix-prelive-shadow-v3`.
 
 Its pre-SSH gate verifies the exact tag targets and build runs, both complete
 asset bundles and checksum files, immutable image references and OCI revision
-labels, unchanged Compose/NATS/route/migration contracts, exact SHADOW renders,
-blank execution configuration, and the reviewed allowlist:
+labels, byte-identical NATS/route/migration contracts, semantically equivalent
+protected Compose contracts, exact SHADOW renders, blank execution
+configuration, and the reviewed allowlist:
 
 ```text
 feed-ingestor
