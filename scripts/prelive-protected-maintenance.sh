@@ -704,7 +704,9 @@ JSON
 python3 "$helper" validate-render-pair \
   --plan "$plan_file" \
   --release-metadata "$state_dir/release.render.json" \
-  --rollback-metadata "$state_dir/rollback.render.json" >/dev/null ||
+  --rollback-metadata "$state_dir/rollback.render.json" \
+  --release-compose "$state_dir/release.compose.json" \
+  --rollback-compose "$state_dir/rollback.compose.json" >/dev/null ||
   fail 'release and rollback render contracts differ'
 
 python3 "$deploy_dir/production_context.py" write-state \

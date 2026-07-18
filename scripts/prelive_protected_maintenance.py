@@ -15,7 +15,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any
 
 
-PLAN_SCHEMA = "phoenix.protected-maintenance-plan.v1"
+PLAN_SCHEMA = "phoenix.protected-maintenance-plan.v2"
 SNAPSHOT_SCHEMA = "phoenix.protected-maintenance-snapshot.v2"
 CONTEXT_SCHEMA = "phoenix.protected-maintenance-context.v2"
 RELEASE_SCHEMA = "phoenix.release.v1"
@@ -38,6 +38,7 @@ PROTECTED_SERVICES = (
 )
 FIXED_SERVICES = ("nitro-feed-relay", "nats", "postgres")
 MUTABLE_SERVICES = ("feed-ingestor", "recorder")
+MIGRATION_SERVICE = "migration-runner"
 OPTIONAL_SERVICES = (
     "prometheus",
     "rpc-gateway",
@@ -45,6 +46,22 @@ OPTIONAL_SERVICES = (
     "phoenix-engine",
     "dashboard",
 )
+COMPOSE_SERVICES = (
+    "nitro-feed-relay",
+    "nats",
+    "postgres",
+    MIGRATION_SERVICE,
+    "rpc-gateway",
+    "feed-ingestor",
+    "phoenix-engine",
+    "shadow-dispatcher",
+    "recorder",
+    "dashboard",
+    "prometheus",
+)
+COMPOSE_NETWORKS = ("phoenix-internal",)
+COMPOSE_VOLUMES = ("nats-jetstream",)
+COMPOSE_EXTENSIONS = ("x-common-env", "x-logging")
 MAINTENANCE_ORDER = ("recorder", "feed-ingestor")
 STREAM_NAMES = ("PHOENIX_FEED_TX", "PHOENIX_ENGINE_INPUT")
 CONSUMER_NAMES = ("PHOENIX_RECORDER", "PHOENIX_ENGINE_SHADOW")
@@ -63,9 +80,20 @@ FIXED_IMAGES = {
         "sha256:57c72fd2a128e416c7fcc499958864df5301e940bca0a56f58fddf30ffc07777"
     ),
 }
+PROMETHEUS_IMAGE = (
+    "prom/prometheus@"
+    "sha256:075b1ba2c4ebb04bc3a6ab86c06ec8d8099f8fda1c96ef6d104d9bb1def1d8bc"
+)
+OPTIONAL_IMAGE_OWNERS = {
+    "rpc-gateway": "rpc-gateway",
+    "phoenix-engine": "phoenix-engine",
+    "shadow-dispatcher": "recorder",
+    "dashboard": "dashboard",
+}
 
+COMPOSE_CONTRACT_PATH = "compose.prod.yml"
 STATIC_CONTRACT_PATHS = (
-    "compose.prod.yml",
+    COMPOSE_CONTRACT_PATH,
     "deploy/nats-server.conf",
     "fixtures/routes/arbitrum_uniswap_v3_pool_proofs.json",
     "scripts/production_context.py",
@@ -85,6 +113,9 @@ EXPECTED_MIGRATIONS = tuple(f"migrations/{index:03d}_{name}.sql" for index, name
     (10, "fork_simulation_evidence"),
 ))
 CONTRACT_PATHS = STATIC_CONTRACT_PATHS + EXPECTED_MIGRATIONS
+EXACT_HASH_CONTRACT_PATHS = tuple(
+    path for path in CONTRACT_PATHS if path != COMPOSE_CONTRACT_PATH
+)
 
 FEED_METRICS = (
     "feed_last_sequence",
@@ -130,6 +161,7 @@ DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 CONTAINER_RE = re.compile(r"^[0-9a-f]{64}$")
 IMAGE_RE = re.compile(r"^[^\s@]+@sha256:[0-9a-f]{64}$")
 SAFE_NAME_RE = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
+COMPOSE_PROJECT_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,127}$")
 INTEGER_METRIC_RE = re.compile(r"^(?:0|[1-9][0-9]*)(?:\.0+)?$")
 MAX_JSON_BYTES = 4 * 1024 * 1024
 MAX_STORAGE_METADATA_BYTES = 64 * 1024
@@ -334,11 +366,18 @@ def build_plan(
     rollback_assets = validate_asset_manifest(rollback_assets_manifest, rollback_sha)
 
     contract_digests: dict[str, str] = {}
+    compose_source_digests: dict[str, str] = {}
     for path in CONTRACT_PATHS:
         candidate = release_assets.get(path)
         previous = rollback_assets.get(path)
         if candidate is None or previous is None:
             _fail("release_contract_missing")
+        if path == COMPOSE_CONTRACT_PATH:
+            compose_source_digests = {
+                "release": candidate["sha256"],
+                "rollback": previous["sha256"],
+            }
+            continue
         if candidate["sha256"] != previous["sha256"]:
             _fail("protected_contract_changed")
         contract_digests[path] = candidate["sha256"]
@@ -365,6 +404,7 @@ def build_plan(
             "rollback": rollback_images,
         },
         "contract_sha256": contract_digests,
+        "compose_source_sha256": compose_source_digests,
         "bounds": {
             "minimum_disk_free_bytes": MIN_DISK_FREE_BYTES,
             "maximum_ack_pending": MAX_ACK_PENDING,
@@ -400,6 +440,7 @@ def validate_plan(value: Any) -> dict[str, Any]:
             "maintenance_order",
             "images",
             "contract_sha256",
+            "compose_source_sha256",
             "bounds",
             "safety",
         },
@@ -460,8 +501,18 @@ def validate_plan(value: Any) -> dict[str, Any]:
     contract = plan["contract_sha256"]
     if (
         not isinstance(contract, dict)
-        or set(contract) != set(CONTRACT_PATHS)
+        or set(contract) != set(EXACT_HASH_CONTRACT_PATHS)
         or any(DIGEST_RE.fullmatch(str(value)) is None for value in contract.values())
+    ):
+        _fail("plan_invalid")
+    compose_source = plan["compose_source_sha256"]
+    if (
+        not isinstance(compose_source, dict)
+        or set(compose_source) != {"release", "rollback"}
+        or any(
+            DIGEST_RE.fullmatch(str(value)) is None
+            for value in compose_source.values()
+        )
     ):
         _fail("plan_invalid")
     return plan
@@ -471,35 +522,204 @@ def load_plan(path: Path) -> dict[str, Any]:
     return validate_plan(load_json(path, "plan_missing"))
 
 
-def validate_render_pair(
-    plan: dict[str, Any], release_metadata: Any, rollback_metadata: Any
-) -> None:
-    for role, metadata in (
-        ("release", release_metadata),
-        ("rollback", rollback_metadata),
+def _expected_compose_images(plan: dict[str, Any], role: str) -> dict[str, str]:
+    images = dict(FIXED_IMAGES)
+    images[MIGRATION_SERVICE] = plan["images"][role]["feed-ingestor"]
+    for service in MUTABLE_SERVICES:
+        images[service] = plan["images"][role][service]
+    for service, owner in OPTIONAL_IMAGE_OWNERS.items():
+        images[service] = plan["images"][role][owner]
+    images["prometheus"] = PROMETHEUS_IMAGE
+    return images
+
+
+def _validate_render_metadata(
+    plan: dict[str, Any], role: str, metadata: Any
+) -> dict[str, Any]:
+    if not isinstance(metadata, dict):
+        _fail("render_contract_invalid")
+    if (
+        metadata.get("schema") != "phoenix.production-render.v1"
+        or metadata.get("status") != "ok"
+        or metadata.get("release_sha") != plan[f"{role}_sha"]
+        or metadata.get("chain_id") != 42161
+        or metadata.get("mode") != "SHADOW"
+        or metadata.get("live_execution") is not False
+        or metadata.get("expected_services") != list(COMPOSE_SERVICES)
+        or DIGEST_RE.fullmatch(str(metadata.get("route_registry_hash", ""))) is None
+        or not isinstance(metadata.get("images"), dict)
     ):
-        if not isinstance(metadata, dict):
-            _fail("render_contract_invalid")
+        _fail("render_contract_invalid")
+    images = metadata["images"]
+    expected = _expected_compose_images(plan, role)
+    if set(images) != set(COMPOSE_SERVICES):
+        _fail("render_contract_invalid")
+    for service, reference in expected.items():
+        if images.get(service) != reference:
+            _fail(f"protected_compose_service_changed:{service}")
+    return metadata
+
+
+def _normalize_resource_contract(
+    value: Any, project_name: str | None, error_code: str
+) -> dict[str, Any]:
+    if not isinstance(value, dict) or len(value) > 32:
+        _fail("protected_compose_invalid")
+    normalized: dict[str, Any] = {}
+    for name, raw in value.items():
         if (
-            metadata.get("schema") != "phoenix.production-render.v1"
-            or metadata.get("status") != "ok"
-            or metadata.get("release_sha") != plan[f"{role}_sha"]
-            or metadata.get("chain_id") != 42161
-            or metadata.get("mode") != "SHADOW"
-            or metadata.get("live_execution") is not False
-            or not isinstance(metadata.get("images"), dict)
+            not isinstance(name, str)
+            or SAFE_NAME_RE.fullmatch(name) is None
+            or not isinstance(raw, dict)
         ):
-            _fail("render_contract_invalid")
-        images = metadata["images"]
-        expected = plan["images"][role]
-        if images.get("feed-ingestor") != expected["feed-ingestor"]:
-            _fail("render_contract_invalid")
-        if images.get("recorder") != expected["recorder"]:
-            _fail("render_contract_invalid")
-        for service, reference in FIXED_IMAGES.items():
-            if images.get(service) != reference:
-                _fail("protected_contract_changed")
-    if release_metadata.get("route_registry_hash") != rollback_metadata.get(
+            _fail("protected_compose_invalid")
+        contract = dict(raw)
+        generated_name = contract.get("name")
+        if (
+            project_name is not None
+            and generated_name == f"{project_name}_{name}"
+        ):
+            contract["name"] = f"<project>_{name}"
+        normalized[name] = contract
+    if not normalized:
+        _fail(error_code)
+    return normalized
+
+
+def _validate_rendered_compose(value: Any) -> dict[str, Any]:
+    expected_keys = {
+        "name",
+        "services",
+        "networks",
+        "volumes",
+        *COMPOSE_EXTENSIONS,
+    }
+    if (
+        not isinstance(value, dict)
+        or not set(value).issubset(expected_keys)
+        or not {
+            "services",
+            "networks",
+            "volumes",
+            *COMPOSE_EXTENSIONS,
+        }.issubset(value)
+    ):
+        _fail("protected_compose_invalid")
+    project_name = value.get("name")
+    if project_name is not None and (
+        not isinstance(project_name, str)
+        or COMPOSE_PROJECT_RE.fullmatch(project_name) is None
+    ):
+        _fail("protected_compose_invalid")
+    services = value["services"]
+    if not isinstance(services, dict):
+        _fail("protected_compose_invalid")
+    if set(services) != set(COMPOSE_SERVICES):
+        _fail("protected_compose_service_set_changed")
+    for service, contract in services.items():
+        if not isinstance(contract, dict) or not contract:
+            _fail("protected_compose_invalid")
+        image = contract.get("image")
+        if not isinstance(image, str) or IMAGE_RE.fullmatch(image) is None:
+            _fail(f"protected_compose_service_changed:{service}")
+    networks = _normalize_resource_contract(
+        value["networks"], project_name, "protected_compose_networks_changed"
+    )
+    volumes = _normalize_resource_contract(
+        value["volumes"], project_name, "protected_compose_volumes_changed"
+    )
+    if set(networks) != set(COMPOSE_NETWORKS):
+        _fail("protected_compose_networks_changed")
+    if set(volumes) != set(COMPOSE_VOLUMES):
+        _fail("protected_compose_volumes_changed")
+    extensions = {name: value[name] for name in COMPOSE_EXTENSIONS}
+    return {
+        "services": services,
+        "networks": networks,
+        "volumes": volumes,
+        "extensions": extensions,
+    }
+
+
+def _without_image(contract: dict[str, Any]) -> dict[str, Any]:
+    return {key: value for key, value in contract.items() if key != "image"}
+
+
+def _validate_prometheus_delta(
+    release: dict[str, Any], rollback: dict[str, Any]
+) -> None:
+    release_contract = _without_image(release)
+    rollback_contract = _without_image(rollback)
+    if release_contract == rollback_contract:
+        return
+    release_user = release_contract.pop("user", None)
+    rollback_has_user = "user" in rollback_contract
+    rollback_contract.pop("user", None)
+    if (
+        release_user != "65534:65534"
+        or rollback_has_user
+        or release_contract != rollback_contract
+    ):
+        _fail("protected_compose_service_changed:prometheus")
+
+
+def validate_render_pair(
+    plan: dict[str, Any],
+    release_metadata: Any,
+    rollback_metadata: Any,
+    release_compose: Any,
+    rollback_compose: Any,
+) -> None:
+    metadata = {
+        "release": _validate_render_metadata(plan, "release", release_metadata),
+        "rollback": _validate_render_metadata(plan, "rollback", rollback_metadata),
+    }
+    rendered = {
+        "release": _validate_rendered_compose(release_compose),
+        "rollback": _validate_rendered_compose(rollback_compose),
+    }
+
+    release_services = rendered["release"]["services"]
+    rollback_services = rendered["rollback"]["services"]
+    expected_release_images = _expected_compose_images(plan, "release")
+    expected_rollback_images = _expected_compose_images(plan, "rollback")
+    for service in COMPOSE_SERVICES:
+        release_service = release_services[service]
+        rollback_service = rollback_services[service]
+        if (
+            release_service["image"] != expected_release_images[service]
+            or rollback_service["image"] != expected_rollback_images[service]
+        ):
+            _fail(f"protected_compose_service_changed:{service}")
+
+    for service in FIXED_SERVICES:
+        if release_services[service] != rollback_services[service]:
+            _fail(f"protected_compose_service_changed:{service}")
+
+    for service in (*MUTABLE_SERVICES, MIGRATION_SERVICE):
+        if _without_image(release_services[service]) != _without_image(
+            rollback_services[service]
+        ):
+            _fail(f"protected_compose_service_changed:{service}")
+
+    for service in OPTIONAL_SERVICES:
+        if service == "prometheus":
+            _validate_prometheus_delta(
+                release_services[service], rollback_services[service]
+            )
+        elif _without_image(release_services[service]) != _without_image(
+            rollback_services[service]
+        ):
+            _fail(f"protected_compose_service_changed:{service}")
+
+    if rendered["release"]["networks"] != rendered["rollback"]["networks"]:
+        _fail("protected_compose_networks_changed")
+    if rendered["release"]["volumes"] != rendered["rollback"]["volumes"]:
+        _fail("protected_compose_volumes_changed")
+    if rendered["release"]["extensions"] != rendered["rollback"]["extensions"]:
+        _fail("protected_compose_extensions_changed")
+
+    if metadata["release"].get("route_registry_hash") != metadata["rollback"].get(
         "route_registry_hash"
     ):
         _fail("route_contract_changed")
@@ -1318,6 +1538,8 @@ def command_render_pair(args: argparse.Namespace) -> None:
         plan,
         load_json(Path(args.release_metadata)),
         load_json(Path(args.rollback_metadata)),
+        load_json(Path(args.release_compose)),
+        load_json(Path(args.rollback_compose)),
     )
     print("PROTECTED_MAINTENANCE_RENDER_PAIR_OK")
 
@@ -1421,6 +1643,8 @@ def parser() -> argparse.ArgumentParser:
     render.add_argument("--plan", required=True)
     render.add_argument("--release-metadata", required=True)
     render.add_argument("--rollback-metadata", required=True)
+    render.add_argument("--release-compose", required=True)
+    render.add_argument("--rollback-compose", required=True)
     render.set_defaults(handler=command_render_pair)
 
     refs = commands.add_parser("image-refs")

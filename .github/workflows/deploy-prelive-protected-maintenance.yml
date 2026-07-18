@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       release_sha:
-        description: Exact phoenix-prelive-shadow-v3 source SHA
+        description: Exact phoenix-prelive-shadow-v4 source SHA
         required: true
         type: string
       build_run_id:
@@ -12,7 +12,7 @@ on:
         required: true
         type: string
       rollback_sha:
-        description: Exact phoenix-prelive-shadow-v2 rollback SHA
+        description: Exact phoenix-prelive-shadow-v3 rollback SHA
         required: true
         type: string
       rollback_build_run_id:
@@ -34,12 +34,12 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  RELEASE_TAG: phoenix-prelive-shadow-v3
-  ROLLBACK_TAG: phoenix-prelive-shadow-v2
-  REVIEWED_RELEASE_SHA: ddbc3e6820f565b41d0d0a2323f67a4187b3dd45
-  REVIEWED_BUILD_RUN_ID: "29519008274"
-  REVIEWED_ROLLBACK_SHA: e84aa5eb69a749da1a01e308422d76a34f0409e8
-  REVIEWED_ROLLBACK_BUILD_RUN_ID: "29487710804"
+  RELEASE_TAG: phoenix-prelive-shadow-v4
+  ROLLBACK_TAG: phoenix-prelive-shadow-v3
+  REVIEWED_RELEASE_SHA: a7f19ab165d93dafb4bcc20463f9d010f587281a
+  REVIEWED_BUILD_RUN_ID: "29638026962"
+  REVIEWED_ROLLBACK_SHA: ddbc3e6820f565b41d0d0a2323f67a4187b3dd45
+  REVIEWED_ROLLBACK_BUILD_RUN_ID: "29519008274"
 
 jobs:
   deploy-prelive-protected-maintenance:
@@ -67,10 +67,10 @@ jobs:
           case "$BUILD_RUN_ID:$ROLLBACK_BUILD_RUN_ID" in
             *[!0-9:]*|:*|*:|*::* ) echo "build run IDs must be decimal integers"; exit 1 ;;
           esac
-          [ "$RELEASE_SHA" = "$REVIEWED_RELEASE_SHA" ] || { echo "release SHA is not the reviewed v3 source"; exit 1; }
-          [ "$ROLLBACK_SHA" = "$REVIEWED_ROLLBACK_SHA" ] || { echo "rollback SHA is not the reviewed v2 source"; exit 1; }
-          [ "$BUILD_RUN_ID" = "$REVIEWED_BUILD_RUN_ID" ] || { echo "release build run is not the reviewed v3 run"; exit 1; }
-          [ "$ROLLBACK_BUILD_RUN_ID" = "$REVIEWED_ROLLBACK_BUILD_RUN_ID" ] || { echo "rollback build run is not the reviewed v2 run"; exit 1; }
+          [ "$RELEASE_SHA" = "$REVIEWED_RELEASE_SHA" ] || { echo "release SHA is not the reviewed v4 source"; exit 1; }
+          [ "$ROLLBACK_SHA" = "$REVIEWED_ROLLBACK_SHA" ] || { echo "rollback SHA is not the reviewed v3 source"; exit 1; }
+          [ "$BUILD_RUN_ID" = "$REVIEWED_BUILD_RUN_ID" ] || { echo "release build run is not the reviewed v4 run"; exit 1; }
+          [ "$ROLLBACK_BUILD_RUN_ID" = "$REVIEWED_ROLLBACK_BUILD_RUN_ID" ] || { echo "rollback build run is not the reviewed v3 run"; exit 1; }
           [ "$ACKNOWLEDGEMENT" = DEPLOY_PRELIVE_PROTECTED_MAINTENANCE ] || {
             echo "protected maintenance acknowledgement is invalid"
             exit 1
@@ -99,11 +99,11 @@ jobs:
             "refs/tags/${RELEASE_TAG}:refs/tags/${RELEASE_TAG}" \
             "refs/tags/${ROLLBACK_TAG}:refs/tags/${ROLLBACK_TAG}"
           [ "$(git rev-parse "${RELEASE_TAG}^{commit}")" = "$RELEASE_SHA" ] || {
-            echo "release SHA does not equal the exact v3 tag target"
+            echo "release SHA does not equal the exact v4 tag target"
             exit 1
           }
           [ "$(git rev-parse "${ROLLBACK_TAG}^{commit}")" = "$ROLLBACK_SHA" ] || {
-            echo "rollback SHA does not equal the exact v2 tag target"
+            echo "rollback SHA does not equal the exact v3 tag target"
             exit 1
           }
 
@@ -170,7 +170,7 @@ jobs:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           path: rollback-assets
 
-      - name: Verify manifests checksums and reviewed allowlist
+      - name: Verify immutable release asset checksums
         shell: bash
         env:
           RELEASE_SHA: ${{ inputs.release_sha }}
@@ -187,14 +187,6 @@ jobs:
             --manifest rollback-assets/release-assets-manifest.json \
             --checksums rollback-assets/release-assets-checksums.txt \
             --expected-sha "$ROLLBACK_SHA"
-          python3 scripts/prelive_protected_maintenance.py plan \
-            --release-manifest release/release-manifest.json \
-            --rollback-manifest rollback/release-manifest.json \
-            --release-assets-manifest release-assets/release-assets-manifest.json \
-            --rollback-assets-manifest rollback-assets/release-assets-manifest.json \
-            --release-sha "$RELEASE_SHA" \
-            --rollback-sha "$ROLLBACK_SHA" \
-            --output protected-maintenance-plan.json
 
       - name: Validate exact release and rollback render contracts
         shell: bash
@@ -212,6 +204,8 @@ jobs:
           rollback_root="$PWD/rollback-tree/phoenix-release-${ROLLBACK_SHA}"
           release_manifest="$PWD/release/release-manifest.json"
           rollback_manifest="$PWD/rollback/release-manifest.json"
+          release_assets_manifest="$PWD/release-assets/release-assets-manifest.json"
+          rollback_assets_manifest="$PWD/rollback-assets/release-assets-manifest.json"
           maintenance_plan="$PWD/protected-maintenance-plan.json"
           validation_env="$PWD/maintenance-validation.env"
           release_validation_env="$PWD/release-validation.env"
@@ -275,10 +269,20 @@ jobs:
             --release-manifest "$rollback_manifest" \
             --output "$rollback_render" \
             --metadata-output "$rollback_render_metadata" >/dev/null
+          python3 scripts/prelive_protected_maintenance.py plan \
+            --release-manifest "$release_manifest" \
+            --rollback-manifest "$rollback_manifest" \
+            --release-assets-manifest "$release_assets_manifest" \
+            --rollback-assets-manifest "$rollback_assets_manifest" \
+            --release-sha "$RELEASE_SHA" \
+            --rollback-sha "$ROLLBACK_SHA" \
+            --output "$maintenance_plan"
           python3 scripts/prelive_protected_maintenance.py validate-render-pair \
             --plan "$maintenance_plan" \
             --release-metadata "$release_render_metadata" \
-            --rollback-metadata "$rollback_render_metadata"
+            --rollback-metadata "$rollback_render_metadata" \
+            --release-compose "$release_render" \
+            --rollback-compose "$rollback_render"
 
       - name: Login to GHCR for immutable inspection
         uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9

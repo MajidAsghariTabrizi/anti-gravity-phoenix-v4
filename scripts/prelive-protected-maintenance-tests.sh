@@ -42,14 +42,18 @@ grep -F '[ "$ACKNOWLEDGEMENT" = DEPLOY_PRELIVE_PROTECTED_MAINTENANCE ]' \
   "$workflow" >/dev/null || fail 'exact acknowledgement guard is missing'
 grep -F 'environment: production-shadow' "$workflow" >/dev/null ||
   fail 'protected GitHub Environment is missing'
-grep -F 'REVIEWED_RELEASE_SHA: ddbc3e6820f565b41d0d0a2323f67a4187b3dd45' \
-  "$workflow" >/dev/null || fail 'reviewed v3 source is not pinned'
-grep -F 'REVIEWED_BUILD_RUN_ID: "29519008274"' "$workflow" >/dev/null ||
-  fail 'reviewed v3 build run is not pinned'
-grep -F 'REVIEWED_ROLLBACK_SHA: e84aa5eb69a749da1a01e308422d76a34f0409e8' \
-  "$workflow" >/dev/null || fail 'reviewed v2 rollback source is not pinned'
-grep -F 'REVIEWED_ROLLBACK_BUILD_RUN_ID: "29487710804"' "$workflow" >/dev/null ||
-  fail 'reviewed v2 rollback build is not pinned'
+grep -F 'RELEASE_TAG: phoenix-prelive-shadow-v4' "$workflow" >/dev/null ||
+  fail 'reviewed v4 tag is not pinned'
+grep -F 'ROLLBACK_TAG: phoenix-prelive-shadow-v3' "$workflow" >/dev/null ||
+  fail 'reviewed v3 rollback tag is not pinned'
+grep -F 'REVIEWED_RELEASE_SHA: a7f19ab165d93dafb4bcc20463f9d010f587281a' \
+  "$workflow" >/dev/null || fail 'reviewed v4 source is not pinned'
+grep -F 'REVIEWED_BUILD_RUN_ID: "29638026962"' "$workflow" >/dev/null ||
+  fail 'reviewed v4 build run is not pinned'
+grep -F 'REVIEWED_ROLLBACK_SHA: ddbc3e6820f565b41d0d0a2323f67a4187b3dd45' \
+  "$workflow" >/dev/null || fail 'reviewed v3 rollback source is not pinned'
+grep -F 'REVIEWED_ROLLBACK_BUILD_RUN_ID: "29519008274"' "$workflow" >/dev/null ||
+  fail 'reviewed v3 rollback build is not pinned'
 
 grep -F 'phoenix-release-assets-${{ inputs.rollback_sha }}' "$workflow" >/dev/null ||
   fail 'complete rollback assets are not downloaded'
@@ -62,6 +66,8 @@ for path_binding in \
   'rollback_root="$PWD/rollback-tree/phoenix-release-${ROLLBACK_SHA}"' \
   'release_manifest="$PWD/release/release-manifest.json"' \
   'rollback_manifest="$PWD/rollback/release-manifest.json"' \
+  'release_assets_manifest="$PWD/release-assets/release-assets-manifest.json"' \
+  'rollback_assets_manifest="$PWD/rollback-assets/release-assets-manifest.json"' \
   'maintenance_plan="$PWD/protected-maintenance-plan.json"' \
   'validation_env="$PWD/maintenance-validation.env"' \
   'release_validation_env="$PWD/release-validation.env"' \
@@ -84,6 +90,8 @@ validator_env_count=$(
 for canonical_use in \
   '--manifest "$release_manifest"' \
   '--manifest "$rollback_manifest"' \
+  '--release-assets-manifest "$release_assets_manifest"' \
+  '--rollback-assets-manifest "$rollback_assets_manifest"' \
   '--output "$release_validation_env"' \
   '--output "$rollback_validation_env"' \
   '--env-file "$validation_env"' \
@@ -95,7 +103,9 @@ for canonical_use in \
   '--metadata-output "$rollback_render_metadata"' \
   '--plan "$maintenance_plan"' \
   '--release-metadata "$release_render_metadata"' \
-  '--rollback-metadata "$rollback_render_metadata"'
+  '--rollback-metadata "$rollback_render_metadata"' \
+  '--release-compose "$release_render"' \
+  '--rollback-compose "$rollback_render"'
 do
   grep -F -- "$canonical_use" "$workflow" >/dev/null ||
     fail "canonical render-contract use is missing: $canonical_use"
@@ -104,12 +114,44 @@ grep -F 'image-refs.tsv' "$workflow" >/dev/null ||
   fail 'digest-pinned image inspection is missing'
 grep -F 'org.opencontainers.image.revision' "$workflow" >/dev/null ||
   fail 'OCI revision verification is missing'
+grep -F -- '--release-compose "$state_dir/release.compose.json"' "$runtime" \
+  >/dev/null ||
+  fail 'remote candidate render is absent from semantic comparison'
+grep -F -- '--rollback-compose "$state_dir/rollback.compose.json"' "$runtime" \
+  >/dev/null ||
+  fail 'remote rollback render is absent from semantic comparison'
 
 oci_line=$(grep -n 'Verify every image digest and OCI revision before SSH' "$workflow" | cut -d: -f1)
+release_render_line=$(
+  grep -n '"$release_root/scripts/render-production-compose.sh"' "$workflow" |
+    cut -d: -f1
+)
+rollback_render_line=$(
+  grep -n '"$rollback_root/scripts/render-production-compose.sh"' "$workflow" |
+    cut -d: -f1
+)
+plan_line=$(
+  grep -n 'scripts/prelive_protected_maintenance.py plan' "$workflow" |
+    cut -d: -f1
+)
+render_pair_line=$(
+  grep -n 'scripts/prelive_protected_maintenance.py validate-render-pair' "$workflow" |
+    cut -d: -f1
+)
 ssh_install_line=$(grep -n 'Install SSH material' "$workflow" | cut -d: -f1)
 ssh_run_line=$(grep -n 'Run bounded protected maintenance' "$workflow" | cut -d: -f1)
-[ -n "$oci_line" ] && [ -n "$ssh_install_line" ] && [ -n "$ssh_run_line" ] ||
+[ -n "$release_render_line" ] &&
+  [ -n "$rollback_render_line" ] &&
+  [ -n "$plan_line" ] &&
+  [ -n "$render_pair_line" ] &&
+  [ -n "$oci_line" ] &&
+  [ -n "$ssh_install_line" ] &&
+  [ -n "$ssh_run_line" ] ||
   fail 'workflow gate ordering markers are missing'
+[ "$release_render_line" -lt "$plan_line" ] &&
+  [ "$rollback_render_line" -lt "$plan_line" ] &&
+  [ "$plan_line" -lt "$render_pair_line" ] ||
+  fail 'final plan approval occurs before both exact renders'
 [ "$oci_line" -lt "$ssh_install_line" ] && [ "$ssh_install_line" -lt "$ssh_run_line" ] ||
   fail 'an SSH step occurs before immutable preflight completes'
 
@@ -197,11 +239,12 @@ mkdir -p \
   "$fixture/release" \
   "$fixture/rollback"
 
-release_sha=ddbc3e6820f565b41d0d0a2323f67a4187b3dd45
-rollback_sha=e84aa5eb69a749da1a01e308422d76a34f0409e8
+release_sha=a7f19ab165d93dafb4bcc20463f9d010f587281a
+rollback_sha=ddbc3e6820f565b41d0d0a2323f67a4187b3dd45
 printf '{}\n' >"$fixture/release/release-manifest.json"
 printf '{}\n' >"$fixture/rollback/release-manifest.json"
-printf '{}\n' >"$fixture/protected-maintenance-plan.json"
+printf '{}\n' >"$fixture/release-assets/release-assets-manifest.json"
+printf '{}\n' >"$fixture/rollback-assets/release-assets-manifest.json"
 : >"$fixture_scripts/prelive_protected_maintenance.py"
 
 validator_template=$tmp_dir/fixture-validate-production-env.sh
@@ -313,25 +356,74 @@ case "${1-}" in
     printf '%s\n' "$output" >>"$CONTEXT_TRACE"
     ;;
   */prelive_protected_maintenance.py)
-    [ "${2-}" = validate-render-pair ] || exit 114
+    command=${2-}
     shift 2
-    plan=
-    release_metadata=
-    rollback_metadata=
-    while [ "$#" -gt 0 ]; do
-      case "$1" in
-        --plan) plan=$2; shift 2 ;;
-        --release-metadata) release_metadata=$2; shift 2 ;;
-        --rollback-metadata) rollback_metadata=$2; shift 2 ;;
-        *) shift ;;
-      esac
-    done
-    is_absolute "$plan" || exit 115
-    is_absolute "$release_metadata" || exit 116
-    is_absolute "$rollback_metadata" || exit 117
-    printf '%s\t%s\t%s\n' \
-      "$plan" "$release_metadata" "$rollback_metadata" >>"$VALIDATE_TRACE"
-    [ "${FAIL_RENDER_PAIR:-0}" -eq 0 ] || exit 118
+    case "$command" in
+      plan)
+        release_manifest=
+        rollback_manifest=
+        release_assets_manifest=
+        rollback_assets_manifest=
+        output=
+        while [ "$#" -gt 0 ]; do
+          case "$1" in
+            --release-manifest) release_manifest=$2; shift 2 ;;
+            --rollback-manifest) rollback_manifest=$2; shift 2 ;;
+            --release-assets-manifest) release_assets_manifest=$2; shift 2 ;;
+            --rollback-assets-manifest) rollback_assets_manifest=$2; shift 2 ;;
+            --output) output=$2; shift 2 ;;
+            *) shift ;;
+          esac
+        done
+        for plan_path in \
+          "$release_manifest" \
+          "$rollback_manifest" \
+          "$release_assets_manifest" \
+          "$rollback_assets_manifest" \
+          "$output"
+        do
+          is_absolute "$plan_path" || exit 114
+        done
+        printf '{}\n' >"$output"
+        printf '%s\n' "$output" >>"$PLAN_TRACE"
+        ;;
+      validate-render-pair)
+        plan=
+        release_metadata=
+        rollback_metadata=
+        release_compose=
+        rollback_compose=
+        while [ "$#" -gt 0 ]; do
+          case "$1" in
+            --plan) plan=$2; shift 2 ;;
+            --release-metadata) release_metadata=$2; shift 2 ;;
+            --rollback-metadata) rollback_metadata=$2; shift 2 ;;
+            --release-compose) release_compose=$2; shift 2 ;;
+            --rollback-compose) rollback_compose=$2; shift 2 ;;
+            *) shift ;;
+          esac
+        done
+        for render_path in \
+          "$plan" \
+          "$release_metadata" \
+          "$rollback_metadata" \
+          "$release_compose" \
+          "$rollback_compose"
+        do
+          is_absolute "$render_path" || exit 115
+        done
+        printf '%s\t%s\t%s\t%s\t%s\n' \
+          "$plan" \
+          "$release_metadata" \
+          "$rollback_metadata" \
+          "$release_compose" \
+          "$rollback_compose" >>"$VALIDATE_TRACE"
+        [ "${FAIL_RENDER_PAIR:-0}" -eq 0 ] || exit 118
+        ;;
+      *)
+        exit 119
+        ;;
+    esac
     ;;
   *)
     exit 119
@@ -368,10 +460,12 @@ validator_trace=$tmp_dir/validator.trace
 context_trace=$tmp_dir/context.trace
 render_trace=$tmp_dir/render.trace
 validate_trace=$tmp_dir/validate.trace
+plan_trace=$tmp_dir/plan.trace
 : >"$validator_trace"
 : >"$context_trace"
 : >"$render_trace"
 : >"$validate_trace"
+: >"$plan_trace"
 export EXPECTED_VALIDATION_ENV="$expected_validation_env"
 export EXPECTED_RELEASE_VALIDATION_ENV="$expected_release_validation_env"
 export EXPECTED_ROLLBACK_VALIDATION_ENV="$expected_rollback_validation_env"
@@ -379,6 +473,7 @@ export VALIDATOR_TRACE="$validator_trace"
 export CONTEXT_TRACE="$context_trace"
 export RENDER_TRACE="$render_trace"
 export VALIDATE_TRACE="$validate_trace"
+export PLAN_TRACE="$plan_trace"
 
 (
   cd "$fixture"
@@ -405,6 +500,8 @@ grep -Fx "$expected_rollback_validation_env" "$context_trace" >/dev/null ||
   fail 'rollback manifest-env output is not canonical'
 [ "$(wc -l <"$render_trace" | tr -d ' ')" -eq 2 ] ||
   fail 'release and rollback renders were not both invoked'
+[ -s "$plan_trace" ] ||
+  fail 'workflow fixture did not create the final plan after rendering'
 [ -s "$validate_trace" ] ||
   fail 'workflow fixture did not reach validate-render-pair'
 
