@@ -1,5 +1,6 @@
 use phoenix_recorder::dispatcher::{
-    dispatch_once, DispatchConfig, DispatcherError, DispatcherMetrics, DispatcherReadiness,
+    dispatch_once, refresh_backlog_telemetry, DispatchConfig, DispatcherError, DispatcherMetrics,
+    DispatcherReadiness,
 };
 use phoenix_recorder::engine_outbox::{OutboxError, OutboxStore, PostgresOutbox};
 use phoenix_recorder::engine_stream::{
@@ -16,6 +17,7 @@ use tokio_util::sync::CancellationToken;
 
 const DEPENDENCY_RETRY: Duration = Duration::from_secs(1);
 const NATS_PROBE_INTERVAL: Duration = Duration::from_secs(5);
+const BACKLOG_STATEMENT_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Clone, Debug)]
 struct Config {
@@ -25,6 +27,7 @@ struct Config {
     nats_url: String,
     dispatch: DispatchConfig,
     idle_poll: Duration,
+    backlog_refresh: Duration,
 }
 
 impl Config {
@@ -63,6 +66,13 @@ impl Config {
         if idle_poll < Duration::from_millis(25) || idle_poll > Duration::from_secs(5) {
             return Err("invalid Shadow Dispatcher polling configuration");
         }
+        let backlog_refresh = Duration::from_secs(optional_u64(
+            "SHADOW_DISPATCHER_BACKLOG_REFRESH_SECONDS",
+            60,
+        )?);
+        if !valid_backlog_refresh(backlog_refresh) {
+            return Err("invalid Shadow Dispatcher backlog refresh configuration");
+        }
         Ok(Self {
             health_addr: std::env::var("SHADOW_DISPATCHER_HEALTH_ADDR")
                 .unwrap_or_else(|_| "0.0.0.0:9500".to_string()),
@@ -71,6 +81,7 @@ impl Config {
             nats_url: required_env("NATS_URL")?,
             dispatch,
             idle_poll,
+            backlog_refresh,
         })
     }
 }
@@ -96,7 +107,9 @@ async fn run() -> Result<(), &'static str> {
         stream = ENGINE_STREAM_NAME,
         subject = ENGINE_SUBJECT,
         batch_max_messages = config.dispatch.batch_size,
-        lease_seconds = config.dispatch.lease.as_secs()
+        lease_seconds = config.dispatch.lease.as_secs(),
+        backlog_refresh_seconds = config.backlog_refresh.as_secs(),
+        backlog_statement_timeout_ms = BACKLOG_STATEMENT_TIMEOUT.as_millis() as u64
     );
 
     let health_task = tokio::spawn(serve_health(
@@ -176,6 +189,14 @@ async fn run() -> Result<(), &'static str> {
         }
 
         let publisher = JetStreamEnginePublisher::new(client.clone());
+        let telemetry_shutdown = shutdown.child_token();
+        let telemetry_task = tokio::spawn(run_backlog_telemetry(
+            store.clone(),
+            metrics.clone(),
+            telemetry_shutdown.clone(),
+            config.backlog_refresh,
+            BACKLOG_STATEMENT_TIMEOUT,
+        ));
         let mut last_nats_probe = Instant::now();
         loop {
             if shutdown.is_cancelled() {
@@ -226,6 +247,8 @@ async fn run() -> Result<(), &'static str> {
                 }
             }
         }
+        telemetry_shutdown.cancel();
+        let _ = telemetry_task.await;
         if terminal_failure || shutdown.is_cancelled() {
             break;
         }
@@ -242,6 +265,27 @@ async fn run() -> Result<(), &'static str> {
         Err("Shadow Dispatcher stopped on terminal integrity failure")
     } else {
         Ok(())
+    }
+}
+
+async fn run_backlog_telemetry(
+    store: PostgresOutbox,
+    metrics: DispatcherMetrics,
+    shutdown: CancellationToken,
+    refresh_interval: Duration,
+    statement_timeout: Duration,
+) {
+    loop {
+        if let Err(error) = refresh_backlog_telemetry(&store, &metrics, statement_timeout).await {
+            tracing::warn!(
+                event = "shadow_dispatcher_backlog_refresh_failed",
+                error_class = error.class(),
+                retry_delay_seconds = refresh_interval.as_secs()
+            );
+        }
+        if sleep_or_shutdown(refresh_interval, &shutdown).await {
+            return;
+        }
     }
 }
 
@@ -359,6 +403,10 @@ fn valid_owner(value: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
 }
 
+fn valid_backlog_refresh(value: Duration) -> bool {
+    (Duration::from_secs(10)..=Duration::from_secs(300)).contains(&value)
+}
+
 fn optional_usize(name: &'static str, default: usize) -> Result<usize, &'static str> {
     match std::env::var(name) {
         Ok(value) => value
@@ -452,6 +500,15 @@ mod tests {
         assert!(valid_owner("shadow-dispatcher-1"));
         assert!(!valid_owner("dispatcher with spaces"));
         assert!(!valid_owner(&"a".repeat(129)));
+    }
+
+    #[test]
+    fn backlog_refresh_interval_is_bounded() {
+        assert!(valid_backlog_refresh(Duration::from_secs(10)));
+        assert!(valid_backlog_refresh(Duration::from_secs(60)));
+        assert!(valid_backlog_refresh(Duration::from_secs(300)));
+        assert!(!valid_backlog_refresh(Duration::from_secs(9)));
+        assert!(!valid_backlog_refresh(Duration::from_secs(301)));
     }
 
     #[test]

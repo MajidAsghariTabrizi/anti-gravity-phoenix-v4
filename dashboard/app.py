@@ -384,6 +384,33 @@ def _render_jetstream(snapshot: DashboardSnapshot) -> None:
     )
 
 
+def _render_money_path_ingress(snapshot: DashboardSnapshot) -> None:
+    ingress = snapshot.data["money_path_ingress"]
+    _metric_grid(
+        [
+            ("Feed inputs", ingress["feed_inputs_total"]),
+            ("Irrelevant filtered", ingress["irrelevant_filtered_total"]),
+            ("Unsupported interesting", ingress["unsupported_interesting_total"]),
+            ("Relevant route inputs", ingress["relevant_route_inputs_total"]),
+            ("Persistence ratio", ingress["persistence_ratio"]),
+            ("Raw rows avoided", ingress["raw_rows_avoided_total"]),
+            ("Relevant commits", ingress["relevant_transactions_committed_total"]),
+            ("Relevant failures", ingress["relevant_transaction_failures_total"]),
+            ("Bounded samples", ingress["bounded_samples_total"]),
+            ("Sample limit reached", ingress["sample_limit_reached_total"]),
+            ("Dispatcher published", ingress["dispatcher_rows_published_total"]),
+            ("Pending rows estimate", ingress["dispatcher_pending_rows_estimate"]),
+            (
+                "Oldest claimable (s)",
+                ingress["dispatcher_oldest_claimable_age_seconds"],
+            ),
+            ("Backlog telemetry stale (s)", ingress["dispatcher_backlog_stale_seconds"]),
+            ("Projected runway (days)", ingress["projected_disk_runway_days"]),
+        ],
+        width=5,
+    )
+
+
 def _render_postgres(snapshot: DashboardSnapshot) -> None:
     postgres = snapshot.data["postgres"]
     _metric_grid(
@@ -591,6 +618,7 @@ def main() -> None:
             "Feed Quality",
             "RPC Verification",
             "JetStream & Recorder",
+            "Selective Persistence",
             "PostgreSQL",
             "Reliability",
             "Fork Simulation",
@@ -607,6 +635,7 @@ def main() -> None:
         _render_feed,
         _render_rpc,
         _render_jetstream,
+        _render_money_path_ingress,
         _render_postgres,
         _render_reliability,
         _render_fork,

@@ -1,3 +1,5 @@
+use money_path_classifier::MoneyPathClassifier;
+use phoenix_recorder::ingress::{IngressBuffer, IngressBufferConfig};
 use phoenix_recorder::jetstream::{
     ensure_durable_pipeline, MessageFetcher, CONSUMER_ACK_WAIT, CONSUMER_MAX_ACK_PENDING,
     DURABLE_CONSUMER_NAME, STREAM_NAME,
@@ -6,8 +8,9 @@ use phoenix_recorder::logging::LogSampler;
 use phoenix_recorder::metrics::Metrics;
 use phoenix_recorder::persistence::{EventStore, PostgresStore};
 use phoenix_recorder::runtime::{
-    consume_durable_messages, mark_nats_connected, mark_nats_disconnected, monitor_database,
-    nats_connect_options, BatchConfig, ConsumerExit, RetryPolicy,
+    consume_durable_messages, flush_ingress_evidence, mark_nats_connected, mark_nats_disconnected,
+    monitor_database, nats_connect_options, BatchConfig, ConsumerExit, PrePersistenceClassifier,
+    RetryPolicy,
 };
 use phoenix_recorder::state::Readiness;
 use std::error::Error;
@@ -28,16 +31,42 @@ struct Config {
     pg_ssl_mode: String,
     nats_url: String,
     batch: BatchConfig,
+    classifier: MoneyPathClassifier,
+    ingress: IngressBufferConfig,
+    persistence_policy: PersistencePolicy,
 }
 
 impl Config {
     fn from_env() -> Result<Self, &'static str> {
+        validate_shadow_safety()?;
+        let persistence_policy =
+            PersistencePolicy::parse(&required_env("RECORDER_PERSISTENCE_POLICY")?)?;
+        let router_addresses = parse_router_addresses(&required_env("ENGINE_ROUTER_ADDRESSES")?)?;
+        let classifier = MoneyPathClassifier::from_release(
+            &router_addresses,
+            &required_env("ENGINE_ROUTE_REGISTRY_JSON")?,
+        )
+        .map_err(|_| "invalid Recorder money-path classifier configuration")?;
         let batch = BatchConfig {
             max_size: optional_usize("RECORDER_BATCH_MAX_SIZE", 256)?,
             max_wait: Duration::from_millis(optional_u64("RECORDER_BATCH_MAX_WAIT_MS", 100)?),
         }
         .validate()
         .map_err(|_| "invalid Recorder batch configuration")?;
+        let ingress = IngressBufferConfig {
+            flush_interval: Duration::from_secs(optional_u64(
+                "RECORDER_AGGREGATE_FLUSH_SECONDS",
+                60,
+            )?),
+            flush_after_events: optional_usize("RECORDER_AGGREGATE_FLUSH_EVENTS", 10_000)?,
+            max_samples_per_detail_per_day: optional_usize(
+                "RECORDER_MAX_SAMPLES_PER_DETAIL_PER_DAY",
+                100,
+            )?,
+            max_sample_json_bytes: optional_usize("RECORDER_MAX_SAMPLE_JSON_BYTES", 1_024)?,
+        }
+        .validate()
+        .map_err(|_| "invalid Recorder ingress evidence configuration")?;
         Ok(Self {
             health_addr: std::env::var("RECORDER_HEALTH_ADDR")
                 .unwrap_or_else(|_| "0.0.0.0:9400".to_string()),
@@ -45,8 +74,58 @@ impl Config {
             pg_ssl_mode: std::env::var("PGSSLMODE").unwrap_or_else(|_| "prefer".to_string()),
             nats_url: required_env("NATS_URL")?,
             batch,
+            classifier,
+            ingress,
+            persistence_policy,
         })
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PersistencePolicy {
+    MoneyPathV1,
+}
+
+impl PersistencePolicy {
+    fn parse(value: &str) -> Result<Self, &'static str> {
+        match value {
+            "money_path_v1" => Ok(Self::MoneyPathV1),
+            _ => Err("RECORDER_PERSISTENCE_POLICY must be money_path_v1"),
+        }
+    }
+
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::MoneyPathV1 => "money_path_v1",
+        }
+    }
+}
+
+fn validate_shadow_safety() -> Result<(), &'static str> {
+    if std::env::var("PHOENIX_MODE").ok().as_deref() != Some("SHADOW")
+        || std::env::var("LIVE_EXECUTION").ok().as_deref() != Some("false")
+    {
+        return Err("Recorder requires fail-closed SHADOW mode");
+    }
+    for name in ["SIGNER_PRIVATE_KEY", "EXECUTOR_ADDRESS", "WALLET_ADDRESS"] {
+        if std::env::var(name).unwrap_or_default() != "" {
+            return Err("Recorder SHADOW execution configuration must remain empty");
+        }
+    }
+    Ok(())
+}
+
+fn parse_router_addresses(raw: &str) -> Result<Vec<String>, &'static str> {
+    let values = raw
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    if values.is_empty() || values.join(",") != raw {
+        return Err("ENGINE_ROUTER_ADDRESSES is invalid");
+    }
+    Ok(values)
 }
 
 fn optional_usize(name: &'static str, default: usize) -> Result<usize, &'static str> {
@@ -111,6 +190,9 @@ async fn run_daemon() -> Result<(), &'static str> {
     let metrics = Metrics::default();
     let sampler = LogSampler::default();
     let shutdown = CancellationToken::new();
+    let classifier: Arc<dyn PrePersistenceClassifier> = Arc::new(config.classifier.clone());
+    let ingress = IngressBuffer::new(config.ingress.clone())
+        .map_err(|_| "Recorder ingress evidence configuration invalid")?;
 
     tracing::info!(
         event = "recorder_startup",
@@ -121,7 +203,11 @@ async fn run_daemon() -> Result<(), &'static str> {
         batch_max_messages = config.batch.max_size,
         batch_max_wait_ms = config.batch.max_wait.as_millis() as u64,
         max_ack_pending = CONSUMER_MAX_ACK_PENDING,
-        ack_wait_seconds = CONSUMER_ACK_WAIT.as_secs()
+        ack_wait_seconds = CONSUMER_ACK_WAIT.as_secs(),
+        persistence_policy = config.persistence_policy.as_str(),
+        aggregate_flush_seconds = config.ingress.flush_interval.as_secs(),
+        aggregate_flush_events = config.ingress.flush_after_events,
+        max_samples_per_detail_per_day = config.ingress.max_samples_per_detail_per_day
     );
 
     let health_task = tokio::spawn(serve_health(
@@ -155,6 +241,13 @@ async fn run_daemon() -> Result<(), &'static str> {
         sampler.clone(),
         shutdown.clone(),
         Duration::from_secs(5),
+    ));
+    let ingress_flush = tokio::spawn(flush_ingress_evidence(
+        store.clone(),
+        ingress.clone(),
+        metrics.clone(),
+        sampler.clone(),
+        shutdown.clone(),
     ));
 
     let disconnected = Arc::new(AtomicBool::new(false));
@@ -222,6 +315,8 @@ async fn run_daemon() -> Result<(), &'static str> {
         let exit = consume_durable_messages(
             fetcher,
             store.clone(),
+            classifier.clone(),
+            ingress.clone(),
             readiness.clone(),
             metrics.clone(),
             sampler.clone(),
@@ -249,6 +344,7 @@ async fn run_daemon() -> Result<(), &'static str> {
 
     shutdown.cancel();
     let _ = database_monitor.await;
+    let _ = ingress_flush.await;
     readiness.stop_event_loop();
     let _ = health_task.await;
     tracing::info!(event = "recorder_graceful_shutdown_complete");
@@ -482,5 +578,23 @@ mod tests {
 
         let metric_response = request("/metrics", readiness, metrics).await;
         assert!(metric_response.contains("recorder_readiness 1"));
+    }
+
+    #[test]
+    fn persistence_policy_is_explicit_and_unknown_values_fail() {
+        assert_eq!(
+            PersistencePolicy::parse("money_path_v1"),
+            Ok(PersistencePolicy::MoneyPathV1)
+        );
+        assert!(PersistencePolicy::parse("all_events").is_err());
+        assert!(PersistencePolicy::parse("").is_err());
+    }
+
+    #[test]
+    fn reviewed_router_list_is_exact_and_unambiguous() {
+        let raw = money_path_classifier::REVIEWED_ROUTER_ADDRESSES.join(",");
+        assert_eq!(parse_router_addresses(&raw).unwrap().len(), 3);
+        assert!(parse_router_addresses("router, with, spaces").is_err());
+        assert!(parse_router_addresses("").is_err());
     }
 }

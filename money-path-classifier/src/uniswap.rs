@@ -1,6 +1,6 @@
 use super::{
-    DecodedSwap, DecodedSwapKind, OriginEvidence, OuterSelectorKind, RouterKind, UnsupportedReason,
-    WrapperKind,
+    DecodeOutcome, DecodedSwap, DecodedSwapKind, OriginEvidence, OuterSelectorKind, RouterKind,
+    UnsupportedReason, WrapperKind,
 };
 use crate::domain::{Address, Amount, PoolId};
 use ethabi::{ParamType, Token};
@@ -15,12 +15,6 @@ const MAX_PERMIT_DETAILS: usize = 16;
 const MAX_SIGNATURE_BYTES: usize = 4 * 1024;
 const UNIVERSAL_COMMAND_MASK: u8 = 0x3f;
 const UNIVERSAL_ALLOW_REVERT: u8 = 0x80;
-
-pub(super) enum DecodeOutcome {
-    Supported(DecodedSwap),
-    Unsupported(OriginEvidence),
-    Malformed(OriginEvidence),
-}
 
 #[derive(Clone, Debug)]
 struct Selectors {
@@ -45,7 +39,7 @@ struct Selectors {
 
 static SELECTORS: OnceLock<Selectors> = OnceLock::new();
 
-pub(super) fn classify(router_kind: RouterKind, calldata: &str) -> DecodeOutcome {
+pub(crate) fn classify(router_kind: RouterKind, calldata: &str) -> DecodeOutcome {
     let bytes = match decode_calldata(calldata) {
         Ok(bytes) => bytes,
         Err(()) => {

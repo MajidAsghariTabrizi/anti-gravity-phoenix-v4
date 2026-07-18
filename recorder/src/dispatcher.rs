@@ -1,8 +1,8 @@
-use crate::engine_outbox::{OutboxError, OutboxStore, PendingState, MAX_CLAIM_BATCH};
+use crate::engine_outbox::{BacklogTelemetry, OutboxError, OutboxStore, MAX_CLAIM_BATCH};
 use crate::engine_stream::{EnginePublisher, EngineStreamError};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -70,9 +70,13 @@ struct MetricValues {
     retries: AtomicU64,
     retry_recoveries: AtomicU64,
     terminal_integrity_failures: AtomicU64,
-    pending_rows: AtomicU64,
-    oldest_pending_age_nanos: AtomicU64,
+    pending_rows_estimate: AtomicU64,
+    oldest_claimable_age_nanos: AtomicU64,
+    backlog_refresh_total: AtomicU64,
+    backlog_refresh_failures: AtomicU64,
+    backlog_last_success_unix_seconds: AtomicU64,
     batch_size: AtomicU64,
+    batch_cycle_nanos: AtomicU64,
     publish_latency_nanos: AtomicU64,
 }
 
@@ -114,20 +118,51 @@ impl DispatcherMetrics {
             .fetch_add(1, Ordering::Relaxed);
     }
 
-    pub fn set_pending(&self, state: PendingState) {
-        self.inner.pending_rows.store(state.rows, Ordering::Relaxed);
-        let nanos =
-            (state.oldest_age_seconds.max(0.0) * 1_000_000_000.0).min(u64::MAX as f64) as u64;
+    pub fn batch_cycle(&self, duration: Duration) {
+        self.inner.batch_cycle_nanos.store(
+            duration.as_nanos().min(u64::MAX as u128) as u64,
+            Ordering::Relaxed,
+        );
+    }
+
+    pub fn backlog_refresh_succeeded(&self, state: BacklogTelemetry) {
         self.inner
-            .oldest_pending_age_nanos
+            .backlog_refresh_total
+            .fetch_add(1, Ordering::Relaxed);
+        self.inner
+            .pending_rows_estimate
+            .store(state.pending_rows_estimate, Ordering::Relaxed);
+        let nanos = (state.oldest_claimable_age_seconds.max(0.0) * 1_000_000_000.0)
+            .min(u64::MAX as f64) as u64;
+        self.inner
+            .oldest_claimable_age_nanos
             .store(nanos, Ordering::Relaxed);
+        self.inner
+            .backlog_last_success_unix_seconds
+            .store(unix_seconds(), Ordering::Relaxed);
+    }
+
+    pub fn backlog_refresh_failed(&self) {
+        self.inner
+            .backlog_refresh_total
+            .fetch_add(1, Ordering::Relaxed);
+        self.inner
+            .backlog_refresh_failures
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn render(&self, readiness: &DispatcherReadiness) -> String {
+        let last_success = self
+            .inner
+            .backlog_last_success_unix_seconds
+            .load(Ordering::Relaxed);
+        let backlog_stale_seconds = unix_seconds().saturating_sub(last_success);
         format!(
             concat!(
                 "# TYPE shadow_dispatcher_rows_claimed_total counter\n",
                 "shadow_dispatcher_rows_claimed_total {}\n",
+                "# TYPE shadow_dispatcher_rows_published_total counter\n",
+                "shadow_dispatcher_rows_published_total {}\n",
                 "# TYPE shadow_dispatcher_publish_success_total counter\n",
                 "shadow_dispatcher_publish_success_total {}\n",
                 "# TYPE shadow_dispatcher_publish_failures_total counter\n",
@@ -138,12 +173,21 @@ impl DispatcherMetrics {
                 "shadow_dispatcher_retry_recoveries_total {}\n",
                 "# TYPE shadow_dispatcher_terminal_integrity_failures_total counter\n",
                 "shadow_dispatcher_terminal_integrity_failures_total {}\n",
-                "# TYPE shadow_dispatcher_pending_rows gauge\n",
-                "shadow_dispatcher_pending_rows {}\n",
-                "# TYPE shadow_dispatcher_oldest_pending_age_seconds gauge\n",
-                "shadow_dispatcher_oldest_pending_age_seconds {:.9}\n",
+                "# HELP shadow_dispatcher_pending_rows_estimate Estimated unpublished rows from PostgreSQL partial-index statistics.\n",
+                "# TYPE shadow_dispatcher_pending_rows_estimate gauge\n",
+                "shadow_dispatcher_pending_rows_estimate {}\n",
+                "# TYPE shadow_dispatcher_oldest_claimable_age_seconds gauge\n",
+                "shadow_dispatcher_oldest_claimable_age_seconds {:.9}\n",
+                "# TYPE shadow_dispatcher_backlog_refresh_total counter\n",
+                "shadow_dispatcher_backlog_refresh_total {}\n",
+                "# TYPE shadow_dispatcher_backlog_refresh_failures_total counter\n",
+                "shadow_dispatcher_backlog_refresh_failures_total {}\n",
+                "# TYPE shadow_dispatcher_backlog_stale_seconds gauge\n",
+                "shadow_dispatcher_backlog_stale_seconds {}\n",
                 "# TYPE shadow_dispatcher_batch_size gauge\n",
                 "shadow_dispatcher_batch_size {}\n",
+                "# TYPE shadow_dispatcher_batch_cycle_seconds gauge\n",
+                "shadow_dispatcher_batch_cycle_seconds {:.9}\n",
                 "# TYPE shadow_dispatcher_publish_latency_seconds gauge\n",
                 "shadow_dispatcher_publish_latency_seconds {:.9}\n",
                 "# TYPE shadow_dispatcher_readiness gauge\n",
@@ -151,15 +195,25 @@ impl DispatcherMetrics {
             ),
             self.inner.rows_claimed.load(Ordering::Relaxed),
             self.inner.publish_success.load(Ordering::Relaxed),
+            self.inner.publish_success.load(Ordering::Relaxed),
             self.inner.publish_failures.load(Ordering::Relaxed),
             self.inner.retries.load(Ordering::Relaxed),
             self.inner.retry_recoveries.load(Ordering::Relaxed),
             self.inner
                 .terminal_integrity_failures
                 .load(Ordering::Relaxed),
-            self.inner.pending_rows.load(Ordering::Relaxed),
-            self.inner.oldest_pending_age_nanos.load(Ordering::Relaxed) as f64 / 1_000_000_000.0,
+            self.inner.pending_rows_estimate.load(Ordering::Relaxed),
+            self.inner
+                .oldest_claimable_age_nanos
+                .load(Ordering::Relaxed) as f64
+                / 1_000_000_000.0,
+            self.inner.backlog_refresh_total.load(Ordering::Relaxed),
+            self.inner
+                .backlog_refresh_failures
+                .load(Ordering::Relaxed),
+            backlog_stale_seconds,
             self.inner.batch_size.load(Ordering::Relaxed),
+            self.inner.batch_cycle_nanos.load(Ordering::Relaxed) as f64 / 1_000_000_000.0,
             self.inner.publish_latency_nanos.load(Ordering::Relaxed) as f64 / 1_000_000_000.0,
             u8::from(readiness.ready().is_ok()),
         )
@@ -282,6 +336,7 @@ pub async fn dispatch_once(
     readiness: &DispatcherReadiness,
     metrics: &DispatcherMetrics,
 ) -> Result<usize, DispatcherError> {
+    let cycle_started = Instant::now();
     let rows = match store
         .claim_batch(&config.owner, config.batch_size, config.lease)
         .await
@@ -341,17 +396,34 @@ pub async fn dispatch_once(
         }
     }
 
-    let pending = match store.pending_state().await {
-        Ok(pending) => pending,
-        Err(error) => {
-            readiness.set_postgres_connected(false);
-            return Err(DispatcherError::Outbox(error));
-        }
-    };
-    metrics.set_pending(pending);
     readiness.set_postgres_connected(true);
     readiness.set_publisher_active(true);
+    metrics.batch_cycle(cycle_started.elapsed());
     Ok(rows.len())
+}
+
+pub async fn refresh_backlog_telemetry(
+    store: &dyn OutboxStore,
+    metrics: &DispatcherMetrics,
+    statement_timeout: Duration,
+) -> Result<(), OutboxError> {
+    match store.backlog_telemetry(statement_timeout).await {
+        Ok(state) => {
+            metrics.backlog_refresh_succeeded(state);
+            Ok(())
+        }
+        Err(error) => {
+            metrics.backlog_refresh_failed();
+            Err(error)
+        }
+    }
+}
+
+fn unix_seconds() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
 }
 
 pub fn retry_delay(initial: Duration, maximum: Duration, attempt: u32) -> Duration {
@@ -436,10 +508,14 @@ mod tests {
             self.release_result.lock().unwrap().clone()
         }
 
-        async fn pending_state(&self) -> Result<PendingState, OutboxError> {
-            Ok(PendingState {
-                rows: 3,
-                oldest_age_seconds: 2.5,
+        async fn backlog_telemetry(
+            &self,
+            _statement_timeout: Duration,
+        ) -> Result<BacklogTelemetry, OutboxError> {
+            self.events.lock().unwrap().push("telemetry");
+            Ok(BacklogTelemetry {
+                pending_rows_estimate: 3,
+                oldest_claimable_age_seconds: 2.5,
             })
         }
     }
@@ -517,7 +593,30 @@ mod tests {
         assert!(readiness.ready().is_ok());
         let rendered = metrics.render(&readiness);
         assert!(rendered.contains("shadow_dispatcher_publish_success_total 1"));
-        assert!(rendered.contains("shadow_dispatcher_pending_rows 3"));
+        assert!(!events.lock().unwrap().contains(&"telemetry"));
+        assert!(rendered.contains("shadow_dispatcher_batch_cycle_seconds"));
+    }
+
+    #[tokio::test]
+    async fn telemetry_refresh_is_separate_and_failure_does_not_change_readiness() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let store = FakeStore::new(Vec::new(), events.clone());
+        let readiness = DispatcherReadiness::new();
+        ready_dependencies(&readiness);
+        readiness.set_publisher_active(true);
+        let metrics = DispatcherMetrics::default();
+
+        refresh_backlog_telemetry(&store, &metrics, Duration::from_secs(2))
+            .await
+            .unwrap();
+
+        assert_eq!(&*events.lock().unwrap(), &["telemetry"]);
+        assert!(readiness.ready().is_ok());
+        let rendered = metrics.render(&readiness);
+        assert!(rendered.contains("shadow_dispatcher_pending_rows_estimate 3"));
+        assert!(rendered.contains("shadow_dispatcher_oldest_claimable_age_seconds 2.500000000"));
+        assert!(rendered.contains("shadow_dispatcher_backlog_refresh_total 1"));
+        assert!(rendered.contains("shadow_dispatcher_backlog_refresh_failures_total 0"));
     }
 
     #[tokio::test]
@@ -772,14 +871,19 @@ mod tests {
         let rendered = DispatcherMetrics::default().render(&DispatcherReadiness::new());
         for required in [
             "shadow_dispatcher_rows_claimed_total",
+            "shadow_dispatcher_rows_published_total",
             "shadow_dispatcher_publish_success_total",
             "shadow_dispatcher_publish_failures_total",
             "shadow_dispatcher_retries_total",
             "shadow_dispatcher_retry_recoveries_total",
             "shadow_dispatcher_terminal_integrity_failures_total",
-            "shadow_dispatcher_pending_rows",
-            "shadow_dispatcher_oldest_pending_age_seconds",
+            "shadow_dispatcher_pending_rows_estimate",
+            "shadow_dispatcher_oldest_claimable_age_seconds",
+            "shadow_dispatcher_backlog_refresh_total",
+            "shadow_dispatcher_backlog_refresh_failures_total",
+            "shadow_dispatcher_backlog_stale_seconds",
             "shadow_dispatcher_batch_size",
+            "shadow_dispatcher_batch_cycle_seconds",
             "shadow_dispatcher_publish_latency_seconds",
             "shadow_dispatcher_readiness",
         ] {

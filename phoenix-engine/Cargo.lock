@@ -1266,6 +1266,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "money-path-classifier"
+version = "0.1.0"
+dependencies = [
+ "ethabi",
+ "hex",
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
 name = "nkeys"
 version = "0.4.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1473,6 +1484,7 @@ dependencies = [
  "ethabi",
  "futures-util",
  "hex",
+ "money-path-classifier",
  "phoenix-recorder",
  "primitive-types",
  "reqwest",
@@ -1498,6 +1510,7 @@ dependencies = [
  "chrono",
  "futures-util",
  "hex",
+ "money-path-classifier",
  "serde",
  "serde_json",
  "sqlx",

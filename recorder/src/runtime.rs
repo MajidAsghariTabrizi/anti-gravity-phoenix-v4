@@ -1,3 +1,4 @@
+use crate::ingress::{IngressBuffer, IngressError};
 use crate::jetstream::{
     Delivery, MessageFetcher, PipelineError, CONSUMER_MAX_BATCH, CONSUMER_MAX_DELIVERIES,
     POISON_REDELIVERY_DELAY,
@@ -8,6 +9,9 @@ use crate::model::{decode_message, ValidatedMessage};
 use crate::persistence::{EventStore, PersistOutcome};
 use crate::state::Readiness;
 use futures_util::{stream, StreamExt};
+use money_path_classifier::{
+    ClassificationResult, ClassifierError, IngressClassification, MoneyPathClassifier,
+};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -79,6 +83,25 @@ pub enum RuntimeConfigError {
     BatchWait,
 }
 
+pub trait PrePersistenceClassifier: Send + Sync {
+    fn classify(&self, message: &ValidatedMessage)
+        -> Result<ClassificationResult, ClassifierError>;
+}
+
+impl PrePersistenceClassifier for MoneyPathClassifier {
+    fn classify(
+        &self,
+        message: &ValidatedMessage,
+    ) -> Result<ClassificationResult, ClassifierError> {
+        MoneyPathClassifier::classify(
+            self,
+            message.tx.chain_id,
+            (!message.tx.to.is_empty()).then_some(message.tx.to.as_str()),
+            &message.tx.calldata,
+        )
+    }
+}
+
 #[derive(Default)]
 struct AckHealthTracker {
     consecutive_failures: u64,
@@ -113,6 +136,8 @@ impl AckHealthTracker {
 pub async fn consume_durable_messages(
     fetcher: Arc<dyn MessageFetcher>,
     store: Arc<dyn EventStore>,
+    classifier: Arc<dyn PrePersistenceClassifier>,
+    ingress: IngressBuffer,
     readiness: Readiness,
     metrics: Metrics,
     sampler: LogSampler,
@@ -179,6 +204,8 @@ pub async fn consume_durable_messages(
         match process_delivery_batch(
             deliveries,
             store.as_ref(),
+            classifier.as_ref(),
+            &ingress,
             &readiness,
             &metrics,
             &sampler,
@@ -206,6 +233,8 @@ enum BatchDisposition {
 async fn process_delivery_batch(
     deliveries: Vec<Delivery>,
     store: &dyn EventStore,
+    classifier: &dyn PrePersistenceClassifier,
+    ingress: &IngressBuffer,
     readiness: &Readiness,
     metrics: &Metrics,
     sampler: &LogSampler,
@@ -217,8 +246,9 @@ async fn process_delivery_batch(
         return BatchDisposition::Shutdown;
     }
 
-    let mut valid_deliveries = Vec::with_capacity(deliveries.len());
-    let mut valid_messages = Vec::with_capacity(deliveries.len());
+    let mut relevant_deliveries = Vec::with_capacity(deliveries.len());
+    let mut relevant_messages = Vec::with_capacity(deliveries.len());
+    let mut filtered_deliveries = Vec::with_capacity(deliveries.len());
     for delivery in deliveries {
         metrics.message_received();
         if delivery.delivery_count > 1 {
@@ -226,8 +256,50 @@ async fn process_delivery_batch(
         }
         match decode_message(&delivery.payload) {
             Ok(message) => {
-                valid_deliveries.push(delivery);
-                valid_messages.push(message);
+                let classification = match classifier.classify(&message) {
+                    Ok(classification) => classification,
+                    Err(error) => {
+                        readiness.mark_integrity_loss();
+                        tracing::error!(
+                            event = "recorder_money_path_classifier_failed",
+                            error_class = %error,
+                            delivery_count = delivery.delivery_count
+                        );
+                        return BatchDisposition::IntegrityFailure;
+                    }
+                };
+                metrics.classified(classification.classification);
+                match ingress.record(&classification, message.seen_at) {
+                    Ok(outcome) => {
+                        if outcome.sample_limit_reached {
+                            metrics.sample_limit_reached(1);
+                        }
+                    }
+                    Err(IngressError::SampleOversized) => {
+                        metrics.bounded_sample_failure();
+                        if let Some(suppressed) = sampler.sample("bounded_sample_failure") {
+                            tracing::warn!(
+                                event = "recorder_bounded_sample_rejected",
+                                error_class = "sample_oversized",
+                                suppressed
+                            );
+                        }
+                    }
+                    Err(error) => {
+                        readiness.mark_integrity_loss();
+                        tracing::error!(
+                            event = "recorder_ingress_evidence_invariant_failed",
+                            error_class = %error
+                        );
+                        return BatchDisposition::IntegrityFailure;
+                    }
+                }
+                if classification.classification == IngressClassification::RelevantRouteInput {
+                    relevant_deliveries.push(delivery);
+                    relevant_messages.push(message);
+                } else {
+                    filtered_deliveries.push(delivery);
+                }
             }
             Err(error) => {
                 metrics.decode_failure();
@@ -266,14 +338,23 @@ async fn process_delivery_batch(
         }
     }
 
-    if valid_messages.is_empty() {
+    acknowledge_filtered(
+        &filtered_deliveries,
+        readiness,
+        metrics,
+        sampler,
+        ack_health,
+    )
+    .await;
+
+    if relevant_messages.is_empty() {
         return BatchDisposition::Continue;
     }
 
     let outcomes = match persist_batch_with_retry(
         store,
-        &valid_messages,
-        &valid_deliveries,
+        &relevant_messages,
+        &relevant_deliveries,
         readiness,
         metrics,
         sampler,
@@ -287,18 +368,18 @@ async fn process_delivery_batch(
         None => return BatchDisposition::Shutdown,
     };
 
-    if outcomes.len() != valid_messages.len() {
+    if outcomes.len() != relevant_messages.len() {
         readiness.mark_integrity_loss();
         tracing::error!(
             event = "recorder_batch_outcome_cardinality_mismatch",
-            messages = valid_messages.len(),
+            messages = relevant_messages.len(),
             outcomes = outcomes.len()
         );
         return BatchDisposition::IntegrityFailure;
     }
 
-    record_persist_outcomes(&valid_messages, &outcomes, metrics);
-    let ack_results = stream::iter(valid_deliveries.iter().map(|delivery| {
+    record_persist_outcomes(&relevant_messages, &outcomes, metrics);
+    let ack_results = stream::iter(relevant_deliveries.iter().map(|delivery| {
         let acker = delivery.acker.clone();
         async move { acker.ack_confirmed().await }
     }))
@@ -356,6 +437,7 @@ async fn persist_batch_with_retry(
                 failed_attempts = failed_attempts.saturating_add(1);
                 metrics.database_failure();
                 metrics.database_retry();
+                metrics.relevant_transaction_failure();
                 readiness.set_postgres_connected(false);
                 readiness.set_persistence_healthy(false);
                 if let Some(suppressed) = sampler.sample("database_failure") {
@@ -391,6 +473,7 @@ fn record_persist_outcomes(
     metrics: &Metrics,
 ) {
     for (message, outcome) in messages.iter().zip(outcomes) {
+        metrics.relevant_transaction_committed();
         if outcome.feed_event_inserted
             || outcome.origin_transaction_inserted
             || outcome.engine_outbox_inserted
@@ -409,6 +492,92 @@ fn record_persist_outcomes(
             || !outcome.engine_outbox_inserted
         {
             metrics.duplicate_skip();
+        }
+    }
+}
+
+async fn acknowledge_filtered(
+    deliveries: &[Delivery],
+    readiness: &Readiness,
+    metrics: &Metrics,
+    sampler: &LogSampler,
+    ack_health: &mut AckHealthTracker,
+) {
+    let ack_results = stream::iter(deliveries.iter().map(|delivery| {
+        let acker = delivery.acker.clone();
+        async move { acker.ack_confirmed().await }
+    }))
+    .buffer_unordered(MAX_CONCURRENT_ACKS)
+    .collect::<Vec<_>>()
+    .await;
+    for result in ack_results {
+        if !ack_health.observe(result, readiness, metrics) {
+            sampled_ack_failure(sampler, "filtered_confirmed_ack_failure");
+        }
+    }
+}
+
+pub async fn flush_ingress_evidence(
+    store: Arc<dyn EventStore>,
+    ingress: IngressBuffer,
+    metrics: Metrics,
+    sampler: LogSampler,
+    shutdown: CancellationToken,
+) {
+    let interval = ingress.config().flush_interval;
+    let mut ticker = tokio::time::interval(interval);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    ticker.tick().await;
+    loop {
+        tokio::select! {
+            _ = shutdown.cancelled() => {
+                let _ = flush_ingress_once(store.as_ref(), &ingress, &metrics, &sampler).await;
+                return;
+            }
+            _ = ticker.tick() => {}
+            _ = ingress.wait_for_flush_request() => {}
+        }
+        let _ = flush_ingress_once(store.as_ref(), &ingress, &metrics, &sampler).await;
+    }
+}
+
+async fn flush_ingress_once(
+    store: &dyn EventStore,
+    ingress: &IngressBuffer,
+    metrics: &Metrics,
+    sampler: &LogSampler,
+) -> Result<(), ()> {
+    let batch = match ingress.take() {
+        Ok(batch) if !batch.is_empty() => batch,
+        Ok(_) => return Ok(()),
+        Err(_) => {
+            metrics.aggregate_flush_failure();
+            return Err(());
+        }
+    };
+    match store
+        .persist_ingress_evidence(&batch, ingress.config().max_samples_per_detail_per_day)
+        .await
+    {
+        Ok(outcome) => {
+            metrics.aggregate_flush();
+            metrics.bounded_samples(outcome.samples_inserted);
+            metrics.sample_limit_reached(outcome.sample_limit_reached);
+            Ok(())
+        }
+        Err(error) => {
+            metrics.aggregate_flush_failure();
+            if ingress.restore(batch).is_err() {
+                metrics.bounded_sample_failure();
+            }
+            if let Some(suppressed) = sampler.sample("ingress_evidence_flush_failure") {
+                tracing::warn!(
+                    event = "recorder_ingress_evidence_flush_failed",
+                    error_class = %error,
+                    suppressed
+                );
+            }
+            Err(())
         }
     }
 }
@@ -564,10 +733,14 @@ pub fn mark_nats_disconnected(readiness: &Readiness, disconnected_since_last_con
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ingress::IngressBufferConfig;
     use crate::jetstream::{ConsumerState, DeliveryAcker};
     use crate::model::{ARBITRUM_ONE_CHAIN_ID, NORMALIZED_SCHEMA_VERSION};
     use crate::persistence::StoreError;
     use async_trait::async_trait;
+    use money_path_classifier::{
+        DecodedSwapKind, OuterSelectorKind, SafeDecoderSummary, UnsupportedReason, WrapperKind,
+    };
     use std::collections::VecDeque;
     use std::sync::atomic::AtomicUsize;
     use std::sync::Mutex;
@@ -586,6 +759,55 @@ mod tests {
         batch_sizes: Mutex<Vec<usize>>,
         delay: Duration,
         persist_gate: Option<PersistGate>,
+    }
+
+    #[derive(Clone, Debug)]
+    struct FixedClassifier {
+        result: Result<ClassificationResult, ClassifierError>,
+    }
+
+    impl PrePersistenceClassifier for FixedClassifier {
+        fn classify(
+            &self,
+            _message: &ValidatedMessage,
+        ) -> Result<ClassificationResult, ClassifierError> {
+            self.result.clone()
+        }
+    }
+
+    fn fixed_classifier(classification: IngressClassification) -> FixedClassifier {
+        FixedClassifier {
+            result: Ok(ClassificationResult {
+                classification,
+                detail_class: match classification {
+                    IngressClassification::Irrelevant => "irrelevant_origin",
+                    IngressClassification::UnsupportedInteresting => {
+                        "known_router_unsupported_command"
+                    }
+                    IngressClassification::RelevantRouteInput => "reviewed_route_touched",
+                },
+                summary: SafeDecoderSummary {
+                    router_kind: None,
+                    outer_selector_kind: OuterSelectorKind::Unknown,
+                    wrapper_kind: WrapperKind::None,
+                    decoded_swap_kind: DecodedSwapKind::None,
+                    unsupported_reason: UnsupportedReason::None,
+                    command_count: 0,
+                    v3_hop_count: 0,
+                    reviewed_pool_matches: usize::from(
+                        classification == IngressClassification::RelevantRouteInput,
+                    ),
+                },
+            }),
+        }
+    }
+
+    fn relevant_classifier() -> FixedClassifier {
+        fixed_classifier(IngressClassification::RelevantRouteInput)
+    }
+
+    fn ingress_buffer() -> IngressBuffer {
+        IngressBuffer::new(IngressBufferConfig::default()).unwrap()
     }
 
     impl FakeStore {
@@ -783,6 +1005,8 @@ mod tests {
                 delivery(2, 'b', 1, second_ack.clone()),
             ],
             &store,
+            &relevant_classifier(),
+            &ingress_buffer(),
             &ready_state(),
             &metrics,
             &LogSampler::default(),
@@ -802,6 +1026,87 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn filtered_classifications_ack_without_raw_persistence() {
+        let store = FakeStore::new(vec![]);
+        let irrelevant_ack = Arc::new(FakeAcker::default());
+        let unsupported_ack = Arc::new(FakeAcker::default());
+        let metrics = Metrics::default();
+        let readiness = ready_state();
+        let mut ack_health = AckHealthTracker::default();
+
+        let irrelevant = process_delivery_batch(
+            vec![delivery(1, 'a', 1, irrelevant_ack.clone())],
+            &store,
+            &fixed_classifier(IngressClassification::Irrelevant),
+            &ingress_buffer(),
+            &readiness,
+            &metrics,
+            &LogSampler::default(),
+            &CancellationToken::new(),
+            RetryPolicy::default(),
+            &mut ack_health,
+        )
+        .await;
+        let unsupported = process_delivery_batch(
+            vec![delivery(2, 'b', 1, unsupported_ack.clone())],
+            &store,
+            &fixed_classifier(IngressClassification::UnsupportedInteresting),
+            &ingress_buffer(),
+            &readiness,
+            &metrics,
+            &LogSampler::default(),
+            &CancellationToken::new(),
+            RetryPolicy::default(),
+            &mut ack_health,
+        )
+        .await;
+
+        assert_eq!(irrelevant, BatchDisposition::Continue);
+        assert_eq!(unsupported, BatchDisposition::Continue);
+        assert_eq!(store.calls.load(Ordering::Relaxed), 0);
+        assert_eq!(irrelevant_ack.ack.load(Ordering::Relaxed), 1);
+        assert_eq!(unsupported_ack.ack.load(Ordering::Relaxed), 1);
+        let rendered = metrics.render(&readiness);
+        assert!(rendered.contains("recorder_irrelevant_filtered_total 1"));
+        assert!(rendered.contains("recorder_unsupported_interesting_total 1"));
+        assert!(rendered.contains("recorder_raw_rows_avoided_total 6"));
+        assert!(rendered.contains("recorder_relevant_route_inputs_total 0"));
+    }
+
+    #[tokio::test]
+    async fn internal_classifier_failure_never_persists_or_acknowledges() {
+        let store = FakeStore::new(vec![]);
+        let acker = Arc::new(FakeAcker::default());
+        let classifier = FixedClassifier {
+            result: Err(ClassifierError::Invariant),
+        };
+        let readiness = ready_state();
+        let mut ack_health = AckHealthTracker::default();
+        let result = process_delivery_batch(
+            vec![delivery(1, 'a', 1, acker.clone())],
+            &store,
+            &classifier,
+            &ingress_buffer(),
+            &readiness,
+            &Metrics::default(),
+            &LogSampler::default(),
+            &CancellationToken::new(),
+            RetryPolicy::default(),
+            &mut ack_health,
+        )
+        .await;
+
+        assert_eq!(result, BatchDisposition::IntegrityFailure);
+        assert_eq!(store.calls.load(Ordering::Relaxed), 0);
+        assert_eq!(acker.ack.load(Ordering::Relaxed), 0);
+        assert_eq!(acker.nak.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            readiness.ready(),
+            Err("terminal Recorder integrity condition detected")
+        );
+    }
+
+    #[tokio::test]
     async fn postgres_failure_makes_progress_without_ack_then_recovers() {
         let inserted = PersistOutcome {
             feed_event_inserted: true,
@@ -816,6 +1121,8 @@ mod tests {
         let result = process_delivery_batch(
             vec![delivery(1, 'a', 1, acker.clone())],
             &store,
+            &relevant_classifier(),
+            &ingress_buffer(),
             &readiness,
             &metrics,
             &LogSampler::default(),
@@ -855,6 +1162,8 @@ mod tests {
         process_delivery_batch(
             vec![delivery(7, 'a', 1, failed_ack)],
             &store,
+            &relevant_classifier(),
+            &ingress_buffer(),
             &readiness,
             &metrics,
             &LogSampler::default(),
@@ -866,6 +1175,8 @@ mod tests {
         process_delivery_batch(
             vec![delivery(7, 'a', 2, replay_ack.clone())],
             &store,
+            &relevant_classifier(),
+            &ingress_buffer(),
             &readiness,
             &metrics,
             &LogSampler::default(),
@@ -897,6 +1208,8 @@ mod tests {
                 delivery(9, 'b', 1, valid_ack.clone()),
             ],
             &store,
+            &relevant_classifier(),
+            &ingress_buffer(),
             &readiness,
             &Metrics::default(),
             &LogSampler::default(),
@@ -926,6 +1239,8 @@ mod tests {
         let result = process_delivery_batch(
             vec![delivery(1, 'a', 1, acker.clone())],
             &store,
+            &relevant_classifier(),
+            &ingress_buffer(),
             &ready_state(),
             &Metrics::default(),
             &LogSampler::default(),
@@ -956,6 +1271,8 @@ mod tests {
         let result = process_delivery_batch(
             vec![delivery(1, 'a', 1, acker.clone())],
             &store,
+            &relevant_classifier(),
+            &ingress_buffer(),
             &ready_state(),
             &Metrics::default(),
             &LogSampler::default(),
@@ -984,6 +1301,8 @@ mod tests {
         let result = process_delivery_batch(
             deliveries,
             &store,
+            &relevant_classifier(),
+            &ingress_buffer(),
             &readiness,
             &metrics,
             &LogSampler::default(),
@@ -1018,6 +1337,8 @@ mod tests {
         let exit = consume_durable_messages(
             fetcher.clone(),
             Arc::new(FakeStore::new(vec![])),
+            Arc::new(relevant_classifier()),
+            ingress_buffer(),
             ready_state(),
             metrics.clone(),
             LogSampler::default(),

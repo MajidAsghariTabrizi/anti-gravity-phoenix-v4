@@ -10,6 +10,30 @@ use thiserror::Error;
 
 pub const MAX_CLAIM_BATCH: usize = 64;
 pub const MAX_OWNER_BYTES: usize = 128;
+pub const MAX_TELEMETRY_STATEMENT_TIMEOUT: Duration = Duration::from_secs(5);
+
+pub const PENDING_ROWS_ESTIMATE_SQL: &str = r#"
+SELECT GREATEST(COALESCE(index_relation.reltuples, 0), 0)::double precision
+           AS pending_rows_estimate
+FROM pg_class AS index_relation
+JOIN pg_namespace AS namespace
+  ON namespace.oid = index_relation.relnamespace
+WHERE namespace.nspname = 'public'
+  AND index_relation.relname = 'engine_outbox_pending_idx'
+"#;
+
+pub const OLDEST_CLAIMABLE_SQL: &str = r#"
+SELECT GREATEST(
+           EXTRACT(EPOCH FROM (now() - created_at)),
+           0
+       )::double precision AS oldest_claimable_age_seconds
+FROM engine_outbox
+WHERE published_at IS NULL
+  AND available_at <= now()
+  AND (claim_expires_at IS NULL OR claim_expires_at <= now())
+ORDER BY available_at, created_at, outbox_id
+LIMIT 1
+"#;
 
 pub const CLAIM_BATCH_SQL: &str = r#"
 WITH claimable AS (
@@ -54,9 +78,9 @@ pub struct OutboxRow {
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
-pub struct PendingState {
-    pub rows: u64,
-    pub oldest_age_seconds: f64,
+pub struct BacklogTelemetry {
+    pub pending_rows_estimate: u64,
+    pub oldest_claimable_age_seconds: f64,
 }
 
 #[derive(Clone, Debug, Error, PartialEq, Eq)]
@@ -111,7 +135,10 @@ pub trait OutboxStore: Send + Sync {
         error_class: &'static str,
         delay: Duration,
     ) -> Result<(), OutboxError>;
-    async fn pending_state(&self) -> Result<PendingState, OutboxError>;
+    async fn backlog_telemetry(
+        &self,
+        statement_timeout: Duration,
+    ) -> Result<BacklogTelemetry, OutboxError>;
 }
 
 #[derive(Clone, Debug)]
@@ -245,26 +272,43 @@ WHERE outbox_id = $1
         require_single_claim(result.rows_affected())
     }
 
-    async fn pending_state(&self) -> Result<PendingState, OutboxError> {
-        let row = sqlx::query(
-            r#"
-SELECT count(*)::bigint AS pending_rows,
-       COALESCE(EXTRACT(EPOCH FROM (now() - min(created_at))), 0)::double precision
-           AS oldest_age_seconds
-FROM engine_outbox
-WHERE published_at IS NULL
-"#,
-        )
-        .fetch_one(&self.pool)
-        .await
-        .map_err(classify_sqlx_error)?;
-        let rows: i64 = row.try_get("pending_rows").map_err(classify_sqlx_error)?;
-        let oldest_age_seconds: f64 = row
-            .try_get("oldest_age_seconds")
+    async fn backlog_telemetry(
+        &self,
+        statement_timeout: Duration,
+    ) -> Result<BacklogTelemetry, OutboxError> {
+        if statement_timeout.is_zero() || statement_timeout > MAX_TELEMETRY_STATEMENT_TIMEOUT {
+            return Err(OutboxError::Configuration);
+        }
+        let timeout_millis = statement_timeout.as_millis().min(u64::MAX as u128) as u64;
+        let mut transaction = self.pool.begin().await.map_err(classify_sqlx_error)?;
+        sqlx::query("SELECT set_config('statement_timeout', $1, true)")
+            .bind(format!("{timeout_millis}ms"))
+            .execute(&mut *transaction)
+            .await
             .map_err(classify_sqlx_error)?;
-        Ok(PendingState {
-            rows: rows.max(0) as u64,
-            oldest_age_seconds: oldest_age_seconds.max(0.0),
+
+        let estimate: f64 = sqlx::query(PENDING_ROWS_ESTIMATE_SQL)
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(classify_sqlx_error)?
+            .ok_or(OutboxError::Schema)?
+            .try_get("pending_rows_estimate")
+            .map_err(classify_sqlx_error)?;
+        let oldest_claimable_age_seconds = sqlx::query(OLDEST_CLAIMABLE_SQL)
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(classify_sqlx_error)?
+            .map(|row| {
+                row.try_get::<f64, _>("oldest_claimable_age_seconds")
+                    .map_err(classify_sqlx_error)
+            })
+            .transpose()?
+            .unwrap_or_default();
+        transaction.commit().await.map_err(classify_sqlx_error)?;
+
+        Ok(BacklogTelemetry {
+            pending_rows_estimate: estimate.max(0.0).round().min(u64::MAX as f64) as u64,
+            oldest_claimable_age_seconds: oldest_claimable_age_seconds.max(0.0),
         })
     }
 }
@@ -358,6 +402,22 @@ mod tests {
         for forbidden in ["DELETE", "TRUNCATE", "DROP"] {
             assert!(!CLAIM_BATCH_SQL.contains(forbidden));
         }
+    }
+
+    #[test]
+    fn backlog_queries_are_bounded_estimates_without_table_aggregates() {
+        assert!(PENDING_ROWS_ESTIMATE_SQL.contains("reltuples"));
+        assert!(PENDING_ROWS_ESTIMATE_SQL.contains("engine_outbox_pending_idx"));
+        assert!(!PENDING_ROWS_ESTIMATE_SQL
+            .to_ascii_uppercase()
+            .contains("COUNT("));
+        assert!(!PENDING_ROWS_ESTIMATE_SQL
+            .to_ascii_uppercase()
+            .contains("MIN("));
+        assert!(OLDEST_CLAIMABLE_SQL.contains("ORDER BY available_at, created_at, outbox_id"));
+        assert!(OLDEST_CLAIMABLE_SQL.contains("LIMIT 1"));
+        assert!(!OLDEST_CLAIMABLE_SQL.to_ascii_uppercase().contains("COUNT("));
+        assert!(!OLDEST_CLAIMABLE_SQL.to_ascii_uppercase().contains("MIN("));
     }
 
     #[test]

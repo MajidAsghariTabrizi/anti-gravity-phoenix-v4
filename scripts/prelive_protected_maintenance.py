@@ -111,6 +111,7 @@ EXPECTED_MIGRATIONS = tuple(f"migrations/{index:03d}_{name}.sql" for index, name
     (8, "shadow_route_discovery_indexes"),
     (9, "profit_triggered_secondary_verification"),
     (10, "fork_simulation_evidence"),
+    (11, "money_path_selective_persistence"),
 ))
 CONTRACT_PATHS = STATIC_CONTRACT_PATHS + EXPECTED_MIGRATIONS
 EXACT_HASH_CONTRACT_PATHS = tuple(
