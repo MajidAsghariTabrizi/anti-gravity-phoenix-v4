@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 from datetime import datetime, timezone
+from decimal import Decimal, InvalidOperation
 import hashlib
 import json
 import os
@@ -102,6 +103,36 @@ ARTIFACT_KINDS = {
     "samples_ndjson",
     "technical_json",
 }
+MONEY_PATH_METRIC_KEYS = (
+    "aggregate_flush_failures_total",
+    "aggregate_flush_total",
+    "bounded_sample_failures_total",
+    "bounded_samples_total",
+    "database_bytes_per_input_estimate",
+    "database_bytes_per_input_estimate_available",
+    "dispatcher_backlog_refresh_failures_total",
+    "dispatcher_backlog_refresh_total",
+    "dispatcher_backlog_stale_seconds",
+    "dispatcher_batch_cycle_seconds",
+    "dispatcher_oldest_claimable_age_seconds",
+    "dispatcher_pending_rows_estimate",
+    "dispatcher_rows_published_total",
+    "feed_inputs_total",
+    "irrelevant_filtered_total",
+    "persistence_ratio",
+    "raw_rows_avoided_total",
+    "relevant_route_inputs_total",
+    "relevant_transaction_failures_total",
+    "relevant_transactions_committed_total",
+    "sample_limit_reached_total",
+    "unsupported_interesting_total",
+)
+MONEY_PATH_DECIMAL_KEYS = {
+    "database_bytes_per_input_estimate",
+    "dispatcher_batch_cycle_seconds",
+    "dispatcher_oldest_claimable_age_seconds",
+    "persistence_ratio",
+}
 
 SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
@@ -110,6 +141,7 @@ SAFE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
 SAFE_FILE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
 CANONICAL_COUNT_RE = re.compile(r"^(?:0|[1-9][0-9]*)$")
 SIGNED_COUNT_RE = re.compile(r"^(?:0|-?[1-9][0-9]*)$")
+CANONICAL_DECIMAL_RE = re.compile(r"^(?:0|[1-9][0-9]*)(?:\.[0-9]+)?$")
 URL_RE = re.compile(r"(?i)(?:https?|wss?|postgres(?:ql)?|nats)://")
 URL_VALUE_RE = re.compile(r"(?i)(?:https?|wss?|postgres(?:ql)?|nats)://[^\s\"']+")
 ADDRESS_RE = re.compile(r"(?i)0x[0-9a-f]{40}")
@@ -258,6 +290,35 @@ def _signed_count(value: Any) -> int:
     if not isinstance(value, str) or len(value) > 79 or SIGNED_COUNT_RE.fullmatch(value) is None:
         _fail("evidence_shape_invalid")
     return int(value)
+
+
+def _metric_decimal(value: Any) -> Decimal:
+    if (
+        not isinstance(value, str)
+        or len(value) > 79
+        or CANONICAL_DECIMAL_RE.fullmatch(value) is None
+    ):
+        _fail("evidence_shape_invalid")
+    try:
+        parsed = Decimal(value)
+    except InvalidOperation as exc:
+        raise ControlEvidenceError("evidence_shape_invalid") from exc
+    if not parsed.is_finite() or parsed < 0:
+        _fail("evidence_shape_invalid")
+    return parsed
+
+
+def _validate_money_path_metrics(value: Any) -> None:
+    metrics = _object(value, set(MONEY_PATH_METRIC_KEYS))
+    for key, nested in metrics.items():
+        if key in MONEY_PATH_DECIMAL_KEYS:
+            _metric_decimal(nested)
+        else:
+            _count(nested)
+    if _count(metrics["database_bytes_per_input_estimate_available"]) not in {0, 1}:
+        _fail("evidence_accounting_invalid")
+    if _metric_decimal(metrics["persistence_ratio"]) > 1:
+        _fail("evidence_accounting_invalid")
 
 
 def _timestamp(value: Any) -> datetime:
@@ -727,7 +788,7 @@ def _validate_funnels(value: Any) -> None:
 
 
 def _validate_metrics(value: Any) -> None:
-    metrics = _object(value, {"rpc", "jetstream", "database", "feed"})
+    metrics = _object(value, {"rpc", "jetstream", "database", "feed", "money_path_ingress"})
     metric_keys = {
         "rpc": (
             "requests",
@@ -760,6 +821,7 @@ def _validate_metrics(value: Any) -> None:
     growth = _signed_count(database["growth_bytes"])
     if end - start != growth:
         _fail("evidence_accounting_invalid")
+    _validate_money_path_metrics(metrics["money_path_ingress"])
 
 
 def _validate_artifacts(value: Any) -> None:
@@ -1064,6 +1126,30 @@ def sample_from_money_path(report: Any, jetstream_root: Any) -> dict[str, Any]:
             "missing_sequences": _required_metric(values, "feed_missing_sequences_total"),
             "decode_failures": _required_metric(values, "feed_decode_failures_total"),
         },
+        "money_path_ingress": {
+            **technical.get("money_path_ingress", {}),
+            "dispatcher_backlog_refresh_failures_total": technical.get("jetstream", {}).get(
+                "dispatcher_backlog_refresh_failures_total"
+            ),
+            "dispatcher_backlog_refresh_total": technical.get("jetstream", {}).get(
+                "dispatcher_backlog_refresh_total"
+            ),
+            "dispatcher_backlog_stale_seconds": technical.get("jetstream", {}).get(
+                "dispatcher_backlog_stale_seconds"
+            ),
+            "dispatcher_batch_cycle_seconds": technical.get("jetstream", {}).get(
+                "dispatcher_batch_cycle_seconds"
+            ),
+            "dispatcher_oldest_claimable_age_seconds": technical.get("jetstream", {}).get(
+                "dispatcher_oldest_claimable_age_seconds"
+            ),
+            "dispatcher_pending_rows_estimate": technical.get("jetstream", {}).get(
+                "dispatcher_pending_rows_estimate"
+            ),
+            "dispatcher_rows_published_total": technical.get("jetstream", {}).get(
+                "dispatcher_rows_published_total"
+            ),
+        },
         "_observed_at": observed_at,
     }
     for group, row in metrics.items():
@@ -1071,6 +1157,9 @@ def sample_from_money_path(report: Any, jetstream_root: Any) -> dict[str, Any]:
             continue
         if not isinstance(row, dict):
             _fail("money_path_invalid")
+        if group == "money_path_ingress":
+            _validate_money_path_metrics(row)
+            continue
         for value in row.values():
             _count(value)
     errors = _sample_errors(funnels, metrics)
@@ -1104,11 +1193,20 @@ def validate_sample(value: Any) -> dict[str, Any]:
     _validate_safety(sample["safety"])
     _validate_funnels(sample["funnels"])
     metrics = sample["metrics"]
-    if not isinstance(metrics, dict) or set(metrics) != {"rpc", "jetstream", "database", "feed"}:
+    if not isinstance(metrics, dict) or set(metrics) != {
+        "rpc",
+        "jetstream",
+        "database",
+        "feed",
+        "money_path_ingress",
+    }:
         _fail("sample_invalid")
     for name, row in metrics.items():
         if not isinstance(row, dict):
             _fail("sample_invalid")
+        if name == "money_path_ingress":
+            _validate_money_path_metrics(row)
+            continue
         expected = {
             "rpc": {"requests", "success", "timeouts", "rate_limited", "unavailable", "disagreements"},
             "jetstream": {"streams", "consumers", "pending", "ack_pending", "redeliveries"},
@@ -1254,6 +1352,7 @@ def assemble_evidence(args: argparse.Namespace) -> dict[str, Any]:
             "growth_bytes": str(database_end - database_start),
         },
         "feed": last["metrics"]["feed"],
+        "money_path_ingress": last["metrics"]["money_path_ingress"],
     }
     errors = [error for sample in samples for error in sample["bounded_errors"]][-MAX_ERRORS:]
     artifacts = load_json(Path(args.artifacts))

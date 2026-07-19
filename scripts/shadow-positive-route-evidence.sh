@@ -44,6 +44,37 @@ number_or_zero() {
   esac
 }
 
+decimal_or_zero() {
+  positive_decimal=$(printf '%s' "$1" | tr -d '[:space:]')
+  if printf '%s\n' "$positive_decimal" | grep -Eq '^(0|[1-9][0-9]*)(\.[0-9]+)?$'; then
+    printf '%s\n' "$positive_decimal"
+  else
+    printf '0\n'
+  fi
+}
+
+service_metric() {
+  positive_metric_service=$1
+  positive_metric_port=$2
+  positive_metric_name=$3
+  positive_metric_payload=$(compose exec -T "$positive_metric_service" wget -q -O - \
+    "http://127.0.0.1:$positive_metric_port/metrics" 2>/dev/null || true)
+  positive_metric_value=$(printf '%s\n' "$positive_metric_payload" | awk \
+    -v metric="$positive_metric_name" '
+      $1 == metric {
+        print $2
+        found = 1
+        exit
+      }
+      END {
+        if (!found) {
+          print 0
+        }
+      }
+    ')
+  decimal_or_zero "$positive_metric_value"
+}
+
 sql_query() {
   compose exec -T postgres psql \
     -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d "$POSTGRES_DB" -Atc "$1"
@@ -587,6 +618,31 @@ positive_evidence_finish() {
   printf '%s\n' "$positive_result"
 }
 
+positive_evidence_no_evidence_diagnostics() {
+  positive_feed_inputs=$(service_metric recorder 9400 recorder_feed_inputs_total)
+  positive_irrelevant=$(service_metric recorder 9400 recorder_irrelevant_filtered_total)
+  positive_unsupported=$(service_metric recorder 9400 recorder_unsupported_interesting_total)
+  positive_relevant=$(service_metric recorder 9400 recorder_relevant_route_inputs_total)
+  positive_dispatched=$(service_metric shadow-dispatcher 9500 shadow_dispatcher_rows_published_total)
+  positive_oldest=$(service_metric shadow-dispatcher 9500 shadow_dispatcher_oldest_claimable_age_seconds)
+  positive_pending=$(service_metric shadow-dispatcher 9500 shadow_dispatcher_pending_rows_estimate)
+  positive_attempts=$(sql_count \
+    "SELECT count(*) FROM shadow_engine_processing_attempts WHERE completed_at >= '$RUN_STARTED_AT_UTC'::timestamptz") ||
+    return 1
+  positive_classifications=$(sql_count \
+    "SELECT count(*) FROM shadow_engine_classifications WHERE classified_at >= '$RUN_STARTED_AT_UTC'::timestamptz") ||
+    return 1
+  positive_candidates=$(sql_count \
+    "SELECT COALESCE(sum(candidate_count), 0) FROM shadow_engine_classifications WHERE classified_at >= '$RUN_STARTED_AT_UTC'::timestamptz") ||
+    return 1
+  positive_decisions=$(sql_count \
+    "SELECT count(*) FROM shadow_decisions WHERE created_at >= '$RUN_STARTED_AT_UTC'::timestamptz") ||
+    return 1
+
+  printf '%s\n' \
+    "POSITIVE_ROUTE_NO_EVIDENCE_DIAGNOSTICS feed_inputs=$positive_feed_inputs irrelevant_filtered=$positive_irrelevant unsupported_interesting=$positive_unsupported relevant_route_inputs=$positive_relevant dispatcher_rows_published=$positive_dispatched processing_attempts=$positive_attempts classifications=$positive_classifications candidates=$positive_candidates decisions=$positive_decisions oldest_claimable_age_seconds=$positive_oldest pending_rows_estimate=$positive_pending"
+}
+
 positive_evidence_fail() {
   positive_failure_reason=$1
   if [ "${positive_runtime_touched:-0}" -eq 1 ]; then
@@ -626,8 +682,12 @@ positive_evidence_main() {
   case "$timeout_seconds:$poll_seconds" in
     *[!0-9:]*) positive_evidence_blocked 'timeouts must be positive integers' ;;
   esac
-  [ "$timeout_seconds" -gt 0 ] && [ "$timeout_seconds" -le 86400 ] || positive_evidence_blocked 'timeout must be between 1 and 86400 seconds'
-  [ "$poll_seconds" -gt 0 ] && [ "$poll_seconds" -le 60 ] || positive_evidence_blocked 'poll interval must be between 1 and 60 seconds'
+  if [ "$timeout_seconds" -le 0 ] || [ "$timeout_seconds" -gt 86400 ]; then
+    positive_evidence_blocked 'timeout must be between 1 and 86400 seconds'
+  fi
+  if [ "$poll_seconds" -le 0 ] || [ "$poll_seconds" -gt 60 ]; then
+    positive_evidence_blocked 'poll interval must be between 1 and 60 seconds'
+  fi
   command -v docker >/dev/null 2>&1 || positive_evidence_blocked 'docker is unavailable'
   command -v python3 >/dev/null 2>&1 || positive_evidence_blocked 'python3 is unavailable'
   [ -f "$env_file" ] || positive_evidence_blocked 'production environment file is missing'
@@ -710,6 +770,8 @@ positive_evidence_main() {
     fi
     sleep "$poll_seconds"
   done
+  positive_evidence_no_evidence_diagnostics ||
+    positive_evidence_fail 'bounded no-evidence diagnostics failed'
   positive_evidence_finish POSITIVE_ROUTE_EVIDENCE_NOT_FOUND '' ''
 }
 

@@ -399,6 +399,12 @@ def _render_money_path_ingress(snapshot: DashboardSnapshot) -> None:
             ("Bounded samples", ingress["bounded_samples_total"]),
             ("Sample limit reached", ingress["sample_limit_reached_total"]),
             ("Dispatcher published", ingress["dispatcher_rows_published_total"]),
+            ("Backlog refreshes", ingress["dispatcher_backlog_refresh_total"]),
+            (
+                "Backlog refresh failures",
+                ingress["dispatcher_backlog_refresh_failures_total"],
+            ),
+            ("Dispatcher batch cycle (s)", ingress["dispatcher_batch_cycle_seconds"]),
             ("Pending rows estimate", ingress["dispatcher_pending_rows_estimate"]),
             (
                 "Oldest claimable (s)",

@@ -239,6 +239,31 @@
       "database_write_latency_ms": {"p50": "8", "p95": "22", "p99": "48"}
     }
   },
+  "money_path_ingress": {
+    "aggregate_flush_failures_total": "0",
+    "aggregate_flush_total": "2",
+    "bounded_sample_failures_total": "0",
+    "bounded_samples_total": "2",
+    "database_bytes_per_input_estimate": "80",
+    "database_bytes_per_input_estimate_available": "1",
+    "dispatcher_backlog_refresh_failures_total": "0",
+    "dispatcher_backlog_refresh_total": "2",
+    "dispatcher_backlog_stale_seconds": "1",
+    "dispatcher_batch_cycle_seconds": "0.02",
+    "dispatcher_oldest_claimable_age_seconds": "15",
+    "dispatcher_pending_rows_estimate": "3",
+    "dispatcher_rows_published_total": "5",
+    "feed_inputs_total": "100",
+    "irrelevant_filtered_total": "90",
+    "persistence_ratio": "0.05",
+    "projected_disk_runway_days": "426.666666667",
+    "raw_rows_avoided_total": "285",
+    "relevant_route_inputs_total": "5",
+    "relevant_transaction_failures_total": "0",
+    "relevant_transactions_committed_total": "5",
+    "sample_limit_reached_total": "0",
+    "unsupported_interesting_total": "5"
+  },
   "postgres": {
     "readiness": true,
     "database_size_bytes": "524288000",
@@ -252,7 +277,7 @@
     "wal_bytes": "33554432",
     "oldest_relevant_event": "2026-07-15T00:00:00Z",
     "newest_relevant_event": "2026-07-15T23:59:30Z",
-    "migration_version": "010_fork_simulation_evidence",
+    "migration_version": "011_money_path_selective_persistence",
     "migration_checksum": "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
     "retention_status": "not_configured"
   },

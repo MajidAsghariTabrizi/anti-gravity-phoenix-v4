@@ -1359,11 +1359,17 @@ def build_snapshot(args: argparse.Namespace) -> tuple[dict[str, Any], list[dict[
         )
     money_path_ingress = {
         **ingress_metrics,
+        "dispatcher_backlog_refresh_total": technical["jetstream"][
+            "dispatcher_backlog_refresh_total"
+        ],
         "dispatcher_backlog_refresh_failures_total": technical["jetstream"][
             "dispatcher_backlog_refresh_failures_total"
         ],
         "dispatcher_backlog_stale_seconds": technical["jetstream"][
             "dispatcher_backlog_stale_seconds"
+        ],
+        "dispatcher_batch_cycle_seconds": technical["jetstream"][
+            "dispatcher_batch_cycle_seconds"
         ],
         "dispatcher_oldest_claimable_age_seconds": technical["jetstream"][
             "dispatcher_oldest_claimable_age_seconds"

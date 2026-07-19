@@ -596,6 +596,11 @@ class SampleTests(unittest.TestCase):
         self.assertEqual(sample["funnels"]["profitability"]["primary_profitable"], "7")
         self.assertEqual(sample["metrics"]["jetstream"]["streams"], "2")
         self.assertEqual(sample["metrics"]["jetstream"]["consumers"], "2")
+        self.assertEqual(sample["metrics"]["money_path_ingress"]["feed_inputs_total"], "100")
+        self.assertEqual(
+            sample["metrics"]["money_path_ingress"]["dispatcher_rows_published_total"],
+            "5",
+        )
         self.assertFalse(sample["safety"]["execution_request_created"])
 
     def test_sample_append_rejects_non_monotonic_time(self) -> None:
@@ -626,6 +631,30 @@ class SampleTests(unittest.TestCase):
                     "jetstream": {"streams": "2", "consumers": "2", "pending": "0", "ack_pending": "0", "redeliveries": "0"},
                     "database": {"size_bytes": "1"},
                     "feed": {"messages": "1", "gaps": "0", "missing_sequences": "0", "decode_failures": "0"},
+                    "money_path_ingress": {
+                        "aggregate_flush_failures_total": "0",
+                        "aggregate_flush_total": "1",
+                        "bounded_sample_failures_total": "0",
+                        "bounded_samples_total": "0",
+                        "database_bytes_per_input_estimate": "0",
+                        "database_bytes_per_input_estimate_available": "0",
+                        "dispatcher_backlog_refresh_failures_total": "0",
+                        "dispatcher_backlog_refresh_total": "1",
+                        "dispatcher_backlog_stale_seconds": "0",
+                        "dispatcher_batch_cycle_seconds": "0",
+                        "dispatcher_oldest_claimable_age_seconds": "0",
+                        "dispatcher_pending_rows_estimate": "0",
+                        "dispatcher_rows_published_total": "0",
+                        "feed_inputs_total": "1",
+                        "irrelevant_filtered_total": "1",
+                        "persistence_ratio": "0",
+                        "raw_rows_avoided_total": "3",
+                        "relevant_route_inputs_total": "0",
+                        "relevant_transaction_failures_total": "0",
+                        "relevant_transactions_committed_total": "0",
+                        "sample_limit_reached_total": "0",
+                        "unsupported_interesting_total": "0",
+                    },
                 },
                 "bounded_errors": [],
             }

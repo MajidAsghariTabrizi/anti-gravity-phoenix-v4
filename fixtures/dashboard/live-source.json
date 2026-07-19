@@ -12,7 +12,7 @@
     "wal_bytes": "33554432",
     "oldest_relevant_event": "2026-07-15T12:10:00Z",
     "newest_relevant_event": "2026-07-16T11:59:30Z",
-    "migration_version": "010_fork_simulation_evidence",
+    "migration_version": "011_money_path_selective_persistence",
     "migration_checksum": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
     "retention_status": "not_configured"
   },
