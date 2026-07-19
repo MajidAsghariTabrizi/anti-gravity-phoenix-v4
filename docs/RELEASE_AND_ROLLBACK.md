@@ -2,7 +2,8 @@
 
 ## Release Manifest
 
-`Build Phoenix Images` creates `release-manifest.json`:
+An explicitly authorized `Build Phoenix Images` workflow dispatch creates
+`release-manifest.json`:
 
 ```json
 {
@@ -20,6 +21,18 @@
 ```
 
 Production deploys image references from this manifest only. Mutable tags are rejected.
+
+Ordinary pushes and pull requests cannot publish Phoenix images. The manual
+workflow requires an exact release SHA reachable from main, the bounded
+release intent, and the exact publication confirmation. Only publishing jobs
+receive `packages: write`.
+
+The same run also creates `release-provenance.json`. It binds all six image
+fragments, immutable release assets, release manifest, exact source SHA,
+release intent, and build run. Canonical validation additionally requires the
+completed GitHub run and every required job to be successful. Run
+`29683234024` is quarantined as `NON_CANONICAL_INCOMPLETE_BUILD`; none of its
+partial images or artifacts are release evidence.
 
 The manifest contains six immutable images: feed-ingestor, phoenix-engine,
 rpc-gateway, recorder, fork-sandbox, and dashboard. The production renderer
@@ -134,6 +147,14 @@ tree all agree.
 
 Database migrations are forward-only. Rollbacks require backward-compatible migrations until a dedicated manual data rollback plan exists.
 
+The v5 selective-persistence candidate uses a different contract. Existing v4
+and its migrations 001-010 database remain together as untouched Environment
+A. V5 uses a fresh isolated Environment B database initialized through
+migrations 001-011. Candidate rollback returns traffic and services to
+Environment A; it never downgrades Environment B and does not claim v4
+compatibility with the v5 database. See
+`docs/PHOENIX_PRELIVE_SHADOW_V5_RELEASE.md`.
+
 ## Protected-Service Maintenance
 
 Normal `deploy-shadow` behavior remains unchanged: a Feed Ingestor or Recorder
@@ -219,3 +240,8 @@ their candidate and rollback digests before SSH and blocks any difference.
 Deploying those changed images therefore requires a separate, explicitly
 authorized maintenance gate that reconciles protected-service continuity; this
 milestone does not silently recreate them.
+
+The v5 release-preparation contract does not authorize that maintenance path
+or reuse the existing database. Its candidate manifest contains placeholders
+until one later complete manual build exists, and a separate clean-cutover
+deployment review remains required.

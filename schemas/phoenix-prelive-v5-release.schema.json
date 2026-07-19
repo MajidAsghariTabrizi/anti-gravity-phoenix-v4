@@ -1,0 +1,373 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://phoenix.invalid/schemas/phoenix-prelive-v5-release.schema.json",
+  "title": "Phoenix PRE-LIVE SHADOW v5 clean cutover",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "release",
+    "fallback_environment",
+    "candidate_environment",
+    "runtime_environment",
+    "safety",
+    "post_deploy_validation",
+    "rollback"
+  ],
+  "properties": {
+    "schema": {
+      "const": "phoenix.prelive-v5-release.v1"
+    },
+    "release": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "tag",
+        "release_intent",
+        "source_sha",
+        "build_run_id",
+        "build_run_evidence_sha256",
+        "release_manifest_sha256",
+        "release_provenance_sha256",
+        "canonical_build_required"
+      ],
+      "properties": {
+        "tag": {
+          "const": "phoenix-prelive-shadow-v5"
+        },
+        "release_intent": {
+          "const": "PHOENIX_PRELIVE_SHADOW_V5"
+        },
+        "source_sha": {
+          "type": "string"
+        },
+        "build_run_id": {
+          "type": "string"
+        },
+        "build_run_evidence_sha256": {
+          "type": "string"
+        },
+        "release_manifest_sha256": {
+          "type": "string"
+        },
+        "release_provenance_sha256": {
+          "type": "string"
+        },
+        "canonical_build_required": {
+          "const": true
+        }
+      }
+    },
+    "fallback_environment": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "tag",
+        "release_sha",
+        "build_run_id",
+        "migrations",
+        "database_reused_for_candidate",
+        "mutate_during_candidate_validation"
+      ],
+      "properties": {
+        "name": {
+          "const": "environment-a"
+        },
+        "tag": {
+          "const": "phoenix-prelive-shadow-v4"
+        },
+        "release_sha": {
+          "const": "a7f19ab165d93dafb4bcc20463f9d010f587281a"
+        },
+        "build_run_id": {
+          "const": "29638026962"
+        },
+        "migrations": {
+          "$ref": "#/$defs/migrations"
+        },
+        "database_reused_for_candidate": {
+          "const": false
+        },
+        "mutate_during_candidate_validation": {
+          "const": false
+        }
+      }
+    },
+    "candidate_environment": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "database_role",
+        "database_generation",
+        "database_name_env",
+        "database_dsn_env",
+        "fallback_database_name_env",
+        "initialization_confirmation",
+        "fresh_database_required",
+        "allowed_initial_tables",
+        "migrations",
+        "migration_apply_count",
+        "required_schema_consumers",
+        "zero_data_tables",
+        "historical_import",
+        "pending_outbox_import",
+        "backfill",
+        "shares_database_with_fallback"
+      ],
+      "properties": {
+        "name": {
+          "const": "environment-b"
+        },
+        "database_role": {
+          "const": "v5_candidate"
+        },
+        "database_generation": {
+          "const": "fresh-001-011"
+        },
+        "database_name_env": {
+          "const": "PHOENIX_V5_CANDIDATE_DATABASE_NAME"
+        },
+        "database_dsn_env": {
+          "const": "PHOENIX_V5_CANDIDATE_POSTGRES_DSN"
+        },
+        "fallback_database_name_env": {
+          "const": "PHOENIX_V4_FALLBACK_DATABASE_NAME"
+        },
+        "initialization_confirmation": {
+          "const": "INITIALIZE_EMPTY_PHOENIX_V5_DATABASE"
+        },
+        "fresh_database_required": {
+          "const": true
+        },
+        "allowed_initial_tables": {
+          "const": [
+            "schema_migrations"
+          ]
+        },
+        "migrations": {
+          "$ref": "#/$defs/migrations"
+        },
+        "migration_apply_count": {
+          "const": 2
+        },
+        "required_schema_consumers": {
+          "const": [
+            "recorder",
+            "shadow-dispatcher",
+            "phoenix-engine"
+          ]
+        },
+        "zero_data_tables": {
+          "type": "array",
+          "minItems": 15,
+          "maxItems": 15,
+          "uniqueItems": true,
+          "items": {
+            "type": "string"
+          }
+        },
+        "historical_import": {
+          "const": false
+        },
+        "pending_outbox_import": {
+          "const": false
+        },
+        "backfill": {
+          "const": false
+        },
+        "shares_database_with_fallback": {
+          "const": false
+        }
+      }
+    },
+    "runtime_environment": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "required_exact",
+        "required_empty",
+        "bounded_integers",
+        "forbidden_capabilities"
+      ],
+      "properties": {
+        "required_exact": {
+          "const": {
+            "PHOENIX_MODE": "SHADOW",
+            "LIVE_EXECUTION": "false",
+            "CHAIN_ID": "42161",
+            "RECORDER_PERSISTENCE_POLICY": "money_path_v1"
+          }
+        },
+        "required_empty": {
+          "const": [
+            "SIGNER_PRIVATE_KEY",
+            "WALLET_ADDRESS",
+            "EXECUTOR_ADDRESS"
+          ]
+        },
+        "bounded_integers": {
+          "type": "object"
+        },
+        "forbidden_capabilities": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "safety": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "execution_eligible",
+        "execution_request_created",
+        "wallet_configured",
+        "signer_configured",
+        "executor_configured",
+        "submission_enabled",
+        "broadcast_enabled"
+      ],
+      "properties": {
+        "execution_eligible": {
+          "const": false
+        },
+        "execution_request_created": {
+          "const": false
+        },
+        "wallet_configured": {
+          "const": false
+        },
+        "signer_configured": {
+          "const": false
+        },
+        "executor_configured": {
+          "const": false
+        },
+        "submission_enabled": {
+          "const": false
+        },
+        "broadcast_enabled": {
+          "const": false
+        }
+      }
+    },
+    "post_deploy_validation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "stages",
+        "requires_prior_stage_success",
+        "evidence_fields",
+        "acceptance"
+      ],
+      "properties": {
+        "stages": {
+          "const": [
+            "15m",
+            "1h"
+          ]
+        },
+        "requires_prior_stage_success": {
+          "const": true
+        },
+        "evidence_fields": {
+          "type": "array",
+          "minItems": 17,
+          "maxItems": 17,
+          "uniqueItems": true,
+          "items": {
+            "type": "string"
+          }
+        },
+        "acceptance": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "safety_regression_allowed",
+            "relevant_fixture_loss_allowed",
+            "irrelevant_raw_persistence_max_percent",
+            "unsupported_raw_persistence_max_percent",
+            "old_storage_growth_mib_per_day",
+            "material_storage_reduction_required",
+            "execution_attempts",
+            "executions",
+            "realized_pnl"
+          ],
+          "properties": {
+            "safety_regression_allowed": {
+              "const": false
+            },
+            "relevant_fixture_loss_allowed": {
+              "const": false
+            },
+            "irrelevant_raw_persistence_max_percent": {
+              "const": 0
+            },
+            "unsupported_raw_persistence_max_percent": {
+              "const": 0
+            },
+            "old_storage_growth_mib_per_day": {
+              "const": 7168
+            },
+            "material_storage_reduction_required": {
+              "const": true
+            },
+            "execution_attempts": {
+              "const": 0
+            },
+            "executions": {
+              "const": 0
+            },
+            "realized_pnl": {
+              "const": 0
+            }
+          }
+        }
+      }
+    },
+    "rollback": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "scope",
+        "target_environment",
+        "candidate_database_downgrade",
+        "candidate_database_reused_by_fallback",
+        "v4_compatible_with_candidate_database"
+      ],
+      "properties": {
+        "scope": {
+          "const": "environment"
+        },
+        "target_environment": {
+          "const": "environment-a"
+        },
+        "candidate_database_downgrade": {
+          "const": false
+        },
+        "candidate_database_reused_by_fallback": {
+          "const": false
+        },
+        "v4_compatible_with_candidate_database": {
+          "const": false
+        }
+      }
+    }
+  },
+  "$defs": {
+    "migrations": {
+      "type": "array",
+      "minItems": 10,
+      "maxItems": 11,
+      "uniqueItems": true,
+      "items": {
+        "type": "string",
+        "pattern": "^0(0[1-9]|1[01])_[a-z0-9_]+$"
+      }
+    }
+  }
+}

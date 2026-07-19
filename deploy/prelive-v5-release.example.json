@@ -1,0 +1,182 @@
+{
+  "schema": "phoenix.prelive-v5-release.v1",
+  "release": {
+    "tag": "phoenix-prelive-shadow-v5",
+    "release_intent": "PHOENIX_PRELIVE_SHADOW_V5",
+    "source_sha": "UNSET",
+    "build_run_id": "UNSET",
+    "build_run_evidence_sha256": "UNSET",
+    "release_manifest_sha256": "UNSET",
+    "release_provenance_sha256": "UNSET",
+    "canonical_build_required": true
+  },
+  "fallback_environment": {
+    "name": "environment-a",
+    "tag": "phoenix-prelive-shadow-v4",
+    "release_sha": "a7f19ab165d93dafb4bcc20463f9d010f587281a",
+    "build_run_id": "29638026962",
+    "migrations": [
+      "001_init",
+      "002_event_signatures",
+      "003_shadow_profitability_evidence",
+      "004_shadow_engine_runtime",
+      "005_shadow_decision_identity",
+      "006_dependency_exhaustion_quarantine",
+      "007_canonical_profitability_truth",
+      "008_shadow_route_discovery_indexes",
+      "009_profit_triggered_secondary_verification",
+      "010_fork_simulation_evidence"
+    ],
+    "database_reused_for_candidate": false,
+    "mutate_during_candidate_validation": false
+  },
+  "candidate_environment": {
+    "name": "environment-b",
+    "database_role": "v5_candidate",
+    "database_generation": "fresh-001-011",
+    "database_name_env": "PHOENIX_V5_CANDIDATE_DATABASE_NAME",
+    "database_dsn_env": "PHOENIX_V5_CANDIDATE_POSTGRES_DSN",
+    "fallback_database_name_env": "PHOENIX_V4_FALLBACK_DATABASE_NAME",
+    "initialization_confirmation": "INITIALIZE_EMPTY_PHOENIX_V5_DATABASE",
+    "fresh_database_required": true,
+    "allowed_initial_tables": [
+      "schema_migrations"
+    ],
+    "migrations": [
+      "001_init",
+      "002_event_signatures",
+      "003_shadow_profitability_evidence",
+      "004_shadow_engine_runtime",
+      "005_shadow_decision_identity",
+      "006_dependency_exhaustion_quarantine",
+      "007_canonical_profitability_truth",
+      "008_shadow_route_discovery_indexes",
+      "009_profit_triggered_secondary_verification",
+      "010_fork_simulation_evidence",
+      "011_money_path_selective_persistence"
+    ],
+    "migration_apply_count": 2,
+    "required_schema_consumers": [
+      "recorder",
+      "shadow-dispatcher",
+      "phoenix-engine"
+    ],
+    "zero_data_tables": [
+      "origin_transactions",
+      "feed_events",
+      "engine_outbox",
+      "opportunities",
+      "opportunity_legs",
+      "shadow_engine_processing_attempts",
+      "shadow_engine_classifications",
+      "shadow_decisions",
+      "shadow_profitability_facts",
+      "fork_simulation_results",
+      "money_path_ingress_daily",
+      "money_path_ingress_samples",
+      "execution_attempts",
+      "executions",
+      "realized_pnl"
+    ],
+    "historical_import": false,
+    "pending_outbox_import": false,
+    "backfill": false,
+    "shares_database_with_fallback": false
+  },
+  "runtime_environment": {
+    "required_exact": {
+      "PHOENIX_MODE": "SHADOW",
+      "LIVE_EXECUTION": "false",
+      "CHAIN_ID": "42161",
+      "RECORDER_PERSISTENCE_POLICY": "money_path_v1"
+    },
+    "required_empty": [
+      "SIGNER_PRIVATE_KEY",
+      "WALLET_ADDRESS",
+      "EXECUTOR_ADDRESS"
+    ],
+    "bounded_integers": {
+      "RECORDER_AGGREGATE_FLUSH_SECONDS": {
+        "minimum": 1,
+        "maximum": 300
+      },
+      "RECORDER_AGGREGATE_FLUSH_EVENTS": {
+        "minimum": 1,
+        "maximum": 100000
+      },
+      "RECORDER_MAX_SAMPLES_PER_DETAIL_PER_DAY": {
+        "minimum": 1,
+        "maximum": 1000
+      },
+      "RECORDER_MAX_SAMPLE_JSON_BYTES": {
+        "minimum": 256,
+        "maximum": 65536
+      },
+      "SHADOW_DISPATCHER_BACKLOG_REFRESH_SECONDS": {
+        "minimum": 1,
+        "maximum": 3600
+      }
+    },
+    "forbidden_capabilities": [
+      "ETH_SEND_RAW_TRANSACTION",
+      "ETH_SEND_TRANSACTION",
+      "PUBLIC_TRANSACTION_SUBMISSION",
+      "PRIVATE_RELAY_SUBMISSION",
+      "PUBLIC_BROADCAST",
+      "TRANSACTION_BROADCAST"
+    ]
+  },
+  "safety": {
+    "execution_eligible": false,
+    "execution_request_created": false,
+    "wallet_configured": false,
+    "signer_configured": false,
+    "executor_configured": false,
+    "submission_enabled": false,
+    "broadcast_enabled": false
+  },
+  "post_deploy_validation": {
+    "stages": [
+      "15m",
+      "1h"
+    ],
+    "requires_prior_stage_success": true,
+    "evidence_fields": [
+      "feed_input_count",
+      "irrelevant_filtered_count",
+      "unsupported_count",
+      "relevant_count",
+      "persistence_ratio",
+      "postgresql_growth_bytes",
+      "bytes_per_input",
+      "projected_mb_per_day",
+      "outbox_input_rate",
+      "outbox_output_rate",
+      "dispatcher_oldest_claimable_age_seconds",
+      "classifications",
+      "candidates",
+      "decisions",
+      "execution_attempts",
+      "executions",
+      "realized_pnl"
+    ],
+    "acceptance": {
+      "safety_regression_allowed": false,
+      "relevant_fixture_loss_allowed": false,
+      "irrelevant_raw_persistence_max_percent": 0,
+      "unsupported_raw_persistence_max_percent": 0,
+      "old_storage_growth_mib_per_day": 7168,
+      "material_storage_reduction_required": true,
+      "execution_attempts": 0,
+      "executions": 0,
+      "realized_pnl": 0
+    }
+  },
+  "rollback": {
+    "scope": "environment",
+    "target_environment": "environment-a",
+    "candidate_database_downgrade": false,
+    "candidate_database_reused_by_fallback": false,
+    "v4_compatible_with_candidate_database": false
+  }
+}
