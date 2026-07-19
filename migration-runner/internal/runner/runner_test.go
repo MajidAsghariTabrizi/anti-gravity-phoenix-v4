@@ -326,19 +326,20 @@ func TestFreshV5DatabaseInitializesFromZeroAndIsIdempotent(t *testing.T) {
 	if os.Getenv("PHOENIX_FRESH_DATABASE_TEST_CONFIRM") != "CREATE_AND_DROP_ISOLATED_TEST_DATABASE" {
 		t.Fatal("PHOENIX_FRESH_DATABASE_TEST_CONFIRM is required")
 	}
-	parsed, err := url.Parse(dsn)
-	if err != nil {
-		t.Fatalf("parse migration test DSN: %v", err)
+	if err := withValidatedFreshDatabaseTestDSN(dsn, func(sanitized *url.URL) {
+		runFreshV5DatabaseIntegration(t, sanitized)
+	}); err != nil {
+		t.Fatalf("validate migration test DSN: %v", err)
 	}
-	if parsed.Scheme != "postgres" && parsed.Scheme != "postgresql" {
-		t.Fatal("migration test DSN must use PostgreSQL")
-	}
-	if parsed.Hostname() != "127.0.0.1" && parsed.Hostname() != "localhost" {
-		t.Fatal("fresh database integration test is loopback-only")
-	}
+}
 
+func runFreshV5DatabaseIntegration(t *testing.T, sanitized *url.URL) {
+	t.Helper()
 	databaseName := fmt.Sprintf("phoenix_v5_fresh_test_%d", time.Now().UnixNano())
-	adminURL := *parsed
+	if err := validateFreshDatabaseTestName(databaseName); err != nil {
+		t.Fatal(err)
+	}
+	adminURL := *sanitized
 	adminURL.Path = "/postgres"
 	admin, err := sql.Open("postgres", adminURL.String())
 	if err != nil {
@@ -355,6 +356,10 @@ func TestFreshV5DatabaseInitializesFromZeroAndIsIdempotent(t *testing.T) {
 		t.Fatalf("create isolated test database: %v", err)
 	}
 	defer func() {
+		if err := validateFreshDatabaseTestName(databaseName); err != nil {
+			t.Errorf("refuse unsafe fresh database cleanup: %v", err)
+			return
+		}
 		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cleanupCancel()
 		_, _ = admin.ExecContext(
@@ -369,7 +374,7 @@ func TestFreshV5DatabaseInitializesFromZeroAndIsIdempotent(t *testing.T) {
 		}
 	}()
 
-	candidateURL := *parsed
+	candidateURL := *sanitized
 	candidateURL.Path = "/" + databaseName
 	db, err := sql.Open("postgres", candidateURL.String())
 	if err != nil {
