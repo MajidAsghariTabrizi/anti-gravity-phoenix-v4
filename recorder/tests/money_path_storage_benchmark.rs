@@ -19,6 +19,7 @@ use serde::Serialize;
 use serde_json::json;
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use sqlx::PgPool;
+use std::collections::BTreeMap;
 use std::fs;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -43,6 +44,7 @@ struct ProcessUsage {
 #[derive(Debug, Serialize)]
 struct BenchmarkResult {
     relevance_ratio_percent: f64,
+    warmup_fixture_inputs: u64,
     fixture_inputs: u64,
     fixture_payload_bytes: usize,
     relevant_events: u64,
@@ -54,6 +56,7 @@ struct BenchmarkResult {
     outbox_rows_per_second: f64,
     dispatcher_rows_published_per_second: f64,
     postgres_relation_size_delta_bytes: u64,
+    postgres_relation_size_delta_by_table: BTreeMap<String, u64>,
     postgres_bytes_per_feed_input: f64,
     postgres_bytes_per_relevant_event: f64,
     projected_mb_per_day_at_16_76_inputs_per_second: f64,
@@ -179,20 +182,32 @@ async fn apply_migrations(pool: &PgPool) {
     }
 }
 
-async fn measured_relation_bytes(pool: &PgPool) -> u64 {
-    let bytes: i64 = sqlx::query_scalar(
+async fn measured_relation_bytes(pool: &PgPool) -> BTreeMap<String, u64> {
+    let rows: Vec<(String, i64)> = sqlx::query_as(
         r#"
-SELECT pg_total_relation_size('origin_transactions')
-     + pg_total_relation_size('feed_events')
-     + pg_total_relation_size('engine_outbox')
-     + pg_total_relation_size('money_path_ingress_daily')
-     + pg_total_relation_size('money_path_ingress_samples')
+SELECT relation_name,
+       pg_total_relation_size(relation_name::regclass)::bigint
+FROM (
+    VALUES
+        ('origin_transactions'),
+        ('feed_events'),
+        ('engine_outbox'),
+        ('money_path_ingress_daily'),
+        ('money_path_ingress_samples')
+) AS measured_relations(relation_name)
 "#,
     )
-    .fetch_one(pool)
+    .fetch_all(pool)
     .await
     .expect("measure benchmark relations");
-    u64::try_from(bytes).expect("relation size must be non-negative")
+    rows.into_iter()
+        .map(|(name, bytes)| {
+            (
+                name,
+                u64::try_from(bytes).expect("relation size must be non-negative"),
+            )
+        })
+        .collect()
 }
 
 async fn table_count(pool: &PgPool, table: &str) -> i64 {
@@ -231,65 +246,43 @@ fn process_usage() -> ProcessUsage {
     }
 }
 
-async fn run_scenario(
-    admin_pool: &PgPool,
-    base_options: &PgConnectOptions,
+struct BenchmarkWindow {
+    fixture_payload_bytes: usize,
+    relevant: u64,
+    unsupported: u64,
+    irrelevant: u64,
+    persistence_seconds: f64,
+    published: u64,
+    dispatcher_seconds: f64,
+    aggregate_rows_added: i64,
+    sample_rows_added: i64,
+}
+
+async fn run_window(
+    pool: &PgPool,
+    store: &PostgresStore,
+    classifier: &MoneyPathClassifier,
     total_inputs: u64,
     relevance_bps: u64,
-) -> BenchmarkResult {
-    let unique = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos()
-        % 1_000_000_000;
-    let database_name = format!(
-        "mpv1_bench_{}_{}_{}",
-        std::process::id(),
-        relevance_bps,
-        unique
-    );
-    sqlx::query(&format!("CREATE DATABASE {database_name}"))
-        .execute(admin_pool)
-        .await
-        .expect("create isolated benchmark database");
-
-    let options = base_options.clone().database(&database_name);
-    let pool = PgPoolOptions::new()
-        .max_connections(4)
-        .connect_with(options)
-        .await
-        .expect("connect isolated benchmark database");
-    apply_migrations(&pool).await;
-    let store = PostgresStore::from_pool(pool.clone());
-    store
-        .verify_schema()
-        .await
-        .expect("verify benchmark schema");
-    let baseline_bytes = measured_relation_bytes(&pool).await;
-    let usage_before = process_usage();
-
-    let classifier = MoneyPathClassifier::from_release(
-        ADMISSION_POLICY_VERSION,
-        &REVIEWED_ROUTER_ADDRESSES
-            .iter()
-            .map(|value| (*value).to_string())
-            .collect::<Vec<_>>(),
-        ROUTES,
-    )
-    .expect("construct benchmark classifier");
+    sequence_offset: u64,
+    observed_at: chrono::DateTime<chrono::Utc>,
+) -> BenchmarkWindow {
     let ingress = IngressBuffer::new(IngressBufferConfig {
         flush_after_events: 100_000,
         ..IngressBufferConfig::default()
     })
     .expect("construct benchmark aggregate buffer");
     let calldata = relevant_calldata();
-    let fixture_payload_bytes = serde_json::to_vec(&message(1, &calldata).payload)
-        .expect("encode benchmark payload")
-        .len();
+    let fixture_payload_bytes =
+        serde_json::to_vec(&message(sequence_offset + 1, &calldata).payload)
+            .expect("encode benchmark payload")
+            .len();
     let relevant_target = total_inputs.saturating_mul(relevance_bps) / 10_000;
-    let observed_at = chrono::DateTime::parse_from_rfc3339("2026-07-19T00:00:00Z")
-        .unwrap()
-        .with_timezone(&chrono::Utc);
+    let origin_rows_before = table_count(pool, "origin_transactions").await;
+    let feed_rows_before = table_count(pool, "feed_events").await;
+    let outbox_rows_before = table_count(pool, "engine_outbox").await;
+    let aggregate_rows_before = table_count(pool, "money_path_ingress_daily").await;
+    let sample_rows_before = table_count(pool, "money_path_ingress_samples").await;
     let mut relevant_batch = Vec::with_capacity(256);
     let mut relevant = 0_u64;
     let mut unsupported = 0_u64;
@@ -315,7 +308,7 @@ async fn run_scenario(
         match classification.classification {
             IngressClassification::RelevantRouteInput => {
                 relevant = relevant.saturating_add(1);
-                relevant_batch.push(message(index + 1, &calldata));
+                relevant_batch.push(message(sequence_offset + index + 1, &calldata));
                 if relevant_batch.len() == 256 {
                     let outcomes = store
                         .persist_batch(&relevant_batch)
@@ -358,14 +351,20 @@ async fn run_scenario(
     assert_eq!(relevant, relevant_target);
     assert_eq!(relevant + unsupported + irrelevant, total_inputs);
     assert_eq!(
-        table_count(&pool, "origin_transactions").await,
+        table_count(pool, "origin_transactions").await - origin_rows_before,
         relevant as i64
     );
-    assert_eq!(table_count(&pool, "feed_events").await, relevant as i64);
-    assert_eq!(table_count(&pool, "engine_outbox").await, relevant as i64);
-    assert_eq!(table_count(&pool, "execution_attempts").await, 0);
-    assert_eq!(table_count(&pool, "executions").await, 0);
-    assert_eq!(table_count(&pool, "realized_pnl").await, 0);
+    assert_eq!(
+        table_count(pool, "feed_events").await - feed_rows_before,
+        relevant as i64
+    );
+    assert_eq!(
+        table_count(pool, "engine_outbox").await - outbox_rows_before,
+        relevant as i64
+    );
+    assert_eq!(table_count(pool, "execution_attempts").await, 0);
+    assert_eq!(table_count(pool, "executions").await, 0);
+    assert_eq!(table_count(pool, "realized_pnl").await, 0);
 
     let outbox = PostgresOutbox::from_pool(pool.clone());
     outbox
@@ -374,7 +373,7 @@ async fn run_scenario(
         .expect("verify benchmark outbox schema");
     let publisher = BenchmarkPublisher::default();
     let dispatcher_config = DispatchConfig {
-        owner: format!("storage-benchmark-{relevance_bps}"),
+        owner: format!("storage-benchmark-{relevance_bps}-{sequence_offset}"),
         ..DispatchConfig::default()
     }
     .validate()
@@ -404,27 +403,140 @@ async fn run_scenario(
         .expect("verify benchmark outbox drained")
         .is_empty());
 
+    BenchmarkWindow {
+        fixture_payload_bytes,
+        relevant,
+        unsupported,
+        irrelevant,
+        persistence_seconds,
+        published,
+        dispatcher_seconds,
+        aggregate_rows_added: table_count(pool, "money_path_ingress_daily").await
+            - aggregate_rows_before,
+        sample_rows_added: table_count(pool, "money_path_ingress_samples").await
+            - sample_rows_before,
+    }
+}
+
+async fn run_scenario(
+    admin_pool: &PgPool,
+    base_options: &PgConnectOptions,
+    total_inputs: u64,
+    relevance_bps: u64,
+) -> BenchmarkResult {
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos()
+        % 1_000_000_000;
+    let database_name = format!(
+        "mpv1_bench_{}_{}_{}",
+        std::process::id(),
+        relevance_bps,
+        unique
+    );
+    sqlx::query(&format!("CREATE DATABASE {database_name}"))
+        .execute(admin_pool)
+        .await
+        .expect("create isolated benchmark database");
+
+    let options = base_options.clone().database(&database_name);
+    let pool = PgPoolOptions::new()
+        .max_connections(4)
+        .connect_with(options)
+        .await
+        .expect("connect isolated benchmark database");
+    apply_migrations(&pool).await;
+    let store = PostgresStore::from_pool(pool.clone());
+    store
+        .verify_schema()
+        .await
+        .expect("verify benchmark schema");
+    let classifier = MoneyPathClassifier::from_release(
+        ADMISSION_POLICY_VERSION,
+        &REVIEWED_ROUTER_ADDRESSES
+            .iter()
+            .map(|value| (*value).to_string())
+            .collect::<Vec<_>>(),
+        ROUTES,
+    )
+    .expect("construct benchmark classifier");
+    let warmup_at = chrono::DateTime::parse_from_rfc3339("2026-07-18T00:00:00Z")
+        .unwrap()
+        .with_timezone(&chrono::Utc);
+    let warmup = run_window(
+        &pool,
+        &store,
+        &classifier,
+        total_inputs,
+        relevance_bps,
+        0,
+        warmup_at,
+    )
+    .await;
+    assert_eq!(warmup.aggregate_rows_added, 3);
+    assert_eq!(warmup.sample_rows_added, 100);
+    // The synthetic burst is faster than autovacuum. Expose its dead claim/publish
+    // versions before measuring the next window's ongoing allocation.
+    sqlx::query("VACUUM (ANALYZE) engine_outbox")
+        .execute(&pool)
+        .await
+        .expect("vacuum warmup outbox versions");
+    let baseline_bytes = measured_relation_bytes(&pool).await;
+    let usage_before = process_usage();
+    let measured_at = chrono::DateTime::parse_from_rfc3339("2026-07-19T00:00:00Z")
+        .unwrap()
+        .with_timezone(&chrono::Utc);
+    let measured = run_window(
+        &pool,
+        &store,
+        &classifier,
+        total_inputs,
+        relevance_bps,
+        total_inputs,
+        measured_at,
+    )
+    .await;
+
     let final_bytes = measured_relation_bytes(&pool).await;
-    let relation_delta = final_bytes.saturating_sub(baseline_bytes);
+    let relation_deltas = final_bytes
+        .iter()
+        .map(|(name, bytes)| {
+            let baseline = *baseline_bytes
+                .get(name)
+                .expect("every measured relation must have a baseline");
+            (
+                name.clone(),
+                bytes
+                    .checked_sub(baseline)
+                    .expect("measured relation size must not regress below its baseline"),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    let relation_delta = relation_deltas.values().copied().sum();
     let bytes_per_input = relation_delta as f64 / total_inputs as f64;
-    let bytes_per_relevant = relation_delta as f64 / relevant.max(1) as f64;
+    let bytes_per_relevant = relation_delta as f64 / measured.relevant.max(1) as f64;
     let projected_daily_bytes = bytes_per_input * FEED_INPUTS_PER_SECOND * 86_400.0;
     let current_inputs_per_day = FEED_INPUTS_PER_SECOND * 86_400.0;
     let current_bytes_per_input = CURRENT_DAILY_GROWTH_BYTES / current_inputs_per_day;
     let usage_after = process_usage();
     let result = BenchmarkResult {
         relevance_ratio_percent: relevance_bps as f64 / 100.0,
+        warmup_fixture_inputs: total_inputs,
         fixture_inputs: total_inputs,
-        fixture_payload_bytes,
-        relevant_events: relevant,
-        unsupported_events: unsupported,
-        irrelevant_events: irrelevant,
-        feed_inputs_per_second: total_inputs as f64 / persistence_seconds,
-        filtered_events_per_second: (unsupported + irrelevant) as f64 / persistence_seconds,
-        relevant_commits_per_second: relevant as f64 / persistence_seconds,
-        outbox_rows_per_second: relevant as f64 / persistence_seconds,
-        dispatcher_rows_published_per_second: published as f64 / dispatcher_seconds,
+        fixture_payload_bytes: measured.fixture_payload_bytes,
+        relevant_events: measured.relevant,
+        unsupported_events: measured.unsupported,
+        irrelevant_events: measured.irrelevant,
+        feed_inputs_per_second: total_inputs as f64 / measured.persistence_seconds,
+        filtered_events_per_second: (measured.unsupported + measured.irrelevant) as f64
+            / measured.persistence_seconds,
+        relevant_commits_per_second: measured.relevant as f64 / measured.persistence_seconds,
+        outbox_rows_per_second: measured.relevant as f64 / measured.persistence_seconds,
+        dispatcher_rows_published_per_second: measured.published as f64
+            / measured.dispatcher_seconds,
         postgres_relation_size_delta_bytes: relation_delta,
+        postgres_relation_size_delta_by_table: relation_deltas,
         postgres_bytes_per_feed_input: bytes_per_input,
         postgres_bytes_per_relevant_event: bytes_per_relevant,
         projected_mb_per_day_at_16_76_inputs_per_second: projected_daily_bytes / 1_000_000.0,
@@ -434,12 +546,12 @@ async fn run_scenario(
         resident_memory_delta_bytes: usage_after.resident_bytes as i64
             - usage_before.resident_bytes as i64,
         peak_resident_memory_bytes: usage_after.peak_resident_bytes,
-        aggregate_rows: table_count(&pool, "money_path_ingress_daily").await,
-        bounded_sample_rows: table_count(&pool, "money_path_ingress_samples").await,
-        methodology: "fresh isolated PostgreSQL database per ratio; actual migrations 001-011; actual Recorder three-row transaction for admitted inputs; bounded aggregate/sample flush for filtered inputs; pg_total_relation_size delta across origin_transactions, feed_events, engine_outbox, money_path_ingress_daily, and money_path_ingress_samples; actual Dispatcher claim/mark loop with deterministic in-process ACK stub",
+        aggregate_rows: measured.aggregate_rows_added,
+        bounded_sample_rows: measured.sample_rows_added,
+        methodology: "fresh isolated PostgreSQL database per ratio; the first fixture window exercises actual Recorder inserts and Dispatcher claim/mark churn; ordinary non-rewriting VACUUM (ANALYZE) exposes reusable outbox space; reported pg_total_relation_size delta is the second UTC-day fixture window across origin_transactions, feed_events, engine_outbox, money_path_ingress_daily, and money_path_ingress_samples; each window uses actual migrations 001-011, actual Recorder three-row transactions, bounded aggregate/sample persistence, and the actual Dispatcher claim/mark loop with a deterministic in-process ACK stub",
     };
-    assert!(result.aggregate_rows <= 3);
-    assert!(result.bounded_sample_rows <= 100);
+    assert_eq!(result.aggregate_rows, 3);
+    assert_eq!(result.bounded_sample_rows, 100);
 
     pool.close().await;
     sqlx::query(&format!("DROP DATABASE {database_name}"))
