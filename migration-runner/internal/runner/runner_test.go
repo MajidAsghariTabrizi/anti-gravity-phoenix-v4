@@ -4,8 +4,11 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -312,6 +315,203 @@ func TestPendingFailsChangedChecksum(t *testing.T) {
 	migrations := []Migration{{Version: "001", Checksum: "new"}}
 	if _, err := Pending(map[string]string{"001": "old"}, migrations); err == nil {
 		t.Fatal("expected changed checksum error")
+	}
+}
+
+func TestFreshV5DatabaseInitializesFromZeroAndIsIdempotent(t *testing.T) {
+	dsn := os.Getenv("MIGRATION_TEST_DSN")
+	if dsn == "" {
+		t.Skip("MIGRATION_TEST_DSN not set")
+	}
+	if os.Getenv("PHOENIX_FRESH_DATABASE_TEST_CONFIRM") != "CREATE_AND_DROP_ISOLATED_TEST_DATABASE" {
+		t.Fatal("PHOENIX_FRESH_DATABASE_TEST_CONFIRM is required")
+	}
+	if err := withValidatedFreshDatabaseTestDSN(dsn, func(sanitized *url.URL) {
+		runFreshV5DatabaseIntegration(t, sanitized)
+	}); err != nil {
+		t.Fatalf("validate migration test DSN: %v", err)
+	}
+}
+
+func runFreshV5DatabaseIntegration(t *testing.T, sanitized *url.URL) {
+	t.Helper()
+	databaseName := fmt.Sprintf("phoenix_v5_fresh_test_%d", time.Now().UnixNano())
+	if err := validateFreshDatabaseTestName(databaseName); err != nil {
+		t.Fatal(err)
+	}
+	adminURL := *sanitized
+	adminURL.Path = "/postgres"
+	admin, err := sql.Open("postgres", adminURL.String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer admin.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	if err := admin.PingContext(ctx); err != nil {
+		t.Fatalf("connect test database administrator: %v", err)
+	}
+	if _, err := admin.ExecContext(ctx, `CREATE DATABASE "`+databaseName+`"`); err != nil {
+		t.Fatalf("create isolated test database: %v", err)
+	}
+	defer func() {
+		if err := validateFreshDatabaseTestName(databaseName); err != nil {
+			t.Errorf("refuse unsafe fresh database cleanup: %v", err)
+			return
+		}
+		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cleanupCancel()
+		_, _ = admin.ExecContext(
+			cleanupCtx,
+			"SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = $1",
+			databaseName,
+		)
+		if _, dropErr := admin.ExecContext(
+			cleanupCtx, `DROP DATABASE IF EXISTS "`+databaseName+`"`,
+		); dropErr != nil {
+			t.Errorf("drop isolated test database: %v", dropErr)
+		}
+	}()
+
+	candidateURL := *sanitized
+	candidateURL.Path = "/" + databaseName
+	db, err := sql.Open("postgres", candidateURL.String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	db.SetMaxOpenConns(1)
+	defer db.Close()
+	if err := db.PingContext(ctx); err != nil {
+		t.Fatalf("connect isolated candidate database: %v", err)
+	}
+
+	var initialTables int
+	if err := db.QueryRowContext(
+		ctx,
+		"SELECT count(*) FROM information_schema.tables WHERE table_schema = 'public' AND table_type = 'BASE TABLE'",
+	).Scan(&initialTables); err != nil {
+		t.Fatal(err)
+	}
+	if initialTables != 0 {
+		t.Fatalf("isolated candidate database is not empty: %d public tables", initialTables)
+	}
+
+	migrations, err := LoadMigrations(filepath.Join("..", "..", "..", "migrations"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	expectedMigrations := []string{
+		"001_init",
+		"002_event_signatures",
+		"003_shadow_profitability_evidence",
+		"004_shadow_engine_runtime",
+		"005_shadow_decision_identity",
+		"006_dependency_exhaustion_quarantine",
+		"007_canonical_profitability_truth",
+		"008_shadow_route_discovery_indexes",
+		"009_profit_triggered_secondary_verification",
+		"010_fork_simulation_evidence",
+		"011_money_path_selective_persistence",
+	}
+	loadedVersions := make([]string, 0, len(migrations))
+	for _, migration := range migrations {
+		loadedVersions = append(loadedVersions, migration.Version)
+	}
+	if !reflect.DeepEqual(loadedVersions, expectedMigrations) {
+		t.Fatalf("unexpected candidate migration set: %v", loadedVersions)
+	}
+	if err := Run(ctx, db, migrations); err != nil {
+		t.Fatalf("apply fresh candidate migrations: %v", err)
+	}
+	if err := Run(ctx, db, migrations); err != nil {
+		t.Fatalf("second candidate migration apply must be idempotent: %v", err)
+	}
+
+	rows, err := db.QueryContext(
+		ctx,
+		"SELECT version, checksum FROM schema_migrations ORDER BY version",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	applied := make(map[string]string)
+	for rows.Next() {
+		var version string
+		var checksum string
+		if err := rows.Scan(&version, &checksum); err != nil {
+			rows.Close()
+			t.Fatal(err)
+		}
+		applied[version] = checksum
+	}
+	if err := rows.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if len(applied) != len(migrations) {
+		t.Fatalf("expected %d applied migrations, got %d", len(migrations), len(applied))
+	}
+	for _, migration := range migrations {
+		if applied[migration.Version] != migration.Checksum {
+			t.Fatalf("migration checksum mismatch for %s", migration.Version)
+		}
+	}
+
+	requiredColumns := map[string][]string{
+		"origin_transactions":               {"tx_hash"},
+		"feed_events":                       {"sequence_number"},
+		"engine_outbox":                     {"outbox_id", "claim_owner", "claim_expires_at", "published_at"},
+		"shadow_engine_classifications":     {"source_event_identity"},
+		"shadow_decisions":                  {"execution_eligible"},
+		"money_path_ingress_daily":          {"event_count"},
+		"money_path_ingress_samples":        {"safe_decoder_summary"},
+		"shadow_profitability_facts":        {"shadow_decision_id", "execution_request_created"},
+		"shadow_engine_processing_attempts": {"source_event_identity"},
+	}
+	for table, columns := range requiredColumns {
+		for _, column := range columns {
+			var exists bool
+			if err := db.QueryRowContext(
+				ctx,
+				`SELECT EXISTS (
+					SELECT 1 FROM information_schema.columns
+					WHERE table_schema = 'public' AND table_name = $1 AND column_name = $2
+				)`,
+				table,
+				column,
+			).Scan(&exists); err != nil {
+				t.Fatal(err)
+			}
+			if !exists {
+				t.Fatalf("fresh candidate schema is missing %s.%s", table, column)
+			}
+		}
+	}
+
+	for _, table := range []string{
+		"origin_transactions",
+		"feed_events",
+		"engine_outbox",
+		"opportunities",
+		"opportunity_legs",
+		"shadow_engine_processing_attempts",
+		"shadow_engine_classifications",
+		"shadow_decisions",
+		"shadow_profitability_facts",
+		"fork_simulation_results",
+		"money_path_ingress_daily",
+		"money_path_ingress_samples",
+		"execution_attempts",
+		"executions",
+		"realized_pnl",
+	} {
+		var count int
+		if err := db.QueryRowContext(ctx, "SELECT count(*) FROM "+table).Scan(&count); err != nil {
+			t.Fatalf("count fresh candidate table %s: %v", table, err)
+		}
+		if count != 0 {
+			t.Fatalf("fresh candidate table %s unexpectedly contains %d rows", table, count)
+		}
 	}
 }
 

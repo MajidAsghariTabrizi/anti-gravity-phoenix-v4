@@ -60,6 +60,12 @@ class ReleaseAssetsTests(unittest.TestCase):
             self.assertIn("scripts/install-production-release-context.sh", paths)
             self.assertIn("scripts/prelive-protected-maintenance-launch.sh", paths)
             self.assertIn("scripts/prelive-protected-maintenance-unit.sh", paths)
+            self.assertIn("scripts/prelive-v5-fresh-database-gate.sh", paths)
+            self.assertIn("scripts/prelive_v5_release.py", paths)
+            self.assertIn("scripts/release_provenance.py", paths)
+            self.assertIn("deploy/prelive-v5-release.example.json", paths)
+            self.assertIn("schemas/phoenix-release-provenance.schema.json", paths)
+            self.assertIn("schemas/phoenix-prelive-v5-release.schema.json", paths)
             self.assertTrue(
                 all(
                     item["size_bytes"] <= release_assets.MAX_FILE_BYTES

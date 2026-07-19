@@ -1,16 +1,28 @@
 name: Build Phoenix Images
 
 on:
-  push:
-    branches: [main]
   workflow_dispatch:
+    inputs:
+      release_sha:
+        description: Exact lowercase 40-character commit SHA reachable from main
+        required: true
+        type: string
+      release_intent:
+        description: Bounded immutable release intent
+        required: true
+        type: choice
+        options:
+          - PHOENIX_PRELIVE_SHADOW_V5
+      confirm_publish:
+        description: Type PUBLISH_IMMUTABLE_PHOENIX_IMAGES
+        required: true
+        type: string
 
 permissions:
   contents: read
-  packages: write
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref_name }}
+  group: ${{ github.workflow }}-${{ inputs.release_sha }}
   cancel-in-progress: false
 
 env:
@@ -18,10 +30,47 @@ env:
   IMAGE_OWNER: majidasgharitabrizi
 
 jobs:
+  preflight:
+    name: publication-preflight
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout exact requested release
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          ref: ${{ inputs.release_sha }}
+          fetch-depth: 0
+
+      - name: Validate explicit publication authorization
+        shell: bash
+        env:
+          RELEASE_SHA: ${{ inputs.release_sha }}
+          RELEASE_INTENT: ${{ inputs.release_intent }}
+          CONFIRM_PUBLISH: ${{ inputs.confirm_publish }}
+        run: |
+          set -euo pipefail
+          checked_out_sha="$(git rev-parse HEAD)"
+          python3 scripts/release_provenance.py validate-dispatch \
+            --release-sha "$RELEASE_SHA" \
+            --release-intent "$RELEASE_INTENT" \
+            --confirm-publish "$CONFIRM_PUBLISH" \
+            --checked-out-sha "$checked_out_sha"
+          git fetch --no-tags origin main
+          if ! git merge-base --is-ancestor "$RELEASE_SHA" origin/main; then
+            echo "Requested release SHA is not reachable from origin/main"
+            exit 1
+          fi
+
   build:
     name: build-${{ matrix.image }}
+    needs: preflight
     runs-on: ubuntu-24.04
     timeout-minutes: 35
+    permissions:
+      contents: read
+      packages: write
     strategy:
       fail-fast: false
       matrix:
@@ -47,6 +96,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          ref: ${{ inputs.release_sha }}
 
       - name: Setup Docker Buildx
         uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f
@@ -71,10 +122,10 @@ jobs:
           file: ${{ matrix.dockerfile }}
           push: true
           build-args: ${{ matrix.build_args }}
-          tags: ghcr.io/majidasgharitabrizi/${{ matrix.image }}:sha-${{ github.sha }}
+          tags: ghcr.io/majidasgharitabrizi/${{ matrix.image }}:sha-${{ inputs.release_sha }}
           labels: |
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
-            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.revision=${{ inputs.release_sha }}
             org.opencontainers.image.created=${{ steps.created.outputs.value }}
             org.opencontainers.image.title=${{ matrix.image }}
           cache-from: type=gha,scope=${{ matrix.image }}
@@ -87,9 +138,13 @@ jobs:
           mkdir -p manifest-fragments
           cat > "manifest-fragments/${{ matrix.image }}.json" <<EOF
           {
+            "schema": "phoenix.release-fragment.v1",
+            "release_sha": "${{ inputs.release_sha }}",
+            "build_run_id": "${{ github.run_id }}",
+            "release_intent": "${{ inputs.release_intent }}",
             "name": "${{ matrix.image }}",
             "repository": "ghcr.io/majidasgharitabrizi/${{ matrix.image }}",
-            "tag": "sha-${{ github.sha }}",
+            "tag": "sha-${{ inputs.release_sha }}",
             "digest": "${{ steps.build.outputs.digest }}"
           }
           EOF
@@ -104,6 +159,7 @@ jobs:
 
   assets:
     name: release-assets
+    needs: preflight
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     permissions:
@@ -111,6 +167,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          ref: ${{ inputs.release_sha }}
 
       - name: Install Foundry
         uses: foundry-rs/foundry-toolchain@b00af27efadbc7b4ca8b82abbd903b17cc874d2a
@@ -119,37 +177,44 @@ jobs:
 
       - name: Build and verify immutable release assets
         shell: bash
+        env:
+          RELEASE_SHA: ${{ inputs.release_sha }}
         run: |
           set -euo pipefail
           forge build --root contracts
           python3 -m unittest scripts.tests.test_release_assets
           python3 scripts/release_assets.py build \
             --repo-root . \
-            --release-sha "$GITHUB_SHA" \
+            --release-sha "$RELEASE_SHA" \
             --contract-artifact contracts/out/PhoenixExecutor.sol/PhoenixExecutor.json \
             --output-dir release-assets
           python3 scripts/release_assets.py verify \
-            --archive "release-assets/phoenix-release-assets-${GITHUB_SHA}.tar.gz" \
+            --archive "release-assets/phoenix-release-assets-${RELEASE_SHA}.tar.gz" \
             --manifest release-assets/release-assets-manifest.json \
             --checksums release-assets/release-assets-checksums.txt \
-            --expected-sha "$GITHUB_SHA"
+            --expected-sha "$RELEASE_SHA"
 
       - name: Upload immutable release assets
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: phoenix-release-assets-${{ github.sha }}
+          name: phoenix-release-assets-${{ inputs.release_sha }}
           path: release-assets/
           if-no-files-found: error
           retention-days: 90
 
   manifest:
     name: release-manifest
-    needs: [build, assets]
+    needs: [preflight, build, assets]
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
       contents: read
     steps:
+      - name: Checkout exact requested release
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          ref: ${{ inputs.release_sha }}
+
       - name: Download image manifest fragments
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
         with:
@@ -157,55 +222,40 @@ jobs:
           merge-multiple: true
           path: manifest-fragments
 
-      - name: Assemble release manifest
+      - name: Download immutable release assets
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: phoenix-release-assets-${{ inputs.release_sha }}
+          path: release-assets
+
+      - name: Assemble same-run release manifest and provenance
         shell: bash
+        env:
+          RELEASE_SHA: ${{ inputs.release_sha }}
+          RELEASE_INTENT: ${{ inputs.release_intent }}
+          BUILD_RUN_ID: ${{ github.run_id }}
         run: |
           set -euo pipefail
-          python3 - <<'PY'
-          import json
-          import os
-          from datetime import datetime, timezone
-          from pathlib import Path
+          python3 scripts/release_assets.py verify \
+            --archive "release-assets/phoenix-release-assets-${RELEASE_SHA}.tar.gz" \
+            --manifest release-assets/release-assets-manifest.json \
+            --checksums release-assets/release-assets-checksums.txt \
+            --expected-sha "$RELEASE_SHA"
+          python3 scripts/release_provenance.py assemble \
+            --fragments-dir manifest-fragments \
+            --release-assets-dir release-assets \
+            --release-sha "$RELEASE_SHA" \
+            --build-run-id "$BUILD_RUN_ID" \
+            --release-intent "$RELEASE_INTENT" \
+            --output-manifest release-manifest.json \
+            --output-provenance release-provenance.json
 
-          images = {}
-          for path in sorted(Path("manifest-fragments").glob("*.json")):
-              item = json.loads(path.read_text())
-              if set(item) != {"name", "repository", "tag", "digest"}:
-                  raise SystemExit(f"invalid release fragment contract in {path}")
-              if item["name"] in images:
-                  raise SystemExit(f"duplicate release image fragment for {item['name']}")
-              if not item["tag"].startswith("sha-") or len(item["tag"]) != 44:
-                  raise SystemExit(f"mutable or invalid tag in {path}")
-              if not item["digest"].startswith("sha256:"):
-                  raise SystemExit(f"missing digest in {path}")
-              images[item["name"]] = {
-                  "repository": item["repository"],
-                  "tag": item["tag"],
-                  "digest": item["digest"],
-              }
-          expected = {
-              "dashboard",
-              "feed-ingestor",
-              "fork-sandbox",
-              "phoenix-engine",
-              "recorder",
-              "rpc-gateway",
-          }
-          if set(images) != expected:
-              raise SystemExit("release manifest image set is incomplete or unexpected")
-          manifest = {
-              "schema": "phoenix.release.v1",
-              "release_sha": os.environ["GITHUB_SHA"],
-              "created_at": datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
-              "images": images,
-          }
-          Path("release-manifest.json").write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
-          PY
-
-      - name: Upload release manifest
+      - name: Upload release manifest and provenance
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: phoenix-release-manifest-${{ github.sha }}
-          path: release-manifest.json
+          name: phoenix-release-manifest-${{ inputs.release_sha }}
+          path: |
+            release-manifest.json
+            release-provenance.json
           if-no-files-found: error
           retention-days: 90

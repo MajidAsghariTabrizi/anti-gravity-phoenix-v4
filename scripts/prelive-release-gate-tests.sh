@@ -48,7 +48,16 @@ grep -F 'image: fork-sandbox' "$build_workflow" >/dev/null ||
   fail 'fork-sandbox immutable image publication is missing'
 grep -F 'name: release-assets' "$build_workflow" >/dev/null ||
   fail 'release-assets publication job is missing'
-grep -F 'needs: [build, assets]' "$build_workflow" >/dev/null ||
+grep -F 'workflow_dispatch:' "$build_workflow" >/dev/null ||
+  fail 'image publication is not manual dispatch'
+if grep -E '^  (push|pull_request):' "$build_workflow" >/dev/null; then
+  fail 'image publication still has an automatic trigger'
+fi
+for input in release_sha release_intent confirm_publish; do
+  grep -F "      $input:" "$build_workflow" >/dev/null ||
+    fail "image publication input is missing: $input"
+done
+grep -F 'needs: [preflight, build, assets]' "$build_workflow" >/dev/null ||
   fail 'release manifest is not gated on immutable assets'
 
 for release_script in "$deploy_script" "$rollback_script"; do

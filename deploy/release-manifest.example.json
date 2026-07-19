@@ -13,6 +13,11 @@
       "tag": "sha-0000000000000000000000000000000000000000",
       "digest": "sha256:replace_with_feed_ingestor_digest"
     },
+    "fork-sandbox": {
+      "repository": "ghcr.io/majidasgharitabrizi/fork-sandbox",
+      "tag": "sha-0000000000000000000000000000000000000000",
+      "digest": "sha256:replace_with_fork_sandbox_digest"
+    },
     "phoenix-engine": {
       "repository": "ghcr.io/majidasgharitabrizi/phoenix-engine",
       "tag": "sha-0000000000000000000000000000000000000000",

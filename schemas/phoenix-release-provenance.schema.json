@@ -1,0 +1,170 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://phoenix.invalid/schemas/phoenix-release-provenance.schema.json",
+  "title": "Phoenix immutable release provenance",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "repository",
+    "workflow",
+    "release_sha",
+    "release_intent",
+    "build_run_id",
+    "quarantine",
+    "required_jobs",
+    "required_release_artifacts",
+    "image_fragments",
+    "release_assets",
+    "release_manifest_sha256"
+  ],
+  "properties": {
+    "schema": {
+      "const": "phoenix.release-provenance.v1"
+    },
+    "repository": {
+      "const": "MajidAsghariTabrizi/anti-gravity-phoenix-v4"
+    },
+    "workflow": {
+      "const": "Build Phoenix Images"
+    },
+    "release_sha": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{40}$"
+    },
+    "release_intent": {
+      "const": "PHOENIX_PRELIVE_SHADOW_V5"
+    },
+    "build_run_id": {
+      "type": "string",
+      "pattern": "^[1-9][0-9]{0,19}$"
+    },
+    "quarantine": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "classification",
+        "run_ids"
+      ],
+      "properties": {
+        "classification": {
+          "const": "NON_CANONICAL_INCOMPLETE_BUILD"
+        },
+        "run_ids": {
+          "type": "array",
+          "uniqueItems": true,
+          "contains": {
+            "const": "29683234024"
+          },
+          "items": {
+            "type": "string",
+            "pattern": "^[1-9][0-9]{0,19}$"
+          }
+        }
+      }
+    },
+    "required_jobs": {
+      "type": "array",
+      "minItems": 9,
+      "maxItems": 9,
+      "uniqueItems": true,
+      "items": {
+        "type": "string"
+      }
+    },
+    "required_release_artifacts": {
+      "type": "array",
+      "minItems": 8,
+      "maxItems": 8,
+      "uniqueItems": true,
+      "items": {
+        "type": "string"
+      }
+    },
+    "image_fragments": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "dashboard",
+        "feed-ingestor",
+        "fork-sandbox",
+        "phoenix-engine",
+        "recorder",
+        "rpc-gateway"
+      ],
+      "properties": {
+        "dashboard": {
+          "$ref": "#/$defs/fragment"
+        },
+        "feed-ingestor": {
+          "$ref": "#/$defs/fragment"
+        },
+        "fork-sandbox": {
+          "$ref": "#/$defs/fragment"
+        },
+        "phoenix-engine": {
+          "$ref": "#/$defs/fragment"
+        },
+        "recorder": {
+          "$ref": "#/$defs/fragment"
+        },
+        "rpc-gateway": {
+          "$ref": "#/$defs/fragment"
+        }
+      }
+    },
+    "release_assets": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "artifact_name",
+        "archive_name",
+        "archive_sha256",
+        "manifest_sha256",
+        "checksums_sha256"
+      ],
+      "properties": {
+        "artifact_name": {
+          "type": "string"
+        },
+        "archive_name": {
+          "type": "string"
+        },
+        "archive_sha256": {
+          "$ref": "#/$defs/digest"
+        },
+        "manifest_sha256": {
+          "$ref": "#/$defs/digest"
+        },
+        "checksums_sha256": {
+          "$ref": "#/$defs/digest"
+        }
+      }
+    },
+    "release_manifest_sha256": {
+      "$ref": "#/$defs/digest"
+    }
+  },
+  "$defs": {
+    "digest": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "fragment": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "artifact_name",
+        "sha256"
+      ],
+      "properties": {
+        "artifact_name": {
+          "type": "string"
+        },
+        "sha256": {
+          "$ref": "#/$defs/digest"
+        }
+      }
+    }
+  }
+}
