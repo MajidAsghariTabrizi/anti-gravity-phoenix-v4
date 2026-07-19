@@ -1,4 +1,4 @@
-use money_path_classifier::MoneyPathClassifier;
+use money_path_classifier::{MoneyPathClassifier, ADMISSION_POLICY_VERSION};
 use phoenix_recorder::ingress::{IngressBuffer, IngressBufferConfig};
 use phoenix_recorder::jetstream::{
     ensure_durable_pipeline, MessageFetcher, CONSUMER_ACK_WAIT, CONSUMER_MAX_ACK_PENDING,
@@ -43,6 +43,7 @@ impl Config {
             PersistencePolicy::parse(&required_env("RECORDER_PERSISTENCE_POLICY")?)?;
         let router_addresses = parse_router_addresses(&required_env("ENGINE_ROUTER_ADDRESSES")?)?;
         let classifier = MoneyPathClassifier::from_release(
+            persistence_policy.as_str(),
             &router_addresses,
             &required_env("ENGINE_ROUTE_REGISTRY_JSON")?,
         )
@@ -89,7 +90,7 @@ enum PersistencePolicy {
 impl PersistencePolicy {
     fn parse(value: &str) -> Result<Self, &'static str> {
         match value {
-            "money_path_v1" => Ok(Self::MoneyPathV1),
+            ADMISSION_POLICY_VERSION => Ok(Self::MoneyPathV1),
             _ => Err("RECORDER_PERSISTENCE_POLICY must be money_path_v1"),
         }
     }

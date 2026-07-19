@@ -45,18 +45,17 @@ CREATE TABLE IF NOT EXISTS money_path_ingress_samples (
     wrapper_kind TEXT NOT NULL,
     selector_kind TEXT NOT NULL,
     sample_ordinal SMALLINT NOT NULL,
+    sample_fingerprint BYTEA NOT NULL,
     safe_decoder_summary JSONB NOT NULL,
     observed_at TIMESTAMPTZ NOT NULL,
     schema_version TEXT NOT NULL,
     PRIMARY KEY (
         bucket_date,
-        classification,
         detail_class,
-        router_kind,
-        wrapper_kind,
-        selector_kind,
         sample_ordinal
     ),
+    CONSTRAINT money_path_ingress_samples_fingerprint_unique
+        UNIQUE (bucket_date, detail_class, sample_fingerprint),
     CONSTRAINT money_path_ingress_samples_classification_check
         CHECK (classification = 'unsupported_interesting'),
     CONSTRAINT money_path_ingress_samples_detail_check
@@ -68,6 +67,8 @@ CREATE TABLE IF NOT EXISTS money_path_ingress_samples (
         ),
     CONSTRAINT money_path_ingress_samples_ordinal_check
         CHECK (sample_ordinal BETWEEN 1 AND 1000),
+    CONSTRAINT money_path_ingress_samples_fingerprint_check
+        CHECK (octet_length(sample_fingerprint) = 32),
     CONSTRAINT money_path_ingress_samples_summary_check
         CHECK (
             jsonb_typeof(safe_decoder_summary) = 'object'
@@ -82,6 +83,16 @@ CREATE TABLE IF NOT EXISTS money_path_ingress_samples (
                 'v3_hop_count',
                 'reviewed_pool_matches'
             ]
+            AND safe_decoder_summary - ARRAY[
+                'router_kind',
+                'outer_selector_kind',
+                'wrapper_kind',
+                'decoded_swap_kind',
+                'unsupported_reason',
+                'command_count',
+                'v3_hop_count',
+                'reviewed_pool_matches'
+            ] = '{}'::jsonb
             AND NOT safe_decoder_summary ?| ARRAY[
                 'tx_hash',
                 'address',

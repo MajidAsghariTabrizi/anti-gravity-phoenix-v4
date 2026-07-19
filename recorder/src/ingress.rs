@@ -2,13 +2,14 @@ use chrono::{DateTime, NaiveDate, Utc};
 use money_path_classifier::{ClassificationResult, IngressClassification};
 use serde::Serialize;
 use serde_json::Value;
-use std::collections::{btree_map::Entry, BTreeMap};
+use std::collections::{btree_map::Entry, BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use thiserror::Error;
 use tokio::sync::Notify;
 
 pub const INGRESS_SCHEMA_VERSION: &str = "money_path.ingress.v1";
+pub const MAX_AGGREGATE_KEYS: usize = 256;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct IngressBufferConfig {
@@ -119,6 +120,9 @@ impl IngressBuffer {
     ) -> Result<RecordOutcome, IngressError> {
         let key = aggregate_key(result, observed_at.date_naive())?;
         let mut state = self.inner.lock().map_err(|_| IngressError::Invariant)?;
+        if !state.aggregates.contains_key(&key) && state.aggregates.len() >= MAX_AGGREGATE_KEYS {
+            return Err(IngressError::Invariant);
+        }
         let aggregate = state
             .aggregates
             .entry(key.clone())
@@ -175,6 +179,16 @@ impl IngressBuffer {
 
     pub fn restore(&self, batch: IngressFlushBatch) -> Result<(), IngressError> {
         let mut state = self.inner.lock().map_err(|_| IngressError::Invariant)?;
+        let additional_keys = batch
+            .aggregates
+            .iter()
+            .filter(|aggregate| !state.aggregates.contains_key(&aggregate.key))
+            .map(|aggregate| &aggregate.key)
+            .collect::<BTreeSet<_>>()
+            .len();
+        if state.aggregates.len().saturating_add(additional_keys) > MAX_AGGREGATE_KEYS {
+            return Err(IngressError::Invariant);
+        }
         for incoming in batch.aggregates {
             let count = incoming.event_count;
             match state.aggregates.entry(incoming.key.clone()) {
@@ -184,12 +198,13 @@ impl IngressBuffer {
                 Entry::Occupied(mut entry) => {
                     let aggregate = entry.get_mut();
                     aggregate.event_count = aggregate.event_count.saturating_add(count);
-                    aggregate.first_seen_at =
-                        aggregate.first_seen_at.min(incoming.first_seen_at);
+                    aggregate.first_seen_at = aggregate.first_seen_at.min(incoming.first_seen_at);
                     aggregate.last_seen_at = aggregate.last_seen_at.max(incoming.last_seen_at);
                 }
             }
-            state.buffered_events = state.buffered_events.saturating_add(count as usize);
+            state.buffered_events = state
+                .buffered_events
+                .saturating_add(usize::try_from(count).unwrap_or(usize::MAX));
         }
         for sample in batch.samples {
             let sample_key = (sample.key.bucket_date, sample.key.detail_class.clone());
@@ -351,5 +366,44 @@ mod tests {
         }
         .validate()
         .is_err());
+    }
+
+    #[test]
+    fn aggregate_key_space_has_an_explicit_hard_bound() {
+        assert_eq!(MAX_AGGREGATE_KEYS, 256);
+        let source = include_str!("ingress.rs");
+        assert!(source.contains("state.aggregates.len() >= MAX_AGGREGATE_KEYS"));
+    }
+
+    #[test]
+    fn failed_flush_restore_cannot_exceed_aggregate_key_bound() {
+        let buffer = IngressBuffer::new(IngressBufferConfig::default()).unwrap();
+        let observed = Utc::now();
+        buffer
+            .record(&result(IngressClassification::Irrelevant), observed)
+            .unwrap();
+        let aggregates = (0..MAX_AGGREGATE_KEYS)
+            .map(|index| IngressAggregate {
+                key: IngressAggregateKey {
+                    bucket_date: observed.date_naive(),
+                    classification: "irrelevant".to_string(),
+                    detail_class: format!("bounded_restore_{index}"),
+                    router_kind: "none".to_string(),
+                    wrapper_kind: "none".to_string(),
+                    selector_kind: "unknown".to_string(),
+                },
+                event_count: 1,
+                first_seen_at: observed,
+                last_seen_at: observed,
+            })
+            .collect();
+        assert_eq!(
+            buffer.restore(IngressFlushBatch {
+                aggregates,
+                samples: Vec::new(),
+            }),
+            Err(IngressError::Invariant)
+        );
+        assert_eq!(buffer.counts(), (1, 0));
     }
 }

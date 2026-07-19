@@ -1513,6 +1513,7 @@ dependencies = [
  "money-path-classifier",
  "serde",
  "serde_json",
+ "sha2",
  "sqlx",
  "thiserror",
  "tokio",

@@ -160,6 +160,11 @@ impl PostgresOutbox {
             .map_err(classify_sqlx_error)?;
         Ok(Self { pool })
     }
+
+    #[doc(hidden)]
+    pub fn from_pool(pool: PgPool) -> Self {
+        Self { pool }
+    }
 }
 
 #[async_trait]

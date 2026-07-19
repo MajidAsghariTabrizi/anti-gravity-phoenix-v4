@@ -402,5 +402,18 @@ mod tests {
         assert!(rendered.contains("recorder_aggregate_flush_total 1"));
         assert!(rendered.contains("recorder_bounded_samples_total 2"));
         assert!(rendered.contains("recorder_sample_limit_reached_total 1"));
+        for forbidden in ["{", "tx_hash=", "address=", "source_identity=", "selector="] {
+            assert!(!rendered.contains(forbidden));
+        }
+    }
+
+    #[test]
+    fn selective_persistence_dependency_graph_has_no_redis() {
+        for lockfile in [
+            include_str!("../Cargo.lock"),
+            include_str!("../../money-path-classifier/Cargo.lock"),
+        ] {
+            assert!(!lockfile.contains("name = \"redis\""));
+        }
     }
 }

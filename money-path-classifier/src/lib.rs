@@ -11,6 +11,7 @@ const ARBITRUM_ONE_CHAIN_ID: u64 = 42161;
 const MAX_ROUTE_CONFIG_BYTES: usize = 64 * 1024;
 const MAX_ROUTES: usize = 256;
 
+pub const ADMISSION_POLICY_VERSION: &str = "money_path_v1";
 pub const LEGACY_SWAP_ROUTER_ADDRESS: &str = "0xe592427a0aece92de3edee1f18e0157c05861564";
 pub const SWAP_ROUTER_02_ADDRESS: &str = "0x68b3465833fb72a70ecdf485e0e4c7bd8665fc45";
 pub const UNIVERSAL_ROUTER_ADDRESS: &str = "0xa51afafe0263b40edaef0df8781ea9aa03e381a3";
@@ -251,9 +252,13 @@ pub struct MoneyPathClassifier {
 
 impl MoneyPathClassifier {
     pub fn from_release(
+        admission_policy_version: &str,
         router_addresses: &[String],
         route_registry_json: &str,
     ) -> Result<Self, ClassifierError> {
+        if admission_policy_version != ADMISSION_POLICY_VERSION {
+            return Err(ClassifierError::AdmissionPolicy);
+        }
         if router_addresses.is_empty() || router_addresses.len() > REVIEWED_ROUTER_ADDRESSES.len() {
             return Err(ClassifierError::RouterRegistry);
         }
@@ -360,6 +365,8 @@ impl MoneyPathClassifier {
 
 #[derive(Clone, Debug, Error, PartialEq, Eq)]
 pub enum ClassifierError {
+    #[error("money-path admission policy is invalid")]
+    AdmissionPolicy,
     #[error("reviewed router registry is invalid")]
     RouterRegistry,
     #[error("reviewed route registry is invalid")]
@@ -408,7 +415,8 @@ struct RouteSpec {
     route_fingerprint: String,
     trigger_pool_id: String,
     legs: Vec<RouteLegSpec>,
-    strategy: StrategySpec,
+    #[serde(rename = "strategy")]
+    _strategy: serde_json::Map<String, serde_json::Value>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -421,34 +429,6 @@ struct RouteLegSpec {
     token_in: String,
     token_out: String,
     direction: String,
-}
-
-#[derive(Clone, Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct StrategySpec {
-    min_input_amount: String,
-    max_input_amount: String,
-    max_evaluations: usize,
-    minimum_net_profit: String,
-    flash_premium_bps: u16,
-    minimum_slippage_bps: u16,
-    protocol_fees: String,
-    estimated_execution_gas: u64,
-    l1_data_fee: String,
-    contract_overhead: String,
-    failed_attempt_gas_cost: String,
-    failure_probability_bps: u16,
-    stale_state_loss: String,
-    stale_quote_probability_bps: u16,
-    state_drift_reserve: String,
-    latency_reserve: String,
-    uncertainty_reserve: String,
-    replacement_transaction_cost: String,
-    probability_of_success_bps: u16,
-    max_gas_price_wei: String,
-    max_quote_age_ms: u64,
-    max_simulation_age_ms: u64,
-    min_confidence_bps: u16,
 }
 
 fn reviewed_pools(raw: &str) -> Result<HashSet<PoolId>, ClassifierError> {
@@ -469,7 +449,6 @@ fn reviewed_pools(raw: &str) -> Result<HashSet<PoolId>, ClassifierError> {
             || !route_ids.insert(route.route_id)
             || !fingerprints.insert(route.route_fingerprint)
             || route.legs.len() != 2
-            || !valid_strategy(&route.strategy)
         {
             return Err(ClassifierError::RouteRegistry);
         }
@@ -520,61 +499,6 @@ fn canonical_pool_id(token_a: &Address, token_b: &Address, fee: u32) -> PoolId {
     PoolId(format!("{}:{}:{fee}", token0.as_str(), token1.as_str()))
 }
 
-fn valid_strategy(strategy: &StrategySpec) -> bool {
-    let amounts = [
-        &strategy.min_input_amount,
-        &strategy.max_input_amount,
-        &strategy.minimum_net_profit,
-        &strategy.protocol_fees,
-        &strategy.l1_data_fee,
-        &strategy.contract_overhead,
-        &strategy.failed_attempt_gas_cost,
-        &strategy.stale_state_loss,
-        &strategy.state_drift_reserve,
-        &strategy.latency_reserve,
-        &strategy.uncertainty_reserve,
-        &strategy.replacement_transaction_cost,
-        &strategy.max_gas_price_wei,
-    ]
-    .into_iter()
-    .map(|value| parse_u128(value))
-    .collect::<Option<Vec<_>>>();
-    let Some(amounts) = amounts else {
-        return false;
-    };
-    amounts[0] > 0
-        && amounts[1] >= amounts[0]
-        && amounts[2] > 0
-        && amounts[12] > 0
-        && strategy.max_evaluations > 0
-        && strategy.max_evaluations <= 64
-        && strategy.estimated_execution_gas > 0
-        && strategy.max_quote_age_ms > 0
-        && strategy.max_simulation_age_ms > 0
-        && strategy.probability_of_success_bps > 0
-        && [
-            strategy.flash_premium_bps,
-            strategy.minimum_slippage_bps,
-            strategy.failure_probability_bps,
-            strategy.stale_quote_probability_bps,
-            strategy.probability_of_success_bps,
-            strategy.min_confidence_bps,
-        ]
-        .into_iter()
-        .all(|value| value <= 10_000)
-}
-
-fn parse_u128(value: &str) -> Option<u128> {
-    if value.is_empty()
-        || value.len() > 39
-        || !value.bytes().all(|byte| byte.is_ascii_digit())
-        || (value.len() > 1 && value.starts_with('0'))
-    {
-        return None;
-    }
-    value.parse().ok()
-}
-
 fn bounded(value: &str, minimum: usize, maximum: usize) -> bool {
     value.len() >= minimum && value.len() <= maximum && !value.chars().any(char::is_control)
 }
@@ -592,6 +516,7 @@ mod tests {
 
     fn classifier() -> MoneyPathClassifier {
         MoneyPathClassifier::from_release(
+            ADMISSION_POLICY_VERSION,
             &REVIEWED_ROUTER_ADDRESSES
                 .iter()
                 .map(|value| (*value).to_string())
@@ -645,10 +570,19 @@ mod tests {
             Err(ClassifierError::Invariant)
         );
         assert!(MoneyPathClassifier::from_release(
+            ADMISSION_POLICY_VERSION,
             &[REVIEWED_ROUTER_ADDRESSES[0].to_string()],
             "[]"
         )
         .is_err());
+        assert!(matches!(
+            MoneyPathClassifier::from_release(
+                "money_path_v2",
+                &[REVIEWED_ROUTER_ADDRESSES[0].to_string()],
+                ROUTES,
+            ),
+            Err(ClassifierError::AdmissionPolicy)
+        ));
     }
 
     #[test]
@@ -696,10 +630,7 @@ mod tests {
                 &router02_exact_input_single(WETH, DAI),
             )
             .unwrap();
-        assert_eq!(
-            unrelated.classification,
-            IngressClassification::Irrelevant
-        );
+        assert_eq!(unrelated.classification, IngressClassification::Irrelevant);
         assert_eq!(unrelated.detail_class, "no_affected_reviewed_route");
 
         let exact_output = classifier
@@ -717,5 +648,84 @@ mod tests {
             exact_output.detail_class,
             "known_router_unsupported_exact_output"
         );
+    }
+
+    #[test]
+    fn admission_is_mode_independent_and_contains_no_runtime_mode_branch() {
+        let classifier = classifier();
+        let calldata = router02_exact_input_single(WETH, USDC);
+        let baseline = classifier
+            .classify(
+                ARBITRUM_ONE_CHAIN_ID,
+                Some(SWAP_ROUTER_02_ADDRESS),
+                &calldata,
+            )
+            .unwrap();
+        for _synthetic_mode in ["SHADOW", "SIMULATE", "LIVE"] {
+            assert_eq!(
+                classifier
+                    .classify(
+                        ARBITRUM_ONE_CHAIN_ID,
+                        Some(SWAP_ROUTER_02_ADDRESS),
+                        &calldata,
+                    )
+                    .unwrap(),
+                baseline
+            );
+        }
+
+        let source = include_str!("lib.rs");
+        for forbidden in [
+            ["PHOENIX_", "MODE"].concat(),
+            ["LIVE_", "EXECUTION"].concat(),
+            ["std::", "env::"].concat(),
+        ] {
+            assert!(!source.contains(&forbidden));
+        }
+    }
+
+    #[test]
+    fn admission_is_independent_of_strategy_economics() {
+        let calldata = router02_exact_input_single(WETH, USDC);
+        let expected = classifier()
+            .classify(
+                ARBITRUM_ONE_CHAIN_ID,
+                Some(SWAP_ROUTER_02_ADDRESS),
+                &calldata,
+            )
+            .unwrap();
+        let mut routes: serde_json::Value = serde_json::from_str(ROUTES).unwrap();
+        routes[0]["strategy"] = serde_json::json!({
+            "opaque_to_structural_admission": true
+        });
+        let structural_classifier = MoneyPathClassifier::from_release(
+            ADMISSION_POLICY_VERSION,
+            &REVIEWED_ROUTER_ADDRESSES
+                .iter()
+                .map(|value| (*value).to_string())
+                .collect::<Vec<_>>(),
+            &serde_json::to_string(&routes).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            structural_classifier
+                .classify(
+                    ARBITRUM_ONE_CHAIN_ID,
+                    Some(SWAP_ROUTER_02_ADDRESS),
+                    &calldata,
+                )
+                .unwrap(),
+            expected
+        );
+
+        let source = include_str!("lib.rs");
+        for forbidden in [
+            ["minimum_", "net_profit"].concat(),
+            ["estimated_execution_", "gas"].concat(),
+            ["max_gas_", "price_wei"].concat(),
+            ["max_simulation_", "age_ms"].concat(),
+        ] {
+            assert!(!source.contains(&forbidden));
+        }
     }
 }

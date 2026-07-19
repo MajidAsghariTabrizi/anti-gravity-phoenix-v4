@@ -449,6 +449,7 @@ mod tests {
         claims: Mutex<VecDeque<Result<Vec<OutboxRow>, OutboxError>>>,
         mark_result: Mutex<Result<(), OutboxError>>,
         release_result: Mutex<Result<(), OutboxError>>,
+        telemetry_result: Mutex<Result<BacklogTelemetry, OutboxError>>,
         events: Arc<Mutex<Vec<&'static str>>>,
     }
 
@@ -458,6 +459,10 @@ mod tests {
                 claims: Mutex::new(VecDeque::from([Ok(rows)])),
                 mark_result: Mutex::new(Ok(())),
                 release_result: Mutex::new(Ok(())),
+                telemetry_result: Mutex::new(Ok(BacklogTelemetry {
+                    pending_rows_estimate: 3,
+                    oldest_claimable_age_seconds: 2.5,
+                })),
                 events,
             }
         }
@@ -513,10 +518,7 @@ mod tests {
             _statement_timeout: Duration,
         ) -> Result<BacklogTelemetry, OutboxError> {
             self.events.lock().unwrap().push("telemetry");
-            Ok(BacklogTelemetry {
-                pending_rows_estimate: 3,
-                oldest_claimable_age_seconds: 2.5,
-            })
+            self.telemetry_result.lock().unwrap().clone()
         }
     }
 
@@ -598,7 +600,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn telemetry_refresh_is_separate_and_failure_does_not_change_readiness() {
+    async fn telemetry_refresh_is_separate_from_publish_readiness() {
         let events = Arc::new(Mutex::new(Vec::new()));
         let store = FakeStore::new(Vec::new(), events.clone());
         let readiness = DispatcherReadiness::new();
@@ -617,6 +619,50 @@ mod tests {
         assert!(rendered.contains("shadow_dispatcher_oldest_claimable_age_seconds 2.500000000"));
         assert!(rendered.contains("shadow_dispatcher_backlog_refresh_total 1"));
         assert!(rendered.contains("shadow_dispatcher_backlog_refresh_failures_total 0"));
+    }
+
+    #[tokio::test]
+    async fn telemetry_failure_does_not_stop_the_next_publish_cycle() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let store = FakeStore::new(vec![row()], events.clone());
+        *store.telemetry_result.lock().unwrap() = Err(OutboxError::Connection);
+        let publisher = FakePublisher {
+            result: Ok(EnginePublishReceipt {
+                stream_sequence: 12,
+                duplicate: false,
+            }),
+            events: events.clone(),
+        };
+        let readiness = DispatcherReadiness::new();
+        ready_dependencies(&readiness);
+        readiness.set_publisher_active(true);
+        let metrics = DispatcherMetrics::default();
+
+        assert_eq!(
+            refresh_backlog_telemetry(&store, &metrics, Duration::from_secs(2)).await,
+            Err(OutboxError::Connection)
+        );
+        assert!(readiness.ready().is_ok());
+        assert_eq!(
+            dispatch_once(
+                &store,
+                &publisher,
+                &DispatchConfig::default(),
+                &readiness,
+                &metrics,
+            )
+            .await,
+            Ok(1)
+        );
+        assert_eq!(
+            &*events.lock().unwrap(),
+            &["telemetry", "claim", "publish_ack", "mark"]
+        );
+        assert!(readiness.ready().is_ok());
+        let rendered = metrics.render(&readiness);
+        assert!(rendered.contains("shadow_dispatcher_backlog_refresh_total 1"));
+        assert!(rendered.contains("shadow_dispatcher_backlog_refresh_failures_total 1"));
+        assert!(rendered.contains("shadow_dispatcher_publish_success_total 1"));
     }
 
     #[tokio::test]
@@ -714,6 +760,7 @@ mod tests {
             ])),
             mark_result: Mutex::new(Ok(())),
             release_result: Mutex::new(Ok(())),
+            telemetry_result: Mutex::new(Ok(BacklogTelemetry::default())),
             events: events.clone(),
         };
         let publisher = FakePublisher {
@@ -768,6 +815,7 @@ mod tests {
             claims: Mutex::new(VecDeque::from([Ok(vec![event]), Ok(vec![retried_event])])),
             mark_result: Mutex::new(Ok(())),
             release_result: Mutex::new(Ok(())),
+            telemetry_result: Mutex::new(Ok(BacklogTelemetry::default())),
             events: events.clone(),
         };
         let readiness = DispatcherReadiness::new();
