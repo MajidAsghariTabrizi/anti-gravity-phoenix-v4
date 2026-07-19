@@ -221,7 +221,8 @@ for name in \
   RPC_UPSTREAM_CALL_BURST \
   RPC_STATE_REQUESTS_PER_MINUTE \
   RPC_PROVIDER_PROBE_INTERVAL_SECONDS \
-  ENGINE_ROUTER_ADDRESSES
+  ENGINE_ROUTER_ADDRESSES \
+  RECORDER_PERSISTENCE_POLICY
 do
   require_var "$name"
 done
@@ -231,6 +232,8 @@ done
 [ "${LIVE_EXECUTION:-}" = "false" ] || fail "LIVE_EXECUTION must be false for shadow production"
 [ "${CHAIN_ID:-}" = "42161" ] || fail "CHAIN_ID must be 42161"
 [ "${PHOENIX_FEED_SOURCE:-}" = "relay" ] || fail "PHOENIX_FEED_SOURCE must be relay"
+[ "${RECORDER_PERSISTENCE_POLICY:-}" = "money_path_v1" ] ||
+  fail "RECORDER_PERSISTENCE_POLICY must be money_path_v1"
 
 if [ -n "${PHOENIX_FEED_FIXTURE:-}" ]; then
   fail "PHOENIX_FEED_FIXTURE must not be set in production"
@@ -287,6 +290,7 @@ ok "Upstream RPC budget: ${RPC_UPSTREAM_CALLS_PER_SECOND} calls/s, burst ${RPC_U
 ok "RPC state request budget: ${RPC_STATE_REQUESTS_PER_MINUTE}/minute"
 ok "RPC provider probe interval: ${RPC_PROVIDER_PROBE_INTERVAL_SECONDS}s"
 ok "$(csv_count "${ENGINE_ROUTER_ADDRESSES:-}") reviewed Engine routers configured"
+ok "Recorder persistence policy: money_path_v1"
 ok "Parent-chain RPC configured"
 ok "Arbitrum RPC configured"
 ok "PostgreSQL configuration consistent"

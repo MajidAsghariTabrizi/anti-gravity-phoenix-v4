@@ -1,6 +1,7 @@
 pub mod dispatcher;
 pub mod engine_outbox;
 pub mod engine_stream;
+pub mod ingress;
 pub mod jetstream;
 pub mod logging;
 pub mod metrics;

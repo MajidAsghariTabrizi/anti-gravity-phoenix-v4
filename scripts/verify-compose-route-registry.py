@@ -54,24 +54,28 @@ def main() -> None:
 
     try:
         config = json.loads(Path(args.compose_config).read_text(encoding="utf-8"))
-        rendered_raw = config["services"]["phoenix-engine"]["environment"][
-            "ENGINE_ROUTE_REGISTRY_JSON"
-        ]
-    except (json.JSONDecodeError, KeyError, TypeError):
+    except (json.JSONDecodeError, TypeError):
         fail("rendered Compose value is unavailable")
-    if not isinstance(rendered_raw, str):
-        fail("rendered Compose value is not a string")
-    if rendered_raw != expected_raw:
-        fail("rendered Compose value differs from operator input")
+    for service in ("phoenix-engine", "recorder"):
+        try:
+            rendered_raw = config["services"][service]["environment"][
+                "ENGINE_ROUTE_REGISTRY_JSON"
+            ]
+        except (KeyError, TypeError):
+            fail(f"{service} rendered Compose value is unavailable")
+        if not isinstance(rendered_raw, str):
+            fail(f"{service} rendered Compose value is not a string")
+        if rendered_raw != expected_raw:
+            fail(f"{service} rendered Compose value differs from operator input")
 
-    try:
-        rendered = json.loads(rendered_raw)
-    except json.JSONDecodeError:
-        fail("rendered Compose value is not valid JSON")
-    if not isinstance(rendered, list):
-        fail("rendered Compose value is not an array")
-    if rendered != expected:
-        fail("rendered Compose structure differs from operator input")
+        try:
+            rendered = json.loads(rendered_raw)
+        except json.JSONDecodeError:
+            fail(f"{service} rendered Compose value is not valid JSON")
+        if not isinstance(rendered, list):
+            fail(f"{service} rendered Compose value is not an array")
+        if rendered != expected:
+            fail(f"{service} rendered Compose structure differs from operator input")
 
 
 if __name__ == "__main__":

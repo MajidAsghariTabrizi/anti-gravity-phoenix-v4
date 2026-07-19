@@ -1,7 +1,9 @@
+use crate::ingress::{IngressAggregate, IngressFlushBatch, IngressSample, INGRESS_SCHEMA_VERSION};
 use crate::model::{
     engine_event_identity, ValidatedMessage, ENGINE_INPUT_SCHEMA_VERSION, ORIGIN_CLASSIFICATION,
 };
 use async_trait::async_trait;
+use sha2::{Digest, Sha256};
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions, PgSslMode};
 use sqlx::types::Json;
 use sqlx::{PgPool, Postgres, QueryBuilder, Row};
@@ -80,6 +82,67 @@ const REQUIRED_COLUMNS: &[(&str, &str, &str, bool)] = &[
         "timestamp with time zone",
         true,
     ),
+    ("money_path_ingress_daily", "bucket_date", "date", false),
+    ("money_path_ingress_daily", "classification", "text", false),
+    ("money_path_ingress_daily", "detail_class", "text", false),
+    ("money_path_ingress_daily", "router_kind", "text", false),
+    ("money_path_ingress_daily", "wrapper_kind", "text", false),
+    ("money_path_ingress_daily", "selector_kind", "text", false),
+    ("money_path_ingress_daily", "event_count", "bigint", false),
+    (
+        "money_path_ingress_daily",
+        "first_seen_at",
+        "timestamp with time zone",
+        false,
+    ),
+    (
+        "money_path_ingress_daily",
+        "last_seen_at",
+        "timestamp with time zone",
+        false,
+    ),
+    ("money_path_ingress_daily", "schema_version", "text", false),
+    ("money_path_ingress_samples", "bucket_date", "date", false),
+    (
+        "money_path_ingress_samples",
+        "classification",
+        "text",
+        false,
+    ),
+    ("money_path_ingress_samples", "detail_class", "text", false),
+    ("money_path_ingress_samples", "router_kind", "text", false),
+    ("money_path_ingress_samples", "wrapper_kind", "text", false),
+    ("money_path_ingress_samples", "selector_kind", "text", false),
+    (
+        "money_path_ingress_samples",
+        "sample_ordinal",
+        "smallint",
+        false,
+    ),
+    (
+        "money_path_ingress_samples",
+        "sample_fingerprint",
+        "bytea",
+        false,
+    ),
+    (
+        "money_path_ingress_samples",
+        "safe_decoder_summary",
+        "jsonb",
+        false,
+    ),
+    (
+        "money_path_ingress_samples",
+        "observed_at",
+        "timestamp with time zone",
+        false,
+    ),
+    (
+        "money_path_ingress_samples",
+        "schema_version",
+        "text",
+        false,
+    ),
 ];
 
 const ORIGIN_BATCH_INSERT_PREFIX: &str = r#"INSERT INTO origin_transactions (
@@ -116,6 +179,13 @@ pub struct PersistOutcome {
     pub engine_outbox_inserted: bool,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct IngressPersistOutcome {
+    pub aggregate_rows_upserted: u64,
+    pub samples_inserted: u64,
+    pub sample_limit_reached: u64,
+}
+
 impl PersistOutcome {
     pub fn is_duplicate(&self) -> bool {
         !self.feed_event_inserted
@@ -144,6 +214,13 @@ pub trait EventStore: Send + Sync {
         &self,
         messages: &[ValidatedMessage],
     ) -> Result<Vec<PersistOutcome>, StoreError>;
+    async fn persist_ingress_evidence(
+        &self,
+        _batch: &IngressFlushBatch,
+        _sample_limit: usize,
+    ) -> Result<IngressPersistOutcome, StoreError> {
+        Ok(IngressPersistOutcome::default())
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -166,6 +243,11 @@ impl PostgresStore {
         Ok(Self { pool })
     }
 
+    #[doc(hidden)]
+    pub fn from_pool(pool: PgPool) -> Self {
+        Self { pool }
+    }
+
     async fn load_schema_snapshot(&self) -> Result<SchemaSnapshot, StoreError> {
         let mut snapshot = SchemaSnapshot::default();
         let rows = sqlx::query(
@@ -173,7 +255,13 @@ impl PostgresStore {
 SELECT table_name, column_name, data_type, is_nullable
 FROM information_schema.columns
 WHERE table_schema = 'public'
-  AND table_name IN ('feed_events', 'origin_transactions', 'engine_outbox')
+  AND table_name IN (
+      'feed_events',
+      'origin_transactions',
+      'engine_outbox',
+      'money_path_ingress_daily',
+      'money_path_ingress_samples'
+  )
 "#,
         )
         .fetch_all(&self.pool)
@@ -203,7 +291,13 @@ JOIN information_schema.key_column_usage kcu
  AND tc.constraint_name = kcu.constraint_name
  AND tc.table_name = kcu.table_name
 WHERE tc.table_schema = 'public'
-  AND tc.table_name IN ('feed_events', 'origin_transactions', 'engine_outbox')
+  AND tc.table_name IN (
+      'feed_events',
+      'origin_transactions',
+      'engine_outbox',
+      'money_path_ingress_daily',
+      'money_path_ingress_samples'
+  )
   AND tc.constraint_type IN ('PRIMARY KEY', 'UNIQUE')
 GROUP BY tc.table_name, tc.constraint_name
 "#,
@@ -365,6 +459,165 @@ impl EventStore for PostgresStore {
             inserted_outbox,
         ))
     }
+
+    async fn persist_ingress_evidence(
+        &self,
+        batch: &IngressFlushBatch,
+        sample_limit: usize,
+    ) -> Result<IngressPersistOutcome, StoreError> {
+        if batch.is_empty() {
+            return Ok(IngressPersistOutcome::default());
+        }
+        if !(1..=1_000).contains(&sample_limit)
+            || batch
+                .aggregates
+                .iter()
+                .any(|aggregate| aggregate.event_count > i64::MAX as u64)
+        {
+            return Err(StoreError::Configuration);
+        }
+        let mut transaction = self.pool.begin().await.map_err(classify_sqlx_error)?;
+        if !batch.aggregates.is_empty() {
+            persist_aggregates(&mut transaction, &batch.aggregates).await?;
+        }
+        let mut samples_inserted = 0_u64;
+        let mut sample_limit_reached = 0_u64;
+        for sample in &batch.samples {
+            match persist_sample(&mut transaction, sample, sample_limit).await? {
+                SamplePersistOutcome::Inserted => {
+                    samples_inserted = samples_inserted.saturating_add(1);
+                }
+                SamplePersistOutcome::Duplicate => {}
+                SamplePersistOutcome::LimitReached => {
+                    sample_limit_reached = sample_limit_reached.saturating_add(1);
+                }
+            }
+        }
+        transaction.commit().await.map_err(classify_sqlx_error)?;
+        Ok(IngressPersistOutcome {
+            aggregate_rows_upserted: batch.aggregates.len() as u64,
+            samples_inserted,
+            sample_limit_reached,
+        })
+    }
+}
+
+async fn persist_aggregates(
+    transaction: &mut sqlx::Transaction<'_, Postgres>,
+    aggregates: &[IngressAggregate],
+) -> Result<(), StoreError> {
+    let mut query = QueryBuilder::<Postgres>::new(
+        r#"INSERT INTO money_path_ingress_daily (
+    bucket_date, classification, detail_class, router_kind, wrapper_kind,
+    selector_kind, event_count, first_seen_at, last_seen_at, schema_version
+) "#,
+    );
+    query.push_values(aggregates, |mut row, aggregate| {
+        row.push_bind(aggregate.key.bucket_date)
+            .push_bind(&aggregate.key.classification)
+            .push_bind(&aggregate.key.detail_class)
+            .push_bind(&aggregate.key.router_kind)
+            .push_bind(&aggregate.key.wrapper_kind)
+            .push_bind(&aggregate.key.selector_kind)
+            .push_bind(aggregate.event_count as i64)
+            .push_bind(aggregate.first_seen_at)
+            .push_bind(aggregate.last_seen_at)
+            .push_bind(INGRESS_SCHEMA_VERSION);
+    });
+    query.push(
+        r#" ON CONFLICT (
+    bucket_date, classification, detail_class, router_kind, wrapper_kind, selector_kind
+) DO UPDATE SET
+    event_count = money_path_ingress_daily.event_count + EXCLUDED.event_count,
+    first_seen_at = LEAST(money_path_ingress_daily.first_seen_at, EXCLUDED.first_seen_at),
+    last_seen_at = GREATEST(money_path_ingress_daily.last_seen_at, EXCLUDED.last_seen_at)"#,
+    );
+    query
+        .build()
+        .execute(&mut **transaction)
+        .await
+        .map_err(classify_sqlx_error)?;
+    Ok(())
+}
+
+async fn persist_sample(
+    transaction: &mut sqlx::Transaction<'_, Postgres>,
+    sample: &IngressSample,
+    sample_limit: usize,
+) -> Result<SamplePersistOutcome, StoreError> {
+    let fingerprint = sample_fingerprint(sample)?;
+    let lock_key = format!("{}:{}", sample.key.bucket_date, sample.key.detail_class);
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+        .bind(lock_key)
+        .execute(&mut **transaction)
+        .await
+        .map_err(classify_sqlx_error)?;
+    let status: String = sqlx::query_scalar(
+        r#"
+WITH existing AS (
+    SELECT 1
+    FROM money_path_ingress_samples
+    WHERE bucket_date = $1
+      AND detail_class = $3
+      AND sample_fingerprint = $7
+), next_sample AS (
+    SELECT COALESCE(MAX(sample_ordinal), 0) + 1 AS sample_ordinal
+    FROM money_path_ingress_samples
+    WHERE bucket_date = $1
+      AND detail_class = $3
+), inserted AS (
+INSERT INTO money_path_ingress_samples (
+    bucket_date, classification, detail_class, router_kind, wrapper_kind,
+    selector_kind, sample_ordinal, sample_fingerprint, safe_decoder_summary,
+    observed_at, schema_version
+)
+SELECT $1, $2, $3, $4, $5, $6, next_sample.sample_ordinal,
+       $7, $8, $9, $10
+FROM next_sample
+WHERE NOT EXISTS (SELECT 1 FROM existing)
+  AND next_sample.sample_ordinal <= $11
+ON CONFLICT DO NOTHING
+RETURNING 1
+)
+SELECT CASE
+    WHEN EXISTS (SELECT 1 FROM inserted) THEN 'inserted'
+    WHEN EXISTS (SELECT 1 FROM existing) THEN 'duplicate'
+    ELSE 'limit_reached'
+END
+"#,
+    )
+    .bind(sample.key.bucket_date)
+    .bind(&sample.key.classification)
+    .bind(&sample.key.detail_class)
+    .bind(&sample.key.router_kind)
+    .bind(&sample.key.wrapper_kind)
+    .bind(&sample.key.selector_kind)
+    .bind(fingerprint.as_slice())
+    .bind(Json(&sample.safe_decoder_summary))
+    .bind(sample.observed_at)
+    .bind(INGRESS_SCHEMA_VERSION)
+    .bind(sample_limit as i16)
+    .fetch_one(&mut **transaction)
+    .await
+    .map_err(classify_sqlx_error)?;
+    match status.as_str() {
+        "inserted" => Ok(SamplePersistOutcome::Inserted),
+        "duplicate" => Ok(SamplePersistOutcome::Duplicate),
+        "limit_reached" => Ok(SamplePersistOutcome::LimitReached),
+        _ => Err(StoreError::Transaction),
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SamplePersistOutcome {
+    Inserted,
+    Duplicate,
+    LimitReached,
+}
+
+fn sample_fingerprint(sample: &IngressSample) -> Result<[u8; 32], StoreError> {
+    let encoded = serde_json::to_vec(sample).map_err(|_| StoreError::Configuration)?;
+    Ok(Sha256::digest(encoded).into())
 }
 
 fn build_outcomes(
@@ -405,6 +658,28 @@ pub fn validate_schema_snapshot(snapshot: &SchemaSnapshot) -> Result<(), StoreEr
     require_unique(snapshot, "feed_events", &["sequence_number", "tx_hash"])?;
     require_unique(snapshot, "engine_outbox", &["outbox_id"])?;
     require_unique(snapshot, "engine_outbox", &["source_event_identity"])?;
+    require_unique(
+        snapshot,
+        "money_path_ingress_daily",
+        &[
+            "bucket_date",
+            "classification",
+            "detail_class",
+            "router_kind",
+            "wrapper_kind",
+            "selector_kind",
+        ],
+    )?;
+    require_unique(
+        snapshot,
+        "money_path_ingress_samples",
+        &["bucket_date", "detail_class", "sample_ordinal"],
+    )?;
+    require_unique(
+        snapshot,
+        "money_path_ingress_samples",
+        &["bucket_date", "detail_class", "sample_fingerprint"],
+    )?;
 
     let chain_check_present = snapshot.origin_chain_checks.iter().any(|definition| {
         let normalized = definition.to_ascii_lowercase().replace(['(', ')'], "");
@@ -538,6 +813,37 @@ mod tests {
                 vec!["source_event_identity".to_string()],
             ]);
         snapshot
+            .unique_constraints
+            .entry("money_path_ingress_daily".to_string())
+            .or_default()
+            .insert(
+                [
+                    "bucket_date",
+                    "classification",
+                    "detail_class",
+                    "router_kind",
+                    "wrapper_kind",
+                    "selector_kind",
+                ]
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+            );
+        snapshot
+            .unique_constraints
+            .entry("money_path_ingress_samples".to_string())
+            .or_default()
+            .extend([
+                ["bucket_date", "detail_class", "sample_ordinal"]
+                    .into_iter()
+                    .map(str::to_string)
+                    .collect(),
+                ["bucket_date", "detail_class", "sample_fingerprint"]
+                    .into_iter()
+                    .map(str::to_string)
+                    .collect(),
+            ]);
+        snapshot
             .origin_chain_checks
             .push("CHECK ((chain_id = 42161))".to_string());
         snapshot.outbox_checks.extend([
@@ -650,6 +956,21 @@ mod tests {
         for destructive in ["DROP TABLE", "TRUNCATE", "DELETE FROM"] {
             assert!(!outbox.contains(destructive));
         }
+
+        let ingress = include_str!("../../migrations/011_money_path_selective_persistence.sql");
+        for required in [
+            "money_path_ingress_daily",
+            "money_path_ingress_samples",
+            "sample_ordinal BETWEEN 1 AND 1000",
+            "UNIQUE (bucket_date, detail_class, sample_fingerprint)",
+            "safe_decoder_summary - ARRAY[",
+            "money_path.ingress.v1",
+        ] {
+            assert!(ingress.contains(required), "migration missing {required}");
+        }
+        for destructive in ["DROP TABLE", "TRUNCATE", "DELETE FROM", "VACUUM FULL"] {
+            assert!(!ingress.contains(destructive));
+        }
     }
 
     #[test]
@@ -668,6 +989,41 @@ mod tests {
         let display = StoreError::Connection.to_string();
         assert!(!display.contains("postgres://"));
         assert!(!display.to_ascii_lowercase().contains("password"));
+    }
+
+    #[test]
+    fn sample_fingerprint_is_stable_without_raw_identity_material() {
+        let sample = IngressSample {
+            key: crate::ingress::IngressAggregateKey {
+                bucket_date: chrono::NaiveDate::from_ymd_opt(2026, 7, 19).unwrap(),
+                classification: "unsupported_interesting".to_string(),
+                detail_class: "known_router_unsupported_exact_output".to_string(),
+                router_kind: "legacy_swap_router".to_string(),
+                wrapper_kind: "direct".to_string(),
+                selector_kind: "legacy_exact_output_single".to_string(),
+            },
+            safe_decoder_summary: serde_json::json!({
+                "router_kind": "legacy_swap_router",
+                "outer_selector_kind": "legacy_exact_output_single",
+                "wrapper_kind": "direct",
+                "decoded_swap_kind": "none",
+                "unsupported_reason": "exact_output",
+                "command_count": 1,
+                "v3_hop_count": 0,
+                "reviewed_pool_matches": 0
+            }),
+            observed_at: chrono::DateTime::parse_from_rfc3339("2026-07-19T00:00:00Z")
+                .unwrap()
+                .with_timezone(&chrono::Utc),
+        };
+        let first = sample_fingerprint(&sample).unwrap();
+        let second = sample_fingerprint(&sample).unwrap();
+        assert_eq!(first, second);
+        assert_eq!(first.len(), 32);
+        let encoded = serde_json::to_string(&sample).unwrap();
+        for forbidden in ["tx_hash", "calldata", "source_event_identity", "http://"] {
+            assert!(!encoded.contains(forbidden));
+        }
     }
 
     #[test]

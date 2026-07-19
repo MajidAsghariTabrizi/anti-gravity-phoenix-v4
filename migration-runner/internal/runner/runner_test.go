@@ -244,6 +244,32 @@ func TestForkSimulationEvidenceMigrationIsAdditiveAndForkOnly(t *testing.T) {
 	}
 }
 
+func TestMoneyPathSelectivePersistenceMigrationIsAdditiveAndBounded(t *testing.T) {
+	migrationPath := filepath.Join("..", "..", "..", "migrations", "011_money_path_selective_persistence.sql")
+	content, err := os.ReadFile(migrationPath)
+	if err != nil {
+		t.Fatalf("read money-path persistence migration: %v", err)
+	}
+	sqlText := strings.ToUpper(string(content))
+	for _, required := range []string{
+		"CREATE TABLE IF NOT EXISTS MONEY_PATH_INGRESS_DAILY",
+		"CREATE TABLE IF NOT EXISTS MONEY_PATH_INGRESS_SAMPLES",
+		"UNSUPPORTED_INTERESTING",
+		"SAMPLE_ORDINAL BETWEEN 1 AND 1000",
+		"MONEY_PATH.INGRESS.V1",
+		"SAFE_DECODER_SUMMARY",
+	} {
+		if !strings.Contains(sqlText, required) {
+			t.Fatalf("migration missing %q", required)
+		}
+	}
+	for _, destructive := range []string{"DROP TABLE", "TRUNCATE", "DELETE FROM", "VACUUM FULL"} {
+		if strings.Contains(sqlText, destructive) {
+			t.Fatalf("migration contains destructive statement %q", destructive)
+		}
+	}
+}
+
 func TestLoadMigrationsOrdersByVersion(t *testing.T) {
 	dir := t.TempDir()
 	writeMigration(t, dir, "002_second.sql", "SELECT 2;")

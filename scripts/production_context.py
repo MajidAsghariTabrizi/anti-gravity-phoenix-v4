@@ -355,14 +355,25 @@ def validate_render(args: argparse.Namespace) -> None:
     if operator_env.get("CHAIN_ID") != "42161" or str(engine_env.get("CHAIN_ID")) != "42161":
         raise ContextError("CHAIN_ID_MISMATCH")
     dispatcher_env = service_environment(services, "shadow-dispatcher")
+    recorder_env = service_environment(services, "recorder")
+    if recorder_env.get("ENGINE_ROUTE_REGISTRY_JSON") != expected_route_raw:
+        raise ContextError("ROUTE_REGISTRY_RENDER_MISMATCH")
+    if recorder_env.get("ENGINE_ROUTER_ADDRESSES") != operator_env.get(
+        "ENGINE_ROUTER_ADDRESSES"
+    ):
+        raise ContextError("ROUTE_REGISTRY_RENDER_MISMATCH")
+    if operator_env.get("RECORDER_PERSISTENCE_POLICY") != "money_path_v1" or recorder_env.get(
+        "RECORDER_PERSISTENCE_POLICY"
+    ) != "money_path_v1":
+        raise ContextError("RECORDER_PERSISTENCE_POLICY_INVALID")
     if operator_env.get("PHOENIX_MODE") != "SHADOW" or any(
         environment.get("PHOENIX_MODE") != "SHADOW"
-        for environment in (engine_env, dispatcher_env)
+        for environment in (engine_env, dispatcher_env, recorder_env)
     ):
         raise ContextError("SHADOW_MODE_REQUIRED")
     if operator_env.get("LIVE_EXECUTION") != "false" or any(
         str(environment.get("LIVE_EXECUTION", "")).lower() != "false"
-        for environment in (engine_env, dispatcher_env)
+        for environment in (engine_env, dispatcher_env, recorder_env)
     ):
         raise ContextError("LIVE_EXECUTION_MUST_BE_FALSE")
     for name, code in (
@@ -371,7 +382,8 @@ def validate_render(args: argparse.Namespace) -> None:
         ("EXECUTOR_ADDRESS", "EXECUTOR_MUST_BE_EMPTY"),
     ):
         if operator_env.get(name, "") != "" or any(
-            environment.get(name, "") != "" for environment in (engine_env, dispatcher_env)
+            environment.get(name, "") != ""
+            for environment in (engine_env, dispatcher_env, recorder_env)
         ):
             raise ContextError(code)
 

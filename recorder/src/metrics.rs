@@ -1,5 +1,6 @@
 use crate::jetstream::ConsumerState;
 use crate::state::Readiness;
+use money_path_classifier::IngressClassification;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -33,11 +34,90 @@ struct MetricValues {
     consumer_ack_pending: AtomicU64,
     last_sequence: AtomicU64,
     last_timestamp_ms: AtomicU64,
+    irrelevant_filtered: AtomicU64,
+    unsupported_interesting: AtomicU64,
+    relevant_route_inputs: AtomicU64,
+    raw_rows_avoided: AtomicU64,
+    relevant_transactions_committed: AtomicU64,
+    relevant_transaction_failures: AtomicU64,
+    aggregate_flushes: AtomicU64,
+    aggregate_flush_failures: AtomicU64,
+    bounded_samples: AtomicU64,
+    bounded_sample_failures: AtomicU64,
+    sample_limit_reached: AtomicU64,
 }
 
 impl Metrics {
     pub fn message_received(&self) {
         self.inner.messages_received.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn classified(&self, classification: IngressClassification) {
+        match classification {
+            IngressClassification::Irrelevant => {
+                self.inner
+                    .irrelevant_filtered
+                    .fetch_add(1, Ordering::Relaxed);
+                self.raw_rows_avoided(3);
+            }
+            IngressClassification::UnsupportedInteresting => {
+                self.inner
+                    .unsupported_interesting
+                    .fetch_add(1, Ordering::Relaxed);
+                self.raw_rows_avoided(3);
+            }
+            IngressClassification::RelevantRouteInput => {
+                self.inner
+                    .relevant_route_inputs
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
+    pub fn relevant_transaction_committed(&self) {
+        self.inner
+            .relevant_transactions_committed
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn relevant_transaction_failure(&self) {
+        self.inner
+            .relevant_transaction_failures
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn aggregate_flush(&self) {
+        self.inner.aggregate_flushes.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn aggregate_flush_failure(&self) {
+        self.inner
+            .aggregate_flush_failures
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn bounded_samples(&self, count: u64) {
+        self.inner
+            .bounded_samples
+            .fetch_add(count, Ordering::Relaxed);
+    }
+
+    pub fn bounded_sample_failure(&self) {
+        self.inner
+            .bounded_sample_failures
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn sample_limit_reached(&self, count: u64) {
+        self.inner
+            .sample_limit_reached
+            .fetch_add(count, Ordering::Relaxed);
+    }
+
+    fn raw_rows_avoided(&self, count: u64) {
+        self.inner
+            .raw_rows_avoided
+            .fetch_add(count, Ordering::Relaxed);
     }
 
     pub fn message_persisted(&self) {
@@ -143,10 +223,47 @@ impl Metrics {
             .batch_persist_latency_nanos
             .load(Ordering::Relaxed) as f64
             / 1_000_000_000.0;
+        let feed_inputs = self.inner.messages_received.load(Ordering::Relaxed);
+        let persistence_ratio = if feed_inputs == 0 {
+            0.0
+        } else {
+            self.inner.relevant_route_inputs.load(Ordering::Relaxed) as f64 / feed_inputs as f64
+        };
         format!(
             concat!(
                 "# TYPE recorder_messages_received_total counter\n",
                 "recorder_messages_received_total {}\n",
+                "# TYPE recorder_feed_inputs_total counter\n",
+                "recorder_feed_inputs_total {}\n",
+                "# TYPE recorder_irrelevant_filtered_total counter\n",
+                "recorder_irrelevant_filtered_total {}\n",
+                "# TYPE recorder_unsupported_interesting_total counter\n",
+                "recorder_unsupported_interesting_total {}\n",
+                "# TYPE recorder_relevant_route_inputs_total counter\n",
+                "recorder_relevant_route_inputs_total {}\n",
+                "# TYPE recorder_raw_rows_avoided_total counter\n",
+                "recorder_raw_rows_avoided_total {}\n",
+                "# TYPE recorder_relevant_transactions_committed_total counter\n",
+                "recorder_relevant_transactions_committed_total {}\n",
+                "# TYPE recorder_relevant_transaction_failures_total counter\n",
+                "recorder_relevant_transaction_failures_total {}\n",
+                "# TYPE recorder_aggregate_flush_total counter\n",
+                "recorder_aggregate_flush_total {}\n",
+                "# TYPE recorder_aggregate_flush_failures_total counter\n",
+                "recorder_aggregate_flush_failures_total {}\n",
+                "# TYPE recorder_bounded_samples_total counter\n",
+                "recorder_bounded_samples_total {}\n",
+                "# TYPE recorder_bounded_sample_failures_total counter\n",
+                "recorder_bounded_sample_failures_total {}\n",
+                "# TYPE recorder_sample_limit_reached_total counter\n",
+                "recorder_sample_limit_reached_total {}\n",
+                "# TYPE recorder_persistence_ratio gauge\n",
+                "recorder_persistence_ratio {:.9}\n",
+                "# HELP recorder_database_bytes_per_input_estimate Zero while no isolated relation-size measurement is available.\n",
+                "# TYPE recorder_database_bytes_per_input_estimate gauge\n",
+                "recorder_database_bytes_per_input_estimate 0\n",
+                "# TYPE recorder_database_bytes_per_input_estimate_available gauge\n",
+                "recorder_database_bytes_per_input_estimate_available 0\n",
                 "# TYPE recorder_messages_persisted_total counter\n",
                 "recorder_messages_persisted_total {}\n",
                 "# TYPE recorder_transactions_persisted_total counter\n",
@@ -194,7 +311,24 @@ impl Metrics {
                 "# TYPE recorder_last_persisted_feed_timestamp_ms gauge\n",
                 "recorder_last_persisted_feed_timestamp_ms {}\n"
             ),
-            self.inner.messages_received.load(Ordering::Relaxed),
+            feed_inputs,
+            feed_inputs,
+            self.inner.irrelevant_filtered.load(Ordering::Relaxed),
+            self.inner.unsupported_interesting.load(Ordering::Relaxed),
+            self.inner.relevant_route_inputs.load(Ordering::Relaxed),
+            self.inner.raw_rows_avoided.load(Ordering::Relaxed),
+            self.inner
+                .relevant_transactions_committed
+                .load(Ordering::Relaxed),
+            self.inner
+                .relevant_transaction_failures
+                .load(Ordering::Relaxed),
+            self.inner.aggregate_flushes.load(Ordering::Relaxed),
+            self.inner.aggregate_flush_failures.load(Ordering::Relaxed),
+            self.inner.bounded_samples.load(Ordering::Relaxed),
+            self.inner.bounded_sample_failures.load(Ordering::Relaxed),
+            self.inner.sample_limit_reached.load(Ordering::Relaxed),
+            persistence_ratio,
             self.inner.messages_persisted.load(Ordering::Relaxed),
             self.inner.transactions_persisted.load(Ordering::Relaxed),
             self.inner.engine_outbox_inserted.load(Ordering::Relaxed),
@@ -235,6 +369,13 @@ mod tests {
         metrics.database_retry();
         metrics.database_retry_recovered();
         metrics.batch_persisted(17, Duration::from_millis(25));
+        metrics.classified(IngressClassification::Irrelevant);
+        metrics.classified(IngressClassification::UnsupportedInteresting);
+        metrics.classified(IngressClassification::RelevantRouteInput);
+        metrics.relevant_transaction_committed();
+        metrics.aggregate_flush();
+        metrics.bounded_samples(2);
+        metrics.sample_limit_reached(1);
         metrics.set_consumer_state(ConsumerState {
             pending: 31,
             ack_pending: 7,
@@ -252,5 +393,27 @@ mod tests {
         assert!(rendered.contains("recorder_batch_persist_latency_seconds 0.025000000"));
         assert!(rendered.contains("recorder_consumer_pending_messages 31"));
         assert!(rendered.contains("recorder_consumer_ack_pending 7"));
+        assert!(rendered.contains("recorder_feed_inputs_total 0"));
+        assert!(rendered.contains("recorder_irrelevant_filtered_total 1"));
+        assert!(rendered.contains("recorder_unsupported_interesting_total 1"));
+        assert!(rendered.contains("recorder_relevant_route_inputs_total 1"));
+        assert!(rendered.contains("recorder_raw_rows_avoided_total 6"));
+        assert!(rendered.contains("recorder_relevant_transactions_committed_total 1"));
+        assert!(rendered.contains("recorder_aggregate_flush_total 1"));
+        assert!(rendered.contains("recorder_bounded_samples_total 2"));
+        assert!(rendered.contains("recorder_sample_limit_reached_total 1"));
+        for forbidden in ["{", "tx_hash=", "address=", "source_identity=", "selector="] {
+            assert!(!rendered.contains(forbidden));
+        }
+    }
+
+    #[test]
+    fn selective_persistence_dependency_graph_has_no_redis() {
+        for lockfile in [
+            include_str!("../Cargo.lock"),
+            include_str!("../../money-path-classifier/Cargo.lock"),
+        ] {
+            assert!(!lockfile.contains("name = \"redis\""));
+        }
     }
 }

@@ -1350,6 +1350,38 @@ def build_snapshot(args: argparse.Namespace) -> tuple[dict[str, Any], list[dict[
         Path(args.identity_current)
     )
     technical = money["technical"]
+    ingress_metrics = technical["money_path_ingress"]
+    growth_24h = postgres["growth_bytes_24h"]
+    projected_runway_days = None
+    if growth_24h is not None and _number(growth_24h) > 0:
+        projected_runway_days = _canonical_decimal(
+            _number(postgres["projected_disk_headroom_bytes"]) / _number(growth_24h)
+        )
+    money_path_ingress = {
+        **ingress_metrics,
+        "dispatcher_backlog_refresh_total": technical["jetstream"][
+            "dispatcher_backlog_refresh_total"
+        ],
+        "dispatcher_backlog_refresh_failures_total": technical["jetstream"][
+            "dispatcher_backlog_refresh_failures_total"
+        ],
+        "dispatcher_backlog_stale_seconds": technical["jetstream"][
+            "dispatcher_backlog_stale_seconds"
+        ],
+        "dispatcher_batch_cycle_seconds": technical["jetstream"][
+            "dispatcher_batch_cycle_seconds"
+        ],
+        "dispatcher_oldest_claimable_age_seconds": technical["jetstream"][
+            "dispatcher_oldest_claimable_age_seconds"
+        ],
+        "dispatcher_pending_rows_estimate": technical["jetstream"][
+            "dispatcher_pending_rows_estimate"
+        ],
+        "dispatcher_rows_published_total": technical["jetstream"][
+            "dispatcher_rows_published_total"
+        ],
+        "projected_disk_runway_days": projected_runway_days,
+    }
     runtime_exits = []
     for row in money["metric_series"]:
         if row.get("name") == "phoenix_engine_runtime_exits_total":
@@ -1445,6 +1477,7 @@ def build_snapshot(args: argparse.Namespace) -> tuple[dict[str, Any], list[dict[
                 "database_write_latency_ms": {"p50": None, "p95": None, "p99": None},
             },
         },
+        "money_path_ingress": money_path_ingress,
         "postgres": postgres,
         "reliability": reliability,
         "fork": fork,
@@ -1531,6 +1564,7 @@ def build_snapshot(args: argparse.Namespace) -> tuple[dict[str, Any], list[dict[
         "feed": feed,
         "rpc": technical_payload["rpc"],
         "jetstream": technical_payload["jetstream"],
+        "money_path_ingress": money_path_ingress,
         "postgres": postgres,
         "reliability": reliability,
         "fork": fork,

@@ -1,4 +1,7 @@
 use phoenix_recorder::engine_outbox::{OutboxStore, PostgresOutbox};
+use phoenix_recorder::ingress::{
+    IngressAggregate, IngressAggregateKey, IngressFlushBatch, IngressSample, INGRESS_SCHEMA_VERSION,
+};
 use phoenix_recorder::model::{decode_message, ARBITRUM_ONE_CHAIN_ID, NORMALIZED_SCHEMA_VERSION};
 use phoenix_recorder::persistence::{EventStore, PostgresStore, StoreError};
 use serde_json::json;
@@ -49,6 +52,7 @@ async fn apply_migrations(pool: &PgPool) {
         include_str!("../../migrations/008_shadow_route_discovery_indexes.sql"),
         include_str!("../../migrations/009_profit_triggered_secondary_verification.sql"),
         include_str!("../../migrations/010_fork_simulation_evidence.sql"),
+        include_str!("../../migrations/011_money_path_selective_persistence.sql"),
     ] {
         sqlx::raw_sql(migration)
             .execute(pool)
@@ -68,6 +72,60 @@ async fn row_count(pool: &PgPool, table: &str, tx_hash: &str) -> i64 {
         .expect("decode integration count")
 }
 
+async fn table_count(pool: &PgPool, table: &str) -> i64 {
+    let query = format!("SELECT count(*) AS count FROM {table}");
+    sqlx::query(&query)
+        .fetch_one(pool)
+        .await
+        .expect("count integration table")
+        .try_get("count")
+        .expect("decode integration table count")
+}
+
+fn ingress_evidence_batch() -> IngressFlushBatch {
+    let observed = chrono::DateTime::parse_from_rfc3339("2026-07-19T00:00:00Z")
+        .unwrap()
+        .with_timezone(&chrono::Utc);
+    let key = IngressAggregateKey {
+        bucket_date: observed.date_naive(),
+        classification: "unsupported_interesting".to_string(),
+        detail_class: "known_router_unsupported_exact_output".to_string(),
+        router_kind: "legacy_swap_router".to_string(),
+        wrapper_kind: "direct".to_string(),
+        selector_kind: "legacy_exact_output_single".to_string(),
+    };
+    let summary = json!({
+        "router_kind": "legacy_swap_router",
+        "outer_selector_kind": "legacy_exact_output_single",
+        "wrapper_kind": "direct",
+        "decoded_swap_kind": "none",
+        "unsupported_reason": "exact_output",
+        "command_count": 1,
+        "v3_hop_count": 0,
+        "reviewed_pool_matches": 0
+    });
+    let first = IngressSample {
+        key: key.clone(),
+        safe_decoder_summary: summary,
+        observed_at: observed,
+    };
+    let mut second = first.clone();
+    second.key.router_kind = "swap_router02".to_string();
+    second.observed_at += chrono::Duration::seconds(1);
+    let mut over_limit = first.clone();
+    over_limit.key.router_kind = "universal_router".to_string();
+    over_limit.observed_at += chrono::Duration::seconds(2);
+    IngressFlushBatch {
+        aggregates: vec![IngressAggregate {
+            key,
+            event_count: 4,
+            first_seen_at: observed,
+            last_seen_at: observed + chrono::Duration::seconds(2),
+        }],
+        samples: vec![first.clone(), first, second, over_limit],
+    }
+}
+
 #[tokio::test]
 async fn recorder_commit_outbox_recovery_and_rollback_are_atomic() {
     let Some(dsn) = local_postgres_dsn() else {
@@ -77,10 +135,13 @@ async fn recorder_commit_outbox_recovery_and_rollback_are_atomic() {
         .await
         .expect("connect integration PostgreSQL");
     apply_migrations(&pool).await;
-    sqlx::query("TRUNCATE engine_outbox, feed_events, origin_transactions CASCADE")
-        .execute(&pool)
-        .await
-        .expect("reset integration tables");
+    sqlx::query(
+        "TRUNCATE money_path_ingress_samples, money_path_ingress_daily, \
+         engine_outbox, feed_events, origin_transactions CASCADE",
+    )
+    .execute(&pool)
+    .await
+    .expect("reset integration tables");
 
     let store = PostgresStore::connect(&dsn, "disable")
         .await
@@ -104,6 +165,9 @@ async fn recorder_commit_outbox_recovery_and_rollback_are_atomic() {
         row_count(&pool, "engine_outbox", &first.tx.tx_hash).await,
         1
     );
+    assert_eq!(table_count(&pool, "execution_attempts").await, 0);
+    assert_eq!(table_count(&pool, "executions").await, 0);
+    assert_eq!(table_count(&pool, "realized_pnl").await, 0);
 
     let replay_store = PostgresStore::connect(&dsn, "disable")
         .await
@@ -173,6 +237,65 @@ async fn recorder_commit_outbox_recovery_and_rollback_are_atomic() {
         .await
         .expect("verify published rows are not claimable")
         .is_empty());
+
+    let origin_before_evidence = table_count(&pool, "origin_transactions").await;
+    let feed_before_evidence = table_count(&pool, "feed_events").await;
+    let outbox_before_evidence = table_count(&pool, "engine_outbox").await;
+    let evidence = ingress_evidence_batch();
+    let evidence_outcome = replay_store
+        .persist_ingress_evidence(&evidence, 2)
+        .await
+        .expect("persist bounded ingress evidence");
+    assert_eq!(evidence_outcome.aggregate_rows_upserted, 1);
+    assert_eq!(evidence_outcome.samples_inserted, 2);
+    assert_eq!(evidence_outcome.sample_limit_reached, 1);
+
+    let replay_outcome = replay_store
+        .persist_ingress_evidence(&evidence, 2)
+        .await
+        .expect("replay bounded ingress evidence");
+    assert_eq!(replay_outcome.samples_inserted, 0);
+    assert_eq!(replay_outcome.sample_limit_reached, 1);
+    assert_eq!(table_count(&pool, "money_path_ingress_daily").await, 1);
+    assert_eq!(table_count(&pool, "money_path_ingress_samples").await, 2);
+    assert_eq!(
+        table_count(&pool, "origin_transactions").await,
+        origin_before_evidence
+    );
+    assert_eq!(
+        table_count(&pool, "feed_events").await,
+        feed_before_evidence
+    );
+    assert_eq!(
+        table_count(&pool, "engine_outbox").await,
+        outbox_before_evidence
+    );
+    assert_eq!(table_count(&pool, "execution_attempts").await, 0);
+    assert_eq!(table_count(&pool, "executions").await, 0);
+    assert_eq!(table_count(&pool, "realized_pnl").await, 0);
+    let stored_schema: String = sqlx::query_scalar(
+        "SELECT schema_version FROM money_path_ingress_samples ORDER BY sample_ordinal LIMIT 1",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("read bounded sample schema");
+    assert_eq!(stored_schema, INGRESS_SCHEMA_VERSION);
+    let stored_summary: String = sqlx::query_scalar(
+        "SELECT safe_decoder_summary::text FROM money_path_ingress_samples \
+         ORDER BY sample_ordinal LIMIT 1",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("read bounded sample");
+    for forbidden in [
+        "tx_hash",
+        "calldata",
+        "source_event_identity",
+        "http://",
+        "postgres://",
+    ] {
+        assert!(!stored_summary.contains(forbidden));
+    }
 
     sqlx::raw_sql(
         r#"

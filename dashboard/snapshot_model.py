@@ -765,6 +765,46 @@ def _validate_postgres(value: Any) -> None:
     _text(item["retention_status"], choices={"configured", "not_configured", "unknown"})
 
 
+def _validate_money_path_ingress(value: Any) -> None:
+    item = _object(
+        value,
+        {
+            "aggregate_flush_failures_total",
+            "aggregate_flush_total",
+            "bounded_sample_failures_total",
+            "bounded_samples_total",
+            "database_bytes_per_input_estimate",
+            "database_bytes_per_input_estimate_available",
+            "dispatcher_backlog_refresh_failures_total",
+            "dispatcher_backlog_refresh_total",
+            "dispatcher_backlog_stale_seconds",
+            "dispatcher_batch_cycle_seconds",
+            "dispatcher_oldest_claimable_age_seconds",
+            "dispatcher_pending_rows_estimate",
+            "dispatcher_rows_published_total",
+            "feed_inputs_total",
+            "irrelevant_filtered_total",
+            "persistence_ratio",
+            "projected_disk_runway_days",
+            "raw_rows_avoided_total",
+            "relevant_route_inputs_total",
+            "relevant_transaction_failures_total",
+            "relevant_transactions_committed_total",
+            "sample_limit_reached_total",
+            "unsupported_interesting_total",
+        },
+    )
+    for key, nested in item.items():
+        if key == "projected_disk_runway_days":
+            _optional_decimal(nested)
+        else:
+            _decimal(nested)
+    if _number(item["database_bytes_per_input_estimate_available"]) not in {0, 1}:
+        _fail()
+    if _number(item["persistence_ratio"]) > 1:
+        _fail()
+
+
 def _validate_reliability(value: Any) -> None:
     item = _object(
         value,
@@ -1045,6 +1085,7 @@ def validate_snapshot(data: Any) -> dict[str, Any]:
             "feed",
             "rpc",
             "jetstream",
+            "money_path_ingress",
             "postgres",
             "reliability",
             "fork",
@@ -1068,6 +1109,7 @@ def validate_snapshot(data: Any) -> dict[str, Any]:
     _validate_feed(top["feed"])
     _validate_rpc(top["rpc"])
     _validate_jetstream(top["jetstream"])
+    _validate_money_path_ingress(top["money_path_ingress"])
     _validate_postgres(top["postgres"])
     _validate_reliability(top["reliability"])
     _validate_fork(top["fork"])

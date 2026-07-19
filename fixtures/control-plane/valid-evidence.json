@@ -115,7 +115,31 @@
     "rpc": {"requests": "25", "success": "22", "timeouts": "1", "rate_limited": "1", "unavailable": "1", "disagreements": "1"},
     "jetstream": {"streams": "2", "consumers": "2", "pending": "4", "ack_pending": "1", "redeliveries": "0"},
     "database": {"size_start_bytes": "1000", "size_end_bytes": "1200", "growth_bytes": "200"},
-    "feed": {"messages": "100", "gaps": "1", "missing_sequences": "2", "decode_failures": "0"}
+    "feed": {"messages": "100", "gaps": "1", "missing_sequences": "2", "decode_failures": "0"},
+    "money_path_ingress": {
+      "aggregate_flush_failures_total": "0",
+      "aggregate_flush_total": "2",
+      "bounded_sample_failures_total": "0",
+      "bounded_samples_total": "2",
+      "database_bytes_per_input_estimate": "80",
+      "database_bytes_per_input_estimate_available": "1",
+      "dispatcher_backlog_refresh_failures_total": "0",
+      "dispatcher_backlog_refresh_total": "2",
+      "dispatcher_backlog_stale_seconds": "1",
+      "dispatcher_batch_cycle_seconds": "0.02",
+      "dispatcher_oldest_claimable_age_seconds": "15",
+      "dispatcher_pending_rows_estimate": "3",
+      "dispatcher_rows_published_total": "5",
+      "feed_inputs_total": "100",
+      "irrelevant_filtered_total": "90",
+      "persistence_ratio": "0.05",
+      "raw_rows_avoided_total": "285",
+      "relevant_route_inputs_total": "5",
+      "relevant_transaction_failures_total": "0",
+      "relevant_transactions_committed_total": "5",
+      "sample_limit_reached_total": "0",
+      "unsupported_interesting_total": "5"
+    }
   },
   "bounded_errors": [
     {"observed_at": "2026-07-16T00:08:00Z", "service": "rpc-gateway", "class": "verification_disagreement", "message": "Independent verification disagreed for one bounded evaluation"}

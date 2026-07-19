@@ -61,6 +61,8 @@ grep -F "classification.classified_at >= '$RUN_STARTED_AT_UTC'::timestamptz" "$f
   fail 'candidate query is not classification-time scoped'
 grep -F "current_attempt.completed_at >= '$RUN_STARTED_AT_UTC'::timestamptz" "$fake_psql_query" >/dev/null ||
   fail 'candidate query is not current-attempt scoped'
+grep -F "positive_evidence_no_evidence_diagnostics" "$workflow" >/dev/null ||
+  fail 'an exhausted current-run query does not emit bounded diagnostics'
 grep -F "positive_evidence_finish POSITIVE_ROUTE_EVIDENCE_NOT_FOUND '' ''" "$workflow" >/dev/null ||
   fail 'an exhausted current-run query does not return NOT_FOUND'
 
@@ -220,6 +222,7 @@ write_rendered_budget() {
     >"$isolated_canary_state_dir/compose.rendered.json"
 }
 
+# shellcheck disable=SC2317  # Test double invoked by the sourced workflow.
 compose() {
   printf '%s\n' "$*" >>"$test_log"
 }
@@ -357,6 +360,35 @@ grep -F 'timeout_seconds=${SHADOW_POSITIVE_ROUTE_TIMEOUT_SECONDS:-900}' "$workfl
   fail 'default timeout is not 15 minutes'
 grep -F 'POSITIVE_ROUTE_EVIDENCE_FOUND' "$workflow" >/dev/null || fail 'positive terminal result is missing'
 grep -F 'POSITIVE_ROUTE_EVIDENCE_NOT_FOUND' "$workflow" >/dev/null || fail 'no-evidence terminal result is missing'
+service_metric() {
+  case "$3" in
+    recorder_feed_inputs_total) printf '100\n' ;;
+    recorder_irrelevant_filtered_total) printf '90\n' ;;
+    recorder_unsupported_interesting_total) printf '5\n' ;;
+    recorder_relevant_route_inputs_total) printf '5\n' ;;
+    shadow_dispatcher_rows_published_total) printf '5\n' ;;
+    shadow_dispatcher_oldest_claimable_age_seconds) printf '15.5\n' ;;
+    shadow_dispatcher_pending_rows_estimate) printf '3\n' ;;
+    *) return 1 ;;
+  esac
+}
+sql_count() {
+  case "$1" in
+    *shadow_engine_processing_attempts*) printf '10\n' ;;
+    *'sum(candidate_count)'*) printf '4\n' ;;
+    *shadow_engine_classifications*) printf '8\n' ;;
+    *shadow_decisions*) printf '3\n' ;;
+    *) return 1 ;;
+  esac
+}
+diagnostics=$(positive_evidence_no_evidence_diagnostics) ||
+  fail 'bounded no-evidence diagnostic harness failed'
+printf '%s\n' "$diagnostics" | grep -Fx \
+  'POSITIVE_ROUTE_NO_EVIDENCE_DIAGNOSTICS feed_inputs=100 irrelevant_filtered=90 unsupported_interesting=5 relevant_route_inputs=5 dispatcher_rows_published=5 processing_attempts=10 classifications=8 candidates=4 decisions=3 oldest_claimable_age_seconds=15.5 pending_rows_estimate=3' >/dev/null ||
+  fail 'bounded no-evidence diagnostics are incomplete'
+if printf '%s\n' "$diagnostics" | grep -Ei '0x[0-9a-f]{40}|https?://|postgres://|nats://|tx_hash|source_event_identity' >/dev/null; then
+  fail 'bounded no-evidence diagnostics expose sensitive or high-cardinality material'
+fi
 grep -F -- '--source-sequence "$positive_candidate_source_sequence"' "$workflow" >/dev/null ||
   fail 'production replay is not scoped to the exact source sequence'
 

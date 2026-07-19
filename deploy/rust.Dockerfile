@@ -5,6 +5,7 @@ COPY phoenix-engine ./phoenix-engine
 COPY rpc-gateway ./rpc-gateway
 COPY recorder ./recorder
 COPY replay ./replay
+COPY money-path-classifier ./money-path-classifier
 COPY fixtures/routes ./fixtures/routes
 COPY fixtures/engine ./fixtures/engine
 COPY migrations ./migrations

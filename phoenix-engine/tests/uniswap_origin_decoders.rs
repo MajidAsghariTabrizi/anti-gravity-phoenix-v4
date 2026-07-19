@@ -654,7 +654,7 @@ fn classification_evidence_is_bounded_and_excludes_raw_identity_material() {
 
 #[test]
 fn decoder_source_has_no_rpc_or_payload_logging_path() {
-    let source = include_str!("../src/origin/uniswap.rs");
+    let source = include_str!("../../money-path-classifier/src/uniswap.rs");
     for forbidden in [
         "reqwest",
         "rpc_gateway",

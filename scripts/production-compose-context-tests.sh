@@ -22,6 +22,7 @@ fi
 
 release_sha=1111111111111111111111111111111111111111
 provider_secret=provider-token-must-not-print
+reviewed_routers=0xe592427a0aece92de3edee1f18e0157c05861564,0x68b3465833fb72a70ecdf485e0e4c7bd8665fc45,0xa51afafe0263b40edaef0df8781ea9aa03e381a3
 manifest=$test_root/release-manifest.json
 release_env=$test_root/release.env
 operator_env=$test_root/phoenix.env
@@ -76,7 +77,9 @@ write_operator_env() {
 PHOENIX_ENV=production
 PHOENIX_MODE=SHADOW
 LIVE_EXECUTION=false
+RECORDER_PERSISTENCE_POLICY=money_path_v1
 CHAIN_ID=42161
+ENGINE_ROUTER_ADDRESSES=$reviewed_routers
 SIGNER_PRIVATE_KEY=
 WALLET_ADDRESS=
 EXECUTOR_ADDRESS=
@@ -92,11 +95,11 @@ write_rendered() {
   rendered_route=$1
   budget=$2
   engine_image=${3:-ghcr.io/majidasgharitabrizi/phoenix-engine@sha256:2222222222222222222222222222222222222222222222222222222222222222}
-  python3 - "$compose_output" "$rendered_route" "$budget" "$engine_image" <<'PY'
+  python3 - "$compose_output" "$rendered_route" "$budget" "$engine_image" "$reviewed_routers" <<'PY'
 import json
 import sys
 
-output, route, budget, engine_image = sys.argv[1:]
+output, route, budget, engine_image, reviewed_routers = sys.argv[1:]
 images = {
     "nitro-feed-relay": "offchainlabs/nitro-node@sha256:ebc985e3b105980734630744981e1542001c22d74cba57509fe0d5ed8bb84c14",
     "nats": "nats@sha256:b83efabe3e7def1e0a4a31ec6e078999bb17c80363f881df35edc70fcb6bb927",
@@ -124,8 +127,13 @@ services["phoenix-engine"]["environment"] = safety
 services["shadow-dispatcher"]["environment"] = {
     key: value for key, value in safety.items() if key != "ENGINE_ROUTE_REGISTRY_JSON" and key != "CHAIN_ID"
 }
+services["recorder"]["environment"] = {
+    **safety,
+    "ENGINE_ROUTER_ADDRESSES": reviewed_routers,
+    "RECORDER_PERSISTENCE_POLICY": "money_path_v1",
+}
 services["rpc-gateway"]["environment"] = {"RPC_STATE_REQUESTS_PER_MINUTE": budget}
-for service in ("nitro-feed-relay", "nats", "postgres", "migration-runner", "feed-ingestor", "recorder", "dashboard", "prometheus"):
+for service in ("nitro-feed-relay", "nats", "postgres", "migration-runner", "feed-ingestor", "dashboard", "prometheus"):
     services[service]["environment"] = {}
 with open(output, "w", encoding="utf-8", newline="\n") as handle:
     json.dump({"services": services}, handle, sort_keys=True, separators=(",", ":"))

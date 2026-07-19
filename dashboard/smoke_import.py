@@ -31,7 +31,7 @@ def main() -> None:
         app = run_app(FIXTURE)
         if "Phoenix PRE-LIVE SHADOW" not in values(app.title):
             raise RuntimeError("dashboard title missing")
-        if len(app.tabs) != 13:
+        if len(app.tabs) != 14:
             raise RuntimeError("dashboard section count changed")
         if not any(
             "NOT REALIZED CAPITAL PNL" in value for value in values(app.warning)
@@ -43,6 +43,9 @@ def main() -> None:
             "LIVE execution",
             "Execution eligible",
             "Execution request created",
+            "Feed inputs",
+            "Persistence ratio",
+            "Pending rows estimate",
         ):
             if required not in metric_labels:
                 raise RuntimeError(f"dashboard safety metric missing: {required}")

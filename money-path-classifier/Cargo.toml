@@ -1,0 +1,13 @@
+[package]
+name = "money-path-classifier"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.79"
+license = "MIT"
+
+[dependencies]
+ethabi = "=18.0.0"
+hex = "=0.4.3"
+serde = { version = "=1.0.210", features = ["derive"] }
+serde_json = "=1.0.128"
+thiserror = "=1.0.63"

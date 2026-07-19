@@ -153,6 +153,7 @@ RPC_UPSTREAM_CALL_BURST=4
 RPC_STATE_REQUESTS_PER_MINUTE=12
 RPC_PROVIDER_PROBE_INTERVAL_SECONDS=60
 ENGINE_ROUTER_ADDRESSES=0xe592427a0aece92de3edee1f18e0157c05861564,0x68b3465833fb72a70ecdf485e0e4c7bd8665fc45,0xa51afafe0263b40edaef0df8781ea9aa03e381a3
+RECORDER_PERSISTENCE_POLICY=money_path_v1
 EXECUTOR_ADDRESS=
 SIGNER_PRIVATE_KEY=
 WALLET_ADDRESS=
@@ -385,9 +386,11 @@ if sudo env \
 then
   fail 'Prometheus data symlink was accepted'
 fi
-[ "$outside_prometheus_state" = "$(stat -c '%u:%g:%a' "$outside_prometheus/marker")" ] &&
-  [ "$outside_prometheus_sha" = "$(sha256sum "$outside_prometheus/marker")" ] ||
+if [ "$outside_prometheus_state" != "$(stat -c '%u:%g:%a' "$outside_prometheus/marker")" ] ||
+  [ "$outside_prometheus_sha" != "$(sha256sum "$outside_prometheus/marker")" ]
+then
   fail 'Prometheus data symlink changed an outside path'
+fi
 
 nested_prometheus_root=$tmp_dir/nested-prometheus-host
 mkdir -p "$nested_prometheus_root/data/prometheus"
@@ -408,9 +411,11 @@ fi
   stat -c '%u:%g:%a' "$nested_prometheus_root/data/prometheus"
 )" ] ||
   fail 'nested Prometheus symlink failure partially changed the data directory'
-[ "$outside_prometheus_state" = "$(stat -c '%u:%g:%a' "$outside_prometheus/marker")" ] &&
-  [ "$outside_prometheus_sha" = "$(sha256sum "$outside_prometheus/marker")" ] ||
+if [ "$outside_prometheus_state" != "$(stat -c '%u:%g:%a' "$outside_prometheus/marker")" ] ||
+  [ "$outside_prometheus_sha" != "$(sha256sum "$outside_prometheus/marker")" ]
+then
   fail 'nested Prometheus data symlink changed an outside path'
+fi
 
 linked_prometheus_root=$tmp_dir/linked-prometheus-host
 mkdir -p "$linked_prometheus_root/data/prometheus"
@@ -424,9 +429,11 @@ if sudo env \
 then
   fail 'hard-linked Prometheus data file was accepted'
 fi
-[ "$outside_prometheus_state" = "$(stat -c '%u:%g:%a' "$outside_prometheus/marker")" ] &&
-  [ "$outside_prometheus_sha" = "$(sha256sum "$outside_prometheus/marker")" ] ||
+if [ "$outside_prometheus_state" != "$(stat -c '%u:%g:%a' "$outside_prometheus/marker")" ] ||
+  [ "$outside_prometheus_sha" != "$(sha256sum "$outside_prometheus/marker")" ]
+then
   fail 'Prometheus hard-link failure changed an outside path'
+fi
 
 file_prometheus_root=$tmp_dir/file-prometheus-host
 mkdir -p "$file_prometheus_root/data"
