@@ -1,8 +1,10 @@
 #!/usr/bin/env sh
+# Sourced canary functions consume these globals and test doubles indirectly.
+# shellcheck disable=SC2016,SC2034,SC2317
 set -eu
 
-script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
-repo_dir=$(CDPATH= cd -- "$script_dir/.." && pwd)
+script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
+repo_dir=$(CDPATH='' cd -- "$script_dir/.." && pwd)
 
 if ! command -v python3 >/dev/null 2>&1 && command -v python >/dev/null 2>&1; then
   python3() {
@@ -73,16 +75,16 @@ fi
 
 ENGINE_ROUTE_REGISTRY_JSON='[{"route_id":"expected","legs":[{"pool_id":"token-a:token-b:500"}]}]'
 printf 'ENGINE_ROUTE_REGISTRY_JSON=%s\n' "$ENGINE_ROUTE_REGISTRY_JSON" >"$env_file"
-route_config_payload='{"services":{"phoenix-engine":{"environment":{"ENGINE_ROUTE_REGISTRY_JSON":"[{\"route_id\":\"expected\",\"legs\":[{\"pool_id\":\"token-a:token-b:500\"}]}]"}}}}'
+route_config_payload='{"services":{"phoenix-engine":{"environment":{"ENGINE_ROUTE_REGISTRY_JSON":"[{\"route_id\":\"expected\",\"legs\":[{\"pool_id\":\"token-a:token-b:500\"}]}]"}},"recorder":{"environment":{"ENGINE_ROUTE_REGISTRY_JSON":"[{\"route_id\":\"expected\",\"legs\":[{\"pool_id\":\"token-a:token-b:500\"}]}]"}}}}'
 isolated_canary_state_dir=$(mktemp -d)
 isolated_canary_route_registry_preflight || fail 'valid rendered route registry failed preflight'
 
-route_config_payload='{"services":{"phoenix-engine":{"environment":{"ENGINE_ROUTE_REGISTRY_JSON":"[{route_id:expected}]"}}}}'
+route_config_payload='{"services":{"phoenix-engine":{"environment":{"ENGINE_ROUTE_REGISTRY_JSON":"[{route_id:expected}]"}},"recorder":{"environment":{"ENGINE_ROUTE_REGISTRY_JSON":"[{route_id:expected}]"}}}}'
 if isolated_canary_route_registry_preflight; then
   fail 'malformed rendered route registry passed preflight'
 fi
 
-route_config_payload='{"services":{"phoenix-engine":{"environment":{"ENGINE_ROUTE_REGISTRY_JSON":"[{\"route_id\":\"different\"}]"}}}}'
+route_config_payload='{"services":{"phoenix-engine":{"environment":{"ENGINE_ROUTE_REGISTRY_JSON":"[{\"route_id\":\"different\"}]"}},"recorder":{"environment":{"ENGINE_ROUTE_REGISTRY_JSON":"[{\"route_id\":\"different\"}]"}}}}'
 if isolated_canary_route_registry_preflight; then
   fail 'structurally different rendered route registry passed preflight'
 fi
@@ -122,7 +124,7 @@ if grep -E '^up([[:space:]]|$)' "$test_log" >/dev/null; then
   fail 'route registry preflight failure started Engine or RPC Gateway'
 fi
 
-route_config_payload='{"services":{"phoenix-engine":{"environment":{"ENGINE_ROUTE_REGISTRY_JSON":"[{\"route_id\":\"expected\",\"legs\":[{\"pool_id\":\"token-a:token-b:500\"}]}]"}}}}'
+route_config_payload='{"services":{"phoenix-engine":{"environment":{"ENGINE_ROUTE_REGISTRY_JSON":"[{\"route_id\":\"expected\",\"legs\":[{\"pool_id\":\"token-a:token-b:500\"}]}]"}},"recorder":{"environment":{"ENGINE_ROUTE_REGISTRY_JSON":"[{\"route_id\":\"expected\",\"legs\":[{\"pool_id\":\"token-a:token-b:500\"}]}]"}}}}'
 isolated_canary_state_dir=$(mktemp -d)
 isolated_canary_container_is_healthy() {
   [ "$1" != 'feed-ingestor' ]

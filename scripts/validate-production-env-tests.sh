@@ -1,7 +1,7 @@
 #!/usr/bin/env sh
 set -eu
 
-script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 validator="$script_dir/validate-production-env.sh"
 tmp_dir=$(mktemp -d "${TMPDIR:-/tmp}/phoenix-env-test.XXXXXX")
 trap 'rm -rf "$tmp_dir"' EXIT

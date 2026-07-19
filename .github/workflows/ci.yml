@@ -235,12 +235,19 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          cargo fmt --all --check --manifest-path money-path-classifier/Cargo.toml
+          cargo clippy --manifest-path money-path-classifier/Cargo.toml --all-targets --all-features --locked -- -D warnings
+          cargo test --manifest-path money-path-classifier/Cargo.toml --all-targets --all-features --locked
           cargo fmt --check --manifest-path recorder/Cargo.toml
           cargo clippy --manifest-path recorder/Cargo.toml --all-targets --all-features -- -D warnings
           cargo test --manifest-path recorder/Cargo.toml
           PHOENIX_TEST_POSTGRES_DSN=postgres://phoenix_test:phoenix_test_password@127.0.0.1:5432/phoenix_test \
             cargo test --locked --manifest-path recorder/Cargo.toml \
               --test postgres_outbox_integration -- --nocapture
+          PHOENIX_TEST_POSTGRES_DSN=postgres://phoenix_test:phoenix_test_password@127.0.0.1:5432/phoenix_test \
+          PHOENIX_STORAGE_BENCHMARK_INPUTS=100000 \
+            cargo test --locked --manifest-path recorder/Cargo.toml \
+              --test money_path_storage_benchmark -- --nocapture
 
   rust-replay:
     name: rust-replay
@@ -492,7 +499,13 @@ jobs:
             --publish 127.0.0.1:4222:4222 \
             --volume "$PWD/deploy/nats-server.conf:/etc/nats/nats-server.conf:ro" \
             nats@sha256:b83efabe3e7def1e0a4a31ec6e078999bb17c80363f881df35edc70fcb6bb927 -c /etc/nats/nats-server.conf
-          trap 'docker rm --force phoenix-ci-nats >/dev/null 2>&1 || true' EXIT
+          docker run --detach --name phoenix-ci-postgres \
+            --publish 127.0.0.1:5432:5432 \
+            --env POSTGRES_USER=phoenix_test \
+            --env POSTGRES_PASSWORD=phoenix_test_password \
+            --env POSTGRES_DB=phoenix_test \
+            postgres@sha256:57c72fd2a128e416c7fcc499958864df5301e940bca0a56f58fddf30ffc07777
+          trap 'docker rm --force phoenix-ci-nats phoenix-ci-postgres >/dev/null 2>&1 || true' EXIT
 
           for attempt in $(seq 1 30); do
             if docker exec phoenix-ci-nats wget -q -O - \
@@ -505,6 +518,16 @@ jobs:
             fi
             sleep 1
           done
+          for attempt in $(seq 1 30); do
+            if docker exec phoenix-ci-postgres pg_isready -U phoenix_test -d phoenix_test >/dev/null; then
+              break
+            fi
+            if [ "$attempt" -eq 30 ]; then
+              docker logs --tail 100 phoenix-ci-postgres
+              exit 1
+            fi
+            sleep 1
+          done
 
           (
             cd feed-ingestor
@@ -512,8 +535,9 @@ jobs:
               go test ./internal/publisher -run '^TestJetStreamPublisherIntegration$' -count=1 -v
           )
           PHOENIX_TEST_NATS_URL=nats://127.0.0.1:4222 \
+          PHOENIX_TEST_POSTGRES_DSN=postgres://phoenix_test:phoenix_test_password@127.0.0.1:5432/phoenix_test \
             cargo test --locked --manifest-path recorder/Cargo.toml \
-              --test jetstream_integration -- --nocapture
+              --test jetstream_integration -- --nocapture --test-threads=1
           PHOENIX_TEST_NATS_URL=nats://127.0.0.1:4222 \
             cargo test --locked --manifest-path recorder/Cargo.toml \
               --test engine_stream_integration -- --nocapture
