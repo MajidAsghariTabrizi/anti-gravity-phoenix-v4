@@ -554,11 +554,52 @@ async fn run_scenario(
     assert_eq!(result.bounded_sample_rows, 100);
 
     pool.close().await;
-    sqlx::query(&format!("DROP DATABASE {database_name}"))
+    drop_isolated_database(admin_pool, &database_name).await;
+    result
+}
+
+async fn drop_isolated_database(admin_pool: &PgPool, database_name: &str) {
+    assert!(
+        database_name.starts_with("mpv1_bench_")
+            && database_name
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_'),
+        "refuse to clean up a database outside the generated benchmark namespace"
+    );
+
+    const DROP_ATTEMPTS: usize = 10;
+    for attempt in 1..=DROP_ATTEMPTS {
+        sqlx::query(
+            "SELECT pg_terminate_backend(pid)
+             FROM pg_stat_activity
+             WHERE datname = $1
+               AND pid <> pg_backend_pid()",
+        )
+        .bind(database_name)
         .execute(admin_pool)
         .await
-        .expect("drop isolated benchmark database");
-    result
+        .expect("terminate lingering isolated benchmark database sessions");
+
+        match sqlx::query(&format!("DROP DATABASE {database_name}"))
+            .execute(admin_pool)
+            .await
+        {
+            Ok(_) => return,
+            Err(error)
+                if attempt < DROP_ATTEMPTS
+                    && matches!(
+                        &error,
+                        sqlx::Error::Database(database_error)
+                            if database_error.code().as_deref() == Some("55006")
+                    ) =>
+            {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            Err(error) => panic!("drop isolated benchmark database: {error}"),
+        }
+    }
+
+    unreachable!("bounded isolated benchmark database cleanup exhausted its attempts");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
