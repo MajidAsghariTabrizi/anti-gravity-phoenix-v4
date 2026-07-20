@@ -1,4 +1,4 @@
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Timelike, Utc};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -216,7 +216,8 @@ pub struct CounterfactualResult {
 }
 
 impl CounterfactualResult {
-    pub fn from_body(body: CounterfactualResultBody) -> Result<Self, serde_json::Error> {
+    pub fn from_body(mut body: CounterfactualResultBody) -> Result<Self, serde_json::Error> {
+        body.simulated_at = canonical_persistence_time(body.simulated_at);
         let encoded = serde_json::to_vec(&body)?;
         Ok(Self {
             result_hash: hex::encode(Sha256::digest(encoded)),
@@ -283,6 +284,32 @@ impl CounterfactualResult {
             return Err(EvidenceIntegrityError::Invalid);
         }
         Ok(())
+    }
+}
+
+fn canonical_persistence_time(value: DateTime<Utc>) -> DateTime<Utc> {
+    let nanosecond = value.nanosecond() / 1_000 * 1_000;
+    value.with_nanosecond(nanosecond).unwrap_or(value)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::canonical_persistence_time;
+    use chrono::{TimeZone, Timelike, Utc};
+
+    #[test]
+    fn result_timestamps_match_postgres_microsecond_precision_before_hashing() {
+        let original = Utc
+            .with_ymd_and_hms(2026, 7, 20, 12, 0, 0)
+            .single()
+            .expect("fixture time")
+            .with_nanosecond(123_456_789)
+            .expect("subsecond fixture");
+
+        let canonical = canonical_persistence_time(original);
+
+        assert_eq!(canonical.nanosecond(), 123_456_000);
+        assert_eq!(canonical, canonical_persistence_time(canonical));
     }
 }
 
