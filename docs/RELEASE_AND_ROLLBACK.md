@@ -27,17 +27,18 @@ workflow requires an exact release SHA reachable from main, the bounded
 release intent, and the exact publication confirmation. Only publishing jobs
 receive `packages: write`.
 
-The same run also creates `release-provenance.json`. It binds all six image
+The same run also creates `release-provenance.json`. It binds all seven image
 fragments, immutable release assets, release manifest, exact source SHA,
 release intent, and build run. Canonical validation additionally requires the
 completed GitHub run and every required job to be successful. Run
 `29683234024` is quarantined as `NON_CANONICAL_INCOMPLETE_BUILD`; none of its
 partial images or artifacts are release evidence.
 
-The manifest contains six immutable images: feed-ingestor, phoenix-engine,
-rpc-gateway, recorder, fork-sandbox, and dashboard. The production renderer
-uses the five production image entries; fork-sandbox remains isolated and is
-published for controlled fork evidence only.
+The manifest contains seven immutable images: feed-ingestor, phoenix-engine,
+rpc-gateway, recorder, fork-sandbox, live-executor, and dashboard. The
+production renderer uses the five SHADOW production image entries;
+fork-sandbox remains isolated for controlled fork evidence and live-executor
+remains disabled behind the explicit `live-canary` profile.
 
 Nitro Relay, NATS, PostgreSQL, and Prometheus are pinned directly in
 `compose.prod.yml` by multi-platform manifest digest. Phoenix-owned image

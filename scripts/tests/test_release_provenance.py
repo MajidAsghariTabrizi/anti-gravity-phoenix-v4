@@ -13,6 +13,11 @@ RUN_ID = "30000000001"
 
 
 class ReleaseProvenanceTests(unittest.TestCase):
+    def test_release_contract_requires_the_seventh_live_executor_image(self) -> None:
+        self.assertEqual(len(release_provenance.EXPECTED_IMAGES), 7)
+        self.assertIn("live-executor", release_provenance.EXPECTED_IMAGES)
+        self.assertIn("build-live-executor", release_provenance.EXPECTED_JOBS)
+
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
         self.root = Path(self.temporary.name)
