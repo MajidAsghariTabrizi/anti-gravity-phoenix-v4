@@ -5,6 +5,8 @@ COPY phoenix-engine ./phoenix-engine
 COPY rpc-gateway ./rpc-gateway
 COPY recorder ./recorder
 COPY replay ./replay
+COPY live-executor ./live-executor
+COPY fork-sandbox/abi ./fork-sandbox/abi
 COPY money-path-classifier ./money-path-classifier
 COPY fixtures/routes ./fixtures/routes
 COPY fixtures/engine ./fixtures/engine
@@ -18,6 +20,7 @@ RUN case "${CRATE}" in \
       rpc-gateway) BIN=rpc-gateway ;; \
       recorder) BIN=phoenix-recorder ;; \
       replay) BIN=phoenix-replay ;; \
+      live-executor) BIN=live-executor ;; \
       *) echo "unknown crate ${CRATE}" && exit 1 ;; \
     esac && \
     cd "${CRATE}" && cargo build --release --bin "${BIN}" && \

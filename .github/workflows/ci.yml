@@ -69,6 +69,7 @@ jobs:
           sh ./scripts/prelive-protected-maintenance-tests.sh
           sh ./scripts/prelive-protected-maintenance-supervisor-tests.sh
           sh ./scripts/production-bootstrap-safety-tests.sh
+          python3 -m unittest scripts.tests.test_live_executor_safety -v
 
       - name: Validate tracked hygiene
         shell: bash
@@ -273,7 +274,7 @@ jobs:
   rust-fork-sandbox:
     name: rust-fork-sandbox
     runs-on: ubuntu-24.04
-    timeout-minutes: 20
+    timeout-minutes: 30
     services:
       postgres:
         image: postgres@sha256:57c72fd2a128e416c7fcc499958864df5301e940bca0a56f58fddf30ffc07777
@@ -293,7 +294,13 @@ jobs:
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
       - name: Install Rust components
         shell: bash
-        run: rustup toolchain install stable --profile minimal --component rustfmt,clippy
+        run: |
+          rustup toolchain install stable --profile minimal --component rustfmt,clippy
+          rustup toolchain install 1.79.0 --profile minimal --component rustfmt,clippy
+      - name: Install Foundry
+        uses: foundry-rs/foundry-toolchain@b00af27efadbc7b4ca8b82abbd903b17cc874d2a
+        with:
+          version: stable
       - name: Verify isolated fork sandbox
         shell: bash
         env:
@@ -304,6 +311,13 @@ jobs:
           cargo clippy --locked --manifest-path fork-sandbox/Cargo.toml --all-targets --all-features -- -D warnings
           cargo test --locked --manifest-path fork-sandbox/Cargo.toml -- --nocapture
           sh ./scripts/fork-sandbox-validate.sh
+          cargo +1.79.0 fmt --check --manifest-path live-executor/Cargo.toml
+          cargo +1.79.0 clippy --locked --manifest-path live-executor/Cargo.toml --all-targets --all-features -- -D warnings
+          cargo +1.79.0 test --locked --manifest-path live-executor/Cargo.toml --all-targets --all-features
+          PHOENIX_TEST_POSTGRES_DSN="$PHOENIX_TEST_POSTGRES_DSN" \
+            cargo +1.79.0 test --locked --manifest-path live-executor/Cargo.toml \
+              --test postgres_nonce_recovery -- --nocapture --test-threads=1
+          sh ./scripts/live-executor-isolated-fork-tests.sh
 
   solidity:
     name: solidity
@@ -395,11 +409,35 @@ jobs:
           RPC_GATEWAY_IMAGE=ghcr.io/majidasgharitabrizi/rpc-gateway@sha256:3333333333333333333333333333333333333333333333333333333333333333
           RECORDER_IMAGE=ghcr.io/majidasgharitabrizi/recorder@sha256:4444444444444444444444444444444444444444444444444444444444444444
           DASHBOARD_IMAGE=ghcr.io/majidasgharitabrizi/dashboard@sha256:5555555555555555555555555555555555555555555555555555555555555555
+          LIVE_EXECUTOR_IMAGE=ghcr.io/majidasgharitabrizi/live-executor@sha256:6666666666666666666666666666666666666666666666666666666666666666
+          LIVE_EXECUTOR_PHOENIX_MODE=SHADOW
+          LIVE_EXECUTOR_LIVE_EXECUTION=false
+          LIVE_EXECUTOR_ARMED=false
+          LIVE_EXECUTOR_KILL_SWITCH=true
+          LIVE_EXECUTOR_ONE_TRANSACTION_AT_A_TIME=true
+          LIVE_EXECUTOR_WALLET_ADDRESS=0x1111111111111111111111111111111111111111
+          LIVE_EXECUTOR_EXECUTOR_ADDRESS=0x2222222222222222222222222222222222222222
+          LIVE_EXECUTOR_PNL_ASSET_ADDRESS=0x82af49447d8a07e3bd95bd0d56f35241523fbab1
+          LIVE_EXECUTOR_RPC_URL=https://live-executor-rpc-placeholder.invalid
+          LIVE_EXECUTOR_RPC_ALLOWLIST=https://live-executor-rpc-placeholder.invalid
+          LIVE_EXECUTOR_MAX_GAS_LIMIT=500000
+          LIVE_EXECUTOR_MAX_MAX_FEE_PER_GAS_WEI=1000000000
+          LIVE_EXECUTOR_MAX_PRIORITY_FEE_PER_GAS_WEI=100000000
+          LIVE_EXECUTOR_MAX_INPUT_AMOUNT=1000000
+          LIVE_EXECUTOR_MIN_EXPECTED_PROFIT=1
+          LIVE_EXECUTOR_MAX_DAILY_LOSS_WEI=1000000
+          LIVE_EXECUTOR_RECEIPT_TIMEOUT_SECONDS=90
+          LIVE_EXECUTOR_POLL_INTERVAL_SECONDS=1
           EOF
           docker compose config
           PHOENIX_ENV_FILE=.ci-prod.env docker compose --env-file .ci-prod.env -f compose.prod.yml config
           PHOENIX_ENV_FILE=.ci-prod.env docker compose --env-file .ci-prod.env -f compose.prod.yml config --format json > .ci-prod-config.json
           python3 scripts/verify_dashboard_compose.py .ci-prod-config.json
+          PHOENIX_ENV_FILE=.ci-prod.env docker compose --env-file .ci-prod.env \
+            -f compose.prod.yml -f compose.live-canary.yml config
+          PHOENIX_ENV_FILE=.ci-prod.env docker compose --env-file .ci-prod.env \
+            -f compose.prod.yml -f compose.live-canary.yml \
+            --profile live-canary config --format json > .ci-live-canary-config.json
           cat > .ci-fork.env <<'EOF'
           FORK_ANVIL_DIGEST=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
           FORK_POSTGRES_PASSWORD=ci-fork-placeholder
@@ -456,6 +494,7 @@ jobs:
           docker buildx build --load -f deploy/rust.Dockerfile --build-arg CRATE=phoenix-engine -t phoenix/phoenix-engine:ci .
           docker buildx build --load -f deploy/rust.Dockerfile --build-arg CRATE=rpc-gateway -t phoenix/rpc-gateway:ci .
           docker buildx build --load -f deploy/rust.Dockerfile --build-arg CRATE=recorder -t phoenix/recorder:ci .
+          docker buildx build --load -f deploy/rust.Dockerfile --build-arg CRATE=live-executor -t phoenix/live-executor:ci .
           docker buildx build --load -f deploy/fork-sandbox.Dockerfile -t phoenix/fork-sandbox:ci .
           docker buildx build --load -f deploy/dashboard.Dockerfile -t phoenix/dashboard:ci .
 
