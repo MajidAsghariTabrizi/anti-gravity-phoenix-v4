@@ -2063,11 +2063,12 @@ fn valid_profitability_evidence(opportunity: &Opportunity) -> bool {
     {
         return false;
     }
-    let expected_status = if economics.base.expected_net_pnl >= economics.minimum_required_net_pnl {
-        PrimaryProfitabilityStatus::MeetsMinimum
-    } else {
-        PrimaryProfitabilityStatus::BelowMinimum
-    };
+    let expected_status =
+        if economics.conservative.expected_net_pnl > economics.minimum_required_net_pnl {
+            PrimaryProfitabilityStatus::MeetsMinimum
+        } else {
+            PrimaryProfitabilityStatus::BelowMinimum
+        };
     let base_execution_fee = u128::from(economics.base.estimated_execution_gas)
         .checked_mul(economics.base.gas_price_wei);
     economics.primary_status == expected_status

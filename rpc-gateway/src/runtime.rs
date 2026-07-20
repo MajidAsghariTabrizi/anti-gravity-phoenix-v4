@@ -27,6 +27,8 @@ const LIQUIDITY_SELECTOR: &str = "0x1a686502";
 const TOKEN0_SELECTOR: &str = "0x0dfe1681";
 const TOKEN1_SELECTOR: &str = "0xd21220a7";
 const FEE_SELECTOR: &str = "0xddca3f43";
+const TICK_SPACING_SELECTOR: &str = "0xd0c93a7c";
+const DECIMALS_SELECTOR: &str = "0x313ce567";
 const MAX_STATE_RESPONSE_DATA_BYTES: usize = 4096;
 const MAX_MULTICALL_CODE_BYTES: usize = 1024 * 1024;
 const CACHE_CAPACITY: usize = 1024;
@@ -650,13 +652,24 @@ impl GatewayRuntime {
             self.metrics.static_metadata_cache_hit();
         }
 
-        let mut calls = Vec::with_capacity(request.pools.len() * if static_cached { 2 } else { 5 });
+        let mut calls = Vec::with_capacity(request.pools.len() * if static_cached { 2 } else { 8 });
         if !static_cached {
             for pool in &request.pools {
-                for selector in [TOKEN0_SELECTOR, TOKEN1_SELECTOR, FEE_SELECTOR] {
+                for selector in [
+                    TOKEN0_SELECTOR,
+                    TOKEN1_SELECTOR,
+                    FEE_SELECTOR,
+                    TICK_SPACING_SELECTOR,
+                ] {
                     calls.push(EthCall {
                         target: pool.address.clone(),
                         calldata: selector.to_string(),
+                    });
+                }
+                for token in [&pool.token0, &pool.token1] {
+                    calls.push(EthCall {
+                        target: token.clone(),
+                        calldata: DECIMALS_SELECTOR.to_string(),
                     });
                 }
             }
@@ -704,10 +717,22 @@ impl GatewayRuntime {
                     .ok_or_else(|| BundleFailure::integrity(quality.clone()))?;
                 let fee = parse_u32_bytes(&results[offset + 2])
                     .ok_or_else(|| BundleFailure::integrity(quality.clone()))?;
-                if token0 != pool.token0 || token1 != pool.token1 || fee != pool.fee {
+                let tick_spacing = parse_i24_bytes(&results[offset + 3])
+                    .ok_or_else(|| BundleFailure::integrity(quality.clone()))?;
+                let token0_decimals = parse_u8_bytes(&results[offset + 4])
+                    .ok_or_else(|| BundleFailure::integrity(quality.clone()))?;
+                let token1_decimals = parse_u8_bytes(&results[offset + 5])
+                    .ok_or_else(|| BundleFailure::integrity(quality.clone()))?;
+                if token0 != pool.token0
+                    || token1 != pool.token1
+                    || fee != pool.fee
+                    || tick_spacing != pool.tick_spacing
+                    || token0_decimals != pool.token0_decimals
+                    || token1_decimals != pool.token1_decimals
+                {
                     return Err(BundleFailure::integrity(quality));
                 }
-                offset += 3;
+                offset += 6;
             }
         }
 
@@ -724,7 +749,10 @@ impl GatewayRuntime {
                 &pool.protocol,
                 &pool.token0,
                 &pool.token1,
+                pool.token0_decimals,
+                pool.token1_decimals,
                 pool.fee,
+                pool.tick_spacing,
                 &slot0,
                 &liquidity,
             ))
@@ -735,7 +763,10 @@ impl GatewayRuntime {
                 protocol: pool.protocol.clone(),
                 token0: pool.token0.clone(),
                 token1: pool.token1.clone(),
+                token0_decimals: pool.token0_decimals,
+                token1_decimals: pool.token1_decimals,
                 fee: pool.fee,
+                tick_spacing: pool.tick_spacing,
                 slot0,
                 liquidity,
                 state_hash: canonical_hash_bytes(&state_material),
@@ -1296,6 +1327,28 @@ fn parse_u32_bytes(value: &[u8]) -> Option<u32> {
     Some(u32::from_be_bytes(value[28..].try_into().ok()?))
 }
 
+fn parse_u8_bytes(value: &[u8]) -> Option<u8> {
+    let value = parse_u32_bytes(value)?;
+    u8::try_from(value).ok()
+}
+
+fn parse_i24_bytes(value: &[u8]) -> Option<i32> {
+    if value.len() != 32 {
+        return None;
+    }
+    let negative = value[29] & 0x80 != 0;
+    let expected_prefix = if negative { 0xff } else { 0x00 };
+    if value[..29].iter().any(|byte| *byte != expected_prefix) {
+        return None;
+    }
+    let raw = u32::from_be_bytes([0, value[29], value[30], value[31]]);
+    Some(if negative {
+        raw as i32 - (1_i32 << 24)
+    } else {
+        raw as i32
+    })
+}
+
 fn canonical_quantity(value: &str) -> bool {
     let Some(body) = value.strip_prefix("0x") else {
         return false;
@@ -1440,6 +1493,14 @@ mod tests {
                         [0x0d, 0xfe, 0x16, 0x81] => address_word(0x33),
                         [0xd2, 0x12, 0x20, 0xa7] => address_word(0x44),
                         [0xdd, 0xca, 0x3f, 0x43] => u32_word(500),
+                        [0xd0, 0xc9, 0x3a, 0x7c] => u32_word(10),
+                        [0x31, 0x3c, 0xe5, 0x67] => {
+                            if values[0].clone().into_address().unwrap().as_bytes()[19] == 0x33 {
+                                u32_word(18)
+                            } else {
+                                u32_word(6)
+                            }
+                        }
                         [0x38, 0x50, 0xc7, 0xbd] => {
                             let marker = if self.disagreement.load(Ordering::Relaxed)
                                 && provider_id == "provider_1"
@@ -1543,7 +1604,10 @@ mod tests {
                     protocol: "UniswapV3".to_string(),
                     token0: "0x3333333333333333333333333333333333333333".to_string(),
                     token1: "0x4444444444444444444444444444444444444444".to_string(),
+                    token0_decimals: 18,
+                    token1_decimals: 6,
                     fee: 500,
+                    tick_spacing: 10,
                 },
                 PoolStateRequest {
                     pool_id: "pool-b".to_string(),
@@ -1551,7 +1615,10 @@ mod tests {
                     protocol: "SushiSwapV3".to_string(),
                     token0: "0x3333333333333333333333333333333333333333".to_string(),
                     token1: "0x4444444444444444444444444444444444444444".to_string(),
+                    token0_decimals: 18,
+                    token1_decimals: 6,
                     fee: 500,
+                    tick_spacing: 10,
                 },
             ],
             evidence: EvidenceRequest::Primary,
@@ -1639,7 +1706,7 @@ mod tests {
         assert_eq!(primary.route_config_hash, expected_route_hash);
         assert!(!primary.provider_agreement);
         let calls = client.calls();
-        assert_eq!(multicall_inner_counts(&calls), vec![10]);
+        assert_eq!(multicall_inner_counts(&calls), vec![16]);
         assert_eq!(
             calls
                 .iter()
@@ -1665,7 +1732,7 @@ mod tests {
             .await;
         runtime.resolve_shadow_state(request()).await.unwrap();
         let calls = client.calls();
-        assert_eq!(multicall_inner_counts(&calls), vec![10, 4]);
+        assert_eq!(multicall_inner_counts(&calls), vec![16, 4]);
         assert_eq!(
             calls
                 .iter()
@@ -1721,7 +1788,7 @@ mod tests {
             Some(verified.route_config_hash.as_str())
         );
         let calls = client.calls();
-        assert_eq!(multicall_inner_counts(&calls), vec![10, 10]);
+        assert_eq!(multicall_inner_counts(&calls), vec![16, 16]);
         assert_eq!(calls.len(), 9, "cold path must stay below the old 26 calls");
         assert_eq!(
             calls
@@ -1843,7 +1910,7 @@ mod tests {
         );
         let calls = client.calls();
         assert_eq!(calls.len(), 5);
-        assert_eq!(multicall_inner_counts(&calls), vec![10]);
+        assert_eq!(multicall_inner_counts(&calls), vec![16]);
     }
 
     #[tokio::test]
@@ -2018,7 +2085,7 @@ mod tests {
             .await;
         let second = runtime.resolve_shadow_state(request()).await.unwrap();
         assert_eq!(second.block_hash, REORG_HASH);
-        assert_eq!(multicall_inner_counts(&client.calls()), vec![10, 4]);
+        assert_eq!(multicall_inner_counts(&client.calls()), vec![16, 4]);
     }
 
     #[tokio::test]
@@ -2029,7 +2096,7 @@ mod tests {
         let mut changed = request();
         changed.route_fingerprint = "route-v2".to_string();
         runtime.resolve_shadow_state(changed).await.unwrap();
-        assert_eq!(multicall_inner_counts(&client.calls()), vec![10, 10]);
+        assert_eq!(multicall_inner_counts(&client.calls()), vec![16, 16]);
     }
 
     #[tokio::test]

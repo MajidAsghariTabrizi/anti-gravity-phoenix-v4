@@ -1,4 +1,5 @@
 #!/usr/bin/env sh
+# shellcheck disable=SC1007
 set -eu
 
 script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
@@ -62,6 +63,23 @@ assert top["canonical_pool_addresses"] == [
     "0xc473e2aee3441bf9240be85eb122abb059a3b57c",
 ]
 assert top["suggested_route_json"]["strategy"]["max_gas_price_wei"] == "1000000000000"
+assert top["suggested_route_json"]["settlement_asset_decimals"] == 18
+assert top["suggested_route_json"]["legs"][0]["token_in_decimals"] == 18
+assert top["suggested_route_json"]["legs"][0]["token_out_decimals"] == 6
+assert top["suggested_route_json"]["legs"][0]["tick_spacing"] == 10
+assert top["suggested_route_json"]["legs"][1]["token_in_decimals"] == 6
+assert top["suggested_route_json"]["legs"][1]["token_out_decimals"] == 18
+assert top["suggested_route_json"]["legs"][1]["tick_spacing"] == 60
+assert top["suggested_route_json"]["strategy"]["candidate_sizes"] == [
+    "100000000000000",
+    "250000000000000",
+    "500000000000000",
+    "1000000000000000",
+    "2500000000000000",
+    "5000000000000000",
+    "10000000000000000",
+]
+assert top["suggested_route_json"]["strategy"]["conservative_cost_multiplier_bps"] == 12500
 assert "untrusted_or_synthetic_history" in top["unsafe_or_unsupported_reasons"]
 assert top["shadow_activation_eligible"] is False
 assert "feed_gap_overlap_unavailable_not_persisted" in report["global_warnings"]

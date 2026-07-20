@@ -1,4 +1,7 @@
-use crate::amm::v3::simulate_exact_input;
+use crate::amm::v3::{
+    amount_less_fee, current_range_input_capacity, quote_spot_exact_input,
+    simulate_current_range_exact_input,
+};
 use crate::decision::{decide, DecisionContext, ShadowPolicy};
 use crate::domain::{Amount, Direction, DomainError, Liquidity, OpportunityId, SqrtPriceX96, Tick};
 use crate::economics::{evaluate_scenarios, EconomicInput};
@@ -7,12 +10,16 @@ use crate::metrics::RuntimeMetrics;
 use crate::opportunity::{
     AgreementState, BasisPoints, DecisionEvidence,
     IndependentVerificationStatus as OpportunityIndependentVerificationStatus, MarketEvidence,
-    Opportunity, OpportunityIdentity, OutcomeEvidence, PoolStateEvidence, RejectionReason,
-    RouteEvidence, ScenarioEconomics, ShadowDisposition, SignedAmount, SimulationClassification,
-    SimulationEvidence, SimulationKind, StateSource, Strategy, VerificationSkipReason,
+    MonetaryUnit, Opportunity, OpportunityIdentity, OutcomeEvidence, PoolStateEvidence,
+    PrimaryProfitabilityStatus, RejectionReason, RouteEvidence, ScenarioEconomics,
+    ShadowDisposition, SignedAmount, SimulationClassification, SimulationEvidence, SimulationKind,
+    StateSource, Strategy, VerificationSkipReason,
     VerificationStatus as OpportunityVerificationStatus,
 };
-use crate::optimizer::{optimize, CandidateEvaluation, OptimizerConfig};
+use crate::optimizer::{
+    calculate_profit_threshold, generate_candidate_sizes, ProfitThreshold, ProfitThresholdConfig,
+    SizeLadderConfig,
+};
 use crate::origin::OriginEvent;
 use crate::shadow_processor::{
     CandidateBatch, CandidateEvaluator, EvaluatedOpportunity, EvaluationError, RuntimeRoute,
@@ -29,6 +36,7 @@ use rpc_gateway::shadow_state::{
     VerificationStatus as GatewayVerificationStatus, ARBITRUM_ONE_CHAIN_ID,
     MAX_GATEWAY_REQUEST_BYTES, MAX_GATEWAY_RESPONSE_BYTES, SHADOW_STATE_SCHEMA_VERSION,
 };
+use serde::Serialize;
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
@@ -36,14 +44,101 @@ use std::fmt;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
+use tokio::sync::Semaphore;
 
 const DEFAULT_GATEWAY_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_PROVIDER_QUALITY_RECORDS: usize = 512;
 const MAX_CLOCK_SKEW_MS: u64 = 30_000;
+const MAX_EVALUATION_CONCURRENCY: usize = 8;
 const STATE_MODEL_CONFIDENCE_BPS: u16 = 7_000;
-const STRATEGY_VERSION: &str = "two-pool-v3-block-state-v1";
+const STRATEGY_VERSION: &str = "two-pool-v3-profitability-scale-v1";
 const DETECTOR_VERSION: &str = "exact-input-single-v1";
-const POLICY_VERSION: &str = "shadow-state-policy-v1";
+const POLICY_VERSION: &str = "shadow-profitability-scale-v1";
+const ARBITRUM_WETH: &str = "0x82af49447d8a07e3bd95bd0d56f35241523fbab1";
+const PROFITABILITY_EVIDENCE_SCHEMA_VERSION: &str = "phoenix.profitability_scale.v1";
+
+#[derive(Clone, Debug, Serialize)]
+struct LegLiquidityEvidence {
+    leg_index: usize,
+    pool_id: String,
+    input_asset: String,
+    input_decimals: u8,
+    input_amount: String,
+    input_amount_less_fee: String,
+    current_range_input_capacity: Option<String>,
+    utilization_bps: Option<String>,
+    complete: bool,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct FeeComponentEvidence {
+    protocol_fees: String,
+    pool_fees: String,
+    price_impact: String,
+    slippage_allowance: String,
+    flash_loan_premium: String,
+    arbitrum_execution_fee: String,
+    l1_data_fee: String,
+    contract_overhead: String,
+    failed_attempt_reserve: String,
+    stale_state_reserve: String,
+    ordering_reserve: String,
+    state_drift_reserve: String,
+    latency_reserve: String,
+    uncertainty_reserve: String,
+    base_total_cost: String,
+    conservative_total_cost: String,
+    severe_total_cost: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct ProfitThresholdEvidence {
+    configured_absolute_minimum: String,
+    configured_input_relative_minimum: String,
+    conservative_cost_safety_buffer: String,
+    required: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct CandidateSizeEvidence {
+    candidate_size: String,
+    settlement_asset: String,
+    settlement_asset_decimals: u8,
+    monetary_unit: &'static str,
+    status: &'static str,
+    selected: bool,
+    liquidity_evidence_complete: bool,
+    liquidity: Vec<LegLiquidityEvidence>,
+    maximum_liquidity_utilization_bps: Option<u16>,
+    spot_output: Option<String>,
+    no_fee_curve_output: Option<String>,
+    expected_output: Option<String>,
+    price_impact: Option<String>,
+    price_impact_bps: Option<u16>,
+    slippage_bps: Option<u16>,
+    fee_components: Option<FeeComponentEvidence>,
+    expected_net_pnl: Option<String>,
+    conservative_net_pnl: Option<String>,
+    severe_net_pnl: Option<String>,
+    minimum_required_net_pnl: Option<String>,
+    threshold_components: Option<ProfitThresholdEvidence>,
+    rejection_reason: Option<&'static str>,
+}
+
+#[derive(Clone, Debug)]
+struct CandidateAttempt {
+    evidence: CandidateSizeEvidence,
+    evaluation: Option<AmountEvaluation>,
+    economic_gate_passed: bool,
+}
+
+#[derive(Clone, Debug)]
+struct LadderEvaluation {
+    attempts: Vec<CandidateAttempt>,
+    selected_index: Option<usize>,
+    economic_fallback_index: Option<usize>,
+    incomplete_state_seen: bool,
+}
 
 #[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
 pub enum GatewayClientError {
@@ -191,6 +286,7 @@ pub struct RpcCandidateEvaluator {
     client: Arc<dyn ShadowStateClient>,
     code_version: String,
     metrics: RuntimeMetrics,
+    evaluation_permits: Arc<Semaphore>,
 }
 
 impl fmt::Debug for RpcCandidateEvaluator {
@@ -215,13 +311,25 @@ impl RpcCandidateEvaluator {
         code_version: String,
         metrics: RuntimeMetrics,
     ) -> Result<Self, &'static str> {
-        if !bounded_label(&code_version, 1, 128) {
+        Self::with_metrics_and_concurrency(client, code_version, metrics, 1)
+    }
+
+    pub fn with_metrics_and_concurrency(
+        client: Arc<dyn ShadowStateClient>,
+        code_version: String,
+        metrics: RuntimeMetrics,
+        max_evaluation_concurrency: usize,
+    ) -> Result<Self, &'static str> {
+        if !bounded_label(&code_version, 1, 128)
+            || !(1..=MAX_EVALUATION_CONCURRENCY).contains(&max_evaluation_concurrency)
+        {
             return Err("invalid Engine code version");
         }
         Ok(Self {
             client,
             code_version,
             metrics,
+            evaluation_permits: Arc::new(Semaphore::new(max_evaluation_concurrency)),
         })
     }
 }
@@ -234,6 +342,11 @@ impl CandidateEvaluator for RpcCandidateEvaluator {
         origin: &OriginEvent,
         route: &RuntimeRoute,
     ) -> Result<CandidateBatch, EvaluationError> {
+        let _permit = self
+            .evaluation_permits
+            .acquire()
+            .await
+            .map_err(|_| EvaluationError::Terminal("evaluation_concurrency_closed"))?;
         let request = state_request(route)?;
         let requested_at = Instant::now();
         let primary_response = self
@@ -257,115 +370,77 @@ impl CandidateEvaluator for RpcCandidateEvaluator {
         let pools = decode_pools(route, &primary_response)?;
         let gas_price_wei = parse_decimal_u128(&input.normalized.max_fee_per_gas)
             .ok_or(EvaluationError::Terminal("economic_input_out_of_range"))?;
-        let mut incomplete_state_seen = false;
-        let optimized = optimize(
-            OptimizerConfig {
-                min_amount: route.strategy.min_input_amount,
-                max_amount: route.strategy.max_input_amount,
-                max_evaluations: route.strategy.max_evaluations,
-                min_profit: route.strategy.minimum_net_profit,
-            },
-            |amount| match evaluate_amount(route, &pools, amount, gas_price_wei) {
-                Ok(value) => Ok(CandidateEvaluation {
-                    amount,
-                    gross_profit: value.gross_profit.0,
-                    flash_premium: value.economics.base.flash_loan_fee,
-                    expected_execution_cost: value
-                        .economics
-                        .base
-                        .arbitrum_execution_fee
-                        .checked_add(value.economics.base.l1_data_fee)?
-                        .checked_add(value.economics.base.contract_overhead)?,
-                    expected_ordering_cost: value
-                        .economics
-                        .base
-                        .failure_cost_reserve
-                        .checked_add(value.economics.base.ordering_reserve)?,
-                    uncertainty_reserve: value.economics.base.uncertainty_reserve,
-                    expected_net_profit: value.economics.base.expected_net_pnl.0,
-                }),
-                Err(ModelError::NotViable) => Err(DomainError::ArithmeticUnderflow),
-                Err(ModelError::StateIncomplete) => {
-                    incomplete_state_seen = true;
-                    Err(DomainError::ArithmeticUnderflow)
-                }
-                Err(ModelError::Integrity) => Err(DomainError::ArithmeticOverflow),
-            },
-        )
-        .map_err(|_| EvaluationError::Terminal("shadow_model_arithmetic_failure"))?;
-
-        let Some(optimized) = optimized else {
+        let primary_ladder = evaluate_ladder(route, &pools, gas_price_wei)?;
+        let primary_profitability = profitability_scale_evidence(route, &primary_ladder);
+        let Some(primary_selected_index) = primary_ladder.selected_index else {
             self.metrics.rpc_primary_screen_rejected();
             self.metrics.rpc_secondary_skipped();
-            self.metrics
-                .profitability_without_candidate(incomplete_state_seen);
+            let fallback = primary_ladder
+                .economic_fallback_index
+                .and_then(|index| primary_ladder.attempts[index].evaluation.clone());
+            if fallback.is_none() {
+                self.metrics
+                    .profitability_without_candidate(primary_ladder.incomplete_state_seen);
+            }
+            let evaluations = fallback
+                .map(|selected| {
+                    build_opportunity(
+                        input,
+                        origin,
+                        route,
+                        &primary_response,
+                        &pools,
+                        primary_response_hash.clone(),
+                        selected,
+                        true,
+                        Some(VerificationSkipReason::PrimaryScreenNoProfitableCandidate),
+                        requested_at.elapsed(),
+                        now_ms,
+                        &self.code_version,
+                    )
+                    .map(|opportunity| {
+                        vec![EvaluatedOpportunity {
+                            opportunity,
+                            rpc_quality: primary_response.quality.clone(),
+                        }]
+                    })
+                })
+                .transpose()?
+                .unwrap_or_default();
             return Ok(CandidateBatch {
-                evaluations: Vec::new(),
+                evaluations,
                 evidence: json!({
-                    "state_block": primary_response.block_number,
-                    "state_block_hash": primary_response.block_hash,
-                    "state_hash": primary_response.state_hash,
-                    "route_config_hash": primary_response.route_config_hash,
-                    "primary_provider_id": primary_response.primary_provider_id,
-                    "verification_status": primary_response.verification_status,
-                    "independent_verification_status": "not_requested",
-                    "independent_verification_lifecycle": ["not_requested"],
-                    "verification_skip_reason": "primary_screen_no_profitable_candidate",
-                    "rpc_quality_record_count": primary_response.quality.len(),
-                    "state_model_tick_crossings_supported": 0,
-                    "incomplete_state_seen": incomplete_state_seen,
-                    "primary_screen_rejected": true,
-                    "secondary_skipped": true
+                    "state": {
+                        "state_block": primary_response.block_number,
+                        "state_block_hash": &primary_response.block_hash,
+                        "state_hash": &primary_response.state_hash,
+                        "route_config_hash": &primary_response.route_config_hash,
+                        "primary_response_hash": primary_response_hash,
+                        "primary_provider_id": &primary_response.primary_provider_id,
+                        "verification_status": primary_response.verification_status,
+                        "independent_verification_status": "not_requested",
+                        "independent_verification_lifecycle": ["not_requested"],
+                        "verification_skip_reason": "primary_screen_no_profitable_candidate",
+                        "rpc_quality_record_count": primary_response.quality.len(),
+                        "state_model_scope": "verified_current_tick_range_only",
+                        "incomplete_state_seen": primary_ladder.incomplete_state_seen,
+                        "primary_screen_rejected": true,
+                        "secondary_skipped": true
+                    },
+                    "profitability_scale": {
+                        "primary": primary_profitability,
+                        "verified": null
+                    }
                 }),
             });
         };
-        if !optimized.meets_minimum {
-            self.metrics.rpc_primary_screen_rejected();
-            self.metrics.rpc_secondary_skipped();
-            let selected = evaluate_amount(route, &pools, optimized.best_amount, gas_price_wei)
-                .map_err(|_| EvaluationError::Terminal("shadow_model_recalculation_failure"))?;
-            let opportunity = build_opportunity(
-                input,
-                origin,
-                route,
-                &primary_response,
-                &pools,
-                primary_response_hash.clone(),
-                selected,
-                Some(VerificationSkipReason::PrimaryScreenNoProfitableCandidate),
-                requested_at.elapsed(),
-                now_ms,
-                &self.code_version,
-            )?;
-            let primary_evidence = json!({
-                "state": {
-                    "state_block": primary_response.block_number,
-                    "state_block_hash": &primary_response.block_hash,
-                    "state_hash": &primary_response.state_hash,
-                    "route_config_hash": &primary_response.route_config_hash,
-                    "primary_response_hash": primary_response_hash,
-                    "primary_provider_id": &primary_response.primary_provider_id,
-                    "verification_status": primary_response.verification_status,
-                    "independent_verification_status": "not_requested",
-                    "independent_verification_lifecycle": ["not_requested"],
-                    "verification_skip_reason": "primary_screen_no_profitable_candidate",
-                    "rpc_quality_record_count": primary_response.quality.len(),
-                    "state_model_tick_crossings_supported": 0,
-                    "incomplete_state_seen": incomplete_state_seen,
-                    "primary_screen_rejected": true,
-                    "secondary_skipped": true
-                },
-                "optimizer_evaluated_amount_count": optimized.evaluated_amount_count,
-                "selected_input_amount": optimized.best_amount.0.to_string()
-            });
-            return Ok(CandidateBatch {
-                evaluations: vec![EvaluatedOpportunity {
-                    opportunity,
-                    rpc_quality: primary_response.quality,
-                }],
-                evidence: primary_evidence,
-            });
-        }
+        let primary_selected_amount = primary_ladder.attempts[primary_selected_index]
+            .evaluation
+            .as_ref()
+            .ok_or(EvaluationError::Terminal(
+                "shadow_model_selection_integrity_failure",
+            ))?
+            .input;
         let verification_request = verification_request(&request, &primary_response)?;
         let response = match self.client.fetch(&verification_request).await {
             Ok(response) => response,
@@ -383,6 +458,8 @@ impl CandidateEvaluator for RpcCandidateEvaluator {
         let now_ms = unix_time_ms();
         validate_response(&verification_request, &response, now_ms)?;
         let verified_pools = decode_pools(route, &response)?;
+        let verified_ladder = evaluate_ladder(route, &verified_pools, gas_price_wei)?;
+        let verified_profitability = profitability_scale_evidence(route, &verified_ladder);
         let verification_response_hash =
             canonical_hash_bytes(&serde_json::to_vec(&response).map_err(|_| {
                 EvaluationError::Terminal("rpc_gateway_response_integrity_failure")
@@ -408,12 +485,33 @@ impl CandidateEvaluator for RpcCandidateEvaluator {
                 response.independent_verification_status
             ],
             "rpc_quality_record_count": response.quality.len(),
-            "state_model_tick_crossings_supported": 0,
-            "incomplete_state_seen": incomplete_state_seen
+            "state_model_scope": "verified_current_tick_range_only",
+            "incomplete_state_seen": verified_ladder.incomplete_state_seen
         });
-        let selected =
-            evaluate_amount(route, &verified_pools, optimized.best_amount, gas_price_wei)
-                .map_err(|_| EvaluationError::Terminal("shadow_model_recalculation_failure"))?;
+        let selected_index = verified_ladder
+            .selected_index
+            .or(verified_ladder.economic_fallback_index);
+        let Some(selected_index) = selected_index else {
+            self.metrics
+                .profitability_without_candidate(verified_ladder.incomplete_state_seen);
+            return Ok(CandidateBatch {
+                evaluations: Vec::new(),
+                evidence: json!({
+                    "state": base_evidence,
+                    "profitability_scale": {
+                        "primary_selected_input_amount": primary_selected_amount.0.to_string(),
+                        "primary": primary_profitability,
+                        "verified": verified_profitability
+                    }
+                }),
+            });
+        };
+        let selected = verified_ladder.attempts[selected_index]
+            .evaluation
+            .clone()
+            .ok_or(EvaluationError::Terminal(
+                "shadow_model_selection_integrity_failure",
+            ))?;
         let opportunity = build_opportunity(
             input,
             origin,
@@ -422,6 +520,7 @@ impl CandidateEvaluator for RpcCandidateEvaluator {
             &verified_pools,
             primary_response_hash,
             selected,
+            true,
             None,
             requested_at.elapsed(),
             now_ms,
@@ -434,26 +533,41 @@ impl CandidateEvaluator for RpcCandidateEvaluator {
             }],
             evidence: json!({
                 "state": base_evidence,
-                "optimizer_evaluated_amount_count": optimized.evaluated_amount_count,
-                "selected_input_amount": optimized.best_amount.0.to_string()
+                "profitability_scale": {
+                    "primary_selected_input_amount": primary_selected_amount.0.to_string(),
+                    "primary": primary_profitability,
+                    "verified": verified_profitability
+                }
             }),
         })
     }
 }
 
 fn state_request(route: &RuntimeRoute) -> Result<ShadowStateRequest, EvaluationError> {
-    if route.state_targets.len() != route.route.legs.len() {
+    if route.state_targets.len() != route.route.legs.len()
+        || route.leg_units.len() != route.route.legs.len()
+    {
         return Err(EvaluationError::Terminal("route_state_target_mismatch"));
     }
     let pools = route
         .route
         .legs
         .iter()
-        .zip(&route.state_targets)
-        .map(|(leg, target)| {
-            let (token0, token1) = match leg.direction {
-                Direction::ZeroForOne => (&leg.token_in, &leg.token_out),
-                Direction::OneForZero => (&leg.token_out, &leg.token_in),
+        .zip(route.state_targets.iter().zip(&route.leg_units))
+        .map(|(leg, (target, units))| {
+            let (token0, token1, token0_decimals, token1_decimals) = match leg.direction {
+                Direction::ZeroForOne => (
+                    &leg.token_in,
+                    &leg.token_out,
+                    units.token_in_decimals,
+                    units.token_out_decimals,
+                ),
+                Direction::OneForZero => (
+                    &leg.token_out,
+                    &leg.token_in,
+                    units.token_out_decimals,
+                    units.token_in_decimals,
+                ),
             };
             PoolStateRequest {
                 pool_id: leg.pool_id.0.clone(),
@@ -461,7 +575,10 @@ fn state_request(route: &RuntimeRoute) -> Result<ShadowStateRequest, EvaluationE
                 protocol: leg.protocol.clone(),
                 token0: token0.0.as_str().to_string(),
                 token1: token1.0.as_str().to_string(),
+                token0_decimals,
+                token1_decimals,
                 fee: leg.fee,
+                tick_spacing: units.tick_spacing,
             }
         })
         .collect();
@@ -674,7 +791,10 @@ fn validate_response(
             &actual.protocol,
             &actual.token0,
             &actual.token1,
+            actual.token0_decimals,
+            actual.token1_decimals,
             actual.fee,
+            actual.tick_spacing,
             &actual.slot0,
             &actual.liquidity,
         ))
@@ -684,7 +804,10 @@ fn validate_response(
             || actual.protocol != expected.protocol
             || actual.token0 != expected.token0
             || actual.token1 != expected.token1
+            || actual.token0_decimals != expected.token0_decimals
+            || actual.token1_decimals != expected.token1_decimals
             || actual.fee != expected.fee
+            || actual.tick_spacing != expected.tick_spacing
             || !canonical_data(&actual.slot0, 4096)
             || !canonical_data(&actual.liquidity, 4096)
             || !canonical_hash(&actual.state_hash)
@@ -750,18 +873,41 @@ fn decode_pools(
     route: &RuntimeRoute,
     response: &ShadowStateResponse,
 ) -> Result<Vec<PoolState>, EvaluationError> {
+    if route.route.legs.len() != route.leg_units.len()
+        || route.route.legs.len() != response.pools.len()
+    {
+        return Err(EvaluationError::Terminal("pool_state_identity_mismatch"));
+    }
     route
         .route
         .legs
         .iter()
-        .zip(&response.pools)
-        .map(|(leg, state)| {
+        .zip(route.leg_units.iter().zip(&response.pools))
+        .map(|(leg, (units, state))| {
             let (sqrt_price_x96, tick) = decode_slot0(&state.slot0)?;
             let liquidity = decode_liquidity(&state.liquidity)?;
-            let (token0, token1) = match leg.direction {
-                Direction::ZeroForOne => (leg.token_in.clone(), leg.token_out.clone()),
-                Direction::OneForZero => (leg.token_out.clone(), leg.token_in.clone()),
+            let (token0, token1, token0_decimals, token1_decimals) = match leg.direction {
+                Direction::ZeroForOne => (
+                    leg.token_in.clone(),
+                    leg.token_out.clone(),
+                    units.token_in_decimals,
+                    units.token_out_decimals,
+                ),
+                Direction::OneForZero => (
+                    leg.token_out.clone(),
+                    leg.token_in.clone(),
+                    units.token_out_decimals,
+                    units.token_in_decimals,
+                ),
             };
+            if state.token0 != token0.0.as_str()
+                || state.token1 != token1.0.as_str()
+                || state.token0_decimals != token0_decimals
+                || state.token1_decimals != token1_decimals
+                || state.tick_spacing != units.tick_spacing
+            {
+                return Err(EvaluationError::Terminal("pool_state_identity_mismatch"));
+            }
             Ok(PoolState {
                 pool_id: leg.pool_id.clone(),
                 token0,
@@ -831,7 +977,14 @@ struct AmountEvaluation {
     input: Amount,
     output: Amount,
     leg_outputs: Vec<Amount>,
-    gross_profit: SignedAmount,
+    spot_output: Amount,
+    no_fee_curve_output: Amount,
+    price_impact: Amount,
+    price_impact_bps: u16,
+    slippage_bps: u16,
+    liquidity: Vec<LegLiquidityEvidence>,
+    maximum_liquidity_utilization_bps: u16,
+    threshold: ProfitThreshold,
     economics: ScenarioEconomics,
 }
 
@@ -842,25 +995,184 @@ enum ModelError {
     Integrity,
 }
 
+#[derive(Clone, Debug)]
+struct ModelFailure {
+    kind: ModelError,
+    liquidity: Vec<LegLiquidityEvidence>,
+}
+
+fn evaluate_ladder(
+    route: &RuntimeRoute,
+    pools: &[PoolState],
+    gas_price_wei: u128,
+) -> Result<LadderEvaluation, EvaluationError> {
+    if route.settlement_asset.0.as_str() != ARBITRUM_WETH || route.settlement_asset_decimals != 18 {
+        return Err(EvaluationError::Terminal("settlement_asset_unit_mismatch"));
+    }
+    let sizes = generate_candidate_sizes(&SizeLadderConfig {
+        min_amount: route.strategy.min_input_amount,
+        max_amount: route.strategy.max_input_amount,
+        max_evaluations: route.strategy.max_evaluations,
+        explicit_sizes: route.strategy.candidate_sizes.clone(),
+        geometric_step_bps: route.strategy.geometric_step_bps,
+    })
+    .map_err(|_| EvaluationError::Terminal("shadow_size_ladder_invalid"))?;
+    let mut attempts = Vec::with_capacity(sizes.len());
+    let mut selected_index = None;
+    let mut economic_fallback_index = None;
+    let mut incomplete_state_seen = false;
+
+    for amount in sizes {
+        let evaluation = match evaluate_amount(route, pools, amount, gas_price_wei) {
+            Ok(evaluation) => evaluation,
+            Err(failure) if failure.kind == ModelError::Integrity => {
+                return Err(EvaluationError::Terminal("shadow_model_arithmetic_failure"));
+            }
+            Err(failure) => {
+                incomplete_state_seen |= failure.kind == ModelError::StateIncomplete;
+                let rejection_reason = match failure.kind {
+                    ModelError::StateIncomplete
+                        if failure.liquidity.is_empty()
+                            || failure
+                                .liquidity
+                                .iter()
+                                .any(|leg| leg.current_range_input_capacity.is_none()) =>
+                    {
+                        "liquidity_unknown"
+                    }
+                    ModelError::StateIncomplete => "liquidity_insufficient",
+                    ModelError::NotViable => "quote_incomplete",
+                    ModelError::Integrity => unreachable!(),
+                };
+                attempts.push(CandidateAttempt {
+                    evidence: incomplete_candidate_evidence(
+                        route,
+                        amount,
+                        failure.liquidity,
+                        rejection_reason,
+                    ),
+                    evaluation: None,
+                    economic_gate_passed: false,
+                });
+                continue;
+            }
+        };
+        let rejection_reason = if gas_price_wei > route.strategy.max_gas_price_wei {
+            Some("gas_price_limit_exceeded")
+        } else if route.strategy.estimated_execution_gas > route.strategy.maximum_execution_gas {
+            Some("gas_limit_exceeded")
+        } else if evaluation.maximum_liquidity_utilization_bps
+            > route.strategy.maximum_pool_depth_utilization_bps
+        {
+            Some("liquidity_insufficient")
+        } else if evaluation.price_impact_bps > route.strategy.maximum_price_impact_bps {
+            Some("price_impact_limit_exceeded")
+        } else if evaluation.slippage_bps > route.strategy.maximum_slippage_bps {
+            Some("slippage_limit_exceeded")
+        } else if evaluation.economics.conservative.expected_net_pnl
+            <= SignedAmount(
+                i128::try_from(evaluation.threshold.required.0)
+                    .map_err(|_| EvaluationError::Terminal("shadow_model_arithmetic_failure"))?,
+            )
+        {
+            Some("conservative_net_pnl_below_threshold")
+        } else {
+            None
+        };
+        let economic_gate_passed = rejection_reason.is_none();
+        let attempt_index = attempts.len();
+        attempts.push(CandidateAttempt {
+            evidence: completed_candidate_evidence(route, &evaluation, rejection_reason),
+            evaluation: Some(evaluation),
+            economic_gate_passed,
+        });
+
+        if economic_gate_passed
+            && selected_index.map_or(true, |index| {
+                candidate_is_better(&attempts[attempt_index], &attempts[index])
+            })
+        {
+            selected_index = Some(attempt_index);
+        }
+        if rejection_reason == Some("conservative_net_pnl_below_threshold")
+            && economic_fallback_index.map_or(true, |index| {
+                candidate_is_better(&attempts[attempt_index], &attempts[index])
+            })
+        {
+            economic_fallback_index = Some(attempt_index);
+        }
+    }
+
+    if let Some(index) = selected_index {
+        for (attempt_index, attempt) in attempts.iter_mut().enumerate() {
+            if attempt.economic_gate_passed {
+                if attempt_index == index {
+                    attempt.evidence.status = "selected";
+                    attempt.evidence.selected = true;
+                    attempt.evidence.rejection_reason = None;
+                } else {
+                    attempt.evidence.status = "rejected";
+                    attempt.evidence.rejection_reason = Some("lower_conservative_net_pnl");
+                }
+            }
+        }
+    }
+    Ok(LadderEvaluation {
+        attempts,
+        selected_index,
+        economic_fallback_index,
+        incomplete_state_seen,
+    })
+}
+
+fn candidate_is_better(candidate: &CandidateAttempt, current: &CandidateAttempt) -> bool {
+    let candidate = candidate
+        .evaluation
+        .as_ref()
+        .expect("completed candidate has an evaluation");
+    let current = current
+        .evaluation
+        .as_ref()
+        .expect("completed candidate has an evaluation");
+    candidate.economics.conservative.expected_net_pnl
+        > current.economics.conservative.expected_net_pnl
+}
+
 fn evaluate_amount(
     route: &RuntimeRoute,
     pools: &[PoolState],
     amount: Amount,
     gas_price_wei: u128,
-) -> Result<AmountEvaluation, ModelError> {
-    let (output, leg_outputs) = simulate_route(route, pools, amount, false)?;
-    let (no_fee_output, _) = simulate_route(route, pools, amount, true)?;
-    let pool_fees = no_fee_output
+) -> Result<AmountEvaluation, ModelFailure> {
+    let (output, leg_outputs, liquidity) = simulate_actual_route(route, pools, amount)?;
+    let (no_fee_curve_output, _) = simulate_complete_route(route, pools, amount, true, &liquidity)?;
+    let spot_output = quote_spot_route(route, pools, amount, &liquidity)?;
+    let pool_fees = no_fee_curve_output
         .checked_sub(output)
-        .map_err(|_| ModelError::Integrity)?;
-    let economics = evaluate_scenarios(&EconomicInput {
+        .map_err(|_| model_failure(ModelError::Integrity, &liquidity))?;
+    let price_impact = spot_output
+        .checked_sub(no_fee_curve_output)
+        .map_err(|_| model_failure(ModelError::Integrity, &liquidity))?;
+    let slippage = spot_output
+        .checked_sub(output)
+        .map_err(|_| model_failure(ModelError::Integrity, &liquidity))?;
+    let price_impact_bps = ratio_bps_ceil(price_impact, spot_output)
+        .map_err(|kind| model_failure(kind, &liquidity))?;
+    let slippage_bps =
+        ratio_bps_ceil(slippage, spot_output).map_err(|kind| model_failure(kind, &liquidity))?;
+    let mut economics = evaluate_scenarios(&EconomicInput {
+        settlement_asset: route.settlement_asset.clone(),
+        settlement_asset_decimals: route.settlement_asset_decimals,
+        monetary_unit: MonetaryUnit::SettlementAssetBaseUnits,
         principal: amount,
-        gross_output: no_fee_output,
+        gross_output: spot_output,
         protocol_fees: route.strategy.protocol_fees,
         pool_fees,
-        price_impact: Amount::ZERO,
-        minimum_slippage_buffer: bps_amount(no_fee_output, route.strategy.minimum_slippage_bps)?,
-        flash_loan_fee: bps_amount(amount, route.strategy.flash_premium_bps)?,
+        price_impact,
+        minimum_slippage_buffer: bps_amount(spot_output, route.strategy.minimum_slippage_bps)
+            .map_err(|kind| model_failure(kind, &liquidity))?,
+        flash_loan_fee: bps_amount(amount, route.strategy.flash_premium_bps)
+            .map_err(|kind| model_failure(kind, &liquidity))?,
         estimated_execution_gas: route.strategy.estimated_execution_gas,
         gas_price_wei,
         l1_data_fee: route.strategy.l1_data_fee,
@@ -874,47 +1186,365 @@ fn evaluate_amount(
         uncertainty_reserve: route.strategy.uncertainty_reserve,
         replacement_transaction_cost: route.strategy.replacement_transaction_cost,
         probability_of_success_bps: route.strategy.probability_of_success_bps,
-        minimum_required_net_pnl: SignedAmount(
-            i128::try_from(route.strategy.minimum_net_profit.0)
-                .map_err(|_| ModelError::Integrity)?,
-        ),
+        minimum_required_net_pnl: SignedAmount(0),
     })
-    .map_err(|_| ModelError::Integrity)?;
+    .map_err(|_| model_failure(ModelError::Integrity, &liquidity))?;
+    let threshold = calculate_profit_threshold(
+        amount,
+        economics.conservative.total_cost,
+        ProfitThresholdConfig {
+            absolute_minimum: route.strategy.minimum_net_profit,
+            input_relative_minimum_bps: route.strategy.minimum_net_profit_bps,
+            conservative_cost_multiplier_bps: route.strategy.conservative_cost_multiplier_bps,
+        },
+    )
+    .map_err(|_| model_failure(ModelError::Integrity, &liquidity))?;
+    let required = SignedAmount(
+        i128::try_from(threshold.required.0)
+            .map_err(|_| model_failure(ModelError::Integrity, &liquidity))?,
+    );
+    economics.minimum_required_net_pnl = required;
+    economics.primary_status = if economics.conservative.expected_net_pnl > required {
+        PrimaryProfitabilityStatus::MeetsMinimum
+    } else {
+        PrimaryProfitabilityStatus::BelowMinimum
+    };
+    let maximum_liquidity_utilization_bps = liquidity
+        .iter()
+        .filter_map(|leg| {
+            leg.utilization_bps
+                .as_deref()
+                .and_then(|value| value.parse::<u16>().ok())
+        })
+        .max()
+        .ok_or_else(|| model_failure(ModelError::StateIncomplete, &liquidity))?;
     Ok(AmountEvaluation {
         input: amount,
         output,
         leg_outputs,
-        gross_profit: economics.base.gross_profit,
+        spot_output,
+        no_fee_curve_output,
+        price_impact,
+        price_impact_bps,
+        slippage_bps,
+        liquidity,
+        maximum_liquidity_utilization_bps,
+        threshold,
         economics,
     })
 }
 
-fn simulate_route(
+fn simulate_actual_route(
+    route: &RuntimeRoute,
+    pools: &[PoolState],
+    amount: Amount,
+) -> Result<(Amount, Vec<Amount>, Vec<LegLiquidityEvidence>), ModelFailure> {
+    if pools.len() != route.route.legs.len() || pools.len() != route.leg_units.len() {
+        return Err(model_failure(ModelError::Integrity, &[]));
+    }
+    let mut current = amount;
+    let mut leg_outputs = Vec::with_capacity(route.route.legs.len());
+    let mut liquidity = Vec::with_capacity(route.route.legs.len());
+    for (index, ((leg, pool), units)) in route
+        .route
+        .legs
+        .iter()
+        .zip(pools)
+        .zip(&route.leg_units)
+        .enumerate()
+    {
+        let amount_in_less_fee = amount_less_fee(current, pool.fee)
+            .map_err(|error| domain_model_failure(error, &liquidity))?;
+        let capacity = match current_range_input_capacity(pool, leg.direction, units.tick_spacing) {
+            Ok(capacity) => capacity,
+            Err(error) => {
+                liquidity.push(LegLiquidityEvidence {
+                    leg_index: index,
+                    pool_id: leg.pool_id.0.clone(),
+                    input_asset: leg.token_in.0.as_str().to_string(),
+                    input_decimals: units.token_in_decimals,
+                    input_amount: current.0.to_string(),
+                    input_amount_less_fee: amount_in_less_fee.0.to_string(),
+                    current_range_input_capacity: None,
+                    utilization_bps: None,
+                    complete: false,
+                });
+                return Err(domain_model_failure(error, &liquidity));
+            }
+        };
+        let utilization_bps = ratio_bps_string(amount_in_less_fee, capacity);
+        if amount_in_less_fee.0 >= capacity.0 {
+            liquidity.push(LegLiquidityEvidence {
+                leg_index: index,
+                pool_id: leg.pool_id.0.clone(),
+                input_asset: leg.token_in.0.as_str().to_string(),
+                input_decimals: units.token_in_decimals,
+                input_amount: current.0.to_string(),
+                input_amount_less_fee: amount_in_less_fee.0.to_string(),
+                current_range_input_capacity: Some(capacity.0.to_string()),
+                utilization_bps: Some(utilization_bps),
+                complete: false,
+            });
+            return Err(model_failure(ModelError::StateIncomplete, &liquidity));
+        }
+        let simulation =
+            simulate_current_range_exact_input(pool, current, leg.direction, units.tick_spacing)
+                .map_err(|error| domain_model_failure(error, &liquidity))?;
+        liquidity.push(LegLiquidityEvidence {
+            leg_index: index,
+            pool_id: leg.pool_id.0.clone(),
+            input_asset: leg.token_in.0.as_str().to_string(),
+            input_decimals: units.token_in_decimals,
+            input_amount: current.0.to_string(),
+            input_amount_less_fee: simulation.amount_in_less_fee.0.to_string(),
+            current_range_input_capacity: Some(simulation.current_range_capacity.0.to_string()),
+            utilization_bps: Some(simulation.utilization_bps.to_string()),
+            complete: true,
+        });
+        current = simulation.amount_out;
+        leg_outputs.push(current);
+    }
+    Ok((current, leg_outputs, liquidity))
+}
+
+fn simulate_complete_route(
     route: &RuntimeRoute,
     pools: &[PoolState],
     amount: Amount,
     remove_fees: bool,
-) -> Result<(Amount, Vec<Amount>), ModelError> {
-    if pools.len() != route.route.legs.len() {
-        return Err(ModelError::Integrity);
-    }
+    liquidity: &[LegLiquidityEvidence],
+) -> Result<(Amount, Vec<Amount>), ModelFailure> {
     let mut current = amount;
     let mut leg_outputs = Vec::with_capacity(route.route.legs.len());
-    for (leg, pool) in route.route.legs.iter().zip(pools) {
+    for ((leg, pool), units) in route.route.legs.iter().zip(pools).zip(&route.leg_units) {
         let mut pool = pool.clone();
         if remove_fees {
             pool.fee = 0;
         }
-        current = simulate_exact_input(&pool, current, leg.direction, 0)
-            .map(|simulation| simulation.amount_out)
-            .map_err(|error| match error {
-                DomainError::StateIncomplete => ModelError::StateIncomplete,
-                DomainError::ArithmeticUnderflow => ModelError::NotViable,
-                _ => ModelError::Integrity,
-            })?;
+        current =
+            simulate_current_range_exact_input(&pool, current, leg.direction, units.tick_spacing)
+                .map(|simulation| simulation.amount_out)
+                .map_err(|error| domain_model_failure(error, liquidity))?;
         leg_outputs.push(current);
     }
     Ok((current, leg_outputs))
+}
+
+fn quote_spot_route(
+    route: &RuntimeRoute,
+    pools: &[PoolState],
+    amount: Amount,
+    liquidity: &[LegLiquidityEvidence],
+) -> Result<Amount, ModelFailure> {
+    let mut current = amount;
+    for (leg, pool) in route.route.legs.iter().zip(pools) {
+        current = quote_spot_exact_input(pool, current, leg.direction)
+            .map_err(|error| domain_model_failure(error, liquidity))?;
+        if current.0 == 0 {
+            return Err(model_failure(ModelError::NotViable, liquidity));
+        }
+    }
+    Ok(current)
+}
+
+fn domain_model_failure(error: DomainError, liquidity: &[LegLiquidityEvidence]) -> ModelFailure {
+    let kind = match error {
+        DomainError::StateIncomplete => ModelError::StateIncomplete,
+        DomainError::ArithmeticUnderflow => ModelError::NotViable,
+        _ => ModelError::Integrity,
+    };
+    model_failure(kind, liquidity)
+}
+
+fn model_failure(kind: ModelError, liquidity: &[LegLiquidityEvidence]) -> ModelFailure {
+    ModelFailure {
+        kind,
+        liquidity: liquidity.to_vec(),
+    }
+}
+
+fn ratio_bps_ceil(value: Amount, denominator: Amount) -> Result<u16, ModelError> {
+    if denominator.0 == 0 || value > denominator {
+        return Err(ModelError::Integrity);
+    }
+    let numerator = U256::from(value.0)
+        .checked_mul(U256::from(10_000_u16))
+        .ok_or(ModelError::Integrity)?;
+    let denominator = U256::from(denominator.0);
+    let quotient = numerator / denominator;
+    let rounded = quotient
+        .checked_add(U256::from(u8::from(
+            numerator % denominator != U256::zero(),
+        )))
+        .ok_or(ModelError::Integrity)?;
+    u16::try_from(rounded.low_u32()).map_err(|_| ModelError::Integrity)
+}
+
+fn ratio_bps_string(value: Amount, denominator: Amount) -> String {
+    if denominator.0 == 0 {
+        return "0".to_string();
+    }
+    let numerator = U256::from(value.0) * U256::from(10_000_u16);
+    let denominator = U256::from(denominator.0);
+    let quotient = numerator / denominator;
+    (quotient + U256::from(u8::from(numerator % denominator != U256::zero()))).to_string()
+}
+
+fn incomplete_candidate_evidence(
+    route: &RuntimeRoute,
+    amount: Amount,
+    liquidity: Vec<LegLiquidityEvidence>,
+    rejection_reason: &'static str,
+) -> CandidateSizeEvidence {
+    let liquidity_evidence_complete = !liquidity.is_empty()
+        && liquidity
+            .iter()
+            .all(|leg| leg.current_range_input_capacity.is_some());
+    CandidateSizeEvidence {
+        candidate_size: amount.0.to_string(),
+        settlement_asset: route.settlement_asset.0.as_str().to_string(),
+        settlement_asset_decimals: route.settlement_asset_decimals,
+        monetary_unit: "settlement_asset_base_units",
+        status: "rejected",
+        selected: false,
+        liquidity_evidence_complete,
+        liquidity,
+        maximum_liquidity_utilization_bps: None,
+        spot_output: None,
+        no_fee_curve_output: None,
+        expected_output: None,
+        price_impact: None,
+        price_impact_bps: None,
+        slippage_bps: None,
+        fee_components: None,
+        expected_net_pnl: None,
+        conservative_net_pnl: None,
+        severe_net_pnl: None,
+        minimum_required_net_pnl: None,
+        threshold_components: None,
+        rejection_reason: Some(rejection_reason),
+    }
+}
+
+fn completed_candidate_evidence(
+    route: &RuntimeRoute,
+    evaluation: &AmountEvaluation,
+    rejection_reason: Option<&'static str>,
+) -> CandidateSizeEvidence {
+    let base = &evaluation.economics.base;
+    CandidateSizeEvidence {
+        candidate_size: evaluation.input.0.to_string(),
+        settlement_asset: route.settlement_asset.0.as_str().to_string(),
+        settlement_asset_decimals: route.settlement_asset_decimals,
+        monetary_unit: "settlement_asset_base_units",
+        status: if rejection_reason.is_some() {
+            "rejected"
+        } else {
+            "eligible"
+        },
+        selected: false,
+        liquidity_evidence_complete: evaluation.liquidity.iter().all(|leg| leg.complete),
+        liquidity: evaluation.liquidity.clone(),
+        maximum_liquidity_utilization_bps: Some(evaluation.maximum_liquidity_utilization_bps),
+        spot_output: Some(evaluation.spot_output.0.to_string()),
+        no_fee_curve_output: Some(evaluation.no_fee_curve_output.0.to_string()),
+        expected_output: Some(evaluation.output.0.to_string()),
+        price_impact: Some(evaluation.price_impact.0.to_string()),
+        price_impact_bps: Some(evaluation.price_impact_bps),
+        slippage_bps: Some(evaluation.slippage_bps),
+        fee_components: Some(FeeComponentEvidence {
+            protocol_fees: base.protocol_fees.0.to_string(),
+            pool_fees: base.pool_fees.0.to_string(),
+            price_impact: base.price_impact.0.to_string(),
+            slippage_allowance: base.slippage_allowance.0.to_string(),
+            flash_loan_premium: base.flash_loan_fee.0.to_string(),
+            arbitrum_execution_fee: base.arbitrum_execution_fee.0.to_string(),
+            l1_data_fee: base.l1_data_fee.0.to_string(),
+            contract_overhead: base.contract_overhead.0.to_string(),
+            failed_attempt_reserve: base.failure_cost_reserve.0.to_string(),
+            stale_state_reserve: base.stale_state_penalty.0.to_string(),
+            ordering_reserve: base.ordering_reserve.0.to_string(),
+            state_drift_reserve: base.state_drift_reserve.0.to_string(),
+            latency_reserve: base.latency_reserve.0.to_string(),
+            uncertainty_reserve: base.uncertainty_reserve.0.to_string(),
+            base_total_cost: base.total_cost.0.to_string(),
+            conservative_total_cost: evaluation.economics.conservative.total_cost.0.to_string(),
+            severe_total_cost: evaluation.economics.severe.total_cost.0.to_string(),
+        }),
+        expected_net_pnl: Some(evaluation.economics.base.expected_net_pnl.0.to_string()),
+        conservative_net_pnl: Some(
+            evaluation
+                .economics
+                .conservative
+                .expected_net_pnl
+                .0
+                .to_string(),
+        ),
+        severe_net_pnl: Some(evaluation.economics.severe.expected_net_pnl.0.to_string()),
+        minimum_required_net_pnl: Some(evaluation.threshold.required.0.to_string()),
+        threshold_components: Some(ProfitThresholdEvidence {
+            configured_absolute_minimum: evaluation.threshold.absolute_minimum.0.to_string(),
+            configured_input_relative_minimum: evaluation
+                .threshold
+                .input_relative_minimum
+                .0
+                .to_string(),
+            conservative_cost_safety_buffer: evaluation
+                .threshold
+                .conservative_cost_safety_buffer
+                .0
+                .to_string(),
+            required: evaluation.threshold.required.0.to_string(),
+        }),
+        rejection_reason,
+    }
+}
+
+fn profitability_scale_evidence(
+    route: &RuntimeRoute,
+    ladder: &LadderEvaluation,
+) -> serde_json::Value {
+    let selected_best_size = ladder.selected_index.and_then(|index| {
+        ladder.attempts[index]
+            .evaluation
+            .as_ref()
+            .map(|evaluation| evaluation.input.0.to_string())
+    });
+    let attempts = ladder
+        .attempts
+        .iter()
+        .map(|attempt| &attempt.evidence)
+        .collect::<Vec<_>>();
+    json!({
+        "schema_version": PROFITABILITY_EVIDENCE_SCHEMA_VERSION,
+        "route_id": route.route.route_id.0,
+        "route_fingerprint": route.fingerprint,
+        "settlement_asset": route.settlement_asset.0.as_str(),
+        "settlement_asset_decimals": route.settlement_asset_decimals,
+        "monetary_unit": "settlement_asset_base_units",
+        "sizing_policy": {
+            "minimum_size": route.strategy.min_input_amount.0.to_string(),
+            "maximum_size": route.strategy.max_input_amount.0.to_string(),
+            "maximum_evaluations": route.strategy.max_evaluations,
+            "candidate_sizes": route.strategy.candidate_sizes.as_ref().map(|sizes| {
+                sizes.iter().map(|amount| amount.0.to_string()).collect::<Vec<_>>()
+            }),
+            "geometric_step_bps": route.strategy.geometric_step_bps,
+            "maximum_pool_depth_utilization_bps":
+                route.strategy.maximum_pool_depth_utilization_bps,
+            "maximum_slippage_bps": route.strategy.maximum_slippage_bps,
+            "maximum_price_impact_bps": route.strategy.maximum_price_impact_bps,
+            "maximum_execution_gas": route.strategy.maximum_execution_gas,
+            "minimum_absolute_net_profit":
+                route.strategy.minimum_net_profit.0.to_string(),
+            "minimum_net_profit_bps": route.strategy.minimum_net_profit_bps,
+            "conservative_cost_multiplier_bps":
+                route.strategy.conservative_cost_multiplier_bps
+        },
+        "attempted_size_count": attempts.len(),
+        "selected_best_size": selected_best_size,
+        "candidate_results": attempts
+    })
 }
 
 fn bps_amount(amount: Amount, bps: u16) -> Result<Amount, ModelError> {
@@ -935,6 +1565,7 @@ fn build_opportunity(
     pools: &[PoolState],
     response_hash: String,
     selected: AmountEvaluation,
+    liquidity_sufficient: bool,
     verification_skip_reason: Option<VerificationSkipReason>,
     evaluation_latency: Duration,
     now_ms: u64,
@@ -990,9 +1621,13 @@ fn build_opportunity(
                 .iter()
                 .map(|leg| leg.protocol.clone())
                 .collect(),
+            settlement_asset: route.settlement_asset.clone(),
+            settlement_asset_decimals: route.settlement_asset_decimals,
+            monetary_unit: MonetaryUnit::SettlementAssetBaseUnits,
             input_token: route.route.legs[0].token_in.clone(),
             output_token: route.route.legs[1].token_out.clone(),
             input_amount: selected.input,
+            flash_loan_amount: selected.input,
             expected_output: selected.output,
             expected_leg_outputs: selected.leg_outputs,
             exact_ordered_legs: route.route.legs.clone(),
@@ -1117,7 +1752,8 @@ fn build_opportunity(
             now_unix_ms: now_ms,
             duplicate: false,
             sequence_contiguous: true,
-            liquidity_sufficient: false,
+            liquidity_known: true,
+            liquidity_sufficient,
             rpc_state_agrees: !matches!(
                 response.verification_status,
                 GatewayVerificationStatus::Disagreed
@@ -1288,8 +1924,8 @@ mod tests {
     use std::sync::Mutex;
 
     const BLOCK_HASH: &str = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-    const TOKEN0: &str = "0x1111111111111111111111111111111111111111";
-    const TOKEN1: &str = "0x2222222222222222222222222222222222222222";
+    const TOKEN0: &str = ARBITRUM_WETH;
+    const TOKEN1: &str = "0xaf88d065e77c8cc2239327c5edb3a432268e5831";
 
     #[derive(Clone, Copy, Debug)]
     enum FakeMode {
@@ -1365,17 +2001,39 @@ mod tests {
                 ],
             },
             fingerprint: "two-pool-v1".to_string(),
+            settlement_asset: token(TOKEN0),
+            settlement_asset_decimals: 18,
             state_targets: vec![
                 Address::parse("0x3333333333333333333333333333333333333333").unwrap(),
                 Address::parse("0x4444444444444444444444444444444444444444").unwrap(),
             ],
+            leg_units: vec![
+                crate::shadow_processor::RuntimeLegUnits {
+                    token_in_decimals: 18,
+                    token_out_decimals: 6,
+                    tick_spacing: 10,
+                },
+                crate::shadow_processor::RuntimeLegUnits {
+                    token_in_decimals: 6,
+                    token_out_decimals: 18,
+                    tick_spacing: 10,
+                },
+            ],
             strategy: RuntimeStrategy {
                 min_input_amount: Amount(100),
                 max_input_amount: Amount(1_000),
-                max_evaluations: 16,
+                max_evaluations: 4,
+                candidate_sizes: Some(vec![Amount(100), Amount(250), Amount(500), Amount(1_000)]),
+                geometric_step_bps: None,
                 minimum_net_profit: Amount(1),
+                minimum_net_profit_bps: 1,
+                conservative_cost_multiplier_bps: 10_000,
+                maximum_pool_depth_utilization_bps: 10_000,
+                maximum_slippage_bps: 10_000,
+                maximum_price_impact_bps: 10_000,
+                maximum_execution_gas: 1,
                 flash_premium_bps: 0,
-                minimum_slippage_bps: 0,
+                minimum_slippage_bps: 1,
                 protocol_fees: Amount::ZERO,
                 estimated_execution_gas: 1,
                 l1_data_fee: Amount::ZERO,
@@ -1454,30 +2112,43 @@ mod tests {
         agreement: bool,
         profitable: bool,
     ) -> ShadowStateResponse {
-        let first_sqrt = U256::from(1_u8) << 96;
-        let second_sqrt = U256::from(1_u8) << 95;
+        let q96 = U256::from(1_u8) << 96;
+        let first_sqrt = q96 * U256::from(11_u8) / U256::from(10_u8);
+        let second_sqrt = q96 * U256::from(9_u8) / U256::from(10_u8);
         let pools: Vec<PoolStateResponse> = request
             .pools
             .iter()
             .enumerate()
             .map(|(index, pool)| {
+                let tick = if index == 0 || !profitable {
+                    1_906
+                } else {
+                    -2_108
+                };
+                let tick_word = if tick < 0 {
+                    format!("{}{:06x}", "f".repeat(58), (1_i32 << 24) + tick)
+                } else {
+                    format!("{tick:064x}")
+                };
                 let slot0 = format!(
-                    "0x{:064x}{:064x}",
+                    "0x{:064x}{tick_word}",
                     if index == 0 || !profitable {
                         first_sqrt
                     } else {
                         second_sqrt
-                    },
-                    0
+                    }
                 );
-                let liquidity = format!("0x{:064x}", 1_000_000_000_u128);
+                let liquidity = format!("0x{:064x}", 1_000_000_000_000_u128);
                 let state_material = serde_json::to_vec(&(
                     &pool.pool_id,
                     &pool.address,
                     &pool.protocol,
                     &pool.token0,
                     &pool.token1,
+                    pool.token0_decimals,
+                    pool.token1_decimals,
                     pool.fee,
+                    pool.tick_spacing,
                     &slot0,
                     &liquidity,
                 ))
@@ -1488,7 +2159,10 @@ mod tests {
                     protocol: pool.protocol.clone(),
                     token0: pool.token0.clone(),
                     token1: pool.token1.clone(),
+                    token0_decimals: pool.token0_decimals,
+                    token1_decimals: pool.token1_decimals,
                     fee: pool.fee,
+                    tick_spacing: pool.tick_spacing,
                     slot0,
                     liquidity,
                     state_hash: canonical_hash_bytes(&state_material),
@@ -1811,8 +2485,13 @@ mod tests {
         );
         assert_eq!(
             evaluation.opportunity.decision.primary_rejection_reason,
-            Some(RejectionReason::LiquidityInsufficient)
+            Some(RejectionReason::ContractPathUnavailable)
         );
+        assert!(!evaluation
+            .opportunity
+            .decision
+            .secondary_rejection_reasons
+            .contains(&RejectionReason::LiquidityInsufficient));
         assert!(!evaluation.opportunity.decision.execution_eligible);
         assert_eq!(evaluation.rpc_quality.len(), 2);
         evaluation.opportunity.validate_traceability().unwrap();

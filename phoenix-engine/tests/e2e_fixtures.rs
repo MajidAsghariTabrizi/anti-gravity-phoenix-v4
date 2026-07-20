@@ -5,10 +5,10 @@ use phoenix_engine::execution::{
 use phoenix_engine::graph::{PoolEdge, PoolGraph, Route};
 use phoenix_engine::opportunity::{
     AgreementState, BasisPoints, CostBreakdown, DecisionEvidence, IndependentVerificationStatus,
-    MarketEvidence, OpportunityIdentity, OutcomeEvidence, PoolStateEvidence,
-    PrimaryProfitabilityStatus, RouteEvidence, ScenarioEconomics, ShadowDisposition, SignedAmount,
-    SimulationClassification, SimulationEvidence, SimulationKind, StateSource, Strategy,
-    VerificationSkipReason, VerificationStatus, PROFITABILITY_MODEL_VERSION,
+    MarketEvidence, MonetaryUnit, MoneyContext, OpportunityIdentity, OutcomeEvidence,
+    PoolStateEvidence, PrimaryProfitabilityStatus, RouteEvidence, ScenarioEconomics,
+    ShadowDisposition, SignedAmount, SimulationClassification, SimulationEvidence, SimulationKind,
+    StateSource, Strategy, VerificationSkipReason, VerificationStatus, PROFITABILITY_MODEL_VERSION,
 };
 use phoenix_engine::optimizer::{optimize, CandidateEvaluation, OptimizerConfig};
 use phoenix_engine::origin::{OriginClassification, OriginDetector};
@@ -206,9 +206,13 @@ fn profitable_fixture_reaches_shadow_sink_and_dynamic_sizing() {
                 .iter()
                 .map(|leg| leg.protocol.clone())
                 .collect(),
+            settlement_asset: routes[0].legs[0].token_in.clone(),
+            settlement_asset_decimals: 18,
+            monetary_unit: MonetaryUnit::SettlementAssetBaseUnits,
             input_token: routes[0].legs[0].token_in.clone(),
             output_token: routes[0].legs[1].token_out.clone(),
             input_amount: optimized.best_amount,
+            flash_loan_amount: optimized.best_amount,
             expected_output: Amount(
                 optimized
                     .best_amount
@@ -256,6 +260,12 @@ fn profitable_fixture_reaches_shadow_sink_and_dynamic_sizing() {
             feed_to_detection_latency_ns: 1,
         },
         economics: ScenarioEconomics {
+            money: MoneyContext {
+                settlement_asset: routes[0].legs[0].token_in.clone(),
+                settlement_asset_decimals: 18,
+                input_amount: optimized.best_amount,
+                monetary_unit: MonetaryUnit::SettlementAssetBaseUnits,
+            },
             base: base.clone(),
             conservative: base.clone(),
             severe: base,

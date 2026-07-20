@@ -24,6 +24,7 @@ pub struct DecisionContext {
     pub now_unix_ms: u64,
     pub duplicate: bool,
     pub sequence_contiguous: bool,
+    pub liquidity_known: bool,
     pub liquidity_sufficient: bool,
     pub rpc_state_agrees: bool,
     pub contract_path_available: bool,
@@ -62,7 +63,10 @@ pub fn decide(
         reasons.push(RejectionReason::RpcStateDisagreement);
         risk_flags.push(RiskFlag::RpcDisagreement);
     }
-    if !context.liquidity_sufficient {
+    if !context.liquidity_known {
+        reasons.push(RejectionReason::LiquidityUnknown);
+        risk_flags.push(RiskFlag::IncompleteLiquidity);
+    } else if !context.liquidity_sufficient {
         reasons.push(RejectionReason::LiquidityInsufficient);
         risk_flags.push(RiskFlag::IncompleteLiquidity);
     }
@@ -174,9 +178,10 @@ mod tests {
     use crate::graph::{PoolEdge, Route};
     use crate::opportunity::{
         AgreementState, BasisPoints, CostBreakdown, IndependentVerificationStatus, MarketEvidence,
-        OpportunityIdentity, OutcomeEvidence, PrimaryProfitabilityStatus, RouteEvidence,
-        ScenarioEconomics, SimulationEvidence, SimulationKind, StateSource, Strategy,
-        VerificationSkipReason, VerificationStatus, PROFITABILITY_MODEL_VERSION,
+        MonetaryUnit, MoneyContext, OpportunityIdentity, OutcomeEvidence,
+        PrimaryProfitabilityStatus, RouteEvidence, ScenarioEconomics, SimulationEvidence,
+        SimulationKind, StateSource, Strategy, VerificationSkipReason, VerificationStatus,
+        PROFITABILITY_MODEL_VERSION,
     };
     use crate::Direction;
 
@@ -231,9 +236,13 @@ mod tests {
                     Address::parse("0x3333333333333333333333333333333333333333").unwrap()
                 ],
                 protocols: vec!["UniswapV3".to_string()],
+                settlement_asset: token0.clone(),
+                settlement_asset_decimals: 18,
+                monetary_unit: MonetaryUnit::SettlementAssetBaseUnits,
                 input_token: token0,
                 output_token: token1,
                 input_amount: Amount(1_000),
+                flash_loan_amount: Amount(1_000),
                 expected_output: Amount(1_100),
                 expected_leg_outputs: vec![Amount(1_100)],
                 exact_ordered_legs: Route {
@@ -268,6 +277,12 @@ mod tests {
                 feed_to_detection_latency_ns: 1,
             },
             economics: ScenarioEconomics {
+                money: MoneyContext {
+                    settlement_asset: token("0x1111111111111111111111111111111111111111"),
+                    settlement_asset_decimals: 18,
+                    input_amount: Amount(1_000),
+                    monetary_unit: MonetaryUnit::SettlementAssetBaseUnits,
+                },
                 base: economics.clone(),
                 conservative: economics.clone(),
                 severe: economics,
@@ -340,6 +355,7 @@ mod tests {
             now_unix_ms: 1_010,
             duplicate: false,
             sequence_contiguous: true,
+            liquidity_known: true,
             liquidity_sufficient: true,
             rpc_state_agrees: true,
             contract_path_available: true,

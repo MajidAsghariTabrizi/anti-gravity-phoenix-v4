@@ -1,13 +1,16 @@
-use crate::domain::Amount;
+use crate::domain::{Amount, TokenAddress};
 use crate::opportunity::{
-    BasisPoints, CostBreakdown, PrimaryProfitabilityStatus, ScenarioEconomics, SignedAmount,
-    PROFITABILITY_MODEL_VERSION,
+    BasisPoints, CostBreakdown, MonetaryUnit, MoneyContext, PrimaryProfitabilityStatus,
+    ScenarioEconomics, SignedAmount, PROFITABILITY_MODEL_VERSION,
 };
 
 const BPS_DENOMINATOR: u128 = 10_000;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EconomicInput {
+    pub settlement_asset: TokenAddress,
+    pub settlement_asset_decimals: u8,
+    pub monetary_unit: MonetaryUnit,
     pub principal: Amount,
     pub gross_output: Amount,
     pub protocol_fees: Amount,
@@ -95,14 +98,21 @@ pub enum EconomicError {
 
 pub fn evaluate_scenarios(input: &EconomicInput) -> Result<ScenarioEconomics, EconomicError> {
     let base = evaluate(input, ScenarioConfig::BASE)?;
+    let conservative = evaluate(input, ScenarioConfig::CONSERVATIVE)?;
     Ok(ScenarioEconomics {
-        primary_status: if base.expected_net_pnl >= input.minimum_required_net_pnl {
+        money: MoneyContext {
+            settlement_asset: input.settlement_asset.clone(),
+            settlement_asset_decimals: input.settlement_asset_decimals,
+            input_amount: input.principal,
+            monetary_unit: input.monetary_unit,
+        },
+        primary_status: if conservative.expected_net_pnl > input.minimum_required_net_pnl {
             PrimaryProfitabilityStatus::MeetsMinimum
         } else {
             PrimaryProfitabilityStatus::BelowMinimum
         },
         base,
-        conservative: evaluate(input, ScenarioConfig::CONSERVATIVE)?,
+        conservative,
         severe: evaluate(input, ScenarioConfig::SEVERE)?,
         minimum_required_net_pnl: input.minimum_required_net_pnl,
         model_version: PROFITABILITY_MODEL_VERSION.to_string(),
@@ -222,7 +232,9 @@ pub fn evaluate(
 }
 
 fn validate(input: &EconomicInput, scenario: ScenarioConfig) -> Result<(), EconomicError> {
-    if input.failure_probability_bps > 10_000
+    if input.settlement_asset_decimals == 0
+        || input.settlement_asset_decimals > 36
+        || input.failure_probability_bps > 10_000
         || input.stale_quote_probability_bps > 10_000
         || input.probability_of_success_bps > 10_000
     {
@@ -301,9 +313,15 @@ fn checked_sum(values: &[u128]) -> Result<u128, EconomicError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::{Address, TokenAddress};
 
     fn input() -> EconomicInput {
         EconomicInput {
+            settlement_asset: TokenAddress(
+                Address::parse("0x82af49447d8a07e3bd95bd0d56f35241523fbab1").unwrap(),
+            ),
+            settlement_asset_decimals: 18,
+            monetary_unit: MonetaryUnit::SettlementAssetBaseUnits,
             principal: Amount(1_000_000),
             gross_output: Amount(1_100_000),
             protocol_fees: Amount(1_000),
@@ -416,6 +434,18 @@ mod tests {
             PrimaryProfitabilityStatus::BelowMinimum
         );
         assert_eq!(result.base.expected_net_pnl, SignedAmount(74_000));
+    }
+
+    #[test]
+    fn profit_exactly_at_the_minimum_does_not_clear_the_floor() {
+        let mut candidate = input();
+        candidate.minimum_required_net_pnl = evaluate(&candidate, ScenarioConfig::CONSERVATIVE)
+            .unwrap()
+            .expected_net_pnl;
+        assert_eq!(
+            evaluate_scenarios(&candidate).unwrap().primary_status,
+            PrimaryProfitabilityStatus::BelowMinimum
+        );
     }
 
     #[test]

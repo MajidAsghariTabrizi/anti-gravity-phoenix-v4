@@ -149,7 +149,14 @@ STRATEGY_KEYS = {
     "min_input_amount",
     "max_input_amount",
     "max_evaluations",
+    "candidate_sizes",
     "minimum_net_profit",
+    "minimum_net_profit_bps",
+    "conservative_cost_multiplier_bps",
+    "maximum_pool_depth_utilization_bps",
+    "maximum_slippage_bps",
+    "maximum_price_impact_bps",
+    "maximum_execution_gas",
     "flash_premium_bps",
     "minimum_slippage_bps",
     "protocol_fees",
@@ -381,6 +388,13 @@ def validate_strategy(value: object) -> dict[str, object]:
     require_exact_keys(strategy, STRATEGY_KEYS, "strategy template")
     decimal_fields = STRATEGY_KEYS - {
         "max_evaluations",
+        "candidate_sizes",
+        "minimum_net_profit_bps",
+        "conservative_cost_multiplier_bps",
+        "maximum_pool_depth_utilization_bps",
+        "maximum_slippage_bps",
+        "maximum_price_impact_bps",
+        "maximum_execution_gas",
         "flash_premium_bps",
         "minimum_slippage_bps",
         "estimated_execution_gas",
@@ -393,17 +407,77 @@ def validate_strategy(value: object) -> dict[str, object]:
     }
     for field in decimal_fields:
         parse_decimal(strategy[field], field, maximum=MAX_U128)
-    for field in ("max_evaluations", "estimated_execution_gas", "max_quote_age_ms", "max_simulation_age_ms"):
+    max_evaluations = require_json_int(
+        strategy["max_evaluations"], "max_evaluations", minimum=1, maximum=32
+    )
+    for field in (
+        "estimated_execution_gas",
+        "maximum_execution_gas",
+        "max_quote_age_ms",
+        "max_simulation_age_ms",
+    ):
         require_json_int(strategy[field], field, minimum=1, maximum=10_000_000)
     for field in (
-        "flash_premium_bps", "minimum_slippage_bps", "failure_probability_bps",
-        "stale_quote_probability_bps", "probability_of_success_bps", "min_confidence_bps",
+        "minimum_net_profit_bps",
+        "maximum_pool_depth_utilization_bps",
+        "maximum_slippage_bps",
+        "maximum_price_impact_bps",
+        "flash_premium_bps",
+        "minimum_slippage_bps",
+        "failure_probability_bps",
+        "stale_quote_probability_bps",
+        "probability_of_success_bps",
+        "min_confidence_bps",
     ):
         require_json_int(strategy[field], field, maximum=SCORE_SCALE)
-    if parse_decimal(strategy["min_input_amount"], "min_input_amount", maximum=MAX_U128) > parse_decimal(
-        strategy["max_input_amount"], "max_input_amount", maximum=MAX_U128
-    ):
+    conservative_multiplier = require_json_int(
+        strategy["conservative_cost_multiplier_bps"],
+        "conservative_cost_multiplier_bps",
+        minimum=10_000,
+        maximum=100_000,
+    )
+    if conservative_multiplier < SCORE_SCALE:
+        raise DiscoveryError("strategy cost multiplier is not conservative")
+    min_input = parse_decimal(strategy["min_input_amount"], "min_input_amount", maximum=MAX_U128)
+    max_input = parse_decimal(strategy["max_input_amount"], "max_input_amount", maximum=MAX_U128)
+    if min_input <= 0 or min_input > max_input:
         raise DiscoveryError("strategy input bounds are inverted")
+    candidate_values = strategy["candidate_sizes"]
+    if (
+        not isinstance(candidate_values, list)
+        or not candidate_values
+        or len(candidate_values) > max_evaluations
+    ):
+        raise DiscoveryError("strategy candidate sizes are invalid")
+    candidate_sizes = [
+        parse_decimal(value, "candidate size", maximum=MAX_U128)
+        for value in candidate_values
+    ]
+    if (
+        any(value < min_input or value > max_input for value in candidate_sizes)
+        or any(left >= right for left, right in zip(candidate_sizes, candidate_sizes[1:]))
+        or require_json_int(strategy["minimum_net_profit_bps"], "minimum_net_profit_bps") == 0
+        or require_json_int(
+            strategy["maximum_pool_depth_utilization_bps"],
+            "maximum_pool_depth_utilization_bps",
+        )
+        == 0
+        or require_json_int(strategy["maximum_slippage_bps"], "maximum_slippage_bps") == 0
+        or require_json_int(
+            strategy["maximum_price_impact_bps"], "maximum_price_impact_bps"
+        )
+        == 0
+        or require_json_int(strategy["minimum_slippage_bps"], "minimum_slippage_bps") == 0
+        or strategy["minimum_slippage_bps"] > strategy["maximum_slippage_bps"]
+        or strategy["estimated_execution_gas"] > strategy["maximum_execution_gas"]
+        or parse_decimal(strategy["minimum_net_profit"], "minimum_net_profit", maximum=MAX_U128)
+        == 0
+        or parse_decimal(strategy["max_gas_price_wei"], "max_gas_price_wei", maximum=MAX_U128)
+        == 0
+        or require_json_int(strategy["probability_of_success_bps"], "probability_of_success_bps")
+        == 0
+    ):
+        raise DiscoveryError("strategy bounded optimizer contract is invalid")
     return copy.deepcopy(strategy)
 
 
@@ -449,12 +523,34 @@ def load_pool_proofs(path: Path) -> tuple[dict[tuple[str, str, int], dict[str, o
         raise DiscoveryError("pool proofs must be a bounded non-empty array")
     pools: dict[tuple[str, str, int], dict[str, object]] = {}
     addresses: set[str] = set()
+    token_decimals: dict[str, int] = {}
     for item in pools_value:
         proof = require_object(item, "pool proof")
-        require_exact_keys(proof, {"token0", "token1", "fee", "pool_address"}, "pool proof")
+        require_exact_keys(
+            proof,
+            {
+                "token0",
+                "token1",
+                "token0_decimals",
+                "token1_decimals",
+                "fee",
+                "tick_spacing",
+                "pool_address",
+            },
+            "pool proof",
+        )
         token0 = canonical_address(proof["token0"], "pool token0")
         token1 = canonical_address(proof["token1"], "pool token1")
+        token0_decimals = require_json_int(
+            proof["token0_decimals"], "pool token0 decimals", minimum=1, maximum=36
+        )
+        token1_decimals = require_json_int(
+            proof["token1_decimals"], "pool token1 decimals", minimum=1, maximum=36
+        )
         fee = require_json_int(proof["fee"], "pool fee", minimum=1, maximum=999_999)
+        tick_spacing = require_json_int(
+            proof["tick_spacing"], "pool tick spacing", minimum=1, maximum=887_272
+        )
         address = canonical_address(proof["pool_address"], "pool address")
         if token0 >= token1:
             raise DiscoveryError("pool proof token order is not canonical")
@@ -463,7 +559,19 @@ def load_pool_proofs(path: Path) -> tuple[dict[tuple[str, str, int], dict[str, o
             raise DiscoveryError("pool proof registry contains duplicates")
         if compute_pool_address(factory, init_code_hash, token0, token1, fee) != address:
             raise DiscoveryError("pool proof does not match official CREATE2 identity")
-        pools[key] = {"token0": token0, "token1": token1, "fee": fee, "pool_address": address}
+        for token, decimals in ((token0, token0_decimals), (token1, token1_decimals)):
+            if token in token_decimals and token_decimals[token] != decimals:
+                raise DiscoveryError("pool proof token decimals are inconsistent")
+            token_decimals[token] = decimals
+        pools[key] = {
+            "token0": token0,
+            "token1": token1,
+            "token0_decimals": token0_decimals,
+            "token1_decimals": token1_decimals,
+            "fee": fee,
+            "tick_spacing": tick_spacing,
+            "pool_address": address,
+        }
         addresses.add(address)
 
     templates_value = document["strategy_templates"]
@@ -475,7 +583,14 @@ def load_pool_proofs(path: Path) -> tuple[dict[tuple[str, str, int], dict[str, o
         template = require_object(item, "strategy template record")
         require_exact_keys(
             template,
-            {"template_id", "token0", "token1", "settlement_asset", "strategy"},
+            {
+                "template_id",
+                "token0",
+                "token1",
+                "settlement_asset",
+                "settlement_asset_decimals",
+                "strategy",
+            },
             "strategy template record",
         )
         template_id = require_string(template["template_id"], "strategy template id", maximum=128)
@@ -484,16 +599,24 @@ def load_pool_proofs(path: Path) -> tuple[dict[tuple[str, str, int], dict[str, o
         settlement_asset = canonical_address(
             template["settlement_asset"], "strategy settlement asset"
         )
+        settlement_asset_decimals = require_json_int(
+            template["settlement_asset_decimals"],
+            "strategy settlement asset decimals",
+            minimum=1,
+            maximum=36,
+        )
         template_key = (token0, token1, settlement_asset)
         if (
             token0 >= token1
             or settlement_asset not in {token0, token1}
+            or token_decimals.get(settlement_asset) != settlement_asset_decimals
             or template_key in templates
             or template_id in template_ids
         ):
             raise DiscoveryError("strategy templates contain duplicate or non-canonical identities")
         templates[template_key] = {
             "template_id": template_id,
+            "settlement_asset_decimals": settlement_asset_decimals,
             "strategy": validate_strategy(template["strategy"]),
         }
         template_ids.add(template_id)
@@ -860,6 +983,10 @@ def suggested_route(
     if proof0 is None or proof1 is None or template is None:
         return None
     other_asset = token1 if settlement_asset == token0 else token0
+    settlement_asset_decimals = template["settlement_asset_decimals"]
+    other_asset_decimals = (
+        proof0["token1_decimals"] if settlement_asset == token0 else proof0["token0_decimals"]
+    )
     first_direction = "zero_for_one" if settlement_asset == token0 else "one_for_zero"
     second_direction = "one_for_zero" if settlement_asset == token0 else "zero_for_one"
     route_id, fingerprint = route_identity(candidate_key)
@@ -869,6 +996,8 @@ def suggested_route(
         "route_id": route_id,
         "route_fingerprint": fingerprint,
         "trigger_pool_id": pool0,
+        "settlement_asset": settlement_asset,
+        "settlement_asset_decimals": settlement_asset_decimals,
         "legs": [
             {
                 "pool_id": pool0,
@@ -877,6 +1006,9 @@ def suggested_route(
                 "fee": fee0,
                 "token_in": settlement_asset,
                 "token_out": other_asset,
+                "token_in_decimals": settlement_asset_decimals,
+                "token_out_decimals": other_asset_decimals,
+                "tick_spacing": proof0["tick_spacing"],
                 "direction": first_direction,
             },
             {
@@ -886,6 +1018,9 @@ def suggested_route(
                 "fee": fee1,
                 "token_in": other_asset,
                 "token_out": settlement_asset,
+                "token_in_decimals": other_asset_decimals,
+                "token_out_decimals": settlement_asset_decimals,
+                "tick_spacing": proof1["tick_spacing"],
                 "direction": second_direction,
             },
         ],

@@ -2,7 +2,7 @@ use crate::domain::{Address, Amount, OpportunityId, PoolId, RouteId, TokenAddres
 use crate::graph::PoolEdge;
 use serde::Serialize;
 
-pub const PROFITABILITY_MODEL_VERSION: &str = "shadow-profitability-v2";
+pub const PROFITABILITY_MODEL_VERSION: &str = "shadow-profitability-scale-v1";
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 #[serde(transparent)]
@@ -16,6 +16,21 @@ pub struct BasisPoints(pub i32);
 #[serde(rename_all = "snake_case")]
 pub enum Strategy {
     TwoPoolV3Arbitrage,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MonetaryUnit {
+    #[default]
+    SettlementAssetBaseUnits,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct MoneyContext {
+    pub settlement_asset: TokenAddress,
+    pub settlement_asset_decimals: u8,
+    pub input_amount: Amount,
+    pub monetary_unit: MonetaryUnit,
 }
 
 impl Strategy {
@@ -51,9 +66,13 @@ pub struct RouteEvidence {
     pub pools: Vec<PoolId>,
     pub pool_addresses: Vec<Address>,
     pub protocols: Vec<String>,
+    pub settlement_asset: TokenAddress,
+    pub settlement_asset_decimals: u8,
+    pub monetary_unit: MonetaryUnit,
     pub input_token: TokenAddress,
     pub output_token: TokenAddress,
     pub input_amount: Amount,
+    pub flash_loan_amount: Amount,
     pub expected_output: Amount,
     pub expected_leg_outputs: Vec<Amount>,
     pub exact_ordered_legs: Vec<PoolEdge>,
@@ -213,6 +232,7 @@ pub struct CostBreakdown {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct ScenarioEconomics {
+    pub money: MoneyContext,
     pub base: CostBreakdown,
     pub conservative: CostBreakdown,
     pub severe: CostBreakdown,
@@ -224,6 +244,15 @@ pub struct ScenarioEconomics {
 impl Default for ScenarioEconomics {
     fn default() -> Self {
         Self {
+            money: MoneyContext {
+                settlement_asset: TokenAddress(
+                    Address::parse("0x0000000000000000000000000000000000000000")
+                        .expect("zero address is canonical"),
+                ),
+                settlement_asset_decimals: 0,
+                input_amount: Amount::ZERO,
+                monetary_unit: MonetaryUnit::SettlementAssetBaseUnits,
+            },
             base: CostBreakdown::default(),
             conservative: CostBreakdown::default(),
             severe: CostBreakdown::default(),
@@ -307,6 +336,7 @@ pub enum RejectionReason {
     GrossSpreadInsufficient,
     NetPnlNegative,
     StressPnlNegative,
+    LiquidityUnknown,
     LiquidityInsufficient,
     QuoteStale,
     SimulationReverted,
@@ -329,6 +359,7 @@ impl RejectionReason {
             Self::GrossSpreadInsufficient => "gross_spread_insufficient",
             Self::NetPnlNegative => "net_pnl_negative",
             Self::StressPnlNegative => "stress_pnl_negative",
+            Self::LiquidityUnknown => "liquidity_unknown",
             Self::LiquidityInsufficient => "liquidity_insufficient",
             Self::QuoteStale => "quote_stale",
             Self::SimulationReverted => "simulation_reverted",
@@ -412,6 +443,19 @@ impl Opportunity {
             || self.route.expected_leg_outputs.len() != self.route.exact_ordered_legs.len()
         {
             return Err("route evidence incomplete");
+        }
+        if self.route.settlement_asset != self.route.input_token
+            || self.route.settlement_asset != self.route.output_token
+            || self.route.settlement_asset_decimals == 0
+            || self.route.settlement_asset_decimals > 36
+            || self.route.flash_loan_amount != self.route.input_amount
+            || self.economics.money.settlement_asset != self.route.settlement_asset
+            || self.economics.money.settlement_asset_decimals
+                != self.route.settlement_asset_decimals
+            || self.economics.money.input_amount != self.route.input_amount
+            || self.economics.money.monetary_unit != self.route.monetary_unit
+        {
+            return Err("money unit evidence incomplete");
         }
         if self.market.state_block == 0 || self.market.quote_block == 0 {
             return Err("block context missing");

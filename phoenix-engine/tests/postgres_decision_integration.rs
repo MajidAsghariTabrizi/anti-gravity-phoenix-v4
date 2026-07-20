@@ -6,10 +6,11 @@ use phoenix_engine::engine_input::{EngineClassification, InputIdentity};
 use phoenix_engine::graph::PoolEdge;
 use phoenix_engine::opportunity::{
     AgreementState, BasisPoints, CostBreakdown, DecisionEvidence, IndependentVerificationStatus,
-    MarketEvidence, Opportunity, OpportunityIdentity, OutcomeEvidence, PoolStateEvidence,
-    PrimaryProfitabilityStatus, RejectionReason, RiskFlag, RouteEvidence, ScenarioEconomics,
-    ShadowDisposition, SignedAmount, SimulationClassification, SimulationEvidence, SimulationKind,
-    StateSource, Strategy, VerificationSkipReason, VerificationStatus, PROFITABILITY_MODEL_VERSION,
+    MarketEvidence, MonetaryUnit, MoneyContext, Opportunity, OpportunityIdentity, OutcomeEvidence,
+    PoolStateEvidence, PrimaryProfitabilityStatus, RejectionReason, RiskFlag, RouteEvidence,
+    ScenarioEconomics, ShadowDisposition, SignedAmount, SimulationClassification,
+    SimulationEvidence, SimulationKind, StateSource, Strategy, VerificationSkipReason,
+    VerificationStatus, PROFITABILITY_MODEL_VERSION,
 };
 use phoenix_engine::persistence::{
     ClassificationRecord, PersistOutcome, PostgresShadowStore, ShadowStore, StoreError,
@@ -104,9 +105,13 @@ fn evaluation(hash_byte: char, opportunity_id: &str) -> EvaluatedOpportunity {
                     Address::parse("0x4444444444444444444444444444444444444444").unwrap(),
                 ],
                 protocols: vec!["UniswapV3".to_string(), "SushiSwapV3".to_string()],
+                settlement_asset: token0.clone(),
+                settlement_asset_decimals: 18,
+                monetary_unit: MonetaryUnit::SettlementAssetBaseUnits,
                 input_token: token0.clone(),
                 output_token: token0.clone(),
                 input_amount: Amount(100),
+                flash_loan_amount: Amount(100),
                 expected_output: Amount(200),
                 expected_leg_outputs: vec![Amount(150), Amount(200)],
                 exact_ordered_legs: vec![
@@ -167,6 +172,12 @@ fn evaluation(hash_byte: char, opportunity_id: &str) -> EvaluatedOpportunity {
                 feed_to_detection_latency_ns: 1,
             },
             economics: ScenarioEconomics {
+                money: MoneyContext {
+                    settlement_asset: token("0x1111111111111111111111111111111111111111"),
+                    settlement_asset_decimals: 18,
+                    input_amount: Amount(100),
+                    monetary_unit: MonetaryUnit::SettlementAssetBaseUnits,
+                },
                 base: economics.clone(),
                 conservative: economics.clone(),
                 severe: economics,
