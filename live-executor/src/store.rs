@@ -503,6 +503,8 @@ impl ExecutorStore for PostgresExecutorStore {
         }
         if let Some(outcome) = receipt_outcome {
             let tx_hash = tx_hash.as_deref().ok_or(StoreError::Invariant)?;
+            let receipt_status =
+                i16::try_from(outcome.receipt_status).map_err(|_| StoreError::Invariant)?;
             sqlx::query(
                 "INSERT INTO live_canary.execution_outcomes(
                     request_id, tx_hash, outcome_status, receipt_status,
@@ -519,7 +521,7 @@ impl ExecutorStore for PostgresExecutorStore {
             .bind(request_id)
             .bind(tx_hash)
             .bind(status.as_str())
-            .bind(outcome.receipt_status.to_string())
+            .bind(receipt_status)
             .bind(outcome.settled_event_found)
             .bind(outcome.block_number.to_string())
             .bind(outcome.gas_used.to_string())
