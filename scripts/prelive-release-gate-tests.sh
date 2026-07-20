@@ -1,4 +1,5 @@
 #!/usr/bin/env sh
+# shellcheck disable=SC2016
 set -eu
 
 script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
@@ -46,6 +47,10 @@ fi
 
 grep -F 'image: fork-sandbox' "$build_workflow" >/dev/null ||
   fail 'fork-sandbox immutable image publication is missing'
+grep -F 'image: live-executor' "$build_workflow" >/dev/null ||
+  fail 'live-executor immutable image publication is missing'
+grep -F 'build_args: "CRATE=live-executor"' "$build_workflow" >/dev/null ||
+  fail 'live-executor immutable build does not use its reviewed crate'
 grep -F 'name: release-assets' "$build_workflow" >/dev/null ||
   fail 'release-assets publication job is missing'
 grep -F 'workflow_dispatch:' "$build_workflow" >/dev/null ||

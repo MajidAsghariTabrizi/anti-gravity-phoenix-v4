@@ -11,7 +11,7 @@ use sqlx::{PgPool, Postgres, Row, Transaction};
 use thiserror::Error;
 use uuid::Uuid;
 
-const SCHEMA_VERSION: &str = "phoenix.live-canary-schema.v1";
+const SCHEMA_VERSION: &str = "phoenix.live-canary-schema.v2";
 const ACTIVE_STATUSES: &str =
     "'claimed', 'nonce_allocated', 'submission_unknown', 'pending', 'timed_out'";
 
@@ -180,17 +180,20 @@ impl ExecutorStore for PostgresExecutorStore {
 
         let row = sqlx::query(&format!(
             "{} WHERE r.status = 'approved'
+                 AND r.schema_version = $2
                  AND r.approved_at IS NOT NULL
                  AND r.approved_by IS NOT NULL
                  AND r.policy_version IS NOT NULL
                  AND r.approval_digest IS NOT NULL
                  AND r.deadline > $1
+                 AND r.approval_deadline > $1
              ORDER BY r.approved_at, r.id
              FOR UPDATE OF r SKIP LOCKED
              LIMIT 1",
             request_select()
         ))
         .bind(now)
+        .bind(crate::REQUEST_SCHEMA_VERSION)
         .fetch_optional(&mut *transaction)
         .await
         .map_err(StoreError::from)?;
@@ -658,14 +661,24 @@ async fn update_request_status(
     Ok(())
 }
 
-fn request_select() -> &'static str {
+pub(crate) fn request_select() -> &'static str {
     "SELECT
         r.id,
         r.opportunity_id,
         r.schema_version,
         r.chain_id,
         r.route_id,
+        r.route_fingerprint,
+        r.selected_size::text AS selected_size,
+        r.token_path,
         r.origin_router,
+        r.executor_address,
+        r.executor_code_hash,
+        r.calldata_hash,
+        r.simulation_result_hash,
+        r.plan_hash,
+        r.pinned_block_number::text AS pinned_block_number,
+        r.pinned_block_hash,
         r.flash_asset,
         r.flash_amount::text AS flash_amount,
         r.maximum_input_amount::text AS maximum_input_amount,
@@ -678,6 +691,7 @@ fn request_select() -> &'static str {
         r.max_priority_fee_per_gas::text AS max_priority_fee_per_gas,
         r.approved_by,
         r.approved_at,
+        r.approval_deadline,
         r.policy_version,
         r.approval_digest
      FROM live_canary.execution_requests r"
@@ -695,15 +709,34 @@ fn active_attempt_select() -> String {
     )
 }
 
-fn decode_request(row: &sqlx::postgres::PgRow) -> Result<ExecutionRequest, StoreError> {
+pub(crate) fn decode_request(row: &sqlx::postgres::PgRow) -> Result<ExecutionRequest, StoreError> {
     let legs: Json<Vec<ExecutionLeg>> = row.try_get("legs").map_err(StoreError::from)?;
+    let token_path: Json<Vec<String>> = row.try_get("token_path").map_err(StoreError::from)?;
     RawExecutionRequest {
         id: row.try_get("id").map_err(StoreError::from)?,
         opportunity_id: row.try_get("opportunity_id").map_err(StoreError::from)?,
         schema_version: row.try_get("schema_version").map_err(StoreError::from)?,
         chain_id: row.try_get("chain_id").map_err(StoreError::from)?,
         route_id: row.try_get("route_id").map_err(StoreError::from)?,
+        route_fingerprint: row.try_get("route_fingerprint").map_err(StoreError::from)?,
+        selected_size: row.try_get("selected_size").map_err(StoreError::from)?,
+        token_path: token_path.0,
         origin_router: row.try_get("origin_router").map_err(StoreError::from)?,
+        executor_address: row.try_get("executor_address").map_err(StoreError::from)?,
+        executor_code_hash: row
+            .try_get("executor_code_hash")
+            .map_err(StoreError::from)?,
+        calldata_hash: row.try_get("calldata_hash").map_err(StoreError::from)?,
+        simulation_result_hash: row
+            .try_get("simulation_result_hash")
+            .map_err(StoreError::from)?,
+        plan_hash: row.try_get("plan_hash").map_err(StoreError::from)?,
+        pinned_block_number: row
+            .try_get::<String, _>("pinned_block_number")
+            .map_err(StoreError::from)?
+            .parse::<i64>()
+            .map_err(|_| StoreError::Data)?,
+        pinned_block_hash: row.try_get("pinned_block_hash").map_err(StoreError::from)?,
         flash_asset: row.try_get("flash_asset").map_err(StoreError::from)?,
         flash_amount: row.try_get("flash_amount").map_err(StoreError::from)?,
         maximum_input_amount: row
@@ -720,6 +753,7 @@ fn decode_request(row: &sqlx::postgres::PgRow) -> Result<ExecutionRequest, Store
             .map_err(StoreError::from)?,
         approved_by: row.try_get("approved_by").map_err(StoreError::from)?,
         approved_at: row.try_get("approved_at").map_err(StoreError::from)?,
+        approval_deadline: row.try_get("approval_deadline").map_err(StoreError::from)?,
         policy_version: row.try_get("policy_version").map_err(StoreError::from)?,
         approval_digest: row.try_get("approval_digest").map_err(StoreError::from)?,
     }

@@ -14,6 +14,8 @@ The service can submit only when all environment gates are exact:
 - `LIVE_EXECUTOR_KILL_SWITCH=false`
 - `CHAIN_ID=42161`
 - the configured wallet exactly matches `SIGNER_PRIVATE_KEY`
+- `LIVE_EXECUTOR_EXECUTOR_CODE_HASH` is the reviewed lowercase SHA-256
+  digest of the configured PhoenixExecutor runtime bytecode
 - `LIVE_EXECUTOR_PNL_ASSET_ADDRESS` is canonical Arbitrum WETH
 - the selected HTTPS RPC exactly matches `LIVE_EXECUTOR_RPC_ALLOWLIST`
 - every gas, fee, input, profit, loss, polling, and timeout limit is positive
@@ -39,15 +41,28 @@ the service, or run the profile.
 
 ## Service-owned schema
 
-`live-executor/schema/001_live_canary.sql` is intentionally outside the exact
-v5 root migration set. The runtime never installs or modifies schema. It
-validates `phoenix.live-canary-schema.v1` at startup and fails closed when the
+`live-executor/schema/001_live_canary.sql` and
+`live-executor/schema/002_approval_evidence.sql` are intentionally outside the
+exact v5 root migration set. The runtime never installs or modifies schema. It
+validates `phoenix.live-canary-schema.v2` at startup and fails closed when the
 schema is absent.
 
 Only rows in `live_canary.execution_requests` with `status='approved'`, complete
-approval metadata, a future deadline, and a matching canonical approval digest
-can be claimed. Request calldata is reconstructed from typed fields through the
-reviewed PhoenixExecutor ABI; arbitrary calldata is never accepted.
+v2 approval evidence, a future approval deadline, and a matching canonical
+approval digest can be claimed. The canonical digest binds the independently
+verified simulation and plan hashes, route fingerprint, selected size, token
+path, pinned block, executor identity, and calldata hash.
+
+`approve-execution-request` is the only repository operator materializer. It
+accepts one stored simulation result hash, bounded approval metadata, and the
+exact `APPROVE_ONE_SIMULATED_PHOENIX_CANARY` confirmation. It reads the
+canonical unsigned plan from PostgreSQL, rejects reverted, non-independent,
+expired, or below-floor evidence, reconstructs PhoenixExecutor calldata, and
+inserts one idempotent approved request. It has no calldata argument.
+
+Before querying or allocating a nonce, `live-executor` recomputes the approval
+digest and PhoenixExecutor calldata and requires the configured executor address
+and code hash to match the approved evidence.
 
 ## State machine
 

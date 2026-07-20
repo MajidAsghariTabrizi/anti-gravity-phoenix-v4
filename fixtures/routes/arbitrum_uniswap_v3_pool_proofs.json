@@ -15,13 +15,19 @@
     {
       "token0": "0x82af49447d8a07e3bd95bd0d56f35241523fbab1",
       "token1": "0xaf88d065e77c8cc2239327c5edb3a432268e5831",
+      "token0_decimals": 18,
+      "token1_decimals": 6,
       "fee": 500,
+      "tick_spacing": 10,
       "pool_address": "0xc6962004f452be9203591991d15f6b388e09e8d0"
     },
     {
       "token0": "0x82af49447d8a07e3bd95bd0d56f35241523fbab1",
       "token1": "0xaf88d065e77c8cc2239327c5edb3a432268e5831",
+      "token0_decimals": 18,
+      "token1_decimals": 6,
       "fee": 3000,
+      "tick_spacing": 60,
       "pool_address": "0xc473e2aee3441bf9240be85eb122abb059a3b57c"
     }
   ],
@@ -31,11 +37,27 @@
       "token0": "0x82af49447d8a07e3bd95bd0d56f35241523fbab1",
       "token1": "0xaf88d065e77c8cc2239327c5edb3a432268e5831",
       "settlement_asset": "0x82af49447d8a07e3bd95bd0d56f35241523fbab1",
+      "settlement_asset_decimals": 18,
       "strategy": {
-        "min_input_amount": "1000000",
-        "max_input_amount": "1000000000000000000",
-        "max_evaluations": 32,
-        "minimum_net_profit": "1",
+        "min_input_amount": "100000000000000",
+        "max_input_amount": "10000000000000000",
+        "max_evaluations": 7,
+        "candidate_sizes": [
+          "100000000000000",
+          "250000000000000",
+          "500000000000000",
+          "1000000000000000",
+          "2500000000000000",
+          "5000000000000000",
+          "10000000000000000"
+        ],
+        "minimum_net_profit": "1000000000000",
+        "minimum_net_profit_bps": 10,
+        "conservative_cost_multiplier_bps": 12500,
+        "maximum_pool_depth_utilization_bps": 1000,
+        "maximum_slippage_bps": 100,
+        "maximum_price_impact_bps": 50,
+        "maximum_execution_gas": 600000,
         "flash_premium_bps": 5,
         "minimum_slippage_bps": 10,
         "protocol_fees": "0",

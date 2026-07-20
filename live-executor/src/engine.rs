@@ -6,7 +6,9 @@ use crate::model::{
 use crate::rpc::{ExecutionRpc, RpcError, RpcErrorKind, TransactionReceipt};
 use crate::signer::{SignerError, TransactionDraft, TransactionSigner};
 use crate::store::{ExecutorStore, StoreError};
+use crate::APPROVAL_POLICY_VERSION;
 use chrono::{DateTime, Utc};
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -65,21 +67,24 @@ where
         let Some(request) = self.store.claim_approved(&self.config, now).await? else {
             return Ok(ExecutionState::ArmedIdle);
         };
-        if let Err(error) = validate_policy(&request, &self.config, now) {
-            self.store
-                .mark_terminal(
-                    request.id,
-                    AttemptStatus::Failed,
-                    Some(error.code()),
-                    None,
-                    now,
-                )
-                .await?;
-            self.store.disarm(error.code()).await?;
-            return Ok(ExecutionState::Disarmed {
-                reason: DisarmReason::Policy,
-            });
-        }
+        let calldata = match validate_and_encode(&request, &self.config, now) {
+            Ok(calldata) => calldata,
+            Err(error) => {
+                self.store
+                    .mark_terminal(
+                        request.id,
+                        AttemptStatus::Failed,
+                        Some(error.code()),
+                        None,
+                        now,
+                    )
+                    .await?;
+                self.store.disarm(error.code()).await?;
+                return Ok(ExecutionState::Disarmed {
+                    reason: DisarmReason::Policy,
+                });
+            }
+        };
 
         let network_nonce = match self.rpc.pending_nonce(self.config.wallet_address).await {
             Ok(nonce) => nonce,
@@ -93,16 +98,6 @@ where
             .store
             .allocate_nonce(request.id, &self.config, network_nonce)
             .await?;
-        let calldata = match encode_execute_opportunity(&request, self.config.executor_address) {
-            Ok(calldata) => calldata,
-            Err(error) => {
-                self.store
-                    .fail_unsubmitted(request.id, "abi_encoding_failure", now)
-                    .await?;
-                self.store.disarm("abi_encoding_failure").await?;
-                return Err(EngineError::Abi(error));
-            }
-        };
         let signed = match self.signer.sign(TransactionDraft {
             chain_id: self.config.chain_id,
             nonce,
@@ -481,11 +476,14 @@ where
     }
 }
 
-fn validate_policy(
+fn validate_and_encode(
     request: &ExecutionRequest,
     config: &ExecutorConfig,
     now: DateTime<Utc>,
-) -> Result<(), PolicyError> {
+) -> Result<Vec<u8>, PolicyError> {
+    request
+        .validate_current_route()
+        .map_err(|_| PolicyError::Route)?;
     if request
         .canonical_approval_digest()
         .map_err(|_| PolicyError::Approval)?
@@ -493,8 +491,21 @@ fn validate_policy(
     {
         return Err(PolicyError::Approval);
     }
-    if request.chain_id != config.chain_id || request.approved_at > now || request.deadline <= now {
+    if request.policy_version != APPROVAL_POLICY_VERSION {
+        return Err(PolicyError::ApprovalPolicy);
+    }
+    if request.chain_id != config.chain_id
+        || request.approved_at > now
+        || request.approval_deadline <= now
+        || request.approval_deadline > request.deadline
+        || request.deadline <= now
+    {
         return Err(PolicyError::Boundary);
+    }
+    if request.executor_address != config.executor_address
+        || request.executor_code_hash != config.executor_code_hash
+    {
+        return Err(PolicyError::ExecutorIdentity);
     }
     if request.flash_asset != config.pnl_asset_address {
         return Err(PolicyError::ProfitAsset);
@@ -526,7 +537,12 @@ fn validate_policy(
     if !config.one_transaction_at_a_time {
         return Err(PolicyError::Concurrency);
     }
-    Ok(())
+    let calldata = encode_execute_opportunity(request, request.executor_address)
+        .map_err(|_| PolicyError::Calldata)?;
+    if hex::encode(Sha256::digest(&calldata)) != request.calldata_hash {
+        return Err(PolicyError::Calldata);
+    }
+    Ok(calldata)
 }
 
 fn rpc_error_code(kind: RpcErrorKind) -> &'static str {
@@ -610,10 +626,18 @@ impl ExecutionState {
 
 #[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
 enum PolicyError {
+    #[error("request route is outside the reviewed canary contract")]
+    Route,
     #[error("request approval digest is invalid")]
     Approval,
+    #[error("request approval policy is unsupported")]
+    ApprovalPolicy,
     #[error("request boundary is invalid")]
     Boundary,
+    #[error("request executor identity is invalid")]
+    ExecutorIdentity,
+    #[error("request calldata binding is invalid")]
+    Calldata,
     #[error("request profit asset is unsupported")]
     ProfitAsset,
     #[error("request input exceeds cap")]
@@ -631,8 +655,12 @@ enum PolicyError {
 impl PolicyError {
     const fn code(self) -> &'static str {
         match self {
+            Self::Route => "route_contract_mismatch",
             Self::Approval => "approval_digest_mismatch",
+            Self::ApprovalPolicy => "approval_policy_mismatch",
             Self::Boundary => "request_boundary_invalid",
+            Self::ExecutorIdentity => "executor_identity_mismatch",
+            Self::Calldata => "calldata_hash_mismatch",
             Self::ProfitAsset => "profit_asset_invalid",
             Self::InputCap => "input_cap_exceeded",
             Self::GasCap => "gas_cap_exceeded",

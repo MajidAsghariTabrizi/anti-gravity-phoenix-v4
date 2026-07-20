@@ -90,6 +90,9 @@ jobs:
           - image: fork-sandbox
             dockerfile: deploy/fork-sandbox.Dockerfile
             build_args: ""
+          - image: live-executor
+            dockerfile: deploy/rust.Dockerfile
+            build_args: "CRATE=live-executor"
           - image: dashboard
             dockerfile: deploy/dashboard.Dockerfile
             build_args: ""

@@ -42,6 +42,7 @@ struct DaemonConfig {
     routes: RouteRegistry,
     rpc_gateway_url: String,
     code_version: String,
+    max_evaluation_concurrency: usize,
     dependency_retry_policy: DependencyRetryPolicy,
 }
 
@@ -74,6 +75,12 @@ impl DaemonConfig {
                 .unwrap_or_else(|_| "http://rpc-gateway:9300".to_string()),
             code_version: std::env::var("PHOENIX_CODE_VERSION")
                 .unwrap_or_else(|_| env!("CARGO_PKG_VERSION").to_string()),
+            max_evaluation_concurrency: std::env::var("ENGINE_MAX_EVALUATION_CONCURRENCY")
+                .unwrap_or_else(|_| "1".to_string())
+                .parse()
+                .ok()
+                .filter(|value| (1..=8).contains(value))
+                .ok_or("invalid Engine evaluation concurrency")?,
             dependency_retry_policy: DependencyRetryPolicy::engine_default()?,
         })
     }
@@ -115,10 +122,11 @@ async fn run_daemon() -> Result<(), &'static str> {
             .map_err(|_| "invalid RPC Gateway configuration")?,
     );
     let evaluator = Arc::new(
-        RpcCandidateEvaluator::with_metrics(
+        RpcCandidateEvaluator::with_metrics_and_concurrency(
             rpc_client.clone(),
             config.code_version.clone(),
             metrics.clone(),
+            config.max_evaluation_concurrency,
         )
         .map_err(|_| "invalid Engine evaluator configuration")?,
     );
@@ -135,6 +143,7 @@ async fn run_daemon() -> Result<(), &'static str> {
         strategy_configured,
         evaluation_backend = "block_pinned_rpc_state",
         simulation_level = "state_based",
+        max_evaluation_concurrency = config.max_evaluation_concurrency,
         dependency_exhaustion_limit = config.dependency_retry_policy.max_deliveries(),
         live_execution = false
     );

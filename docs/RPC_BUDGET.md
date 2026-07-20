@@ -30,10 +30,10 @@ For a configured two-pool route:
 | Route-block cache hit | 0 | 0 |
 | Warm primary screen, rejected | 2 | 4 |
 | Warm primary plus secondary agreement | 4 | 8 |
-| First process-cold primary | 5 | 10 |
-| First process-cold primary plus cold secondary | 9 | 20 |
+| First process-cold primary | 5 | 16 |
+| First process-cold primary plus cold secondary | 9 | 32 |
 
-The warm primary count is one Multicall plus one canonical block-hash verification. The warm secondary adds the same two calls. A stale shared head adds one coalesced head lookup, amortized across concurrent routes. Process-cold counts include one chain-ID check and one Multicall3 code check per newly used provider; the primary count also includes the first shared head lookup. Cold batches include six static metadata reads and four dynamic reads. Later batches contain only four dynamic reads.
+The warm primary count is one Multicall plus one canonical block-hash verification. The warm secondary adds the same two calls. A stale shared head adds one coalesced head lookup, amortized across concurrent routes. Process-cold counts include one chain-ID check and one Multicall3 code check per newly used provider; the primary count also includes the first shared head lookup. Cold batches include twelve static metadata reads (pool token identities, token decimals, fee, and tick spacing) and four dynamic reads. Later batches contain only four dynamic reads.
 
 The previous implementation performed 13 upstream requests per provider for two pools, or 26 requests for mandatory two-provider agreement. It repeated chain ID, block, static metadata, dynamic state, and final block reads for every candidate.
 

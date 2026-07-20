@@ -1,6 +1,5 @@
 use crate::model::{
     CounterfactualResult, PersistedOpportunity, SimulationStatus, UnsignedTransactionPlan,
-    ARBITRUM_ONE_CHAIN_ID, PLAN_SCHEMA_VERSION, RESULT_SCHEMA_VERSION,
 };
 use serde::Serialize;
 use serde_json::{to_value, Value};
@@ -97,6 +96,7 @@ SELECT shadow_decision_id::text AS shadow_decision_id,
        model_version,
        policy_version,
        disposition,
+       final_rejection_reason,
        primary_profitability_status,
        evidence_completeness_status,
        fork_evidence_schema_version,
@@ -163,6 +163,7 @@ WHERE shadow_decision_id = CAST($1 AS uuid)
             model_version: row.try_get("model_version")?,
             policy_version: row.try_get("policy_version")?,
             disposition: row.try_get("disposition")?,
+            primary_rejection_reason: row.try_get("final_rejection_reason")?,
             primary_profitability_status: row.try_get("primary_profitability_status")?,
             evidence_completeness_status: row.try_get("evidence_completeness_status")?,
             fork_evidence_schema_version: row.try_get("fork_evidence_schema_version")?,
@@ -177,44 +178,9 @@ WHERE shadow_decision_id = CAST($1 AS uuid)
         plan: &UnsignedTransactionPlan,
         result: &CounterfactualResult,
     ) -> Result<(), StoreError> {
-        let plan_hash = plan.canonical_hash().map_err(|_| StoreError::Integrity)?;
-        let result_hash = CounterfactualResult::from_body(result.body.clone())
-            .map_err(|_| StoreError::Integrity)?
-            .result_hash;
-        if plan.schema_version != PLAN_SCHEMA_VERSION
-            || result.body.schema_version != RESULT_SCHEMA_VERSION
-            || result.body.plan_hash != plan_hash
-            || result.result_hash != result_hash
-            || result.body.shadow_decision_id != plan.shadow_decision_id
-            || plan.chain_id != ARBITRUM_ONE_CHAIN_ID
-            || result.body.fork.chain_id != plan.chain_id
-            || result.body.fork.fork_block != plan.pinned_block
-            || result.body.fork.local_block.number < plan.pinned_block.number
-            || result.body.predicted_gross_profit != plan.predicted.gross_profit
-            || result.body.predicted_total_cost != plan.predicted.total_cost
-            || result.body.predicted_net_pnl != plan.predicted.net_pnl
-            || result.body.model_version != plan.model_version
-            || result.body.policy_version != plan.policy_version
-            || result.body.evidence.target_code_hash != plan.target_code_hash
-            || result.body.evidence.observed_aggregate_state_hash != plan.primary_state_hash
-            || !plan.unsigned
-            || !plan.fork_only
-            || !plan.shadow_only
-            || plan.live_execution
-            || plan.execution_eligible
-            || plan.execution_request_created
-            || plan.public_broadcast
-            || plan.signer_used
-            || !result.body.fork_only
-            || !result.body.shadow_only
-            || result.body.live_execution
-            || result.body.execution_eligible
-            || result.body.execution_request_created
-            || result.body.public_broadcast
-            || result.body.signer_used
-        {
-            return Err(StoreError::Integrity);
-        }
+        result
+            .validate_plan_binding(plan)
+            .map_err(|_| StoreError::Integrity)?;
         let record = ResultRecord {
             result_hash: &result.result_hash,
             plan_hash: &result.body.plan_hash,

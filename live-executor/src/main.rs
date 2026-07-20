@@ -110,6 +110,7 @@ fn config_error_code(error: &ConfigError) -> &'static str {
         ConfigError::InvalidBoolean => "invalid_boolean",
         ConfigError::InvalidChain => "invalid_chain",
         ConfigError::InvalidAddress => "invalid_address",
+        ConfigError::InvalidCodeHash => "invalid_code_hash",
         ConfigError::UnsupportedProfitAsset => "unsupported_profit_asset",
         ConfigError::Signer(_) => "invalid_signer",
         ConfigError::WalletMismatch => "wallet_mismatch",

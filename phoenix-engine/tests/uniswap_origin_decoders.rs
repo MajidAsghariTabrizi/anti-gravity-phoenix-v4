@@ -694,13 +694,19 @@ fn route_registry_json() -> String {
             "route_id":"weth-usdc-two-pool",
             "route_fingerprint":"weth-usdc-two-pool-v1",
             "trigger_pool_id":"{WETH}:{USDC}:500",
+            "settlement_asset":"{WETH}",
+            "settlement_asset_decimals":18,
             "legs":[
-                {{"pool_id":"{WETH}:{USDC}:500","state_target":"0x0000000000000000000000000000000000001001","protocol":"UniswapV3","fee":500,"token_in":"{WETH}","token_out":"{USDC}","direction":"zero_for_one"}},
-                {{"pool_id":"comparison-pool","state_target":"0x0000000000000000000000000000000000002001","protocol":"SushiSwapV3","fee":500,"token_in":"{USDC}","token_out":"{WETH}","direction":"one_for_zero"}}
+                {{"pool_id":"{WETH}:{USDC}:500","state_target":"0x0000000000000000000000000000000000001001","protocol":"UniswapV3","fee":500,"token_in":"{WETH}","token_out":"{USDC}","token_in_decimals":18,"token_out_decimals":6,"tick_spacing":10,"direction":"zero_for_one"}},
+                {{"pool_id":"comparison-pool","state_target":"0x0000000000000000000000000000000000002001","protocol":"SushiSwapV3","fee":500,"token_in":"{USDC}","token_out":"{WETH}","token_in_decimals":6,"token_out_decimals":18,"tick_spacing":10,"direction":"one_for_zero"}}
             ],
             "strategy":{{
                 "min_input_amount":"100","max_input_amount":"1000","max_evaluations":16,
+                "candidate_sizes":["100","250","500","1000"],
                 "minimum_net_profit":"1","flash_premium_bps":5,"minimum_slippage_bps":10,
+                "minimum_net_profit_bps":10,"conservative_cost_multiplier_bps":12500,
+                "maximum_pool_depth_utilization_bps":1000,"maximum_slippage_bps":100,
+                "maximum_price_impact_bps":50,"maximum_execution_gas":600000,
                 "protocol_fees":"0","estimated_execution_gas":500000,"l1_data_fee":"1",
                 "contract_overhead":"1","failed_attempt_gas_cost":"1","failure_probability_bps":500,
                 "stale_state_loss":"1","stale_quote_probability_bps":100,"state_drift_reserve":"1",

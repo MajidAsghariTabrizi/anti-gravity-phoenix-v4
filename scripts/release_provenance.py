@@ -32,6 +32,7 @@ EXPECTED_IMAGES = (
     "dashboard",
     "feed-ingestor",
     "fork-sandbox",
+    "live-executor",
     "phoenix-engine",
     "recorder",
     "rpc-gateway",

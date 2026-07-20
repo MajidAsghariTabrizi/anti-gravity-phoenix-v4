@@ -54,12 +54,13 @@ Integration fixtures exercise deterministic profitable, non-profitable, unsuppor
 - `ghcr.io/majidasgharitabrizi/rpc-gateway`
 - `ghcr.io/majidasgharitabrizi/recorder`
 - `ghcr.io/majidasgharitabrizi/fork-sandbox`
+- `ghcr.io/majidasgharitabrizi/live-executor`
 - `ghcr.io/majidasgharitabrizi/dashboard`
 
 The manual dispatch requires an exact SHA reachable from main, a bounded
 release intent, and the confirmation
 `PUBLISH_IMMUTABLE_PHOENIX_IMAGES`. Ordinary main pushes and pull requests
-cannot publish. `packages: write` is scoped only to the six publishing jobs.
+cannot publish. `packages: write` is scoped only to the seven publishing jobs.
 
 Images use `sha-<full git sha>` tags and OCI labels for source, revision,
 created timestamp, and image title. The release manifest records the exact
@@ -67,7 +68,7 @@ repositories, tags, and digests. A same-run provenance sidecar binds all
 fragments and release assets to one successful workflow run and SHA.
 Production deployment consumes the manifest, not `latest`.
 
-The same workflow builds `phoenix-release-assets-<sha>.tar.gz`, a deterministic bounded bundle containing the canonical Compose context, migrations, report and control schemas, deployment/control scripts, route proofs, Dashboard snapshot model, and compiled PhoenixExecutor artifact. `release-assets-manifest.json` records every path, mode, size, and SHA-256 digest. The release manifest is withheld unless all six image builds and the asset bundle succeed. Canonical validation also requires the final manifest job and complete run to succeed; run `29683234024` is explicitly quarantined as an incomplete non-release build.
+The same workflow builds `phoenix-release-assets-<sha>.tar.gz`, a deterministic bounded bundle containing the canonical Compose context, migrations, report and control schemas, deployment/control scripts, route proofs, Dashboard snapshot model, and compiled PhoenixExecutor artifact. `release-assets-manifest.json` records every path, mode, size, and SHA-256 digest. The release manifest is withheld unless all seven image builds and the asset bundle succeed. Canonical validation also requires the final manifest job and complete run to succeed; run `29683234024` is explicitly quarantined as an incomplete non-release build.
 
 Replay is an offline CLI and is not published as a permanent production daemon image.
 

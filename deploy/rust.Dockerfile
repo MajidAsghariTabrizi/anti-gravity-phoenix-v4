@@ -6,7 +6,7 @@ COPY rpc-gateway ./rpc-gateway
 COPY recorder ./recorder
 COPY replay ./replay
 COPY live-executor ./live-executor
-COPY fork-sandbox/abi ./fork-sandbox/abi
+COPY fork-sandbox ./fork-sandbox
 COPY money-path-classifier ./money-path-classifier
 COPY fixtures/routes ./fixtures/routes
 COPY fixtures/engine ./fixtures/engine
@@ -32,6 +32,10 @@ RUN case "${CRATE}" in \
     if [ "${CRATE}" = "recorder" ]; then \
       cargo build --release --bin shadow-dispatcher && \
       cp target/release/shadow-dispatcher /out/shadow-dispatcher; \
+    fi && \
+    if [ "${CRATE}" = "live-executor" ]; then \
+      cargo build --release --bin approve-execution-request && \
+      cp target/release/approve-execution-request /out/approve-execution-request; \
     fi
 
 FROM debian:bookworm-slim

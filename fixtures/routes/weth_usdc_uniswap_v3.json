@@ -3,6 +3,8 @@
     "route_id": "arbitrum-weth-usdc-uniswap-v3-500-3000",
     "route_fingerprint": "arbitrum-weth-usdc-uniswap-v3-500-3000-v1",
     "trigger_pool_id": "0x82af49447d8a07e3bd95bd0d56f35241523fbab1:0xaf88d065e77c8cc2239327c5edb3a432268e5831:500",
+    "settlement_asset": "0x82af49447d8a07e3bd95bd0d56f35241523fbab1",
+    "settlement_asset_decimals": 18,
     "legs": [
       {
         "pool_id": "0x82af49447d8a07e3bd95bd0d56f35241523fbab1:0xaf88d065e77c8cc2239327c5edb3a432268e5831:500",
@@ -11,6 +13,9 @@
         "fee": 500,
         "token_in": "0x82af49447d8a07e3bd95bd0d56f35241523fbab1",
         "token_out": "0xaf88d065e77c8cc2239327c5edb3a432268e5831",
+        "token_in_decimals": 18,
+        "token_out_decimals": 6,
+        "tick_spacing": 10,
         "direction": "zero_for_one"
       },
       {
@@ -20,14 +25,32 @@
         "fee": 3000,
         "token_in": "0xaf88d065e77c8cc2239327c5edb3a432268e5831",
         "token_out": "0x82af49447d8a07e3bd95bd0d56f35241523fbab1",
+        "token_in_decimals": 6,
+        "token_out_decimals": 18,
+        "tick_spacing": 60,
         "direction": "one_for_zero"
       }
     ],
     "strategy": {
-      "min_input_amount": "1000000",
-      "max_input_amount": "1000000000000000000",
-      "max_evaluations": 32,
-      "minimum_net_profit": "1",
+      "min_input_amount": "100000000000000",
+      "max_input_amount": "10000000000000000",
+      "max_evaluations": 7,
+      "candidate_sizes": [
+        "100000000000000",
+        "250000000000000",
+        "500000000000000",
+        "1000000000000000",
+        "2500000000000000",
+        "5000000000000000",
+        "10000000000000000"
+      ],
+      "minimum_net_profit": "1000000000000",
+      "minimum_net_profit_bps": 10,
+      "conservative_cost_multiplier_bps": 12500,
+      "maximum_pool_depth_utilization_bps": 1000,
+      "maximum_slippage_bps": 100,
+      "maximum_price_impact_bps": 50,
+      "maximum_execution_gas": 600000,
       "flash_premium_bps": 5,
       "minimum_slippage_bps": 10,
       "protocol_fees": "0",

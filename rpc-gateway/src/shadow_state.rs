@@ -3,7 +3,7 @@ use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 use thiserror::Error;
 
-pub const SHADOW_STATE_SCHEMA_VERSION: &str = "phoenix.rpc.shadow_state.v3";
+pub const SHADOW_STATE_SCHEMA_VERSION: &str = "phoenix.rpc.shadow_state.v4";
 pub const ARBITRUM_ONE_CHAIN_ID: u64 = 42161;
 pub const MAX_POOLS_PER_REQUEST: usize = 16;
 pub const MAX_GATEWAY_REQUEST_BYTES: usize = 64 * 1024;
@@ -38,7 +38,10 @@ pub struct PoolStateRequest {
     pub protocol: String,
     pub token0: String,
     pub token1: String,
+    pub token0_decimals: u8,
+    pub token1_decimals: u8,
     pub fee: u32,
+    pub tick_spacing: i32,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -93,7 +96,10 @@ pub struct PoolStateResponse {
     pub protocol: String,
     pub token0: String,
     pub token1: String,
+    pub token0_decimals: u8,
+    pub token1_decimals: u8,
     pub fee: u32,
+    pub tick_spacing: i32,
     pub slot0: String,
     pub liquidity: String,
     pub state_hash: String,
@@ -161,8 +167,11 @@ impl ShadowStateRequest {
                 || !canonical_address(&pool.token0)
                 || !canonical_address(&pool.token1)
                 || pool.token0 == pool.token1
+                || !(1..=36).contains(&pool.token0_decimals)
+                || !(1..=36).contains(&pool.token1_decimals)
                 || pool.fee == 0
                 || pool.fee >= 1_000_000
+                || !(1..=887_272).contains(&pool.tick_spacing)
                 || !pool_ids.insert(pool.pool_id.as_str())
                 || !addresses.insert(pool.address.as_str())
             {
@@ -261,7 +270,10 @@ mod tests {
                     protocol: "UniswapV3".to_string(),
                     token0: "0x3333333333333333333333333333333333333333".to_string(),
                     token1: "0x4444444444444444444444444444444444444444".to_string(),
+                    token0_decimals: 18,
+                    token1_decimals: 6,
                     fee: 500,
+                    tick_spacing: 10,
                 },
                 PoolStateRequest {
                     pool_id: "pool-b".to_string(),
@@ -269,7 +281,10 @@ mod tests {
                     protocol: "SushiSwapV3".to_string(),
                     token0: "0x3333333333333333333333333333333333333333".to_string(),
                     token1: "0x4444444444444444444444444444444444444444".to_string(),
+                    token0_decimals: 18,
+                    token1_decimals: 6,
                     fee: 500,
+                    tick_spacing: 10,
                 },
             ],
             evidence: EvidenceRequest::Primary,

@@ -9,9 +9,10 @@ use phoenix_engine::economics::{evaluate_scenarios, EconomicError, EconomicInput
 use phoenix_engine::graph::PoolEdge;
 use phoenix_engine::opportunity::{
     AgreementState, BasisPoints, DecisionEvidence, IndependentVerificationStatus, MarketEvidence,
-    Opportunity, OpportunityIdentity, OutcomeEvidence, PoolStateEvidence, RejectionReason,
-    RouteEvidence, ShadowDisposition, SimulationClassification, SimulationEvidence, SimulationKind,
-    StateSource, Strategy, VerificationSkipReason, VerificationStatus,
+    MonetaryUnit, Opportunity, OpportunityIdentity, OutcomeEvidence, PoolStateEvidence,
+    RejectionReason, RouteEvidence, ShadowDisposition, SimulationClassification,
+    SimulationEvidence, SimulationKind, StateSource, Strategy, VerificationSkipReason,
+    VerificationStatus,
 };
 use serde::Deserialize;
 
@@ -20,6 +21,9 @@ pub mod evidence;
 pub const REPLAY_SCHEMA_VERSION: &str = "shadow-replay-v1";
 pub const STRATEGY_VERSION: &str = "two-pool-v3-v1";
 pub const POLICY_VERSION: &str = "shadow-policy-v1";
+const FIXTURE_SETTLEMENT_ASSET: &str = "0x1111111111111111111111111111111111111111";
+const FIXTURE_COUNTER_ASSET: &str = "0x2222222222222222222222222222222222222222";
+const FIXTURE_SETTLEMENT_ASSET_DECIMALS: u8 = 18;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DeterministicClock {
@@ -212,7 +216,11 @@ pub fn replay_cases(mut cases: Vec<ReplayCase>) -> Result<ReplayReport, ReplayEr
 }
 
 fn evaluate_case(case: &ReplayCase) -> Result<ReplayDecision, ReplayError> {
+    let settlement_asset = token(FIXTURE_SETTLEMENT_ASSET)?;
     let economics = evaluate_scenarios(&EconomicInput {
+        settlement_asset,
+        settlement_asset_decimals: FIXTURE_SETTLEMENT_ASSET_DECIMALS,
+        monetary_unit: MonetaryUnit::SettlementAssetBaseUnits,
         principal: Amount(case.principal),
         gross_output: Amount(case.gross_output),
         protocol_fees: Amount(case.protocol_fees),
@@ -245,6 +253,7 @@ fn evaluate_case(case: &ReplayCase) -> Result<ReplayDecision, ReplayError> {
             now_unix_ms: case.decided_at_unix_ms,
             duplicate: case.duplicate,
             sequence_contiguous: case.sequence_contiguous,
+            liquidity_known: true,
             liquidity_sufficient: case.liquidity_sufficient,
             rpc_state_agrees: case.rpc_state_agrees,
             contract_path_available: case.contract_path_available,
@@ -272,8 +281,8 @@ fn evaluate_case(case: &ReplayCase) -> Result<ReplayDecision, ReplayError> {
         protocol: opportunity.route.protocols[0].clone(),
         token_pair: format!(
             "{}:{}",
-            opportunity.route.input_token.0.as_str(),
-            opportunity.route.output_token.0.as_str()
+            opportunity.route.token_path[0].0.as_str(),
+            opportunity.route.token_path[1].0.as_str()
         ),
         simulation_passed: opportunity.simulation.classification
             == SimulationClassification::Passed,
@@ -289,16 +298,25 @@ fn build_opportunity(
     case: &ReplayCase,
     economics: phoenix_engine::opportunity::ScenarioEconomics,
 ) -> Result<Opportunity, ReplayError> {
-    let token0 = token("0x1111111111111111111111111111111111111111")?;
-    let token1 = token("0x2222222222222222222222222222222222222222")?;
-    let pool = PoolId("fixture-pool".to_string());
-    let leg = PoolEdge {
-        pool_id: pool.clone(),
+    let token0 = token(FIXTURE_SETTLEMENT_ASSET)?;
+    let token1 = token(FIXTURE_COUNTER_ASSET)?;
+    let pool0 = PoolId("fixture-pool-0".to_string());
+    let pool1 = PoolId("fixture-pool-1".to_string());
+    let leg0 = PoolEdge {
+        pool_id: pool0.clone(),
         protocol: "UniswapV3".to_string(),
         fee: 500,
         token_in: token0.clone(),
         token_out: token1.clone(),
         direction: Direction::ZeroForOne,
+    };
+    let leg1 = PoolEdge {
+        pool_id: pool1.clone(),
+        protocol: "UniswapV3".to_string(),
+        fee: 3_000,
+        token_in: token1.clone(),
+        token_out: token0.clone(),
+        direction: Direction::OneForZero,
     };
     Ok(Opportunity {
         identity: OpportunityIdentity {
@@ -320,24 +338,39 @@ fn build_opportunity(
         route: RouteEvidence {
             route_id: RouteId("fixture-two-pool-route".to_string()),
             route_fingerprint: "fixture-two-pool-route-v1".to_string(),
-            token_path: vec![token0.clone(), token1.clone()],
-            pools: vec![pool.clone()],
-            pool_addresses: vec![Address::parse("0x3333333333333333333333333333333333333333")
-                .map_err(|_| ReplayError::InvalidAddress)?],
-            protocols: vec!["UniswapV3".to_string()],
-            input_token: token0,
-            output_token: token1,
+            token_path: vec![token0.clone(), token1.clone(), token0.clone()],
+            pools: vec![pool0.clone(), pool1.clone()],
+            pool_addresses: vec![
+                Address::parse("0x3333333333333333333333333333333333333333")
+                    .map_err(|_| ReplayError::InvalidAddress)?,
+                Address::parse("0x4444444444444444444444444444444444444444")
+                    .map_err(|_| ReplayError::InvalidAddress)?,
+            ],
+            protocols: vec!["UniswapV3".to_string(), "UniswapV3".to_string()],
+            settlement_asset: token0.clone(),
+            settlement_asset_decimals: FIXTURE_SETTLEMENT_ASSET_DECIMALS,
+            monetary_unit: MonetaryUnit::SettlementAssetBaseUnits,
+            input_token: token0.clone(),
+            output_token: token0,
             input_amount: Amount(case.principal),
+            flash_loan_amount: Amount(case.principal),
             expected_output: Amount(case.gross_output),
-            expected_leg_outputs: vec![Amount(case.gross_output)],
-            exact_ordered_legs: vec![leg],
+            expected_leg_outputs: vec![Amount(case.principal), Amount(case.gross_output)],
+            exact_ordered_legs: vec![leg0, leg1],
         },
         market: MarketEvidence {
-            pool_states: vec![PoolStateEvidence {
-                pool,
-                state_hash: case.state_hash.clone(),
-                reserve_or_liquidity_summary: "fixture-recorded-liquidity".to_string(),
-            }],
+            pool_states: vec![
+                PoolStateEvidence {
+                    pool: pool0,
+                    state_hash: case.state_hash.clone(),
+                    reserve_or_liquidity_summary: "fixture-recorded-liquidity-0".to_string(),
+                },
+                PoolStateEvidence {
+                    pool: pool1,
+                    state_hash: case.state_hash.clone(),
+                    reserve_or_liquidity_summary: "fixture-recorded-liquidity-1".to_string(),
+                },
+            ],
             state_block: case.observed_block,
             state_block_hash: Some(case.state_block_hash.clone()),
             route_config_hash: None,

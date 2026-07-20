@@ -16,6 +16,8 @@ use thiserror::Error;
 
 const MAX_ROUTE_LEGS: usize = 4;
 const MAX_CALLDATA_BYTES: usize = 128 * 1024;
+const ARBITRUM_WETH: &str = "0x82af49447d8a07e3bd95bd0d56f35241523fbab1";
+const ARBITRUM_NATIVE_USDC: &str = "0xaf88d065e77c8cc2239327c5edb3a432268e5831";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PlanPolicy {
@@ -259,13 +261,24 @@ fn pool_requests(
                 "one_for_zero" => (token_out, token_in),
                 _ => return Err(PlannerError::InvalidEvidence),
             };
+            if token0 != ARBITRUM_WETH || token1 != ARBITRUM_NATIVE_USDC {
+                return Err(PlannerError::InvalidEvidence);
+            }
+            let tick_spacing = match fees[index] {
+                500 => 10,
+                3_000 => 60,
+                _ => return Err(PlannerError::InvalidEvidence),
+            };
             Ok(PoolStateRequest {
                 pool_id: pool_ids[index].clone(),
                 address: pool_addresses[index].clone(),
                 protocol: protocols[index].clone(),
                 token0,
                 token1,
+                token0_decimals: 18,
+                token1_decimals: 6,
                 fee: fees[index],
+                tick_spacing,
             })
         })
         .collect()
@@ -309,7 +322,8 @@ fn validate_fact(
         return Err(PlannerError::WrongChain);
     }
     if fact.fork_evidence_schema_version != FORK_EVIDENCE_SCHEMA_VERSION
-        || fact.disposition != "accepted"
+        || fact.disposition != "rejected"
+        || fact.primary_rejection_reason.as_deref() != Some("contract_path_unavailable")
         || fact.primary_profitability_status != "meets_minimum"
         || fact.evidence_completeness_status != "complete"
         || !fact.shadow_only

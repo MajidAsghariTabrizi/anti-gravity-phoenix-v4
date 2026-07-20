@@ -1,7 +1,7 @@
 use alloy_primitives::keccak256;
 use async_trait::async_trait;
 use chrono::{DateTime, Duration as ChronoDuration, TimeZone, Utc};
-use phoenix_live_executor::abi::RpcLog;
+use phoenix_live_executor::abi::{encode_execute_opportunity, RpcLog};
 use phoenix_live_executor::config::{ExecutorConfig, SafetyLimits};
 use phoenix_live_executor::engine::{DisarmReason, ExecutionState, LiveExecutor};
 use phoenix_live_executor::model::{
@@ -11,8 +11,13 @@ use phoenix_live_executor::model::{
 use phoenix_live_executor::rpc::{ExecutionRpc, RpcError, RpcErrorKind, TransactionReceipt};
 use phoenix_live_executor::signer::TransactionSigner;
 use phoenix_live_executor::store::{ControlState, ExecutorStore, StoreError};
-use phoenix_live_executor::{ARBITRUM_ONE_CHAIN_ID, ARBITRUM_WETH_ADDRESS, REQUEST_SCHEMA_VERSION};
+use phoenix_live_executor::{
+    ARBITRUM_NATIVE_USDC_ADDRESS, ARBITRUM_ONE_CHAIN_ID, ARBITRUM_WETH_ADDRESS,
+    CURRENT_ROUTE_FINGERPRINT, CURRENT_ROUTE_POOL_3000_ADDRESS, CURRENT_ROUTE_POOL_500_ADDRESS,
+    REQUEST_SCHEMA_VERSION,
+};
 use primitive_types::U256;
+use sha2::{Digest, Sha256};
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -405,6 +410,7 @@ fn harness(request_count: usize) -> Harness {
         rpc_allowlist: vec![Url::parse("https://rpc.example.invalid").expect("url")],
         wallet_address: signer.address(),
         executor_address,
+        executor_code_hash: "a".repeat(64),
         pnl_asset_address: pnl_asset,
         chain_id: ARBITRUM_ONE_CHAIN_ID,
         limits: SafetyLimits {
@@ -444,16 +450,26 @@ fn harness(request_count: usize) -> Harness {
 }
 
 fn valid_request(now: DateTime<Utc>, flash_asset: CanonicalAddress) -> ExecutionRequest {
-    let token_b =
-        CanonicalAddress::parse("0x2222222222222222222222222222222222222222").expect("token");
+    let token_b = CanonicalAddress::parse(ARBITRUM_NATIVE_USDC_ADDRESS).expect("token");
     let mut request = ExecutionRequest {
         id: Uuid::from_u128(1),
         opportunity_id: Uuid::from_u128(2),
         schema_version: REQUEST_SCHEMA_VERSION.to_string(),
         chain_id: ARBITRUM_ONE_CHAIN_ID,
         route_id: [4_u8; 32],
+        route_fingerprint: CURRENT_ROUTE_FINGERPRINT.to_string(),
+        selected_size: 1_000,
+        token_path: vec![flash_asset, token_b, flash_asset],
         origin_router: CanonicalAddress::parse("0x4444444444444444444444444444444444444444")
             .expect("router"),
+        executor_address: CanonicalAddress::parse("0x3333333333333333333333333333333333333333")
+            .expect("executor"),
+        executor_code_hash: "a".repeat(64),
+        calldata_hash: String::new(),
+        simulation_result_hash: "b".repeat(64),
+        plan_hash: "c".repeat(64),
+        pinned_block_number: 123_456,
+        pinned_block_hash: format!("0x{}", "d".repeat(64)),
         flash_asset,
         flash_amount: 1_000,
         maximum_input_amount: 1_000,
@@ -462,8 +478,7 @@ fn valid_request(now: DateTime<Utc>, flash_asset: CanonicalAddress) -> Execution
         deadline: now + ChronoDuration::seconds(60),
         legs: vec![
             ValidatedLeg {
-                pool: CanonicalAddress::parse("0x5555555555555555555555555555555555555555")
-                    .expect("pool"),
+                pool: CanonicalAddress::parse(CURRENT_ROUTE_POOL_500_ADDRESS).expect("pool"),
                 token_in: flash_asset,
                 token_out: token_b,
                 fee: 500,
@@ -471,11 +486,10 @@ fn valid_request(now: DateTime<Utc>, flash_asset: CanonicalAddress) -> Execution
                 min_amount_out: 900,
             },
             ValidatedLeg {
-                pool: CanonicalAddress::parse("0x6666666666666666666666666666666666666666")
-                    .expect("pool"),
+                pool: CanonicalAddress::parse(CURRENT_ROUTE_POOL_3000_ADDRESS).expect("pool"),
                 token_in: token_b,
                 token_out: flash_asset,
-                fee: 500,
+                fee: 3_000,
                 zero_for_one: false,
                 min_amount_out: 1_100,
             },
@@ -485,9 +499,13 @@ fn valid_request(now: DateTime<Utc>, flash_asset: CanonicalAddress) -> Execution
         max_priority_fee_per_gas: 90,
         approved_by: "canary-reviewer".to_string(),
         approved_at: now - ChronoDuration::seconds(1),
-        policy_version: "live-canary-v1".to_string(),
+        approval_deadline: now + ChronoDuration::seconds(30),
+        policy_version: "phoenix.live-canary-approval.v1".to_string(),
         approval_digest: String::new(),
     };
+    request.calldata_hash = hex::encode(Sha256::digest(
+        encode_execute_opportunity(&request, request.executor_address).expect("calldata"),
+    ));
     request.approval_digest = request
         .canonical_approval_digest()
         .expect("approval digest");
@@ -848,6 +866,99 @@ async fn gas_and_amount_caps_fail_before_submission() {
         }
     );
     assert_eq!(priority_fee_harness.rpc.send_count(), 0);
+}
+
+#[tokio::test]
+async fn calldata_binding_fails_before_nonce_allocation() {
+    let harness = harness(1);
+    {
+        let mut state = harness.store.state.lock().expect("state");
+        state.requests[0].calldata_hash = "f".repeat(64);
+        state.requests[0].approval_digest = state.requests[0]
+            .canonical_approval_digest()
+            .expect("approval digest");
+    }
+    let state = harness
+        .executor
+        .step(harness.now)
+        .await
+        .expect("calldata policy");
+    assert_eq!(
+        state,
+        ExecutionState::Disarmed {
+            reason: DisarmReason::Policy
+        }
+    );
+    assert_eq!(harness.store.next_nonce(), 0);
+    assert_eq!(harness.rpc.send_count(), 0);
+    assert_eq!(
+        harness.store.disarm_reason(),
+        Some("calldata_hash_mismatch")
+    );
+}
+
+#[tokio::test]
+async fn unreviewed_approval_policy_fails_before_nonce_allocation() {
+    let harness = harness(1);
+    {
+        let mut state = harness.store.state.lock().expect("state");
+        state.requests[0].policy_version = "unreviewed-policy".to_string();
+        state.requests[0].approval_digest = state.requests[0]
+            .canonical_approval_digest()
+            .expect("approval digest");
+    }
+    let state = harness
+        .executor
+        .step(harness.now)
+        .await
+        .expect("approval policy");
+    assert_eq!(
+        state,
+        ExecutionState::Disarmed {
+            reason: DisarmReason::Policy
+        }
+    );
+    assert_eq!(harness.store.next_nonce(), 0);
+    assert_eq!(harness.rpc.send_count(), 0);
+    assert_eq!(
+        harness.store.disarm_reason(),
+        Some("approval_policy_mismatch")
+    );
+}
+
+#[tokio::test]
+async fn current_route_binding_fails_before_nonce_allocation() {
+    let harness = harness(1);
+    {
+        let mut state = harness.store.state.lock().expect("state");
+        state.requests[0].legs[0].pool =
+            CanonicalAddress::parse("0x5555555555555555555555555555555555555555")
+                .expect("alternate pool");
+        state.requests[0].calldata_hash = hex::encode(Sha256::digest(
+            encode_execute_opportunity(&state.requests[0], state.requests[0].executor_address)
+                .expect("calldata"),
+        ));
+        state.requests[0].approval_digest = state.requests[0]
+            .canonical_approval_digest()
+            .expect("approval digest");
+    }
+    let state = harness
+        .executor
+        .step(harness.now)
+        .await
+        .expect("route policy");
+    assert_eq!(
+        state,
+        ExecutionState::Disarmed {
+            reason: DisarmReason::Policy
+        }
+    );
+    assert_eq!(harness.store.next_nonce(), 0);
+    assert_eq!(harness.rpc.send_count(), 0);
+    assert_eq!(
+        harness.store.disarm_reason(),
+        Some("route_contract_mismatch")
+    );
 }
 
 #[tokio::test]

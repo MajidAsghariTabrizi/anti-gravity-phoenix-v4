@@ -1,4 +1,8 @@
-use crate::{ARBITRUM_ONE_CHAIN_ID, REQUEST_SCHEMA_VERSION};
+use crate::{
+    ARBITRUM_NATIVE_USDC_ADDRESS, ARBITRUM_ONE_CHAIN_ID, ARBITRUM_WETH_ADDRESS,
+    CURRENT_ROUTE_FINGERPRINT, CURRENT_ROUTE_POOL_3000_ADDRESS, CURRENT_ROUTE_POOL_500_ADDRESS,
+    REQUEST_SCHEMA_VERSION,
+};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -9,6 +13,7 @@ use uuid::Uuid;
 pub const MAX_ROUTE_LEGS: usize = 4;
 pub const MAX_APPROVER_BYTES: usize = 128;
 pub const MAX_POLICY_VERSION_BYTES: usize = 128;
+pub const MAX_ROUTE_FINGERPRINT_BYTES: usize = 256;
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Serialize)]
 pub struct CanonicalAddress([u8; 20]);
@@ -112,7 +117,17 @@ pub struct ExecutionRequest {
     pub schema_version: String,
     pub chain_id: u64,
     pub route_id: [u8; 32],
+    pub route_fingerprint: String,
+    pub selected_size: u128,
+    pub token_path: Vec<CanonicalAddress>,
     pub origin_router: CanonicalAddress,
+    pub executor_address: CanonicalAddress,
+    pub executor_code_hash: String,
+    pub calldata_hash: String,
+    pub simulation_result_hash: String,
+    pub plan_hash: String,
+    pub pinned_block_number: u64,
+    pub pinned_block_hash: String,
     pub flash_asset: CanonicalAddress,
     pub flash_amount: u128,
     pub maximum_input_amount: u128,
@@ -125,6 +140,7 @@ pub struct ExecutionRequest {
     pub max_priority_fee_per_gas: u128,
     pub approved_by: String,
     pub approved_at: DateTime<Utc>,
+    pub approval_deadline: DateTime<Utc>,
     pub policy_version: String,
     pub approval_digest: String,
 }
@@ -136,7 +152,17 @@ pub struct RawExecutionRequest {
     pub schema_version: String,
     pub chain_id: i64,
     pub route_id: String,
+    pub route_fingerprint: String,
+    pub selected_size: String,
+    pub token_path: Vec<String>,
     pub origin_router: String,
+    pub executor_address: String,
+    pub executor_code_hash: String,
+    pub calldata_hash: String,
+    pub simulation_result_hash: String,
+    pub plan_hash: String,
+    pub pinned_block_number: i64,
+    pub pinned_block_hash: String,
     pub flash_asset: String,
     pub flash_amount: String,
     pub maximum_input_amount: String,
@@ -149,6 +175,7 @@ pub struct RawExecutionRequest {
     pub max_priority_fee_per_gas: String,
     pub approved_by: String,
     pub approved_at: DateTime<Utc>,
+    pub approval_deadline: DateTime<Utc>,
     pub policy_version: String,
     pub approval_digest: String,
 }
@@ -160,7 +187,17 @@ struct ApprovalBody<'a> {
     opportunity_id: String,
     chain_id: u64,
     route_id: String,
+    route_fingerprint: &'a str,
+    selected_size: String,
+    token_path: Vec<String>,
     origin_router: String,
+    executor_address: String,
+    executor_code_hash: &'a str,
+    calldata_hash: &'a str,
+    simulation_result_hash: &'a str,
+    plan_hash: &'a str,
+    pinned_block_number: u64,
+    pinned_block_hash: &'a str,
     flash_asset: String,
     flash_amount: String,
     maximum_input_amount: String,
@@ -173,6 +210,7 @@ struct ApprovalBody<'a> {
     max_priority_fee_per_gas: String,
     approved_by: &'a str,
     approved_at: String,
+    approval_deadline: String,
     policy_version: &'a str,
 }
 
@@ -203,6 +241,11 @@ impl RawExecutionRequest {
             return Err(ModelError::WrongChain);
         }
         let route_id = parse_fixed_hex::<32>(&self.route_id).ok_or(ModelError::InvalidRoute)?;
+        let pinned_block_number = u64::try_from(self.pinned_block_number)
+            .ok()
+            .filter(|value| *value > 0)
+            .ok_or(ModelError::InvalidApproval)?;
+        let selected_size = parse_positive_u128(&self.selected_size)?;
         let flash_amount = parse_positive_u128(&self.flash_amount)?;
         let maximum_input_amount = parse_positive_u128(&self.maximum_input_amount)?;
         let minimum_profit = parse_positive_u128(&self.minimum_profit)?;
@@ -224,12 +267,31 @@ impl RawExecutionRequest {
             .into_iter()
             .map(ValidatedLeg::try_from)
             .collect::<Result<Vec<_>, _>>()?;
-        validate_route(&legs, CanonicalAddress::parse(&self.flash_asset)?)?;
+        let flash_asset = CanonicalAddress::parse(&self.flash_asset)?;
+        validate_route(&legs, flash_asset)?;
+        let token_path = self
+            .token_path
+            .iter()
+            .map(|address| CanonicalAddress::parse(address))
+            .collect::<Result<Vec<_>, _>>()?;
+        validate_token_path(&token_path, &legs, flash_asset)?;
         if self.approved_by.trim().is_empty()
             || self.approved_by.len() > MAX_APPROVER_BYTES
             || self.policy_version.trim().is_empty()
             || self.policy_version.len() > MAX_POLICY_VERSION_BYTES
+            || self.route_fingerprint.trim().is_empty()
+            || self.route_fingerprint.len() > MAX_ROUTE_FINGERPRINT_BYTES
+            || self.route_fingerprint.chars().any(char::is_control)
+            || !canonical_digest(&self.executor_code_hash)
+            || !canonical_digest(&self.calldata_hash)
+            || !canonical_digest(&self.simulation_result_hash)
+            || !canonical_digest(&self.plan_hash)
+            || !canonical_block_hash(&self.pinned_block_hash)
             || !canonical_digest(&self.approval_digest)
+            || selected_size != flash_amount
+            || maximum_input_amount < selected_size
+            || self.approved_at >= self.approval_deadline
+            || self.approval_deadline > self.deadline
         {
             return Err(ModelError::InvalidApproval);
         }
@@ -239,8 +301,18 @@ impl RawExecutionRequest {
             schema_version: self.schema_version,
             chain_id,
             route_id,
+            route_fingerprint: self.route_fingerprint,
+            selected_size,
+            token_path,
             origin_router: CanonicalAddress::parse(&self.origin_router)?,
-            flash_asset: CanonicalAddress::parse(&self.flash_asset)?,
+            executor_address: CanonicalAddress::parse(&self.executor_address)?,
+            executor_code_hash: self.executor_code_hash,
+            calldata_hash: self.calldata_hash,
+            simulation_result_hash: self.simulation_result_hash,
+            plan_hash: self.plan_hash,
+            pinned_block_number,
+            pinned_block_hash: self.pinned_block_hash,
+            flash_asset,
             flash_amount,
             maximum_input_amount,
             minimum_profit,
@@ -252,9 +324,11 @@ impl RawExecutionRequest {
             max_priority_fee_per_gas,
             approved_by: self.approved_by,
             approved_at: self.approved_at,
+            approval_deadline: self.approval_deadline,
             policy_version: self.policy_version,
             approval_digest: self.approval_digest,
         };
+        request.validate_current_route()?;
         if request.canonical_approval_digest()? != request.approval_digest {
             return Err(ModelError::ApprovalDigestMismatch);
         }
@@ -263,6 +337,31 @@ impl RawExecutionRequest {
 }
 
 impl ExecutionRequest {
+    pub fn validate_current_route(&self) -> Result<(), ModelError> {
+        let weth = CanonicalAddress::parse(ARBITRUM_WETH_ADDRESS)?;
+        let usdc = CanonicalAddress::parse(ARBITRUM_NATIVE_USDC_ADDRESS)?;
+        let pool_500 = CanonicalAddress::parse(CURRENT_ROUTE_POOL_500_ADDRESS)?;
+        let pool_3000 = CanonicalAddress::parse(CURRENT_ROUTE_POOL_3000_ADDRESS)?;
+        if self.route_fingerprint != CURRENT_ROUTE_FINGERPRINT
+            || self.flash_asset != weth
+            || self.token_path.as_slice() != [weth, usdc, weth]
+            || self.legs.len() != 2
+            || self.legs[0].pool != pool_500
+            || self.legs[0].token_in != weth
+            || self.legs[0].token_out != usdc
+            || self.legs[0].fee != 500
+            || !self.legs[0].zero_for_one
+            || self.legs[1].pool != pool_3000
+            || self.legs[1].token_in != usdc
+            || self.legs[1].token_out != weth
+            || self.legs[1].fee != 3_000
+            || self.legs[1].zero_for_one
+        {
+            return Err(ModelError::InvalidLegs);
+        }
+        Ok(())
+    }
+
     pub fn canonical_approval_digest(&self) -> Result<String, ModelError> {
         let body = ApprovalBody {
             schema_version: &self.schema_version,
@@ -270,7 +369,17 @@ impl ExecutionRequest {
             opportunity_id: self.opportunity_id.to_string(),
             chain_id: self.chain_id,
             route_id: format!("0x{}", hex::encode(self.route_id)),
+            route_fingerprint: &self.route_fingerprint,
+            selected_size: self.selected_size.to_string(),
+            token_path: self.token_path.iter().map(ToString::to_string).collect(),
             origin_router: self.origin_router.to_string(),
+            executor_address: self.executor_address.to_string(),
+            executor_code_hash: &self.executor_code_hash,
+            calldata_hash: &self.calldata_hash,
+            simulation_result_hash: &self.simulation_result_hash,
+            plan_hash: &self.plan_hash,
+            pinned_block_number: self.pinned_block_number,
+            pinned_block_hash: &self.pinned_block_hash,
             flash_asset: self.flash_asset.to_string(),
             flash_amount: self.flash_amount.to_string(),
             maximum_input_amount: self.maximum_input_amount.to_string(),
@@ -285,6 +394,9 @@ impl ExecutionRequest {
             approved_at: self
                 .approved_at
                 .to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+            approval_deadline: self
+                .approval_deadline
+                .to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
             policy_version: &self.policy_version,
         };
         let encoded = serde_json::to_vec(&body).map_err(|_| ModelError::InvalidApproval)?;
@@ -296,7 +408,7 @@ impl TryFrom<ExecutionLeg> for ValidatedLeg {
     type Error = ModelError;
 
     fn try_from(value: ExecutionLeg) -> Result<Self, Self::Error> {
-        if value.fee == 0 || value.fee > 1_000_000 {
+        if value.fee == 0 || value.fee >= 1_000_000 {
             return Err(ModelError::InvalidLegs);
         }
         Ok(Self {
@@ -313,12 +425,32 @@ impl TryFrom<ExecutionLeg> for ValidatedLeg {
 fn validate_route(legs: &[ValidatedLeg], flash_asset: CanonicalAddress) -> Result<(), ModelError> {
     let mut expected_input = flash_asset;
     for leg in legs {
-        if leg.token_in != expected_input || leg.token_in == leg.token_out {
+        if leg.token_in != expected_input
+            || leg.token_in == leg.token_out
+            || leg.zero_for_one != (leg.token_in.as_bytes() < leg.token_out.as_bytes())
+        {
             return Err(ModelError::InvalidLegs);
         }
         expected_input = leg.token_out;
     }
     if expected_input != flash_asset {
+        return Err(ModelError::InvalidLegs);
+    }
+    Ok(())
+}
+
+fn validate_token_path(
+    token_path: &[CanonicalAddress],
+    legs: &[ValidatedLeg],
+    flash_asset: CanonicalAddress,
+) -> Result<(), ModelError> {
+    if token_path.len() != legs.len() + 1
+        || token_path.first() != Some(&flash_asset)
+        || token_path.last() != Some(&flash_asset)
+        || legs.iter().enumerate().any(|(index, leg)| {
+            token_path[index] != leg.token_in || token_path[index + 1] != leg.token_out
+        })
+    {
         return Err(ModelError::InvalidLegs);
     }
     Ok(())
@@ -343,6 +475,14 @@ fn parse_fixed_hex<const N: usize>(value: &str) -> Option<[u8; N]> {
 pub fn canonical_digest(value: &str) -> bool {
     value.len() == 64
         && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+pub fn canonical_block_hash(value: &str) -> bool {
+    value.len() == 66
+        && value.starts_with("0x")
+        && value[2..]
             .bytes()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }

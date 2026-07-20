@@ -414,6 +414,8 @@ struct RouteSpec {
     route_id: String,
     route_fingerprint: String,
     trigger_pool_id: String,
+    settlement_asset: String,
+    settlement_asset_decimals: u8,
     legs: Vec<RouteLegSpec>,
     #[serde(rename = "strategy")]
     _strategy: serde_json::Map<String, serde_json::Value>,
@@ -428,6 +430,9 @@ struct RouteLegSpec {
     fee: u32,
     token_in: String,
     token_out: String,
+    token_in_decimals: u8,
+    token_out_decimals: u8,
+    tick_spacing: i32,
     direction: String,
 }
 
@@ -454,11 +459,19 @@ fn reviewed_pools(raw: &str) -> Result<HashSet<PoolId>, ClassifierError> {
         }
         let first = validate_leg(&route.legs[0])?;
         let second = validate_leg(&route.legs[1])?;
+        let settlement_asset =
+            Address::parse(&route.settlement_asset).map_err(|_| ClassifierError::RouteRegistry)?;
         if route.trigger_pool_id != route.legs[0].pool_id
             || first.1 != second.0
             || second.1 != first.0
             || route.legs[0].pool_id == route.legs[1].pool_id
             || route.legs[0].state_target == route.legs[1].state_target
+            || settlement_asset != first.0
+            || settlement_asset != second.1
+            || !(1..=36).contains(&route.settlement_asset_decimals)
+            || route.settlement_asset_decimals != route.legs[0].token_in_decimals
+            || route.settlement_asset_decimals != route.legs[1].token_out_decimals
+            || route.legs[0].token_out_decimals != route.legs[1].token_in_decimals
         {
             return Err(ClassifierError::RouteRegistry);
         }
@@ -484,6 +497,9 @@ fn validate_leg(leg: &RouteLegSpec) -> Result<(Address, Address), ClassifierErro
         || token_in == token_out
         || !direction_matches
         || leg.pool_id != expected_pool.0
+        || !(1..=36).contains(&leg.token_in_decimals)
+        || !(1..=36).contains(&leg.token_out_decimals)
+        || !(1..=887_272).contains(&leg.tick_spacing)
     {
         return Err(ClassifierError::RouteRegistry);
     }

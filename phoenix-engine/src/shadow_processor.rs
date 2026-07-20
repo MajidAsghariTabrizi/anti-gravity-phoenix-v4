@@ -16,6 +16,8 @@ use thiserror::Error;
 
 const MAX_ROUTE_CONFIG_BYTES: usize = 64 * 1024;
 const MAX_ROUTES: usize = 256;
+pub const MAX_CANDIDATE_SIZES_PER_ROUTE: usize = 32;
+const ARBITRUM_WETH: &str = "0x82af49447d8a07e3bd95bd0d56f35241523fbab1";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ProcessingAction {
@@ -131,8 +133,18 @@ impl CandidateEvaluator for UnavailableEvaluator {
 pub struct RuntimeRoute {
     pub route: Route,
     pub fingerprint: String,
+    pub settlement_asset: TokenAddress,
+    pub settlement_asset_decimals: u8,
     pub state_targets: Vec<Address>,
+    pub leg_units: Vec<RuntimeLegUnits>,
     pub strategy: RuntimeStrategy,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RuntimeLegUnits {
+    pub token_in_decimals: u8,
+    pub token_out_decimals: u8,
+    pub tick_spacing: i32,
 }
 
 #[derive(Clone, Debug)]
@@ -140,7 +152,15 @@ pub struct RuntimeStrategy {
     pub min_input_amount: Amount,
     pub max_input_amount: Amount,
     pub max_evaluations: usize,
+    pub candidate_sizes: Option<Vec<Amount>>,
+    pub geometric_step_bps: Option<u32>,
     pub minimum_net_profit: Amount,
+    pub minimum_net_profit_bps: u16,
+    pub conservative_cost_multiplier_bps: u32,
+    pub maximum_pool_depth_utilization_bps: u16,
+    pub maximum_slippage_bps: u16,
+    pub maximum_price_impact_bps: u16,
+    pub maximum_execution_gas: u64,
     pub flash_premium_bps: u16,
     pub minimum_slippage_bps: u16,
     pub protocol_fees: Amount,
@@ -421,6 +441,8 @@ struct RouteSpec {
     route_id: String,
     route_fingerprint: String,
     trigger_pool_id: String,
+    settlement_asset: String,
+    settlement_asset_decimals: u8,
     legs: Vec<RouteLegSpec>,
     strategy: StrategySpec,
 }
@@ -434,6 +456,9 @@ struct RouteLegSpec {
     fee: u32,
     token_in: String,
     token_out: String,
+    token_in_decimals: u8,
+    token_out_decimals: u8,
+    tick_spacing: i32,
     direction: String,
 }
 
@@ -443,7 +468,17 @@ struct StrategySpec {
     min_input_amount: String,
     max_input_amount: String,
     max_evaluations: usize,
+    #[serde(default)]
+    candidate_sizes: Option<Vec<String>>,
+    #[serde(default)]
+    geometric_step_bps: Option<u32>,
     minimum_net_profit: String,
+    minimum_net_profit_bps: u16,
+    conservative_cost_multiplier_bps: u32,
+    maximum_pool_depth_utilization_bps: u16,
+    maximum_slippage_bps: u16,
+    maximum_price_impact_bps: u16,
+    maximum_execution_gas: u64,
     flash_premium_bps: u16,
     minimum_slippage_bps: u16,
     protocol_fees: String,
@@ -471,6 +506,8 @@ impl RouteSpec {
             route_id,
             route_fingerprint,
             trigger_pool_id,
+            settlement_asset,
+            settlement_asset_decimals,
             legs,
             strategy,
         } = self;
@@ -481,12 +518,19 @@ impl RouteSpec {
         {
             return Err(RouteRegistryError::InvalidRoute);
         }
-        let (legs, state_targets): (Vec<_>, Vec<_>) = legs
-            .into_iter()
-            .map(RouteLegSpec::into_parts)
-            .collect::<Result<Vec<_>, _>>()?
-            .into_iter()
-            .unzip();
+        let mut runtime_legs = Vec::with_capacity(legs.len());
+        let mut state_targets = Vec::with_capacity(legs.len());
+        let mut leg_units = Vec::with_capacity(legs.len());
+        for leg in legs {
+            let (runtime_leg, state_target, units) = leg.into_parts()?;
+            runtime_legs.push(runtime_leg);
+            state_targets.push(state_target);
+            leg_units.push(units);
+        }
+        let legs = runtime_legs;
+        let settlement_asset = Address::parse(&settlement_asset)
+            .map(TokenAddress)
+            .map_err(|_| RouteRegistryError::InvalidRoute)?;
         if legs[0].pool_id.0 != trigger_pool_id
             || legs[0].protocol != "UniswapV3"
             || legs.iter().any(|leg| !leg.protocol.ends_with("V3"))
@@ -494,6 +538,13 @@ impl RouteSpec {
             || legs[1].token_out != legs[0].token_in
             || legs[0].pool_id == legs[1].pool_id
             || state_targets[0] == state_targets[1]
+            || settlement_asset != legs[0].token_in
+            || settlement_asset != legs[1].token_out
+            || settlement_asset.0.as_str() != ARBITRUM_WETH
+            || settlement_asset_decimals != 18
+            || settlement_asset_decimals != leg_units[0].token_in_decimals
+            || settlement_asset_decimals != leg_units[1].token_out_decimals
+            || leg_units[0].token_out_decimals != leg_units[1].token_in_decimals
         {
             return Err(RouteRegistryError::InvalidRoute);
         }
@@ -503,18 +554,24 @@ impl RouteSpec {
                 legs,
             },
             fingerprint: route_fingerprint,
+            settlement_asset,
+            settlement_asset_decimals,
             state_targets,
+            leg_units,
             strategy: strategy.into_runtime()?,
         })
     }
 }
 
 impl RouteLegSpec {
-    fn into_parts(self) -> Result<(PoolEdge, Address), RouteRegistryError> {
+    fn into_parts(self) -> Result<(PoolEdge, Address, RuntimeLegUnits), RouteRegistryError> {
         if !bounded(&self.pool_id, 1, 256)
             || !bounded(&self.protocol, 1, 64)
             || self.fee == 0
             || self.fee >= 1_000_000
+            || !(1..=36).contains(&self.token_in_decimals)
+            || !(1..=36).contains(&self.token_out_decimals)
+            || !(1..=887_272).contains(&self.tick_spacing)
         {
             return Err(RouteRegistryError::InvalidRoute);
         }
@@ -548,17 +605,39 @@ impl RouteLegSpec {
                 direction,
             },
             state_target,
+            RuntimeLegUnits {
+                token_in_decimals: self.token_in_decimals,
+                token_out_decimals: self.token_out_decimals,
+                tick_spacing: self.tick_spacing,
+            },
         ))
     }
 }
 
 impl StrategySpec {
     fn into_runtime(self) -> Result<RuntimeStrategy, RouteRegistryError> {
+        let candidate_sizes = self
+            .candidate_sizes
+            .map(|sizes| {
+                sizes
+                    .iter()
+                    .map(|size| parse_amount(size))
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .transpose()?;
         let strategy = RuntimeStrategy {
             min_input_amount: parse_amount(&self.min_input_amount)?,
             max_input_amount: parse_amount(&self.max_input_amount)?,
             max_evaluations: self.max_evaluations,
+            candidate_sizes,
+            geometric_step_bps: self.geometric_step_bps,
             minimum_net_profit: parse_amount(&self.minimum_net_profit)?,
+            minimum_net_profit_bps: self.minimum_net_profit_bps,
+            conservative_cost_multiplier_bps: self.conservative_cost_multiplier_bps,
+            maximum_pool_depth_utilization_bps: self.maximum_pool_depth_utilization_bps,
+            maximum_slippage_bps: self.maximum_slippage_bps,
+            maximum_price_impact_bps: self.maximum_price_impact_bps,
+            maximum_execution_gas: self.maximum_execution_gas,
             flash_premium_bps: self.flash_premium_bps,
             minimum_slippage_bps: self.minimum_slippage_bps,
             protocol_fees: parse_amount(&self.protocol_fees)?,
@@ -579,12 +658,36 @@ impl StrategySpec {
             max_simulation_age_ms: self.max_simulation_age_ms,
             min_confidence_bps: self.min_confidence_bps,
         };
+        let explicit_sizes_valid = strategy.candidate_sizes.as_ref().map_or(true, |sizes| {
+            !sizes.is_empty()
+                && sizes.len() <= strategy.max_evaluations
+                && sizes.len() <= MAX_CANDIDATE_SIZES_PER_ROUTE
+                && sizes.windows(2).all(|window| window[0] < window[1])
+                && sizes.iter().all(|size| {
+                    *size >= strategy.min_input_amount && *size <= strategy.max_input_amount
+                })
+        });
         if strategy.min_input_amount.0 == 0
             || strategy.max_input_amount < strategy.min_input_amount
             || strategy.max_evaluations == 0
-            || strategy.max_evaluations > 64
+            || strategy.max_evaluations > MAX_CANDIDATE_SIZES_PER_ROUTE
+            || !explicit_sizes_valid
+            || (strategy.candidate_sizes.is_some() && strategy.geometric_step_bps.is_some())
+            || strategy
+                .geometric_step_bps
+                .is_some_and(|value| !(10_001..=100_000).contains(&value))
             || strategy.minimum_net_profit.0 == 0
+            || strategy.minimum_net_profit_bps == 0
+            || strategy.minimum_net_profit_bps > 10_000
+            || !(10_000..=100_000).contains(&strategy.conservative_cost_multiplier_bps)
+            || !(1..=10_000).contains(&strategy.maximum_pool_depth_utilization_bps)
+            || !(1..=10_000).contains(&strategy.maximum_slippage_bps)
+            || !(1..=10_000).contains(&strategy.maximum_price_impact_bps)
             || strategy.estimated_execution_gas == 0
+            || strategy.maximum_execution_gas == 0
+            || strategy.estimated_execution_gas > strategy.maximum_execution_gas
+            || strategy.minimum_slippage_bps == 0
+            || strategy.minimum_slippage_bps > strategy.maximum_slippage_bps
             || strategy.max_gas_price_wei == 0
             || strategy.max_quote_age_ms == 0
             || strategy.max_simulation_age_ms == 0
@@ -665,13 +768,21 @@ mod tests {
                 "route_id":"weth-usdc-two-pool",
                 "route_fingerprint":"weth-usdc-two-pool-v1",
                 "trigger_pool_id":"{WETH}:{USDC}:500",
+                "settlement_asset":"{WETH}",
+                "settlement_asset_decimals":18,
                 "legs":[
-                    {{"pool_id":"{WETH}:{USDC}:500","state_target":"0x0000000000000000000000000000000000001001","protocol":"UniswapV3","fee":500,"token_in":"{WETH}","token_out":"{USDC}","direction":"zero_for_one"}},
-                    {{"pool_id":"comparison-pool","state_target":"0x0000000000000000000000000000000000002001","protocol":"SushiSwapV3","fee":500,"token_in":"{USDC}","token_out":"{WETH}","direction":"one_for_zero"}}
+                    {{"pool_id":"{WETH}:{USDC}:500","state_target":"0x0000000000000000000000000000000000001001","protocol":"UniswapV3","fee":500,"token_in":"{WETH}","token_out":"{USDC}","token_in_decimals":18,"token_out_decimals":6,"tick_spacing":10,"direction":"zero_for_one"}},
+                    {{"pool_id":"comparison-pool","state_target":"0x0000000000000000000000000000000000002001","protocol":"SushiSwapV3","fee":500,"token_in":"{USDC}","token_out":"{WETH}","token_in_decimals":6,"token_out_decimals":18,"tick_spacing":10,"direction":"one_for_zero"}}
                 ],
                 "strategy":{{
                     "min_input_amount":"100","max_input_amount":"1000","max_evaluations":16,
-                    "minimum_net_profit":"1","flash_premium_bps":5,"minimum_slippage_bps":10,
+                    "candidate_sizes":["100","250","500","1000"],
+                    "minimum_net_profit":"1","minimum_net_profit_bps":1,
+                    "conservative_cost_multiplier_bps":12500,
+                    "maximum_pool_depth_utilization_bps":5000,
+                    "maximum_slippage_bps":100,"maximum_price_impact_bps":100,
+                    "maximum_execution_gas":600000,
+                    "flash_premium_bps":5,"minimum_slippage_bps":10,
                     "protocol_fees":"0","estimated_execution_gas":500000,"l1_data_fee":"1",
                     "contract_overhead":"1","failed_attempt_gas_cost":"1","failure_probability_bps":500,
                     "stale_state_loss":"1","stale_quote_probability_bps":100,"state_drift_reserve":"1",

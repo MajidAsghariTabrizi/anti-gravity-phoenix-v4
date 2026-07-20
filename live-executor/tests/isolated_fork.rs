@@ -4,6 +4,7 @@ use phoenix_live_executor::model::{CanonicalAddress, ExecutionRequest, Validated
 use phoenix_live_executor::rpc::{ExecutionRpc, HttpExecutionRpc};
 use phoenix_live_executor::signer::{TransactionDraft, TransactionSigner};
 use phoenix_live_executor::{ARBITRUM_ONE_CHAIN_ID, ARBITRUM_WETH_ADDRESS, REQUEST_SCHEMA_VERSION};
+use sha2::{Digest, Sha256};
 use url::Url;
 use uuid::Uuid;
 use zeroize::Zeroize;
@@ -91,8 +92,18 @@ fn deliberately_reverting_request(executor_address: CanonicalAddress) -> Executi
         schema_version: REQUEST_SCHEMA_VERSION.to_string(),
         chain_id: ARBITRUM_ONE_CHAIN_ID,
         route_id: [33_u8; 32],
+        route_fingerprint: "isolated-weth-token-weth".to_string(),
+        selected_size: 1,
+        token_path: vec![flash_asset, token_b, flash_asset],
         origin_router: CanonicalAddress::parse("0x4444444444444444444444444444444444444444")
             .expect("router"),
+        executor_address,
+        executor_code_hash: "a".repeat(64),
+        calldata_hash: String::new(),
+        simulation_result_hash: "b".repeat(64),
+        plan_hash: "c".repeat(64),
+        pinned_block_number: 1,
+        pinned_block_hash: format!("0x{}", "d".repeat(64)),
         flash_asset,
         flash_amount: 1,
         maximum_input_amount: 1,
@@ -124,9 +135,13 @@ fn deliberately_reverting_request(executor_address: CanonicalAddress) -> Executi
         max_priority_fee_per_gas: 1_000_000_000,
         approved_by: "isolated-fork-fixture".to_string(),
         approved_at: now,
-        policy_version: "isolated-fork-v1".to_string(),
+        approval_deadline: now + ChronoDuration::seconds(30),
+        policy_version: "phoenix.live-canary-approval.v1".to_string(),
         approval_digest: String::new(),
     };
+    request.calldata_hash = hex::encode(Sha256::digest(
+        encode_execute_opportunity(&request, executor_address).expect("calldata"),
+    ));
     request.approval_digest = request
         .canonical_approval_digest()
         .expect("approval digest");

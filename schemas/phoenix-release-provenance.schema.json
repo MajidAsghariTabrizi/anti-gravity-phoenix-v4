@@ -65,8 +65,8 @@
     },
     "required_jobs": {
       "type": "array",
-      "minItems": 9,
-      "maxItems": 9,
+      "minItems": 10,
+      "maxItems": 10,
       "uniqueItems": true,
       "items": {
         "type": "string"
@@ -74,8 +74,8 @@
     },
     "required_release_artifacts": {
       "type": "array",
-      "minItems": 8,
-      "maxItems": 8,
+      "minItems": 9,
+      "maxItems": 9,
       "uniqueItems": true,
       "items": {
         "type": "string"
@@ -88,6 +88,7 @@
         "dashboard",
         "feed-ingestor",
         "fork-sandbox",
+        "live-executor",
         "phoenix-engine",
         "recorder",
         "rpc-gateway"
@@ -100,6 +101,9 @@
           "$ref": "#/$defs/fragment"
         },
         "fork-sandbox": {
+          "$ref": "#/$defs/fragment"
+        },
+        "live-executor": {
           "$ref": "#/$defs/fragment"
         },
         "phoenix-engine": {
