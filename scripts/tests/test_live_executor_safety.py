@@ -114,6 +114,9 @@ class LiveExecutorSafetyTests(unittest.TestCase):
         self.assertIn("CONFIRMED_LOCAL_ANVIL", fixture)
         self.assertNotIn("--fork-url", fixture)
         self.assertNotIn("SIGNER_" + "PRIVATE_KEY", fixture)
+        constructor_args = fixture.index("--constructor-args")
+        self.assertLess(fixture.index("--broadcast"), constructor_args)
+        self.assertLess(fixture.index("--json"), constructor_args)
 
     def test_runtime_does_not_log_raw_payload_or_rpc_url(self) -> None:
         rpc = (ROOT / "live-executor/src/rpc.rs").read_text(encoding="utf-8")

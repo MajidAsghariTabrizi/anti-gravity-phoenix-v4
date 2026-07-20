@@ -65,9 +65,10 @@ deployment_json="$tmp_dir/deployment.json"
   forge create src/PhoenixExecutor.sol:PhoenixExecutor \
     --rpc-url "$rpc_url" \
     --private-key "$test_key" \
-    --constructor-args "$test_wallet" "$test_wallet" \
     --broadcast \
-    --json >"$deployment_json"
+    --json \
+    --constructor-args "$test_wallet" "$test_wallet" \
+    >"$deployment_json"
 )
 executor_address="$(
   python3 - "$deployment_json" <<'PY'
