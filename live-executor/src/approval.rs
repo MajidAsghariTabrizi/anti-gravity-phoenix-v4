@@ -72,9 +72,6 @@ impl ApprovalMaterializer {
         now: DateTime<Utc>,
     ) -> Result<ApprovalOutcome, ApprovalError> {
         validate_input(&input)?;
-        let now = now
-            .with_nanosecond(0)
-            .ok_or(ApprovalError::InvalidCandidate)?;
         let mut transaction = self.pool.begin().await.map_err(database_error)?;
         let schema_valid: bool = sqlx::query_scalar(
             "SELECT EXISTS(
@@ -294,6 +291,9 @@ fn build_request(
     {
         return Err(ApprovalError::InvalidCandidate);
     }
+    let approved_at = now
+        .with_nanosecond(0)
+        .ok_or(ApprovalError::InvalidCandidate)?;
     let simulated_gross_profit = positive_u128(result.body.simulated_gross_profit.as_deref())?;
     let simulated_gas_cost = positive_u128(result.body.simulated_gas_cost.as_deref())?;
     let simulated_balance_delta = positive_u128(result.body.simulated_balance_delta.as_deref())?;
@@ -364,7 +364,7 @@ fn build_request(
         .ok()
         .and_then(|seconds| DateTime::from_timestamp(seconds, 0))
         .ok_or(ApprovalError::InvalidCandidate)?;
-    let requested_deadline = now
+    let requested_deadline = approved_at
         .checked_add_signed(Duration::seconds(
             i64::try_from(input.approval_ttl_seconds).map_err(|_| ApprovalError::InvalidInput)?,
         ))
@@ -444,7 +444,7 @@ fn build_request(
         max_fee_per_gas,
         max_priority_fee_per_gas: input.max_priority_fee_per_gas,
         approved_by: input.approved_by.clone(),
-        approved_at: now,
+        approved_at,
         approval_deadline,
         policy_version: APPROVAL_POLICY_VERSION.to_string(),
         approval_digest: String::new(),
@@ -765,6 +765,24 @@ mod tests {
         assert_eq!(
             request.canonical_approval_digest().expect("digest"),
             request.approval_digest
+        );
+    }
+
+    #[test]
+    fn subsecond_simulation_before_observation_is_not_rejected_as_future() {
+        let approved_at = fixture_time();
+        let observed_at = approved_at + Duration::milliseconds(900);
+        let simulated_at = approved_at + Duration::milliseconds(500);
+        let (plan, _) = fixture(observed_at);
+        let result = result_for_plan(&plan, simulated_at, "230000000");
+
+        let request = build_request(&plan, &result, &input(&result), observed_at)
+            .expect("same-second simulation preceded observation");
+
+        assert_eq!(request.approved_at, approved_at);
+        assert_eq!(
+            request.approval_deadline,
+            approved_at + Duration::minutes(5)
         );
     }
 
