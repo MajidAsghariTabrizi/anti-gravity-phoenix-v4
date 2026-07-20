@@ -29,6 +29,10 @@ class LiveExecutorSafetyTests(unittest.TestCase):
             "LIVE_EXECUTOR_KILL_SWITCH: ${LIVE_EXECUTOR_KILL_SWITCH:-true}",
             overlay,
         )
+        self.assertIn(
+            "LIVE_EXECUTOR_EXECUTOR_CODE_HASH: ${LIVE_EXECUTOR_EXECUTOR_CODE_HASH:-}",
+            overlay,
+        )
         self.assertIn("restart: \"no\"", overlay)
         self.assertIn("read_only: true", overlay)
         self.assertIn("cap_drop: [ALL]", overlay)
@@ -41,6 +45,9 @@ class LiveExecutorSafetyTests(unittest.TestCase):
         schema = (ROOT / "live-executor/schema/001_live_canary.sql").read_text(
             encoding="utf-8"
         )
+        approval_schema = (
+            ROOT / "live-executor/schema/002_approval_evidence.sql"
+        ).read_text(encoding="utf-8")
         self.assertIn("armed BOOLEAN NOT NULL DEFAULT false", schema)
         self.assertIn("kill_switch BOOLEAN NOT NULL DEFAULT true", schema)
         self.assertIn("WHERE status = 'approved'", schema)
@@ -64,8 +71,44 @@ class LiveExecutorSafetyTests(unittest.TestCase):
             schema,
         )
         self.assertIn("net_pnl_wei = -actual_fee_wei", schema)
+        for field in (
+            "route_fingerprint",
+            "selected_size",
+            "token_path",
+            "executor_address",
+            "executor_code_hash",
+            "calldata_hash",
+            "simulation_result_hash",
+            "plan_hash",
+            "pinned_block_number",
+            "pinned_block_hash",
+            "approval_deadline",
+        ):
+            self.assertIn(field, approval_schema)
+        self.assertIn("selected_size = flash_amount", approval_schema)
+        self.assertIn("approval_deadline <= deadline", approval_schema)
+        self.assertIn(
+            "live_canary_execution_request_simulation_result", approval_schema
+        )
+        self.assertIn("live_canary_execution_request_plan", approval_schema)
         store = (ROOT / "live-executor/src/store.rs").read_text(encoding="utf-8")
         self.assertIn("AT TIME ZONE 'UTC'", store)
+
+    def test_approval_cli_accepts_no_calldata_and_runtime_checks_before_nonce(self) -> None:
+        cli = (
+            ROOT / "live-executor/src/approve_execution_request_main.rs"
+        ).read_text(encoding="utf-8")
+        approval = (ROOT / "live-executor/src/approval.rs").read_text(
+            encoding="utf-8"
+        )
+        engine = (ROOT / "live-executor/src/engine.rs").read_text(encoding="utf-8")
+        self.assertNotIn("--calldata", cli)
+        self.assertIn("APPROVAL_CONFIRMATION", cli)
+        self.assertIn("APPROVE_ONE_SIMULATED_PHOENIX_CANARY", approval)
+        validation = engine.index("validate_and_encode(&request")
+        nonce = engine.index(".pending_nonce(")
+        self.assertLess(validation, nonce)
+        self.assertIn("calldata_hash_mismatch", engine)
 
     def test_profit_and_gas_accounting_use_arbitrum_weth(self) -> None:
         library = (ROOT / "live-executor/src/lib.rs").read_text(encoding="utf-8")

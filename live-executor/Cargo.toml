@@ -13,6 +13,10 @@ path = "src/lib.rs"
 name = "live-executor"
 path = "src/main.rs"
 
+[[bin]]
+name = "approve-execution-request"
+path = "src/approve_execution_request_main.rs"
+
 [dependencies]
 alloy-consensus = { version = "=0.6.4", default-features = false, features = ["std", "k256"] }
 alloy-eips = { version = "=0.6.4", default-features = false, features = ["std"] }
@@ -28,6 +32,7 @@ hex = "=0.4.3"
 home = "=0.5.9"
 primitive-types = { version = "=0.12.2", default-features = false }
 proc-macro-crate = "=3.2.0"
+phoenix-fork-sandbox = { path = "../fork-sandbox" }
 reqwest = { version = "=0.12.7", default-features = false, features = ["json", "rustls-tls"] }
 serde = { version = "=1.0.210", features = ["derive"] }
 serde_json = "=1.0.128"
@@ -42,4 +47,5 @@ uuid = { version = "=1.10.0", features = ["serde", "v4"] }
 zeroize = "=1.8.1"
 
 [dev-dependencies]
+rpc-gateway = { path = "../rpc-gateway" }
 tempfile = "=3.12.0"

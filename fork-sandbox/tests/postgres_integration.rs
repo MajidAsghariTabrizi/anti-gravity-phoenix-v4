@@ -12,8 +12,8 @@ use std::collections::BTreeSet;
 
 const DECISION_ID: &str = "11111111-1111-8111-8111-111111111111";
 const BLOCK_HASH: &str = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-const TOKEN_A: &str = "0x1111111111111111111111111111111111111111";
-const TOKEN_B: &str = "0x2222222222222222222222222222222222222222";
+const TOKEN_A: &str = "0x82af49447d8a07e3bd95bd0d56f35241523fbab1";
+const TOKEN_B: &str = "0xaf88d065e77c8cc2239327c5edb3a432268e5831";
 const POOL_A: &str = "0x3333333333333333333333333333333333333333";
 const POOL_B: &str = "0x4444444444444444444444444444444444444444";
 const ROUTER: &str = "0x5555555555555555555555555555555555555555";
@@ -160,7 +160,7 @@ INSERT INTO shadow_decisions (
     id, strategy, strategy_version, detector_version, code_version,
     config_version, policy_version, chain_id, source_sequence,
     observed_block, state_block, quote_block, route_fingerprint,
-    disposition, confidence_bps, execution_eligible, base_net_pnl,
+    disposition, primary_rejection_reason, confidence_bps, execution_eligible, base_net_pnl,
     conservative_net_pnl, severe_net_pnl, identity_evidence,
     route_evidence, market_evidence, economics_evidence,
     simulation_evidence, decision_evidence, outcome_evidence,
@@ -169,7 +169,8 @@ INSERT INTO shadow_decisions (
 ) VALUES (
     CAST($1 AS uuid), 'two_pool_v3_arbitrage', 'fixture-v1', 'fixture-v1',
     'integration-test', 'fixture-v1', 'shadow-state-policy-v1', 42161,
-    7, 100, 100, 100, 'fixture-route-v1', 'accepted', 9500, false,
+    7, 100, 100, 100, 'fixture-route-v1', 'rejected',
+    'contract_path_unavailable', 9500, false,
     90, 80, 70, '{}'::jsonb, '{}'::jsonb, '{}'::jsonb, '{}'::jsonb,
     '{}'::jsonb, '{}'::jsonb, '{}'::jsonb, now() - interval '1 second',
     now() - interval '1 second', now(), $2, '[]'::jsonb, '[]'::jsonb, 1
@@ -201,7 +202,7 @@ INSERT INTO shadow_profitability_facts (
     latency_reserve, uncertainty_reserve, contract_overhead, total_cost,
     expected_net_pnl, conservative_net_pnl, severe_net_pnl,
     minimum_required_net_pnl, primary_profitability_status, disposition,
-    secondary_rejection_reasons, model_version, policy_version,
+    final_rejection_reason, secondary_rejection_reasons, model_version, policy_version,
     detector_version, code_version, primary_provider_id,
     primary_response_hash, route_config_hash, secondary_provider_id,
     secondary_state_hash, secondary_block_number, secondary_block_hash,
@@ -216,7 +217,8 @@ INSERT INTO shadow_profitability_facts (
     $12::jsonb, $13::jsonb, $14::jsonb, now() + interval '1 hour',
     'phoenix.fork-evidence.v1', 100, 200, 100, 100, 0, 0, 10, 1, 10,
     0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 10, 90, 80, 70, 50,
-    'meets_minimum', 'accepted', '[]'::jsonb, 'shadow-profitability-v1',
+    'meets_minimum', 'rejected', 'contract_path_unavailable', '[]'::jsonb,
+    'shadow-profitability-v1',
     'shadow-state-policy-v1', 'fixture-v1', 'integration-test',
     'provider_0', $15, $16, 'provider_1', $6, 100, $5, $16, 'agreed',
     'agreed', '["requested", "agreed"]'::jsonb, 'agreed', true, false,
@@ -257,7 +259,10 @@ fn route_hash() -> String {
                 protocol: "UniswapV3".to_string(),
                 token0: TOKEN_A.to_string(),
                 token1: TOKEN_B.to_string(),
+                token0_decimals: 18,
+                token1_decimals: 6,
                 fee: 500,
+                tick_spacing: 10,
             },
             PoolStateRequest {
                 pool_id: "pool-b".to_string(),
@@ -265,7 +270,10 @@ fn route_hash() -> String {
                 protocol: "SushiSwapV3".to_string(),
                 token0: TOKEN_A.to_string(),
                 token1: TOKEN_B.to_string(),
+                token0_decimals: 18,
+                token1_decimals: 6,
                 fee: 3_000,
+                tick_spacing: 60,
             },
         ],
         evidence: EvidenceRequest::Primary,

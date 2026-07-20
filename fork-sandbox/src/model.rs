@@ -1,6 +1,7 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use thiserror::Error;
 
 pub const FORK_EVIDENCE_SCHEMA_VERSION: &str = "phoenix.fork-evidence.v1";
 pub const PLAN_SCHEMA_VERSION: &str = "phoenix.unsigned-fork-plan.v1";
@@ -49,6 +50,7 @@ pub struct PersistedOpportunity {
     pub model_version: String,
     pub policy_version: String,
     pub disposition: String,
+    pub primary_rejection_reason: Option<String>,
     pub primary_profitability_status: String,
     pub evidence_completeness_status: String,
     pub fork_evidence_schema_version: String,
@@ -221,4 +223,71 @@ impl CounterfactualResult {
             body,
         })
     }
+
+    pub fn validate_plan_binding(
+        &self,
+        plan: &UnsignedTransactionPlan,
+    ) -> Result<(), EvidenceIntegrityError> {
+        let plan_hash = plan
+            .canonical_hash()
+            .map_err(|_| EvidenceIntegrityError::Invalid)?;
+        let result_hash = Self::from_body(self.body.clone())
+            .map_err(|_| EvidenceIntegrityError::Invalid)?
+            .result_hash;
+        let calldata = plan
+            .calldata
+            .strip_prefix("0x")
+            .filter(|encoded| {
+                !encoded.is_empty()
+                    && encoded.len() % 2 == 0
+                    && encoded
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            })
+            .and_then(|encoded| hex::decode(encoded).ok())
+            .ok_or(EvidenceIntegrityError::Invalid)?;
+        if plan.schema_version != PLAN_SCHEMA_VERSION
+            || self.body.schema_version != RESULT_SCHEMA_VERSION
+            || self.body.plan_hash != plan_hash
+            || self.result_hash != result_hash
+            || hex::encode(Sha256::digest(calldata)) != plan.calldata_hash
+            || self.body.shadow_decision_id != plan.shadow_decision_id
+            || plan.chain_id != ARBITRUM_ONE_CHAIN_ID
+            || self.body.fork.chain_id != plan.chain_id
+            || self.body.fork.fork_block != plan.pinned_block
+            || self.body.fork.local_block.number < plan.pinned_block.number
+            || self.body.predicted_gross_profit != plan.predicted.gross_profit
+            || self.body.predicted_total_cost != plan.predicted.total_cost
+            || self.body.predicted_net_pnl != plan.predicted.net_pnl
+            || self.body.model_version != plan.model_version
+            || self.body.policy_version != plan.policy_version
+            || self.body.evidence.target_code_hash != plan.target_code_hash
+            || self.body.evidence.observed_pool_state_hashes != plan.pool_state_hash_path
+            || self.body.evidence.observed_aggregate_state_hash != plan.primary_state_hash
+            || !plan.unsigned
+            || !plan.fork_only
+            || !plan.shadow_only
+            || plan.live_execution
+            || plan.execution_eligible
+            || plan.execution_request_created
+            || plan.public_broadcast
+            || plan.signer_used
+            || !self.body.fork_only
+            || !self.body.shadow_only
+            || self.body.live_execution
+            || self.body.execution_eligible
+            || self.body.execution_request_created
+            || self.body.public_broadcast
+            || self.body.signer_used
+        {
+            return Err(EvidenceIntegrityError::Invalid);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
+pub enum EvidenceIntegrityError {
+    #[error("fork plan and simulation evidence are not canonically bound")]
+    Invalid,
 }

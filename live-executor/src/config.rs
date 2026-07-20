@@ -1,4 +1,4 @@
-use crate::model::CanonicalAddress;
+use crate::model::{canonical_digest, CanonicalAddress};
 use crate::signer::{SignerError, TransactionSigner};
 use crate::{ARBITRUM_ONE_CHAIN_ID, ARBITRUM_WETH_ADDRESS};
 use std::collections::BTreeMap;
@@ -17,6 +17,7 @@ const ENVIRONMENT_NAMES: &[&str] = &[
     "CHAIN_ID",
     "WALLET_ADDRESS",
     "EXECUTOR_ADDRESS",
+    "LIVE_EXECUTOR_EXECUTOR_CODE_HASH",
     "LIVE_EXECUTOR_PNL_ASSET_ADDRESS",
     "SIGNER_PRIVATE_KEY",
     "LIVE_EXECUTOR_RPC_URL",
@@ -56,6 +57,7 @@ pub struct ExecutorConfig {
     pub rpc_allowlist: Vec<Url>,
     pub wallet_address: CanonicalAddress,
     pub executor_address: CanonicalAddress,
+    pub executor_code_hash: String,
     pub pnl_asset_address: CanonicalAddress,
     pub chain_id: u64,
     pub limits: SafetyLimits,
@@ -113,6 +115,10 @@ impl Bootstrap {
             .map_err(|_| ConfigError::InvalidAddress)?;
         let executor_address = CanonicalAddress::parse(required(&values, "EXECUTOR_ADDRESS")?)
             .map_err(|_| ConfigError::InvalidAddress)?;
+        let executor_code_hash = required(&values, "LIVE_EXECUTOR_EXECUTOR_CODE_HASH")?.to_string();
+        if !canonical_digest(&executor_code_hash) {
+            return Err(ConfigError::InvalidCodeHash);
+        }
         let pnl_asset_address =
             CanonicalAddress::parse(required(&values, "LIVE_EXECUTOR_PNL_ASSET_ADDRESS")?)
                 .map_err(|_| ConfigError::InvalidAddress)?;
@@ -191,6 +197,7 @@ impl Bootstrap {
                 rpc_allowlist,
                 wallet_address,
                 executor_address,
+                executor_code_hash,
                 pnl_asset_address,
                 chain_id,
                 limits,
@@ -261,6 +268,8 @@ pub enum ConfigError {
     InvalidChain,
     #[error("invalid address")]
     InvalidAddress,
+    #[error("executor code hash is invalid")]
+    InvalidCodeHash,
     #[error("live canary profit asset must be Arbitrum WETH")]
     UnsupportedProfitAsset,
     #[error("signer configuration is invalid")]
@@ -299,6 +308,10 @@ mod tests {
             (
                 "EXECUTOR_ADDRESS".to_string(),
                 "0x1111111111111111111111111111111111111111".to_string(),
+            ),
+            (
+                "LIVE_EXECUTOR_EXECUTOR_CODE_HASH".to_string(),
+                "a".repeat(64),
             ),
             (
                 "LIVE_EXECUTOR_PNL_ASSET_ADDRESS".to_string(),
@@ -422,6 +435,19 @@ mod tests {
         assert!(matches!(
             Bootstrap::from_values(values),
             Err(ConfigError::InvalidAddress)
+        ));
+    }
+
+    #[test]
+    fn executor_code_hash_must_be_canonical() {
+        let mut values = fully_armed_values();
+        values.insert(
+            "LIVE_EXECUTOR_EXECUTOR_CODE_HASH".to_string(),
+            "0xnot-a-canonical-digest".to_string(),
+        );
+        assert!(matches!(
+            Bootstrap::from_values(values),
+            Err(ConfigError::InvalidCodeHash)
         ));
     }
 

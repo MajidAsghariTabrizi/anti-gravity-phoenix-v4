@@ -18,8 +18,8 @@ use std::time::Duration;
 
 const NOW_MS: u64 = 1_700_000_000_000;
 const BLOCK_HASH: &str = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-const TOKEN_A: &str = "0x1111111111111111111111111111111111111111";
-const TOKEN_B: &str = "0x2222222222222222222222222222222222222222";
+const TOKEN_A: &str = "0x82af49447d8a07e3bd95bd0d56f35241523fbab1";
+const TOKEN_B: &str = "0xaf88d065e77c8cc2239327c5edb3a432268e5831";
 const POOL_A: &str = "0x3333333333333333333333333333333333333333";
 const POOL_B: &str = "0x4444444444444444444444444444444444444444";
 const ROUTER: &str = "0x5555555555555555555555555555555555555555";
@@ -408,14 +408,20 @@ fn fixture() -> (PersistedOpportunity, Vec<PoolObservation>, Vec<String>) {
         PoolObservation {
             token0: TOKEN_A.to_string(),
             token1: TOKEN_B.to_string(),
+            token0_decimals: 18,
+            token1_decimals: 6,
             fee: 500,
+            tick_spacing: 10,
             slot0: format!("0x{}", "01".repeat(64)),
             liquidity: format!("0x{}", "02".repeat(32)),
         },
         PoolObservation {
             token0: TOKEN_A.to_string(),
             token1: TOKEN_B.to_string(),
+            token0_decimals: 18,
+            token1_decimals: 6,
             fee: 3_000,
+            tick_spacing: 60,
             slot0: format!("0x{}", "03".repeat(64)),
             liquidity: format!("0x{}", "04".repeat(32)),
         },
@@ -486,7 +492,8 @@ fn fixture() -> (PersistedOpportunity, Vec<PoolObservation>, Vec<String>) {
             agreement_state: "agreed".to_string(),
             model_version: "shadow-profitability-v1".to_string(),
             policy_version: "shadow-state-policy-v1".to_string(),
-            disposition: "accepted".to_string(),
+            disposition: "rejected".to_string(),
+            primary_rejection_reason: Some("contract_path_unavailable".to_string()),
             primary_profitability_status: "meets_minimum".to_string(),
             evidence_completeness_status: "complete".to_string(),
             fork_evidence_schema_version: "phoenix.fork-evidence.v1".to_string(),
@@ -529,7 +536,10 @@ fn pool_requests() -> Vec<PoolStateRequest> {
             protocol: "UniswapV3".to_string(),
             token0: TOKEN_A.to_string(),
             token1: TOKEN_B.to_string(),
+            token0_decimals: 18,
+            token1_decimals: 6,
             fee: 500,
+            tick_spacing: 10,
         },
         PoolStateRequest {
             pool_id: "pool-b".to_string(),
@@ -537,7 +547,10 @@ fn pool_requests() -> Vec<PoolStateRequest> {
             protocol: "SushiSwapV3".to_string(),
             token0: TOKEN_A.to_string(),
             token1: TOKEN_B.to_string(),
+            token0_decimals: 18,
+            token1_decimals: 6,
             fee: 3_000,
+            tick_spacing: 60,
         },
     ]
 }
@@ -556,7 +569,10 @@ fn state_hashes(
                 &request.protocol,
                 &request.token0,
                 &request.token1,
+                request.token0_decimals,
+                request.token1_decimals,
                 request.fee,
+                request.tick_spacing,
                 &observation.slot0,
                 &observation.liquidity,
             ))
@@ -567,7 +583,10 @@ fn state_hashes(
                 protocol: request.protocol.clone(),
                 token0: request.token0.clone(),
                 token1: request.token1.clone(),
+                token0_decimals: request.token0_decimals,
+                token1_decimals: request.token1_decimals,
                 fee: request.fee,
+                tick_spacing: request.tick_spacing,
                 slot0: observation.slot0.clone(),
                 liquidity: observation.liquidity.clone(),
                 state_hash: canonical_hash_bytes(&material),

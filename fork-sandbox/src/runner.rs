@@ -75,7 +75,10 @@ impl ForkRunner {
             let observed = rpc.observe_pool(&request).await?;
             if observed.token0 != request.token0
                 || observed.token1 != request.token1
+                || observed.token0_decimals != request.token0_decimals
+                || observed.token1_decimals != request.token1_decimals
                 || observed.fee != request.fee
+                || observed.tick_spacing != request.tick_spacing
             {
                 return Err(RunnerError::StateDrift);
             }
@@ -85,7 +88,10 @@ impl ForkRunner {
                 &request.protocol,
                 &request.token0,
                 &request.token1,
+                request.token0_decimals,
+                request.token1_decimals,
                 request.fee,
+                request.tick_spacing,
                 &observed.slot0,
                 &observed.liquidity,
             ))
@@ -98,7 +104,10 @@ impl ForkRunner {
                 protocol: request.protocol,
                 token0: request.token0,
                 token1: request.token1,
+                token0_decimals: request.token0_decimals,
+                token1_decimals: request.token1_decimals,
                 fee: request.fee,
+                tick_spacing: request.tick_spacing,
                 slot0: observed.slot0,
                 liquidity: observed.liquidity,
                 state_hash,

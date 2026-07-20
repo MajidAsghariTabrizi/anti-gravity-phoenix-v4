@@ -39,7 +39,10 @@ pub struct BlockObservation {
 pub struct PoolObservation {
     pub token0: String,
     pub token1: String,
+    pub token0_decimals: u8,
+    pub token1_decimals: u8,
     pub fee: u32,
+    pub tick_spacing: i32,
     pub slot0: String,
     pub liquidity: String,
 }
@@ -225,6 +228,9 @@ impl ForkRpc for HttpForkRpc {
         let token0 = decode_address_word(&self.pool_call(&pool.address, "0x0dfe1681").await?)?;
         let token1 = decode_address_word(&self.pool_call(&pool.address, "0xd21220a7").await?)?;
         let fee = decode_u32_word(&self.pool_call(&pool.address, "0xddca3f43").await?)?;
+        let tick_spacing = decode_i24_word(&self.pool_call(&pool.address, "0xd0c93a7c").await?)?;
+        let token0_decimals = decode_u8_word(&self.pool_call(&token0, "0x313ce567").await?)?;
+        let token1_decimals = decode_u8_word(&self.pool_call(&token1, "0x313ce567").await?)?;
         let slot0 = self.pool_call(&pool.address, "0x3850c7bd").await?;
         validate_data(&slot0, 64, None, MAX_STATE_BYTES)?;
         let liquidity = self.pool_call(&pool.address, "0x1a686502").await?;
@@ -232,7 +238,10 @@ impl ForkRpc for HttpForkRpc {
         Ok(PoolObservation {
             token0,
             token1,
+            token0_decimals,
+            token1_decimals,
             fee,
+            tick_spacing,
             slot0,
             liquidity,
         })
@@ -407,6 +416,25 @@ fn decode_u32_word(value: &str) -> Result<u32, RpcError> {
     Ok(u32::from_be_bytes(
         word[28..].try_into().map_err(|_| RpcError::Integrity)?,
     ))
+}
+
+fn decode_u8_word(value: &str) -> Result<u8, RpcError> {
+    u8::try_from(decode_u32_word(value)?).map_err(|_| RpcError::Integrity)
+}
+
+fn decode_i24_word(value: &str) -> Result<i32, RpcError> {
+    let word = validate_data(value, 32, Some(32), 32)?;
+    let negative = word[29] & 0x80 != 0;
+    let expected_prefix = if negative { 0xff } else { 0x00 };
+    if word[..29].iter().any(|byte| *byte != expected_prefix) {
+        return Err(RpcError::Integrity);
+    }
+    let raw = u32::from_be_bytes([0, word[29], word[30], word[31]]);
+    Ok(if negative {
+        raw as i32 - (1_i32 << 24)
+    } else {
+        raw as i32
+    })
 }
 
 fn parse_trace(value: Value) -> Result<TraceObservation, RpcError> {
