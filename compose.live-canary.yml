@@ -1,0 +1,47 @@
+services:
+  live-executor:
+    profiles: ["live-canary"]
+    image: ${LIVE_EXECUTOR_IMAGE:?LIVE_EXECUTOR_IMAGE is required}
+    build:
+      context: .
+      dockerfile: deploy/rust.Dockerfile
+      args:
+        CRATE: live-executor
+    env_file:
+      - ${PHOENIX_ENV_FILE:-/etc/phoenix/phoenix.env}
+    environment:
+      PHOENIX_MODE: ${LIVE_EXECUTOR_PHOENIX_MODE:-SHADOW}
+      LIVE_EXECUTION: ${LIVE_EXECUTOR_LIVE_EXECUTION:-false}
+      LIVE_EXECUTOR_ARMED: ${LIVE_EXECUTOR_ARMED:-false}
+      LIVE_EXECUTOR_KILL_SWITCH: ${LIVE_EXECUTOR_KILL_SWITCH:-true}
+      LIVE_EXECUTOR_ONE_TRANSACTION_AT_A_TIME: ${LIVE_EXECUTOR_ONE_TRANSACTION_AT_A_TIME:-true}
+      CHAIN_ID: ${CHAIN_ID:-42161}
+      POSTGRES_DSN: ${POSTGRES_DSN:?POSTGRES_DSN is required}
+      SIGNER_PRIVATE_KEY: ${LIVE_EXECUTOR_SIGNER_PRIVATE_KEY:-}
+      WALLET_ADDRESS: ${LIVE_EXECUTOR_WALLET_ADDRESS:-}
+      EXECUTOR_ADDRESS: ${LIVE_EXECUTOR_EXECUTOR_ADDRESS:-}
+      LIVE_EXECUTOR_PNL_ASSET_ADDRESS: ${LIVE_EXECUTOR_PNL_ASSET_ADDRESS:-}
+      LIVE_EXECUTOR_RPC_URL: ${LIVE_EXECUTOR_RPC_URL:-}
+      LIVE_EXECUTOR_RPC_ALLOWLIST: ${LIVE_EXECUTOR_RPC_ALLOWLIST:-}
+      LIVE_EXECUTOR_MAX_GAS_LIMIT: ${LIVE_EXECUTOR_MAX_GAS_LIMIT:-}
+      LIVE_EXECUTOR_MAX_MAX_FEE_PER_GAS_WEI: ${LIVE_EXECUTOR_MAX_MAX_FEE_PER_GAS_WEI:-}
+      LIVE_EXECUTOR_MAX_PRIORITY_FEE_PER_GAS_WEI: ${LIVE_EXECUTOR_MAX_PRIORITY_FEE_PER_GAS_WEI:-}
+      LIVE_EXECUTOR_MAX_INPUT_AMOUNT: ${LIVE_EXECUTOR_MAX_INPUT_AMOUNT:-}
+      LIVE_EXECUTOR_MIN_EXPECTED_PROFIT: ${LIVE_EXECUTOR_MIN_EXPECTED_PROFIT:-}
+      LIVE_EXECUTOR_MAX_DAILY_LOSS_WEI: ${LIVE_EXECUTOR_MAX_DAILY_LOSS_WEI:-}
+      LIVE_EXECUTOR_RECEIPT_TIMEOUT_SECONDS: ${LIVE_EXECUTOR_RECEIPT_TIMEOUT_SECONDS:-}
+      LIVE_EXECUTOR_POLL_INTERVAL_SECONDS: ${LIVE_EXECUTOR_POLL_INTERVAL_SECONDS:-}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks: [phoenix-internal]
+    init: true
+    user: "65532:65532"
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1777,noexec,nosuid,nodev
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    restart: "no"
+    stop_grace_period: 15s
