@@ -20,7 +20,7 @@ use serde_json::json;
 use sqlx::{PgPool, Row};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, OnceCell};
 use tokio_util::sync::CancellationToken;
 
 const ROUTES: &str = include_str!("../../fixtures/routes/weth_usdc_uniswap_v3.json");
@@ -30,6 +30,11 @@ const USDC: &str = "0xaf88d065e77c8cc2239327c5edb3a432268e5831";
 fn integration_lock() -> &'static Mutex<()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
     LOCK.get_or_init(|| Mutex::new(()))
+}
+
+fn migrations_applied() -> &'static OnceCell<()> {
+    static APPLIED: OnceCell<()> = OnceCell::const_new();
+    &APPLIED
 }
 
 fn local_nats_url() -> Option<String> {
@@ -182,24 +187,28 @@ fn relevant_payload(sequence: u64, hash_byte: char) -> Vec<u8> {
 }
 
 async fn apply_migrations(pool: &PgPool) {
-    for migration in [
-        include_str!("../../migrations/001_init.sql"),
-        include_str!("../../migrations/002_event_signatures.sql"),
-        include_str!("../../migrations/003_shadow_profitability_evidence.sql"),
-        include_str!("../../migrations/004_shadow_engine_runtime.sql"),
-        include_str!("../../migrations/005_shadow_decision_identity.sql"),
-        include_str!("../../migrations/006_dependency_exhaustion_quarantine.sql"),
-        include_str!("../../migrations/007_canonical_profitability_truth.sql"),
-        include_str!("../../migrations/008_shadow_route_discovery_indexes.sql"),
-        include_str!("../../migrations/009_profit_triggered_secondary_verification.sql"),
-        include_str!("../../migrations/010_fork_simulation_evidence.sql"),
-        include_str!("../../migrations/011_money_path_selective_persistence.sql"),
-    ] {
-        sqlx::raw_sql(migration)
-            .execute(pool)
-            .await
-            .expect("apply integration migration");
-    }
+    migrations_applied()
+        .get_or_init(|| async {
+            for migration in [
+                include_str!("../../migrations/001_init.sql"),
+                include_str!("../../migrations/002_event_signatures.sql"),
+                include_str!("../../migrations/003_shadow_profitability_evidence.sql"),
+                include_str!("../../migrations/004_shadow_engine_runtime.sql"),
+                include_str!("../../migrations/005_shadow_decision_identity.sql"),
+                include_str!("../../migrations/006_dependency_exhaustion_quarantine.sql"),
+                include_str!("../../migrations/007_canonical_profitability_truth.sql"),
+                include_str!("../../migrations/008_shadow_route_discovery_indexes.sql"),
+                include_str!("../../migrations/009_profit_triggered_secondary_verification.sql"),
+                include_str!("../../migrations/010_fork_simulation_evidence.sql"),
+                include_str!("../../migrations/011_money_path_selective_persistence.sql"),
+            ] {
+                sqlx::raw_sql(migration)
+                    .execute(pool)
+                    .await
+                    .expect("apply integration migration");
+            }
+        })
+        .await;
 }
 
 async fn table_count(pool: &PgPool, table: &str) -> i64 {

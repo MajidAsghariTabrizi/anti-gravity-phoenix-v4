@@ -210,9 +210,9 @@ assert_live_canary_context() {
   do
     [ -f "$context_target/$relative" ] && [ ! -L "$context_target/$relative" ] ||
       fail "installed live-canary asset is missing or unsafe: $relative"
-    cmp "$context_source/$relative" "$context_target/$relative" >/dev/null ||
+    sudo cmp "$context_source/$relative" "$context_target/$relative" >/dev/null ||
       fail "installed live-canary asset bytes differ: $relative"
-    [ "$(stat -c '%a' "$context_target/$relative")" = 640 ] ||
+    [ "$(sudo stat -c '%a' "$context_target/$relative")" = 640 ] ||
       fail "installed live-canary asset mode differs: $relative"
   done
 }
