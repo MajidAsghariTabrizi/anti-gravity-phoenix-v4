@@ -5,11 +5,17 @@ import tarfile
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from scripts import release_assets
 
 
 RELEASE_SHA = "1" * 40
+LIVE_CANARY_ASSETS = (
+    "compose.live-canary.yml",
+    "live-executor/schema/001_live_canary.sql",
+    "live-executor/schema/002_approval_evidence.sql",
+)
 
 
 class ReleaseAssetsTests(unittest.TestCase):
@@ -51,6 +57,8 @@ class ReleaseAssetsTests(unittest.TestCase):
             self.assertEqual(paths, sorted(paths))
             self.assertEqual(len(paths), len(set(paths)))
             self.assertIn("compose.prod.yml", paths)
+            for required in LIVE_CANARY_ASSETS:
+                self.assertIn(required, paths)
             self.assertIn("contracts/PhoenixExecutor.compiled.json", paths)
             self.assertIn("schemas/phoenix-release-assets.schema.json", paths)
             self.assertIn("scripts/prelive-shadow-control.sh", paths)
@@ -80,6 +88,63 @@ class ReleaseAssetsTests(unittest.TestCase):
             )
             release_assets.verify_release_assets(archive, manifest_path, checksums, RELEASE_SHA)
 
+    def test_live_canary_assets_have_exact_bytes_hashes_modes_and_archive_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            archive, manifest_path, _ = self.build(Path(raw))
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            entries = {item["path"]: item for item in manifest["files"]}
+            root_name = f"phoenix-release-{RELEASE_SHA}"
+            with tarfile.open(archive, mode="r:gz") as bundle:
+                members = {member.name: member for member in bundle.getmembers()}
+                for relative in LIVE_CANARY_ASSETS:
+                    source_bytes = (self.repo_root / relative).read_bytes()
+                    entry = entries[relative]
+                    self.assertEqual(entry["mode"], "0644")
+                    self.assertEqual(entry["size_bytes"], len(source_bytes))
+                    self.assertEqual(entry["sha256"], release_assets._sha256(source_bytes))
+                    archive_path = f"{root_name}/{relative}"
+                    member = members[archive_path]
+                    self.assertTrue(member.isfile())
+                    self.assertEqual(member.mode, 0o644)
+                    extracted = bundle.extractfile(member)
+                    self.assertIsNotNone(extracted)
+                    self.assertEqual(extracted.read(), source_bytes)
+
+    def test_missing_live_canary_asset_fails_closed(self) -> None:
+        replaced = tuple(
+            "missing/compose.live-canary.yml" if path == LIVE_CANARY_ASSETS[0] else path
+            for path in release_assets.STATIC_PATHS
+        )
+        with tempfile.TemporaryDirectory() as raw, mock.patch.object(
+            release_assets, "STATIC_PATHS", replaced
+        ):
+            with self.assertRaisesRegex(
+                release_assets.ReleaseAssetError, "missing or not a regular file"
+            ):
+                self.build(Path(raw))
+
+    @unittest.skipUnless(os.name == "posix", "POSIX symlink fixture")
+    def test_symlinked_live_canary_asset_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            source = root / "outside.sql"
+            source.write_text("SELECT 1;\n", encoding="ascii")
+            target = root / LIVE_CANARY_ASSETS[1]
+            target.parent.mkdir(parents=True)
+            target.symlink_to(source)
+            contract = root / "contract.json"
+            contract.write_text("{}\n", encoding="ascii")
+            with (
+                mock.patch.object(release_assets, "STATIC_PATHS", (LIVE_CANARY_ASSETS[1],)),
+                mock.patch.object(release_assets, "GLOB_PATHS", ()),
+                self.assertRaisesRegex(
+                    release_assets.ReleaseAssetError, "missing or not a regular file"
+                ),
+            ):
+                release_assets.build_release_assets(
+                    root, RELEASE_SHA, root / "output", contract
+                )
+
     def test_extracted_tree_is_exact_and_integrity_checked(self) -> None:
         with tempfile.TemporaryDirectory() as raw, tempfile.TemporaryDirectory() as tree_raw:
             archive, manifest, _ = self.build(Path(raw))
@@ -89,6 +154,17 @@ class ReleaseAssetsTests(unittest.TestCase):
             release_assets.verify_release_tree(root, manifest, RELEASE_SHA)
             (root / "unexpected.txt").write_text("unexpected", encoding="ascii")
             with self.assertRaisesRegex(release_assets.ReleaseAssetError, "member set"):
+                release_assets.verify_release_tree(root, manifest, RELEASE_SHA)
+
+    def test_modified_live_canary_asset_in_release_tree_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as raw, tempfile.TemporaryDirectory() as tree_raw:
+            archive, manifest, _ = self.build(Path(raw))
+            with tarfile.open(archive, mode="r:gz") as bundle:
+                bundle.extractall(tree_raw, filter="data")
+            root = Path(tree_raw) / f"phoenix-release-{RELEASE_SHA}"
+            target = root / LIVE_CANARY_ASSETS[2]
+            target.write_bytes(target.read_bytes() + b"-- modified\n")
+            with self.assertRaisesRegex(release_assets.ReleaseAssetError, "payload mismatch"):
                 release_assets.verify_release_tree(root, manifest, RELEASE_SHA)
 
     @unittest.skipUnless(os.name == "posix", "POSIX mode enforcement")

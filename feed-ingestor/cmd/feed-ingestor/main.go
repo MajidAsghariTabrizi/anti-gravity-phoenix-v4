@@ -77,6 +77,7 @@ func run(ctx context.Context) error {
 			registry.SetGauge("feed_readiness", readinessGauge(readiness))
 			log.Printf("feed_jetstream_reconnected")
 		},
+		PublishState: jetStreamPublishStateHandler(registry, log.Default()),
 	})
 	if err != nil {
 		if errors.Is(err, publisher.ErrStreamUnavailable) {
@@ -238,7 +239,8 @@ func processRelayFrame(
 		readiness.MarkIntegrityFailure("malformed Nitro feed message")
 	}
 
-	observation := state.Observe(frame.Sequence, afterReconnect)
+	candidateState := *state
+	observation := candidateState.Observe(frame.Sequence, afterReconnect)
 	switch observation.Event {
 	case sequence.Duplicate:
 		registry.Inc("feed_duplicates_total")
@@ -261,17 +263,6 @@ func processRelayFrame(
 		issueLogger.LogSequence(observation)
 	}
 
-	if state.HasUnresolvedGap() {
-		readiness.MarkSequenceGap()
-		registry.SetGauge("feed_data_completeness", 0)
-	} else {
-		readiness.ClearSequenceGap()
-		registry.SetGauge("feed_data_completeness", 1)
-	}
-	readiness.MarkSequenceKnown()
-	registry.SetGauge("feed_last_sequence", float64(frame.Sequence))
-	registry.SetGauge("feed_last_message_timestamp", float64(frame.TimestampUnixMS))
-
 	normalized, normalizationFailures := normalizeRelayTransactions(frame)
 	registry.Add("feed_decode_failures_total", uint64(len(normalizationFailures)))
 	if len(normalizationFailures) > 0 {
@@ -282,10 +273,35 @@ func processRelayFrame(
 	}
 	registry.Add("feed_normalized_transactions_total", uint64(len(normalized)))
 	if len(normalized) == 0 {
-		registry.SetGauge("feed_readiness", readinessGauge(readiness))
+		commitRelaySequence(state, &candidateState, frame, registry, readiness)
 		return nil
 	}
-	return publishAndUpdateReadiness(ctx, pub, registry, readiness, normalized, start)
+	if err := publishAndUpdateReadiness(ctx, pub, registry, readiness, normalized, start); err != nil {
+		return err
+	}
+	commitRelaySequence(state, &candidateState, frame, registry, readiness)
+	return nil
+}
+
+func commitRelaySequence(
+	state *sequence.State,
+	candidate *sequence.State,
+	frame nitro.Frame,
+	registry *metrics.Registry,
+	readiness *metrics.Readiness,
+) {
+	*state = *candidate
+	if state.HasUnresolvedGap() {
+		readiness.MarkSequenceGap()
+		registry.SetGauge("feed_data_completeness", 0)
+	} else {
+		readiness.ClearSequenceGap()
+		registry.SetGauge("feed_data_completeness", 1)
+	}
+	readiness.MarkSequenceKnown()
+	registry.SetGauge("feed_last_sequence", float64(frame.Sequence))
+	registry.SetGauge("feed_last_message_timestamp", float64(frame.TimestampUnixMS))
+	registry.SetGauge("feed_readiness", readinessGauge(readiness))
 }
 
 func relayLifecycleHandler(registry *metrics.Registry, readiness *metrics.Readiness) func(feed.RelayEvent) {
@@ -349,6 +365,55 @@ func publishTransactions(ctx context.Context, pub publisher.Publisher, registry 
 		published++
 	}
 	return published, nil
+}
+
+func jetStreamPublishStateHandler(registry *metrics.Registry, logger *log.Logger) func(publisher.PublishEvent) {
+	return func(event publisher.PublishEvent) {
+		elapsedMilliseconds := event.Elapsed.Milliseconds()
+		switch event.Kind {
+		case publisher.PublishEventAckTimeoutRetry:
+			registry.Inc("feed_jetstream_publish_ack_timeout_retries_total")
+			logger.Printf(
+				"feed_jetstream_publish_ack_timeout_retry subject=%s message_id=%s attempt=%d next_attempt=%d max_attempts=%d elapsed_ms=%d",
+				event.Subject,
+				event.MessageID,
+				event.Attempt,
+				event.Attempt+1,
+				event.MaxAttempts,
+				elapsedMilliseconds,
+			)
+		case publisher.PublishEventRecoveredNormal:
+			registry.Inc("feed_jetstream_publish_recovered_normal_total")
+			logger.Printf(
+				"feed_jetstream_publish_recovered acknowledgement=normal subject=%s message_id=%s attempt=%d max_attempts=%d elapsed_ms=%d",
+				event.Subject,
+				event.MessageID,
+				event.Attempt,
+				event.MaxAttempts,
+				elapsedMilliseconds,
+			)
+		case publisher.PublishEventRecoveredDuplicate:
+			registry.Inc("feed_jetstream_publish_recovered_duplicate_total")
+			logger.Printf(
+				"feed_jetstream_publish_recovered acknowledgement=duplicate subject=%s message_id=%s attempt=%d max_attempts=%d elapsed_ms=%d",
+				event.Subject,
+				event.MessageID,
+				event.Attempt,
+				event.MaxAttempts,
+				elapsedMilliseconds,
+			)
+		case publisher.PublishEventRetryExhausted:
+			registry.Inc("feed_jetstream_publish_retry_exhausted_total")
+			logger.Printf(
+				"feed_jetstream_publish_retry_exhausted subject=%s message_id=%s attempts=%d max_attempts=%d elapsed_ms=%d action=fail_closed",
+				event.Subject,
+				event.MessageID,
+				event.Attempt,
+				event.MaxAttempts,
+				elapsedMilliseconds,
+			)
+		}
+	}
 }
 
 func publishAndUpdateReadiness(

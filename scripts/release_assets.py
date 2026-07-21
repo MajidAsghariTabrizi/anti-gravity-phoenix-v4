@@ -27,11 +27,14 @@ MAX_TOTAL_BYTES = 64 * 1024 * 1024
 MAX_ARCHIVE_BYTES = 72 * 1024 * 1024
 
 STATIC_PATHS = (
+    "compose.live-canary.yml",
     "compose.prod.yml",
     "dashboard/snapshot_model.py",
     "deploy/nats-server.conf",
     "deploy/prelive-v5-release.example.json",
     "fixtures/routes/arbitrum_uniswap_v3_pool_proofs.json",
+    "live-executor/schema/001_live_canary.sql",
+    "live-executor/schema/002_approval_evidence.sql",
     "prometheus/prometheus.yml",
     "scripts/bootstrap-production.sh",
     "scripts/deploy-release.sh",
