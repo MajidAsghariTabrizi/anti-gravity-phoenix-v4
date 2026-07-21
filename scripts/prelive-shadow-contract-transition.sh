@@ -74,8 +74,14 @@ rollback_provenance=$rollback_dir/release-provenance.json
 rollback_run_evidence=$rollback_dir/build-run-evidence.json
 candidate_route_registry=$stage_dir/candidate-route-registry.json
 plan_file=$stage_dir/shadow-contract-transition-plan.json
+recorder_config_evidence=$stage_dir/recorder-config-preflight.json
 helper=$stage_dir/prelive_shadow_contract_transition.py
 maintenance_helper=$stage_dir/prelive_protected_maintenance.py
+
+[ ! -L "$recorder_config_evidence" ] || fail 'Recorder config evidence path is unsafe'
+if [ -e "$recorder_config_evidence" ] && [ ! -f "$recorder_config_evidence" ]; then
+  fail 'Recorder config evidence path is unsafe'
+fi
 
 for required_file in \
   "$release_manifest" \
@@ -105,7 +111,7 @@ do
 done
 
 for required_command in \
-  awk cmp cp date df docker find grep install mktemp python3 sha256sum stat tar
+  awk cmp cp date df docker find grep install mktemp python3 sha256sum stat tar timeout tr
 do
   command -v "$required_command" >/dev/null 2>&1 ||
     fail "required command is unavailable: $required_command"
@@ -1005,6 +1011,90 @@ python3 "$helper" validate-render-pair \
   --rollback-compose "$state_dir/rollback.compose.json" >/dev/null ||
   fail 'candidate and rollback semantic Compose contracts are not reviewed'
 
+recorder_config_env=$state_dir/recorder.config.env
+recorder_config_result=$state_dir/recorder.config.result.json
+recorder_config_report=$state_dir/recorder.config.evidence.json
+recorder_config_cid_file=$state_dir/recorder.config.cid
+python3 "$helper" prepare-recorder-config-check \
+  --plan "$plan_file" \
+  --compose-config "$state_dir/release.compose.json" \
+  --env-output "$recorder_config_env" >/dev/null ||
+  fail 'candidate Recorder config-check environment could not be materialized'
+python3 "$helper" image-refs --plan "$plan_file" \
+  >"$state_dir/preflight-image-refs.tsv" ||
+  fail 'candidate Recorder image reference could not be read from the reviewed plan'
+candidate_recorder_count=$(awk -F '\t' \
+  '$1 == "release" && $2 == "recorder" { count += 1 } END { print count + 0 }' \
+  "$state_dir/preflight-image-refs.tsv")
+[ "$candidate_recorder_count" -eq 1 ] ||
+  fail 'candidate Recorder image reference is ambiguous'
+candidate_recorder_image=$(awk -F '\t' \
+  '$1 == "release" && $2 == "recorder" { print $3 }' \
+  "$state_dir/preflight-image-refs.tsv")
+docker pull "$candidate_recorder_image" >/dev/null ||
+  fail 'reviewed candidate Recorder image is not pullable'
+candidate_recorder_image_id=$(docker image inspect --format '{{.Id}}' \
+  "$candidate_recorder_image") || fail 'candidate Recorder image identity is unavailable'
+candidate_recorder_revision=$(docker image inspect --format \
+  '{{index .Config.Labels "org.opencontainers.image.revision"}}' \
+  "$candidate_recorder_image") || fail 'candidate Recorder OCI revision is unavailable'
+[ "$candidate_recorder_revision" = "$release_sha" ] ||
+  fail 'candidate Recorder OCI revision does not match the reviewed release'
+
+recorder_config_exit=0
+if timeout 15 docker run \
+  --rm \
+  --network none \
+  --read-only \
+  --cap-drop ALL \
+  --security-opt no-new-privileges:true \
+  --pids-limit 64 \
+  --memory 128m \
+  --cpus 1 \
+  --cidfile "$recorder_config_cid_file" \
+  --env-file "$recorder_config_env" \
+  --entrypoint /usr/local/bin/service \
+  "$candidate_recorder_image" --config-check \
+  >"$recorder_config_result" 2>/dev/null
+then
+  :
+else
+  recorder_config_exit=$?
+fi
+if [ -s "$recorder_config_cid_file" ]; then
+  recorder_config_cid=$(tr -d '\r\n' <"$recorder_config_cid_file")
+  printf '%s\n' "$recorder_config_cid" | grep -Eq '^[0-9a-f]{64}$' ||
+    fail 'candidate Recorder config-check container identity is invalid'
+  if docker inspect "$recorder_config_cid" >/dev/null 2>&1; then
+    docker rm --force "$recorder_config_cid" >/dev/null 2>&1 ||
+      fail 'candidate Recorder config-check container could not be removed'
+  fi
+  if docker inspect "$recorder_config_cid" >/dev/null 2>&1; then
+    fail 'candidate Recorder config-check container remained after validation'
+  fi
+fi
+if [ ! -s "$recorder_config_result" ] || [ -L "$recorder_config_result" ]; then
+  printf '%s\n' \
+    '{"schema":"phoenix.recorder-config-check.v1","status":"error","error_code":"config_check_result_missing","environment_name":null}' \
+    >"$recorder_config_result"
+fi
+recorder_config_valid=1
+if ! python3 "$helper" complete-recorder-config-check \
+  --plan "$plan_file" \
+  --compose-config "$state_dir/release.compose.json" \
+  --result "$recorder_config_result" \
+  --image-id "$candidate_recorder_image_id" \
+  --oci-revision "$candidate_recorder_revision" \
+  --exit-code "$recorder_config_exit" \
+  --output "$recorder_config_report" >/dev/null
+then
+  recorder_config_valid=0
+fi
+install -m 0640 "$recorder_config_report" "$recorder_config_evidence" ||
+  fail 'sanitized candidate Recorder config evidence could not be retained'
+[ "$recorder_config_valid" -eq 1 ] ||
+  fail 'candidate Recorder configuration preflight failed'
+
 "$deploy_dir/render-production-compose.sh" \
   --compose-file "$deploy_dir/compose.prod.yml" \
   --env-file "$env_file" \
@@ -1069,6 +1159,7 @@ capture_running_inventory \
 df -Pk "$deploy_root" >"$preflight_dir/disk.txt" ||
   fail 'pre-transition disk evidence capture failed'
 cp "$state_dir/environment-summary.json" "$preflight_dir/environment-summary.json"
+cp "$recorder_config_report" "$preflight_dir/recorder-config-preflight.json"
 cp "$state_dir/remote-plan.json" "$preflight_dir/plan.json"
 cp "$current_release_state" "$preflight_dir/current-release.json"
 cp "$current_release_context" "$preflight_dir/current-release-context.json"
@@ -1096,6 +1187,7 @@ install -d -m 0750 -o root -g phoenix "$evidence_dir"
 
 for evidence_file in \
   environment-summary.json \
+  recorder-config-preflight.json \
   plan.json \
   current-release.json \
   current-release-context.json \
