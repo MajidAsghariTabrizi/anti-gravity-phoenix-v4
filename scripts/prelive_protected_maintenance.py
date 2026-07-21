@@ -21,7 +21,7 @@ CONTEXT_SCHEMA = "phoenix.protected-maintenance-context.v2"
 RELEASE_SCHEMA = "phoenix.release.v1"
 ASSET_SCHEMA = "phoenix.release-assets.v1"
 
-OWNED_IMAGES = (
+LEGACY_RELEASE_IMAGES = (
     "dashboard",
     "feed-ingestor",
     "fork-sandbox",
@@ -29,6 +29,18 @@ OWNED_IMAGES = (
     "recorder",
     "rpc-gateway",
 )
+CURRENT_RELEASE_IMAGES = (
+    "dashboard",
+    "feed-ingestor",
+    "fork-sandbox",
+    "live-executor",
+    "phoenix-engine",
+    "recorder",
+    "rpc-gateway",
+)
+REVIEWED_RELEASE_IMAGE_SETS = (LEGACY_RELEASE_IMAGES, CURRENT_RELEASE_IMAGES)
+OWNED_IMAGES = LEGACY_RELEASE_IMAGES
+MAINTENANCE_IMAGE_REFERENCES = OWNED_IMAGES
 PROTECTED_SERVICES = (
     "nitro-feed-relay",
     "feed-ingestor",
@@ -285,6 +297,16 @@ def _path(value: Any) -> str:
     return value
 
 
+def _reviewed_release_image_names(images: Any, error_code: str) -> tuple[str, ...]:
+    if not isinstance(images, dict):
+        _fail(error_code)
+    names = set(images)
+    for reviewed in REVIEWED_RELEASE_IMAGE_SETS:
+        if names == set(reviewed):
+            return reviewed
+    _fail(error_code)
+
+
 def validate_release_manifest(path: Path, expected_sha: str) -> dict[str, str]:
     _text(expected_sha, SHA_RE, "release_manifest_invalid")
     value = _exact_object(
@@ -295,11 +317,10 @@ def validate_release_manifest(path: Path, expected_sha: str) -> dict[str, str]:
     if value["schema"] != RELEASE_SCHEMA or value["release_sha"] != expected_sha:
         _fail("release_manifest_invalid")
     images = value["images"]
-    if not isinstance(images, dict) or set(images) != set(OWNED_IMAGES):
-        _fail("release_manifest_invalid")
+    image_names = _reviewed_release_image_names(images, "release_manifest_invalid")
 
     references: dict[str, str] = {}
-    for name in OWNED_IMAGES:
+    for name in image_names:
         image = _exact_object(
             images[name],
             {"repository", "tag", "digest"},
@@ -484,9 +505,9 @@ def validate_plan(value: Any) -> dict[str, Any]:
         _fail("plan_invalid")
     for role in ("release", "rollback"):
         role_images = images[role]
-        if not isinstance(role_images, dict) or set(role_images) != set(OWNED_IMAGES):
-            _fail("plan_invalid")
-        for name, reference in role_images.items():
+        image_names = _reviewed_release_image_names(role_images, "plan_invalid")
+        for name in image_names:
+            reference = role_images[name]
             expected_prefix = f"ghcr.io/majidasgharitabrizi/{name}@"
             if (
                 not isinstance(reference, str)
@@ -1548,7 +1569,7 @@ def command_render_pair(args: argparse.Namespace) -> None:
 def command_image_refs(args: argparse.Namespace) -> None:
     plan = load_plan(Path(args.plan))
     for role in ("release", "rollback"):
-        for name in OWNED_IMAGES:
+        for name in MAINTENANCE_IMAGE_REFERENCES:
             print(
                 "\t".join(
                     (
