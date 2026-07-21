@@ -1,6 +1,7 @@
+use async_nats::jetstream::context::Publish;
 use money_path_classifier::{
-    MoneyPathClassifier, ADMISSION_POLICY_VERSION, REVIEWED_ROUTER_ADDRESSES,
-    SWAP_ROUTER_02_ADDRESS,
+    MoneyPathClassifier, ADMISSION_POLICY_VERSION, LEGACY_SWAP_ROUTER_ADDRESS,
+    REVIEWED_ROUTER_ADDRESSES, SWAP_ROUTER_02_ADDRESS,
 };
 use phoenix_recorder::ingress::{IngressBuffer, IngressBufferConfig};
 use phoenix_recorder::jetstream::{
@@ -69,6 +70,61 @@ fn payload(sequence: u64, hash_byte: char) -> Vec<u8> {
         "ingested_at_unix_ns": 1_700_000_000_123_456_789_i64
     }))
     .expect("serialize integration payload")
+}
+
+fn durable_message_id(sequence: u64, hash_byte: char) -> String {
+    format!("{sequence}:0x{}", hash_byte.to_string().repeat(64))
+}
+
+fn unsupported_payload(sequence: u64, hash_byte: char) -> Vec<u8> {
+    serde_json::to_vec(&json!({
+        "schema_version": NORMALIZED_SCHEMA_VERSION,
+        "sequence": sequence,
+        "timestamp_unix_ms": 1_700_000_000_000_u64,
+        "tx_hash": format!("0x{}", hash_byte.to_string().repeat(64)),
+        "tx_type": "0x02",
+        "chain_id": ARBITRUM_ONE_CHAIN_ID,
+        "from": "0x1111111111111111111111111111111111111111",
+        "to": LEGACY_SWAP_ROUTER_ADDRESS,
+        "nonce": sequence,
+        "value": "0",
+        "calldata": "0xdb3e2198",
+        "gas_limit": "300000",
+        "max_fee_per_gas": "100000000",
+        "max_priority_fee_per_gas": "1000000",
+        "raw_tx": "AQID",
+        "ingested_at_unix_ns": 1_700_000_000_123_456_789_i64
+    }))
+    .expect("serialize unsupported integration payload")
+}
+
+async fn publish_and_retry_same_message(
+    context: &async_nats::jetstream::Context,
+    payload: Vec<u8>,
+    message_id: &str,
+) -> u64 {
+    let publication = Publish::build()
+        .message_id(message_id)
+        .payload(payload.into());
+    let accepted = context
+        .send_publish(NATS_SUBJECT, publication.clone())
+        .await
+        .expect("send first idempotent publication")
+        .await
+        .expect("receive first idempotent publication acknowledgement");
+    assert!(
+        !accepted.duplicate,
+        "first publication was unexpectedly duplicate"
+    );
+    let retried = context
+        .send_publish(NATS_SUBJECT, publication)
+        .await
+        .expect("send retried idempotent publication")
+        .await
+        .expect("receive retried idempotent publication acknowledgement");
+    assert!(retried.duplicate, "retry was not duplicate-suppressed");
+    assert_eq!(retried.sequence, accepted.sequence);
+    accepted.sequence
 }
 
 fn address(value: &str) -> ethabi::Token {
@@ -239,6 +295,127 @@ async fn real_stream_consumer_publish_fetch_redelivery_and_ack() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn duplicate_retries_for_filtered_inputs_ack_without_raw_persistence() {
+    let _guard = integration_lock().lock().await;
+    let (Some(nats_url), Some(postgres_dsn)) = (local_nats_url(), local_postgres_dsn()) else {
+        return;
+    };
+    let pool = PgPool::connect(&postgres_dsn)
+        .await
+        .expect("connect filtered integration PostgreSQL");
+    apply_migrations(&pool).await;
+    sqlx::query(
+        "TRUNCATE money_path_ingress_samples, money_path_ingress_daily, \
+         engine_outbox, feed_events, origin_transactions CASCADE",
+    )
+    .execute(&pool)
+    .await
+    .expect("reset filtered integration tables");
+
+    let client = async_nats::connect(nats_url)
+        .await
+        .expect("connect filtered integration NATS");
+    let context = async_nats::jetstream::new(client.clone());
+    let _ = context.delete_stream(STREAM_NAME).await;
+    let consumer = ensure_durable_pipeline(&client)
+        .await
+        .expect("create filtered durable pipeline");
+    let observer = ensure_durable_pipeline(&client)
+        .await
+        .expect("open filtered integration observer");
+
+    publish_and_retry_same_message(&context, payload(70, 'a'), &durable_message_id(70, 'a')).await;
+    publish_and_retry_same_message(
+        &context,
+        unsupported_payload(71, 'b'),
+        &durable_message_id(71, 'b'),
+    )
+    .await;
+    let mut stream = context
+        .get_stream(STREAM_NAME)
+        .await
+        .expect("open filtered integration stream");
+    assert_eq!(
+        stream
+            .info()
+            .await
+            .expect("inspect filtered integration stream")
+            .state
+            .messages,
+        2
+    );
+
+    let store = PostgresStore::connect(&postgres_dsn, "disable")
+        .await
+        .expect("connect filtered integration Recorder store");
+    store
+        .verify_schema()
+        .await
+        .expect("verify filtered integration schema");
+    let classifier: Arc<dyn PrePersistenceClassifier> = Arc::new(
+        MoneyPathClassifier::from_release(
+            ADMISSION_POLICY_VERSION,
+            &REVIEWED_ROUTER_ADDRESSES
+                .iter()
+                .map(|value| (*value).to_string())
+                .collect::<Vec<_>>(),
+            ROUTES,
+        )
+        .expect("construct filtered integration classifier"),
+    );
+    let shutdown = CancellationToken::new();
+    let runtime_shutdown = shutdown.clone();
+    let runtime = consume_durable_messages(
+        Arc::new(consumer),
+        Arc::new(store),
+        classifier,
+        IngressBuffer::new(IngressBufferConfig::default())
+            .expect("construct filtered integration ingress buffer"),
+        Readiness::new(),
+        Metrics::default(),
+        LogSampler::default(),
+        runtime_shutdown,
+        BatchConfig::default(),
+        RetryPolicy::default(),
+    );
+
+    let verification = async {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let state = observer
+                .state()
+                .await
+                .expect("observe filtered acknowledgements");
+            if state.pending == 0 && state.ack_pending == 0 {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "filtered inputs were not acknowledged"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert_eq!(table_count(&pool, "origin_transactions").await, 0);
+        assert_eq!(table_count(&pool, "feed_events").await, 0);
+        assert_eq!(table_count(&pool, "engine_outbox").await, 0);
+        assert_eq!(table_count(&pool, "execution_attempts").await, 0);
+        shutdown.cancel();
+    };
+    let (runtime_result, ()) = tokio::join!(
+        tokio::time::timeout(Duration::from_secs(10), runtime),
+        verification
+    );
+    assert_eq!(
+        runtime_result.expect("filtered Recorder runtime shutdown timeout"),
+        ConsumerExit::Shutdown
+    );
+    context
+        .delete_stream(STREAM_NAME)
+        .await
+        .expect("clean filtered integration stream");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn relevant_source_ack_waits_for_visible_three_row_commit() {
     let _guard = integration_lock().lock().await;
     let (Some(nats_url), Some(postgres_dsn)) = (local_nats_url(), local_postgres_dsn()) else {
@@ -318,12 +495,19 @@ FOR EACH ROW EXECUTE FUNCTION phoenix_test_delay_relevant_commit();
     );
 
     let verification = async {
-        context
-            .publish(NATS_SUBJECT, relevant_payload(77, 'd').into())
+        let message_id = durable_message_id(77, 'd');
+        let stream_sequence =
+            publish_and_retry_same_message(&context, relevant_payload(77, 'd'), &message_id).await;
+        let mut stream = context
+            .get_stream(STREAM_NAME)
             .await
-            .expect("publish relevant integration input")
+            .expect("open relevant integration stream");
+        let stream_info = stream
+            .info()
             .await
-            .expect("confirm relevant stream publish");
+            .expect("inspect relevant integration stream");
+        assert_eq!(stream_info.state.messages, 1);
+        assert_eq!(stream_info.state.last_sequence, stream_sequence);
 
         let pending_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         loop {
@@ -363,6 +547,27 @@ FOR EACH ROW EXECUTE FUNCTION phoenix_test_delay_relevant_commit();
         assert_eq!(table_count(&pool, "feed_events").await, 1);
         assert_eq!(table_count(&pool, "engine_outbox").await, 1);
         assert_eq!(table_count(&pool, "execution_attempts").await, 0);
+
+        let replay = context
+            .send_publish(
+                NATS_SUBJECT,
+                Publish::build()
+                    .message_id(&message_id)
+                    .payload(relevant_payload(77, 'd').into()),
+            )
+            .await
+            .expect("send restart replay")
+            .await
+            .expect("receive restart replay acknowledgement");
+        assert!(
+            replay.duplicate,
+            "restart replay bypassed stream deduplication"
+        );
+        assert_eq!(replay.sequence, stream_sequence);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(table_count(&pool, "origin_transactions").await, 1);
+        assert_eq!(table_count(&pool, "feed_events").await, 1);
+        assert_eq!(table_count(&pool, "engine_outbox").await, 1);
 
         shutdown.cancel();
     };

@@ -8,6 +8,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -84,6 +85,67 @@ func TestPublishTransactionsCountsFailure(t *testing.T) {
 	}
 	if !strings.Contains(rendered, "feed_publish_success_total 0") {
 		t.Fatalf("unexpected publish success counter: %s", rendered)
+	}
+}
+
+func TestPublishTransactionsDoesNotAdvancePastUnprovenSourceItem(t *testing.T) {
+	registry := metrics.NewRegistry()
+	pub := &orderedFailingPublisher{}
+	transactions := []normalizer.NormalizedTx{
+		{Sequence: 100, TxHash: "0xaaa"},
+		{Sequence: 101, TxHash: "0xbbb"},
+	}
+	published, err := publishTransactions(context.Background(), pub, registry, transactions, time.Now())
+	if !errors.Is(err, publisher.ErrPublishAckTimeout) {
+		t.Fatalf("expected fail-closed acknowledgement timeout, got %v", err)
+	}
+	if published != 0 || !reflect.DeepEqual(pub.messageIDs, []string{transactions[0].DurableMessageID()}) {
+		t.Fatalf("source advanced past an unproven publication: published=%d ids=%v", published, pub.messageIDs)
+	}
+	rendered := registry.Render()
+	if !strings.Contains(rendered, "feed_publish_success_total 0") || !strings.Contains(rendered, "feed_publish_failures_total 1") {
+		t.Fatalf("fail-closed publication metrics are incorrect: %s", rendered)
+	}
+}
+
+func TestJetStreamPublishStateObservabilityIsBoundedAndRedacted(t *testing.T) {
+	registry := metrics.NewRegistry()
+	var output bytes.Buffer
+	handler := jetStreamPublishStateHandler(registry, log.New(&output, "", 0))
+	for _, event := range []publisher.PublishEvent{
+		{Kind: publisher.PublishEventAckTimeoutRetry, Subject: txSubject, MessageID: "10:0xaaa", Attempt: 1, MaxAttempts: 3, Elapsed: time.Second},
+		{Kind: publisher.PublishEventRecoveredNormal, Subject: txSubject, MessageID: "11:0xbbb", Attempt: 2, MaxAttempts: 3, Elapsed: 2 * time.Second},
+		{Kind: publisher.PublishEventRecoveredDuplicate, Subject: txSubject, MessageID: "12:0xccc", Attempt: 2, MaxAttempts: 3, Elapsed: 2 * time.Second},
+		{Kind: publisher.PublishEventRetryExhausted, Subject: txSubject, MessageID: "13:0xddd", Attempt: 3, MaxAttempts: 3, Elapsed: 7 * time.Second},
+	} {
+		handler(event)
+	}
+	rendered := registry.Render()
+	for _, expected := range []string{
+		"feed_jetstream_publish_ack_timeout_retries_total 1",
+		"feed_jetstream_publish_recovered_normal_total 1",
+		"feed_jetstream_publish_recovered_duplicate_total 1",
+		"feed_jetstream_publish_retry_exhausted_total 1",
+	} {
+		if !strings.Contains(rendered, expected) {
+			t.Fatalf("missing publish recovery metric %q: %s", expected, rendered)
+		}
+	}
+	logs := output.String()
+	for _, expected := range []string{
+		"feed_jetstream_publish_ack_timeout_retry",
+		"acknowledgement=normal",
+		"acknowledgement=duplicate",
+		"action=fail_closed",
+	} {
+		if !strings.Contains(logs, expected) {
+			t.Fatalf("missing publish recovery log %q: %s", expected, logs)
+		}
+	}
+	for _, forbidden := range []string{"private_key", "password=", "postgres://", "raw_tx", "signed"} {
+		if strings.Contains(strings.ToLower(logs), forbidden) {
+			t.Fatalf("publish recovery log exposed restricted data %q: %s", forbidden, logs)
+		}
 	}
 }
 
@@ -171,6 +233,47 @@ func TestRelayForwardGapIsCountedOnceAdvancesAndReadinessRecovers(t *testing.T) 
 	}
 	if strings.Contains(rendered, "feed_last_gap_timestamp_seconds 0") {
 		t.Fatalf("gap timestamp was not recorded: %s", rendered)
+	}
+}
+
+func TestRelayPublishFailureDoesNotCommitSourceSequence(t *testing.T) {
+	registry := metrics.NewRegistry()
+	readiness := relayDependencyReadyState()
+	state := sequence.New()
+	pub := &orderedFailingPublisher{}
+	issueLogger := newSampledIssueLogger(log.New(io.Discard, "", 0), time.Minute, nil)
+	frame := relayFrame(250, 'a', 1)
+
+	err := processRelayFrame(
+		context.Background(),
+		frame,
+		false,
+		state,
+		pub,
+		registry,
+		readiness,
+		issueLogger,
+		time.Now(),
+	)
+	if !errors.Is(err, publisher.ErrPublishAckTimeout) {
+		t.Fatalf("expected fail-closed publish timeout, got %v", err)
+	}
+	if last, haveLast := state.LastSequence(); haveLast || last != 0 || state.NextExpected() != 0 {
+		t.Fatalf("failed publication committed source sequence: last=%d have=%t next=%d", last, haveLast, state.NextExpected())
+	}
+	if len(pub.messageIDs) != 1 || pub.messageIDs[0] != "250:"+frame.Transactions[0].Hash {
+		t.Fatalf("unexpected attempted publication identity: %v", pub.messageIDs)
+	}
+	rendered := registry.Render()
+	for _, expected := range []string{
+		"feed_last_sequence 0",
+		"feed_publish_success_total 0",
+		"feed_publish_failures_total 1",
+		"feed_readiness 0",
+	} {
+		if !strings.Contains(rendered, expected) {
+			t.Fatalf("uncommitted source metrics missing %q: %s", expected, rendered)
+		}
 	}
 }
 
@@ -393,6 +496,21 @@ func (failingPublisher) Publish(context.Context, string, any) error {
 	return errors.New("publish failed")
 }
 func (failingPublisher) Close() error { return nil }
+
+type orderedFailingPublisher struct {
+	messageIDs []string
+}
+
+func (p *orderedFailingPublisher) Publish(_ context.Context, _ string, value any) error {
+	identified, ok := value.(interface{ DurableMessageID() string })
+	if !ok {
+		return errors.New("missing durable identity")
+	}
+	p.messageIDs = append(p.messageIDs, identified.DurableMessageID())
+	return publisher.ErrPublishAckTimeout
+}
+
+func (*orderedFailingPublisher) Close() error { return nil }
 
 func publishReadyState() *metrics.Readiness {
 	readiness := &metrics.Readiness{}
