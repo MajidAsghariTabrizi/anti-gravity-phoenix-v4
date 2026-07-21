@@ -1,8 +1,11 @@
+import io
 import json
 import tempfile
 import unittest
+from contextlib import redirect_stdout
 from copy import deepcopy
 from pathlib import Path
+from types import SimpleNamespace
 
 from scripts import prelive_protected_maintenance as maintenance
 
@@ -25,7 +28,11 @@ def image_reference(name: str, value: int) -> str:
     return f"ghcr.io/majidasgharitabrizi/{name}@{digest(value)}"
 
 
-def manifest(release_sha: str, offset: int) -> dict:
+def manifest(
+    release_sha: str,
+    offset: int,
+    image_names: tuple[str, ...] = maintenance.LEGACY_RELEASE_IMAGES,
+) -> dict:
     return {
         "schema": maintenance.RELEASE_SCHEMA,
         "release_sha": release_sha,
@@ -36,7 +43,7 @@ def manifest(release_sha: str, offset: int) -> dict:
                 "tag": f"sha-{release_sha}",
                 "digest": digest(offset + index),
             }
-            for index, name in enumerate(maintenance.OWNED_IMAGES, start=1)
+            for index, name in enumerate(image_names, start=1)
         },
     }
 
@@ -351,6 +358,26 @@ class ProtectedMaintenanceTests(unittest.TestCase):
         path.write_text(json.dumps(value), encoding="utf-8")
         return path
 
+    def build_plan_from_manifests(
+        self, release_manifest: dict, rollback_manifest: dict
+    ) -> dict:
+        return maintenance.build_plan(
+            self.write("release-generation.json", release_manifest),
+            self.write("rollback-generation.json", rollback_manifest),
+            self.release_assets,
+            self.rollback_assets,
+            RELEASE_SHA,
+            ROLLBACK_SHA,
+        )
+
+    def build_generation_plan(
+        self, release_images: tuple[str, ...], rollback_images: tuple[str, ...]
+    ) -> dict:
+        return self.build_plan_from_manifests(
+            manifest(RELEASE_SHA, 10, release_images),
+            manifest(ROLLBACK_SHA, 30, rollback_images),
+        )
+
     def baseline(self) -> dict:
         return {
             "schema_version": maintenance.SNAPSHOT_SCHEMA,
@@ -407,6 +434,158 @@ class ProtectedMaintenanceTests(unittest.TestCase):
         value["database"] = database(110, 1010)
         value["metrics"] = metrics(1010, 10)
         return value
+
+    def test_reviewed_six_and_seven_image_generation_pairs_pass(self) -> None:
+        cases = (
+            (
+                "legacy-to-legacy",
+                maintenance.LEGACY_RELEASE_IMAGES,
+                maintenance.LEGACY_RELEASE_IMAGES,
+            ),
+            (
+                "current-to-legacy",
+                maintenance.CURRENT_RELEASE_IMAGES,
+                maintenance.LEGACY_RELEASE_IMAGES,
+            ),
+            (
+                "current-to-current",
+                maintenance.CURRENT_RELEASE_IMAGES,
+                maintenance.CURRENT_RELEASE_IMAGES,
+            ),
+        )
+        for name, release_images, rollback_images in cases:
+            with self.subTest(name=name):
+                plan = self.build_generation_plan(release_images, rollback_images)
+                maintenance.validate_plan(plan)
+                self.assertEqual(set(plan["images"]["release"]), set(release_images))
+                self.assertEqual(set(plan["images"]["rollback"]), set(rollback_images))
+
+    def test_partial_and_unexpected_candidate_image_sets_fail_closed(self) -> None:
+        cases = (
+            (
+                "legacy-production-image-missing",
+                tuple(
+                    name
+                    for name in maintenance.LEGACY_RELEASE_IMAGES
+                    if name != "dashboard"
+                ),
+            ),
+            (
+                "live-executor-present-but-recorder-missing",
+                tuple(
+                    name
+                    for name in maintenance.CURRENT_RELEASE_IMAGES
+                    if name != "recorder"
+                ),
+            ),
+            (
+                "unexpected-eighth-image",
+                maintenance.CURRENT_RELEASE_IMAGES + ("unreviewed-image",),
+            ),
+        )
+        for name, release_images in cases:
+            with self.subTest(name=name):
+                with self.assertRaisesRegex(
+                    maintenance.MaintenanceError, "release_manifest_invalid"
+                ):
+                    self.build_generation_plan(
+                        release_images, maintenance.LEGACY_RELEASE_IMAGES
+                    )
+
+    def test_unexpected_rollback_image_fails_closed(self) -> None:
+        with self.assertRaisesRegex(
+            maintenance.MaintenanceError, "release_manifest_invalid"
+        ):
+            self.build_generation_plan(
+                maintenance.CURRENT_RELEASE_IMAGES,
+                maintenance.CURRENT_RELEASE_IMAGES + ("unreviewed-image",),
+            )
+
+    def test_live_executor_difference_is_release_evidence_only(self) -> None:
+        plan = self.build_generation_plan(
+            maintenance.CURRENT_RELEASE_IMAGES,
+            maintenance.CURRENT_RELEASE_IMAGES,
+        )
+        self.assertNotEqual(
+            plan["images"]["release"]["live-executor"],
+            plan["images"]["rollback"]["live-executor"],
+        )
+        self.assertEqual(
+            plan["protected_allowlist"], ["feed-ingestor", "recorder"]
+        )
+        self.assertNotIn("live-executor", plan["protected_allowlist"])
+        self.assertNotIn("live-executor", plan["fixed_services"])
+        self.assertNotIn("live-executor", plan["optional_services"])
+
+    def test_both_mutable_service_digest_changes_remain_required(self) -> None:
+        for service in maintenance.MUTABLE_SERVICES:
+            with self.subTest(service=service):
+                release = manifest(
+                    RELEASE_SHA, 10, maintenance.CURRENT_RELEASE_IMAGES
+                )
+                rollback = manifest(
+                    ROLLBACK_SHA, 30, maintenance.LEGACY_RELEASE_IMAGES
+                )
+                rollback["images"][service]["digest"] = release["images"][service][
+                    "digest"
+                ]
+                with self.assertRaisesRegex(
+                    maintenance.MaintenanceError, "protected_allowlist_mismatch"
+                ):
+                    self.build_plan_from_manifests(release, rollback)
+
+    def test_seven_image_plan_keeps_production_render_set_exact(self) -> None:
+        plan = self.build_generation_plan(
+            maintenance.CURRENT_RELEASE_IMAGES,
+            maintenance.CURRENT_RELEASE_IMAGES,
+        )
+        release_metadata = rendered_metadata(plan, "release")
+        rollback_metadata = rendered_metadata(plan, "rollback")
+        release_compose = rendered_compose(plan, "release")
+        rollback_compose = rendered_compose(plan, "rollback")
+        self.assertEqual(
+            release_metadata["expected_services"], list(maintenance.COMPOSE_SERVICES)
+        )
+        self.assertNotIn("live-executor", release_metadata["images"])
+        self.assertNotIn("live-executor", release_compose["services"])
+        maintenance.validate_render_pair(
+            plan,
+            release_metadata,
+            rollback_metadata,
+            release_compose,
+            rollback_compose,
+        )
+
+        release_metadata["images"]["live-executor"] = plan["images"]["release"][
+            "live-executor"
+        ]
+        with self.assertRaisesRegex(
+            maintenance.MaintenanceError, "render_contract_invalid"
+        ):
+            maintenance.validate_render_pair(
+                plan,
+                release_metadata,
+                rollback_metadata,
+                release_compose,
+                rollback_compose,
+            )
+
+    def test_image_reference_output_excludes_live_executor(self) -> None:
+        plan = self.build_generation_plan(
+            maintenance.CURRENT_RELEASE_IMAGES,
+            maintenance.CURRENT_RELEASE_IMAGES,
+        )
+        plan_path = self.write("seven-image-plan.json", plan)
+        output = io.StringIO()
+        with redirect_stdout(output):
+            maintenance.command_image_refs(SimpleNamespace(plan=str(plan_path)))
+        rows = [line.split("\t") for line in output.getvalue().splitlines()]
+        self.assertNotIn("live-executor", {row[1] for row in rows})
+        for role in ("release", "rollback"):
+            self.assertEqual(
+                [row[1] for row in rows if row[0] == role],
+                list(maintenance.MAINTENANCE_IMAGE_REFERENCES),
+            )
 
     def test_plan_has_exact_allowlist_and_order(self) -> None:
         self.assertEqual(
