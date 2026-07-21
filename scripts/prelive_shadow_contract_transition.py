@@ -111,8 +111,30 @@ SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 RUN_ID_RE = re.compile(r"^[1-9][0-9]{0,19}$")
 ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+CONTAINER_ID_RE = re.compile(r"^[0-9a-f]{64}$")
 MAX_JSON_BYTES = 4 * 1024 * 1024
 MAX_ENV_BYTES = 1024 * 1024
+MAX_DIAGNOSTIC_LOG_INPUT_BYTES = 2 * 1024 * 1024
+MAX_DIAGNOSTIC_LOG_LINES = 300
+MAX_DIAGNOSTIC_LOG_LINE_BYTES = 2 * 1024
+MAX_DIAGNOSTIC_LOG_BYTES = 640 * 1024
+
+HANDOFF_SCHEMA = "phoenix.shadow-contract-transition-recorder-handoff.v1"
+URL_VALUE_RE = re.compile(
+    r"(?i)(?:https?|wss?|postgres(?:ql)?|nats)://[^\s\"']+"
+)
+ADDRESS_RE = re.compile(r"(?i)0x[0-9a-f]{40}")
+PRIVATE_VALUE_RE = re.compile(r"(?i)0x[0-9a-f]{64,}")
+SECRET_LINE_RE = re.compile(
+    r"(?i)(?:password|passwd|private[_ -]?key|mnemonic|authorization|bearer|"
+    r"credential|secret)[\"']?\s*[:=]|\b(?:RPC_PROVIDER_URLS|POSTGRES_DSN|"
+    r"SIGNER_PRIVATE_KEY|WALLET_ADDRESS|EXECUTOR_ADDRESS)\b"
+)
+ENV_ASSIGNMENT_LINE_RE = re.compile(r"(?:^|\s)[A-Z][A-Z0-9_]{2,63}\s*[:=]")
+SENSITIVE_ENV_NAME_RE = re.compile(
+    r"(?i)(?:URL|URI|DSN|PASSWORD|PASSWD|TOKEN|SECRET|PRIVATE|KEY|MNEMONIC|"
+    r"WALLET|EXECUTOR|CREDENTIAL|AUTH)"
+)
 
 
 class TransitionError(ValueError):
@@ -873,6 +895,25 @@ def write_atomic(path: Path, value: Any, mode: int = 0o640) -> None:
             pass
 
 
+def write_bytes_atomic(path: Path, value: bytes, mode: int = 0o640) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary = tempfile.mkstemp(
+        prefix=f".{path.name}.", dir=path.parent
+    )
+    try:
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write(value)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(temporary, mode)
+        os.replace(temporary, path)
+    finally:
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+
+
 def _parse_env(path: Path) -> tuple[list[str], dict[str, str]]:
     raw = _read_file(path, MAX_ENV_BYTES)
     try:
@@ -903,6 +944,128 @@ def _parse_env(path: Path) -> tuple[list[str], dict[str, str]]:
             candidate = decoded
         values[name] = candidate
     return lines, values
+
+
+def _nonnegative_integer(value: Any, code: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        _fail(code)
+    return value
+
+
+def validate_recorder_handoff(
+    jetstream_value: Any, container_status: str, container_id: str
+) -> dict[str, Any]:
+    if CONTAINER_ID_RE.fullmatch(container_id) is None:
+        _fail("recorder_container_identity_invalid")
+    if container_status != "exited":
+        _fail("recorder_container_not_stopped")
+    try:
+        normalized = maintenance.normalize_jetstream(jetstream_value)
+        _streams, consumers = maintenance._jetstream_resources(jetstream_value)
+    except maintenance.MaintenanceError as error:
+        _fail(str(error))
+    recorder_consumers: list[dict[str, Any]] = []
+    for consumer in consumers:
+        if not isinstance(consumer, dict) or not isinstance(
+            consumer.get("config"), dict
+        ):
+            _fail("jetstream_invalid")
+        config = consumer["config"]
+        name = (
+            consumer.get("name")
+            or config.get("durable_name")
+            or config.get("name")
+        )
+        if name == "PHOENIX_RECORDER":
+            recorder_consumers.append(consumer)
+    if len(recorder_consumers) != 1:
+        _fail("recorder_consumer_state_invalid")
+    recorder = recorder_consumers[0]
+    if "num_waiting" not in recorder:
+        _fail("recorder_waiting_state_unavailable")
+    waiting = _nonnegative_integer(
+        recorder["num_waiting"], "recorder_waiting_state_invalid"
+    )
+    ack_pending = normalized["consumers"]["PHOENIX_RECORDER"]["ack_pending"]
+    if ack_pending != 0:
+        _fail("recorder_ack_pending_not_zero")
+    if waiting != 0:
+        _fail("recorder_pull_subscription_attached")
+    return {
+        "schema": HANDOFF_SCHEMA,
+        "status": "detached",
+        "container_status": container_status,
+        "container_id": container_id,
+        "consumer": "PHOENIX_RECORDER",
+        "num_ack_pending": ack_pending,
+        "num_waiting": waiting,
+    }
+
+
+def _read_bounded_tail(path: Path, maximum: int) -> tuple[bytes, bool]:
+    if not path.is_file() or path.is_symlink():
+        _fail("diagnostic_log_unavailable")
+    try:
+        size = path.stat().st_size
+        with path.open("rb") as handle:
+            truncated = size > maximum
+            if truncated:
+                handle.seek(-maximum, os.SEEK_END)
+            return handle.read(maximum), truncated
+    except OSError:
+        _fail("diagnostic_log_unavailable")
+
+
+def redact_diagnostic_log(
+    input_path: Path, env_path: Path, output_path: Path
+) -> None:
+    raw, input_truncated = _read_bounded_tail(
+        input_path, MAX_DIAGNOSTIC_LOG_INPUT_BYTES
+    )
+    _lines, environment = _parse_env(env_path)
+    text = raw.decode("utf-8", errors="replace")
+    sensitive_values = sorted(
+        {
+            value
+            for name, value in environment.items()
+            if SENSITIVE_ENV_NAME_RE.search(name) and len(value) >= 4
+        },
+        key=len,
+        reverse=True,
+    )
+    for value in sensitive_values:
+        text = text.replace(value, "[redacted-env]")
+
+    lines: list[str] = []
+    for raw_line in text.splitlines()[-MAX_DIAGNOSTIC_LOG_LINES:]:
+        line = "".join(
+            character
+            if character == "\t" or ord(character) >= 32 and ord(character) != 127
+            else "?"
+            for character in raw_line
+        )
+        if SECRET_LINE_RE.search(line):
+            line = "[redacted-sensitive-line]"
+        elif ENV_ASSIGNMENT_LINE_RE.search(line):
+            line = "[redacted-environment-line]"
+        else:
+            line = URL_VALUE_RE.sub("[redacted-url]", line)
+            line = PRIVATE_VALUE_RE.sub("[redacted-private-value]", line)
+            line = ADDRESS_RE.sub("[redacted-address]", line)
+        encoded = line.encode("utf-8")
+        if len(encoded) > MAX_DIAGNOSTIC_LOG_LINE_BYTES:
+            line = (
+                encoded[: MAX_DIAGNOSTIC_LOG_LINE_BYTES - 20]
+                .decode("utf-8", errors="ignore")
+                + "[line-truncated]"
+            )
+        lines.append(line)
+    if input_truncated:
+        lines.insert(0, "[input-truncated]")
+    payload = ("\n".join(lines) + ("\n" if lines else "")).encode("utf-8")
+    if len(payload) > MAX_DIAGNOSTIC_LOG_BYTES:
+        _fail("diagnostic_log_bounds_invalid")
+    write_bytes_atomic(output_path, payload)
 
 
 def _false(value: str | None) -> bool:
@@ -1188,12 +1351,135 @@ def _compatibility_plan(plan: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _assert_transition_progress(
+    baseline: dict[str, Any],
+    progress: dict[str, Any],
+    current: dict[str, Any],
+    allow_quiet: bool,
+) -> None:
+    feed_start = progress["metrics"]["feed"]
+    recorder_start = progress["metrics"]["recorder"]
+    feed = current["metrics"]["feed"]
+    recorder = current["metrics"]["recorder"]
+    if any(value is None for value in feed.values()):
+        _fail("feed_metrics_unavailable")
+    if feed["feed_readiness"] != 1:
+        _fail("feed_readiness_not_ready")
+    if recorder["recorder_readiness"] != 1:
+        _fail("recorder_readiness_not_ready")
+    if any(
+        feed[name] != 0
+        for name in (
+            "feed_sequence_regressions_total",
+            "feed_sequence_gaps_total",
+            "feed_decode_failures_total",
+        )
+    ) or any(
+        recorder[name] != 0
+        for name in (
+            "recorder_database_failures_total",
+            "recorder_jetstream_ack_failures_total",
+            "recorder_poison_messages_total",
+        )
+    ):
+        _fail("runtime_integrity_failed")
+
+    for name in ("feed_last_sequence", "feed_jetstream_publish_success_total"):
+        if feed[name] < feed_start[name]:
+            _fail(f"feed_metric_regressed:{name}")
+    for name in (
+        "recorder_messages_persisted_total",
+        "recorder_last_persisted_feed_sequence",
+    ):
+        if recorder[name] < recorder_start[name]:
+            _fail(f"recorder_metric_regressed:{name}")
+
+    database = current["database"]
+    for name, value in baseline["database"]["counts"].items():
+        if progress["database"]["counts"][name] < value:
+            _fail(f"database_count_regressed:{name}")
+    if (
+        progress["database"]["max_feed_sequence"]
+        < baseline["database"]["max_feed_sequence"]
+    ):
+        _fail("database_feed_sequence_regressed")
+    for reference in (baseline["database"], progress["database"]):
+        for name, value in reference["counts"].items():
+            if database["counts"][name] < value:
+                _fail(f"database_count_regressed:{name}")
+        if database["max_feed_sequence"] < reference["max_feed_sequence"]:
+            _fail("database_feed_sequence_regressed")
+
+    stream_start = progress["jetstream"]["streams"]["PHOENIX_FEED_TX"]
+    stream = current["jetstream"]["streams"]["PHOENIX_FEED_TX"]
+    if stream["last_seq"] < stream_start["last_seq"]:
+        _fail("feed_stream_regressed")
+    consumer_start = progress["jetstream"]["consumers"]["PHOENIX_RECORDER"]
+    consumer = current["jetstream"]["consumers"]["PHOENIX_RECORDER"]
+    if (
+        consumer["delivered_stream_seq"] < consumer_start["delivered_stream_seq"]
+        or consumer["ack_floor_stream_seq"]
+        < consumer_start["ack_floor_stream_seq"]
+    ):
+        _fail("recorder_consumer_regressed")
+    if (
+        consumer["pending"] > maintenance.MAX_RECORDER_PENDING
+        or consumer["ack_pending"] > maintenance.MAX_ACK_PENDING
+        or consumer_start["pending"] > maintenance.MAX_RECORDER_PENDING
+        or consumer_start["ack_pending"] > maintenance.MAX_ACK_PENDING
+    ):
+        _fail("consumer_backlog_unbounded")
+    baseline_consumer = baseline["jetstream"]["consumers"]["PHOENIX_RECORDER"]
+    if (
+        consumer_start["redelivered"] > baseline_consumer["redelivered"]
+        or consumer["redelivered"] > consumer_start["redelivered"]
+    ):
+        _fail("consumer_redelivery_increased")
+
+    recorder_progress = (
+        recorder["recorder_messages_persisted_total"]
+        > recorder_start["recorder_messages_persisted_total"]
+        or recorder["recorder_last_persisted_feed_sequence"]
+        > recorder_start["recorder_last_persisted_feed_sequence"]
+    )
+    if recorder_progress:
+        return
+
+    feed_or_stream_progress = (
+        feed["feed_last_sequence"] > feed_start["feed_last_sequence"]
+        or feed["feed_jetstream_publish_success_total"]
+        > feed_start["feed_jetstream_publish_success_total"]
+        or stream["last_seq"] > stream_start["last_seq"]
+    )
+    delivered_progress = (
+        consumer["delivered_stream_seq"]
+        > consumer_start["delivered_stream_seq"]
+    )
+    ack_progress = (
+        consumer["ack_floor_stream_seq"]
+        > consumer_start["ack_floor_stream_seq"]
+    )
+    if feed_or_stream_progress:
+        if not delivered_progress or not ack_progress:
+            _fail("feed_progress_without_consumer_progress")
+        return
+    if delivered_progress or ack_progress:
+        _fail("consumer_progress_without_feed_activity")
+    if not allow_quiet:
+        _fail("quiet_interval_not_elapsed")
+    if consumer["pending"] != 0 or consumer["ack_pending"] != 0:
+        _fail("quiet_interval_consumer_backlog")
+    if database != progress["database"]:
+        _fail("quiet_interval_database_changed")
+
+
 def validate_data_transition(
     plan: dict[str, Any],
     baseline_value: Any,
     progress_value: Any,
     current_value: Any,
     role: str,
+    allow_quiet: bool = False,
 ) -> None:
     if role not in {"release", "rollback"}:
         _fail("transition_invalid")
@@ -1205,17 +1491,27 @@ def validate_data_transition(
         if baseline["release_sha"] != ROLLBACK_SHA:
             _fail("baseline_release_mismatch")
         maintenance._assert_baseline_images(compatibility, baseline)
+        maintenance._assert_continuity(baseline, progress)
         maintenance._assert_continuity(baseline, current)
         expected_sha = plan[f"{role}_sha"]
-        if current["release_sha"] != expected_sha or progress["release_sha"] != expected_sha:
+        if (
+            current["release_sha"] != expected_sha
+            or progress["release_sha"] != expected_sha
+        ):
             _fail("transition_invalid")
         for service in maintenance.MUTABLE_SERVICES:
             after = current["services"][service]
+            progress_service = progress["services"][service]
             if (
                 after["configured_image"] != plan["images"][role][service]
                 or after["restart_count"] != 0
                 or after["oom_killed"]
                 or not maintenance._service_healthy(after)
+                or progress_service["configured_image"]
+                != plan["images"][role][service]
+                or progress_service["restart_count"] != 0
+                or progress_service["oom_killed"]
+                or not maintenance._service_healthy(progress_service)
             ):
                 _fail("mutable_service_transition_invalid")
             if (
@@ -1223,7 +1519,7 @@ def validate_data_transition(
                 and after["container_id"] == baseline["services"][service]["container_id"]
             ):
                 _fail("mutable_service_transition_invalid")
-        maintenance._assert_progress(baseline, progress, current)
+        _assert_transition_progress(baseline, progress, current, allow_quiet)
     except maintenance.MaintenanceError as error:
         _fail(str(error))
 
@@ -1466,8 +1762,25 @@ def command_validate_data_transition(args: argparse.Namespace) -> None:
         load_json(Path(args.progress_baseline)),
         load_json(Path(args.current)),
         args.role,
+        args.allow_quiet,
     )
     print(f"PHOENIX_SHADOW_CONTRACT_TRANSITION_PROGRESS_OK: role={args.role}")
+
+
+def command_validate_recorder_handoff(args: argparse.Namespace) -> None:
+    value = validate_recorder_handoff(
+        load_json(Path(args.jetstream)), args.container_status, args.container_id
+    )
+    if args.output:
+        write_atomic(Path(args.output), value)
+    print("PHOENIX_SHADOW_CONTRACT_TRANSITION_RECORDER_HANDOFF_OK")
+
+
+def command_redact_diagnostic_log(args: argparse.Namespace) -> None:
+    redact_diagnostic_log(
+        Path(args.input), Path(args.env_file), Path(args.output)
+    )
+    print("PHOENIX_SHADOW_CONTRACT_TRANSITION_DIAGNOSTIC_LOG_OK")
 
 
 def command_runtime_state(args: argparse.Namespace) -> None:
@@ -1577,7 +1890,21 @@ def parser() -> argparse.ArgumentParser:
     transition.add_argument("--progress-baseline", required=True)
     transition.add_argument("--current", required=True)
     transition.add_argument("--role", choices=("release", "rollback"), required=True)
+    transition.add_argument("--allow-quiet", action="store_true")
     transition.set_defaults(handler=command_validate_data_transition)
+
+    handoff = commands.add_parser("validate-recorder-handoff")
+    handoff.add_argument("--jetstream", required=True)
+    handoff.add_argument("--container-status", required=True)
+    handoff.add_argument("--container-id", required=True)
+    handoff.add_argument("--output")
+    handoff.set_defaults(handler=command_validate_recorder_handoff)
+
+    diagnostic_log = commands.add_parser("redact-diagnostic-log")
+    diagnostic_log.add_argument("--input", required=True)
+    diagnostic_log.add_argument("--env-file", required=True)
+    diagnostic_log.add_argument("--output", required=True)
+    diagnostic_log.set_defaults(handler=command_redact_diagnostic_log)
 
     runtime = commands.add_parser("runtime-state")
     runtime.add_argument("--plan", required=True)

@@ -15,6 +15,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 ROUTE_PATH = REPO_ROOT / "fixtures/routes/weth_usdc_uniswap_v3.json"
 PROOF_PATH = REPO_ROOT / transition.ROUTE_PROOF_PATH
 SHELL_PATH = REPO_ROOT / "scripts/prelive-shadow-contract-transition.sh"
+RECORDER_CONTAINER_ID = "a" * 64
 
 
 def digest(value: int) -> str:
@@ -299,6 +300,40 @@ def progress_snapshots(plan: dict, role: str) -> tuple[dict, dict]:
     return start, current
 
 
+def current_from(start: dict, role: str) -> dict:
+    current = deepcopy(start)
+    current["phase"] = "final" if role == "release" else "rollback-final"
+    return current
+
+
+def raw_jetstream(num_waiting: int = 0, num_ack_pending: int = 0) -> dict:
+    return {
+        "streams": [
+            {
+                "name": name,
+                "config": {"name": name, "subjects": [f"fixture.{index}"]},
+                "state": {"messages": 0, "first_seq": 1000, "last_seq": 1000},
+            }
+            for index, name in enumerate(maintenance.STREAM_NAMES)
+        ],
+        "consumers": [
+            {
+                "name": name,
+                "config": {"durable_name": name},
+                "num_pending": 0,
+                "num_ack_pending": (
+                    num_ack_pending if name == "PHOENIX_RECORDER" else 0
+                ),
+                "num_redelivered": 0,
+                "num_waiting": num_waiting if name == "PHOENIX_RECORDER" else 0,
+                "delivered": {"stream_seq": 1000},
+                "ack_floor": {"stream_seq": 1000},
+            }
+            for name in maintenance.CONSUMER_NAMES
+        ],
+    }
+
+
 def compose_metadata(plan: dict, role: str) -> dict:
     compatibility = transition._plan_for_compose(plan)
     return {
@@ -561,36 +596,277 @@ class ShadowContractTransitionTests(unittest.TestCase):
                 self.plan, baseline(self.plan), current, "release"
             )
 
-    def test_candidate_and_rollback_progress_fail_closed_on_evidence_drift(self) -> None:
-        for role in ("release", "rollback"):
-            start, current = progress_snapshots(self.plan, role)
-            transition.validate_data_transition(
-                self.plan, baseline(self.plan), start, current, role
+    def test_recorder_handoff_requires_stopped_container_and_no_waiter(self) -> None:
+        with self.assertRaisesRegex(
+            transition.TransitionError, "recorder_pull_subscription_attached"
+        ):
+            transition.validate_recorder_handoff(
+                raw_jetstream(num_waiting=1), "exited", RECORDER_CONTAINER_ID
             )
-            no_progress = deepcopy(current)
-            no_progress["database"]["max_feed_sequence"] = 1000
-            with self.subTest(role=role, failure="progress"), self.assertRaisesRegex(
-                transition.TransitionError, "database_feed_sequence_not_progressing"
+        with self.assertRaisesRegex(
+            transition.TransitionError, "recorder_container_not_stopped"
+        ):
+            transition.validate_recorder_handoff(
+                raw_jetstream(), "running", RECORDER_CONTAINER_ID
+            )
+
+    def test_recorder_handoff_permits_detached_zero_ack_consumer(self) -> None:
+        value = transition.validate_recorder_handoff(
+            raw_jetstream(), "exited", RECORDER_CONTAINER_ID
+        )
+        self.assertEqual(value["status"], "detached")
+        self.assertEqual(value["container_id"], RECORDER_CONTAINER_ID)
+        self.assertEqual(value["num_ack_pending"], 0)
+        self.assertEqual(value["num_waiting"], 0)
+        with self.assertRaisesRegex(
+            transition.TransitionError, "recorder_ack_pending_not_zero"
+        ):
+            transition.validate_recorder_handoff(
+                raw_jetstream(num_ack_pending=1), "exited", RECORDER_CONTAINER_ID
+            )
+
+    def test_recorder_handoff_poll_is_bounded_and_precedes_candidate_start(self) -> None:
+        handoff = self.shell.split("wait_recorder_handoff()", 1)[1].split(
+            "capture_recorder_health_failure_diagnostics()", 1
+        )[0]
+        self.assertIn("handoff_wait_seconds=60", self.shell)
+        self.assertIn("handoff_deadline=", handoff)
+        self.assertIn('while [ "$(date +%s)" -lt "$handoff_deadline" ]', handoff)
+        self.assertIn("validate-recorder-handoff", handoff)
+        self.assertIn('--container-id "$handoff_container_id"', handoff)
+        self.assertRegex(handoff, r"HANDOFF_TIMEOUT[\s\S]*exit 1")
+        apply_flow = self.shell.split("mutation_started=1", 1)[1]
+        self.assertLess(
+            apply_flow.index("wait_recorder_handoff"),
+            apply_flow.index('start_service "$env_file" "$release_env" recorder'),
+        )
+
+    def test_candidate_health_failure_publishes_sanitized_diagnostics(self) -> None:
+        diagnostics = self.shell.split(
+            "capture_recorder_health_failure_diagnostics()", 1
+        )[1].split("read_validation_error_code()", 1)[0]
+        self.assertIn("capture_service_inspect", diagnostics)
+        self.assertIn("logs --no-color --tail 300 recorder", diagnostics)
+        self.assertIn("capture_jetstream", diagnostics)
+        self.assertIn("redact-diagnostic-log", diagnostics)
+        self.assertIn(
+            "$evidence_dir/$diagnostic_role-recorder-health-inspect.json",
+            diagnostics,
+        )
+        self.assertIn("$evidence_dir/$diagnostic_role-recorder-health.log", diagnostics)
+        self.assertIn(
+            "$evidence_dir/$diagnostic_role-recorder-health-jetstream.json",
+            diagnostics,
+        )
+        candidate_failure = self.shell.split(
+            'if ! start_service "$env_file" "$release_env" recorder; then', 1
+        )[1].split("\nfi", 1)[0]
+        self.assertLess(
+            candidate_failure.index("capture_recorder_health_failure_diagnostics"),
+            candidate_failure.index("fail 'candidate Recorder did not become healthy'"),
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "recorder.raw.log"
+            environment = root / "phoenix.env"
+            output = root / "recorder.log"
+            source.write_text(
+                "\n".join(
+                    (
+                        "ordinary recorder diagnostic",
+                        "POSTGRES_DSN=postgres://operator:password@postgres/db",
+                        "rpc=wss://user:token@example.invalid/feed",
+                        "provider rejected top-secret-token",
+                        "SIGNER_PRIVATE_KEY=0x" + "a" * 64,
+                    )
+                ),
+                encoding="utf-8",
+            )
+            environment.write_text(
+                "POSTGRES_DSN=postgres://operator:password@postgres/db\n"
+                "API_TOKEN=top-secret-token\n",
+                encoding="utf-8",
+            )
+            transition.redact_diagnostic_log(source, environment, output)
+            retained = output.read_text(encoding="utf-8")
+        self.assertIn("ordinary recorder diagnostic", retained)
+        self.assertNotIn("password", retained)
+        self.assertNotIn("top-secret-token", retained)
+        self.assertNotIn("wss://", retained)
+        self.assertNotIn("0x" + "a" * 64, retained)
+
+    def test_recorder_persistence_progress_passes_without_database_growth(self) -> None:
+        start, _unused = progress_snapshots(self.plan, "release")
+        current = current_from(start, "release")
+        current["metrics"]["recorder"]["recorder_messages_persisted_total"] += 1
+        transition.validate_data_transition(
+            self.plan, baseline(self.plan), start, current, "release"
+        )
+
+    def test_irrelevant_consumed_traffic_passes_with_selective_database(self) -> None:
+        start, _unused = progress_snapshots(self.plan, "release")
+        current = current_from(start, "release")
+        current["metrics"]["feed"]["feed_last_sequence"] += 1
+        current["metrics"]["feed"]["feed_jetstream_publish_success_total"] += 1
+        current["jetstream"]["streams"]["PHOENIX_FEED_TX"]["last_seq"] += 1
+        consumer = current["jetstream"]["consumers"]["PHOENIX_RECORDER"]
+        consumer["delivered_stream_seq"] += 1
+        consumer["ack_floor_stream_seq"] += 1
+        consumer["ack_pending"] = maintenance.MAX_ACK_PENDING
+        transition.validate_data_transition(
+            self.plan, baseline(self.plan), start, current, "release"
+        )
+
+    def test_fully_quiet_healthy_interval_requires_bounded_wait(self) -> None:
+        start, _unused = progress_snapshots(self.plan, "release")
+        current = current_from(start, "release")
+        with self.assertRaisesRegex(
+            transition.TransitionError, "quiet_interval_not_elapsed"
+        ):
+            transition.validate_data_transition(
+                self.plan, baseline(self.plan), start, current, "release"
+            )
+        transition.validate_data_transition(
+            self.plan,
+            baseline(self.plan),
+            start,
+            current,
+            "release",
+            allow_quiet=True,
+        )
+        wait = self.shell.split("wait_for_progress()", 1)[1].split(
+            "start_service()", 1
+        )[0]
+        self.assertGreater(wait.index("--allow-quiet"), wait.index("done"))
+
+    def test_feed_progress_without_consumer_progress_fails(self) -> None:
+        start, _unused = progress_snapshots(self.plan, "release")
+        current = current_from(start, "release")
+        current["metrics"]["feed"]["feed_last_sequence"] += 1
+        current["jetstream"]["streams"]["PHOENIX_FEED_TX"]["last_seq"] += 1
+        with self.assertRaisesRegex(
+            transition.TransitionError, "feed_progress_without_consumer_progress"
+        ):
+            transition.validate_data_transition(
+                self.plan, baseline(self.plan), start, current, "release"
+            )
+
+    def test_ack_backlog_or_redelivery_growth_fails(self) -> None:
+        start, current = progress_snapshots(self.plan, "release")
+        backlog = deepcopy(current)
+        backlog["jetstream"]["consumers"]["PHOENIX_RECORDER"][
+            "ack_pending"
+        ] = maintenance.MAX_ACK_PENDING + 1
+        with self.assertRaisesRegex(
+            transition.TransitionError, "consumer_backlog_unbounded"
+        ):
+            transition.validate_data_transition(
+                self.plan, baseline(self.plan), start, backlog, "release"
+            )
+        redelivery = deepcopy(current)
+        redelivery["jetstream"]["consumers"]["PHOENIX_RECORDER"][
+            "redelivered"
+        ] += 1
+        with self.assertRaisesRegex(
+            transition.TransitionError, "consumer_redelivery_increased"
+        ):
+            transition.validate_data_transition(
+                self.plan, baseline(self.plan), start, redelivery, "release"
+            )
+        redelivery_start = deepcopy(start)
+        redelivery_start["jetstream"]["consumers"]["PHOENIX_RECORDER"][
+            "redelivered"
+        ] = 1
+        redelivery_current = deepcopy(current)
+        redelivery_current["jetstream"]["consumers"]["PHOENIX_RECORDER"][
+            "redelivered"
+        ] = 1
+        with self.assertRaisesRegex(
+            transition.TransitionError, "consumer_redelivery_increased"
+        ):
+            transition.validate_data_transition(
+                self.plan,
+                baseline(self.plan),
+                redelivery_start,
+                redelivery_current,
+                "release",
+            )
+
+    def test_duplicate_execution_health_and_storage_fail_closed(self) -> None:
+        start, current = progress_snapshots(self.plan, "release")
+        mutations = (
+            (
+                lambda value: value["database"]["counts"].__setitem__(
+                    "duplicate_feed_events", 1
+                ),
+                "database_integrity_failed",
+            ),
+            (
+                lambda value: value["database"]["counts"].__setitem__(
+                    "execution_attempts", 1
+                ),
+                "execution_activity_detected",
+            ),
+            (
+                lambda value: value["metrics"]["feed"].__setitem__(
+                    "feed_readiness", 0
+                ),
+                "feed_readiness_not_ready",
+            ),
+            (
+                lambda value: value["metrics"]["recorder"].__setitem__(
+                    "recorder_database_failures_total", 1
+                ),
+                "runtime_integrity_failed",
+            ),
+            (
+                lambda value: value.__setitem__(
+                    "protected_storage_identity_sha256", digest(999)
+                ),
+                "protected_storage_metadata_changed",
+            ),
+        )
+        for mutate, error in mutations:
+            candidate = deepcopy(current)
+            mutate(candidate)
+            with self.subTest(error=error), self.assertRaisesRegex(
+                transition.TransitionError, error
             ):
                 transition.validate_data_transition(
-                    self.plan, baseline(self.plan), start, no_progress, role
+                    self.plan, baseline(self.plan), start, candidate, "release"
                 )
-            storage_drift = deepcopy(current)
-            storage_drift["protected_storage_identity_sha256"] = digest(999)
-            with self.subTest(role=role, failure="storage"), self.assertRaisesRegex(
-                transition.TransitionError, "protected_storage_metadata_changed"
-            ):
-                transition.validate_data_transition(
-                    self.plan, baseline(self.plan), start, storage_drift, role
-                )
-            unhealthy = deepcopy(current)
-            unhealthy["metrics"]["feed"]["feed_readiness"] = 0
-            with self.subTest(role=role, failure="health"), self.assertRaisesRegex(
-                transition.TransitionError, "feed_readiness_not_ready"
-            ):
-                transition.validate_data_transition(
-                    self.plan, baseline(self.plan), start, unhealthy, role
-                )
+        regressed_start = deepcopy(start)
+        regressed_start["database"]["counts"]["feed_events"] -= 1
+        with self.assertRaisesRegex(
+            transition.TransitionError, "database_count_regressed:feed_events"
+        ):
+            transition.validate_data_transition(
+                self.plan,
+                baseline(self.plan),
+                regressed_start,
+                current,
+                "release",
+            )
+
+    def test_sparse_rollback_traffic_no_longer_causes_false_failure(self) -> None:
+        start, _unused = progress_snapshots(self.plan, "rollback")
+        consumed = current_from(start, "rollback")
+        consumed["jetstream"]["streams"]["PHOENIX_FEED_TX"]["last_seq"] += 1
+        consumer = consumed["jetstream"]["consumers"]["PHOENIX_RECORDER"]
+        consumer["delivered_stream_seq"] += 1
+        consumer["ack_floor_stream_seq"] += 1
+        transition.validate_data_transition(
+            self.plan, baseline(self.plan), start, consumed, "rollback"
+        )
+        quiet = current_from(start, "rollback")
+        transition.validate_data_transition(
+            self.plan,
+            baseline(self.plan),
+            start,
+            quiet,
+            "rollback",
+            allow_quiet=True,
+        )
 
     def test_fixed_services_are_never_stopped_or_recreated(self) -> None:
         mutation_commands = [
@@ -659,15 +935,21 @@ class ShadowContractTransitionTests(unittest.TestCase):
         self.assertIn("rollback_transition", handler)
         self.assertIn('[ "$mutation_started" -eq 1 ]', handler)
 
-    def test_no_destructive_docker_or_postgresql_operation_exists(self) -> None:
+    def test_no_destructive_docker_postgresql_or_nats_operation_exists(self) -> None:
         forbidden = (
             r"docker\s+(?:compose\s+)?down\b",
+            r"docker\s+(?:compose\s+)?pause\b",
             r"docker\s+(?:system|volume|container|image)\s+prune\b",
             r"docker\s+volume\s+rm\b",
             r"\bDROP\s+(?:DATABASE|TABLE)\b",
             r"\bTRUNCATE\b",
             r"\bDELETE\s+FROM\b",
+            r"\bUPDATE\s+[A-Za-z_]",
             r"\bRESET\s+MASTER\b",
+            r"\bnats\s+(?:stream|consumer)\s+"
+            r"(?:add|edit|rm|delete|purge|reset|pause|resume)\b",
+            r"\b(?:stream|consumer)\s+"
+            r"(?:add|edit|rm|delete|purge|reset|pause|resume)\b",
         )
         for pattern in forbidden:
             self.assertNotRegex(self.shell, re.compile(pattern, re.IGNORECASE))
