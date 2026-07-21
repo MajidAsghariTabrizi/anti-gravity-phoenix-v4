@@ -22,6 +22,7 @@ optional_stop_order='phoenix-engine shadow-dispatcher rpc-gateway dashboard prom
 runtime_services='nitro-feed-relay nats postgres recorder feed-ingestor rpc-gateway phoenix-engine shadow-dispatcher dashboard prometheus'
 service_wait_seconds=180
 drain_wait_seconds=180
+handoff_wait_seconds=60
 progress_wait_seconds=120
 
 state_dir=
@@ -488,6 +489,90 @@ wait_recorder_drain() (
   exit 1
 )
 
+wait_recorder_handoff() (
+  handoff_role=$1
+  handoff_container_id=$2
+  handoff_operator_env=$3
+  handoff_release_env=$4
+  handoff_deadline=$(( $(date +%s) + handoff_wait_seconds ))
+  handoff_jetstream=$state_dir/$handoff_role-recorder-handoff-jetstream.json
+  handoff_output=$state_dir/$handoff_role-recorder-handoff.json
+  handoff_error=$state_dir/$handoff_role-recorder-handoff.error.json
+  while [ "$(date +%s)" -lt "$handoff_deadline" ]; do
+    handoff_status=$(docker inspect --format '{{.State.Status}}' \
+      "$handoff_container_id" 2>/dev/null) || handoff_status=unavailable
+    if capture_jetstream \
+      "$handoff_operator_env" "$handoff_release_env" "$handoff_jetstream"
+    then
+      if python3 "$helper" validate-recorder-handoff \
+        --jetstream "$handoff_jetstream" \
+        --container-status "$handoff_status" \
+        --container-id "$handoff_container_id" \
+        --output "$handoff_output" >/dev/null 2>"$handoff_error"
+      then
+        if [ -n "$evidence_dir" ]; then
+          install -m 0640 -o root -g phoenix \
+            "$handoff_output" \
+            "$evidence_dir/$handoff_role-recorder-handoff.json" || exit 1
+        fi
+        exit 0
+      fi
+    fi
+    sleep 2
+  done
+  if [ -n "$evidence_dir" ]; then
+    [ ! -s "$handoff_jetstream" ] || install -m 0640 -o root -g phoenix \
+      "$handoff_jetstream" \
+      "$evidence_dir/$handoff_role-recorder-handoff-timeout-jetstream.json"
+    [ ! -s "$handoff_error" ] || install -m 0640 -o root -g phoenix \
+      "$handoff_error" \
+      "$evidence_dir/$handoff_role-recorder-handoff-timeout-error.json"
+  fi
+  echo \
+    "PHOENIX_SHADOW_CONTRACT_TRANSITION_HANDOFF_TIMEOUT: role=$handoff_role" \
+    >&2
+  exit 1
+)
+
+capture_recorder_health_failure_diagnostics() (
+  diagnostic_role=$1
+  diagnostic_operator_env=$2
+  diagnostic_release_env=$3
+  diagnostic_dir=$state_dir/$diagnostic_role-recorder-health-failure
+  diagnostic_inspect=$diagnostic_dir/recorder-inspect.json
+  diagnostic_log_raw=$diagnostic_dir/recorder.raw.log
+  diagnostic_log=$diagnostic_dir/recorder.log
+  diagnostic_jetstream=$diagnostic_dir/jetstream.json
+  install -d -m 0700 "$diagnostic_dir" || exit 1
+  capture_service_inspect \
+    "$diagnostic_operator_env" "$diagnostic_release_env" recorder \
+    "$diagnostic_inspect" ||
+    printf '%s\n' '{"status":"inspect_capture_failed"}' >"$diagnostic_inspect"
+  if ! compose_with "$diagnostic_operator_env" "$diagnostic_release_env" \
+    logs --no-color --tail 300 recorder >"$diagnostic_log_raw" 2>&1
+  then
+    printf '%s\n' '[recorder log capture failed]' >"$diagnostic_log_raw"
+  fi
+  python3 "$helper" redact-diagnostic-log \
+    --input "$diagnostic_log_raw" \
+    --env-file "$diagnostic_operator_env" \
+    --output "$diagnostic_log" >/dev/null ||
+    printf '%s\n' '[recorder log redaction failed]' >"$diagnostic_log"
+  capture_jetstream \
+    "$diagnostic_operator_env" "$diagnostic_release_env" \
+    "$diagnostic_jetstream" ||
+    printf '%s\n' '{"status":"jetstream_capture_failed"}' >"$diagnostic_jetstream"
+  install -m 0640 -o root -g phoenix \
+    "$diagnostic_inspect" \
+    "$evidence_dir/$diagnostic_role-recorder-health-inspect.json" || exit 1
+  install -m 0640 -o root -g phoenix \
+    "$diagnostic_log" \
+    "$evidence_dir/$diagnostic_role-recorder-health.log" || exit 1
+  install -m 0640 -o root -g phoenix \
+    "$diagnostic_jetstream" \
+    "$evidence_dir/$diagnostic_role-recorder-health-jetstream.json"
+)
+
 read_validation_error_code() (
   validation_error=$1
   awk -F '"' '
@@ -551,6 +636,24 @@ wait_for_progress() (
     fi
     sleep 3
   done
+  if capture_snapshot \
+    "$progress_phase" "$progress_sha" \
+    "$progress_operator_env" "$progress_release_env" "$progress_candidate"
+  then
+    if python3 "$helper" validate-data-transition \
+      --plan "$plan_file" \
+      --baseline "$state_dir/pre.json" \
+      --progress-baseline "$progress_baseline" \
+      --current "$progress_candidate" \
+      --role "$progress_role" \
+      --allow-quiet >/dev/null 2>"$progress_error"
+    then
+      cp "$progress_candidate" "$progress_output"
+      exit 0
+    fi
+    progress_code=$(read_validation_error_code "$progress_error") ||
+      progress_code=transition_validation_error_unparseable
+  fi
   preserve_progress_timeout "$progress_role" "$progress_candidate" "$progress_code"
   exit 1
 )
@@ -691,8 +794,12 @@ rollback_transition() {
   compose_with "$candidate_env" "$release_env" stop feed-ingestor \
     >/dev/null 2>&1 || true
   wait_recorder_drain "$candidate_env" "$release_env" >/dev/null 2>&1 || true
+  rollback_recorder_id=$(container_id "$candidate_env" "$release_env" recorder) ||
+    return 1
   compose_with "$candidate_env" "$release_env" stop recorder \
     >/dev/null 2>&1 || true
+  wait_recorder_handoff \
+    rollback "$rollback_recorder_id" "$candidate_env" "$release_env" || return 1
 
   restore_environment_backup || return 1
   PHOENIX_DEPLOY_ROOT="$deploy_root" \
@@ -1102,8 +1209,13 @@ compose_with "$env_file" "$rollback_env" stop feed-ingestor >/dev/null ||
   fail 'Feed Ingestor could not be quiesced'
 wait_recorder_drain "$env_file" "$rollback_env" ||
   fail 'Recorder durable consumer did not drain'
+previous_recorder_id=$(container_id "$env_file" "$rollback_env" recorder) ||
+  fail 'Recorder container identity could not be captured before handoff'
 compose_with "$env_file" "$rollback_env" stop recorder >/dev/null ||
   fail 'Recorder could not be stopped after drain'
+wait_recorder_handoff \
+  candidate "$previous_recorder_id" "$env_file" "$rollback_env" ||
+  fail 'Recorder durable pull subscription did not detach'
 
 install_active_file "$candidate_env" "$env_file" root root 0600 ||
   fail 'candidate route environment installation failed'
@@ -1128,8 +1240,14 @@ install_active_file \
   "$release_env" "$deploy_dir/manifests/$release_sha.env" phoenix phoenix 0640 ||
   fail 'candidate image environment installation failed'
 
-start_service "$env_file" "$release_env" recorder ||
+if ! start_service "$env_file" "$release_env" recorder; then
+  capture_recorder_health_failure_diagnostics \
+    candidate "$env_file" "$release_env" ||
+    echo \
+      'PHOENIX_SHADOW_CONTRACT_TRANSITION_DIAGNOSTICS_FAILED: role=candidate' \
+      >&2
   fail 'candidate Recorder did not become healthy'
+fi
 start_service "$env_file" "$release_env" feed-ingestor ||
   fail 'candidate Feed Ingestor did not become healthy'
 capture_snapshot post-start "$release_sha" "$env_file" "$release_env" \
