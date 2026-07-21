@@ -103,12 +103,16 @@ for context_directory in \
   "$deploy_dir/sql" \
   "$deploy_dir/schemas" \
   "$deploy_dir/routes" \
-  "$deploy_dir/contracts"
+  "$deploy_dir/contracts" \
+  "$deploy_dir/live-executor" \
+  "$deploy_dir/live-executor/schema"
 do
   ensure_deploy_directory "$context_directory"
 done
 
 install_source "$source_root/compose.prod.yml" "$deploy_dir/compose.prod.yml" 0640
+install_source \
+  "$source_root/compose.live-canary.yml" "$deploy_dir/compose.live-canary.yml" 0640
 install_source \
   "$source_root/deploy/nats-server.conf" "$deploy_dir/nats-server.conf" 0644
 install_source \
@@ -119,6 +123,12 @@ install_source \
 install_source \
   "$source_root/fixtures/routes/arbitrum_uniswap_v3_pool_proofs.json" \
   "$deploy_dir/routes/arbitrum_uniswap_v3_pool_proofs.json" 0640
+install_source \
+  "$source_root/live-executor/schema/001_live_canary.sql" \
+  "$deploy_dir/live-executor/schema/001_live_canary.sql" 0640
+install_source \
+  "$source_root/live-executor/schema/002_approval_evidence.sql" \
+  "$deploy_dir/live-executor/schema/002_approval_evidence.sql" 0640
 
 for sql_name in \
   shadow-profitability-report.sql \

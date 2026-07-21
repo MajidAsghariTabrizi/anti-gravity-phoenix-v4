@@ -61,6 +61,19 @@ grep -F 'user: "65534:65534"' "$compose_file" >/dev/null ||
   fail 'Prometheus runtime UID/GID is not explicit in production Compose'
 grep -F '"$deploy_dir/prometheus/prometheus.yml" 0644' "$context_installer" >/dev/null ||
   fail 'installed Prometheus configuration is not mode 0644'
+grep -F '"$deploy_dir/compose.live-canary.yml" 0640' "$context_installer" >/dev/null ||
+  fail 'live-canary Compose overlay does not use the existing Compose mode policy'
+grep -F '"$deploy_dir/live-executor/schema/001_live_canary.sql" 0640' \
+  "$context_installer" >/dev/null ||
+  fail 'live-canary base schema does not use the existing data-file mode policy'
+grep -F '"$deploy_dir/live-executor/schema/002_approval_evidence.sql" 0640' \
+  "$context_installer" >/dev/null ||
+  fail 'live-canary approval schema does not use the existing data-file mode policy'
+if grep -E '(^|[[:space:]])psql([[:space:]]|$)|migration-runner' \
+  "$context_installer" "$release_installer" >/dev/null
+then
+  fail 'release installation must package schemas without applying them'
+fi
 grep -F 'prometheus_runtime_uid=65534' "$provisioner" >/dev/null ||
   fail 'Prometheus provisioning UID is not explicit'
 grep -F 'prometheus_runtime_gid=65534' "$provisioner" >/dev/null ||
@@ -84,7 +97,16 @@ sudo docker compose version >/dev/null 2>&1 ||
   fail 'Docker Compose is required for the production installer fixture'
 
 tmp_dir=$(mktemp -d "${TMPDIR:-/tmp}/phoenix-bootstrap-safety.XXXXXX")
+v5_fixture_created=false
+v5_etc_created=false
 cleanup() {
+  if [ "$v5_fixture_created" = true ]; then
+    sudo rm -rf -- /opt/phoenix-v5
+    sudo rm -f -- /etc/phoenix/phoenix-v5.env
+  fi
+  if [ "$v5_etc_created" = true ]; then
+    sudo rmdir /etc/phoenix 2>/dev/null || true
+  fi
   sudo rm -rf -- "$tmp_dir"
 }
 trap cleanup EXIT HUP INT TERM
@@ -178,6 +200,23 @@ snapshot_metadata() {
   ) >"$snapshot_output"
 }
 
+assert_live_canary_context() {
+  context_source=$1
+  context_target=$2
+  for relative in \
+    compose.live-canary.yml \
+    live-executor/schema/001_live_canary.sql \
+    live-executor/schema/002_approval_evidence.sql
+  do
+    [ -f "$context_target/$relative" ] && [ ! -L "$context_target/$relative" ] ||
+      fail "installed live-canary asset is missing or unsafe: $relative"
+    cmp "$context_source/$relative" "$context_target/$relative" >/dev/null ||
+      fail "installed live-canary asset bytes differ: $relative"
+    [ "$(stat -c '%a' "$context_target/$relative")" = 640 ] ||
+      fail "installed live-canary asset mode differs: $relative"
+  done
+}
+
 before=$tmp_dir/protected.before
 after=$tmp_dir/protected.after
 snapshot_metadata "$before"
@@ -222,6 +261,7 @@ sudo env \
   PHOENIX_OWNER_USER="$owner_user" \
   PHOENIX_OWNER_GROUP="$owner_group" \
   /bin/sh "$context_installer" "" "$repo_root" >/dev/null
+assert_live_canary_context "$repo_root" "$host_root/deploy"
 snapshot_metadata "$after"
 cmp "$before" "$after" >/dev/null ||
   fail 'release-context installation changed protected metadata or contents'
@@ -287,6 +327,8 @@ sudo env \
     "$rollback_asset_dir/phoenix-release-assets-$rollback_sha.tar.gz" \
     "$rollback_asset_dir/release-assets-manifest.json" \
     "$rollback_asset_dir/release-assets-checksums.txt" >/dev/null
+assert_live_canary_context \
+  "$host_root/releases/$rollback_sha" "$host_root/deploy"
 snapshot_metadata "$after"
 cmp "$before" "$after" >/dev/null ||
   fail 'rollback release installation changed protected metadata or contents'
@@ -311,9 +353,47 @@ sudo env \
     "$asset_dir/phoenix-release-assets-$release_sha.tar.gz" \
     "$asset_dir/release-assets-manifest.json" \
     "$asset_dir/release-assets-checksums.txt" >/dev/null
+assert_live_canary_context \
+  "$host_root/releases/$release_sha" "$host_root/deploy"
 snapshot_metadata "$after"
 cmp "$before" "$after" >/dev/null ||
   fail 'maintenance-success install changed protected metadata or contents'
+
+[ ! -e /opt/phoenix-v5 ] ||
+  fail 'exact v5 override fixture requires /opt/phoenix-v5 to be absent'
+[ ! -e /opt/phoenix ] ||
+  fail 'exact v5 override fixture requires the default deployment root to be absent'
+[ ! -e /etc/phoenix/phoenix-v5.env ] ||
+  fail 'exact v5 override fixture requires the v5 environment file to be absent'
+[ ! -e /etc/phoenix/phoenix.env ] ||
+  fail 'exact v5 override fixture requires the default environment file to be absent'
+if [ ! -d /etc/phoenix ]; then
+  sudo install -d -m 0755 -o root -g root /etc/phoenix
+  v5_etc_created=true
+fi
+v5_fixture_created=true
+sudo install -d -m 0750 -o root -g root /opt/phoenix-v5
+sudo install -m 0600 -o root -g root "$valid_env" /etc/phoenix/phoenix-v5.env
+sudo env \
+  PHOENIX_DEPLOY_ROOT=/opt/phoenix-v5 \
+  PHOENIX_RELEASE_ROOT=/opt/phoenix-v5/releases \
+  PHOENIX_ENV_FILE=/etc/phoenix/phoenix-v5.env \
+  PHOENIX_OWNER_USER="$owner_user" \
+  PHOENIX_OWNER_GROUP="$owner_group" \
+  PHOENIX_CONTEXT_INSTALLER="$context_installer" \
+  /bin/sh "$release_installer" \
+    "$release_sha" \
+    "$asset_dir/phoenix-release-assets-$release_sha.tar.gz" \
+    "$asset_dir/release-assets-manifest.json" \
+    "$asset_dir/release-assets-checksums.txt" >/dev/null
+[ -d "/opt/phoenix-v5/releases/$release_sha" ] ||
+  fail 'explicit v5 release root was not used'
+assert_live_canary_context \
+  "/opt/phoenix-v5/releases/$release_sha" /opt/phoenix-v5/deploy
+[ ! -e /opt/phoenix ] ||
+  fail 'explicit v5 overrides silently created the default deployment root'
+[ ! -e /etc/phoenix/phoenix.env ] ||
+  fail 'explicit v5 override silently created the default environment file'
 
 sudo env \
   PHOENIX_DEPLOY_ROOT="$host_root" \
