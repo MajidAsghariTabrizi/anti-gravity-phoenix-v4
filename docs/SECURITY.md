@@ -26,7 +26,7 @@ Phoenix v4 is shadow-first and secrets-clean by default.
 | GHCR credential leakage | GitHub publishes with `GITHUB_TOKEN`; production uses a separate least-privilege package pull credential entered through `docker login ghcr.io --password-stdin`. |
 | Docker build secret leakage | No runtime secrets are passed as Docker build args. `.dockerignore` excludes env files, keys, runtime data, caches, and build outputs. |
 | Runtime environment leakage | `/etc/phoenix/phoenix.env` must be `root:root` mode `0600`; validation reports variable names and categories, not values. |
-| Production signer leakage | `SIGNER_PRIVATE_KEY` is host-only and LIVE-only. It is not required for SHADOW startup and must not exist in GitHub secrets. |
+| Production signer leakage | `live-executor` receives signer material only through a read-only file mount after every LIVE gate passes. Raw `SIGNER_PRIVATE_KEY` is local/test compatibility only and must not exist in GitHub secrets. |
 | Fixture accidentally used in production | `feed-ingestor` fails startup if `PHOENIX_ENV=production` and `PHOENIX_FEED_FIXTURE` is set. |
 | LIVE accidentally enabled | Production Compose forces `PHOENIX_MODE=SHADOW` and `LIVE_EXECUTION=false`; release-live workflow cannot edit env or restart LIVE. |
 | Mutable image deployment | Build workflow emits `sha-<full git sha>` tags and digests; deploy scripts reject missing digests and never consume `latest`. |

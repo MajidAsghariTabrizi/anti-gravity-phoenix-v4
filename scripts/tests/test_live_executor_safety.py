@@ -33,9 +33,23 @@ class LiveExecutorSafetyTests(unittest.TestCase):
             "LIVE_EXECUTOR_EXECUTOR_CODE_HASH: ${LIVE_EXECUTOR_EXECUTOR_CODE_HASH:-}",
             overlay,
         )
+        self.assertNotIn("env_file:", overlay)
+        self.assertNotRegex(overlay, r"(?m)^\s+SIGNER_PRIVATE_KEY\s*:")
+        self.assertIn(
+            "SIGNER_PRIVATE_KEY_FILE: /run/secrets/phoenix-live-executor-signer",
+            overlay,
+        )
+        self.assertIn(
+            "source: ${LIVE_EXECUTOR_SIGNER_FILE:?LIVE_EXECUTOR_SIGNER_FILE is required}",
+            overlay,
+        )
+        self.assertIn("target: /run/secrets/phoenix-live-executor-signer", overlay)
+        self.assertIn("create_host_path: false", overlay)
+        self.assertIn('user: "65532:65532"', overlay)
         self.assertIn("restart: \"no\"", overlay)
         self.assertIn("read_only: true", overlay)
         self.assertIn("cap_drop: [ALL]", overlay)
+        self.assertIn("no-new-privileges:true", overlay)
         self.assertNotRegex(overlay, r"ports:\s*\n")
 
     def test_canary_schema_does_not_change_root_migrations(self) -> None:
@@ -145,9 +159,25 @@ class LiveExecutorSafetyTests(unittest.TestCase):
         workflow = (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
         key_name = "SIGNER_" + "PRIVATE_KEY"
         assignments = re.findall(
-            rf"{re.escape(key_name)}[ \t]*[:=][ \t]*([^\s]*)", workflow
+            rf"(?m)^\s*{re.escape(key_name)}[ \t]*[:=]", workflow
         )
-        self.assertTrue(all(value in {"", '""', "''"} for value in assignments))
+        self.assertEqual(assignments, [])
+        self.assertIn(
+            'environment.get("SIGNER_PRIVATE_KEY_FILE") != signer_target',
+            workflow,
+        )
+        self.assertIn('if "SIGNER_PRIVATE_KEY" in environment:', workflow)
+
+    def test_config_failures_are_logged_by_sanitized_code_only(self) -> None:
+        runtime = (ROOT / "live-executor/src/main.rs").read_text(encoding="utf-8")
+        self.assertIn("error_code = error.code()", runtime)
+        self.assertNotIn("error = ?error", runtime)
+        self.assertNotIn("error = %error", runtime)
+
+    def test_operator_example_uses_only_the_signer_file_source(self) -> None:
+        example = (ROOT / ".env.example").read_text(encoding="utf-8")
+        self.assertIn("LIVE_EXECUTOR_SIGNER_FILE=", example)
+        self.assertNotIn("LIVE_EXECUTOR_SIGNER_PRIVATE_KEY=", example)
 
     def test_isolated_submission_fixture_is_loopback_only(self) -> None:
         fixture = (

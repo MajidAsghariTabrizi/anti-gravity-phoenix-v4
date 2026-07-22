@@ -13,7 +13,8 @@ The service can submit only when all environment gates are exact:
 - `LIVE_EXECUTOR_ARMED=true`
 - `LIVE_EXECUTOR_KILL_SWITCH=false`
 - `CHAIN_ID=42161`
-- the configured wallet exactly matches `SIGNER_PRIVATE_KEY`
+- the configured wallet exactly matches the signer loaded from the absolute
+  `SIGNER_PRIVATE_KEY_FILE`
 - `LIVE_EXECUTOR_EXECUTOR_CODE_HASH` is the reviewed lowercase SHA-256
   digest of the configured PhoenixExecutor runtime bytecode
 - `LIVE_EXECUTOR_PNL_ASSET_ADDRESS` is canonical Arbitrum WETH
@@ -24,6 +25,11 @@ The service can submit only when all environment gates are exact:
 The database control row must independently have `armed=true` and
 `kill_switch=false`. Its installed defaults are `armed=false` and
 `kill_switch=true`.
+
+Production Compose mounts `LIVE_EXECUTOR_SIGNER_FILE` read-only at
+`/run/secrets/phoenix-live-executor-signer`; it never passes the key through the
+container environment. `SIGNER_PRIVATE_KEY` remains mutually exclusive,
+local/test-only compatibility input.
 
 The profile is not part of `compose.prod.yml`. A future reviewed release must
 provide a digest-pinned `LIVE_EXECUTOR_IMAGE` and explicitly load the overlay:

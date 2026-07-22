@@ -7,8 +7,6 @@ services:
       dockerfile: deploy/rust.Dockerfile
       args:
         CRATE: live-executor
-    env_file:
-      - ${PHOENIX_ENV_FILE:-/etc/phoenix/phoenix.env}
     environment:
       PHOENIX_MODE: ${LIVE_EXECUTOR_PHOENIX_MODE:-SHADOW}
       LIVE_EXECUTION: ${LIVE_EXECUTOR_LIVE_EXECUTION:-false}
@@ -17,7 +15,7 @@ services:
       LIVE_EXECUTOR_ONE_TRANSACTION_AT_A_TIME: ${LIVE_EXECUTOR_ONE_TRANSACTION_AT_A_TIME:-true}
       CHAIN_ID: ${CHAIN_ID:-42161}
       POSTGRES_DSN: ${POSTGRES_DSN:?POSTGRES_DSN is required}
-      SIGNER_PRIVATE_KEY: ${LIVE_EXECUTOR_SIGNER_PRIVATE_KEY:-}
+      SIGNER_PRIVATE_KEY_FILE: /run/secrets/phoenix-live-executor-signer
       WALLET_ADDRESS: ${LIVE_EXECUTOR_WALLET_ADDRESS:-}
       EXECUTOR_ADDRESS: ${LIVE_EXECUTOR_EXECUTOR_ADDRESS:-}
       LIVE_EXECUTOR_EXECUTOR_CODE_HASH: ${LIVE_EXECUTOR_EXECUTOR_CODE_HASH:-}
@@ -32,6 +30,13 @@ services:
       LIVE_EXECUTOR_MAX_DAILY_LOSS_WEI: ${LIVE_EXECUTOR_MAX_DAILY_LOSS_WEI:-}
       LIVE_EXECUTOR_RECEIPT_TIMEOUT_SECONDS: ${LIVE_EXECUTOR_RECEIPT_TIMEOUT_SECONDS:-}
       LIVE_EXECUTOR_POLL_INTERVAL_SECONDS: ${LIVE_EXECUTOR_POLL_INTERVAL_SECONDS:-}
+    volumes:
+      - type: bind
+        source: ${LIVE_EXECUTOR_SIGNER_FILE:?LIVE_EXECUTOR_SIGNER_FILE is required}
+        target: /run/secrets/phoenix-live-executor-signer
+        read_only: true
+        bind:
+          create_host_path: false
     depends_on:
       postgres:
         condition: service_healthy
