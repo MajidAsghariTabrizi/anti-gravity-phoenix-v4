@@ -105,12 +105,21 @@ release env, SHA pointer, checksummed state, a fresh render, and every running
 container image. It can consume a bounded running-image JSON snapshot for tests
 or inspect an existing runtime. Inspection never starts a service.
 
-Transient deployment files live only under
-`/opt/phoenix/deploy/.runtime`. The repository-local equivalent and generated
-active release files are ignored; root-level `FETCH_HEAD` is explicitly
-forbidden rather than ignored.
+Root deployment scratch lives under mode-`0700`
+`/opt/phoenix/deploy/.deploy-runtime` or the gateway's root-only run directory.
+The separate `/opt/phoenix/deploy/.runtime` remains bounded operator runtime
+state and is never used by the gateway as trusted input. Static scripts and
+release control files are `root:phoenix` and not writable by `phoenix`.
+Repository-local equivalents and generated active release files are ignored;
+root-level `FETCH_HEAD` is explicitly forbidden rather than ignored.
 
 ## Deploy
+
+The production workflow does not invoke the deploy script directly. It calls
+only the installed constrained gateway, which validates and installs the
+immutable candidate tree and executes `deploy-release.sh` from that verified
+tree in a bounded systemd oneshot. The gateway records sanitized result and
+rollback evidence under `/var/lib/phoenix-shadow-deploy`.
 
 `deploy-release.sh <release_sha>`:
 

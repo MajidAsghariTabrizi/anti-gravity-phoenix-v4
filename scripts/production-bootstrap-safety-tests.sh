@@ -262,22 +262,30 @@ sudo env \
   PHOENIX_OWNER_GROUP="$owner_group" \
   /bin/sh "$context_installer" "" "$repo_root" >/dev/null
 assert_live_canary_context "$repo_root" "$host_root/deploy"
+[ "$(sudo stat -c '%U:%G:%a' "$host_root/deploy")" = "root:$owner_group:750" ] ||
+  fail 'canonical deploy directory is writable by the runtime owner'
+[ "$(sudo stat -c '%U:%G:%a' "$host_root/deploy/compose.prod.yml")" = "root:$owner_group:640" ] ||
+  fail 'canonical root control file ownership or mode is invalid'
+[ "$(sudo stat -c '%U:%G:%a' "$host_root/deploy/.runtime")" = "$owner_user:$owner_group:750" ] ||
+  fail 'operator runtime directory lost its bounded write contract'
+[ "$(sudo stat -c '%U:%G:%a' "$host_root/deploy/.deploy-runtime")" = root:root:700 ] ||
+  fail 'root deployment runtime directory is not isolated'
 snapshot_metadata "$after"
 cmp "$before" "$after" >/dev/null ||
   fail 'release-context installation changed protected metadata or contents'
 [ "$(stat -c '%a' "$prometheus_config")" = 644 ] ||
   fail 'installed Prometheus configuration is not mode 0644'
-chmod 0755 "$host_root/deploy" "$host_root/deploy/prometheus"
+sudo chmod 0755 "$host_root/deploy" "$host_root/deploy/prometheus"
 sudo -u '#65534' -g '#65534' test -r "$prometheus_config" ||
   fail 'mode 0644 Prometheus configuration is unreadable by the runtime identity'
-chmod 0750 "$host_root/deploy" "$host_root/deploy/prometheus"
+sudo chmod 0750 "$host_root/deploy" "$host_root/deploy/prometheus"
 [ "$prometheus_payload_sha" = "$(sudo sha256sum "$prometheus_payload")" ] ||
   fail 'release-context installation changed Prometheus data contents'
 
 compose_target=$host_root/deploy/compose.prod.yml
 compose_backup=$tmp_dir/compose.prod.yml.backup
-mv "$compose_target" "$compose_backup"
-ln -s "$postgres_dir/global/pg_control" "$compose_target"
+sudo mv "$compose_target" "$compose_backup"
+sudo ln -s "$postgres_dir/global/pg_control" "$compose_target"
 if sudo env \
   PHOENIX_DEPLOY_ROOT="$host_root" \
   PHOENIX_ENV_FILE="$valid_env" \
@@ -287,8 +295,8 @@ if sudo env \
 then
   fail 'release-context installation followed a protected-data symlink'
 fi
-rm -f -- "$compose_target"
-mv "$compose_backup" "$compose_target"
+sudo rm -f -- "$compose_target"
+sudo mv "$compose_backup" "$compose_target"
 snapshot_metadata "$after"
 cmp "$before" "$after" >/dev/null ||
   fail 'failed symlink redirect changed protected metadata or contents'

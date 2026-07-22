@@ -23,6 +23,7 @@ Production host layout:
         previous-release
         release-assets.sha
         manifests/
+        .deploy-runtime/  # root-only deployment scratch
     data/
         postgres/
         prometheus/
@@ -36,9 +37,21 @@ Production host layout:
 
 /etc/phoenix/
     phoenix.env
+
+/usr/local/sbin/
+    phoenix-shadow-deploy-gateway
+/usr/local/libexec/phoenix-shadow-deploy/
+    # root-owned deployment helpers
+/var/lib/phoenix-shadow-deploy/
+    # bounded run identity and sanitized result evidence
 ```
 
-The production host pulls prebuilt GHCR images. It does not build Phoenix application source. Canonical host scripts, schemas, route proofs, and the compiled contract artifact come only from the verified exact-SHA release-assets bundle.
+The production host pulls prebuilt GHCR images. It does not build Phoenix
+application source. Canonical host scripts, schemas, route proofs, and the
+compiled contract artifact come only from the verified exact-SHA release-assets
+bundle. Ordinary deployment enters only through the root-owned constrained
+gateway; the SSH account cannot execute staged code or obtain a general
+privileged shell.
 
 Do not expose internal services publicly:
 

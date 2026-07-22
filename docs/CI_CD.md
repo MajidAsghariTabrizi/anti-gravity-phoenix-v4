@@ -78,7 +78,20 @@ Replay is an offline CLI and is not published as a permanent production daemon i
 
 Before SSH, the workflow verifies the checkout is current `main`, both manifests are strict and digest-pinned, the release asset archive and extracted tree are integrity checked, and protected `feed-ingestor` and `recorder` image digests match the active rollback release. Before candidate asset installation, the host's active pointer, asset marker, and integrity-checked immutable rollback tree must also agree. A protected-image change fails closed and requires a separately authorized maintenance gate; this workflow will not recreate protected data-plane services.
 
-After those checks, the workflow installs the exact asset bundle, stages both manifests, verifies the active release equals the rollback SHA, and calls `/opt/phoenix/deploy/deploy-release.sh <sha>`. Deploy and rollback start only `prometheus`, `rpc-gateway`, `shadow-dispatcher`, `phoenix-engine`, and `dashboard`, one at a time with bounded health waits. Relay, feed-ingestor, NATS, PostgreSQL, and Recorder container IDs must remain unchanged.
+After those checks, the workflow uploads only the candidate and rollback
+manifest/provenance pair plus the three candidate release-assets files to a
+deterministic run-bound stage. Its only privileged remote command is
+`sudo -n /usr/local/sbin/phoenix-shadow-deploy-gateway`. The root-owned gateway
+locks and snapshots those inputs, repeats canonical validation, verifies the
+active rollback contract and SHADOW controls, and launches a bounded detached
+systemd oneshot. No script from `/tmp` is executed. Deploy and rollback start
+only `prometheus`, `rpc-gateway`, `shadow-dispatcher`, `phoenix-engine`, and
+`dashboard`, one at a time with bounded health waits. Relay, feed-ingestor,
+NATS, PostgreSQL, and Recorder container IDs must remain unchanged.
+
+The workflow polls sanitized gateway evidence. A successful stage is removed
+only after terminal evidence is retrieved; failed stage and root evidence are
+retained for recovery review.
 
 The workflow uses strict host key checking. It requires only:
 
