@@ -6,7 +6,7 @@ mode=${1:-}
 stage_dir=${2:-}
 confirmation=${3:-}
 
-release_sha=ac4868ae86227dc61ea003cf0e4e96032be9c96c
+release_sha=f1bb82681b02c9f6371c0a8de8c1f498fb307034
 rollback_sha=654dad176fe705d90628b418750a122b8ae30283
 required_confirmation=APPLY_EXACT_PHOENIX_SHADOW_CONTRACT_TRANSITION
 
