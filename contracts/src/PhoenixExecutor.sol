@@ -8,6 +8,8 @@ import "./interfaces/IV3Pool.sol";
 contract PhoenixExecutor is IAaveFlashBorrower {
     error Unauthorized();
     error Paused();
+    error NotPaused();
+    error ExecutionActive();
     error Reentrant();
     error ZeroAddress();
     error ZeroAmount();
@@ -35,6 +37,8 @@ contract PhoenixExecutor is IAaveFlashBorrower {
     event FactoryUpdated(address indexed factory, bool approved);
     event PoolUpdated(address indexed pool, address indexed factory, bool approved);
     event MaximumInputUpdated(uint256 maximumInputAmount);
+    event TokenWithdrawn(address indexed token, address indexed owner, uint256 amount);
+    event NativeWithdrawn(address indexed owner, uint256 amount);
     event OpportunityStarted(bytes32 indexed routeId, address indexed asset, uint256 flashAmount);
     event OpportunitySettled(
         bytes32 indexed routeId, address indexed asset, uint256 flashAmount, uint256 premium, uint256 realizedProfit
@@ -113,6 +117,16 @@ contract PhoenixExecutor is IAaveFlashBorrower {
         _;
     }
 
+    modifier whenPaused() {
+        if (!paused) revert NotPaused();
+        _;
+    }
+
+    modifier whenNoActiveExecution() {
+        if (activeExecution.active) revert ExecutionActive();
+        _;
+    }
+
     modifier nonReentrant() {
         if (entered) revert Reentrant();
         entered = true;
@@ -124,9 +138,13 @@ contract PhoenixExecutor is IAaveFlashBorrower {
         if (initialOwner == address(0) || initialFlashProvider == address(0)) revert ZeroAddress();
         owner = initialOwner;
         flashProvider = initialFlashProvider;
+        paused = true;
         emit OwnershipTransferred(address(0), initialOwner);
         emit FlashProviderUpdated(initialFlashProvider);
+        emit PausedSet(true);
     }
+
+    receive() external payable {}
 
     function transferOwnership(address newOwner) external onlyOwner {
         if (newOwner == address(0)) revert ZeroAddress();
@@ -151,6 +169,28 @@ contract PhoenixExecutor is IAaveFlashBorrower {
     function setPaused(bool value) external onlyOwner {
         paused = value;
         emit PausedSet(value);
+    }
+
+    function withdrawToken(address token, uint256 amount)
+        external
+        onlyOwner
+        whenPaused
+        whenNoActiveExecution
+        nonReentrant
+    {
+        if (token == address(0)) revert ZeroAddress();
+        if (amount == 0) revert ZeroAmount();
+        address recipient = owner;
+        _safeTransfer(token, recipient, amount);
+        emit TokenWithdrawn(token, recipient, amount);
+    }
+
+    function withdrawNative(uint256 amount) external onlyOwner whenPaused whenNoActiveExecution nonReentrant {
+        if (amount == 0) revert ZeroAmount();
+        address recipient = owner;
+        (bool ok,) = payable(recipient).call{value: amount}("");
+        if (!ok) revert TransferFailed();
+        emit NativeWithdrawn(recipient, amount);
     }
 
     function setFlashProvider(address provider) external onlyOwner {

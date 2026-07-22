@@ -2,6 +2,13 @@
 pragma solidity ^0.8.24;
 
 import "../src/PhoenixExecutor.sol";
+import "../script/DeployPhoenixExecutor.s.sol";
+
+interface Vm {
+    function chainId(uint256 newChainId) external;
+
+    function deal(address account, uint256 newBalance) external;
+}
 
 contract MockERC20 is IERC20 {
     string public name;
@@ -84,20 +91,27 @@ contract MockERC20 is IERC20 {
             lastAmountIn = amountIn;
             if (zeroForOne) {
                 MockERC20(token1).mint(recipient, outputAmount);
-                PhoenixExecutor(msg.sender).uniswapV3SwapCallback(int256(amountIn), 0, data);
+                PhoenixExecutor(payable(msg.sender)).uniswapV3SwapCallback(int256(amountIn), 0, data);
                 return (int256(amountIn), -int256(outputAmount));
             }
             MockERC20(token0).mint(recipient, outputAmount);
-            PhoenixExecutor(msg.sender).uniswapV3SwapCallback(0, int256(amountIn), data);
+            PhoenixExecutor(payable(msg.sender)).uniswapV3SwapCallback(0, int256(amountIn), data);
             return (-int256(outputAmount), int256(amountIn));
         }
     }
 
         contract MockAavePool is IAaveV3Pool {
             uint256 public premium;
+            PhoenixExecutor public withdrawalTarget;
+            bytes4 public withdrawalError;
 
             constructor(uint256 p) {
                 premium = p;
+            }
+
+            function acceptExecutorOwnership(PhoenixExecutor target) external {
+                withdrawalTarget = target;
+                target.acceptOwnership();
             }
 
             function flashLoanSimple(
@@ -107,6 +121,20 @@ contract MockERC20 is IERC20 {
                 bytes calldata params,
                 uint16
             ) external override {
+                if (address(withdrawalTarget) != address(0)) {
+                    withdrawalTarget.setPaused(true);
+                    try withdrawalTarget.withdrawToken(asset, 1) {
+                        revert("active withdrawal accepted");
+                    } catch (bytes memory reason) {
+                        if (reason.length >= 4) {
+                            bytes4 selector;
+                            assembly {
+                                selector := mload(add(reason, 32))
+                            }
+                            withdrawalError = selector;
+                        }
+                    }
+                }
                 MockERC20(asset).mint(receiverAddress, amount);
                 bool ok = IAaveFlashBorrower(receiverAddress)
                     .executeOperation(asset, amount, premium, receiverAddress, params);
@@ -116,6 +144,8 @@ contract MockERC20 is IERC20 {
         }
 
         contract PhoenixExecutorTest {
+            Vm private constant vm = Vm(address(uint160(uint256(keccak256("hevm cheat code")))));
+
             MockERC20 usdc;
             MockERC20 weth;
             MockAavePool aave;
@@ -145,7 +175,10 @@ contract MockERC20 is IERC20 {
                 executor.setFactory(address(factory2), true);
                 executor.approvePool(address(pool1), address(factory1), address(usdc), address(weth), 500, true);
                 executor.approvePool(address(pool2), address(factory2), address(weth), address(usdc), 500, true);
+                executor.setPaused(false);
             }
+
+            receive() external payable {}
 
             function opportunity(uint256 minProfit, uint256 deadline)
                 internal
@@ -187,6 +220,98 @@ contract MockERC20 is IERC20 {
                 executor.executeOpportunity(opportunity(5, block.timestamp + 1));
                 require(usdc.balanceOf(address(executor)) == 16, "profit retained");
                 require(pool2.lastAmountIn() == 105, "actual prior output not chained");
+            }
+
+            function testStartsPausedWithNoInputOrApprovals() public {
+                MockAavePool freshAave = new MockAavePool(1);
+                PhoenixExecutor fresh = new PhoenixExecutor(address(this), address(freshAave));
+                require(fresh.paused(), "executor did not start paused");
+                require(fresh.maximumInputAmount() == 0, "maximum input was initialized");
+                require(!fresh.authorizedSearchers(address(this)), "searcher was approved");
+                require(!fresh.approvedAssets(address(usdc)), "asset was approved");
+                require(!fresh.approvedRouters(originRouter), "router was approved");
+                require(!fresh.approvedFactories(address(factory1)), "factory was approved");
+                (,,,, bool approved) = fresh.approvedPools(address(pool1));
+                require(!approved, "pool was approved");
+            }
+
+            function testExecutionFailsFromInitialPausedState() public {
+                setUp();
+                executor.setPaused(true);
+                try executor.executeOpportunity(opportunity(5, block.timestamp + 1)) {
+                    revert("paused execution accepted");
+                } catch {}
+            }
+
+            function testWithdrawalFailsWhileUnpaused() public {
+                setUp();
+                usdc.mint(address(executor), 10);
+                vm.deal(address(executor), 10);
+                try executor.withdrawToken(address(usdc), 1) {
+                    revert("unpaused token withdrawal accepted");
+                } catch {}
+                try executor.withdrawNative(1) {
+                    revert("unpaused native withdrawal accepted");
+                } catch {}
+                require(usdc.balanceOf(address(executor)) == 10, "token balance changed");
+                require(address(executor).balance == 10, "native balance changed");
+            }
+
+            function testOnlyOwnerCanWithdraw() public {
+                setUp();
+                executor.setPaused(true);
+                usdc.mint(address(executor), 10);
+                vm.deal(address(executor), 10);
+                Attacker attacker = new Attacker();
+                require(!attacker.tryWithdrawToken(executor, address(usdc), 1), "non-owner token withdrawal accepted");
+                require(!attacker.tryWithdrawNative(executor, 1), "non-owner native withdrawal accepted");
+            }
+
+            function testTokenWithdrawalWorksWhilePausedAndOnlyPaysOwner() public {
+                setUp();
+                executor.setPaused(true);
+                address other = address(0xCAFE);
+                usdc.mint(address(executor), 10);
+                uint256 ownerBefore = usdc.balanceOf(address(this));
+                executor.withdrawToken(address(usdc), 7);
+                require(usdc.balanceOf(address(this)) == ownerBefore + 7, "owner did not receive tokens");
+                require(usdc.balanceOf(other) == 0, "another recipient received tokens");
+                require(usdc.balanceOf(address(executor)) == 3, "executor token balance mismatch");
+            }
+
+            function testNativeWithdrawalWorksWhilePausedAndOnlyPaysOwner() public {
+                setUp();
+                executor.setPaused(true);
+                address other = address(0xCAFE);
+                vm.deal(address(executor), 10);
+                uint256 ownerBefore = address(this).balance;
+                executor.withdrawNative(7);
+                require(address(this).balance == ownerBefore + 7, "owner did not receive native value");
+                require(other.balance == 0, "another recipient received native value");
+                require(address(executor).balance == 3, "executor native balance mismatch");
+            }
+
+            function testWithdrawalRejectsZeroTokenAndAmounts() public {
+                setUp();
+                executor.setPaused(true);
+                try executor.withdrawToken(address(0), 1) {
+                    revert("zero token accepted");
+                } catch {}
+                try executor.withdrawToken(address(usdc), 0) {
+                    revert("zero token amount accepted");
+                } catch {}
+                try executor.withdrawNative(0) {
+                    revert("zero native amount accepted");
+                } catch {}
+            }
+
+            function testWithdrawalRejectsActiveExecution() public {
+                setUp();
+                executor.setSearcher(address(this), true);
+                executor.transferOwnership(address(aave));
+                aave.acceptExecutorOwnership(executor);
+                executor.executeOpportunity(opportunity(5, block.timestamp + 1));
+                require(aave.withdrawalError() == PhoenixExecutor.ExecutionActive.selector, "active guard not enforced");
             }
 
             function testUnauthorizedCaller() public {
@@ -323,5 +448,50 @@ contract MockERC20 is IERC20 {
                 } catch {
                     return false;
                 }
+            }
+
+            function tryWithdrawToken(PhoenixExecutor executor, address token, uint256 amount) external returns (bool) {
+                try executor.withdrawToken(token, amount) {
+                    return true;
+                } catch {
+                    return false;
+                }
+            }
+
+            function tryWithdrawNative(PhoenixExecutor executor, uint256 amount) external returns (bool) {
+                try executor.withdrawNative(amount) {
+                    return true;
+                } catch {
+                    return false;
+                }
+            }
+        }
+
+        contract DeployPhoenixExecutorScriptTest {
+            Vm private constant vm = Vm(address(uint160(uint256(keccak256("hevm cheat code")))));
+
+            function testDeploysExactArbitrumCanaryConfiguration() public {
+                vm.chainId(42161);
+                DeployPhoenixExecutorScript script = new DeployPhoenixExecutorScript();
+                PhoenixExecutor deployed = script.run();
+
+                require(deployed.owner() == script.INITIAL_OWNER(), "owner mismatch");
+                require(deployed.flashProvider() == script.FLASH_PROVIDER(), "flash provider mismatch");
+                require(deployed.paused(), "deployment not paused");
+                require(deployed.maximumInputAmount() == 0, "deployment input enabled");
+                require(!deployed.authorizedSearchers(script.INITIAL_OWNER()), "searcher approved");
+                require(!deployed.approvedAssets(script.FLASH_PROVIDER()), "asset approved");
+                require(!deployed.approvedRouters(address(script)), "router approved");
+                require(!deployed.approvedFactories(script.INITIAL_OWNER()), "factory approved");
+                (,,,, bool poolApproved) = deployed.approvedPools(script.FLASH_PROVIDER());
+                require(!poolApproved, "pool approved");
+            }
+
+            function testDeploymentRejectsAnotherChain() public {
+                vm.chainId(1);
+                DeployPhoenixExecutorScript script = new DeployPhoenixExecutorScript();
+                try script.deploy() returns (PhoenixExecutor) {
+                    revert("wrong chain accepted");
+                } catch {}
             }
         }
