@@ -17,6 +17,17 @@ OWNED_IMAGES = {
     "dashboard": ("DASHBOARD_IMAGE", "dashboard"),
 }
 
+RELEASE_IMAGES = (
+    "dashboard",
+    "feed-ingestor",
+    "fork-sandbox",
+    "live-executor",
+    "phoenix-engine",
+    "recorder",
+    "rpc-gateway",
+)
+PROTECTED_IMAGES = ("feed-ingestor", "recorder")
+
 EXPECTED_SERVICES = (
     "nitro-feed-relay",
     "nats",
@@ -54,6 +65,7 @@ EXTERNAL_IMAGES = {
 
 SHA_PATTERN = re.compile(r"^[0-9a-f]{40}$")
 DIGEST_PATTERN = re.compile(r"^sha256:[0-9a-f]{64}$")
+RUN_ID_PATTERN = re.compile(r"^[1-9][0-9]{0,19}$")
 IMAGE_PATTERN = re.compile(r"^[^\s@]+@sha256:[0-9a-f]{64}$")
 ROUTE_ID_PATTERN = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
 ROUTE_FINGERPRINT_PATTERN = re.compile(r"^[A-Za-z0-9._:-]{1,256}$")
@@ -182,7 +194,10 @@ def sha256_file(path: Path, missing_code: str) -> str:
 
 def load_manifest(path: Path) -> tuple[dict, str, dict[str, str]]:
     manifest = read_json(path, "RELEASE_MANIFEST_MISSING", "RELEASE_IMAGE_MISMATCH")
-    if not isinstance(manifest, dict) or manifest.get("schema") != "phoenix.release.v1":
+    if not isinstance(manifest, dict) or manifest.get("schema") not in (
+        "phoenix.release.v1",
+        "phoenix.release.v2",
+    ):
         raise ContextError("RELEASE_IMAGE_MISMATCH")
     release_sha = manifest.get("release_sha")
     if not isinstance(release_sha, str) or not SHA_PATTERN.fullmatch(release_sha):
@@ -191,23 +206,82 @@ def load_manifest(path: Path) -> tuple[dict, str, dict[str, str]]:
     if not isinstance(images, dict):
         raise ContextError("RELEASE_IMAGE_MISMATCH")
 
+    inherited = manifest["schema"] == "phoenix.release.v2"
+    build_run_id = manifest.get("build_run_id")
+    if inherited:
+        if (
+            set(manifest)
+            != {
+                "schema",
+                "release_sha",
+                "build_run_id",
+                "created_at",
+                "protected_base_sha",
+                "protected_base_build_run_id",
+                "images",
+            }
+            or not isinstance(build_run_id, str)
+            or not RUN_ID_PATTERN.fullmatch(build_run_id)
+            or not isinstance(manifest.get("protected_base_sha"), str)
+            or not SHA_PATTERN.fullmatch(manifest["protected_base_sha"])
+            or manifest["protected_base_sha"] == release_sha
+            or not isinstance(manifest.get("protected_base_build_run_id"), str)
+            or not RUN_ID_PATTERN.fullmatch(manifest["protected_base_build_run_id"])
+            or tuple(sorted(images)) != RELEASE_IMAGES
+        ):
+            raise ContextError("RELEASE_IMAGE_MISMATCH")
+
     references: dict[str, str] = {}
-    for image_name, (_, repository_name) in OWNED_IMAGES.items():
+    names = RELEASE_IMAGES if inherited else tuple(OWNED_IMAGES)
+    for image_name in names:
         image = images.get(image_name)
         if not isinstance(image, dict):
             raise ContextError("RELEASE_IMAGE_MISMATCH")
         repository = image.get("repository")
         tag = image.get("tag")
         digest = image.get("digest")
-        expected_repository = f"ghcr.io/majidasgharitabrizi/{repository_name}"
+        expected_repository = f"ghcr.io/majidasgharitabrizi/{image_name}"
+        expected_tag = f"sha-{release_sha}"
+        if inherited:
+            if set(image) != {
+                "repository",
+                "tag",
+                "digest",
+                "origin",
+                "source_sha",
+                "source_build_run_id",
+                "oci_revision",
+            }:
+                raise ContextError("RELEASE_IMAGE_MISMATCH")
+            source_sha = image.get("source_sha")
+            source_run_id = image.get("source_build_run_id")
+            if (
+                not isinstance(source_sha, str)
+                or not SHA_PATTERN.fullmatch(source_sha)
+                or not isinstance(source_run_id, str)
+                or not RUN_ID_PATTERN.fullmatch(source_run_id)
+                or image.get("oci_revision") != source_sha
+            ):
+                raise ContextError("RELEASE_IMAGE_MISMATCH")
+            expected_tag = f"sha-{source_sha}"
+            if image_name in PROTECTED_IMAGES:
+                if image.get("origin") != "inherited":
+                    raise ContextError("RELEASE_IMAGE_MISMATCH")
+            elif (
+                image.get("origin") != "built"
+                or source_sha != release_sha
+                or source_run_id != build_run_id
+            ):
+                raise ContextError("RELEASE_IMAGE_MISMATCH")
         if (
             repository != expected_repository
-            or tag != f"sha-{release_sha}"
+            or tag != expected_tag
             or not isinstance(digest, str)
             or not DIGEST_PATTERN.fullmatch(digest)
         ):
             raise ContextError("RELEASE_IMAGE_MISMATCH")
-        references[image_name] = f"{repository}@{digest}"
+        if image_name in OWNED_IMAGES:
+            references[image_name] = f"{repository}@{digest}"
     return manifest, release_sha, references
 
 

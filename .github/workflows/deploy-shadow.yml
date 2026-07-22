@@ -78,6 +78,30 @@ jobs:
           git fetch --no-tags --depth=1 origin main
           [ "$(git rev-parse FETCH_HEAD)" = "$RELEASE_SHA" ] || { echo "release SHA is not current main"; exit 1; }
 
+      - name: Verify successful build run identities
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_SHA: ${{ inputs.release_sha }}
+          BUILD_RUN_ID: ${{ inputs.build_run_id }}
+          ROLLBACK_SHA: ${{ inputs.rollback_sha }}
+          ROLLBACK_BUILD_RUN_ID: ${{ inputs.rollback_build_run_id }}
+        run: |
+          set -euo pipefail
+          mkdir -p build-runs
+          gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${BUILD_RUN_ID}" \
+            > build-runs/release.json
+          gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${ROLLBACK_BUILD_RUN_ID}" \
+            > build-runs/rollback.json
+          python3 scripts/release_provenance.py validate-github-run \
+            --run-evidence build-runs/release.json \
+            --expected-sha "$RELEASE_SHA" \
+            --expected-run-id "$BUILD_RUN_ID"
+          python3 scripts/release_provenance.py validate-github-run \
+            --run-evidence build-runs/rollback.json \
+            --expected-sha "$ROLLBACK_SHA" \
+            --expected-run-id "$ROLLBACK_BUILD_RUN_ID"
+
       - name: Download release manifest
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
         with:
@@ -106,7 +130,9 @@ jobs:
         shell: bash
         env:
           RELEASE_SHA: ${{ inputs.release_sha }}
+          BUILD_RUN_ID: ${{ inputs.build_run_id }}
           ROLLBACK_SHA: ${{ inputs.rollback_sha }}
+          ROLLBACK_BUILD_RUN_ID: ${{ inputs.rollback_build_run_id }}
         run: |
           set -euo pipefail
           python3 scripts/release_assets.py verify \
@@ -114,50 +140,15 @@ jobs:
             --manifest release-assets/release-assets-manifest.json \
             --checksums release-assets/release-assets-checksums.txt \
             --expected-sha "$RELEASE_SHA"
-          python3 - <<'PY'
-          import json
-          import os
-          import re
-          from pathlib import Path
-
-          production = {"dashboard", "feed-ingestor", "phoenix-engine", "recorder", "rpc-gateway"}
-          release = production | {"fork-sandbox"}
-
-          def validate(path, expected_sha, expected_sets):
-              value = json.loads(Path(path).read_text(encoding="utf-8"))
-              if set(value) != {"schema", "release_sha", "created_at", "images"}:
-                  raise SystemExit(f"invalid manifest contract: {path}")
-              if value["schema"] != "phoenix.release.v1" or value["release_sha"] != expected_sha:
-                  raise SystemExit(f"invalid manifest identity: {path}")
-              images = value["images"]
-              if not isinstance(images, dict) or set(images) not in expected_sets:
-                  raise SystemExit(f"invalid manifest image set: {path}")
-              for name, image in images.items():
-                  if set(image) != {"repository", "tag", "digest"}:
-                      raise SystemExit(f"invalid image contract for {name}")
-                  if image["repository"] != f"ghcr.io/majidasgharitabrizi/{name}":
-                      raise SystemExit(f"invalid image repository for {name}")
-                  if image["tag"] != f"sha-{expected_sha}":
-                      raise SystemExit(f"invalid immutable image tag for {name}")
-                  if not re.fullmatch(r"sha256:[0-9a-f]{64}", image["digest"]):
-                      raise SystemExit(f"invalid image digest for {name}")
-              return images
-
-          candidate = validate(
-              "release/release-manifest.json", os.environ["RELEASE_SHA"], (release,)
-          )
-          rollback = validate(
-              "rollback/release-manifest.json",
-              os.environ["ROLLBACK_SHA"],
-              (production, release),
-          )
-          for protected in ("feed-ingestor", "recorder"):
-              if candidate[protected]["digest"] != rollback[protected]["digest"]:
-                  raise SystemExit(
-                      f"protected image digest changed for {protected}; "
-                      "a separately authorized maintenance gate is required"
-                  )
-          PY
+          python3 scripts/release_provenance.py validate-deploy-pair \
+            --release-manifest release/release-manifest.json \
+            --release-provenance release/release-provenance.json \
+            --release-sha "$RELEASE_SHA" \
+            --build-run-id "$BUILD_RUN_ID" \
+            --rollback-manifest rollback/release-manifest.json \
+            --rollback-provenance rollback/release-provenance.json \
+            --rollback-sha "$ROLLBACK_SHA" \
+            --rollback-build-run-id "$ROLLBACK_BUILD_RUN_ID"
 
       - name: Install SSH material
         shell: bash

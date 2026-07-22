@@ -525,10 +525,10 @@ fi
 [ ! -e "$ssh_gate_marker" ] ||
   fail 'SSH or remote maintenance could advance after render validation failed'
 
-grep -F 'protected image digest changed for {protected}' "$normal_workflow" >/dev/null ||
-  fail 'normal deployment no longer rejects changed protected images'
-grep -F 'a separately authorized maintenance gate is required' "$normal_workflow" >/dev/null ||
-  fail 'normal deployment protected-image refusal changed'
+grep -F 'validate-deploy-pair' "$normal_workflow" >/dev/null ||
+  fail 'normal deployment no longer validates protected image identity'
+grep -F 'rollback/release-provenance.json' "$normal_workflow" >/dev/null ||
+  fail 'normal deployment does not bind protected images to rollback provenance'
 
 stop_line=$(grep -n 'stop feed-ingestor' "$runtime" | tail -n 1 | cut -d: -f1)
 recorder_line=$(grep -n 'up -d --no-deps recorder' "$runtime" | tail -n 1 | cut -d: -f1)

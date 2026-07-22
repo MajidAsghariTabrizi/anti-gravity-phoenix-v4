@@ -20,7 +20,10 @@
   ],
   "properties": {
     "schema": {
-      "const": "phoenix.release-provenance.v1"
+      "enum": [
+        "phoenix.release-provenance.v1",
+        "phoenix.release-provenance.v2"
+      ]
     },
     "repository": {
       "const": "MajidAsghariTabrizi/anti-gravity-phoenix-v4"
@@ -29,15 +32,13 @@
       "const": "Build Phoenix Images"
     },
     "release_sha": {
-      "type": "string",
-      "pattern": "^[0-9a-f]{40}$"
+      "$ref": "#/$defs/sha"
     },
     "release_intent": {
       "const": "PHOENIX_PRELIVE_SHADOW_V5"
     },
     "build_run_id": {
-      "type": "string",
-      "pattern": "^[1-9][0-9]{0,19}$"
+      "$ref": "#/$defs/runId"
     },
     "quarantine": {
       "type": "object",
@@ -57,8 +58,7 @@
             "const": "29683234024"
           },
           "items": {
-            "type": "string",
-            "pattern": "^[1-9][0-9]{0,19}$"
+            "$ref": "#/$defs/runId"
           }
         }
       }
@@ -94,27 +94,13 @@
         "rpc-gateway"
       ],
       "properties": {
-        "dashboard": {
-          "$ref": "#/$defs/fragment"
-        },
-        "feed-ingestor": {
-          "$ref": "#/$defs/fragment"
-        },
-        "fork-sandbox": {
-          "$ref": "#/$defs/fragment"
-        },
-        "live-executor": {
-          "$ref": "#/$defs/fragment"
-        },
-        "phoenix-engine": {
-          "$ref": "#/$defs/fragment"
-        },
-        "recorder": {
-          "$ref": "#/$defs/fragment"
-        },
-        "rpc-gateway": {
-          "$ref": "#/$defs/fragment"
-        }
+        "dashboard": { "$ref": "#/$defs/fragment" },
+        "feed-ingestor": { "$ref": "#/$defs/fragment" },
+        "fork-sandbox": { "$ref": "#/$defs/fragment" },
+        "live-executor": { "$ref": "#/$defs/fragment" },
+        "phoenix-engine": { "$ref": "#/$defs/fragment" },
+        "recorder": { "$ref": "#/$defs/fragment" },
+        "rpc-gateway": { "$ref": "#/$defs/fragment" }
       }
     },
     "release_assets": {
@@ -134,22 +120,95 @@
         "archive_name": {
           "type": "string"
         },
-        "archive_sha256": {
-          "$ref": "#/$defs/digest"
-        },
-        "manifest_sha256": {
-          "$ref": "#/$defs/digest"
-        },
-        "checksums_sha256": {
-          "$ref": "#/$defs/digest"
-        }
+        "archive_sha256": { "$ref": "#/$defs/digest" },
+        "manifest_sha256": { "$ref": "#/$defs/digest" },
+        "checksums_sha256": { "$ref": "#/$defs/digest" }
       }
     },
     "release_manifest_sha256": {
       "$ref": "#/$defs/digest"
+    },
+    "protected_base": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "release_sha",
+        "build_run_id",
+        "release_manifest_sha256",
+        "release_provenance_sha256"
+      ],
+      "properties": {
+        "release_sha": { "$ref": "#/$defs/sha" },
+        "build_run_id": { "$ref": "#/$defs/runId" },
+        "release_manifest_sha256": { "$ref": "#/$defs/digest" },
+        "release_provenance_sha256": { "$ref": "#/$defs/digest" }
+      }
+    },
+    "built_images": {
+      "type": "array",
+      "minItems": 5,
+      "maxItems": 5,
+      "uniqueItems": true,
+      "items": {
+        "enum": [
+          "dashboard",
+          "fork-sandbox",
+          "live-executor",
+          "phoenix-engine",
+          "rpc-gateway"
+        ]
+      }
+    },
+    "inherited_images": {
+      "type": "array",
+      "minItems": 2,
+      "maxItems": 2,
+      "uniqueItems": true,
+      "items": {
+        "enum": [
+          "feed-ingestor",
+          "recorder"
+        ]
+      }
     }
   },
+  "oneOf": [
+    {
+      "properties": {
+        "schema": {
+          "const": "phoenix.release-provenance.v1"
+        }
+      },
+      "not": {
+        "anyOf": [
+          { "required": ["protected_base"] },
+          { "required": ["built_images"] },
+          { "required": ["inherited_images"] }
+        ]
+      }
+    },
+    {
+      "required": [
+        "protected_base",
+        "built_images",
+        "inherited_images"
+      ],
+      "properties": {
+        "schema": {
+          "const": "phoenix.release-provenance.v2"
+        }
+      }
+    }
+  ],
   "$defs": {
+    "sha": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{40}$"
+    },
+    "runId": {
+      "type": "string",
+      "pattern": "^[1-9][0-9]{0,19}$"
+    },
     "digest": {
       "type": "string",
       "pattern": "^sha256:[0-9a-f]{64}$"

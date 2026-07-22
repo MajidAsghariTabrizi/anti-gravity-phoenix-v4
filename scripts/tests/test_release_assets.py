@@ -72,6 +72,7 @@ class ReleaseAssetsTests(unittest.TestCase):
             self.assertIn("scripts/prelive_v5_release.py", paths)
             self.assertIn("scripts/release_provenance.py", paths)
             self.assertIn("deploy/prelive-v5-release.example.json", paths)
+            self.assertIn("schemas/phoenix-release-manifest.schema.json", paths)
             self.assertIn("schemas/phoenix-release-provenance.schema.json", paths)
             self.assertIn("schemas/phoenix-prelive-v5-release.schema.json", paths)
             self.assertTrue(
