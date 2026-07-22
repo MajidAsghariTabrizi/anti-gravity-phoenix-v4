@@ -131,13 +131,62 @@ compose_with() (
   compose_operator_env=$1
   compose_release_env=$2
   shift 2
-  unset COMPOSE_FILE COMPOSE_PROFILES ENGINE_ROUTE_REGISTRY_JSON
+  unset \
+    COMPOSE_FILE \
+    COMPOSE_PROFILES \
+    DASHBOARD_IMAGE \
+    ENGINE_ROUTE_REGISTRY_JSON \
+    FEED_INGESTOR_IMAGE \
+    PHOENIX_ENGINE_IMAGE \
+    PHOENIX_RELEASE_SHA \
+    RECORDER_IMAGE \
+    RPC_GATEWAY_IMAGE
   PHOENIX_ENV_FILE="$compose_operator_env" PHOENIX_RELEASE_ENV="$compose_release_env" \
     docker compose \
       --project-directory "$deploy_dir" \
       --env-file "$compose_operator_env" \
       --env-file "$compose_release_env" \
       -f "$deploy_dir/compose.prod.yml" "$@"
+)
+
+compose_service_image() (
+  compose_image_operator_env=$1
+  compose_image_release_env=$2
+  compose_image_service=$3
+  case "$compose_image_service" in
+    recorder) ;;
+    *) exit 1 ;;
+  esac
+  compose_with \
+    "$compose_image_operator_env" "$compose_image_release_env" \
+    config --format json |
+    python3 -c '
+import json
+import sys
+
+try:
+    value = json.load(sys.stdin)
+    image = value["services"][sys.argv[1]]["image"]
+except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+    raise SystemExit(1)
+if not isinstance(image, str) or not image or any(char in image for char in "\r\n\t"):
+    raise SystemExit(1)
+print(image)
+' "$compose_image_service"
+)
+
+read_postgres_identity() (
+  identity_env_file=$1
+  identity_name=$2
+  unset POSTGRES_DB POSTGRES_USER
+  set +a
+  # shellcheck disable=SC1090
+  . "$identity_env_file"
+  case "$identity_name" in
+    database) printf '%s' "${POSTGRES_DB-}" ;;
+    user) printf '%s' "${POSTGRES_USER-}" ;;
+    *) exit 1 ;;
+  esac
 )
 
 container_id() (
@@ -151,6 +200,31 @@ container_id() (
     awk 'NF { count += 1 } END { print count + 0 }')
   [ "$container_count" -eq 1 ] || exit 1
   printf '%s\n' "$container_ids" | awk 'NF { print; exit }'
+)
+
+assert_candidate_recorder_identity() (
+  identity_operator_env=$1
+  identity_release_env=$2
+  identity_expected_reference=$3
+  identity_expected_image_id=$4
+  identity_expected_revision=$5
+  identity_container_id=$(container_id \
+    "$identity_operator_env" "$identity_release_env" recorder) || exit 1
+  identity_value=$(docker inspect --format \
+    '{{.Config.Image}}|{{.Image}}' "$identity_container_id" 2>/dev/null) || exit 1
+  old_ifs=$IFS
+  IFS='|' read -r identity_reference identity_image_id identity_extra <<EOF
+$identity_value
+EOF
+  IFS=$old_ifs
+  [ -n "$identity_reference" ] && [ -n "$identity_image_id" ] && \
+    [ -z "$identity_extra" ] || exit 1
+  [ "$identity_reference" = "$identity_expected_reference" ] || exit 1
+  [ "$identity_image_id" = "$identity_expected_image_id" ] || exit 1
+  identity_revision=$(docker image inspect --format \
+    '{{index .Config.Labels "org.opencontainers.image.revision"}}' \
+    "$identity_image_id" 2>/dev/null) || exit 1
+  [ "$identity_revision" = "$identity_expected_revision" ]
 )
 
 service_healthy() (
@@ -268,7 +342,8 @@ capture_database() (
   database_output=$3
   compose_with "$database_operator_env" "$database_release_env" exec -T postgres \
     psql -X -qAt -v ON_ERROR_STOP=1 \
-      -U "$POSTGRES_USER" -d "$POSTGRES_DB" >"$database_output" <<'SQL'
+      -U "$operator_postgres_user" -d "$operator_postgres_db" \
+      >"$database_output" <<'SQL'
 SELECT json_build_object(
   'migrations',
   COALESCE(
@@ -678,6 +753,22 @@ start_service() {
     "$start_operator_env" "$start_release_env" "$start_service_name"
 }
 
+start_candidate_recorder() {
+  candidate_start_operator_env=$1
+  candidate_start_release_env=$2
+  candidate_start_reference=$3
+  candidate_start_image_id=$4
+  candidate_start_revision=$5
+  compose_with "$candidate_start_operator_env" "$candidate_start_release_env" \
+    up -d --no-deps recorder >/dev/null || return 1
+  assert_candidate_recorder_identity \
+    "$candidate_start_operator_env" "$candidate_start_release_env" \
+    "$candidate_start_reference" "$candidate_start_image_id" \
+    "$candidate_start_revision" || return 1
+  wait_service_healthy \
+    "$candidate_start_operator_env" "$candidate_start_release_env" recorder
+}
+
 restore_initial_optional_services() {
   restore_operator_env=$1
   restore_release_env=$2
@@ -980,11 +1071,13 @@ python3 "$helper" install-route-env \
   >"$state_dir/candidate-env-validation.log" ||
   fail 'candidate production environment validation failed'
 
-set -a
-# shellcheck disable=SC1090
-. "$env_file"
-set +a
-[ "$POSTGRES_DB" = phoenix_v5_654dad17 ] ||
+unset operator_postgres_db operator_postgres_user
+operator_postgres_user=$(read_postgres_identity "$env_file" user) ||
+  fail 'PostgreSQL user identity could not be read'
+operator_postgres_db=$(read_postgres_identity "$env_file" database) ||
+  fail 'PostgreSQL database identity could not be read'
+[ -n "$operator_postgres_user" ] || fail 'PostgreSQL user identity is empty'
+[ "$operator_postgres_db" = phoenix_v5_654dad17 ] ||
   fail 'PostgreSQL database identity is not phoenix_v5_654dad17'
 
 "$release_tree/scripts/render-production-compose.sh" \
@@ -1094,6 +1187,11 @@ install -m 0640 "$recorder_config_report" "$recorder_config_evidence" ||
   fail 'sanitized candidate Recorder config evidence could not be retained'
 [ "$recorder_config_valid" -eq 1 ] ||
   fail 'candidate Recorder configuration preflight failed'
+candidate_runtime_recorder_image=$(compose_service_image \
+  "$candidate_env" "$release_env" recorder) ||
+  fail 'candidate runtime Recorder image could not be rendered'
+[ "$candidate_runtime_recorder_image" = "$candidate_recorder_image" ] ||
+  fail 'candidate runtime Recorder image differs from the reviewed plan'
 
 "$deploy_dir/render-production-compose.sh" \
   --compose-file "$deploy_dir/compose.prod.yml" \
@@ -1123,7 +1221,7 @@ assert_protected_healthy "$env_file" "$rollback_env" ||
 assert_forbidden_services_stopped "$env_file" "$rollback_env" ||
   fail 'migration-runner or live-executor is active'
 compose_with "$env_file" "$rollback_env" exec -T postgres \
-  pg_isready -U "$POSTGRES_USER" -d "$POSTGRES_DB" >/dev/null ||
+  pg_isready -U "$operator_postgres_user" -d "$operator_postgres_db" >/dev/null ||
   fail 'PostgreSQL readiness failed'
 compose_with "$env_file" "$rollback_env" exec -T nats wget -q -O - \
   'http://127.0.0.1:8222/healthz?js-enabled-only=true' >/dev/null ||
@@ -1332,7 +1430,10 @@ install_active_file \
   "$release_env" "$deploy_dir/manifests/$release_sha.env" phoenix phoenix 0640 ||
   fail 'candidate image environment installation failed'
 
-if ! start_service "$env_file" "$release_env" recorder; then
+if ! start_candidate_recorder \
+  "$env_file" "$release_env" "$candidate_recorder_image" \
+  "$candidate_recorder_image_id" "$release_sha"
+then
   capture_recorder_health_failure_diagnostics \
     candidate "$env_file" "$release_env" ||
     echo \
