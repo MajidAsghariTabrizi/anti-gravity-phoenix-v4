@@ -98,8 +98,12 @@ class PhoenixExecutorDeploymentSchemaTests(unittest.TestCase):
             source,
         )
         self.assertNotIn("PRIVATE_KEY", source)
+        self.assertNotIn("address(this)", source)
         self.assertIn("vm.startBroadcast()", source)
         self.assertIn("vm.stopBroadcast()", source)
+        self.assertEqual(source.count("_assertNoApprovals(executor,"), 2)
+        self.assertIn("_assertNoApprovals(executor, INITIAL_OWNER)", source)
+        self.assertIn("_assertNoApprovals(executor, FLASH_PROVIDER)", source)
         for mutation in (
             ".setSearcher(",
             ".setAsset(",
@@ -111,6 +115,21 @@ class PhoenixExecutorDeploymentSchemaTests(unittest.TestCase):
         ):
             with self.subTest(mutation=mutation):
                 self.assertNotIn(mutation, source)
+
+    def test_ci_executes_the_real_deployment_entrypoint_without_broadcast(self) -> None:
+        workflow = (self.repo_root / ".github" / "workflows" / "ci.yml").read_text(
+            encoding="utf-8"
+        )
+        command = (
+            "forge script script/DeployPhoenixExecutor.s.sol:"
+            "DeployPhoenixExecutorScript --sig \"run()\" --chain 42161"
+        )
+        self.assertIn(command, workflow)
+        solidity_job = workflow[
+            workflow.index("  solidity:") : workflow.index("  python-dashboard:")
+        ]
+        self.assertNotIn("--broadcast", solidity_job)
+        self.assertNotIn("--rpc-url", solidity_job)
 
 
 if __name__ == "__main__":

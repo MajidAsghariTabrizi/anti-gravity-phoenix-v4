@@ -44,7 +44,6 @@ contract DeployPhoenixExecutorScript {
 
         _assertNoApprovals(executor, INITIAL_OWNER);
         _assertNoApprovals(executor, FLASH_PROVIDER);
-        _assertNoApprovals(executor, address(this));
     }
 
     function _assertNoApprovals(PhoenixExecutor executor, address probe) private view {

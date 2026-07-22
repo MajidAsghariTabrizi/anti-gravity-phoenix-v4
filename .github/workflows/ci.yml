@@ -339,6 +339,7 @@ jobs:
           cd contracts
           forge fmt --check
           forge test
+          forge script script/DeployPhoenixExecutor.s.sol:DeployPhoenixExecutorScript --sig "run()" --chain 42161
 
   python-dashboard:
     name: python-dashboard
