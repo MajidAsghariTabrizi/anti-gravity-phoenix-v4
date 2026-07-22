@@ -17,17 +17,96 @@ ROUTE_PATH = REPO_ROOT / "fixtures/routes/weth_usdc_uniswap_v3.json"
 PROOF_PATH = REPO_ROOT / transition.ROUTE_PROOF_PATH
 SHELL_PATH = REPO_ROOT / "scripts/prelive-shadow-contract-transition.sh"
 RECORDER_CONTAINER_ID = "a" * 64
+EXPECTED_RELEASE_SHA = "f1bb82681b02c9f6371c0a8de8c1f498fb307034"
+EXPECTED_RELEASE_RUN_ID = "29896352400"
+EXPECTED_ROLLBACK_SHA = "654dad176fe705d90628b418750a122b8ae30283"
+EXPECTED_ROLLBACK_RUN_ID = "29689298132"
+RETIRED_RELEASE_SHA = "ac4868ae86227dc61ea003cf0e4e96032be9c96c"
+RETIRED_RELEASE_RUN_ID = "29819429567"
+EXPECTED_CANDIDATE_PROOF_SHA256 = (
+    "sha256:2a1e6ef082c74fecd30673be1261939208f9e0c21a51a76683c2717e55beee8a"
+)
+EXPECTED_ROLLBACK_PROOF_SHA256 = (
+    "sha256:0027d6367df0c00767a351794f48c98861b5c86caa2a3413f0e7eefaddd6afbb"
+)
+EXPECTED_CANDIDATE_ROUTE_HASH = (
+    "sha256:796a9a497990ada50c08d7050ced9e502a236fab769fd0687a2497b1f4e4349c"
+)
+EXPECTED_ROLLBACK_ROUTE_HASH = (
+    "sha256:ad8786f06023a37294a93a697bacfa6287b3a98fbde70ef9bf169e20202dc8ee"
+)
+EXPECTED_IMAGE_DIGESTS = {
+    "release": {
+        "dashboard": "sha256:e1d8db8966339a4c30c334382c43b819e9158c75c0ddd952abd1afc4a0d48636",
+        "feed-ingestor": "sha256:2b571944435c0aa0c5fe1cd1c999643bc81a22d132c17b6d8cf4f73aaebd064a",
+        "fork-sandbox": "sha256:b8f6391441a9626bb0eeffb61a8918d6edd9dc78ff3dc86a28220b66d4a7a2e6",
+        "live-executor": "sha256:dcc6cd27e155dca89ad15fd4e4575fe88bc015afdeea991619337419359a1d8a",
+        "phoenix-engine": "sha256:d9b765b9d4d77dade941a93c4115caac749926746b482e537b21411314a484f0",
+        "recorder": "sha256:87be00afe97786ed3eecebbb022e3c7d41594d80ceb85a491fba49dfb3fa32f7",
+        "rpc-gateway": "sha256:016c51bbd5908e31e8b6d8d0b90efc3f5fce583a0512d0aa8d564d3f73da0ac5",
+    },
+    "rollback": {
+        "dashboard": "sha256:1ea82888c883e52bedf2932cd19034cba4a90777a79e76f1b4fae7a9a510d359",
+        "feed-ingestor": "sha256:ac14d8f0fb521c03a7c11c8763892bd4ff00974a57e3432ecca86c53ffe75c55",
+        "fork-sandbox": "sha256:560fc9aac37342a524b85b634a3b18416ead8679c8bae2cbdfaaa46ce7558e50",
+        "phoenix-engine": "sha256:feba279ae3b1040a31c77edf58b57b6410a642e47709b280716e825b0c524268",
+        "recorder": "sha256:7d3120a8c0a9f40640f36e803758fc54359d20674ca1d45eeee7c23687467d28",
+        "rpc-gateway": "sha256:57e0b8119a967b8ccdfc903ae80bef0b131874b4b1bd4c9bca605fc0dac6c5e8",
+    },
+}
+EXPECTED_IMAGE_REFERENCES = {
+    role: {
+        name: f"ghcr.io/majidasgharitabrizi/{name}@{digest_value}"
+        for name, digest_value in digests.items()
+    }
+    for role, digests in EXPECTED_IMAGE_DIGESTS.items()
+}
+EXPECTED_ARTIFACT_SHA256 = {
+    "release": {
+        "archive": (
+            "sha256:26d93556d7a00e66a1da5c3ed5c4f0002b496232f1150629975617db83cb94bb"
+        ),
+        "assets_manifest": (
+            "sha256:8aeddfdcdeb1bb8e17fd2347f3ec33808678fa0129e38eb6c3e3c1f534955b2d"
+        ),
+        "checksums": (
+            "sha256:83c41ca421ce0c2cd3369b8a4bd6a417af8ae513b0f460dc5f92990ad4d53caf"
+        ),
+        "provenance": (
+            "sha256:bd2a695f1fd111719e2754906a8fed6215bda5e657e6bfc927e84f2489bf8868"
+        ),
+        "release_manifest": (
+            "sha256:d154f84df7b88ee204c2d4e982c0f7c9dc65857b8aeb2e7026b57d242018024d"
+        ),
+        "run_evidence": (
+            "sha256:143839da4e3e868d88d00d30cfcbc05936d39ed68ae2572c657c084c0ec4bd42"
+        ),
+    },
+    "rollback": {
+        "archive": (
+            "sha256:046653f4bfa02fbd61e036fff3281fc0c2630acb06fcc9e0794cf834f64cbd51"
+        ),
+        "assets_manifest": (
+            "sha256:ab042e2a485f8dc1551bd8caa62063275e57636315c160983c63b1248975eb10"
+        ),
+        "checksums": (
+            "sha256:f168d7589732d09801499aecfe1561d247659ff6972b9dfb8147a78c21a02249"
+        ),
+        "provenance": (
+            "sha256:2fd04da00e3bb193f045a5618884dfe31e028b30615e777a5f7654b746faa539"
+        ),
+        "release_manifest": (
+            "sha256:f96334966fe2de08cf1a1fd6a65c9f7c9910b7af737b5ec73d6359cdca39e2a7"
+        ),
+        "run_evidence": (
+            "sha256:872f86a3f2144699d976f014faec67c841f1cf2c133f171e04a96cbbf2341796"
+        ),
+    },
+}
 
 
 def digest(value: int) -> str:
     return f"sha256:{value:064x}"
-
-
-def image_references(names: tuple[str, ...], offset: int) -> dict[str, str]:
-    return {
-        name: f"ghcr.io/majidasgharitabrizi/{name}@{digest(offset + index)}"
-        for index, name in enumerate(names, start=1)
-    }
 
 
 def assets(route_digest: str) -> dict[str, dict[str, object]]:
@@ -46,37 +125,23 @@ def assets(route_digest: str) -> dict[str, dict[str, object]]:
 
 def release_evidence() -> dict:
     return {
-        "sha": transition.RELEASE_SHA,
-        "run_id": transition.RELEASE_RUN_ID,
-        "images": image_references(transition.CURRENT_IMAGES, 10),
-        "assets": assets(transition.CANDIDATE_PROOF_SHA256),
+        "sha": EXPECTED_RELEASE_SHA,
+        "run_id": EXPECTED_RELEASE_RUN_ID,
+        "images": dict(EXPECTED_IMAGE_REFERENCES["release"]),
+        "assets": assets(EXPECTED_CANDIDATE_PROOF_SHA256),
         "proof": PROOF_PATH.read_bytes(),
-        "artifact_sha256": {
-            "archive": digest(1),
-            "assets_manifest": digest(2),
-            "checksums": digest(3),
-            "release_manifest": digest(4),
-            "provenance": digest(5),
-            "run_evidence": digest(6),
-        },
+        "artifact_sha256": dict(EXPECTED_ARTIFACT_SHA256["release"]),
     }
 
 
 def rollback_evidence() -> dict:
     return {
-        "sha": transition.ROLLBACK_SHA,
-        "run_id": transition.ROLLBACK_RUN_ID,
-        "images": image_references(transition.LEGACY_IMAGES, 30),
-        "assets": assets(transition.ROLLBACK_PROOF_SHA256),
+        "sha": EXPECTED_ROLLBACK_SHA,
+        "run_id": EXPECTED_ROLLBACK_RUN_ID,
+        "images": dict(EXPECTED_IMAGE_REFERENCES["rollback"]),
+        "assets": assets(EXPECTED_ROLLBACK_PROOF_SHA256),
         "proof": b"not used after immutable verification",
-        "artifact_sha256": {
-            "archive": digest(11),
-            "assets_manifest": digest(12),
-            "checksums": digest(13),
-            "release_manifest": digest(14),
-            "provenance": digest(15),
-            "run_evidence": digest(16),
-        },
+        "artifact_sha256": dict(EXPECTED_ARTIFACT_SHA256["rollback"]),
     }
 
 
@@ -427,8 +492,27 @@ class ShadowContractTransitionTests(unittest.TestCase):
         self.shell = SHELL_PATH.read_text(encoding="utf-8")
 
     def test_exact_reviewed_pair_passes_plan_validation(self) -> None:
-        self.assertEqual(self.plan["release_sha"], transition.RELEASE_SHA)
-        self.assertEqual(self.plan["rollback_sha"], transition.ROLLBACK_SHA)
+        self.assertEqual(transition.RELEASE_SHA, EXPECTED_RELEASE_SHA)
+        self.assertEqual(transition.RELEASE_RUN_ID, EXPECTED_RELEASE_RUN_ID)
+        self.assertEqual(transition.ROLLBACK_SHA, EXPECTED_ROLLBACK_SHA)
+        self.assertEqual(transition.ROLLBACK_RUN_ID, EXPECTED_ROLLBACK_RUN_ID)
+        self.assertEqual(
+            transition.CANDIDATE_PROOF_SHA256, EXPECTED_CANDIDATE_PROOF_SHA256
+        )
+        self.assertEqual(
+            transition.ROLLBACK_PROOF_SHA256, EXPECTED_ROLLBACK_PROOF_SHA256
+        )
+        self.assertEqual(
+            transition.CANDIDATE_ROUTE_HASH, EXPECTED_CANDIDATE_ROUTE_HASH
+        )
+        self.assertEqual(transition.ROLLBACK_ROUTE_HASH, EXPECTED_ROLLBACK_ROUTE_HASH)
+        self.assertEqual(self.plan["release_sha"], EXPECTED_RELEASE_SHA)
+        self.assertEqual(self.plan["rollback_sha"], EXPECTED_ROLLBACK_SHA)
+        self.assertEqual(self.plan["images"], EXPECTED_IMAGE_REFERENCES)
+        self.assertEqual(self.plan["artifacts"], EXPECTED_ARTIFACT_SHA256)
+        self.assertIn(f"release_sha={EXPECTED_RELEASE_SHA}", self.shell)
+        self.assertNotIn(RETIRED_RELEASE_SHA, self.shell)
+        self.assertNotIn(RETIRED_RELEASE_RUN_ID, self.shell)
         transition.validate_plan(deepcopy(self.plan))
 
     def test_any_other_release_or_rollback_identity_fails(self) -> None:
