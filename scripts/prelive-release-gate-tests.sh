@@ -13,6 +13,7 @@ installer=$script_dir/install-release-assets.sh
 bootstrap=$script_dir/bootstrap-production.sh
 context_installer=$script_dir/install-production-release-context.sh
 provisioner=$script_dir/provision-production-host.sh
+gateway_helper=$script_dir/phoenix_shadow_deploy.py
 
 fail() {
   echo "prelive-release-gate-tests: $1" >&2
@@ -38,12 +39,17 @@ grep -F 'validate-deploy-pair' "$deploy_workflow" >/dev/null ||
   fail 'protected image inheritance is not validated before SSH'
 grep -F 'protected image changed for {name}; maintenance is required' "$release_validator" >/dev/null ||
   fail 'legacy protected image changes are not rejected'
-grep -F 'asset_sha=$(tr -d' "$deploy_workflow" >/dev/null ||
-  fail 'active rollback release-assets identity is not checked before installation'
-grep -F 'release_assets.py verify-tree' "$deploy_workflow" >/dev/null ||
-  fail 'active rollback release-assets integrity is not checked before installation'
-grep -F 'scripts/install-production-release-context.sh' "$deploy_workflow" >/dev/null ||
-  fail 'deployment does not stage the scoped release-context installer'
+grep -F 'validate_host(identity)' "$gateway_helper" >/dev/null ||
+  fail 'gateway does not verify active rollback host identity before installation'
+grep -F 'validate_immutable_tree(deploy_root / "releases"' "$gateway_helper" >/dev/null ||
+  fail 'gateway does not verify the active immutable rollback tree'
+grep -F 'ssh "${ssh_opts[@]}" "$remote" sudo -n "$gateway" "$@"' "$deploy_workflow" >/dev/null ||
+  fail 'deployment does not use the constrained root gateway'
+grep -F 'gateway_remote start "${gateway_args[@]}"' "$deploy_workflow" >/dev/null ||
+  fail 'deployment does not start the bounded gateway operation'
+if grep -E 'sudo /bin/sh|scripts/.*\.(sh|py).*\$remote_stage' "$deploy_workflow" >/dev/null; then
+  fail 'deployment stages or invokes mutable privileged code'
+fi
 if grep -E 'SIGNER_PRIVATE_KEY|WALLET_ADDRESS|EXECUTOR_ADDRESS|eth_send(Raw)?Transaction' "$deploy_workflow" >/dev/null; then
   fail 'deployment workflow contains forbidden LIVE configuration or submission methods'
 fi

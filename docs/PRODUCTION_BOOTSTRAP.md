@@ -42,6 +42,31 @@ Initial host preparation may run from a trusted Phoenix release checkout:
 sudo sh scripts/bootstrap-production.sh
 ```
 
+## Ordinary Deployment Gateway
+
+Install the reviewed gateway once, interactively, from a clean checkout of the
+exact merged release SHA:
+
+```bash
+sudo /bin/sh scripts/install-shadow-deploy-gateway.sh
+```
+
+The installer atomically installs root-owned helpers under
+`/usr/local/libexec/phoenix-shadow-deploy`, the fixed executable
+`/usr/local/sbin/phoenix-shadow-deploy-gateway`, and an exact sudoers fragment
+that grants `phoenix` passwordless access only to that executable. It validates
+the fragment with `visudo -cf`, rejects linked targets, and hardens canonical
+deploy code to `root:phoenix` without touching PostgreSQL, NATS, Feed, Recorder,
+or their data. The installer is never invoked by a deployment workflow.
+
+Verify the reviewed sudoers installation before dispatching an ordinary
+deployment:
+
+```bash
+sudo visudo -cf /etc/sudoers.d/phoenix-shadow-deploy
+sudo -u phoenix sudo -n /usr/local/sbin/phoenix-shadow-deploy-gateway --help
+```
+
 Every deployable release must instead use the three artifacts emitted by the
 successful exact-SHA image workflow:
 

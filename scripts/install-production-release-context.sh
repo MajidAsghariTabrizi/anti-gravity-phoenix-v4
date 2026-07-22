@@ -77,14 +77,19 @@ install_source() {
   if [ -e "$target_path" ] &&
     [ "$(readlink -f "$source_path")" = "$(readlink -f "$target_path")" ]
   then
+    chown "root:$owner_group" "$target_path"
+    chmod "$target_mode" "$target_path"
     return
   fi
-  install -m "$target_mode" -o "$owner_user" -g "$owner_group" \
+  install -m "$target_mode" -o root -g "$owner_group" \
     "$source_path" "$target_path"
 }
 
 ensure_deploy_directory() {
   context_path=$1
+  context_owner=$2
+  context_group=$3
+  context_mode=$4
   if [ -L "$context_path" ]; then
     fail "release context directory must not be a symlink: $context_path"
   fi
@@ -92,13 +97,13 @@ ensure_deploy_directory() {
     [ -d "$context_path" ] ||
       fail "release context path is not a directory: $context_path"
   fi
-  install -d -m 0750 -o "$owner_user" -g "$owner_group" "$context_path"
+  install -d -m "$context_mode" -o "$context_owner" -g "$context_group" \
+    "$context_path"
 }
 
 for context_directory in \
   "$deploy_dir" \
   "$deploy_dir/manifests" \
-  "$deploy_dir/.runtime" \
   "$deploy_dir/prometheus" \
   "$deploy_dir/sql" \
   "$deploy_dir/schemas" \
@@ -107,8 +112,10 @@ for context_directory in \
   "$deploy_dir/live-executor" \
   "$deploy_dir/live-executor/schema"
 do
-  ensure_deploy_directory "$context_directory"
+  ensure_deploy_directory "$context_directory" root "$owner_group" 0750
 done
+ensure_deploy_directory "$deploy_dir/.runtime" "$owner_user" "$owner_group" 0750
+ensure_deploy_directory "$deploy_dir/.deploy-runtime" root root 0700
 
 install_source "$source_root/compose.prod.yml" "$deploy_dir/compose.prod.yml" 0640
 install_source \
@@ -206,7 +213,7 @@ if [ -n "$release_sha" ]; then
   marker=$(mktemp "$deploy_dir/.release-assets.XXXXXX") ||
     fail 'release marker staging failed'
   printf '%s\n' "$release_sha" >"$marker"
-  chown "$owner_user:$owner_group" "$marker"
+  chown "root:$owner_group" "$marker"
   chmod 0640 "$marker"
   mv "$marker" "$deploy_dir/release-assets.sha"
 fi

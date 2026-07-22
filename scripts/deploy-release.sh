@@ -15,7 +15,8 @@ current_env="$deploy_dir/current-release.env"
 current_state="$deploy_dir/current-release.json"
 current_context="$deploy_dir/current-release-context.json"
 previous_file="$deploy_dir/previous-release"
-runtime_dir="$deploy_dir/.runtime"
+runtime_dir="${PHOENIX_DEPLOY_RUNTIME_DIR:-$deploy_dir/.deploy-runtime}"
+rollback_script="${PHOENIX_ROLLBACK_SCRIPT:-$deploy_dir/rollback-release.sh}"
 release_assets_file="$deploy_dir/release-assets.sha"
 protected_services='nitro-feed-relay feed-ingestor nats postgres recorder'
 optional_services='prometheus rpc-gateway shadow-dispatcher phoenix-engine dashboard'
@@ -44,8 +45,10 @@ esac
 
 command -v python3 >/dev/null 2>&1 || fail "python3 is unavailable"
 command -v cmp >/dev/null 2>&1 || fail "cmp is unavailable"
+[ -f "$rollback_script" ] && [ ! -L "$rollback_script" ] ||
+  fail "rollback script is missing or unsafe"
 mkdir -p "$runtime_dir"
-chmod 0750 "$runtime_dir"
+chmod 0700 "$runtime_dir"
 python3 "$deploy_dir/production_context.py" manifest-env \
   --manifest "$manifest" \
   --expected-sha "$release_sha" \
@@ -139,7 +142,7 @@ rollback_on_failure() {
   trap - EXIT
   if [ "$code" -ne 0 ]; then
     echo "DEPLOY_FAILED: invoking rollback"
-    "$deploy_dir/rollback-release.sh" || echo "ROLLBACK_FAILED"
+    "$rollback_script" || echo "ROLLBACK_FAILED"
   fi
   rm -rf "$state_dir"
   exit "$code"

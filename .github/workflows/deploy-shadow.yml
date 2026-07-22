@@ -36,7 +36,7 @@ jobs:
   deploy-shadow:
     name: deploy-shadow
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    timeout-minutes: 50
     environment: production-shadow
     steps:
       - name: Validate deployment request shape
@@ -172,56 +172,85 @@ jobs:
           PROD_PORT: ${{ secrets.PROD_PORT }}
           PROD_USER: ${{ secrets.PROD_USER }}
           RELEASE_SHA: ${{ inputs.release_sha }}
+          BUILD_RUN_ID: ${{ inputs.build_run_id }}
           ROLLBACK_SHA: ${{ inputs.rollback_sha }}
+          ROLLBACK_BUILD_RUN_ID: ${{ inputs.rollback_build_run_id }}
         run: |
           set -euo pipefail
           printf '%s' "$PROD_HOST" | grep -Eq '^[A-Za-z0-9._-]+$' || { echo "production host is invalid"; exit 1; }
-          printf '%s' "$PROD_USER" | grep -Eq '^[A-Za-z_][A-Za-z0-9_-]*$' || { echo "production user is invalid"; exit 1; }
+          [ "$PROD_USER" = phoenix ] || { echo "production user must be phoenix"; exit 1; }
           port="${PROD_PORT:-22}"
           case "$port" in *[!0-9]*|"") echo "production port is invalid"; exit 1 ;; esac
           [ "$port" -ge 1 ] && [ "$port" -le 65535 ] || { echo "production port is invalid"; exit 1; }
           remote="${PROD_USER}@${PROD_HOST}"
           ssh_opts=(-i "$HOME/.ssh/id_ed25519" -p "$port" -o UserKnownHostsFile="$HOME/.ssh/known_hosts" -o StrictHostKeyChecking=yes -o IdentitiesOnly=yes)
           scp_opts=(-i "$HOME/.ssh/id_ed25519" -P "$port" -o UserKnownHostsFile="$HOME/.ssh/known_hosts" -o StrictHostKeyChecking=yes -o IdentitiesOnly=yes)
-          remote_stage=$(ssh "${ssh_opts[@]}" "$remote" "mktemp -d '/tmp/phoenix-release-${RELEASE_SHA}.XXXXXX'")
-          case "$remote_stage" in
-            "/tmp/phoenix-release-${RELEASE_SHA}."*) ;;
-            *) echo "remote release staging path is invalid"; exit 1 ;;
-          esac
+          remote_stage="/tmp/phoenix-shadow-deploy-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${RELEASE_SHA}"
+          ssh "${ssh_opts[@]}" "$remote" \
+            "set -eu; umask 077; [ ! -e '$remote_stage' ]; install -d -m 0700 '$remote_stage'"
           scp "${scp_opts[@]}" release/release-manifest.json "$remote:$remote_stage/release-manifest.json"
+          scp "${scp_opts[@]}" release/release-provenance.json "$remote:$remote_stage/release-provenance.json"
           scp "${scp_opts[@]}" rollback/release-manifest.json "$remote:$remote_stage/rollback-manifest.json"
+          scp "${scp_opts[@]}" rollback/release-provenance.json "$remote:$remote_stage/rollback-provenance.json"
           scp "${scp_opts[@]}" \
             release-assets/release-assets-manifest.json \
             release-assets/release-assets-checksums.txt \
             "release-assets/phoenix-release-assets-${RELEASE_SHA}.tar.gz" \
-            scripts/install-release-assets.sh \
-            scripts/install-production-release-context.sh \
-            scripts/prelive-protected-maintenance.sh \
-            scripts/prelive_protected_maintenance.py \
-            scripts/prelive-protected-maintenance-launch.sh \
-            scripts/prelive-protected-maintenance-unit.sh \
-            scripts/rollback-release.sh \
             "$remote:$remote_stage/"
-          ssh "${ssh_opts[@]}" "$remote" sudo /bin/sh -s -- "$ROLLBACK_SHA" <<'REMOTE'
-          set -eu
-          expected=$1
-          [ -s /opt/phoenix/deploy/current-release ]
-          actual=$(tr -d '\r\n' </opt/phoenix/deploy/current-release)
-          [ "$actual" = "$expected" ]
-          [ -s /opt/phoenix/deploy/release-assets.sha ]
-          asset_sha=$(tr -d '\r\n' </opt/phoenix/deploy/release-assets.sha)
-          [ "$asset_sha" = "$expected" ]
-          rollback_root=/opt/phoenix/releases/$expected
-          [ -d "$rollback_root" ]
-          python3 /opt/phoenix/deploy/release_assets.py verify-tree \
-            --root "$rollback_root" \
-            --manifest "$rollback_root/release-assets-manifest.json" \
-            --expected-sha "$expected" >/dev/null
-          REMOTE
-          ssh "${ssh_opts[@]}" "$remote" \
-            "sudo /bin/sh '$remote_stage/install-release-assets.sh' '$RELEASE_SHA' '$remote_stage/phoenix-release-assets-${RELEASE_SHA}.tar.gz' '$remote_stage/release-assets-manifest.json' '$remote_stage/release-assets-checksums.txt'"
-          ssh "${ssh_opts[@]}" "$remote" \
-            "sudo install -d -m 0750 -o phoenix -g phoenix /opt/phoenix/deploy/manifests && sudo install -m 0640 -o phoenix -g phoenix '$remote_stage/release-manifest.json' '/opt/phoenix/deploy/manifests/${RELEASE_SHA}.json' && sudo install -m 0640 -o phoenix -g phoenix '$remote_stage/rollback-manifest.json' '/opt/phoenix/deploy/manifests/${ROLLBACK_SHA}.json'"
-          ssh "${ssh_opts[@]}" "$remote" \
-            "rm -f '$remote_stage/release-manifest.json' '$remote_stage/rollback-manifest.json' '$remote_stage/release-assets-manifest.json' '$remote_stage/release-assets-checksums.txt' '$remote_stage/phoenix-release-assets-${RELEASE_SHA}.tar.gz' '$remote_stage/install-release-assets.sh' '$remote_stage/install-production-release-context.sh' '$remote_stage/prelive-protected-maintenance.sh' '$remote_stage/prelive_protected_maintenance.py' '$remote_stage/prelive-protected-maintenance-launch.sh' '$remote_stage/prelive-protected-maintenance-unit.sh' '$remote_stage/rollback-release.sh' && rmdir '$remote_stage'"
-          ssh "${ssh_opts[@]}" "$remote" "sudo /opt/phoenix/deploy/deploy-release.sh '$RELEASE_SHA'"
+          ssh "${ssh_opts[@]}" "$remote" "chmod 0600 '$remote_stage'/*"
+
+          gateway=/usr/local/sbin/phoenix-shadow-deploy-gateway
+          gateway_args=(
+            "$RELEASE_SHA"
+            "$ROLLBACK_SHA"
+            "$BUILD_RUN_ID"
+            "$ROLLBACK_BUILD_RUN_ID"
+            "$GITHUB_RUN_ID"
+            "$GITHUB_RUN_ATTEMPT"
+          )
+          gateway_remote() {
+            ssh "${ssh_opts[@]}" "$remote" sudo -n "$gateway" "$@"
+          }
+          set +e
+          start_output=$(gateway_remote start "${gateway_args[@]}" 2>&1)
+          start_code=$?
+          set -e
+          printf '%s\n' "$start_output"
+          if [ "$start_code" -ne 0 ]; then
+            gateway_remote evidence "${gateway_args[@]}" \
+              >shadow-deploy-evidence.json || true
+            cat shadow-deploy-evidence.json
+            exit 1
+          fi
+
+          deadline=$((SECONDS + 2450))
+          status_code=3
+          while [ "$SECONDS" -lt "$deadline" ]; do
+            set +e
+            status_output=$(gateway_remote status "${gateway_args[@]}" 2>&1)
+            status_code=$?
+            set -e
+            printf '%s\n' "$status_output"
+            case "$status_code" in
+              0) break ;;
+              3) sleep 10 ;;
+              1)
+                gateway_remote evidence "${gateway_args[@]}" \
+                  >shadow-deploy-evidence.json || true
+                cat shadow-deploy-evidence.json
+                exit 1
+                ;;
+              *) echo 'deployment gateway status failed'; exit 1 ;;
+            esac
+          done
+          [ "$status_code" -eq 0 ] || {
+            gateway_remote evidence "${gateway_args[@]}" \
+              >shadow-deploy-evidence.json || true
+            cat shadow-deploy-evidence.json
+            echo 'deployment gateway timed out'
+            exit 1
+          }
+          gateway_remote evidence "${gateway_args[@]}" \
+            >shadow-deploy-evidence.json
+          cat shadow-deploy-evidence.json
+          gateway_remote cleanup "${gateway_args[@]}"

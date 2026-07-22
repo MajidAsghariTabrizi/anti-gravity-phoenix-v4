@@ -11,7 +11,7 @@ current_env="$deploy_dir/current-release.env"
 current_state="$deploy_dir/current-release.json"
 current_context="$deploy_dir/current-release-context.json"
 previous_file="$deploy_dir/previous-release"
-runtime_dir="$deploy_dir/.runtime"
+runtime_dir="${PHOENIX_DEPLOY_RUNTIME_DIR:-$deploy_dir/.deploy-runtime}"
 protected_services='nitro-feed-relay feed-ingestor nats postgres recorder'
 optional_services='prometheus rpc-gateway shadow-dispatcher phoenix-engine dashboard'
 service_wait_seconds=${PHOENIX_DEPLOY_SERVICE_WAIT_SECONDS:-300}
@@ -33,7 +33,7 @@ manifest="$deploy_dir/manifests/$release_sha.json"
 release_env="$deploy_dir/manifests/$release_sha.env"
 release_metadata="$deploy_dir/manifests/$release_sha.render.json"
 release_state="$deploy_dir/manifests/$release_sha.state.json"
-context_installer="$deploy_dir/install-production-release-context.sh"
+context_installer="${PHOENIX_CONTEXT_INSTALLER:-$deploy_dir/install-production-release-context.sh}"
 [ -f "$manifest" ] || fail "release manifest is missing"
 [ -f "$compose_file" ] || fail "production compose file is missing"
 [ -f "$env_file" ] || fail "production environment file is missing"
@@ -63,7 +63,7 @@ PHOENIX_ENV_FILE="$env_file" \
 installed_assets_sha=$(tr -d '\r\n' <"$deploy_dir/release-assets.sha")
 [ "$installed_assets_sha" = "$release_sha" ] || fail "rollback release-assets marker is invalid"
 mkdir -p "$runtime_dir"
-chmod 0750 "$runtime_dir"
+chmod 0700 "$runtime_dir"
 python3 "$deploy_dir/production_context.py" manifest-env \
   --manifest "$manifest" \
   --expected-sha "$release_sha" \

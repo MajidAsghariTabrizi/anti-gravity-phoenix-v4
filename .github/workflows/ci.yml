@@ -62,6 +62,9 @@ jobs:
           python3 -m unittest scripts.tests.test_release_assets
           python3 -m py_compile scripts/release_provenance.py scripts/prelive_v5_release.py
           python3 -m unittest scripts.tests.test_release_provenance scripts.tests.test_prelive_v5_release
+          python3 -m py_compile scripts/phoenix_shadow_deploy.py
+          python3 -m unittest scripts.tests.test_shadow_deploy_gateway
+          sh ./scripts/shadow-deploy-gateway-tests.sh
           sh ./scripts/prelive-v5-fresh-database-gate-tests.sh
           sh ./scripts/prelive-release-gate-tests.sh
           python3 -m py_compile scripts/prelive_protected_maintenance.py
