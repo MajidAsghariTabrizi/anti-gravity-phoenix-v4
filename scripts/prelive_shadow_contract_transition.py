@@ -120,6 +120,56 @@ MAX_DIAGNOSTIC_LOG_LINE_BYTES = 2 * 1024
 MAX_DIAGNOSTIC_LOG_BYTES = 640 * 1024
 
 HANDOFF_SCHEMA = "phoenix.shadow-contract-transition-recorder-handoff.v1"
+RECORDER_CONFIG_CHECK_SCHEMA = "phoenix.recorder-config-check.v1"
+RECORDER_CONFIG_EVIDENCE_SCHEMA = (
+    "phoenix.shadow-contract-transition-recorder-config.v1"
+)
+RECORDER_CONFIG_ENVIRONMENT_NAMES = (
+    "PHOENIX_ENV",
+    "PHOENIX_MODE",
+    "LIVE_EXECUTION",
+    "SIGNER_PRIVATE_KEY",
+    "EXECUTOR_ADDRESS",
+    "WALLET_ADDRESS",
+    "RECORDER_DAEMON",
+    "RECORDER_PERSISTENCE_POLICY",
+    "RECORDER_HEALTH_ADDR",
+    "POSTGRES_DSN",
+    "PGSSLMODE",
+    "NATS_URL",
+    "RECORDER_BATCH_MAX_SIZE",
+    "RECORDER_BATCH_MAX_WAIT_MS",
+    "RECORDER_AGGREGATE_FLUSH_SECONDS",
+    "RECORDER_AGGREGATE_FLUSH_EVENTS",
+    "RECORDER_MAX_SAMPLES_PER_DETAIL_PER_DAY",
+    "RECORDER_MAX_SAMPLE_JSON_BYTES",
+    "ENGINE_ROUTER_ADDRESSES",
+    "ENGINE_ROUTE_REGISTRY_JSON",
+)
+RECORDER_CONFIG_SAFE_LENGTH_NAMES = frozenset(
+    {
+        "PHOENIX_ENV",
+        "PHOENIX_MODE",
+        "LIVE_EXECUTION",
+        "RECORDER_DAEMON",
+        "RECORDER_PERSISTENCE_POLICY",
+        "PGSSLMODE",
+        "RECORDER_BATCH_MAX_SIZE",
+        "RECORDER_BATCH_MAX_WAIT_MS",
+        "RECORDER_AGGREGATE_FLUSH_SECONDS",
+        "RECORDER_AGGREGATE_FLUSH_EVENTS",
+        "RECORDER_MAX_SAMPLES_PER_DETAIL_PER_DAY",
+        "RECORDER_MAX_SAMPLE_JSON_BYTES",
+        "ENGINE_ROUTER_ADDRESSES",
+        "ENGINE_ROUTE_REGISTRY_JSON",
+    }
+)
+RECORDER_STRUCTURED_ENVIRONMENT_NAMES = (
+    "ENGINE_ROUTER_ADDRESSES",
+    "ENGINE_ROUTE_REGISTRY_JSON",
+)
+CONFIG_CHECK_CODE_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
+MAX_CONFIG_CHECK_RESULT_BYTES = 4096
 URL_VALUE_RE = re.compile(
     r"(?i)(?:https?|wss?|postgres(?:ql)?|nats)://[^\s\"']+"
 )
@@ -952,6 +1002,177 @@ def _nonnegative_integer(value: Any, code: str) -> int:
     return value
 
 
+def _recorder_render_environment(
+    plan: dict[str, Any], compose_value: Any
+) -> tuple[str, dict[str, str]]:
+    rendered = maintenance._validate_rendered_compose(compose_value)
+    recorder = rendered["services"]["recorder"]
+    expected_image = plan["images"]["release"]["recorder"]
+    if recorder.get("image") != expected_image:
+        _fail("recorder_config_image_invalid")
+    environment = recorder.get("environment")
+    if not isinstance(environment, dict):
+        _fail("recorder_config_environment_invalid")
+    normalized: dict[str, str] = {}
+    total_bytes = 0
+    for name, value in environment.items():
+        if (
+            not isinstance(name, str)
+            or ENV_NAME_RE.fullmatch(name) is None
+            or not isinstance(value, str)
+            or any(character in value for character in ("\0", "\r", "\n"))
+        ):
+            _fail("recorder_config_environment_invalid")
+        encoded = value.encode("utf-8")
+        total_bytes += len(name.encode("ascii")) + len(encoded) + 2
+        if total_bytes > MAX_ENV_BYTES:
+            _fail("recorder_config_environment_invalid")
+        normalized[name] = value
+    return expected_image, normalized
+
+
+def _length_bound(value: str) -> str:
+    length = len(value.encode("utf-8"))
+    for maximum in (0, 16, 64, 256, 4096, 65536):
+        if length <= maximum:
+            return f"0-{maximum}" if maximum else "0"
+    return "65537-plus"
+
+
+def _structured_fingerprint(name: str, value: str) -> dict[str, Any]:
+    canonical = False
+    encoded = value.encode("utf-8")
+    if name == "ENGINE_ROUTE_REGISTRY_JSON":
+        try:
+            decoded = json.loads(
+                value,
+                object_pairs_hook=_unique_object,
+                parse_constant=lambda _value: _fail("structured_config_invalid"),
+            )
+            encoded = _canonical_json(decoded)
+            canonical = True
+        except (TransitionError, UnicodeError, json.JSONDecodeError):
+            pass
+    elif name == "ENGINE_ROUTER_ADDRESSES":
+        values = value.split(",")
+        if values and all(item and item == item.strip() for item in values):
+            encoded = ",".join(values).encode("utf-8")
+            canonical = True
+    return {
+        "canonical": canonical,
+        "sha256": _sha256_bytes(encoded),
+    }
+
+
+def prepare_recorder_config_check(
+    plan: dict[str, Any], compose_value: Any, output: Path
+) -> None:
+    _image, environment = _recorder_render_environment(plan, compose_value)
+    lines = [f"{name}={environment[name]}\n" for name in sorted(environment)]
+    write_bytes_atomic(output, "".join(lines).encode("utf-8"), mode=0o600)
+
+
+def _validate_config_check_result(value: Any) -> dict[str, Any]:
+    result = _exact(
+        value,
+        {"schema", "status", "error_code", "environment_name"},
+        "recorder_config_check_result_invalid",
+    )
+    status = result["status"]
+    code = result["error_code"]
+    environment_name = result["environment_name"]
+    if (
+        result["schema"] != RECORDER_CONFIG_CHECK_SCHEMA
+        or status not in {"ok", "error"}
+        or not isinstance(code, str)
+        or CONFIG_CHECK_CODE_RE.fullmatch(code) is None
+        or (
+            environment_name is not None
+            and environment_name not in RECORDER_CONFIG_ENVIRONMENT_NAMES
+        )
+    ):
+        _fail("recorder_config_check_result_invalid")
+    if (status, code, environment_name) == ("ok", "ok", None):
+        return result
+    if status != "error" or code == "ok":
+        _fail("recorder_config_check_result_invalid")
+    return result
+
+
+def load_config_check_result(path: Path) -> dict[str, Any]:
+    raw = _read_file(path, MAX_CONFIG_CHECK_RESULT_BYTES)
+    try:
+        value = json.loads(
+            raw,
+            object_pairs_hook=_unique_object,
+            parse_constant=lambda _value: _fail("recorder_config_check_result_invalid"),
+        )
+    except (TransitionError, UnicodeError, json.JSONDecodeError):
+        _fail("recorder_config_check_result_invalid")
+    return _validate_config_check_result(value)
+
+
+def build_recorder_config_evidence(
+    plan: dict[str, Any],
+    compose_value: Any,
+    result_value: Any,
+    image_id: str,
+    oci_revision: str,
+    exit_code: int,
+) -> dict[str, Any]:
+    image_reference, environment = _recorder_render_environment(plan, compose_value)
+    result = dict(_validate_config_check_result(result_value))
+    if (
+        DIGEST_RE.fullmatch(image_id) is None
+        or oci_revision != plan["release_sha"]
+        or isinstance(exit_code, bool)
+        or not isinstance(exit_code, int)
+        or not 0 <= exit_code <= 255
+    ):
+        _fail("recorder_config_image_identity_invalid")
+    success = exit_code == 0 and result["status"] == "ok"
+    if (exit_code == 0) != (result["status"] == "ok"):
+        result = {
+            "schema": RECORDER_CONFIG_CHECK_SCHEMA,
+            "status": "error",
+            "error_code": "config_check_process_mismatch",
+            "environment_name": None,
+        }
+        success = False
+
+    expected = []
+    for name in RECORDER_CONFIG_ENVIRONMENT_NAMES:
+        item: dict[str, Any] = {"name": name, "present": name in environment}
+        if name in environment and name in RECORDER_CONFIG_SAFE_LENGTH_NAMES:
+            item["length_bound"] = _length_bound(environment[name])
+        expected.append(item)
+    structured = {
+        name: _structured_fingerprint(name, environment[name])
+        for name in RECORDER_STRUCTURED_ENVIRONMENT_NAMES
+        if name in environment
+    }
+    result["exit_code"] = exit_code
+    return {
+        "schema": RECORDER_CONFIG_EVIDENCE_SCHEMA,
+        "release_sha": plan["release_sha"],
+        "image": {
+            "reference": image_reference,
+            "local_image_id": image_id,
+            "oci_revision": oci_revision,
+        },
+        "environment": {
+            "expected": expected,
+            "duplicate_name_detection": {"detected": False, "names": []},
+            "unexpected_name_count": len(
+                set(environment).difference(RECORDER_CONFIG_ENVIRONMENT_NAMES)
+            ),
+            "structured_configuration": structured,
+        },
+        "config_check": result,
+        "status": "ok" if success else "error",
+    }
+
+
 def validate_recorder_handoff(
     jetstream_value: Any, container_status: str, container_id: str
 ) -> dict[str, Any]:
@@ -1776,6 +1997,45 @@ def command_validate_recorder_handoff(args: argparse.Namespace) -> None:
     print("PHOENIX_SHADOW_CONTRACT_TRANSITION_RECORDER_HANDOFF_OK")
 
 
+def command_prepare_recorder_config_check(args: argparse.Namespace) -> None:
+    prepare_recorder_config_check(
+        load_plan(Path(args.plan)),
+        load_json(Path(args.compose_config)),
+        Path(args.env_output),
+    )
+    print("PHOENIX_SHADOW_CONTRACT_TRANSITION_RECORDER_CONFIG_ENV_OK")
+
+
+def command_complete_recorder_config_check(args: argparse.Namespace) -> None:
+    try:
+        result = load_config_check_result(Path(args.result))
+    except TransitionError:
+        result = {
+            "schema": RECORDER_CONFIG_CHECK_SCHEMA,
+            "status": "error",
+            "error_code": "config_check_result_invalid",
+            "environment_name": None,
+        }
+    evidence = build_recorder_config_evidence(
+        load_plan(Path(args.plan)),
+        load_json(Path(args.compose_config)),
+        result,
+        args.image_id,
+        args.oci_revision,
+        args.exit_code,
+    )
+    write_atomic(Path(args.output), evidence)
+    if evidence["status"] != "ok":
+        result = evidence["config_check"]
+        suffix = (
+            f":{result['environment_name']}"
+            if result["environment_name"] is not None
+            else ""
+        )
+        _fail(f"recorder_config_check_failed:{result['error_code']}{suffix}")
+    print("PHOENIX_SHADOW_CONTRACT_TRANSITION_RECORDER_CONFIG_OK")
+
+
 def command_redact_diagnostic_log(args: argparse.Namespace) -> None:
     redact_diagnostic_log(
         Path(args.input), Path(args.env_file), Path(args.output)
@@ -1899,6 +2159,22 @@ def parser() -> argparse.ArgumentParser:
     handoff.add_argument("--container-id", required=True)
     handoff.add_argument("--output")
     handoff.set_defaults(handler=command_validate_recorder_handoff)
+
+    prepare_config = commands.add_parser("prepare-recorder-config-check")
+    prepare_config.add_argument("--plan", required=True)
+    prepare_config.add_argument("--compose-config", required=True)
+    prepare_config.add_argument("--env-output", required=True)
+    prepare_config.set_defaults(handler=command_prepare_recorder_config_check)
+
+    complete_config = commands.add_parser("complete-recorder-config-check")
+    complete_config.add_argument("--plan", required=True)
+    complete_config.add_argument("--compose-config", required=True)
+    complete_config.add_argument("--result", required=True)
+    complete_config.add_argument("--image-id", required=True)
+    complete_config.add_argument("--oci-revision", required=True)
+    complete_config.add_argument("--exit-code", required=True, type=int)
+    complete_config.add_argument("--output", required=True)
+    complete_config.set_defaults(handler=command_complete_recorder_config_check)
 
     diagnostic_log = commands.add_parser("redact-diagnostic-log")
     diagnostic_log.add_argument("--input", required=True)

@@ -1,4 +1,4 @@
-use money_path_classifier::{MoneyPathClassifier, ADMISSION_POLICY_VERSION};
+use money_path_classifier::{ClassifierError, MoneyPathClassifier, ADMISSION_POLICY_VERSION};
 use phoenix_recorder::ingress::{IngressBuffer, IngressBufferConfig};
 use phoenix_recorder::jetstream::{
     ensure_durable_pipeline, MessageFetcher, CONSUMER_ACK_WAIT, CONSUMER_MAX_ACK_PENDING,
@@ -10,12 +10,14 @@ use phoenix_recorder::persistence::{EventStore, PostgresStore};
 use phoenix_recorder::runtime::{
     consume_durable_messages, flush_ingress_evidence, mark_nats_connected, mark_nats_disconnected,
     monitor_database, nats_connect_options, BatchConfig, ConsumerExit, PrePersistenceClassifier,
-    RetryPolicy,
+    RetryPolicy, RuntimeConfigError,
 };
 use phoenix_recorder::state::Readiness;
 use std::error::Error;
+use std::fmt;
 use std::fs::File;
 use std::io::{self, BufRead, Write};
+use std::net::SocketAddr;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::Duration;
@@ -23,6 +25,76 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
+
+const CONFIG_CHECK_SCHEMA: &str = "phoenix.recorder-config-check.v1";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ConfigError {
+    code: &'static str,
+    environment_name: Option<&'static str>,
+}
+
+impl ConfigError {
+    const fn new(code: &'static str, environment_name: Option<&'static str>) -> Self {
+        Self {
+            code,
+            environment_name,
+        }
+    }
+
+    const fn missing(environment_name: &'static str) -> Self {
+        Self::new("required_environment_missing", Some(environment_name))
+    }
+
+    const fn invalid(code: &'static str, environment_name: &'static str) -> Self {
+        Self::new(code, Some(environment_name))
+    }
+}
+
+impl fmt::Display for ConfigError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{}", self.code)?;
+        if let Some(environment_name) = self.environment_name {
+            write!(formatter, ":{environment_name}")?;
+        }
+        Ok(())
+    }
+}
+
+impl Error for ConfigError {}
+
+#[derive(Debug)]
+enum RecorderError {
+    Config(ConfigError),
+    Runtime(&'static str),
+}
+
+impl RecorderError {
+    const fn code(&self) -> &'static str {
+        match self {
+            Self::Config(error) => error.code,
+            Self::Runtime(code) => code,
+        }
+    }
+
+    const fn environment_name(&self) -> Option<&'static str> {
+        match self {
+            Self::Config(error) => error.environment_name,
+            Self::Runtime(_) => None,
+        }
+    }
+}
+
+impl fmt::Display for RecorderError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Config(error) => error.fmt(formatter),
+            Self::Runtime(code) => write!(formatter, "{code}"),
+        }
+    }
+}
+
+impl Error for RecorderError {}
 
 #[derive(Clone)]
 struct Config {
@@ -37,23 +109,34 @@ struct Config {
 }
 
 impl Config {
-    fn from_env() -> Result<Self, &'static str> {
+    fn from_env() -> Result<Self, ConfigError> {
+        validate_daemon_mode()?;
         validate_shadow_safety()?;
         let persistence_policy =
             PersistencePolicy::parse(&required_env("RECORDER_PERSISTENCE_POLICY")?)?;
         let router_addresses = parse_router_addresses(&required_env("ENGINE_ROUTER_ADDRESSES")?)?;
+        let route_registry = required_env("ENGINE_ROUTE_REGISTRY_JSON")?;
         let classifier = MoneyPathClassifier::from_release(
             persistence_policy.as_str(),
             &router_addresses,
-            &required_env("ENGINE_ROUTE_REGISTRY_JSON")?,
+            &route_registry,
         )
-        .map_err(|_| "invalid Recorder money-path classifier configuration")?;
+        .map_err(classifier_config_error)?;
         let batch = BatchConfig {
             max_size: optional_usize("RECORDER_BATCH_MAX_SIZE", 256)?,
             max_wait: Duration::from_millis(optional_u64("RECORDER_BATCH_MAX_WAIT_MS", 100)?),
         }
         .validate()
-        .map_err(|_| "invalid Recorder batch configuration")?;
+        .map_err(|error| match error {
+            RuntimeConfigError::BatchSize => ConfigError::invalid(
+                "numeric_environment_out_of_range",
+                "RECORDER_BATCH_MAX_SIZE",
+            ),
+            RuntimeConfigError::BatchWait => ConfigError::invalid(
+                "numeric_environment_out_of_range",
+                "RECORDER_BATCH_MAX_WAIT_MS",
+            ),
+        })?;
         let ingress = IngressBufferConfig {
             flush_interval: Duration::from_secs(optional_u64(
                 "RECORDER_AGGREGATE_FLUSH_SECONDS",
@@ -67,12 +150,17 @@ impl Config {
             max_sample_json_bytes: optional_usize("RECORDER_MAX_SAMPLE_JSON_BYTES", 1_024)?,
         }
         .validate()
-        .map_err(|_| "invalid Recorder ingress evidence configuration")?;
+        .map_err(|_| ConfigError::new("ingress_configuration_out_of_range", None))?;
+        let health_addr = optional_env("RECORDER_HEALTH_ADDR", "0.0.0.0:9400")?;
+        health_addr
+            .parse::<SocketAddr>()
+            .map_err(|_| ConfigError::invalid("health_address_invalid", "RECORDER_HEALTH_ADDR"))?;
+        let pg_ssl_mode = optional_env("PGSSLMODE", "prefer")?;
+        validate_pg_ssl_mode(&pg_ssl_mode)?;
         Ok(Self {
-            health_addr: std::env::var("RECORDER_HEALTH_ADDR")
-                .unwrap_or_else(|_| "0.0.0.0:9400".to_string()),
+            health_addr,
             postgres_dsn: required_env("POSTGRES_DSN")?,
-            pg_ssl_mode: std::env::var("PGSSLMODE").unwrap_or_else(|_| "prefer".to_string()),
+            pg_ssl_mode,
             nats_url: required_env("NATS_URL")?,
             batch,
             classifier,
@@ -88,10 +176,13 @@ enum PersistencePolicy {
 }
 
 impl PersistencePolicy {
-    fn parse(value: &str) -> Result<Self, &'static str> {
+    fn parse(value: &str) -> Result<Self, ConfigError> {
         match value {
             ADMISSION_POLICY_VERSION => Ok(Self::MoneyPathV1),
-            _ => Err("RECORDER_PERSISTENCE_POLICY must be money_path_v1"),
+            _ => Err(ConfigError::invalid(
+                "persistence_policy_invalid",
+                "RECORDER_PERSISTENCE_POLICY",
+            )),
         }
     }
 
@@ -102,21 +193,50 @@ impl PersistencePolicy {
     }
 }
 
-fn validate_shadow_safety() -> Result<(), &'static str> {
-    if std::env::var("PHOENIX_MODE").ok().as_deref() != Some("SHADOW")
-        || std::env::var("LIVE_EXECUTION").ok().as_deref() != Some("false")
-    {
-        return Err("Recorder requires fail-closed SHADOW mode");
+fn validate_daemon_mode() -> Result<(), ConfigError> {
+    let value = required_env("RECORDER_DAEMON")?;
+    if !value.eq_ignore_ascii_case("true") {
+        return Err(ConfigError::invalid(
+            "daemon_mode_invalid",
+            "RECORDER_DAEMON",
+        ));
     }
+    Ok(())
+}
+
+fn validate_shadow_safety() -> Result<(), ConfigError> {
+    require_exact_env("PHOENIX_MODE", "SHADOW", "shadow_mode_invalid")?;
+    require_exact_env("LIVE_EXECUTION", "false", "live_execution_invalid")?;
     for name in ["SIGNER_PRIVATE_KEY", "EXECUTOR_ADDRESS", "WALLET_ADDRESS"] {
-        if std::env::var(name).unwrap_or_default() != "" {
-            return Err("Recorder SHADOW execution configuration must remain empty");
+        match std::env::var(name) {
+            Ok(value) if value.is_empty() => {}
+            Err(std::env::VarError::NotPresent) => {}
+            Ok(_) => {
+                return Err(ConfigError::invalid(
+                    "shadow_execution_configuration_present",
+                    name,
+                ));
+            }
+            Err(std::env::VarError::NotUnicode(_)) => {
+                return Err(ConfigError::invalid("environment_encoding_invalid", name));
+            }
         }
     }
     Ok(())
 }
 
-fn parse_router_addresses(raw: &str) -> Result<Vec<String>, &'static str> {
+fn require_exact_env(
+    name: &'static str,
+    expected: &str,
+    code: &'static str,
+) -> Result<(), ConfigError> {
+    if required_env(name)? != expected {
+        return Err(ConfigError::invalid(code, name));
+    }
+    Ok(())
+}
+
+fn parse_router_addresses(raw: &str) -> Result<Vec<String>, ConfigError> {
     let values = raw
         .split(',')
         .map(str::trim)
@@ -124,48 +244,131 @@ fn parse_router_addresses(raw: &str) -> Result<Vec<String>, &'static str> {
         .map(str::to_string)
         .collect::<Vec<_>>();
     if values.is_empty() || values.join(",") != raw {
-        return Err("ENGINE_ROUTER_ADDRESSES is invalid");
+        return Err(ConfigError::invalid(
+            "router_addresses_invalid",
+            "ENGINE_ROUTER_ADDRESSES",
+        ));
     }
     Ok(values)
 }
 
-fn optional_usize(name: &'static str, default: usize) -> Result<usize, &'static str> {
+fn classifier_config_error(error: ClassifierError) -> ConfigError {
+    match error {
+        ClassifierError::AdmissionPolicy => {
+            ConfigError::invalid("persistence_policy_invalid", "RECORDER_PERSISTENCE_POLICY")
+        }
+        ClassifierError::RouterRegistry => {
+            ConfigError::invalid("router_addresses_invalid", "ENGINE_ROUTER_ADDRESSES")
+        }
+        ClassifierError::RouteRegistry => {
+            ConfigError::invalid("route_registry_invalid", "ENGINE_ROUTE_REGISTRY_JSON")
+        }
+        ClassifierError::Invariant => ConfigError::new("classifier_invariant_failed", None),
+    }
+}
+
+fn optional_usize(name: &'static str, default: usize) -> Result<usize, ConfigError> {
     match std::env::var(name) {
         Ok(value) => value
             .parse::<usize>()
-            .map_err(|_| "invalid Recorder batch configuration"),
-        Err(_) => Ok(default),
+            .map_err(|_| ConfigError::invalid("numeric_environment_invalid", name)),
+        Err(std::env::VarError::NotPresent) => Ok(default),
+        Err(std::env::VarError::NotUnicode(_)) => {
+            Err(ConfigError::invalid("environment_encoding_invalid", name))
+        }
     }
 }
 
-fn optional_u64(name: &'static str, default: u64) -> Result<u64, &'static str> {
+fn optional_u64(name: &'static str, default: u64) -> Result<u64, ConfigError> {
     match std::env::var(name) {
         Ok(value) => value
             .parse::<u64>()
-            .map_err(|_| "invalid Recorder batch configuration"),
-        Err(_) => Ok(default),
+            .map_err(|_| ConfigError::invalid("numeric_environment_invalid", name)),
+        Err(std::env::VarError::NotPresent) => Ok(default),
+        Err(std::env::VarError::NotUnicode(_)) => {
+            Err(ConfigError::invalid("environment_encoding_invalid", name))
+        }
     }
 }
 
-fn required_env(name: &'static str) -> Result<String, &'static str> {
-    std::env::var(name)
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-        .ok_or(name)
+fn optional_env(name: &'static str, default: &str) -> Result<String, ConfigError> {
+    match std::env::var(name) {
+        Ok(value) => Ok(value),
+        Err(std::env::VarError::NotPresent) => Ok(default.to_string()),
+        Err(std::env::VarError::NotUnicode(_)) => {
+            Err(ConfigError::invalid("environment_encoding_invalid", name))
+        }
+    }
+}
+
+fn required_env(name: &'static str) -> Result<String, ConfigError> {
+    match std::env::var(name) {
+        Ok(value) if !value.trim().is_empty() => Ok(value),
+        Ok(_) | Err(std::env::VarError::NotPresent) => Err(ConfigError::missing(name)),
+        Err(std::env::VarError::NotUnicode(_)) => {
+            Err(ConfigError::invalid("environment_encoding_invalid", name))
+        }
+    }
+}
+
+fn validate_pg_ssl_mode(value: &str) -> Result<(), ConfigError> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "disable" | "allow" | "prefer" | "" | "require" | "verify-ca" | "verify-full" => Ok(()),
+        _ => Err(ConfigError::invalid("pg_ssl_mode_invalid", "PGSSLMODE")),
+    }
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
+    let arguments = std::env::args().skip(1).collect::<Vec<_>>();
+    if arguments.first().map(String::as_str) == Some("--config-check") {
+        if arguments.len() != 1 {
+            let error = ConfigError::new("config_check_arguments_invalid", None);
+            emit_config_check("error", error.code, error.environment_name);
+            return Err(io::Error::other(error).into());
+        }
+        return match Config::from_env() {
+            Ok(_config) => {
+                emit_config_check("ok", "ok", None);
+                Ok(())
+            }
+            Err(error) => {
+                emit_config_check("error", error.code, error.environment_name);
+                Err(io::Error::other(error).into())
+            }
+        };
+    }
+
     if !daemon_enabled() {
         return run_file_recorder().map_err(Into::into);
     }
 
     init_logging();
     if let Err(error) = run_daemon().await {
-        tracing::error!(event = "recorder_stopped", error_class = error);
+        tracing::error!(
+            event = "recorder_stopped",
+            error_code = error.code(),
+            environment_name = error.environment_name().unwrap_or("none")
+        );
         return Err(io::Error::other(error).into());
     }
     Ok(())
+}
+
+fn emit_config_check(
+    status: &'static str,
+    error_code: &'static str,
+    environment_name: Option<&'static str>,
+) {
+    println!(
+        "{}",
+        serde_json::json!({
+            "schema": CONFIG_CHECK_SCHEMA,
+            "status": status,
+            "error_code": error_code,
+            "environment_name": environment_name,
+        })
+    );
 }
 
 fn daemon_enabled() -> bool {
@@ -185,15 +388,15 @@ fn init_logging() {
         .init();
 }
 
-async fn run_daemon() -> Result<(), &'static str> {
-    let config = Config::from_env().map_err(|_| "required Recorder environment is missing")?;
+async fn run_daemon() -> Result<(), RecorderError> {
+    let config = Config::from_env().map_err(RecorderError::Config)?;
     let readiness = Readiness::new();
     let metrics = Metrics::default();
     let sampler = LogSampler::default();
     let shutdown = CancellationToken::new();
     let classifier: Arc<dyn PrePersistenceClassifier> = Arc::new(config.classifier.clone());
     let ingress = IngressBuffer::new(config.ingress.clone())
-        .map_err(|_| "Recorder ingress evidence configuration invalid")?;
+        .map_err(|_| RecorderError::Runtime("ingress_runtime_configuration_invalid"))?;
 
     tracing::info!(
         event = "recorder_startup",
@@ -233,7 +436,9 @@ async fn run_daemon() -> Result<(), &'static str> {
         RetryPolicy::default(),
     )
     .await
-    .ok_or("Recorder shutdown before PostgreSQL initialization")?;
+    .ok_or(RecorderError::Runtime(
+        "shutdown_before_postgres_initialization",
+    ))?;
     let store: Arc<dyn EventStore> = Arc::new(store);
     let database_monitor = tokio::spawn(monitor_database(
         store.clone(),
@@ -350,7 +555,7 @@ async fn run_daemon() -> Result<(), &'static str> {
     let _ = health_task.await;
     tracing::info!(event = "recorder_graceful_shutdown_complete");
     if integrity_failure {
-        Err("Recorder stopped on a terminal integrity condition")
+        Err(RecorderError::Runtime("terminal_integrity_condition"))
     } else {
         Ok(())
     }

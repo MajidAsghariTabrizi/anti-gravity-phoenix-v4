@@ -1,4 +1,5 @@
 import json
+import os
 import re
 import tempfile
 import unittest
@@ -377,6 +378,28 @@ def rendered_compose(plan: dict, role: str) -> dict:
     }
     for name in transition.ROUTE_ENV_SERVICES:
         services[name]["environment"][transition.ROUTE_ENV_NAME] = route_json
+    services["recorder"]["environment"].update(
+        {
+            "PHOENIX_ENV": "production",
+            "RECORDER_DAEMON": "true",
+            "RECORDER_PERSISTENCE_POLICY": "money_path_v1",
+            "RECORDER_HEALTH_ADDR": "0.0.0.0:9400",
+            "POSTGRES_DSN": "postgresql://fixture.invalid/phoenix",
+            "PGSSLMODE": "prefer",
+            "NATS_URL": "nats://fixture.invalid:4222",
+            "RECORDER_BATCH_MAX_SIZE": "256",
+            "RECORDER_BATCH_MAX_WAIT_MS": "100",
+            "RECORDER_AGGREGATE_FLUSH_SECONDS": "60",
+            "RECORDER_AGGREGATE_FLUSH_EVENTS": "10000",
+            "RECORDER_MAX_SAMPLES_PER_DETAIL_PER_DAY": "100",
+            "RECORDER_MAX_SAMPLE_JSON_BYTES": "1024",
+            "ENGINE_ROUTER_ADDRESSES": (
+                "0xe592427a0aece92de3edee1f18e0157c05861564,"
+                "0x68b3465833fb72a70ecdf485e0e4c7bd8665fc45,"
+                "0xa51afafe0263b40edaef0df8781ea9aa03e381a3"
+            ),
+        }
+    )
     if role == "release":
         services["phoenix-engine"]["environment"][
             transition.ENGINE_CONCURRENCY_ENV_NAME
@@ -624,6 +647,117 @@ class ShadowContractTransitionTests(unittest.TestCase):
             transition.validate_recorder_handoff(
                 raw_jetstream(num_ack_pending=1), "exited", RECORDER_CONTAINER_ID
             )
+
+    def test_recorder_config_check_materializes_exact_rendered_environment(self) -> None:
+        compose = rendered_compose(self.plan, "release")
+        expected = compose["services"]["recorder"]["environment"]
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "recorder.env"
+            transition.prepare_recorder_config_check(self.plan, compose, output)
+            _lines, actual = transition._parse_env(output)
+            self.assertEqual(actual, expected)
+            if os.name == "posix":
+                self.assertEqual(output.stat().st_mode & 0o777, 0o600)
+
+    def test_recorder_config_evidence_is_sanitized_and_candidate_exact(self) -> None:
+        compose = rendered_compose(self.plan, "release")
+        evidence = transition.build_recorder_config_evidence(
+            self.plan,
+            compose,
+            {
+                "schema": transition.RECORDER_CONFIG_CHECK_SCHEMA,
+                "status": "ok",
+                "error_code": "ok",
+                "environment_name": None,
+            },
+            digest(990),
+            transition.RELEASE_SHA,
+            0,
+        )
+        self.assertEqual(evidence["status"], "ok")
+        self.assertEqual(
+            evidence["image"]["reference"],
+            self.plan["images"]["release"]["recorder"],
+        )
+        self.assertFalse(
+            evidence["environment"]["duplicate_name_detection"]["detected"]
+        )
+        self.assertEqual(
+            evidence["environment"]["structured_configuration"][
+                transition.ROUTE_ENV_NAME
+            ]["sha256"],
+            transition.CANDIDATE_ROUTE_HASH,
+        )
+        serialized = json.dumps(evidence, sort_keys=True)
+        environment = compose["services"]["recorder"]["environment"]
+        for value in (
+            environment["POSTGRES_DSN"],
+            environment["NATS_URL"],
+            environment["ENGINE_ROUTER_ADDRESSES"],
+            environment[transition.ROUTE_ENV_NAME],
+        ):
+            self.assertNotIn(value, serialized)
+
+    def test_recorder_config_failures_retain_only_bounded_diagnostics(self) -> None:
+        cases = (
+            ("required_environment_missing", "POSTGRES_DSN"),
+            ("route_registry_invalid", transition.ROUTE_ENV_NAME),
+            ("router_addresses_invalid", "ENGINE_ROUTER_ADDRESSES"),
+            ("numeric_environment_invalid", "RECORDER_BATCH_MAX_SIZE"),
+        )
+        compose = rendered_compose(self.plan, "release")
+        for error_code, environment_name in cases:
+            with self.subTest(error_code=error_code):
+                evidence = transition.build_recorder_config_evidence(
+                    self.plan,
+                    compose,
+                    {
+                        "schema": transition.RECORDER_CONFIG_CHECK_SCHEMA,
+                        "status": "error",
+                        "error_code": error_code,
+                        "environment_name": environment_name,
+                    },
+                    digest(991),
+                    transition.RELEASE_SHA,
+                    1,
+                )
+                self.assertEqual(evidence["status"], "error")
+                self.assertEqual(
+                    evidence["config_check"]["environment_name"], environment_name
+                )
+                self.assertNotIn(
+                    compose["services"]["recorder"]["environment"][
+                        transition.ROUTE_ENV_NAME
+                    ],
+                    json.dumps(evidence),
+                )
+
+    def test_recorder_config_preflight_is_isolated_and_precedes_plan_success(self) -> None:
+        render = self.shell.index('"$release_tree/scripts/render-production-compose.sh"')
+        preflight = self.shell.index("prepare-recorder-config-check", render)
+        plan_exit = self.shell.index('if [ "$mode" = plan ]; then', preflight)
+        mutation = self.shell.index("mutation_started=1", plan_exit)
+        self.assertLess(render, preflight)
+        self.assertLess(preflight, plan_exit)
+        self.assertLess(plan_exit, mutation)
+
+        segment = self.shell[render:plan_exit]
+        self.assertIn('--env-file "$candidate_env"', segment)
+        self.assertIn('--release-env "$release_env"', segment)
+        self.assertIn('--compose-config "$state_dir/release.compose.json"', segment)
+        self.assertIn('--env-file "$recorder_config_env"', segment)
+        self.assertIn('"$candidate_recorder_image" --config-check', segment)
+        self.assertIn("--network none", segment)
+        self.assertIn("--read-only", segment)
+        self.assertIn("--cap-drop ALL", segment)
+        self.assertIn('--cidfile "$recorder_config_cid_file"', segment)
+        self.assertIn('docker rm --force "$recorder_config_cid"', segment)
+        self.assertLess(
+            segment.index('docker rm --force "$recorder_config_cid"'),
+            segment.index('[ "$recorder_config_valid" -eq 1 ]'),
+        )
+        self.assertNotRegex(segment, r"compose_with[^\n]*(?:stop|up -d)")
+        self.assertIn('[ "$recorder_config_valid" -eq 1 ]', segment)
 
     def test_recorder_handoff_poll_is_bounded_and_precedes_candidate_start(self) -> None:
         handoff = self.shell.split("wait_recorder_handoff()", 1)[1].split(
