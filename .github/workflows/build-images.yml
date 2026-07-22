@@ -17,6 +17,16 @@ on:
         description: Type PUBLISH_IMMUTABLE_PHOENIX_IMAGES
         required: true
         type: string
+      protected_base_sha:
+        description: Optional exact release SHA supplying protected images
+        required: false
+        default: ""
+        type: string
+      protected_base_build_run_id:
+        description: Optional successful Build Phoenix Images run for protected_base_sha
+        required: false
+        default: ""
+        type: string
 
 permissions:
   contents: read
@@ -36,6 +46,7 @@ jobs:
     timeout-minutes: 5
     permissions:
       contents: read
+      actions: read
     steps:
       - name: Checkout exact requested release
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
@@ -49,6 +60,8 @@ jobs:
           RELEASE_SHA: ${{ inputs.release_sha }}
           RELEASE_INTENT: ${{ inputs.release_intent }}
           CONFIRM_PUBLISH: ${{ inputs.confirm_publish }}
+          PROTECTED_BASE_SHA: ${{ inputs.protected_base_sha }}
+          PROTECTED_BASE_BUILD_RUN_ID: ${{ inputs.protected_base_build_run_id }}
         run: |
           set -euo pipefail
           checked_out_sha="$(git rev-parse HEAD)"
@@ -56,12 +69,80 @@ jobs:
             --release-sha "$RELEASE_SHA" \
             --release-intent "$RELEASE_INTENT" \
             --confirm-publish "$CONFIRM_PUBLISH" \
-            --checked-out-sha "$checked_out_sha"
+            --checked-out-sha "$checked_out_sha" \
+            --protected-base-sha "$PROTECTED_BASE_SHA" \
+            --protected-base-build-run-id "$PROTECTED_BASE_BUILD_RUN_ID"
           git fetch --no-tags origin main
           if ! git merge-base --is-ancestor "$RELEASE_SHA" origin/main; then
             echo "Requested release SHA is not reachable from origin/main"
             exit 1
           fi
+
+      - name: Validate protected base build run
+        if: ${{ inputs.protected_base_sha != '' }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PROTECTED_BASE_SHA: ${{ inputs.protected_base_sha }}
+          PROTECTED_BASE_BUILD_RUN_ID: ${{ inputs.protected_base_build_run_id }}
+        run: |
+          set -euo pipefail
+          mkdir -p protected-base
+          gh api \
+            "repos/${GITHUB_REPOSITORY}/actions/runs/${PROTECTED_BASE_BUILD_RUN_ID}" \
+            > protected-base/build-run.json
+          python3 scripts/release_provenance.py validate-github-run \
+            --run-evidence protected-base/build-run.json \
+            --expected-sha "$PROTECTED_BASE_SHA" \
+            --expected-run-id "$PROTECTED_BASE_BUILD_RUN_ID"
+
+      - name: Download exact protected base release manifest
+        if: ${{ inputs.protected_base_sha != '' }}
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: phoenix-release-manifest-${{ inputs.protected_base_sha }}
+          run-id: ${{ inputs.protected_base_build_run_id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          path: protected-base/release
+
+      - name: Materialize inherited protected image fragments
+        if: ${{ inputs.protected_base_sha != '' }}
+        shell: bash
+        env:
+          RELEASE_SHA: ${{ inputs.release_sha }}
+          RELEASE_INTENT: ${{ inputs.release_intent }}
+          BUILD_RUN_ID: ${{ github.run_id }}
+          PROTECTED_BASE_SHA: ${{ inputs.protected_base_sha }}
+          PROTECTED_BASE_BUILD_RUN_ID: ${{ inputs.protected_base_build_run_id }}
+        run: |
+          set -euo pipefail
+          python3 scripts/release_provenance.py inherit-protected \
+            --output-dir inherited-fragments \
+            --release-sha "$RELEASE_SHA" \
+            --build-run-id "$BUILD_RUN_ID" \
+            --release-intent "$RELEASE_INTENT" \
+            --protected-base-sha "$PROTECTED_BASE_SHA" \
+            --protected-base-build-run-id "$PROTECTED_BASE_BUILD_RUN_ID" \
+            --protected-base-manifest protected-base/release/release-manifest.json \
+            --protected-base-provenance protected-base/release/release-provenance.json
+
+      - name: Upload inherited feed-ingestor manifest fragment
+        if: ${{ inputs.protected_base_sha != '' }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: release-fragment-feed-ingestor
+          path: inherited-fragments/feed-ingestor.json
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload inherited recorder manifest fragment
+        if: ${{ inputs.protected_base_sha != '' }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: release-fragment-recorder
+          path: inherited-fragments/recorder.json
+          if-no-files-found: error
+          retention-days: 30
 
   build:
     name: build-${{ matrix.image }}
@@ -78,34 +159,49 @@ jobs:
           - image: feed-ingestor
             dockerfile: deploy/feed-ingestor.Dockerfile
             build_args: ""
+            protected: true
           - image: phoenix-engine
             dockerfile: deploy/rust.Dockerfile
             build_args: "CRATE=phoenix-engine"
+            protected: false
           - image: rpc-gateway
             dockerfile: deploy/rust.Dockerfile
             build_args: "CRATE=rpc-gateway"
+            protected: false
           - image: recorder
             dockerfile: deploy/rust.Dockerfile
             build_args: "CRATE=recorder"
+            protected: true
           - image: fork-sandbox
             dockerfile: deploy/fork-sandbox.Dockerfile
             build_args: ""
+            protected: false
           - image: live-executor
             dockerfile: deploy/rust.Dockerfile
             build_args: "CRATE=live-executor"
+            protected: false
           - image: dashboard
             dockerfile: deploy/dashboard.Dockerfile
             build_args: ""
+            protected: false
     steps:
+      - name: Use inherited protected image
+        if: ${{ inputs.protected_base_sha != '' && matrix.protected == true }}
+        shell: bash
+        run: printf 'Protected image %s is inherited from the reviewed base release.\n' '${{ matrix.image }}'
+
       - name: Checkout
+        if: ${{ inputs.protected_base_sha == '' || matrix.protected == false }}
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
         with:
           ref: ${{ inputs.release_sha }}
 
       - name: Setup Docker Buildx
+        if: ${{ inputs.protected_base_sha == '' || matrix.protected == false }}
         uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f
 
       - name: Login to GHCR
+        if: ${{ inputs.protected_base_sha == '' || matrix.protected == false }}
         uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9
         with:
           registry: ghcr.io
@@ -113,11 +209,13 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Capture OCI created timestamp
+        if: ${{ inputs.protected_base_sha == '' || matrix.protected == false }}
         id: created
         shell: bash
         run: echo "value=$(date -u +'%Y-%m-%dT%H:%M:%SZ')" >> "$GITHUB_OUTPUT"
 
       - name: Build and push immutable image
+        if: ${{ inputs.protected_base_sha == '' || matrix.protected == false }}
         id: build
         uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8
         with:
@@ -135,6 +233,7 @@ jobs:
           cache-to: type=gha,mode=max,scope=${{ matrix.image }}
 
       - name: Write image manifest fragment
+        if: ${{ inputs.protected_base_sha == '' || matrix.protected == false }}
         shell: bash
         run: |
           set -euo pipefail
@@ -153,6 +252,7 @@ jobs:
           EOF
 
       - name: Upload image manifest fragment
+        if: ${{ inputs.protected_base_sha == '' || matrix.protected == false }}
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: release-fragment-${{ matrix.image }}
@@ -212,6 +312,7 @@ jobs:
     timeout-minutes: 10
     permissions:
       contents: read
+      actions: read
     steps:
       - name: Checkout exact requested release
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
@@ -231,12 +332,23 @@ jobs:
           name: phoenix-release-assets-${{ inputs.release_sha }}
           path: release-assets
 
+      - name: Download exact protected base release manifest
+        if: ${{ inputs.protected_base_sha != '' }}
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: phoenix-release-manifest-${{ inputs.protected_base_sha }}
+          run-id: ${{ inputs.protected_base_build_run_id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          path: protected-base
+
       - name: Assemble same-run release manifest and provenance
         shell: bash
         env:
           RELEASE_SHA: ${{ inputs.release_sha }}
           RELEASE_INTENT: ${{ inputs.release_intent }}
           BUILD_RUN_ID: ${{ github.run_id }}
+          PROTECTED_BASE_SHA: ${{ inputs.protected_base_sha }}
+          PROTECTED_BASE_BUILD_RUN_ID: ${{ inputs.protected_base_build_run_id }}
         run: |
           set -euo pipefail
           python3 scripts/release_assets.py verify \
@@ -244,6 +356,15 @@ jobs:
             --manifest release-assets/release-assets-manifest.json \
             --checksums release-assets/release-assets-checksums.txt \
             --expected-sha "$RELEASE_SHA"
+          protected_args=()
+          if [ -n "$PROTECTED_BASE_SHA" ]; then
+            protected_args=(
+              --protected-base-sha "$PROTECTED_BASE_SHA"
+              --protected-base-build-run-id "$PROTECTED_BASE_BUILD_RUN_ID"
+              --protected-base-manifest protected-base/release-manifest.json
+              --protected-base-provenance protected-base/release-provenance.json
+            )
+          fi
           python3 scripts/release_provenance.py assemble \
             --fragments-dir manifest-fragments \
             --release-assets-dir release-assets \
@@ -251,7 +372,8 @@ jobs:
             --build-run-id "$BUILD_RUN_ID" \
             --release-intent "$RELEASE_INTENT" \
             --output-manifest release-manifest.json \
-            --output-provenance release-provenance.json
+            --output-provenance release-provenance.json \
+            "${protected_args[@]}"
 
       - name: Upload release manifest and provenance
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02

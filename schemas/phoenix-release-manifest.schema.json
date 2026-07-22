@@ -1,0 +1,228 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://phoenix.invalid/schemas/phoenix-release-manifest.schema.json",
+  "title": "Phoenix immutable release manifest",
+  "oneOf": [
+    {
+      "$ref": "#/$defs/fullBuild"
+    },
+    {
+      "$ref": "#/$defs/protectedInheritance"
+    }
+  ],
+  "$defs": {
+    "sha": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{40}$"
+    },
+    "runId": {
+      "type": "string",
+      "pattern": "^[1-9][0-9]{0,19}$"
+    },
+    "digest": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "legacyImage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "repository",
+        "tag",
+        "digest"
+      ],
+      "properties": {
+        "repository": {
+          "type": "string"
+        },
+        "tag": {
+          "type": "string",
+          "pattern": "^sha-[0-9a-f]{40}$"
+        },
+        "digest": {
+          "$ref": "#/$defs/digest"
+        }
+      }
+    },
+    "builtImage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "repository",
+        "tag",
+        "digest",
+        "origin",
+        "source_sha",
+        "source_build_run_id",
+        "oci_revision"
+      ],
+      "properties": {
+        "repository": {
+          "type": "string"
+        },
+        "tag": {
+          "type": "string",
+          "pattern": "^sha-[0-9a-f]{40}$"
+        },
+        "digest": {
+          "$ref": "#/$defs/digest"
+        },
+        "origin": {
+          "const": "built"
+        },
+        "source_sha": {
+          "$ref": "#/$defs/sha"
+        },
+        "source_build_run_id": {
+          "$ref": "#/$defs/runId"
+        },
+        "oci_revision": {
+          "$ref": "#/$defs/sha"
+        }
+      }
+    },
+    "inheritedImage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "repository",
+        "tag",
+        "digest",
+        "origin",
+        "source_sha",
+        "source_build_run_id",
+        "oci_revision"
+      ],
+      "properties": {
+        "repository": {
+          "type": "string"
+        },
+        "tag": {
+          "type": "string",
+          "pattern": "^sha-[0-9a-f]{40}$"
+        },
+        "digest": {
+          "$ref": "#/$defs/digest"
+        },
+        "origin": {
+          "const": "inherited"
+        },
+        "source_sha": {
+          "$ref": "#/$defs/sha"
+        },
+        "source_build_run_id": {
+          "$ref": "#/$defs/runId"
+        },
+        "oci_revision": {
+          "$ref": "#/$defs/sha"
+        }
+      }
+    },
+    "legacyImages": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "dashboard",
+        "feed-ingestor",
+        "fork-sandbox",
+        "live-executor",
+        "phoenix-engine",
+        "recorder",
+        "rpc-gateway"
+      ],
+      "properties": {
+        "dashboard": { "$ref": "#/$defs/legacyImage" },
+        "feed-ingestor": { "$ref": "#/$defs/legacyImage" },
+        "fork-sandbox": { "$ref": "#/$defs/legacyImage" },
+        "live-executor": { "$ref": "#/$defs/legacyImage" },
+        "phoenix-engine": { "$ref": "#/$defs/legacyImage" },
+        "recorder": { "$ref": "#/$defs/legacyImage" },
+        "rpc-gateway": { "$ref": "#/$defs/legacyImage" }
+      }
+    },
+    "inheritedImages": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "dashboard",
+        "feed-ingestor",
+        "fork-sandbox",
+        "live-executor",
+        "phoenix-engine",
+        "recorder",
+        "rpc-gateway"
+      ],
+      "properties": {
+        "dashboard": { "$ref": "#/$defs/builtImage" },
+        "feed-ingestor": { "$ref": "#/$defs/inheritedImage" },
+        "fork-sandbox": { "$ref": "#/$defs/builtImage" },
+        "live-executor": { "$ref": "#/$defs/builtImage" },
+        "phoenix-engine": { "$ref": "#/$defs/builtImage" },
+        "recorder": { "$ref": "#/$defs/inheritedImage" },
+        "rpc-gateway": { "$ref": "#/$defs/builtImage" }
+      }
+    },
+    "fullBuild": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema",
+        "release_sha",
+        "created_at",
+        "images"
+      ],
+      "properties": {
+        "schema": {
+          "const": "phoenix.release.v1"
+        },
+        "release_sha": {
+          "$ref": "#/$defs/sha"
+        },
+        "created_at": {
+          "type": "string",
+          "minLength": 1
+        },
+        "images": {
+          "$ref": "#/$defs/legacyImages"
+        }
+      }
+    },
+    "protectedInheritance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema",
+        "release_sha",
+        "build_run_id",
+        "created_at",
+        "protected_base_sha",
+        "protected_base_build_run_id",
+        "images"
+      ],
+      "properties": {
+        "schema": {
+          "const": "phoenix.release.v2"
+        },
+        "release_sha": {
+          "$ref": "#/$defs/sha"
+        },
+        "build_run_id": {
+          "$ref": "#/$defs/runId"
+        },
+        "created_at": {
+          "type": "string",
+          "minLength": 1
+        },
+        "protected_base_sha": {
+          "$ref": "#/$defs/sha"
+        },
+        "protected_base_build_run_id": {
+          "$ref": "#/$defs/runId"
+        },
+        "images": {
+          "$ref": "#/$defs/inheritedImages"
+        }
+      }
+    }
+  }
+}

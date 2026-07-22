@@ -6,6 +6,7 @@ script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 repo_root=$(CDPATH='' cd -- "$script_dir/.." && pwd)
 deploy_workflow=$repo_root/.github/workflows/deploy-shadow.yml
 build_workflow=$repo_root/.github/workflows/build-images.yml
+release_validator=$script_dir/release_provenance.py
 deploy_script=$script_dir/deploy-release.sh
 rollback_script=$script_dir/rollback-release.sh
 installer=$script_dir/install-release-assets.sh
@@ -33,8 +34,10 @@ grep -F 'phoenix-release-assets-${{ inputs.release_sha }}' "$deploy_workflow" >/
   fail 'release assets are not downloaded by exact SHA'
 grep -F 'phoenix-release-manifest-${{ inputs.rollback_sha }}' "$deploy_workflow" >/dev/null ||
   fail 'rollback manifest is not downloaded by exact SHA'
-grep -F 'protected image digest changed for {protected}' "$deploy_workflow" >/dev/null ||
-  fail 'protected image changes do not fail before SSH'
+grep -F 'validate-deploy-pair' "$deploy_workflow" >/dev/null ||
+  fail 'protected image inheritance is not validated before SSH'
+grep -F 'protected image changed for {name}; maintenance is required' "$release_validator" >/dev/null ||
+  fail 'legacy protected image changes are not rejected'
 grep -F 'asset_sha=$(tr -d' "$deploy_workflow" >/dev/null ||
   fail 'active rollback release-assets identity is not checked before installation'
 grep -F 'release_assets.py verify-tree' "$deploy_workflow" >/dev/null ||
@@ -58,12 +61,16 @@ grep -F 'workflow_dispatch:' "$build_workflow" >/dev/null ||
 if grep -E '^  (push|pull_request):' "$build_workflow" >/dev/null; then
   fail 'image publication still has an automatic trigger'
 fi
-for input in release_sha release_intent confirm_publish; do
+for input in release_sha release_intent confirm_publish protected_base_sha protected_base_build_run_id; do
   grep -F "      $input:" "$build_workflow" >/dev/null ||
     fail "image publication input is missing: $input"
 done
 grep -F 'needs: [preflight, build, assets]' "$build_workflow" >/dev/null ||
   fail 'release manifest is not gated on immutable assets'
+grep -F 'inherit-protected' "$build_workflow" >/dev/null ||
+  fail 'protected image inheritance materialization is missing'
+grep -F 'matrix.protected == false' "$build_workflow" >/dev/null ||
+  fail 'protected images are not excluded from inherited builds'
 
 for release_script in "$deploy_script" "$rollback_script"; do
   grep -F "protected_services='nitro-feed-relay feed-ingestor nats postgres recorder'" "$release_script" >/dev/null ||
