@@ -29,6 +29,7 @@ MAX_ARCHIVE_BYTES = 72 * 1024 * 1024
 STATIC_PATHS = (
     "compose.live-canary.yml",
     "compose.prod.yml",
+    "release-components.json",
     "dashboard/snapshot_model.py",
     "deploy/nats-server.conf",
     "deploy/prelive-v5-release.example.json",
@@ -59,6 +60,7 @@ STATIC_PATHS = (
     "scripts/production_context.py",
     "scripts/provision-production-host.sh",
     "scripts/release_assets.py",
+    "scripts/release_components.py",
     "scripts/release_provenance.py",
     "scripts/render-production-compose.sh",
     "scripts/rollback-release.sh",

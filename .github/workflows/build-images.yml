@@ -17,6 +17,14 @@ on:
         description: Type PUBLISH_IMMUTABLE_PHOENIX_IMAGES
         required: true
         type: string
+      ci_run_id:
+        description: Exact successful Phoenix CI main-push run for release_sha
+        required: true
+        type: string
+      ci_run_attempt:
+        description: Exact successful Phoenix CI run attempt
+        required: true
+        type: string
       protected_base_sha:
         description: Optional exact release SHA supplying protected images
         required: false
@@ -47,6 +55,8 @@ jobs:
     permissions:
       contents: read
       actions: read
+    outputs:
+      build_matrix: ${{ steps.components.outputs.matrix }}
     steps:
       - name: Checkout exact requested release
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
@@ -54,12 +64,23 @@ jobs:
           ref: ${{ inputs.release_sha }}
           fetch-depth: 0
 
+      - name: Load canonical release component matrix
+        id: components
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/release_components.py validate
+          printf 'matrix=%s\n' "$(python3 scripts/release_components.py build-matrix)" \
+            >> "$GITHUB_OUTPUT"
+
       - name: Validate explicit publication authorization
         shell: bash
         env:
           RELEASE_SHA: ${{ inputs.release_sha }}
           RELEASE_INTENT: ${{ inputs.release_intent }}
           CONFIRM_PUBLISH: ${{ inputs.confirm_publish }}
+          CI_RUN_ID: ${{ inputs.ci_run_id }}
+          CI_RUN_ATTEMPT: ${{ inputs.ci_run_attempt }}
           PROTECTED_BASE_SHA: ${{ inputs.protected_base_sha }}
           PROTECTED_BASE_BUILD_RUN_ID: ${{ inputs.protected_base_build_run_id }}
         run: |
@@ -70,13 +91,47 @@ jobs:
             --release-intent "$RELEASE_INTENT" \
             --confirm-publish "$CONFIRM_PUBLISH" \
             --checked-out-sha "$checked_out_sha" \
+            --ci-run-id "$CI_RUN_ID" \
+            --ci-run-attempt "$CI_RUN_ATTEMPT" \
             --protected-base-sha "$PROTECTED_BASE_SHA" \
             --protected-base-build-run-id "$PROTECTED_BASE_BUILD_RUN_ID"
           git fetch --no-tags origin main
-          if ! git merge-base --is-ancestor "$RELEASE_SHA" origin/main; then
-            echo "Requested release SHA is not reachable from origin/main"
+          if [ "$(git rev-parse origin/main)" != "$RELEASE_SHA" ]; then
+            echo "Requested release SHA is not the exact origin/main tip"
             exit 1
           fi
+
+      - name: Validate exact successful main-push CI evidence
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_SHA: ${{ inputs.release_sha }}
+          CI_RUN_ID: ${{ inputs.ci_run_id }}
+          CI_RUN_ATTEMPT: ${{ inputs.ci_run_attempt }}
+        run: |
+          set -euo pipefail
+          mkdir -p source-ci
+          gh api \
+            "repos/${GITHUB_REPOSITORY}/actions/runs/${CI_RUN_ID}/attempts/${CI_RUN_ATTEMPT}" \
+            > source-ci/run.json
+          gh api \
+            "repos/${GITHUB_REPOSITORY}/actions/runs/${CI_RUN_ID}/attempts/${CI_RUN_ATTEMPT}/jobs?per_page=100" \
+            > source-ci/jobs.json
+          python3 scripts/release_provenance.py validate-source-ci \
+            --run-evidence source-ci/run.json \
+            --jobs-evidence source-ci/jobs.json \
+            --expected-sha "$RELEASE_SHA" \
+            --expected-run-id "$CI_RUN_ID" \
+            --expected-run-attempt "$CI_RUN_ATTEMPT" \
+            --output source-ci/evidence.json
+
+      - name: Upload validated source CI evidence
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: source-ci-evidence-${{ inputs.release_sha }}
+          path: source-ci/evidence.json
+          if-no-files-found: error
+          retention-days: 90
 
       - name: Validate protected base build run
         if: ${{ inputs.protected_base_sha != '' }}
@@ -126,21 +181,12 @@ jobs:
             --protected-base-manifest protected-base/release/release-manifest.json \
             --protected-base-provenance protected-base/release/release-provenance.json
 
-      - name: Upload inherited feed-ingestor manifest fragment
+      - name: Upload inherited protected image fragments
         if: ${{ inputs.protected_base_sha != '' }}
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: release-fragment-feed-ingestor
-          path: inherited-fragments/feed-ingestor.json
-          if-no-files-found: error
-          retention-days: 30
-
-      - name: Upload inherited recorder manifest fragment
-        if: ${{ inputs.protected_base_sha != '' }}
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
-        with:
-          name: release-fragment-recorder
-          path: inherited-fragments/recorder.json
+          name: inherited-protected-fragments
+          path: inherited-fragments/
           if-no-files-found: error
           retention-days: 30
 
@@ -154,41 +200,28 @@ jobs:
       packages: write
     strategy:
       fail-fast: false
-      matrix:
-        include:
-          - image: feed-ingestor
-            dockerfile: deploy/feed-ingestor.Dockerfile
-            build_args: ""
-            protected: true
-          - image: phoenix-engine
-            dockerfile: deploy/rust.Dockerfile
-            build_args: "CRATE=phoenix-engine"
-            protected: false
-          - image: rpc-gateway
-            dockerfile: deploy/rust.Dockerfile
-            build_args: "CRATE=rpc-gateway"
-            protected: false
-          - image: recorder
-            dockerfile: deploy/rust.Dockerfile
-            build_args: "CRATE=recorder"
-            protected: true
-          - image: fork-sandbox
-            dockerfile: deploy/fork-sandbox.Dockerfile
-            build_args: ""
-            protected: false
-          - image: live-executor
-            dockerfile: deploy/rust.Dockerfile
-            build_args: "CRATE=live-executor"
-            protected: false
-          - image: dashboard
-            dockerfile: deploy/dashboard.Dockerfile
-            build_args: ""
-            protected: false
+      matrix: ${{ fromJSON(needs.preflight.outputs.build_matrix) }}
     steps:
       - name: Use inherited protected image
         if: ${{ inputs.protected_base_sha != '' && matrix.protected == true }}
         shell: bash
         run: printf 'Protected image %s is inherited from the reviewed base release.\n' '${{ matrix.image }}'
+
+      - name: Download inherited protected image fragments
+        if: ${{ inputs.protected_base_sha != '' && matrix.protected == true }}
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: inherited-protected-fragments
+          path: inherited-fragments
+
+      - name: Upload inherited image manifest fragment
+        if: ${{ inputs.protected_base_sha != '' && matrix.protected == true }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: release-fragment-${{ matrix.image }}
+          path: inherited-fragments/${{ matrix.image }}.json
+          if-no-files-found: error
+          retention-days: 30
 
       - name: Checkout
         if: ${{ inputs.protected_base_sha == '' || matrix.protected == false }}
@@ -219,11 +252,11 @@ jobs:
         id: build
         uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8
         with:
-          context: .
+          context: ${{ matrix.context }}
           file: ${{ matrix.dockerfile }}
           push: true
           build-args: ${{ matrix.build_args }}
-          tags: ghcr.io/majidasgharitabrizi/${{ matrix.image }}:sha-${{ inputs.release_sha }}
+          tags: ${{ matrix.repository }}:sha-${{ inputs.release_sha }}
           labels: |
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
             org.opencontainers.image.revision=${{ inputs.release_sha }}
@@ -245,7 +278,7 @@ jobs:
             "build_run_id": "${{ github.run_id }}",
             "release_intent": "${{ inputs.release_intent }}",
             "name": "${{ matrix.image }}",
-            "repository": "ghcr.io/majidasgharitabrizi/${{ matrix.image }}",
+            "repository": "${{ matrix.repository }}",
             "tag": "sha-${{ inputs.release_sha }}",
             "digest": "${{ steps.build.outputs.digest }}"
           }
@@ -332,6 +365,12 @@ jobs:
           name: phoenix-release-assets-${{ inputs.release_sha }}
           path: release-assets
 
+      - name: Download validated source CI evidence
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: source-ci-evidence-${{ inputs.release_sha }}
+          path: source-ci
+
       - name: Download exact protected base release manifest
         if: ${{ inputs.protected_base_sha != '' }}
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
@@ -373,6 +412,7 @@ jobs:
             --release-intent "$RELEASE_INTENT" \
             --output-manifest release-manifest.json \
             --output-provenance release-provenance.json \
+            --source-ci-evidence source-ci/evidence.json \
             "${protected_args[@]}"
 
       - name: Upload release manifest and provenance

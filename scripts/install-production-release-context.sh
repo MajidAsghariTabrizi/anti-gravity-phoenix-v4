@@ -121,6 +121,8 @@ install_source "$source_root/compose.prod.yml" "$deploy_dir/compose.prod.yml" 06
 install_source \
   "$source_root/compose.live-canary.yml" "$deploy_dir/compose.live-canary.yml" 0640
 install_source \
+  "$source_root/release-components.json" "$deploy_dir/release-components.json" 0640
+install_source \
   "$source_root/deploy/nats-server.conf" "$deploy_dir/nats-server.conf" 0644
 install_source \
   "$source_root/prometheus/prometheus.yml" \
@@ -158,6 +160,7 @@ done
 
 for script_name in \
   production_context.py \
+  release_components.py \
   render-production-compose.sh \
   verify-compose-route-registry.py \
   validate-production-release-context.sh \

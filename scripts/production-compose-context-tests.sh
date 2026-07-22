@@ -45,7 +45,9 @@ cat >"$manifest" <<EOF
     "phoenix-engine": {"repository": "ghcr.io/majidasgharitabrizi/phoenix-engine", "tag": "sha-$release_sha", "digest": "sha256:2222222222222222222222222222222222222222222222222222222222222222"},
     "rpc-gateway": {"repository": "ghcr.io/majidasgharitabrizi/rpc-gateway", "tag": "sha-$release_sha", "digest": "sha256:3333333333333333333333333333333333333333333333333333333333333333"},
     "recorder": {"repository": "ghcr.io/majidasgharitabrizi/recorder", "tag": "sha-$release_sha", "digest": "sha256:4444444444444444444444444444444444444444444444444444444444444444"},
-    "dashboard": {"repository": "ghcr.io/majidasgharitabrizi/dashboard", "tag": "sha-$release_sha", "digest": "sha256:5555555555555555555555555555555555555555555555555555555555555555"}
+    "dashboard": {"repository": "ghcr.io/majidasgharitabrizi/dashboard", "tag": "sha-$release_sha", "digest": "sha256:5555555555555555555555555555555555555555555555555555555555555555"},
+    "fork-sandbox": {"repository": "ghcr.io/majidasgharitabrizi/fork-sandbox", "tag": "sha-$release_sha", "digest": "sha256:6666666666666666666666666666666666666666666666666666666666666666"},
+    "live-executor": {"repository": "ghcr.io/majidasgharitabrizi/live-executor", "tag": "sha-$release_sha", "digest": "sha256:7777777777777777777777777777777777777777777777777777777777777777"}
   }
 }
 EOF
@@ -433,6 +435,8 @@ for release_script in "$script_dir/deploy-release.sh" "$script_dir/rollback-rele
   fi
 done
 for installed_script in \
+  release-components.json \
+  release_components.py \
   production_context.py \
   render-production-compose.sh \
   validate-production-release-context.sh \

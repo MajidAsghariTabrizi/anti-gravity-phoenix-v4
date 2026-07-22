@@ -129,12 +129,27 @@ jobs:
       - name: Validate immutable release and rollback evidence
         shell: bash
         env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           RELEASE_SHA: ${{ inputs.release_sha }}
           BUILD_RUN_ID: ${{ inputs.build_run_id }}
           ROLLBACK_SHA: ${{ inputs.rollback_sha }}
           ROLLBACK_BUILD_RUN_ID: ${{ inputs.rollback_build_run_id }}
         run: |
           set -euo pipefail
+          source_ci_run_id="$(jq -er '.source_ci.run_id' release/release-provenance.json)"
+          source_ci_run_attempt="$(jq -er '.source_ci.run_attempt' release/release-provenance.json)"
+          mkdir -p source-ci
+          gh api \
+            "repos/${GITHUB_REPOSITORY}/actions/runs/${source_ci_run_id}/attempts/${source_ci_run_attempt}" \
+            > source-ci/run.json
+          gh api \
+            "repos/${GITHUB_REPOSITORY}/actions/runs/${source_ci_run_id}/attempts/${source_ci_run_attempt}/jobs?per_page=100" \
+            > source-ci/jobs.json
+          python3 scripts/release_provenance.py validate-source-ci-api \
+            --release-provenance release/release-provenance.json \
+            --run-evidence source-ci/run.json \
+            --jobs-evidence source-ci/jobs.json \
+            --expected-sha "$RELEASE_SHA"
           python3 scripts/release_assets.py verify \
             --archive "release-assets/phoenix-release-assets-${RELEASE_SHA}.tar.gz" \
             --manifest release-assets/release-assets-manifest.json \

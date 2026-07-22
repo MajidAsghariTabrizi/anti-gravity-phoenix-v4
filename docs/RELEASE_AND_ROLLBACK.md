@@ -23,13 +23,14 @@ An explicitly authorized `Build Phoenix Images` workflow dispatch creates
 Production deploys image references from this manifest only. Mutable tags are rejected.
 
 Ordinary pushes and pull requests cannot publish Phoenix images. The manual
-workflow requires an exact release SHA reachable from main, the bounded
-release intent, and the exact publication confirmation. Only publishing jobs
-receive `packages: write`.
+workflow requires the exact current `main` SHA, the successful `Phoenix CI`
+main-push run ID and attempt for that SHA, the bounded release intent, and the
+exact publication confirmation. Only publishing jobs receive `packages: write`.
 
 The same run also creates `release-provenance.json`. It binds all seven image
 fragments, immutable release assets, release manifest, exact source SHA,
-release intent, and build run. Canonical validation additionally requires the
+release intent, build run, and normalized exact-main CI evidence. Canonical
+validation additionally requires the
 completed GitHub run and every required job to be successful. Run
 `29683234024` is quarantined as `NON_CANONICAL_INCOMPLETE_BUILD`; none of its
 partial images or artifacts are release evidence.

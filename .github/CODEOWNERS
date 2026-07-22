@@ -1,0 +1,15 @@
+/.github/CODEOWNERS @MajidAsghariTabrizi
+/.github/workflows/** @MajidAsghariTabrizi
+/release-components.json @MajidAsghariTabrizi
+/scripts/release_components.py @MajidAsghariTabrizi
+/scripts/release_assets.py @MajidAsghariTabrizi
+/scripts/release_provenance.py @MajidAsghariTabrizi
+/scripts/production_context.py @MajidAsghariTabrizi
+/schemas/release-components.schema.json @MajidAsghariTabrizi
+/schemas/phoenix-release-*.json @MajidAsghariTabrizi
+/contracts/** @MajidAsghariTabrizi
+/live-executor/** @MajidAsghariTabrizi
+/scripts/install-production-release-context.sh @MajidAsghariTabrizi
+/scripts/install-shadow-deploy-gateway.sh @MajidAsghariTabrizi
+/scripts/phoenix-shadow-deploy-gateway.sh @MajidAsghariTabrizi
+/scripts/phoenix_shadow_deploy.py @MajidAsghariTabrizi

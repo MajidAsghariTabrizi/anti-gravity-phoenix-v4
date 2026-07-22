@@ -1,0 +1,145 @@
+{
+  "schema": "phoenix.release-components.v1",
+  "required_ci": {
+    "branch": "main",
+    "event": "push",
+    "jobs": [
+      "hygiene",
+      "go",
+      "rust-phoenix",
+      "rust-rpc-gateway",
+      "rust-recorder",
+      "rust-replay",
+      "rust-fork-sandbox",
+      "solidity",
+      "python-dashboard",
+      "docker-validation",
+      "integration-fixtures",
+      "jetstream-integration"
+    ],
+    "workflow_name": "Phoenix CI",
+    "workflow_path": ".github/workflows/ci.yml"
+  },
+  "components": [
+    {
+      "build_args": {},
+      "build_context": ".",
+      "dockerfile": "deploy/dashboard.Dockerfile",
+      "image_environment": "DASHBOARD_IMAGE",
+      "live_canary_only": false,
+      "name": "dashboard",
+      "production_compose": true,
+      "production_order": 4,
+      "production_services": [
+        "dashboard"
+      ],
+      "protected": false,
+      "release_included": true,
+      "repository": "ghcr.io/majidasgharitabrizi/dashboard"
+    },
+    {
+      "build_args": {},
+      "build_context": ".",
+      "dockerfile": "deploy/feed-ingestor.Dockerfile",
+      "image_environment": "FEED_INGESTOR_IMAGE",
+      "live_canary_only": false,
+      "name": "feed-ingestor",
+      "production_compose": true,
+      "production_order": 0,
+      "production_services": [
+        "feed-ingestor",
+        "migration-runner"
+      ],
+      "protected": true,
+      "release_included": true,
+      "repository": "ghcr.io/majidasgharitabrizi/feed-ingestor"
+    },
+    {
+      "build_args": {},
+      "build_context": ".",
+      "dockerfile": "deploy/fork-sandbox.Dockerfile",
+      "image_environment": null,
+      "live_canary_only": false,
+      "name": "fork-sandbox",
+      "production_compose": false,
+      "production_order": null,
+      "production_services": [],
+      "protected": false,
+      "release_included": true,
+      "repository": "ghcr.io/majidasgharitabrizi/fork-sandbox"
+    },
+    {
+      "build_args": {
+        "CRATE": "live-executor"
+      },
+      "build_context": ".",
+      "dockerfile": "deploy/rust.Dockerfile",
+      "image_environment": "LIVE_EXECUTOR_IMAGE",
+      "live_canary_only": true,
+      "name": "live-executor",
+      "production_compose": true,
+      "production_order": 5,
+      "production_services": [
+        "live-executor"
+      ],
+      "protected": false,
+      "release_included": true,
+      "repository": "ghcr.io/majidasgharitabrizi/live-executor"
+    },
+    {
+      "build_args": {
+        "CRATE": "phoenix-engine"
+      },
+      "build_context": ".",
+      "dockerfile": "deploy/rust.Dockerfile",
+      "image_environment": "PHOENIX_ENGINE_IMAGE",
+      "live_canary_only": false,
+      "name": "phoenix-engine",
+      "production_compose": true,
+      "production_order": 1,
+      "production_services": [
+        "phoenix-engine"
+      ],
+      "protected": false,
+      "release_included": true,
+      "repository": "ghcr.io/majidasgharitabrizi/phoenix-engine"
+    },
+    {
+      "build_args": {
+        "CRATE": "recorder"
+      },
+      "build_context": ".",
+      "dockerfile": "deploy/rust.Dockerfile",
+      "image_environment": "RECORDER_IMAGE",
+      "live_canary_only": false,
+      "name": "recorder",
+      "production_compose": true,
+      "production_order": 3,
+      "production_services": [
+        "recorder",
+        "shadow-dispatcher"
+      ],
+      "protected": true,
+      "release_included": true,
+      "repository": "ghcr.io/majidasgharitabrizi/recorder"
+    },
+    {
+      "build_args": {
+        "CRATE": "rpc-gateway"
+      },
+      "build_context": ".",
+      "dockerfile": "deploy/rust.Dockerfile",
+      "image_environment": "RPC_GATEWAY_IMAGE",
+      "live_canary_only": false,
+      "name": "rpc-gateway",
+      "production_compose": true,
+      "production_order": 2,
+      "production_services": [
+        "rpc-gateway"
+      ],
+      "protected": false,
+      "release_included": true,
+      "repository": "ghcr.io/majidasgharitabrizi/rpc-gateway"
+    }
+  ]
+}

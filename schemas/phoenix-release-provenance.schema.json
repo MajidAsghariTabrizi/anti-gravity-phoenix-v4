@@ -22,7 +22,9 @@
     "schema": {
       "enum": [
         "phoenix.release-provenance.v1",
-        "phoenix.release-provenance.v2"
+        "phoenix.release-provenance.v2",
+        "phoenix.release-provenance.v3",
+        "phoenix.release-provenance.v4"
       ]
     },
     "repository": {
@@ -75,7 +77,7 @@
     "required_release_artifacts": {
       "type": "array",
       "minItems": 9,
-      "maxItems": 9,
+      "maxItems": 10,
       "uniqueItems": true,
       "items": {
         "type": "string"
@@ -128,6 +130,9 @@
     "release_manifest_sha256": {
       "$ref": "#/$defs/digest"
     },
+    "source_ci": {
+      "$ref": "#/$defs/sourceCi"
+    },
     "protected_base": {
       "type": "object",
       "additionalProperties": false,
@@ -177,13 +182,18 @@
       "properties": {
         "schema": {
           "const": "phoenix.release-provenance.v1"
+        },
+        "required_release_artifacts": {
+          "minItems": 9,
+          "maxItems": 9
         }
       },
       "not": {
         "anyOf": [
           { "required": ["protected_base"] },
           { "required": ["built_images"] },
-          { "required": ["inherited_images"] }
+          { "required": ["inherited_images"] },
+          { "required": ["source_ci"] }
         ]
       }
     },
@@ -196,6 +206,51 @@
       "properties": {
         "schema": {
           "const": "phoenix.release-provenance.v2"
+        },
+        "required_release_artifacts": {
+          "minItems": 9,
+          "maxItems": 9
+        }
+      },
+      "not": {
+        "required": ["source_ci"]
+      }
+    },
+    {
+      "required": [
+        "source_ci"
+      ],
+      "properties": {
+        "schema": {
+          "const": "phoenix.release-provenance.v3"
+        },
+        "required_release_artifacts": {
+          "minItems": 10,
+          "maxItems": 10
+        }
+      },
+      "not": {
+        "anyOf": [
+          { "required": ["protected_base"] },
+          { "required": ["built_images"] },
+          { "required": ["inherited_images"] }
+        ]
+      }
+    },
+    {
+      "required": [
+        "source_ci",
+        "protected_base",
+        "built_images",
+        "inherited_images"
+      ],
+      "properties": {
+        "schema": {
+          "const": "phoenix.release-provenance.v4"
+        },
+        "required_release_artifacts": {
+          "minItems": 10,
+          "maxItems": 10
         }
       }
     }
@@ -212,6 +267,84 @@
     "digest": {
       "type": "string",
       "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "ciJobName": {
+      "enum": [
+        "hygiene",
+        "go",
+        "rust-phoenix",
+        "rust-rpc-gateway",
+        "rust-recorder",
+        "rust-replay",
+        "rust-fork-sandbox",
+        "solidity",
+        "python-dashboard",
+        "docker-validation",
+        "integration-fixtures",
+        "jetstream-integration"
+      ]
+    },
+    "sourceCiJob": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "status",
+        "conclusion"
+      ],
+      "properties": {
+        "name": { "$ref": "#/$defs/ciJobName" },
+        "status": { "const": "completed" },
+        "conclusion": { "const": "success" }
+      }
+    },
+    "sourceCi": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema",
+        "repository",
+        "workflow",
+        "workflow_path",
+        "run_id",
+        "run_attempt",
+        "head_sha",
+        "event",
+        "head_branch",
+        "status",
+        "conclusion",
+        "required_jobs",
+        "jobs",
+        "evidence_sha256"
+      ],
+      "properties": {
+        "schema": { "const": "phoenix.source-ci.v1" },
+        "repository": { "const": "MajidAsghariTabrizi/anti-gravity-phoenix-v4" },
+        "workflow": { "const": "Phoenix CI" },
+        "workflow_path": { "const": ".github/workflows/ci.yml" },
+        "run_id": { "$ref": "#/$defs/runId" },
+        "run_attempt": { "$ref": "#/$defs/runId" },
+        "head_sha": { "$ref": "#/$defs/sha" },
+        "event": { "const": "push" },
+        "head_branch": { "const": "main" },
+        "status": { "const": "completed" },
+        "conclusion": { "const": "success" },
+        "required_jobs": {
+          "type": "array",
+          "minItems": 12,
+          "maxItems": 12,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/ciJobName" }
+        },
+        "jobs": {
+          "type": "array",
+          "minItems": 12,
+          "maxItems": 12,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/sourceCiJob" }
+        },
+        "evidence_sha256": { "$ref": "#/$defs/digest" }
+      }
     },
     "fragment": {
       "type": "object",

@@ -17,6 +17,31 @@ CANDIDATE_RUN = "30000000101"
 ROLLBACK_RUN = "30000000100"
 DEPLOY_RUN = "30000000200"
 DEPLOY_ATTEMPT = "1"
+SOURCE_CI_RUN = "30000000300"
+
+
+def source_ci_evidence(release_sha: str) -> dict:
+    run = {
+        "id": int(SOURCE_CI_RUN),
+        "run_attempt": 1,
+        "name": release_provenance.CI_WORKFLOW,
+        "path": release_provenance.CI_WORKFLOW_PATH,
+        "event": release_provenance.CI_EVENT,
+        "head_branch": release_provenance.CI_BRANCH,
+        "head_sha": release_sha,
+        "status": "completed",
+        "conclusion": "success",
+        "repository": {"full_name": release_provenance.REPOSITORY},
+    }
+    jobs = {
+        "jobs": [
+            {"name": name, "status": "completed", "conclusion": "success"}
+            for name in release_provenance.REQUIRED_CI_JOBS
+        ]
+    }
+    return release_provenance.validate_source_ci_run(
+        run, jobs, release_sha, SOURCE_CI_RUN, "1"
+    )
 
 
 def identity() -> gateway.Identity:
@@ -306,6 +331,7 @@ class ReleaseContractTests(unittest.TestCase):
                 release_provenance.RELEASE_INTENT,
                 manifest_path,
                 provenance_path,
+                source_ci_evidence(release_sha),
                 created_at="2026-07-22T00:00:00Z",
             )
         return manifest, provenance, manifest_path, provenance_path
@@ -346,6 +372,7 @@ class ReleaseContractTests(unittest.TestCase):
                     release_provenance.RELEASE_INTENT,
                     candidate_manifest_path,
                     candidate_provenance_path,
+                    source_ci_evidence(CANDIDATE_SHA),
                     created_at="2026-07-22T00:00:00Z",
                     protected_base_sha=ROLLBACK_SHA,
                     protected_base_build_run_id=ROLLBACK_RUN,
@@ -372,12 +399,23 @@ class ReleaseContractTests(unittest.TestCase):
         with mock.patch.object(gateway.release_assets, "verify_release_assets"):
             gateway.validate_release_inputs(identity(), inputs)
 
-    def test_legacy_seven_image_v1_release_remains_accepted(self) -> None:
+    def test_reviewed_legacy_rollback_provenance_remains_accepted(self) -> None:
         _, _, rollback_manifest, rollback_provenance = self._full_release(
             self.root / "rollback-v1", ROLLBACK_SHA, ROLLBACK_RUN
         )
         _, _, candidate_manifest, candidate_provenance = self._full_release(
             self.root / "candidate-v1", CANDIDATE_SHA, CANDIDATE_RUN
+        )
+        rollback_value = json.loads(rollback_provenance.read_text(encoding="utf-8"))
+        rollback_value["schema"] = release_provenance.LEGACY_PROVENANCE_SCHEMA
+        rollback_value.pop("source_ci")
+        rollback_value["required_release_artifacts"] = list(
+            release_provenance._release_artifact_names(
+                ROLLBACK_SHA, include_source_ci=False
+            )
+        )
+        rollback_provenance.write_bytes(
+            release_provenance._canonical_json(rollback_value)
         )
         inputs = self.root / "legacy-inputs"
         inputs.mkdir()

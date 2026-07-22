@@ -11,6 +11,31 @@ from scripts import release_provenance
 
 RELEASE_SHA = "b" * 40
 RUN_ID = "30000000003"
+SOURCE_CI_RUN_ID = "30000000013"
+
+
+def source_ci_evidence() -> dict:
+    run = {
+        "id": int(SOURCE_CI_RUN_ID),
+        "run_attempt": 1,
+        "name": release_provenance.CI_WORKFLOW,
+        "path": release_provenance.CI_WORKFLOW_PATH,
+        "event": release_provenance.CI_EVENT,
+        "head_branch": release_provenance.CI_BRANCH,
+        "head_sha": RELEASE_SHA,
+        "status": "completed",
+        "conclusion": "success",
+        "repository": {"full_name": release_provenance.REPOSITORY},
+    }
+    jobs = {
+        "jobs": [
+            {"name": name, "status": "completed", "conclusion": "success"}
+            for name in release_provenance.REQUIRED_CI_JOBS
+        ]
+    }
+    return release_provenance.validate_source_ci_run(
+        run, jobs, RELEASE_SHA, SOURCE_CI_RUN_ID, "1"
+    )
 
 
 class PreliveV5ReleaseTests(unittest.TestCase):
@@ -171,6 +196,7 @@ class PreliveV5ReleaseTests(unittest.TestCase):
                     release_provenance.RELEASE_INTENT,
                     manifest_path,
                     provenance_path,
+                    source_ci_evidence(),
                     created_at="2026-07-19T00:00:00Z",
                 )
             materialized = prelive_v5_release.materialize_contract(

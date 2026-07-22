@@ -12,13 +12,17 @@ from pathlib import Path
 from typing import Any
 
 try:
-    from scripts import release_assets
+    from scripts import release_assets, release_components
 except (ImportError, ModuleNotFoundError):  # Direct execution from scripts/.
     import release_assets  # type: ignore[no-redef]
+    import release_components  # type: ignore[no-redef]
 
 
-PROVENANCE_SCHEMA = "phoenix.release-provenance.v1"
-INHERITED_PROVENANCE_SCHEMA = "phoenix.release-provenance.v2"
+LEGACY_PROVENANCE_SCHEMA = "phoenix.release-provenance.v1"
+LEGACY_INHERITED_PROVENANCE_SCHEMA = "phoenix.release-provenance.v2"
+PROVENANCE_SCHEMA = "phoenix.release-provenance.v3"
+INHERITED_PROVENANCE_SCHEMA = "phoenix.release-provenance.v4"
+SOURCE_CI_SCHEMA = "phoenix.source-ci.v1"
 RUN_EVIDENCE_SCHEMA = "phoenix.build-run-evidence.v1"
 FRAGMENT_SCHEMA = "phoenix.release-fragment.v1"
 INHERITED_FRAGMENT_SCHEMA = "phoenix.release-inherited-fragment.v1"
@@ -32,17 +36,17 @@ PUBLISH_CONFIRMATION = "PUBLISH_IMMUTABLE_PHOENIX_IMAGES"
 QUARANTINED_RUNS = {
     "29683234024": "NON_CANONICAL_INCOMPLETE_BUILD",
 }
-EXPECTED_IMAGES = (
-    "dashboard",
-    "feed-ingestor",
-    "fork-sandbox",
-    "live-executor",
-    "phoenix-engine",
-    "recorder",
-    "rpc-gateway",
-)
-PROTECTED_IMAGES = ("feed-ingestor", "recorder")
-BUILT_IMAGES = tuple(name for name in EXPECTED_IMAGES if name not in PROTECTED_IMAGES)
+QUARANTINED_CI_RUNS = {
+    "29683234024": "NON_CANONICAL_INCOMPLETE_BUILD",
+}
+EXPECTED_IMAGES = release_components.RELEASE_IMAGES
+PROTECTED_IMAGES = release_components.PROTECTED_IMAGES
+BUILT_IMAGES = release_components.BUILT_IMAGES
+CI_WORKFLOW = release_components.REQUIRED_CI["workflow_name"]
+CI_WORKFLOW_PATH = release_components.REQUIRED_CI["workflow_path"]
+CI_EVENT = release_components.REQUIRED_CI["event"]
+CI_BRANCH = release_components.REQUIRED_CI["branch"]
+REQUIRED_CI_JOBS = release_components.REQUIRED_CI_JOBS
 EXPECTED_JOBS = (
     "publication-preflight",
     *(f"build-{name}" for name in EXPECTED_IMAGES),
@@ -91,12 +95,19 @@ def _read_json(path: Path, label: str) -> dict[str, Any]:
     return value
 
 
-def _release_artifact_names(release_sha: str) -> tuple[str, ...]:
-    return (
-        *(f"release-fragment-{name}" for name in EXPECTED_IMAGES),
-        f"phoenix-release-assets-{release_sha}",
-        f"phoenix-release-manifest-{release_sha}",
+def _release_artifact_names(
+    release_sha: str, *, include_source_ci: bool = True
+) -> tuple[str, ...]:
+    artifacts = [f"release-fragment-{name}" for name in EXPECTED_IMAGES]
+    if include_source_ci:
+        artifacts.append(f"source-ci-evidence-{release_sha}")
+    artifacts.extend(
+        (
+            f"phoenix-release-assets-{release_sha}",
+            f"phoenix-release-manifest-{release_sha}",
+        )
     )
+    return tuple(artifacts)
 
 
 def _validate_sha(value: object, label: str) -> str:
@@ -115,6 +126,13 @@ def _validate_run_id(run_id: object, label: str = "build run ID") -> str:
     return run_id
 
 
+def _validate_run_attempt(value: object, label: str = "run attempt") -> str:
+    attempt = str(value)
+    if not RUN_ID_PATTERN.fullmatch(attempt):
+        raise ReleaseProvenanceError(f"{label} is invalid")
+    return attempt
+
+
 def _validate_digest(value: object, label: str) -> str:
     if (
         not isinstance(value, str)
@@ -126,13 +144,16 @@ def _validate_digest(value: object, label: str) -> str:
 
 
 def _validate_repository(value: object, name: str, label: str) -> str:
-    expected = f"ghcr.io/majidasgharitabrizi/{name}"
+    component = release_components.COMPONENTS_BY_NAME.get(name)
+    if component is None:
+        raise ReleaseProvenanceError(f"unknown release component: {name}")
+    expected = component["repository"]
     if value != expected:
         raise ReleaseProvenanceError(f"{label} is invalid for {name}")
     return expected
 
 
-def validate_dispatch(
+def _validate_release_request(
     release_sha: str,
     release_intent: str,
     confirm_publish: str,
@@ -162,6 +183,214 @@ def validate_dispatch(
         )
         if protected_base_sha == release_sha:
             raise ReleaseProvenanceError("protected base SHA must differ from release_sha")
+
+
+def validate_dispatch(
+    release_sha: str,
+    release_intent: str,
+    confirm_publish: str,
+    checked_out_sha: str,
+    ci_run_id: str,
+    ci_run_attempt: str,
+    protected_base_sha: str = "",
+    protected_base_build_run_id: str = "",
+) -> None:
+    _validate_release_request(
+        release_sha,
+        release_intent,
+        confirm_publish,
+        checked_out_sha,
+        protected_base_sha,
+        protected_base_build_run_id,
+    )
+    _validate_run_id(ci_run_id, "ci_run_id")
+    _validate_run_attempt(ci_run_attempt, "ci_run_attempt")
+
+
+def validate_source_ci_run(
+    run_value: object,
+    jobs_value: object,
+    expected_sha: str,
+    expected_run_id: str,
+    expected_run_attempt: str,
+) -> dict[str, Any]:
+    _validate_sha(expected_sha, "expected source CI SHA")
+    run_id = _validate_run_id(expected_run_id, "expected source CI run ID")
+    run_attempt = _validate_run_attempt(
+        expected_run_attempt, "expected source CI run attempt"
+    )
+    if run_id in QUARANTINED_CI_RUNS:
+        raise ReleaseProvenanceError(
+            f"source CI run {run_id} is quarantined as "
+            f"{QUARANTINED_CI_RUNS[run_id]}"
+        )
+    if not isinstance(run_value, dict):
+        raise ReleaseProvenanceError("GitHub source CI run evidence is invalid")
+    if str(run_value.get("run_attempt")) != run_attempt:
+        raise ReleaseProvenanceError("GitHub source CI run attempt is invalid")
+    repository = run_value.get("repository")
+    if (
+        str(run_value.get("id")) != run_id
+        or run_value.get("name") != CI_WORKFLOW
+        or run_value.get("path") != CI_WORKFLOW_PATH
+        or run_value.get("event") != CI_EVENT
+        or run_value.get("head_branch") != CI_BRANCH
+        or run_value.get("head_sha") != expected_sha
+        or run_value.get("status") != "completed"
+        or run_value.get("conclusion") != "success"
+        or not isinstance(repository, dict)
+        or repository.get("full_name") != REPOSITORY
+    ):
+        raise ReleaseProvenanceError("GitHub source CI run identity or result is invalid")
+    if not isinstance(jobs_value, dict) or not isinstance(jobs_value.get("jobs"), list):
+        raise ReleaseProvenanceError("GitHub source CI jobs evidence is invalid")
+    normalized: dict[str, dict[str, str]] = {}
+    for raw_job in jobs_value["jobs"]:
+        if not isinstance(raw_job, dict):
+            raise ReleaseProvenanceError("GitHub source CI job is invalid")
+        name = raw_job.get("name")
+        if not isinstance(name, str) or not name or name in normalized:
+            raise ReleaseProvenanceError(
+                "GitHub source CI contains a duplicate or invalid required job"
+            )
+        status = raw_job.get("status")
+        conclusion = raw_job.get("conclusion")
+        if not isinstance(status, str) or not isinstance(conclusion, str):
+            raise ReleaseProvenanceError(f"required source CI job is invalid: {name}")
+        normalized[name] = {
+            "name": name,
+            "status": status,
+            "conclusion": conclusion,
+        }
+    if set(normalized) != set(REQUIRED_CI_JOBS):
+        missing = sorted(set(REQUIRED_CI_JOBS) - set(normalized))
+        unexpected = sorted(set(normalized) - set(REQUIRED_CI_JOBS))
+        detail = missing[0] if missing else unexpected[0]
+        raise ReleaseProvenanceError(f"required source CI job set is invalid: {detail}")
+    jobs: list[dict[str, str]] = []
+    for name in REQUIRED_CI_JOBS:
+        job = normalized[name]
+        if job["status"] != "completed" or job["conclusion"] != "success":
+            raise ReleaseProvenanceError(
+                f"required source CI job did not succeed: {name}"
+            )
+        jobs.append(job)
+    evidence: dict[str, Any] = {
+        "schema": SOURCE_CI_SCHEMA,
+        "repository": REPOSITORY,
+        "workflow": CI_WORKFLOW,
+        "workflow_path": CI_WORKFLOW_PATH,
+        "run_id": run_id,
+        "run_attempt": run_attempt,
+        "head_sha": expected_sha,
+        "event": CI_EVENT,
+        "head_branch": CI_BRANCH,
+        "status": "completed",
+        "conclusion": "success",
+        "required_jobs": list(REQUIRED_CI_JOBS),
+        "jobs": jobs,
+    }
+    evidence["evidence_sha256"] = _sha256_bytes(_canonical_json(evidence))
+    return evidence
+
+
+def validate_source_ci_evidence(
+    value: object,
+    expected_sha: str,
+    expected_run_id: str | None = None,
+    expected_run_attempt: str | None = None,
+) -> dict[str, Any]:
+    evidence = _require_keys(
+        value,
+        {
+            "schema",
+            "repository",
+            "workflow",
+            "workflow_path",
+            "run_id",
+            "run_attempt",
+            "head_sha",
+            "event",
+            "head_branch",
+            "status",
+            "conclusion",
+            "required_jobs",
+            "jobs",
+            "evidence_sha256",
+        },
+        "source CI evidence",
+    )
+    if (
+        evidence["schema"] != SOURCE_CI_SCHEMA
+        or evidence["repository"] != REPOSITORY
+        or evidence["workflow"] != CI_WORKFLOW
+        or evidence["workflow_path"] != CI_WORKFLOW_PATH
+        or evidence["head_sha"] != expected_sha
+        or evidence["event"] != CI_EVENT
+        or evidence["head_branch"] != CI_BRANCH
+        or evidence["status"] != "completed"
+        or evidence["conclusion"] != "success"
+        or evidence["required_jobs"] != list(REQUIRED_CI_JOBS)
+    ):
+        raise ReleaseProvenanceError("source CI evidence identity or result is invalid")
+    run_id = _validate_run_id(evidence["run_id"], "source CI evidence run ID")
+    if run_id in QUARANTINED_CI_RUNS:
+        raise ReleaseProvenanceError(
+            f"source CI run {run_id} is quarantined as "
+            f"{QUARANTINED_CI_RUNS[run_id]}"
+        )
+    run_attempt = _validate_run_attempt(
+        evidence["run_attempt"], "source CI evidence run attempt"
+    )
+    if expected_run_id is not None and run_id != expected_run_id:
+        raise ReleaseProvenanceError("source CI evidence run ID is invalid")
+    if expected_run_attempt is not None and run_attempt != str(expected_run_attempt):
+        raise ReleaseProvenanceError("source CI evidence run attempt is invalid")
+    jobs = evidence["jobs"]
+    if not isinstance(jobs, list) or len(jobs) != len(REQUIRED_CI_JOBS):
+        raise ReleaseProvenanceError("source CI evidence job set is invalid")
+    for expected_name, raw_job in zip(REQUIRED_CI_JOBS, jobs, strict=True):
+        job = _require_keys(
+            raw_job, {"name", "status", "conclusion"}, "source CI evidence job"
+        )
+        if (
+            job["name"] != expected_name
+            or job["status"] != "completed"
+            or job["conclusion"] != "success"
+        ):
+            raise ReleaseProvenanceError(
+                f"required source CI job did not succeed: {expected_name}"
+            )
+    unsigned = dict(evidence)
+    supplied_hash = unsigned.pop("evidence_sha256")
+    if supplied_hash != _sha256_bytes(_canonical_json(unsigned)):
+        raise ReleaseProvenanceError("source CI evidence hash is invalid")
+    return evidence
+
+
+def validate_source_ci_against_api(
+    provenance_value: object,
+    run_value: object,
+    jobs_value: object,
+    expected_sha: str,
+) -> dict[str, Any]:
+    if not isinstance(provenance_value, dict):
+        raise ReleaseProvenanceError("candidate release provenance is invalid")
+    source = validate_source_ci_evidence(
+        provenance_value.get("source_ci"), expected_sha
+    )
+    observed = validate_source_ci_run(
+        run_value,
+        jobs_value,
+        expected_sha,
+        source["run_id"],
+        source["run_attempt"],
+    )
+    if observed != source:
+        raise ReleaseProvenanceError(
+            "candidate source CI evidence differs from the GitHub API"
+        )
+    return source
 
 
 def _validate_created_at(value: object) -> None:
@@ -476,6 +705,7 @@ def _validate_base_contract(
         provenance,
         manifest,
         manifest_bytes=manifest_path.read_bytes(),
+        allow_legacy=True,
     )
     if manifest.get("release_sha") != expected_sha:
         raise ReleaseProvenanceError("protected base manifest SHA is invalid")
@@ -494,7 +724,7 @@ def write_inherited_fragments(
     protected_base_manifest: Path,
     protected_base_provenance: Path,
 ) -> None:
-    validate_dispatch(
+    _validate_release_request(
         release_sha,
         release_intent,
         PUBLISH_CONFIRMATION,
@@ -536,13 +766,14 @@ def assemble_release(
     release_intent: str,
     output_manifest: Path,
     output_provenance: Path,
+    source_ci_evidence: object,
     created_at: str | None = None,
     protected_base_sha: str = "",
     protected_base_build_run_id: str = "",
     protected_base_manifest: Path | None = None,
     protected_base_provenance: Path | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
-    validate_dispatch(
+    _validate_release_request(
         release_sha,
         release_intent,
         PUBLISH_CONFIRMATION,
@@ -551,6 +782,7 @@ def assemble_release(
         protected_base_build_run_id,
     )
     _validate_run_id(run_id)
+    source_ci = validate_source_ci_evidence(source_ci_evidence, release_sha)
     inherited = bool(protected_base_sha)
     if inherited != bool(protected_base_manifest and protected_base_provenance):
         raise ReleaseProvenanceError(
@@ -646,6 +878,7 @@ def assemble_release(
             "checksums_sha256": _sha256_file(checksums),
         },
         "release_manifest_sha256": _sha256_bytes(manifest_bytes),
+        "source_ci": source_ci,
     }
     if inherited:
         assert protected_base_manifest is not None
@@ -675,7 +908,11 @@ def assemble_release(
 
 
 def _validate_common_provenance(
-    provenance: dict[str, Any], manifest_value: object, manifest_bytes: bytes | None
+    provenance: dict[str, Any],
+    manifest_value: object,
+    manifest_bytes: bytes | None,
+    *,
+    legacy: bool,
 ) -> tuple[dict[str, Any], str, str]:
     if provenance["repository"] != REPOSITORY or provenance["workflow"] != WORKFLOW:
         raise ReleaseProvenanceError("release provenance workflow identity is invalid")
@@ -698,7 +935,7 @@ def _validate_common_provenance(
     if provenance["required_jobs"] != list(EXPECTED_JOBS):
         raise ReleaseProvenanceError("required build job contract is invalid")
     if provenance["required_release_artifacts"] != list(
-        _release_artifact_names(release_sha)
+        _release_artifact_names(release_sha, include_source_ci=not legacy)
     ):
         raise ReleaseProvenanceError("required release artifact contract is invalid")
 
@@ -744,6 +981,7 @@ def validate_provenance(
     manifest_value: object,
     *,
     manifest_bytes: bytes | None = None,
+    allow_legacy: bool = False,
 ) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise ReleaseProvenanceError("release provenance contract is invalid")
@@ -762,21 +1000,37 @@ def validate_provenance(
         "release_assets",
         "release_manifest_sha256",
     }
-    if schema == PROVENANCE_SCHEMA:
-        provenance = _require_keys(value, common_keys, "release provenance")
-    elif schema == INHERITED_PROVENANCE_SCHEMA:
-        provenance = _require_keys(
-            value,
-            common_keys | {"protected_base", "built_images", "inherited_images"},
-            "release provenance",
+    inherited_keys = {"protected_base", "built_images", "inherited_images"}
+    legacy = schema in {
+        LEGACY_PROVENANCE_SCHEMA,
+        LEGACY_INHERITED_PROVENANCE_SCHEMA,
+    }
+    inherited = schema in {
+        LEGACY_INHERITED_PROVENANCE_SCHEMA,
+        INHERITED_PROVENANCE_SCHEMA,
+    }
+    if legacy and not allow_legacy:
+        raise ReleaseProvenanceError(
+            "legacy release provenance is allowed only for reviewed rollback compatibility"
         )
-    else:
+    if schema not in {
+        LEGACY_PROVENANCE_SCHEMA,
+        LEGACY_INHERITED_PROVENANCE_SCHEMA,
+        PROVENANCE_SCHEMA,
+        INHERITED_PROVENANCE_SCHEMA,
+    }:
         raise ReleaseProvenanceError("release provenance schema is invalid")
+    expected_keys = common_keys | (inherited_keys if inherited else set())
+    if not legacy:
+        expected_keys.add("source_ci")
+    provenance = _require_keys(value, expected_keys, "release provenance")
 
-    manifest, _, _ = _validate_common_provenance(
-        provenance, manifest_value, manifest_bytes
+    manifest, release_sha, _ = _validate_common_provenance(
+        provenance, manifest_value, manifest_bytes, legacy=legacy
     )
-    if schema == PROVENANCE_SCHEMA:
+    if not legacy:
+        validate_source_ci_evidence(provenance["source_ci"], release_sha)
+    if not inherited:
         if manifest["schema"] != RELEASE_SCHEMA:
             raise ReleaseProvenanceError("release provenance/manifest schema mismatch")
         return provenance
@@ -930,6 +1184,7 @@ def validate_deploy_pair(
         rollback_provenance,
         rollback_manifest,
         manifest_bytes=rollback_manifest_path.read_bytes(),
+        allow_legacy=True,
     )
     if (
         candidate_manifest["release_sha"] != candidate_sha
@@ -997,8 +1252,24 @@ def _parser() -> argparse.ArgumentParser:
     dispatch.add_argument("--release-intent", required=True)
     dispatch.add_argument("--confirm-publish", required=True)
     dispatch.add_argument("--checked-out-sha", required=True)
+    dispatch.add_argument("--ci-run-id", required=True)
+    dispatch.add_argument("--ci-run-attempt", required=True)
     dispatch.add_argument("--protected-base-sha", default="")
     dispatch.add_argument("--protected-base-build-run-id", default="")
+
+    source_ci = subparsers.add_parser("validate-source-ci")
+    source_ci.add_argument("--run-evidence", type=Path, required=True)
+    source_ci.add_argument("--jobs-evidence", type=Path, required=True)
+    source_ci.add_argument("--expected-sha", required=True)
+    source_ci.add_argument("--expected-run-id", required=True)
+    source_ci.add_argument("--expected-run-attempt", required=True)
+    source_ci.add_argument("--output", type=Path, required=True)
+
+    source_ci_api = subparsers.add_parser("validate-source-ci-api")
+    source_ci_api.add_argument("--release-provenance", type=Path, required=True)
+    source_ci_api.add_argument("--run-evidence", type=Path, required=True)
+    source_ci_api.add_argument("--jobs-evidence", type=Path, required=True)
+    source_ci_api.add_argument("--expected-sha", required=True)
 
     github_run = subparsers.add_parser("validate-github-run")
     github_run.add_argument("--run-evidence", type=Path, required=True)
@@ -1023,6 +1294,7 @@ def _parser() -> argparse.ArgumentParser:
     assemble.add_argument("--release-intent", required=True)
     assemble.add_argument("--output-manifest", type=Path, required=True)
     assemble.add_argument("--output-provenance", type=Path, required=True)
+    assemble.add_argument("--source-ci-evidence", type=Path, required=True)
     assemble.add_argument("--protected-base-sha", default="")
     assemble.add_argument("--protected-base-build-run-id", default="")
     assemble.add_argument("--protected-base-manifest", type=Path)
@@ -1054,8 +1326,27 @@ def main() -> None:
                 args.release_intent,
                 args.confirm_publish,
                 args.checked_out_sha,
+                args.ci_run_id,
+                args.ci_run_attempt,
                 args.protected_base_sha,
                 args.protected_base_build_run_id,
+            )
+        elif args.command == "validate-source-ci":
+            evidence = validate_source_ci_run(
+                _read_json(args.run_evidence, "GitHub source CI run evidence"),
+                _read_json(args.jobs_evidence, "GitHub source CI jobs evidence"),
+                args.expected_sha,
+                args.expected_run_id,
+                args.expected_run_attempt,
+            )
+            args.output.parent.mkdir(parents=True, exist_ok=True)
+            args.output.write_bytes(_canonical_json(evidence))
+        elif args.command == "validate-source-ci-api":
+            validate_source_ci_against_api(
+                _read_json(args.release_provenance, "candidate release provenance"),
+                _read_json(args.run_evidence, "GitHub source CI run evidence"),
+                _read_json(args.jobs_evidence, "GitHub source CI jobs evidence"),
+                args.expected_sha,
             )
         elif args.command == "validate-github-run":
             validate_github_run(
@@ -1083,6 +1374,7 @@ def main() -> None:
                 args.release_intent,
                 args.output_manifest,
                 args.output_provenance,
+                _read_json(args.source_ci_evidence, "source CI evidence"),
                 protected_base_sha=args.protected_base_sha,
                 protected_base_build_run_id=args.protected_base_build_run_id,
                 protected_base_manifest=args.protected_base_manifest,
