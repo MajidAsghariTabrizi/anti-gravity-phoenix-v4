@@ -2,11 +2,15 @@ use crate::model::{canonical_digest, CanonicalAddress};
 use crate::signer::{SignerError, TransactionSigner};
 use crate::{ARBITRUM_ONE_CHAIN_ID, ARBITRUM_WETH_ADDRESS};
 use std::collections::BTreeMap;
+use std::fs::OpenOptions;
+use std::io::Read;
+use std::path::Path;
 use std::time::Duration;
 use thiserror::Error;
 use url::Url;
 use zeroize::Zeroizing;
 
+const MAX_SIGNER_FILE_BYTES: u64 = 256;
 const MAX_RECEIPT_TIMEOUT_SECONDS: u64 = 600;
 const MAX_POLL_INTERVAL_SECONDS: u64 = 30;
 const ENVIRONMENT_NAMES: &[&str] = &[
@@ -20,6 +24,7 @@ const ENVIRONMENT_NAMES: &[&str] = &[
     "LIVE_EXECUTOR_EXECUTOR_CODE_HASH",
     "LIVE_EXECUTOR_PNL_ASSET_ADDRESS",
     "SIGNER_PRIVATE_KEY",
+    "SIGNER_PRIVATE_KEY_FILE",
     "LIVE_EXECUTOR_RPC_URL",
     "LIVE_EXECUTOR_RPC_ALLOWLIST",
     "LIVE_EXECUTOR_MAX_GAS_LIMIT",
@@ -90,7 +95,16 @@ impl Bootstrap {
     }
 
     pub fn from_values(mut values: BTreeMap<String, String>) -> Result<Self, ConfigError> {
-        let key_material = values.remove("SIGNER_PRIVATE_KEY").map(Zeroizing::new);
+        let environment_key_material = values.remove("SIGNER_PRIVATE_KEY").and_then(|value| {
+            if value.trim().is_empty() {
+                None
+            } else {
+                Some(Zeroizing::new(value))
+            }
+        });
+        let signer_file_path = values
+            .remove("SIGNER_PRIVATE_KEY_FILE")
+            .filter(|value| !value.trim().is_empty());
         let mode = get_or(&values, "PHOENIX_MODE", "SHADOW");
         let live_execution = parse_bool(get_or(&values, "LIVE_EXECUTION", "false"))?;
         let armed = parse_bool(get_or(&values, "LIVE_EXECUTOR_ARMED", "false"))?;
@@ -103,6 +117,9 @@ impl Bootstrap {
         }
         if parse_bool(get_or(&values, "LIVE_EXECUTOR_KILL_SWITCH", "true"))? {
             return Ok(Self::Disabled(DisabledReason::EnvironmentKillSwitch));
+        }
+        if environment_key_material.is_some() && signer_file_path.is_some() {
+            return Err(ConfigError::SignerSourceConflict);
         }
 
         let chain_id = required(&values, "CHAIN_ID")?
@@ -127,13 +144,6 @@ impl Bootstrap {
                 .map_err(|_| ConfigError::InvalidAddress)?
         {
             return Err(ConfigError::UnsupportedProfitAsset);
-        }
-
-        let key_material = key_material.ok_or(ConfigError::Missing("SIGNER_PRIVATE_KEY"))?;
-        let signer_result = TransactionSigner::from_secret(&key_material, chain_id);
-        let signer = signer_result.map_err(ConfigError::Signer)?;
-        if signer.address() != wallet_address {
-            return Err(ConfigError::WalletMismatch);
         }
 
         let rpc_url = parse_url(required(&values, "LIVE_EXECUTOR_RPC_URL")?)?;
@@ -188,6 +198,18 @@ impl Bootstrap {
         let postgres_dsn = required(&values, "POSTGRES_DSN")?.to_string();
         if postgres_dsn.trim().is_empty() {
             return Err(ConfigError::Missing("POSTGRES_DSN"));
+        }
+
+        let key_material = match (environment_key_material, signer_file_path) {
+            (Some(key_material), None) => key_material,
+            (None, Some(path)) => read_signer_file(&path)?,
+            (None, None) => return Err(ConfigError::MissingSigner),
+            (Some(_), Some(_)) => return Err(ConfigError::SignerSourceConflict),
+        };
+        let signer =
+            TransactionSigner::from_secret(&key_material, chain_id).map_err(ConfigError::Signer)?;
+        if signer.address() != wallet_address {
+            return Err(ConfigError::WalletMismatch);
         }
 
         Ok(Self::Armed(Box::new(ArmedBootstrap {
@@ -256,6 +278,56 @@ fn parse_url(value: &str) -> Result<Url, ConfigError> {
     Url::parse(value).map_err(|_| ConfigError::InvalidRpcUrl)
 }
 
+fn read_signer_file(path_value: &str) -> Result<Zeroizing<String>, ConfigError> {
+    let path = Path::new(path_value);
+    if !path.is_absolute() {
+        return Err(ConfigError::SignerFilePath);
+    }
+
+    let metadata =
+        std::fs::symlink_metadata(path).map_err(|_| ConfigError::SignerFileUnavailable)?;
+    if metadata.file_type().is_symlink() {
+        return Err(ConfigError::SignerFileSymlink);
+    }
+    if !metadata.is_file() {
+        return Err(ConfigError::SignerFileType);
+    }
+    if metadata.len() > MAX_SIGNER_FILE_BYTES {
+        return Err(ConfigError::SignerFileTooLarge);
+    }
+
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    let file = options
+        .open(path)
+        .map_err(|_| ConfigError::SignerFileUnavailable)?;
+    if !file
+        .metadata()
+        .map_err(|_| ConfigError::SignerFileUnavailable)?
+        .is_file()
+    {
+        return Err(ConfigError::SignerFileType);
+    }
+
+    let mut contents = Zeroizing::new(String::new());
+    file.take(MAX_SIGNER_FILE_BYTES + 1)
+        .read_to_string(&mut contents)
+        .map_err(|_| ConfigError::SignerFileInvalid)?;
+    if contents.len() as u64 > MAX_SIGNER_FILE_BYTES {
+        return Err(ConfigError::SignerFileTooLarge);
+    }
+    let trimmed = contents.trim();
+    if trimmed.is_empty() {
+        return Err(ConfigError::SignerFileEmpty);
+    }
+    Ok(Zeroizing::new(trimmed.to_owned()))
+}
+
 #[derive(Debug, Error)]
 pub enum ConfigError {
     #[error("live executor arming is incomplete")]
@@ -272,6 +344,24 @@ pub enum ConfigError {
     InvalidCodeHash,
     #[error("live canary profit asset must be Arbitrum WETH")]
     UnsupportedProfitAsset,
+    #[error("signer source is missing")]
+    MissingSigner,
+    #[error("signer sources conflict")]
+    SignerSourceConflict,
+    #[error("signer file path is invalid")]
+    SignerFilePath,
+    #[error("signer file is unavailable")]
+    SignerFileUnavailable,
+    #[error("signer file symlinks are forbidden")]
+    SignerFileSymlink,
+    #[error("signer file type is invalid")]
+    SignerFileType,
+    #[error("signer file is empty")]
+    SignerFileEmpty,
+    #[error("signer file is too large")]
+    SignerFileTooLarge,
+    #[error("signer file contents are invalid")]
+    SignerFileInvalid,
     #[error("signer configuration is invalid")]
     Signer(#[source] SignerError),
     #[error("signer and wallet do not match")]
@@ -286,14 +376,50 @@ pub enum ConfigError {
     ConcurrentCanaryForbidden,
 }
 
+impl ConfigError {
+    pub const fn code(&self) -> &'static str {
+        match self {
+            Self::IncompleteArming => "incomplete_arming",
+            Self::Missing(_) => "missing_setting",
+            Self::InvalidBoolean => "invalid_boolean",
+            Self::InvalidChain => "invalid_chain",
+            Self::InvalidAddress => "invalid_address",
+            Self::InvalidCodeHash => "invalid_code_hash",
+            Self::UnsupportedProfitAsset => "unsupported_profit_asset",
+            Self::MissingSigner => "missing_signer",
+            Self::SignerSourceConflict => "signer_source_conflict",
+            Self::SignerFilePath => "signer_file_path",
+            Self::SignerFileUnavailable => "signer_file_unavailable",
+            Self::SignerFileSymlink => "signer_file_symlink",
+            Self::SignerFileType => "signer_file_type",
+            Self::SignerFileEmpty => "signer_file_empty",
+            Self::SignerFileTooLarge => "signer_file_too_large",
+            Self::SignerFileInvalid => "signer_file_invalid",
+            Self::Signer(_) => "invalid_signer",
+            Self::WalletMismatch => "wallet_mismatch",
+            Self::InvalidRpcUrl => "invalid_rpc_url",
+            Self::RpcNotAllowlisted => "rpc_not_allowlisted",
+            Self::InvalidLimit => "invalid_limit",
+            Self::ConcurrentCanaryForbidden => "concurrent_canary_forbidden",
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use alloy_signer_local::PrivateKeySigner;
+    use std::fs;
+    use std::path::Path;
     use std::str::FromStr;
+    use tempfile::TempDir;
+
+    fn test_private_key() -> String {
+        hex::encode([7_u8; 32])
+    }
 
     fn fully_armed_values() -> BTreeMap<String, String> {
-        let private_key = hex::encode([7_u8; 32]);
+        let private_key = test_private_key();
         let signer = PrivateKeySigner::from_str(&private_key).expect("test signer");
         BTreeMap::from([
             ("PHOENIX_MODE".to_string(), "LIVE".to_string()),
@@ -369,12 +495,51 @@ mod tests {
         ])
     }
 
+    fn signer_file(contents: &str) -> (TempDir, String) {
+        let directory = tempfile::tempdir().expect("temporary signer directory");
+        let path = directory.path().join("signer");
+        fs::write(&path, contents).expect("write signer fixture");
+        (directory, path.to_string_lossy().into_owned())
+    }
+
+    fn use_file_signer(values: &mut BTreeMap<String, String>, path: impl AsRef<Path>) {
+        values.remove("SIGNER_PRIVATE_KEY");
+        values.insert(
+            "SIGNER_PRIVATE_KEY_FILE".to_string(),
+            path.as_ref().to_string_lossy().into_owned(),
+        );
+    }
+
+    fn expect_config_error(result: Result<Bootstrap, ConfigError>) -> ConfigError {
+        match result {
+            Err(error) => error,
+            Ok(_) => panic!("expected configuration failure"),
+        }
+    }
+
     #[test]
     fn safe_defaults_are_disabled_without_secrets() {
         let result = Bootstrap::from_values(BTreeMap::new()).expect("safe default");
         assert!(matches!(
             result,
             Bootstrap::Disabled(DisabledReason::SafeDefaults)
+        ));
+    }
+
+    #[test]
+    fn safe_defaults_ignore_nonexistent_signer_file() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let values = BTreeMap::from([(
+            "SIGNER_PRIVATE_KEY_FILE".to_string(),
+            directory
+                .path()
+                .join("does-not-exist")
+                .to_string_lossy()
+                .into_owned(),
+        )]);
+        assert!(matches!(
+            Bootstrap::from_values(values),
+            Ok(Bootstrap::Disabled(DisabledReason::SafeDefaults))
         ));
     }
 
@@ -399,13 +564,17 @@ mod tests {
     }
 
     #[test]
-    fn environment_kill_switch_disables_before_signer_loading() {
+    fn environment_kill_switch_ignores_nonexistent_or_malformed_signer_file() {
         let mut values = fully_armed_values();
         values.insert("LIVE_EXECUTOR_KILL_SWITCH".to_string(), "true".to_string());
-        values.insert(
-            "SIGNER_PRIVATE_KEY".to_string(),
-            "not-a-private-key".to_string(),
-        );
+        use_file_signer(&mut values, Path::new("relative-signer-path"));
+        assert!(matches!(
+            Bootstrap::from_values(values.clone()),
+            Ok(Bootstrap::Disabled(DisabledReason::EnvironmentKillSwitch))
+        ));
+
+        let directory = tempfile::tempdir().expect("temporary directory");
+        use_file_signer(&mut values, directory.path().join("does-not-exist"));
         assert!(matches!(
             Bootstrap::from_values(values),
             Ok(Bootstrap::Disabled(DisabledReason::EnvironmentKillSwitch))
@@ -413,8 +582,129 @@ mod tests {
     }
 
     #[test]
-    fn wallet_must_match_signer() {
+    fn fully_armed_file_backed_signer_succeeds() {
+        let (_directory, path) = signer_file(&format!("  {}\n", test_private_key()));
         let mut values = fully_armed_values();
+        use_file_signer(&mut values, path);
+        assert!(matches!(
+            Bootstrap::from_values(values),
+            Ok(Bootstrap::Armed(_))
+        ));
+    }
+
+    #[test]
+    fn environment_backed_signer_remains_available_for_local_compatibility() {
+        assert!(matches!(
+            Bootstrap::from_values(fully_armed_values()),
+            Ok(Bootstrap::Armed(_))
+        ));
+    }
+
+    #[test]
+    fn both_nonempty_signer_sources_are_rejected() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let mut values = fully_armed_values();
+        values.insert(
+            "SIGNER_PRIVATE_KEY_FILE".to_string(),
+            directory
+                .path()
+                .join("does-not-need-to-exist")
+                .to_string_lossy()
+                .into_owned(),
+        );
+        let error = expect_config_error(Bootstrap::from_values(values));
+        assert!(matches!(error, ConfigError::SignerSourceConflict));
+        assert_eq!(error.code(), "signer_source_conflict");
+    }
+
+    #[test]
+    fn missing_signer_file_is_rejected_without_path_disclosure() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join("sensitive-deployment-path");
+        let mut values = fully_armed_values();
+        use_file_signer(&mut values, &path);
+        let error = expect_config_error(Bootstrap::from_values(values));
+        assert!(matches!(error, ConfigError::SignerFileUnavailable));
+        assert_eq!(error.code(), "signer_file_unavailable");
+        assert!(!format!("{error}").contains("sensitive-deployment-path"));
+        assert!(!format!("{error:?}").contains("sensitive-deployment-path"));
+    }
+
+    #[test]
+    fn signer_file_path_must_be_absolute() {
+        let mut values = fully_armed_values();
+        use_file_signer(&mut values, Path::new("relative-signer-path"));
+        assert!(matches!(
+            Bootstrap::from_values(values),
+            Err(ConfigError::SignerFilePath)
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn signer_file_symlink_is_rejected() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let target = directory.path().join("target");
+        let link = directory.path().join("link");
+        fs::write(&target, test_private_key()).expect("write signer target");
+        symlink(&target, &link).expect("create signer symlink");
+        let mut values = fully_armed_values();
+        use_file_signer(&mut values, link);
+        assert!(matches!(
+            Bootstrap::from_values(values),
+            Err(ConfigError::SignerFileSymlink)
+        ));
+    }
+
+    #[test]
+    fn empty_and_oversized_signer_files_are_rejected() {
+        let (_empty_directory, empty_path) = signer_file(" \n\t");
+        let mut empty_values = fully_armed_values();
+        use_file_signer(&mut empty_values, empty_path);
+        assert!(matches!(
+            Bootstrap::from_values(empty_values),
+            Err(ConfigError::SignerFileEmpty)
+        ));
+
+        let (_oversized_directory, oversized_path) = signer_file(&"x".repeat(257));
+        let mut oversized_values = fully_armed_values();
+        use_file_signer(&mut oversized_values, oversized_path);
+        assert!(matches!(
+            Bootstrap::from_values(oversized_values),
+            Err(ConfigError::SignerFileTooLarge)
+        ));
+    }
+
+    #[test]
+    fn signer_path_must_reference_a_regular_file() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let mut values = fully_armed_values();
+        use_file_signer(&mut values, directory.path());
+        assert!(matches!(
+            Bootstrap::from_values(values),
+            Err(ConfigError::SignerFileType)
+        ));
+    }
+
+    #[test]
+    fn signer_errors_do_not_expose_file_contents() {
+        let secret_marker = "sensitive-signer-material-marker";
+        let (_directory, path) = signer_file(secret_marker);
+        let mut values = fully_armed_values();
+        use_file_signer(&mut values, path);
+        let error = expect_config_error(Bootstrap::from_values(values));
+        assert_eq!(error.code(), "invalid_signer");
+        assert!(!format!("{error}").contains(secret_marker));
+        assert!(!format!("{error:?}").contains(secret_marker));
+    }
+
+    #[test]
+    fn wallet_must_match_signer() {
+        let (_directory, path) = signer_file(&test_private_key());
+        let mut values = fully_armed_values();
+        use_file_signer(&mut values, path);
         values.insert(
             "WALLET_ADDRESS".to_string(),
             "0x3333333333333333333333333333333333333333".to_string(),
@@ -422,6 +712,18 @@ mod tests {
         assert!(matches!(
             Bootstrap::from_values(values),
             Err(ConfigError::WalletMismatch)
+        ));
+    }
+
+    #[test]
+    fn invalid_live_configuration_fails_before_signer_file_access() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let mut values = fully_armed_values();
+        use_file_signer(&mut values, directory.path().join("does-not-exist"));
+        values.insert("CHAIN_ID".to_string(), "1".to_string());
+        assert!(matches!(
+            Bootstrap::from_values(values),
+            Err(ConfigError::InvalidChain)
         ));
     }
 

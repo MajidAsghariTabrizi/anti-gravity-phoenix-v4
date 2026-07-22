@@ -404,7 +404,6 @@ jobs:
           RPC_PROVIDER_PROBE_INTERVAL_SECONDS=60
           ENGINE_ROUTER_ADDRESSES=0xe592427a0aece92de3edee1f18e0157c05861564,0x68b3465833fb72a70ecdf485e0e4c7bd8665fc45,0xa51afafe0263b40edaef0df8781ea9aa03e381a3
           RECORDER_PERSISTENCE_POLICY=money_path_v1
-          SIGNER_PRIVATE_KEY=
           WALLET_ADDRESS=
           EXECUTOR_ADDRESS=
           FEED_INGESTOR_IMAGE=ghcr.io/majidasgharitabrizi/feed-ingestor@sha256:1111111111111111111111111111111111111111111111111111111111111111
@@ -418,6 +417,7 @@ jobs:
           LIVE_EXECUTOR_ARMED=false
           LIVE_EXECUTOR_KILL_SWITCH=true
           LIVE_EXECUTOR_ONE_TRANSACTION_AT_A_TIME=true
+          LIVE_EXECUTOR_SIGNER_FILE=/tmp/phoenix-live-executor-signer
           LIVE_EXECUTOR_WALLET_ADDRESS=0x1111111111111111111111111111111111111111
           LIVE_EXECUTOR_EXECUTOR_ADDRESS=0x2222222222222222222222222222222222222222
           LIVE_EXECUTOR_PNL_ASSET_ADDRESS=0x82af49447d8a07e3bd95bd0d56f35241523fbab1
@@ -441,6 +441,33 @@ jobs:
           PHOENIX_ENV_FILE=.ci-prod.env docker compose --env-file .ci-prod.env \
             -f compose.prod.yml -f compose.live-canary.yml \
             --profile live-canary config --format json > .ci-live-canary-config.json
+          python3 - <<'PY'
+          import json
+
+          with open(".ci-live-canary-config.json", encoding="utf-8") as handle:
+              rendered = json.load(handle)
+          service = rendered["services"]["live-executor"]
+          environment = service.get("environment", {})
+          if "SIGNER_PRIVATE_KEY" in environment:
+              raise SystemExit("live-executor render exposes raw signer environment")
+          signer_target = "/run/secrets/phoenix-live-executor-signer"
+          if environment.get("SIGNER_PRIVATE_KEY_FILE") != signer_target:
+              raise SystemExit("live-executor signer file target is not canonical")
+          signer_mounts = [
+              mount
+              for mount in service.get("volumes", [])
+              if mount.get("target") == signer_target
+          ]
+          if len(signer_mounts) != 1:
+              raise SystemExit("live-executor signer mount is not unique")
+          signer_mount = signer_mounts[0]
+          if signer_mount.get("type") != "bind":
+              raise SystemExit("live-executor signer mount is not a bind mount")
+          if signer_mount.get("source") != "/tmp/phoenix-live-executor-signer":
+              raise SystemExit("live-executor signer mount source was not rendered exactly")
+          if signer_mount.get("read_only") is not True:
+              raise SystemExit("live-executor signer mount is not read-only")
+          PY
           cat > .ci-fork.env <<'EOF'
           FORK_ANVIL_DIGEST=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
           FORK_POSTGRES_PASSWORD=ci-fork-placeholder

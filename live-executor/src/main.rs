@@ -1,4 +1,4 @@
-use phoenix_live_executor::config::{Bootstrap, ConfigError, DisabledReason};
+use phoenix_live_executor::config::{Bootstrap, DisabledReason};
 use phoenix_live_executor::engine::LiveExecutor;
 use phoenix_live_executor::rpc::HttpExecutionRpc;
 use phoenix_live_executor::store::{ExecutorStore, PostgresExecutorStore};
@@ -17,10 +17,7 @@ async fn main() {
     let bootstrap = match Bootstrap::from_environment() {
         Ok(bootstrap) => bootstrap,
         Err(error) => {
-            error!(
-                error_code = config_error_code(&error),
-                "live executor refused to start"
-            );
+            error!(error_code = error.code(), "live executor refused to start");
             std::process::exit(1);
         }
     };
@@ -100,23 +97,5 @@ fn disabled_reason_code(reason: DisabledReason) -> &'static str {
     match reason {
         DisabledReason::SafeDefaults => "safe_defaults",
         DisabledReason::EnvironmentKillSwitch => "environment_kill_switch",
-    }
-}
-
-fn config_error_code(error: &ConfigError) -> &'static str {
-    match error {
-        ConfigError::IncompleteArming => "incomplete_arming",
-        ConfigError::Missing(_) => "missing_setting",
-        ConfigError::InvalidBoolean => "invalid_boolean",
-        ConfigError::InvalidChain => "invalid_chain",
-        ConfigError::InvalidAddress => "invalid_address",
-        ConfigError::InvalidCodeHash => "invalid_code_hash",
-        ConfigError::UnsupportedProfitAsset => "unsupported_profit_asset",
-        ConfigError::Signer(_) => "invalid_signer",
-        ConfigError::WalletMismatch => "wallet_mismatch",
-        ConfigError::InvalidRpcUrl => "invalid_rpc_url",
-        ConfigError::RpcNotAllowlisted => "rpc_not_allowlisted",
-        ConfigError::InvalidLimit => "invalid_limit",
-        ConfigError::ConcurrentCanaryForbidden => "concurrent_canary_forbidden",
     }
 }
