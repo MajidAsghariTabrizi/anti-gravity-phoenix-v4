@@ -1,7 +1,11 @@
 import json
 import os
 import re
+import shutil
+import subprocess
+import sys
 import tempfile
+import textwrap
 import unittest
 from copy import deepcopy
 from pathlib import Path
@@ -843,6 +847,193 @@ class ShadowContractTransitionTests(unittest.TestCase):
         self.assertNotRegex(segment, r"compose_with[^\n]*(?:stop|up -d)")
         self.assertIn('[ "$recorder_config_valid" -eq 1 ]', segment)
 
+    def test_compose_runtime_candidate_image_wins_over_stale_operator_image(
+        self,
+    ) -> None:
+        shell_executable = shutil.which("sh")
+        if shell_executable is None and os.name == "nt":
+            git_sh = Path(os.environ.get("ProgramFiles", "C:/Program Files")) / (
+                "Git/bin/sh.exe"
+            )
+            if git_sh.is_file():
+                shell_executable = str(git_sh)
+        if shell_executable is None:
+            self.skipTest("POSIX sh is unavailable")
+
+        functions = self.shell[
+            self.shell.index("compose_with() (") : self.shell.index(
+                "\nread_postgres_identity() ("
+            )
+        ]
+        rollback_image = EXPECTED_IMAGE_REFERENCES["rollback"]["recorder"]
+        candidate_image = EXPECTED_IMAGE_REFERENCES["release"]["recorder"]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            operator_env = root / "operator.env"
+            release_env = root / "release.env"
+            up_capture = root / "up-image.txt"
+            harness = root / "compose-precedence.sh"
+            operator_env.write_text(
+                f"RECORDER_IMAGE={rollback_image}\n"
+                f"PHOENIX_RELEASE_SHA={EXPECTED_ROLLBACK_SHA}\n",
+                encoding="utf-8",
+            )
+            release_env.write_text(
+                f"RECORDER_IMAGE={candidate_image}\n"
+                f"PHOENIX_RELEASE_SHA={EXPECTED_RELEASE_SHA}\n",
+                encoding="utf-8",
+            )
+            harness.write_text(
+                textwrap.dedent(
+                    """\
+                    #!/usr/bin/env sh
+                    set -eu
+                    deploy_dir=$1
+                    operator_env=$2
+                    release_env=$3
+                    up_capture=$4
+                    rollback_image=$5
+                    candidate_image=$6
+                    python_bin=$7
+                    export up_capture
+
+                    python3() {
+                      "$python_bin" "$@"
+                    }
+
+                    docker() {
+                      [ "$1" = compose ] || return 1
+                      [ "$2" = --project-directory ] &&
+                        [ "$4" = --env-file ] &&
+                        [ "$6" = --env-file ] &&
+                        [ "$8" = -f ] || return 1
+                      [ -z "${RECORDER_IMAGE+x}" ] &&
+                        [ -z "${PHOENIX_RELEASE_SHA+x}" ] || return 1
+                      resolved_image=$(awk -F= '
+                        $1 == "RECORDER_IMAGE" {
+                          value = substr($0, index($0, "=") + 1)
+                        }
+                        END { if (value == "") exit 1; print value }
+                      ' "$5" "$7") || return 1
+                      case "${10}" in
+                        config)
+                          printf '{"services":{"recorder":{"image":"%s"}}}\n' \
+                            "$resolved_image"
+                          ;;
+                        up) printf '%s\n' "$resolved_image" >"$up_capture" ;;
+                        *) return 1 ;;
+                      esac
+                    }
+                    """
+                )
+                + functions
+                + textwrap.dedent(
+                    """\
+
+                    RECORDER_IMAGE=$rollback_image
+                    PHOENIX_RELEASE_SHA=654dad176fe705d90628b418750a122b8ae30283
+                    export RECORDER_IMAGE PHOENIX_RELEASE_SHA
+                    rendered_image=$(compose_service_image \
+                      "$operator_env" "$release_env" recorder)
+                    [ "$rendered_image" = "$candidate_image" ]
+                    compose_with "$operator_env" "$release_env" \
+                      up -d --no-deps recorder
+                    [ "$(cat "$up_capture")" = "$candidate_image" ]
+                    """
+                ),
+                encoding="utf-8",
+                newline="\n",
+            )
+            completed = subprocess.run(
+                [
+                    shell_executable,
+                    str(harness),
+                    str(root),
+                    str(operator_env),
+                    str(release_env),
+                    str(up_capture),
+                    rollback_image,
+                    candidate_image,
+                    sys.executable,
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+
+    def test_compose_runtime_sanitizes_image_and_release_interpolation(self) -> None:
+        compose = self.shell.split("compose_with() (", 1)[1].split(
+            "compose_service_image() (", 1
+        )[0]
+        for name in (
+            "FEED_INGESTOR_IMAGE",
+            "PHOENIX_ENGINE_IMAGE",
+            "RPC_GATEWAY_IMAGE",
+            "RECORDER_IMAGE",
+            "DASHBOARD_IMAGE",
+            "PHOENIX_RELEASE_SHA",
+        ):
+            with self.subTest(name=name):
+                self.assertRegex(compose, rf"\b{re.escape(name)}\b")
+        self.assertLess(
+            compose.index('--env-file "$compose_operator_env"'),
+            compose.index('--env-file "$compose_release_env"'),
+        )
+
+    def test_postgres_identity_source_is_isolated_from_compose(self) -> None:
+        source = self.shell.split("read_postgres_identity() (", 1)[1].split(
+            "container_id() (", 1
+        )[0]
+        self.assertIn('. "$identity_env_file"', source)
+        self.assertIn("unset POSTGRES_DB POSTGRES_USER", source)
+        self.assertNotIn("set -a", self.shell)
+        self.assertNotIn('. "$env_file"', self.shell)
+
+    def test_candidate_runtime_image_gate_precedes_every_service_stop(self) -> None:
+        runtime_gate = self.shell.index("candidate_runtime_recorder_image=")
+        plan_exit = self.shell.index('if [ "$mode" = plan ]; then', runtime_gate)
+        first_top_level_stop = self.shell.index(
+            'stop "$optional_service"', plan_exit
+        )
+        self.assertLess(runtime_gate, plan_exit)
+        self.assertLess(runtime_gate, first_top_level_stop)
+        segment = self.shell[runtime_gate:plan_exit]
+        self.assertIn(
+            'compose_service_image \\\n  "$candidate_env" "$release_env" recorder',
+            segment,
+        )
+        self.assertIn(
+            '[ "$candidate_runtime_recorder_image" = "$candidate_recorder_image" ]',
+            segment,
+        )
+
+    def test_candidate_recorder_identity_is_checked_before_health_wait(self) -> None:
+        start = self.shell.split("start_candidate_recorder() {", 1)[1].split(
+            "restore_initial_optional_services()", 1
+        )[0]
+        self.assertLess(
+            start.index("up -d --no-deps recorder"),
+            start.index("assert_candidate_recorder_identity"),
+        )
+        self.assertLess(
+            start.index("assert_candidate_recorder_identity"),
+            start.index("wait_service_healthy"),
+        )
+        identity = self.shell.split("assert_candidate_recorder_identity() (", 1)[
+            1
+        ].split("service_healthy() (", 1)[0]
+        self.assertIn("{{.Config.Image}}|{{.Image}}", identity)
+        self.assertIn('"$identity_reference" = "$identity_expected_reference"', identity)
+        self.assertIn('"$identity_image_id" = "$identity_expected_image_id"', identity)
+        self.assertIn("org.opencontainers.image.revision", identity)
+        self.assertIn('"$identity_revision" = "$identity_expected_revision"', identity)
+        apply_flow = self.shell.split("mutation_started=1", 1)[1]
+        self.assertIn(
+            '"$candidate_recorder_image_id" "$release_sha"', apply_flow
+        )
+
     def test_recorder_handoff_poll_is_bounded_and_precedes_candidate_start(self) -> None:
         handoff = self.shell.split("wait_recorder_handoff()", 1)[1].split(
             "capture_recorder_health_failure_diagnostics()", 1
@@ -856,7 +1047,7 @@ class ShadowContractTransitionTests(unittest.TestCase):
         apply_flow = self.shell.split("mutation_started=1", 1)[1]
         self.assertLess(
             apply_flow.index("wait_recorder_handoff"),
-            apply_flow.index('start_service "$env_file" "$release_env" recorder'),
+            apply_flow.index("start_candidate_recorder"),
         )
 
     def test_candidate_health_failure_publishes_sanitized_diagnostics(self) -> None:
@@ -877,7 +1068,7 @@ class ShadowContractTransitionTests(unittest.TestCase):
             diagnostics,
         )
         candidate_failure = self.shell.split(
-            'if ! start_service "$env_file" "$release_env" recorder; then', 1
+            "if ! start_candidate_recorder \\", 1
         )[1].split("\nfi", 1)[0]
         self.assertLess(
             candidate_failure.index("capture_recorder_health_failure_diagnostics"),
@@ -1125,7 +1316,7 @@ class ShadowContractTransitionTests(unittest.TestCase):
         )
         apply_flow = self.shell.split("mutation_started=1", 1)[1]
         observed = [
-            apply_flow.index('start_service "$env_file" "$release_env" recorder'),
+            apply_flow.index("start_candidate_recorder"),
             apply_flow.index('start_service "$env_file" "$release_env" feed-ingestor'),
             apply_flow.index(
                 "for candidate_service in rpc-gateway phoenix-engine shadow-dispatcher dashboard prometheus"
