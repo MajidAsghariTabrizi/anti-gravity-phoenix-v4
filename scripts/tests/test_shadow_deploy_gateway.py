@@ -3,6 +3,7 @@ import json
 import os
 import stat
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -633,6 +634,181 @@ class HostSafetyTests(unittest.TestCase):
 
 
 class OrchestrationTests(unittest.TestCase):
+    def test_start_queues_worker_then_releases_lock_for_worker(self) -> None:
+        value = identity()
+        deployment_lock = threading.Lock()
+        worker_waiting = threading.Event()
+        worker_acquired = threading.Event()
+        worker_thread: threading.Thread | None = None
+
+        class LockHandle:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                deployment_lock.release()
+
+            @staticmethod
+            def fileno() -> int:
+                return 17
+
+        fake_fcntl = mock.Mock(LOCK_EX=2)
+        fake_fcntl.flock.side_effect = lambda *_args: deployment_lock.acquire()
+        fake_pwd = mock.Mock()
+        fake_pwd.getpwnam.return_value = mock.Mock(pw_uid=65532, pw_gid=65532)
+
+        def run_systemd(command, *, check):
+            nonlocal worker_thread
+            self.assertTrue(check)
+            self.assertIn("--no-block", command)
+
+            def acquire_worker_lock() -> None:
+                worker_waiting.set()
+                deployment_lock.acquire()
+                worker_acquired.set()
+                deployment_lock.release()
+
+            worker_thread = threading.Thread(target=acquire_worker_lock)
+            worker_thread.start()
+            self.assertTrue(worker_waiting.wait(timeout=1))
+            self.assertFalse(worker_acquired.wait(timeout=0.05))
+
+        with tempfile.TemporaryDirectory() as temporary, mock.patch.object(
+            gateway, "STATE_ROOT", Path(temporary)
+        ), mock.patch.object(gateway, "fcntl", fake_fcntl), mock.patch.object(
+            gateway, "pwd", fake_pwd
+        ), mock.patch.object(
+            gateway, "_deployment_lock", return_value=LockHandle()
+        ), mock.patch.object(
+            gateway, "verify_installation"
+        ), mock.patch.object(
+            gateway, "_safe_root_directory"
+        ), mock.patch.object(
+            gateway, "_another_deployment_is_active", return_value=False
+        ), mock.patch.object(
+            gateway, "lock_stage", return_value={"release-manifest.json": "c" * 64}
+        ), mock.patch.object(
+            gateway, "validate_locked_inputs"
+        ), mock.patch.object(
+            gateway, "validate_release_inputs"
+        ), mock.patch.object(
+            gateway, "validate_host"
+        ), mock.patch.object(
+            gateway.subprocess, "run", side_effect=run_systemd
+        ) as systemd_run, mock.patch.object(
+            gateway, "_write_evidence"
+        ) as write_evidence:
+            gateway.start(value)
+
+        self.assertTrue(worker_acquired.wait(timeout=1))
+        assert worker_thread is not None
+        worker_thread.join(timeout=1)
+        self.assertFalse(worker_thread.is_alive())
+        command = systemd_run.call_args.args[0]
+        self.assertEqual(command[0:2], ["/usr/bin/systemd-run", "--no-block"])
+        write_evidence.assert_called_once_with(
+            value,
+            phase="worker_started",
+            result="running",
+        )
+
+    def test_start_preserves_systemd_launch_failure_evidence(self) -> None:
+        value = identity()
+        fake_fcntl = mock.Mock(LOCK_EX=2)
+        fake_pwd = mock.Mock()
+        fake_pwd.getpwnam.return_value = mock.Mock(pw_uid=65532, pw_gid=65532)
+        lock_handle = mock.MagicMock()
+        lock_handle.__enter__.return_value = lock_handle
+        lock_handle.fileno.return_value = 17
+
+        with tempfile.TemporaryDirectory() as temporary, mock.patch.object(
+            gateway, "STATE_ROOT", Path(temporary)
+        ), mock.patch.object(gateway, "fcntl", fake_fcntl), mock.patch.object(
+            gateway, "pwd", fake_pwd
+        ), mock.patch.object(
+            gateway, "_deployment_lock", return_value=lock_handle
+        ), mock.patch.object(
+            gateway, "verify_installation"
+        ), mock.patch.object(
+            gateway, "_safe_root_directory"
+        ), mock.patch.object(
+            gateway, "_another_deployment_is_active", return_value=False
+        ), mock.patch.object(
+            gateway, "lock_stage", return_value={"release-manifest.json": "c" * 64}
+        ), mock.patch.object(
+            gateway, "validate_locked_inputs"
+        ), mock.patch.object(
+            gateway, "validate_release_inputs"
+        ), mock.patch.object(
+            gateway, "validate_host"
+        ), mock.patch.object(
+            gateway.subprocess,
+            "run",
+            side_effect=gateway.subprocess.CalledProcessError(
+                1, ["/usr/bin/systemd-run"]
+            ),
+        ), mock.patch.object(
+            gateway, "_write_evidence"
+        ) as write_evidence:
+            with self.assertRaisesRegex(
+                gateway.GatewayError, "^systemd_launch_failed$"
+            ):
+                gateway.start(value)
+
+        write_evidence.assert_called_once_with(
+            value,
+            phase="launch_failed",
+            result="failure",
+            error_code="systemd_launch_failed",
+        )
+
+    def test_status_preserves_pending_and_terminated_worker_semantics(self) -> None:
+        value = identity()
+        running_evidence = json.dumps(
+            {"phase": "worker_started", "result": "running"}
+        ).encode()
+        with mock.patch.object(
+            gateway, "_identity_matches", return_value=True
+        ), mock.patch.object(
+            gateway, "_read_bounded", return_value=running_evidence
+        ), mock.patch.object(
+            gateway,
+            "_systemd_unit_state",
+            return_value={"LoadState": "loaded", "ActiveState": "activating"},
+        ), mock.patch.object(
+            gateway, "_write_evidence"
+        ) as write_evidence, mock.patch(
+            "builtins.print"
+        ) as output:
+            self.assertEqual(gateway.status(value), 3)
+        write_evidence.assert_not_called()
+        output.assert_called_once_with("PHOENIX_SHADOW_DEPLOY_STATUS: pending")
+
+        with mock.patch.object(
+            gateway, "_identity_matches", return_value=True
+        ), mock.patch.object(
+            gateway, "_read_bounded", return_value=running_evidence
+        ), mock.patch.object(
+            gateway,
+            "_systemd_unit_state",
+            return_value={"LoadState": "loaded", "ActiveState": "inactive"},
+        ), mock.patch.object(
+            gateway, "_write_evidence"
+        ) as write_evidence, mock.patch(
+            "builtins.print"
+        ) as output:
+            self.assertEqual(gateway.status(value), 1)
+        write_evidence.assert_called_once_with(
+            value,
+            phase="failed",
+            result="failure",
+            error_code="worker_terminated_without_evidence",
+        )
+        output.assert_called_once_with(
+            "PHOENIX_SHADOW_DEPLOY_STATUS: failure "
+            "worker_terminated_without_evidence"
+        )
+
     def test_rollback_uses_only_installed_root_helper(self) -> None:
         with mock.patch.object(gateway, "_run_checked") as run, mock.patch.object(
             gateway, "_read_pointer", return_value=ROLLBACK_SHA
