@@ -397,7 +397,7 @@ jobs:
               return
             fi
             remote_exec \
-              "sudo rm -f '$remote_stage/release-manifest.json' '$remote_stage/rollback-manifest.json' '$remote_stage/phoenix-release-assets-${RELEASE_SHA}.tar.gz' '$remote_stage/release-assets-manifest.json' '$remote_stage/release-assets-checksums.txt' '$remote_stage/protected-maintenance-plan.json' '$remote_stage/prelive_protected_maintenance.py' '$remote_stage/prelive-protected-maintenance.sh' '$remote_stage/install-release-assets.sh' '$remote_stage/install-production-release-context.sh' '$remote_stage/prelive-protected-maintenance-launch.sh' '$remote_stage/prelive-protected-maintenance-unit.sh' '$remote_stage/rollback-release.sh' '$remote_stage/maintenance.unit' '$remote_stage/maintenance.log' '$remote_stage/maintenance.exit' '$remote_stage/maintenance.result' && sudo rmdir '$remote_stage'" \
+              "sudo rm -f '$remote_stage/release-manifest.json' '$remote_stage/rollback-manifest.json' '$remote_stage/phoenix-release-assets-${RELEASE_SHA}.tar.gz' '$remote_stage/release-assets-manifest.json' '$remote_stage/release-assets-checksums.txt' '$remote_stage/protected-maintenance-plan.json' '$remote_stage/prelive_protected_maintenance.py' '$remote_stage/prelive-protected-maintenance.sh' '$remote_stage/install-release-assets.sh' '$remote_stage/install-production-release-context.sh' '$remote_stage/production-healthcheck.sh' '$remote_stage/release-components.json' '$remote_stage/prelive-protected-maintenance-launch.sh' '$remote_stage/prelive-protected-maintenance-unit.sh' '$remote_stage/rollback-release.sh' '$remote_stage/maintenance.unit' '$remote_stage/maintenance.log' '$remote_stage/maintenance.exit' '$remote_stage/maintenance.result' && sudo rmdir '$remote_stage'" \
               >/dev/null 2>&1 || true
           }
           trap cleanup_remote EXIT
@@ -415,10 +415,12 @@ jobs:
           scp "${scp_opts[@]}" protected-maintenance-plan.json \
             "$remote:$remote_stage/protected-maintenance-plan.json"
           scp "${scp_opts[@]}" \
+            release-components.json \
             scripts/prelive_protected_maintenance.py \
             scripts/prelive-protected-maintenance.sh \
             scripts/install-release-assets.sh \
             scripts/install-production-release-context.sh \
+            scripts/production-healthcheck.sh \
             scripts/prelive-protected-maintenance-launch.sh \
             scripts/prelive-protected-maintenance-unit.sh \
             scripts/rollback-release.sh \

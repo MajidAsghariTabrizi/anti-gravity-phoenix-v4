@@ -33,7 +33,8 @@ check() {
 
 check postgres compose exec -T postgres /bin/sh -c 'pg_isready -U "$POSTGRES_USER" -d "$POSTGRES_DB"'
 check nats compose exec -T nats wget -q -O - http://127.0.0.1:8222/healthz
-check nitro-feed-relay compose exec -T nitro-feed-relay wget -q -O - http://127.0.0.1:8547/livenessprobe
+check nitro-feed-relay compose exec -T nitro-feed-relay /bin/sh -c \
+  "grep -Eq ':25AA[[:space:]].*[[:space:]]0A[[:space:]]' /proc/net/tcp /proc/net/tcp6"
 check rpc-gateway compose exec -T rpc-gateway wget -q -O - http://127.0.0.1:9300/readyz
 check feed-ingestor compose exec -T feed-ingestor wget -q -O - http://127.0.0.1:9100/readyz
 check phoenix-engine compose exec -T phoenix-engine wget -q -O - http://127.0.0.1:9200/readyz

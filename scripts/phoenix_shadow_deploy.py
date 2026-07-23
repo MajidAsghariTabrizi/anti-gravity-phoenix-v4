@@ -57,6 +57,7 @@ TRUSTED_HELPERS = {
     "release_provenance.py": 0o600,
     "install-release-assets.sh": 0o700,
     "install-production-release-context.sh": 0o700,
+    "production-healthcheck.sh": 0o700,
     "prelive-protected-maintenance.sh": 0o700,
     "prelive_protected_maintenance.py": 0o600,
     "prelive-protected-maintenance-launch.sh": 0o700,
