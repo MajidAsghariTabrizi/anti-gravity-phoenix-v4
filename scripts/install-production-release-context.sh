@@ -55,6 +55,18 @@ env_mode=$(stat -c '%a' "$env_file")
   fail 'production environment file must be root:root'
 [ "$env_mode" = 600 ] || fail 'production environment file must be mode 600'
 
+release_components_source=$source_root/release-components.json
+if [ -e "$release_components_source" ] || [ -L "$release_components_source" ]; then
+  [ -f "$release_components_source" ] && [ ! -L "$release_components_source" ] ||
+    fail 'release component registry is unsafe'
+else
+  release_components_source=$script_dir/release-components.json
+  [ -f "$release_components_source" ] && [ ! -L "$release_components_source" ] ||
+    fail 'trusted release component registry is missing or unsafe'
+  [ "$(stat -c '%u:%g:%a:%h' "$release_components_source")" = 0:0:600:1 ] ||
+    fail 'trusted release component registry ownership or mode is invalid'
+fi
+
 install_source() {
   source_path=$1
   target_path=$2
@@ -121,7 +133,7 @@ install_source "$source_root/compose.prod.yml" "$deploy_dir/compose.prod.yml" 06
 install_source \
   "$source_root/compose.live-canary.yml" "$deploy_dir/compose.live-canary.yml" 0640
 install_source \
-  "$source_root/release-components.json" "$deploy_dir/release-components.json" 0640
+  "$release_components_source" "$deploy_dir/release-components.json" 0640
 install_source \
   "$source_root/deploy/nats-server.conf" "$deploy_dir/nats-server.conf" 0644
 install_source \
@@ -165,7 +177,6 @@ for script_name in \
   verify-compose-route-registry.py \
   validate-production-release-context.sh \
   validate-production-env.sh \
-  production-healthcheck.sh \
   shadow-engine-isolated-canary.sh \
   shadow-positive-route-evidence.sh \
   shadow-profitability-report.sh \
@@ -190,6 +201,7 @@ done
 for safety_script in \
   install-release-assets.sh \
   install-production-release-context.sh \
+  production-healthcheck.sh \
   prelive-protected-maintenance.sh \
   prelive_protected_maintenance.py \
   prelive-protected-maintenance-launch.sh \

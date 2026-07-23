@@ -53,6 +53,12 @@ if grep -E 'EXPECTED_IMAGES|feed-ingestor|(^|[^-])recorder([^a-z-]|$)' "$helper"
 fi
 grep -F '"/usr/bin/systemd-run"' "$helper" >/dev/null ||
   fail 'gateway does not use the bounded systemd launch path'
+grep -F '"production-healthcheck.sh": 0o700' "$helper" >/dev/null ||
+  fail 'production healthcheck is not a verified trusted helper'
+grep -F "'production-healthcheck.sh:0700'" "$installer" >/dev/null ||
+  fail 'gateway installer does not install the trusted production healthcheck'
+grep -F "'production-healthcheck.sh:700'" "$gateway" >/dev/null ||
+  fail 'privileged gateway does not verify the trusted production healthcheck'
 grep -F '"--no-block"' "$helper" >/dev/null ||
   fail 'systemd launch can deadlock while the start-side lock is held'
 grep -F '"--property=Type=oneshot"' "$helper" >/dev/null ||
@@ -128,10 +134,15 @@ sudo env \
 installed_gateway=$fixture/usr/local/sbin/phoenix-shadow-deploy-gateway
 installed_libexec=$fixture/usr/local/libexec/phoenix-shadow-deploy
 installed_sudoers=$fixture/etc/sudoers.d/phoenix-shadow-deploy
+installed_healthcheck=$installed_libexec/production-healthcheck.sh
 [ "$(sudo stat -c '%U:%G:%a:%h' "$installed_gateway")" = root:root:755:1 ] ||
   fail 'installed gateway ownership, mode, or link count is invalid'
 [ "$(sudo stat -c '%U:%G:%a' "$installed_libexec")" = root:root:750 ] ||
   fail 'installed libexec ownership or mode is invalid'
+[ "$(sudo stat -c '%U:%G:%a:%h' "$installed_healthcheck")" = root:root:700:1 ] ||
+  fail 'trusted production healthcheck ownership, mode, or link count is invalid'
+sudo cmp "$script_dir/production-healthcheck.sh" "$installed_healthcheck" >/dev/null ||
+  fail 'trusted production healthcheck bytes differ'
 [ "$(sudo stat -c '%U:%G:%a:%h' "$installed_sudoers")" = root:root:440:1 ] ||
   fail 'installed sudoers ownership, mode, or link count is invalid'
 gateway_digest=$(sudo sha256sum "$installed_gateway" | awk '{print $1}')

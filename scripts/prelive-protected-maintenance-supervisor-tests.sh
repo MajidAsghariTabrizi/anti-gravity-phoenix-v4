@@ -132,12 +132,15 @@ then
     prelive-protected-maintenance.sh \
     install-release-assets.sh \
     install-production-release-context.sh \
+    production-healthcheck.sh \
     prelive-protected-maintenance-launch.sh \
     prelive-protected-maintenance-unit.sh \
     rollback-release.sh
   do
     cp "$script_dir/$staged_name" "$detached_stage/$staged_name"
   done
+  cp "$repo_root/release-components.json" \
+    "$detached_stage/release-components.json"
   cat >"$detached_stage/prelive-protected-maintenance.sh" <<'SH'
 #!/usr/bin/env sh
 set -eu

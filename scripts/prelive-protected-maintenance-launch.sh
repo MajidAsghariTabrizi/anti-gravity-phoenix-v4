@@ -59,6 +59,8 @@ for staged_name in \
   prelive-protected-maintenance.sh \
   install-release-assets.sh \
   install-production-release-context.sh \
+  production-healthcheck.sh \
+  release-components.json \
   prelive-protected-maintenance-launch.sh \
   prelive-protected-maintenance-unit.sh \
   rollback-release.sh

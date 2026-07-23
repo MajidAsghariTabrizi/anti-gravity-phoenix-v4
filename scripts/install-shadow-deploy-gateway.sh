@@ -85,6 +85,7 @@ for specification in \
   'release_provenance.py:0600' \
   'install-release-assets.sh:0700' \
   'install-production-release-context.sh:0700' \
+  'production-healthcheck.sh:0700' \
   'prelive-protected-maintenance.sh:0700' \
   'prelive_protected_maintenance.py:0600' \
   'prelive-protected-maintenance-launch.sh:0700' \

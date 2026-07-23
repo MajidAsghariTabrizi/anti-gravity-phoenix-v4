@@ -114,6 +114,12 @@ grep -F 'image-refs.tsv' "$workflow" >/dev/null ||
   fail 'digest-pinned image inspection is missing'
 grep -F 'org.opencontainers.image.revision' "$workflow" >/dev/null ||
   fail 'OCI revision verification is missing'
+for trusted_context_input in production-healthcheck.sh release-components.json; do
+  grep -F "$trusted_context_input" "$workflow" >/dev/null ||
+    fail "trusted context input is not staged: $trusted_context_input"
+  grep -F "$trusted_context_input" "$launcher" >/dev/null ||
+    fail "launcher does not verify trusted context input: $trusted_context_input"
+done
 grep -F -- '--release-compose "$state_dir/release.compose.json"' "$runtime" \
   >/dev/null ||
   fail 'remote candidate render is absent from semantic comparison'
