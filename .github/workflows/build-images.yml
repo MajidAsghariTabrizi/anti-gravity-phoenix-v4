@@ -59,7 +59,7 @@ jobs:
       build_matrix: ${{ steps.components.outputs.matrix }}
     steps:
       - name: Checkout exact requested release
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           ref: ${{ inputs.release_sha }}
           fetch-depth: 0
@@ -225,7 +225,7 @@ jobs:
 
       - name: Checkout
         if: ${{ inputs.protected_base_sha == '' || matrix.protected == false }}
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           ref: ${{ inputs.release_sha }}
 
@@ -302,7 +302,7 @@ jobs:
       contents: read
     steps:
       - name: Checkout
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           ref: ${{ inputs.release_sha }}
 
@@ -348,7 +348,7 @@ jobs:
       actions: read
     steps:
       - name: Checkout exact requested release
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           ref: ${{ inputs.release_sha }}
 
