@@ -42,22 +42,28 @@ the candidate database.
 `Build Phoenix Images` has only a `workflow_dispatch` trigger. A dispatch must
 provide:
 
-- a lowercase 40-character `release_sha` reachable from `origin/main`;
+- the lowercase 40-character `release_sha` at the exact `origin/main` tip;
+- the exact successful `Phoenix CI` main-push `ci_run_id` and
+  `ci_run_attempt` for that SHA;
 - `release_intent=PHOENIX_PRELIVE_SHADOW_V5`;
 - `confirm_publish=PUBLISH_IMMUTABLE_PHOENIX_IMAGES`.
 
-The workflow checks out that exact SHA. Only matrix image jobs receive
+The workflow checks out that exact SHA and loads the seven-image matrix from
+`release-components.json`. Before any package-write job starts, preflight
+validates the supplied CI run path, event, branch, SHA, attempt, conclusion,
+and complete required-job set through the GitHub API. Only matrix image jobs receive
 `packages: write`. Each image fragment binds the image digest, exact SHA,
 release intent, and GitHub run ID. The final manifest job can run only after
-all six image jobs and release-assets succeed.
+all seven image jobs and release-assets succeed.
 
 Run `29683234024` is permanently classified
 `NON_CANONICAL_INCOMPLETE_BUILD`. Its partial Feed and Dashboard images,
 fragments, and release assets must not be referenced by any release. They are
 retained as incident evidence.
 
-`release-provenance.json` records one build run, one SHA, six fragment hashes,
-release-assets hashes, and the release-manifest hash. The artifact is not
+`release-provenance.json` records one build run, one SHA, seven fragment hashes,
+release-assets hashes, the release-manifest hash, and deterministic exact-main
+source-CI evidence. The artifact is not
 canonical until `scripts/release_provenance.py validate-canonical` verifies a
 completed successful `workflow_dispatch` run with every required job and
 release artifact present. Cancelled, skipped, failed, incomplete, duplicate,

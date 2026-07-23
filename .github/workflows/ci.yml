@@ -1,6 +1,8 @@
 name: Phoenix CI
 
 on:
+  push:
+    branches: [main]
   pull_request:
     branches: [main]
   workflow_dispatch:
@@ -20,6 +22,10 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+
+      - name: Install release schema validator
+        shell: bash
+        run: python3 -m pip install --disable-pip-version-check jsonschema==4.25.1
 
       - name: Run secret scans
         shell: bash
@@ -60,8 +66,8 @@ jobs:
           sh ./scripts/prelive-shadow-control-tests.sh
           python3 -m py_compile scripts/release_assets.py
           python3 -m unittest scripts.tests.test_release_assets
-          python3 -m py_compile scripts/release_provenance.py scripts/prelive_v5_release.py
-          python3 -m unittest scripts.tests.test_release_provenance scripts.tests.test_prelive_v5_release
+          python3 -m py_compile scripts/release_components.py scripts/release_provenance.py scripts/prelive_v5_release.py
+          python3 -m unittest scripts.tests.test_release_components scripts.tests.test_release_provenance scripts.tests.test_prelive_v5_release
           python3 -m py_compile scripts/phoenix_shadow_deploy.py
           python3 -m unittest scripts.tests.test_shadow_deploy_gateway
           sh ./scripts/shadow-deploy-gateway-tests.sh
@@ -523,13 +529,16 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          docker buildx build --load -f deploy/feed-ingestor.Dockerfile -t phoenix/feed-ingestor:ci .
-          docker buildx build --load -f deploy/rust.Dockerfile --build-arg CRATE=phoenix-engine -t phoenix/phoenix-engine:ci .
-          docker buildx build --load -f deploy/rust.Dockerfile --build-arg CRATE=rpc-gateway -t phoenix/rpc-gateway:ci .
-          docker buildx build --load -f deploy/rust.Dockerfile --build-arg CRATE=recorder -t phoenix/recorder:ci .
-          docker buildx build --load -f deploy/rust.Dockerfile --build-arg CRATE=live-executor -t phoenix/live-executor:ci .
-          docker buildx build --load -f deploy/fork-sandbox.Dockerfile -t phoenix/fork-sandbox:ci .
-          docker buildx build --load -f deploy/dashboard.Dockerfile -t phoenix/dashboard:ci .
+          while IFS= read -r component; do
+            image="$(jq -r .image <<<"$component")"
+            context="$(jq -r .context <<<"$component")"
+            dockerfile="$(jq -r .dockerfile <<<"$component")"
+            command=(docker buildx build --load -f "$dockerfile" -t "phoenix/$image:ci")
+            while IFS= read -r build_arg; do
+              command+=(--build-arg "$build_arg")
+            done < <(jq -r '.build_args | select(length > 0) | split("\n")[]' <<<"$component")
+            "${command[@]}" "$context"
+          done < <(python3 scripts/release_components.py build-matrix | jq -c '.include[]')
 
   integration-fixtures:
     name: integration-fixtures

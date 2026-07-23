@@ -26,6 +26,8 @@ fi
 for specification in \
   'phoenix_shadow_deploy.py:700' \
   'release_assets.py:600' \
+  'release-components.json:600' \
+  'release_components.py:600' \
   'release_provenance.py:600' \
   'install-release-assets.sh:700' \
   'install-production-release-context.sh:700' \

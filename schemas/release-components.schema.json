@@ -1,0 +1,107 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://phoenix.invalid/schemas/release-components.schema.json",
+  "title": "Phoenix canonical release-component registry",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "required_ci",
+    "components"
+  ],
+  "properties": {
+    "schema": {
+      "const": "phoenix.release-components.v1"
+    },
+    "required_ci": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "branch",
+        "event",
+        "jobs",
+        "workflow_name",
+        "workflow_path"
+      ],
+      "properties": {
+        "branch": { "const": "main" },
+        "event": { "const": "push" },
+        "jobs": {
+          "type": "array",
+          "minItems": 12,
+          "maxItems": 12,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/name" }
+        },
+        "workflow_name": { "const": "Phoenix CI" },
+        "workflow_path": { "const": ".github/workflows/ci.yml" }
+      }
+    },
+    "components": {
+      "type": "array",
+      "minItems": 7,
+      "maxItems": 7,
+      "items": { "$ref": "#/$defs/component" }
+    }
+  },
+  "$defs": {
+    "name": {
+      "type": "string",
+      "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*$"
+    },
+    "component": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "build_args",
+        "build_context",
+        "dockerfile",
+        "image_environment",
+        "live_canary_only",
+        "name",
+        "production_compose",
+        "production_order",
+        "production_services",
+        "protected",
+        "release_included",
+        "repository"
+      ],
+      "properties": {
+        "build_args": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string",
+            "minLength": 1
+          },
+          "propertyNames": {
+            "pattern": "^[A-Z][A-Z0-9_]*$"
+          }
+        },
+        "build_context": { "type": "string", "minLength": 1 },
+        "dockerfile": { "type": "string", "minLength": 1 },
+        "image_environment": {
+          "type": ["string", "null"],
+          "pattern": "^[A-Z][A-Z0-9_]*$"
+        },
+        "live_canary_only": { "type": "boolean" },
+        "name": { "$ref": "#/$defs/name" },
+        "production_compose": { "type": "boolean" },
+        "production_order": {
+          "type": ["integer", "null"],
+          "minimum": 0
+        },
+        "production_services": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/name" }
+        },
+        "protected": { "type": "boolean" },
+        "release_included": { "const": true },
+        "repository": {
+          "type": "string",
+          "pattern": "^ghcr\\.io/majidasgharitabrizi/[a-z0-9]+(?:-[a-z0-9]+)*$"
+        }
+      }
+    }
+  }
+}

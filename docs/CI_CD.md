@@ -2,7 +2,7 @@
 
 Phoenix uses five GitHub workflows:
 
-- `Phoenix CI`: pull requests to `main` and manual dispatch.
+- `Phoenix CI`: pull requests to `main`, pushes to `main`, and manual dispatch.
 - `Build Phoenix Images`: explicitly confirmed manual dispatch only.
 - `Deploy Shadow Production`: acknowledged manual dispatch for an already validated release and rollback pair.
 - `Deploy PRE-LIVE Protected Maintenance`: acknowledged manual dispatch for the separately reviewed v3 Feed Ingestor and Recorder maintenance.
@@ -31,6 +31,12 @@ These jobs are intentionally split so a failing crate or surface is visible in G
 
 Core checks do not use `continue-on-error`. CI has minimum permissions, job timeouts, and concurrency cancellation for superseded PR branch runs.
 
+The repository `CODEOWNERS` file identifies reviewers for release, workflow,
+contract, executor, and deployment-gateway control surfaces. `CODEOWNERS` does
+not enforce review by itself. The `main` branch ruleset must be configured
+manually with the exact GitHub setting **Require review from Code Owners** in
+addition to the required status checks.
+
 The hygiene job runs both secret scanners, both forbidden-file checks, `git diff --check`, and tracked-file validations for `.env`, private key material, runtime databases, feed recordings, replay output, and build output.
 
 The Go job verifies `gofmt` without modifying source, then runs `go vet` and `go test` for feed-ingestor and migration-runner.
@@ -57,10 +63,31 @@ Integration fixtures exercise deterministic profitable, non-profitable, unsuppor
 - `ghcr.io/majidasgharitabrizi/live-executor`
 - `ghcr.io/majidasgharitabrizi/dashboard`
 
-The manual dispatch requires an exact SHA reachable from main, a bounded
-release intent, and the confirmation
+The manual dispatch requires the exact current `main` SHA, the exact successful
+`Phoenix CI` push run ID and attempt for that SHA, a bounded release intent, and
+the confirmation
 `PUBLISH_IMMUTABLE_PHOENIX_IMAGES`. Ordinary main pushes and pull requests
 cannot publish. `packages: write` is scoped only to the seven publishing jobs.
+
+The canonical component, build, protected-image, production-Compose, and CI-job
+contracts are defined in `release-components.json`. Publication preflight loads
+its matrix from that registry and rejects a CI run unless it is the completed,
+successful `.github/workflows/ci.yml` `push` run on `main` for the exact release
+SHA, exact run ID, and exact attempt. The normalized job evidence and its
+deterministic SHA-256 fingerprint are embedded in release provenance.
+
+Example future publication dispatch (after the exact `main` push CI is green):
+
+```sh
+gh workflow run build-images.yml \
+  --repo MajidAsghariTabrizi/anti-gravity-phoenix-v4 \
+  --ref main \
+  -f release_sha=<exact-main-sha> \
+  -f ci_run_id=<successful-main-push-ci-run-id> \
+  -f ci_run_attempt=<successful-main-push-ci-run-attempt> \
+  -f release_intent=PHOENIX_PRELIVE_SHADOW_V5 \
+  -f confirm_publish=PUBLISH_IMMUTABLE_PHOENIX_IMAGES
+```
 
 Images use `sha-<full git sha>` tags and OCI labels for source, revision,
 created timestamp, and image title. The release manifest records the exact
@@ -76,7 +103,15 @@ Replay is an offline CLI and is not published as a permanent production daemon i
 
 `Deploy Shadow Production` never runs automatically. A manual dispatch must provide the exact current `main` SHA, its successful image-build run, the exact active rollback SHA, the rollback image-build run, and the acknowledgement `DEPLOY_PRELIVE_SHADOW`. The `production-shadow` environment gate applies before secrets are available.
 
-Before SSH, the workflow verifies the checkout is current `main`, both manifests are strict and digest-pinned, the release asset archive and extracted tree are integrity checked, and protected `feed-ingestor` and `recorder` image digests match the active rollback release. Before candidate asset installation, the host's active pointer, asset marker, and integrity-checked immutable rollback tree must also agree. A protected-image change fails closed and requires a separately authorized maintenance gate; this workflow will not recreate protected data-plane services.
+Before SSH, the workflow verifies the checkout is current `main`, reconciles
+the candidate's embedded source-CI evidence against the GitHub API, verifies
+both manifests are strict and digest-pinned, integrity checks the release asset
+archive and extracted tree, and requires protected `feed-ingestor` and
+`recorder` image identities to match the active rollback release. Before
+candidate asset installation, the host's active pointer, asset marker, and
+integrity-checked immutable rollback tree must also agree. A protected-image
+change fails closed and requires a separately authorized maintenance gate;
+this workflow will not recreate protected data-plane services.
 
 After those checks, the workflow uploads only the candidate and rollback
 manifest/provenance pair plus the three candidate release-assets files to a

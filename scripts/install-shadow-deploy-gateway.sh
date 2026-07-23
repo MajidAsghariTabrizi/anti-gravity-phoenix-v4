@@ -81,6 +81,7 @@ atomic_install "$script_dir/phoenix-shadow-deploy-gateway.sh" "$gateway" 0755
 for specification in \
   'phoenix_shadow_deploy.py:0700' \
   'release_assets.py:0600' \
+  'release_components.py:0600' \
   'release_provenance.py:0600' \
   'install-release-assets.sh:0700' \
   'install-production-release-context.sh:0700' \
@@ -94,6 +95,8 @@ do
   mode=${specification##*:}
   atomic_install "$script_dir/$name" "$libexec/$name" "$mode"
 done
+atomic_install "$script_dir/../release-components.json" \
+  "$libexec/release-components.json" 0600
 
 sudoers_candidate=$(mktemp "$sudoers_dir/.phoenix-shadow-deploy.XXXXXX") ||
   fail 'sudoers staging failed'

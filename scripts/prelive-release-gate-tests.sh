@@ -14,11 +14,20 @@ bootstrap=$script_dir/bootstrap-production.sh
 context_installer=$script_dir/install-production-release-context.sh
 provisioner=$script_dir/provision-production-host.sh
 gateway_helper=$script_dir/phoenix_shadow_deploy.py
+component_registry=$repo_root/release-components.json
+component_helper=$script_dir/release_components.py
 
 fail() {
   echo "prelive-release-gate-tests: $1" >&2
   exit 1
 }
+
+if ! command -v python3 >/dev/null 2>&1 && command -v python >/dev/null 2>&1; then
+  python3() {
+    python "$@"
+  }
+fi
+command -v python3 >/dev/null 2>&1 || fail 'Python is unavailable'
 
 grep -F 'workflow_dispatch:' "$deploy_workflow" >/dev/null || fail 'deployment is not manual dispatch'
 if grep -F 'workflow_run:' "$deploy_workflow" >/dev/null; then
@@ -37,6 +46,8 @@ grep -F 'phoenix-release-manifest-${{ inputs.rollback_sha }}' "$deploy_workflow"
   fail 'rollback manifest is not downloaded by exact SHA'
 grep -F 'validate-deploy-pair' "$deploy_workflow" >/dev/null ||
   fail 'protected image inheritance is not validated before SSH'
+grep -F 'validate-source-ci-api' "$deploy_workflow" >/dev/null ||
+  fail 'candidate exact-main CI evidence is not revalidated before SSH'
 grep -F 'protected image changed for {name}; maintenance is required' "$release_validator" >/dev/null ||
   fail 'legacy protected image changes are not rejected'
 grep -F 'validate_host(identity)' "$gateway_helper" >/dev/null ||
@@ -54,12 +65,13 @@ if grep -E 'SIGNER_PRIVATE_KEY|WALLET_ADDRESS|EXECUTOR_ADDRESS|eth_send(Raw)?Tra
   fail 'deployment workflow contains forbidden LIVE configuration or submission methods'
 fi
 
-grep -F 'image: fork-sandbox' "$build_workflow" >/dev/null ||
-  fail 'fork-sandbox immutable image publication is missing'
-grep -F 'image: live-executor' "$build_workflow" >/dev/null ||
-  fail 'live-executor immutable image publication is missing'
-grep -F 'build_args: "CRATE=live-executor"' "$build_workflow" >/dev/null ||
-  fail 'live-executor immutable build does not use its reviewed crate'
+[ -f "$component_registry" ] || fail 'canonical release component registry is missing'
+python3 "$component_helper" validate >/dev/null ||
+  fail 'canonical release component registry is invalid'
+grep -F 'fromJSON(needs.preflight.outputs.build_matrix)' "$build_workflow" >/dev/null ||
+  fail 'image publication matrix is not loaded from the canonical registry'
+grep -F 'scripts/release_components.py build-matrix' "$build_workflow" >/dev/null ||
+  fail 'canonical release component matrix generation is missing'
 grep -F 'name: release-assets' "$build_workflow" >/dev/null ||
   fail 'release-assets publication job is missing'
 grep -F 'workflow_dispatch:' "$build_workflow" >/dev/null ||
@@ -67,10 +79,16 @@ grep -F 'workflow_dispatch:' "$build_workflow" >/dev/null ||
 if grep -E '^  (push|pull_request):' "$build_workflow" >/dev/null; then
   fail 'image publication still has an automatic trigger'
 fi
-for input in release_sha release_intent confirm_publish protected_base_sha protected_base_build_run_id; do
+for input in release_sha release_intent confirm_publish ci_run_id ci_run_attempt protected_base_sha protected_base_build_run_id; do
   grep -F "      $input:" "$build_workflow" >/dev/null ||
     fail "image publication input is missing: $input"
 done
+grep -F 'validate-source-ci' "$build_workflow" >/dev/null ||
+  fail 'exact-main source CI validation is missing'
+grep -F 'source-ci-evidence-${{ inputs.release_sha }}' "$build_workflow" >/dev/null ||
+  fail 'validated source CI evidence is not retained'
+grep -F '"$(git rev-parse origin/main)" != "$RELEASE_SHA"' "$build_workflow" >/dev/null ||
+  fail 'release SHA is not required to equal the exact main tip'
 grep -F 'needs: [preflight, build, assets]' "$build_workflow" >/dev/null ||
   fail 'release manifest is not gated on immutable assets'
 grep -F 'inherit-protected' "$build_workflow" >/dev/null ||

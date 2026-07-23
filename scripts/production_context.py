@@ -8,25 +8,21 @@ import sys
 import tempfile
 from pathlib import Path
 
+try:
+    from scripts import release_components
+except (ImportError, ModuleNotFoundError):  # Direct execution from scripts/.
+    import release_components  # type: ignore[no-redef]
 
 OWNED_IMAGES = {
-    "feed-ingestor": ("FEED_INGESTOR_IMAGE", "feed-ingestor"),
-    "phoenix-engine": ("PHOENIX_ENGINE_IMAGE", "phoenix-engine"),
-    "rpc-gateway": ("RPC_GATEWAY_IMAGE", "rpc-gateway"),
-    "recorder": ("RECORDER_IMAGE", "recorder"),
-    "dashboard": ("DASHBOARD_IMAGE", "dashboard"),
+    component["name"]: (
+        component["image_environment"],
+        component["production_services"][0],
+    )
+    for component in release_components.DEFAULT_PRODUCTION_COMPONENTS
 }
-
-RELEASE_IMAGES = (
-    "dashboard",
-    "feed-ingestor",
-    "fork-sandbox",
-    "live-executor",
-    "phoenix-engine",
-    "recorder",
-    "rpc-gateway",
-)
-PROTECTED_IMAGES = ("feed-ingestor", "recorder")
+RELEASE_IMAGES = release_components.RELEASE_IMAGES
+LEGACY_RELEASE_IMAGES = release_components.LEGACY_RELEASE_IMAGES
+PROTECTED_IMAGES = release_components.PROTECTED_IMAGES
 
 EXPECTED_SERVICES = (
     "nitro-feed-relay",
@@ -47,13 +43,9 @@ RUNNING_SERVICES = tuple(
 )
 
 RENDERED_OWNED_IMAGES = {
-    "feed-ingestor": "FEED_INGESTOR_IMAGE",
-    "migration-runner": "FEED_INGESTOR_IMAGE",
-    "phoenix-engine": "PHOENIX_ENGINE_IMAGE",
-    "rpc-gateway": "RPC_GATEWAY_IMAGE",
-    "recorder": "RECORDER_IMAGE",
-    "shadow-dispatcher": "RECORDER_IMAGE",
-    "dashboard": "DASHBOARD_IMAGE",
+    service: component["image_environment"]
+    for component in release_components.DEFAULT_PRODUCTION_COMPONENTS
+    for service in component["production_services"]
 }
 
 EXTERNAL_IMAGES = {
@@ -231,8 +223,15 @@ def load_manifest(path: Path) -> tuple[dict, str, dict[str, str]]:
         ):
             raise ContextError("RELEASE_IMAGE_MISMATCH")
 
+    image_names = tuple(sorted(images))
+    if not inherited and image_names not in (
+        RELEASE_IMAGES,
+        LEGACY_RELEASE_IMAGES,
+    ):
+        raise ContextError("RELEASE_IMAGE_MISMATCH")
+
     references: dict[str, str] = {}
-    names = RELEASE_IMAGES if inherited else tuple(OWNED_IMAGES)
+    names = RELEASE_IMAGES if inherited else image_names
     for image_name in names:
         image = images.get(image_name)
         if not isinstance(image, dict):
@@ -240,7 +239,10 @@ def load_manifest(path: Path) -> tuple[dict, str, dict[str, str]]:
         repository = image.get("repository")
         tag = image.get("tag")
         digest = image.get("digest")
-        expected_repository = f"ghcr.io/majidasgharitabrizi/{image_name}"
+        component = release_components.COMPONENTS_BY_NAME.get(image_name)
+        if component is None:
+            raise ContextError("RELEASE_IMAGE_MISMATCH")
+        expected_repository = component["repository"]
         expected_tag = f"sha-{release_sha}"
         if inherited:
             if set(image) != {

@@ -14,6 +14,10 @@ from datetime import datetime
 from pathlib import Path, PurePosixPath
 from typing import Any
 
+try:
+    from scripts import release_components
+except (ImportError, ModuleNotFoundError):  # Direct execution from scripts/.
+    import release_components  # type: ignore[no-redef]
 
 PLAN_SCHEMA = "phoenix.protected-maintenance-plan.v2"
 SNAPSHOT_SCHEMA = "phoenix.protected-maintenance-snapshot.v2"
@@ -21,23 +25,8 @@ CONTEXT_SCHEMA = "phoenix.protected-maintenance-context.v2"
 RELEASE_SCHEMA = "phoenix.release.v1"
 ASSET_SCHEMA = "phoenix.release-assets.v1"
 
-LEGACY_RELEASE_IMAGES = (
-    "dashboard",
-    "feed-ingestor",
-    "fork-sandbox",
-    "phoenix-engine",
-    "recorder",
-    "rpc-gateway",
-)
-CURRENT_RELEASE_IMAGES = (
-    "dashboard",
-    "feed-ingestor",
-    "fork-sandbox",
-    "live-executor",
-    "phoenix-engine",
-    "recorder",
-    "rpc-gateway",
-)
+LEGACY_RELEASE_IMAGES = release_components.LEGACY_RELEASE_IMAGES
+CURRENT_RELEASE_IMAGES = release_components.RELEASE_IMAGES
 REVIEWED_RELEASE_IMAGE_SETS = (LEGACY_RELEASE_IMAGES, CURRENT_RELEASE_IMAGES)
 OWNED_IMAGES = LEGACY_RELEASE_IMAGES
 MAINTENANCE_IMAGE_REFERENCES = OWNED_IMAGES

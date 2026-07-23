@@ -12,6 +12,38 @@ RELEASE_SHA = "a" * 40
 RUN_ID = "30000000001"
 BASE_SHA = "b" * 40
 BASE_RUN_ID = "30000000002"
+CI_RUN_ID = "30000000009"
+CI_RUN_ATTEMPT = "1"
+
+
+def source_ci_api(release_sha: str = RELEASE_SHA) -> tuple[dict, dict]:
+    run = {
+        "id": int(CI_RUN_ID),
+        "run_attempt": int(CI_RUN_ATTEMPT),
+        "name": release_provenance.CI_WORKFLOW,
+        "path": release_provenance.CI_WORKFLOW_PATH,
+        "event": release_provenance.CI_EVENT,
+        "head_branch": release_provenance.CI_BRANCH,
+        "head_sha": release_sha,
+        "status": "completed",
+        "conclusion": "success",
+        "repository": {"full_name": release_provenance.REPOSITORY},
+    }
+    jobs = {
+        "total_count": len(release_provenance.REQUIRED_CI_JOBS),
+        "jobs": [
+            {"name": name, "status": "completed", "conclusion": "success"}
+            for name in release_provenance.REQUIRED_CI_JOBS
+        ],
+    }
+    return run, jobs
+
+
+def source_ci_evidence(release_sha: str = RELEASE_SHA) -> dict:
+    run, jobs = source_ci_api(release_sha)
+    return release_provenance.validate_source_ci_run(
+        run, jobs, release_sha, CI_RUN_ID, CI_RUN_ATTEMPT
+    )
 
 
 class ReleaseProvenanceTests(unittest.TestCase):
@@ -94,6 +126,7 @@ class ReleaseProvenanceTests(unittest.TestCase):
                 release_provenance.RELEASE_INTENT,
                 manifest_path,
                 provenance_path,
+                source_ci_evidence(release_sha),
                 created_at="2026-07-19T00:00:00Z",
             )
         return manifest, provenance, manifest_path, provenance_path
@@ -124,6 +157,7 @@ class ReleaseProvenanceTests(unittest.TestCase):
                 release_provenance.RELEASE_INTENT,
                 manifest_path,
                 provenance_path,
+                source_ci_evidence(),
                 created_at="2026-07-20T00:00:00Z",
                 protected_base_sha=BASE_SHA,
                 protected_base_build_run_id=BASE_RUN_ID,
@@ -155,6 +189,7 @@ class ReleaseProvenanceTests(unittest.TestCase):
                 release_provenance.RELEASE_INTENT,
                 manifest_path,
                 provenance_path,
+                source_ci_evidence(),
                 created_at="2026-07-19T00:00:00Z",
             )
         return manifest, provenance
@@ -184,6 +219,98 @@ class ReleaseProvenanceTests(unittest.TestCase):
         release_provenance.validate_canonical_run(
             provenance, manifest, self._run_evidence()
         )
+
+    def test_source_ci_requires_exact_successful_main_push(self) -> None:
+        run, jobs = source_ci_api()
+        cases = (
+            ("head_sha", "b" * 40),
+            ("event", "pull_request"),
+            ("head_branch", "feature"),
+            ("status", "in_progress"),
+            ("conclusion", "failure"),
+            ("path", ".github/workflows/other.yml"),
+        )
+        for field, value in cases:
+            changed = copy.deepcopy(run)
+            changed[field] = value
+            with self.subTest(field=field):
+                with self.assertRaises(release_provenance.ReleaseProvenanceError):
+                    release_provenance.validate_source_ci_run(
+                        changed, jobs, RELEASE_SHA, CI_RUN_ID, CI_RUN_ATTEMPT
+                    )
+
+    def test_source_ci_rejects_missing_duplicate_or_non_successful_jobs(self) -> None:
+        run, jobs = source_ci_api()
+        for mutation in ("missing", "duplicate", "skipped", "cancelled", "neutral"):
+            changed = copy.deepcopy(jobs)
+            if mutation == "missing":
+                changed["jobs"].pop()
+            elif mutation == "duplicate":
+                changed["jobs"].append(copy.deepcopy(changed["jobs"][0]))
+            else:
+                changed["jobs"][0]["conclusion"] = mutation
+            with self.subTest(mutation=mutation):
+                with self.assertRaises(release_provenance.ReleaseProvenanceError):
+                    release_provenance.validate_source_ci_run(
+                        run, changed, RELEASE_SHA, CI_RUN_ID, CI_RUN_ATTEMPT
+                    )
+
+    def test_source_ci_attempt_and_quarantine_are_enforced(self) -> None:
+        run, jobs = source_ci_api()
+        with self.assertRaisesRegex(
+            release_provenance.ReleaseProvenanceError, "attempt"
+        ):
+            release_provenance.validate_source_ci_run(
+                run, jobs, RELEASE_SHA, CI_RUN_ID, "2"
+            )
+        quarantined = next(iter(release_provenance.QUARANTINED_CI_RUNS))
+        run["id"] = int(quarantined)
+        with self.assertRaisesRegex(
+            release_provenance.ReleaseProvenanceError, "quarantined"
+        ):
+            release_provenance.validate_source_ci_run(
+                run, jobs, RELEASE_SHA, quarantined, CI_RUN_ATTEMPT
+            )
+
+    def test_source_ci_hash_and_candidate_presence_are_enforced(self) -> None:
+        manifest, provenance = self._assemble()
+        changed = copy.deepcopy(provenance)
+        changed["source_ci"]["evidence_sha256"] = f"sha256:{'9' * 64}"
+        with self.assertRaisesRegex(
+            release_provenance.ReleaseProvenanceError, "evidence hash"
+        ):
+            release_provenance.validate_provenance(changed, manifest)
+
+        legacy = copy.deepcopy(provenance)
+        legacy["schema"] = release_provenance.LEGACY_PROVENANCE_SCHEMA
+        legacy.pop("source_ci")
+        legacy["required_release_artifacts"] = list(
+            release_provenance._release_artifact_names(
+                RELEASE_SHA, include_source_ci=False
+            )
+        )
+        with self.assertRaisesRegex(
+            release_provenance.ReleaseProvenanceError, "reviewed rollback"
+        ):
+            release_provenance.validate_provenance(legacy, manifest)
+        release_provenance.validate_provenance(
+            legacy, manifest, allow_legacy=True
+        )
+
+    def test_candidate_source_ci_is_reconciled_with_github_api_evidence(self) -> None:
+        _, provenance = self._assemble()
+        run, jobs = source_ci_api()
+        release_provenance.validate_source_ci_against_api(
+            provenance, run, jobs, RELEASE_SHA
+        )
+        changed = copy.deepcopy(run)
+        changed["run_attempt"] = 2
+        with self.assertRaisesRegex(
+            release_provenance.ReleaseProvenanceError, "attempt"
+        ):
+            release_provenance.validate_source_ci_against_api(
+                provenance, changed, jobs, RELEASE_SHA
+            )
 
     def test_ordinary_release_inherits_both_protected_images(self) -> None:
         (
@@ -238,6 +365,8 @@ class ReleaseProvenanceTests(unittest.TestCase):
                         release_provenance.RELEASE_INTENT,
                         release_provenance.PUBLISH_CONFIRMATION,
                         RELEASE_SHA,
+                        CI_RUN_ID,
+                        CI_RUN_ATTEMPT,
                         base_sha,
                         base_run,
                     )
@@ -265,7 +394,7 @@ class ReleaseProvenanceTests(unittest.TestCase):
                         base_provenance_path,
                     )
 
-    def test_protected_fragment_digest_repository_and_tag_must_match_base(self) -> None:
+    def test_protected_fragment_identity_must_match_base(self) -> None:
         _, _, base_manifest_path, base_provenance_path = self._build_full_release(
             self.root / "fragment-base", BASE_SHA, BASE_RUN_ID
         )
@@ -285,6 +414,9 @@ class ReleaseProvenanceTests(unittest.TestCase):
             ("digest", f"sha256:{99:064x}"),
             ("repository", "ghcr.io/majidasgharitabrizi/not-recorder"),
             ("tag", f"sha-{'c' * 40}"),
+            ("source_sha", "c" * 40),
+            ("source_build_run_id", "30000000003"),
+            ("oci_revision", "c" * 40),
         )
         for field, value in mutations:
             changed = copy.deepcopy(original)
@@ -303,6 +435,7 @@ class ReleaseProvenanceTests(unittest.TestCase):
                             release_provenance.RELEASE_INTENT,
                             self.root / "bad-manifest.json",
                             self.root / "bad-provenance.json",
+                            source_ci_evidence(),
                             protected_base_sha=BASE_SHA,
                             protected_base_build_run_id=BASE_RUN_ID,
                             protected_base_manifest=base_manifest_path,
@@ -367,6 +500,47 @@ class ReleaseProvenanceTests(unittest.TestCase):
                 BASE_RUN_ID,
             )
 
+    def test_deploy_pair_rejects_invalid_candidate_source_ci(self) -> None:
+        (
+            _,
+            provenance,
+            manifest_path,
+            provenance_path,
+            _,
+            _,
+            base_manifest_path,
+            base_provenance_path,
+        ) = self._assemble_inherited()
+        cases = (
+            ("event", "pull_request"),
+            ("head_sha", "c" * 40),
+            ("conclusion", "failure"),
+        )
+        for field, value in cases:
+            changed = copy.deepcopy(provenance)
+            changed["source_ci"][field] = value
+            unsigned = dict(changed["source_ci"])
+            unsigned.pop("evidence_sha256")
+            changed["source_ci"]["evidence_sha256"] = (
+                release_provenance._sha256_bytes(
+                    release_provenance._canonical_json(unsigned)
+                )
+            )
+            provenance_path.write_bytes(release_provenance._canonical_json(changed))
+            with self.subTest(field=field), self.assertRaises(
+                release_provenance.ReleaseProvenanceError
+            ):
+                release_provenance.validate_deploy_pair(
+                    manifest_path,
+                    provenance_path,
+                    RELEASE_SHA,
+                    RUN_ID,
+                    base_manifest_path,
+                    base_provenance_path,
+                    BASE_SHA,
+                    BASE_RUN_ID,
+                )
+
     def test_legacy_full_build_deploy_contract_remains_supported(self) -> None:
         self._assemble()
         candidate_manifest_path = self.root / "release-manifest.json"
@@ -377,6 +551,19 @@ class ReleaseProvenanceTests(unittest.TestCase):
             rollback_manifest_path,
             rollback_provenance_path,
         ) = self._build_full_release(self.root / "legacy-rollback", BASE_SHA, BASE_RUN_ID)
+        legacy_rollback = json.loads(
+            rollback_provenance_path.read_text(encoding="utf-8")
+        )
+        legacy_rollback["schema"] = release_provenance.LEGACY_PROVENANCE_SCHEMA
+        legacy_rollback.pop("source_ci")
+        legacy_rollback["required_release_artifacts"] = list(
+            release_provenance._release_artifact_names(
+                BASE_SHA, include_source_ci=False
+            )
+        )
+        rollback_provenance_path.write_bytes(
+            release_provenance._canonical_json(legacy_rollback)
+        )
         release_provenance.validate_deploy_pair(
             candidate_manifest_path,
             candidate_provenance_path,
@@ -501,6 +688,8 @@ class ReleaseProvenanceTests(unittest.TestCase):
             release_provenance.RELEASE_INTENT,
             release_provenance.PUBLISH_CONFIRMATION,
             RELEASE_SHA,
+            CI_RUN_ID,
+            CI_RUN_ATTEMPT,
         )
         release_provenance.validate_dispatch(*valid)
         for index, bad_value in (
@@ -510,6 +699,8 @@ class ReleaseProvenanceTests(unittest.TestCase):
             (2, ""),
             (2, "PUBLISH"),
             (3, "b" * 40),
+            (4, ""),
+            (5, "0"),
         ):
             values = list(valid)
             values[index] = bad_value
@@ -533,6 +724,7 @@ class ReleaseProvenanceTests(unittest.TestCase):
                     release_provenance.RELEASE_INTENT,
                     self.root / "manifest.json",
                     self.root / "provenance.json",
+                    source_ci_evidence(),
                 )
 
     def test_mixed_fragment_sha_and_run_are_rejected(self) -> None:
@@ -562,6 +754,7 @@ class ReleaseProvenanceTests(unittest.TestCase):
                             release_provenance.RELEASE_INTENT,
                             self.root / "manifest.json",
                             self.root / "provenance.json",
+                            source_ci_evidence(),
                         )
             path.write_text(json.dumps(fragment), encoding="utf-8")
 
@@ -653,14 +846,26 @@ class ReleaseProvenanceTests(unittest.TestCase):
         self.assertIn("release_sha:", workflow)
         self.assertIn("release_intent:", workflow)
         self.assertIn("confirm_publish:", workflow)
+        self.assertIn("ci_run_id:", workflow)
+        self.assertIn("ci_run_attempt:", workflow)
         self.assertIn("protected_base_sha:", workflow)
         self.assertIn("protected_base_build_run_id:", workflow)
         self.assertIn("PUBLISH_IMMUTABLE_PHOENIX_IMAGES", workflow)
         self.assertIn("PHOENIX_PRELIVE_SHADOW_V5", workflow)
-        self.assertIn('git merge-base --is-ancestor "$RELEASE_SHA" origin/main', workflow)
+        self.assertIn('"$(git rev-parse origin/main)" != "$RELEASE_SHA"', workflow)
+        self.assertIn("validate-source-ci", workflow)
+        self.assertIn(
+            "actions/runs/${CI_RUN_ID}/attempts/${CI_RUN_ATTEMPT}", workflow
+        )
+        self.assertIn(
+            "actions/runs/${CI_RUN_ID}/attempts/${CI_RUN_ATTEMPT}/jobs?per_page=100",
+            workflow,
+        )
+        self.assertNotIn("jobs?filter=latest", workflow)
+        self.assertIn("--source-ci-evidence source-ci/evidence.json", workflow)
+        self.assertIn("fromJSON(needs.preflight.outputs.build_matrix)", workflow)
         self.assertIn("validate-github-run", workflow)
         self.assertIn("inherit-protected", workflow)
-        self.assertEqual(workflow.count("            protected: true"), 2)
         self.assertGreaterEqual(
             workflow.count(
                 "if: ${{ inputs.protected_base_sha == '' || matrix.protected == false }}"
@@ -684,9 +889,20 @@ class ReleaseProvenanceTests(unittest.TestCase):
             / "deploy-shadow.yml"
         ).read_text(encoding="utf-8")
         validation = workflow.index("validate-deploy-pair")
+        source_ci_validation = workflow.index("validate-source-ci-api")
         ssh_install = workflow.index("- name: Install SSH material")
+        self.assertLess(source_ci_validation, ssh_install)
         self.assertLess(validation, ssh_install)
         self.assertIn("Verify successful build run identities", workflow)
+        self.assertIn(
+            "actions/runs/${source_ci_run_id}/attempts/${source_ci_run_attempt}",
+            workflow,
+        )
+        self.assertIn(
+            "actions/runs/${source_ci_run_id}/attempts/${source_ci_run_attempt}/jobs?per_page=100",
+            workflow,
+        )
+        self.assertNotIn("jobs?filter=latest", workflow)
         self.assertIn("--release-provenance release/release-provenance.json", workflow)
         self.assertIn("--rollback-provenance rollback/release-provenance.json", workflow)
 
@@ -702,6 +918,8 @@ class ReleaseProvenanceTests(unittest.TestCase):
         self.assertEqual(
             set(schema["properties"]["schema"]["enum"]),
             {
+                release_provenance.LEGACY_PROVENANCE_SCHEMA,
+                release_provenance.LEGACY_INHERITED_PROVENANCE_SCHEMA,
                 release_provenance.PROVENANCE_SCHEMA,
                 release_provenance.INHERITED_PROVENANCE_SCHEMA,
             },
@@ -712,6 +930,8 @@ class ReleaseProvenanceTests(unittest.TestCase):
             ],
             "29683234024",
         )
+        self.assertIn("source_ci", schema["properties"])
+        self.assertEqual(len(schema["oneOf"]), 4)
 
         manifest_schema = json.loads(
             (

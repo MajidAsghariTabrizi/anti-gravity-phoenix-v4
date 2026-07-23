@@ -57,6 +57,7 @@ class ReleaseAssetsTests(unittest.TestCase):
             self.assertEqual(paths, sorted(paths))
             self.assertEqual(len(paths), len(set(paths)))
             self.assertIn("compose.prod.yml", paths)
+            self.assertIn("release-components.json", paths)
             for required in LIVE_CANARY_ASSETS:
                 self.assertIn(required, paths)
             self.assertIn("contracts/PhoenixExecutor.compiled.json", paths)
@@ -71,9 +72,11 @@ class ReleaseAssetsTests(unittest.TestCase):
             self.assertIn("scripts/prelive-v5-fresh-database-gate.sh", paths)
             self.assertIn("scripts/prelive_v5_release.py", paths)
             self.assertIn("scripts/release_provenance.py", paths)
+            self.assertIn("scripts/release_components.py", paths)
             self.assertIn("deploy/prelive-v5-release.example.json", paths)
             self.assertIn("schemas/phoenix-release-manifest.schema.json", paths)
             self.assertIn("schemas/phoenix-release-provenance.schema.json", paths)
+            self.assertIn("schemas/release-components.schema.json", paths)
             self.assertIn("schemas/phoenix-prelive-v5-release.schema.json", paths)
             self.assertTrue(
                 all(

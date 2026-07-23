@@ -52,6 +52,8 @@ SYSTEMD_TIMEOUT_SECONDS = 2400
 TRUSTED_HELPERS = {
     "phoenix_shadow_deploy.py": 0o700,
     "release_assets.py": 0o600,
+    "release-components.json": 0o600,
+    "release_components.py": 0o600,
     "release_provenance.py": 0o600,
     "install-release-assets.sh": 0o700,
     "install-production-release-context.sh": 0o700,
@@ -700,6 +702,7 @@ def validate_control_context(
         "install-release-assets.sh",
         "production-healthcheck.sh",
         "production_context.py",
+        "release_components.py",
         "release_assets.py",
         "render-production-compose.sh",
         "rollback-release.sh",
@@ -720,7 +723,12 @@ def validate_control_context(
             or _mode(metadata) != 0o750
         ):
             _fail("deploy_context_permissions_invalid")
-    for name in ("compose.prod.yml", "current-release", "release-assets.sha"):
+    for name in (
+        "compose.prod.yml",
+        "current-release",
+        "release-assets.sha",
+        "release-components.json",
+    ):
         path = deploy_dir / name
         try:
             metadata = path.lstat()
