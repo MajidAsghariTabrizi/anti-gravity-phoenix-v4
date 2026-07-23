@@ -53,6 +53,8 @@ if grep -E 'EXPECTED_IMAGES|feed-ingestor|(^|[^-])recorder([^a-z-]|$)' "$helper"
 fi
 grep -F '"/usr/bin/systemd-run"' "$helper" >/dev/null ||
   fail 'gateway does not use the bounded systemd launch path'
+grep -F '"--no-block"' "$helper" >/dev/null ||
+  fail 'systemd launch can deadlock while the start-side lock is held'
 grep -F '"--property=Type=oneshot"' "$helper" >/dev/null ||
   fail 'systemd deployment unit is not Type=oneshot'
 grep -F '"--property=RemainAfterExit=yes"' "$helper" >/dev/null ||

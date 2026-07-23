@@ -1159,6 +1159,7 @@ def start(identity: Identity) -> None:
             raise
         command = [
             "/usr/bin/systemd-run",
+            "--no-block",
             f"--unit={identity.unit}",
             f"--description=Phoenix SHADOW deployment {identity.github_run_id}/{identity.github_run_attempt}",
             "--property=Type=oneshot",
