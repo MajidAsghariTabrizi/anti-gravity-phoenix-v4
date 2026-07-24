@@ -1299,7 +1299,10 @@ class ShadowContractTransitionTests(unittest.TestCase):
         for line in self.shell.splitlines():
             if "psql" in line:
                 self.assertNotIn("live-executor/schema", line)
-        self.assertNotRegex(self.shell, r"psql[^\n]*(001_live_canary|002_approval_evidence)")
+        self.assertNotRegex(
+            self.shell,
+            r"psql[^\n]*(001_live_canary|002_approval_evidence|003_autonomous_hunter)",
+        )
 
     def test_candidate_and_rollback_service_order_is_exact(self) -> None:
         self.assertEqual(

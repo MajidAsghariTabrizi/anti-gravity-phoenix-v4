@@ -66,6 +66,9 @@ jobs:
           sh ./scripts/prelive-shadow-control-tests.sh
           python3 -m py_compile scripts/release_assets.py
           python3 -m unittest scripts.tests.test_release_assets
+          python3 -m py_compile scripts/hunter_contracts.py
+          python3 scripts/hunter_contracts.py validate-fixtures
+          python3 -m unittest scripts.tests.test_hunter_contracts
           python3 -m py_compile scripts/release_components.py scripts/release_provenance.py scripts/prelive_v5_release.py
           python3 -m unittest scripts.tests.test_release_components scripts.tests.test_release_provenance scripts.tests.test_prelive_v5_release
           python3 -m py_compile scripts/phoenix_shadow_deploy.py

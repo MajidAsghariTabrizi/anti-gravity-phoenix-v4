@@ -73,6 +73,9 @@ grep -F '"$deploy_dir/live-executor/schema/001_live_canary.sql" 0640' \
 grep -F '"$deploy_dir/live-executor/schema/002_approval_evidence.sql" 0640' \
   "$context_installer" >/dev/null ||
   fail 'live-canary approval schema does not use the existing data-file mode policy'
+grep -F '"$deploy_dir/live-executor/schema/003_autonomous_hunter_contracts.sql" 0640' \
+  "$context_installer" >/dev/null ||
+  fail 'autonomous Hunter schema does not use the existing data-file mode policy'
 if grep -E '(^|[[:space:]])psql([[:space:]]|$)|migration-runner' \
   "$context_installer" "$release_installer" >/dev/null
 then
@@ -265,7 +268,8 @@ assert_live_canary_context() {
   for relative in \
     compose.live-canary.yml \
     live-executor/schema/001_live_canary.sql \
-    live-executor/schema/002_approval_evidence.sql
+    live-executor/schema/002_approval_evidence.sql \
+    live-executor/schema/003_autonomous_hunter_contracts.sql
   do
     [ -f "$context_target/$relative" ] && [ ! -L "$context_target/$relative" ] ||
       fail "installed live-canary asset is missing or unsafe: $relative"

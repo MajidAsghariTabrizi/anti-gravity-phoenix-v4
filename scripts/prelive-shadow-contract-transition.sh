@@ -841,6 +841,9 @@ restore_context_backup() {
   restore_optional_path compose.live-canary.yml || return 1
   restore_optional_path live-executor/schema/001_live_canary.sql || return 1
   restore_optional_path live-executor/schema/002_approval_evidence.sql || return 1
+  restore_optional_path live-executor/schema/003_autonomous_hunter_contracts.sql || return 1
+  restore_optional_path routes/phoenix-route-universe-v1.json || return 1
+  restore_optional_path schemas/phoenix-autonomous-hunter-v1.schema.json || return 1
   restore_optional_path manifests/$release_sha.json || return 1
   restore_optional_path manifests/$release_sha.env || return 1
   restore_optional_path manifests/$release_sha.render.json || return 1
@@ -867,6 +870,9 @@ backup_transition_state() {
     compose.live-canary.yml \
     live-executor/schema/001_live_canary.sql \
     live-executor/schema/002_approval_evidence.sql \
+    live-executor/schema/003_autonomous_hunter_contracts.sql \
+    routes/phoenix-route-universe-v1.json \
+    schemas/phoenix-autonomous-hunter-v1.schema.json \
     manifests/$release_sha.json \
     manifests/$release_sha.env \
     manifests/$release_sha.render.json \

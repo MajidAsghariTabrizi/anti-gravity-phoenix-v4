@@ -1,0 +1,13 @@
+{
+  "schema_version": "phoenix.submission-quote.v1",
+  "logical_channel_id": "standard_rpc",
+  "quote_created_at": "2026-07-24T06:30:01Z",
+  "quote_expires_at": "2026-07-24T06:30:04Z",
+  "maximum_ordering_payment": "0",
+  "estimated_ordering_payment": "1",
+  "minimum_retained_profit": "1000000000000",
+  "expected_net_after_ordering": "2000000000000",
+  "fallback_allowed": false,
+  "fallback_channel_id": null,
+  "quote_evidence_hash": "39ddc04424df5dda168f0b614cd637a4faae870added33c76ab37544631d17ae"
+}

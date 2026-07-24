@@ -1,0 +1,15 @@
+{
+  "schema_version": "phoenix.autonomous-global-control.v1",
+  "chain_id": 42161,
+  "armed": false,
+  "kill_switch": true,
+  "execution_mode": "disabled",
+  "maximum_input_amount": "10000000000000000",
+  "daily_loss_limit": "10000000000000000",
+  "daily_ordering_budget": "0",
+  "maximum_concurrent_candidates": 1,
+  "control_epoch": 0,
+  "updated_at": "2026-07-24T06:30:00Z",
+  "disarm_reason": "not_armed",
+  "control_hash": "c2318d29778038d2d432774744314754f43bcb17af085bb99b04a6522d73d0f1"
+}

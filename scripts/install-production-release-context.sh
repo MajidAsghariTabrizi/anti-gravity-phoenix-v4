@@ -145,11 +145,17 @@ install_source \
   "$source_root/fixtures/routes/arbitrum_uniswap_v3_pool_proofs.json" \
   "$deploy_dir/routes/arbitrum_uniswap_v3_pool_proofs.json" 0640
 install_source \
+  "$source_root/config/phoenix-route-universe-v1.json" \
+  "$deploy_dir/routes/phoenix-route-universe-v1.json" 0640
+install_source \
   "$source_root/live-executor/schema/001_live_canary.sql" \
   "$deploy_dir/live-executor/schema/001_live_canary.sql" 0640
 install_source \
   "$source_root/live-executor/schema/002_approval_evidence.sql" \
   "$deploy_dir/live-executor/schema/002_approval_evidence.sql" 0640
+install_source \
+  "$source_root/live-executor/schema/003_autonomous_hunter_contracts.sql" \
+  "$deploy_dir/live-executor/schema/003_autonomous_hunter_contracts.sql" 0640
 
 for sql_name in \
   shadow-profitability-report.sql \
@@ -164,6 +170,7 @@ done
 for schema_name in \
   prelive-money-path-summary.schema.json \
   prelive-shadow-control-evidence.schema.json \
+  phoenix-autonomous-hunter-v1.schema.json \
   phoenix-release-assets.schema.json
 do
   install_source \

@@ -7,6 +7,11 @@
 /scripts/production_context.py @MajidAsghariTabrizi
 /schemas/release-components.schema.json @MajidAsghariTabrizi
 /schemas/phoenix-release-*.json @MajidAsghariTabrizi
+/schemas/phoenix-autonomous-hunter-v1.schema.json @MajidAsghariTabrizi
+/config/phoenix-route-universe-v1.json @MajidAsghariTabrizi
+/fixtures/autonomous-hunter/** @MajidAsghariTabrizi
+/docs/AUTONOMOUS_HUNTER_CONTRACTS_V1.md @MajidAsghariTabrizi
+/scripts/hunter_contracts.py @MajidAsghariTabrizi
 /contracts/** @MajidAsghariTabrizi
 /live-executor/** @MajidAsghariTabrizi
 /scripts/install-production-release-context.sh @MajidAsghariTabrizi
