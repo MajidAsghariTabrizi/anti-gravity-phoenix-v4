@@ -55,7 +55,7 @@ ensure_postgres_directory() {
       fail "provisioning path is not a directory: $postgres_dir"
     first_entry=$(find "$postgres_dir" -mindepth 1 -maxdepth 1 -print -quit) ||
       fail 'PostgreSQL data directory inspection failed'
-    [ -z "$first_entry" ] || return
+    [ -z "$first_entry" ] || return 0
   fi
   install -d -m 0750 -o "$owner_user" -g "$owner_group" "$postgres_dir" ||
     fail 'empty PostgreSQL data directory could not be provisioned'

@@ -85,6 +85,8 @@ if grep -E 'chown[[:space:]]+-R.*data/postgres|chmod[[:space:]]+-R.*data/postgre
 then
   fail 'first-host provisioning recursively mutates PostgreSQL data'
 fi
+grep -F '[ -z "$first_entry" ] || return 0' "$provisioner" >/dev/null ||
+  fail 'non-empty PostgreSQL preservation does not return success explicitly'
 
 if [ "$(uname -s)" != Linux ] ||
   ! command -v sudo >/dev/null 2>&1 ||
