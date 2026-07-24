@@ -48,6 +48,7 @@ test_wallet="$(cast wallet address --private-key "$test_key")"
 anvil_port="${PHOENIX_TEST_ANVIL_PORT:-18545}"
 rpc_url="http://127.0.0.1:${anvil_port}"
 anvil --silent --host 127.0.0.1 --port "$anvil_port" --chain-id 42161 \
+  --block-base-fee-per-gas 1 --gas-price 1 \
   >"$tmp_dir/anvil.log" 2>&1 &
 anvil_pid="$!"
 
