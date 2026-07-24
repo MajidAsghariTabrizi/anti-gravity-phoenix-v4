@@ -33,6 +33,10 @@ grep -F 'provision-production-host.sh' "$bootstrap" >/dev/null ||
   fail 'bootstrap does not delegate first-host provisioning'
 grep -F 'install-production-release-context.sh' "$bootstrap" >/dev/null ||
   fail 'bootstrap does not delegate release-context installation'
+grep -F "fail 'host provisioning stage failed'" "$bootstrap" >/dev/null ||
+  fail 'bootstrap lacks a stage-specific host provisioning diagnostic'
+grep -F "fail 'release context installation stage failed'" "$bootstrap" >/dev/null ||
+  fail 'bootstrap lacks a stage-specific release-context diagnostic'
 grep -F 'install-production-release-context.sh' "$release_installer" >/dev/null ||
   fail 'release installer does not use the scoped context installer'
 if grep -F 'bootstrap-production.sh' "$release_installer" >/dev/null; then
@@ -78,6 +82,17 @@ grep -F 'prometheus_runtime_uid=65534' "$provisioner" >/dev/null ||
   fail 'Prometheus provisioning UID is not explicit'
 grep -F 'prometheus_runtime_gid=65534' "$provisioner" >/dev/null ||
   fail 'Prometheus provisioning GID is not explicit'
+grep -F 'directory ownership or mode could not be enforced:' "$provisioner" >/dev/null ||
+  fail 'fresh-host directory provisioning lacks a stage-specific diagnostic'
+if grep -E 'chown[[:space:]]+-R.*data/postgres|chmod[[:space:]]+-R.*data/postgres' \
+  "$provisioner" >/dev/null
+then
+  fail 'first-host provisioning recursively mutates PostgreSQL data'
+fi
+grep -F '[ -z "$first_entry" ] || return 0' "$provisioner" >/dev/null ||
+  fail 'non-empty PostgreSQL preservation does not return success explicitly'
+grep -F '[ -n "$first_entry" ] || return 0' "$provisioner" >/dev/null ||
+  fail 'empty PostgreSQL validation does not return success explicitly'
 
 if [ "$(uname -s)" != Linux ] ||
   ! command -v sudo >/dev/null 2>&1 ||
@@ -87,7 +102,7 @@ then
   exit 0
 fi
 
-for command_name in docker python3 sha256sum stat find; do
+for command_name in docker python3 setpriv sha256sum stat find; do
   command -v "$command_name" >/dev/null 2>&1 ||
     fail "integration command is unavailable: $command_name"
 done
@@ -97,9 +112,17 @@ sudo docker compose version >/dev/null 2>&1 ||
   fail 'Docker Compose is required for the production installer fixture'
 
 tmp_dir=$(mktemp -d "${TMPDIR:-/tmp}/phoenix-bootstrap-safety.XXXXXX")
+fresh_fixture_created=false
+fresh_env_created=false
 v5_fixture_created=false
 v5_etc_created=false
 cleanup() {
+  if [ "$fresh_fixture_created" = true ]; then
+    sudo rm -rf -- /opt/phoenix
+  fi
+  if [ "$fresh_env_created" = true ]; then
+    sudo rm -f -- /etc/phoenix/phoenix.env
+  fi
   if [ "$v5_fixture_created" = true ]; then
     sudo rm -rf -- /opt/phoenix-v5
     sudo rm -f -- /etc/phoenix/phoenix-v5.env
@@ -200,6 +223,42 @@ snapshot_metadata() {
   ) >"$snapshot_output"
 }
 
+snapshot_tree() {
+  snapshot_root=$1
+  snapshot_output=$2
+  sudo /bin/sh -c '
+    set -eu
+    cd "$1"
+    {
+      find . -xdev -printf "%P|%u|%g|%m|%y|%s\n" | LC_ALL=C sort
+      find . -xdev -type f -exec sha256sum {} \; | LC_ALL=C sort
+    } >"$2"
+  ' sh "$snapshot_root" "$snapshot_output" ||
+    fail "tree snapshot failed: $snapshot_root"
+}
+
+prometheus_runtime_write_probe() {
+  probe_dir=$1
+  sudo /bin/sh -c '
+    set -eu
+    cd "$1"
+    exec setpriv --reuid=65534 --regid=65534 --clear-groups \
+      /bin/sh -c ": >.runtime-write-probe && rm -f -- .runtime-write-probe"
+  ' sh "$probe_dir"
+}
+
+prometheus_runtime_read_probe() {
+  probe_file=$1
+  probe_parent=$(dirname -- "$probe_file")
+  probe_name=$(basename -- "$probe_file")
+  sudo /bin/sh -c '
+    set -eu
+    cd "$1"
+    exec setpriv --reuid=65534 --regid=65534 --clear-groups \
+      /bin/sh -c "test -r \"\$1\"" sh "$2"
+  ' sh "$probe_parent" "$probe_name"
+}
+
 assert_live_canary_context() {
   context_source=$1
   context_target=$2
@@ -221,7 +280,7 @@ before=$tmp_dir/protected.before
 after=$tmp_dir/protected.after
 snapshot_metadata "$before"
 
-if sudo -u '#65534' -g '#65534' test -w "$prometheus_dir"; then
+if prometheus_runtime_write_probe "$prometheus_dir" 2>/dev/null; then
   fail 'Prometheus fixture unexpectedly started writable by the runtime identity'
 fi
 sudo env \
@@ -240,9 +299,7 @@ cmp "$before" "$after" >/dev/null ||
   fail 'Prometheus data file runtime ownership or mode is incorrect'
 [ "$prometheus_payload_sha" = "$(sudo sha256sum "$prometheus_payload")" ] ||
   fail 'Prometheus provisioning changed existing data contents'
-sudo -u '#65534' -g '#65534' /bin/sh -c \
-  ': >"$1/.runtime-write-probe" && rm -f -- "$1/.runtime-write-probe"' \
-  sh "$prometheus_dir" ||
+prometheus_runtime_write_probe "$prometheus_dir" ||
   fail 'Prometheus data directory is not writable by the runtime identity'
 
 prometheus_config=$host_root/deploy/prometheus/prometheus.yml
@@ -252,7 +309,7 @@ chmod 0755 "$host_root/deploy" "$host_root/deploy/prometheus"
 chmod 0640 "$prometheus_config"
 [ "$(stat -c '%a' "$prometheus_config")" = 640 ] ||
   fail 'Prometheus configuration regression fixture is not mode 0640'
-if sudo -u '#65534' -g '#65534' test -r "$prometheus_config"; then
+if prometheus_runtime_read_probe "$prometheus_config"; then
   fail 'mode 0640 Prometheus configuration fixture is unexpectedly readable'
 fi
 sudo env \
@@ -276,7 +333,7 @@ cmp "$before" "$after" >/dev/null ||
 [ "$(stat -c '%a' "$prometheus_config")" = 644 ] ||
   fail 'installed Prometheus configuration is not mode 0644'
 sudo chmod 0755 "$host_root/deploy" "$host_root/deploy/prometheus"
-sudo -u '#65534' -g '#65534' test -r "$prometheus_config" ||
+prometheus_runtime_read_probe "$prometheus_config" ||
   fail 'mode 0644 Prometheus configuration is unreadable by the runtime identity'
 sudo chmod 0750 "$host_root/deploy" "$host_root/deploy/prometheus"
 [ "$prometheus_payload_sha" = "$(sudo sha256sum "$prometheus_payload")" ] ||
@@ -366,6 +423,88 @@ assert_live_canary_context \
 snapshot_metadata "$after"
 cmp "$before" "$after" >/dev/null ||
   fail 'maintenance-success install changed protected metadata or contents'
+
+immutable_tree=$host_root/releases/$release_sha
+immutable_before=$tmp_dir/immutable.before
+immutable_after=$tmp_dir/immutable.after
+snapshot_tree "$immutable_tree" "$immutable_before"
+sudo env PYTHONDONTWRITEBYTECODE=1 \
+  /usr/bin/python3 -I -B "$immutable_tree/scripts/release_assets.py" verify-tree \
+    --root "$immutable_tree" \
+    --manifest "$asset_dir/release-assets-manifest.json" \
+    --expected-sha "$release_sha" >/dev/null ||
+  fail 'first explicit immutable-tree verification failed'
+sudo env \
+  PHOENIX_RELEASE_ROOT="$host_root/releases" \
+  PHOENIX_DEPLOY_ROOT="$host_root" \
+  PHOENIX_ENV_FILE="$valid_env" \
+  PHOENIX_OWNER_USER="$owner_user" \
+  PHOENIX_OWNER_GROUP="$owner_group" \
+  PHOENIX_CONTEXT_INSTALLER="$context_installer" \
+  /bin/sh "$release_installer" \
+    "$release_sha" \
+    "$asset_dir/phoenix-release-assets-$release_sha.tar.gz" \
+    "$asset_dir/release-assets-manifest.json" \
+    "$asset_dir/release-assets-checksums.txt" >/dev/null ||
+  fail 'idempotent immutable release installation failed'
+sudo env PYTHONDONTWRITEBYTECODE=1 \
+  /usr/bin/python3 -I -B "$immutable_tree/scripts/release_assets.py" verify-tree \
+    --root "$immutable_tree" \
+    --manifest "$asset_dir/release-assets-manifest.json" \
+    --expected-sha "$release_sha" >/dev/null ||
+  fail 'second explicit immutable-tree verification failed'
+snapshot_tree "$immutable_tree" "$immutable_after"
+cmp "$immutable_before" "$immutable_after" >/dev/null ||
+  fail 'repeated install or verification changed immutable tree metadata or contents'
+if sudo find "$immutable_tree" -xdev \
+  \( -type d -name __pycache__ -o -type f \( -name '*.pyc' -o -name '*.pyo' \) \) \
+  -print -quit | grep . >/dev/null
+then
+  fail 'repeated install or verification generated Python bytecode'
+fi
+
+[ ! -e /opt/phoenix ] ||
+  fail 'fresh-host fixture requires /opt/phoenix to be absent'
+[ ! -e /etc/phoenix/phoenix.env ] ||
+  fail 'fresh-host fixture requires /etc/phoenix/phoenix.env to be absent'
+if [ ! -d /etc/phoenix ]; then
+  sudo install -d -m 0755 -o root -g root /etc/phoenix
+  v5_etc_created=true
+fi
+sudo install -d -m 0750 -o root -g root /opt/phoenix
+fresh_fixture_created=true
+sudo install -m 0600 -o root -g root "$valid_env" /etc/phoenix/phoenix.env
+fresh_env_created=true
+fresh_first_output=$(sudo env \
+  PHOENIX_DEPLOY_ROOT=/opt/phoenix \
+  PHOENIX_ENV_FILE=/etc/phoenix/phoenix.env \
+  PHOENIX_OWNER_USER="$owner_user" \
+  PHOENIX_OWNER_GROUP="$owner_group" \
+  /bin/sh "$bootstrap") ||
+  fail 'fresh pre-created /opt/phoenix provisioning failed'
+printf '%s\n' "$fresh_first_output" | grep -F 'PRODUCTION_PROVISION_OK:' >/dev/null ||
+  fail 'fresh provisioning did not emit its stage completion diagnostic'
+printf '%s\n' "$fresh_first_output" | grep -F 'BOOTSTRAP_OK:' >/dev/null ||
+  fail 'fresh bootstrap did not emit its stage completion diagnostic'
+[ "$(sudo stat -c '%U:%G:%a' /opt/phoenix)" = "$owner_user:$owner_group:750" ] ||
+  fail 'fresh pre-created deployment root ownership or mode was not repaired'
+fresh_before=$tmp_dir/fresh.before
+fresh_after=$tmp_dir/fresh.after
+snapshot_tree /opt/phoenix "$fresh_before"
+sudo env \
+  PHOENIX_DEPLOY_ROOT=/opt/phoenix \
+  PHOENIX_ENV_FILE=/etc/phoenix/phoenix.env \
+  PHOENIX_OWNER_USER="$owner_user" \
+  PHOENIX_OWNER_GROUP="$owner_group" \
+  /bin/sh "$bootstrap" >/dev/null ||
+  fail 'second fresh-host provisioning invocation failed'
+snapshot_tree /opt/phoenix "$fresh_after"
+cmp "$fresh_before" "$fresh_after" >/dev/null ||
+  fail 'second fresh-host provisioning changed metadata or contents'
+sudo rm -rf -- /opt/phoenix
+fresh_fixture_created=false
+sudo rm -f -- /etc/phoenix/phoenix.env
+fresh_env_created=false
 
 [ ! -e /opt/phoenix-v5 ] ||
   fail 'exact v5 override fixture requires /opt/phoenix-v5 to be absent'

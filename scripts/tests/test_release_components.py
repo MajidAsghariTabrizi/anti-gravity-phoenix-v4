@@ -78,6 +78,24 @@ class ReleaseComponentRegistryTests(unittest.TestCase):
             "live-executor",
             tuple(item["name"] for item in release_components.DEFAULT_PRODUCTION_COMPONENTS),
         )
+        self.assertEqual(
+            tuple(
+                item["name"]
+                for item in release_components.IMAGE_ENVIRONMENT_COMPONENTS
+            ),
+            (
+                "feed-ingestor",
+                "phoenix-engine",
+                "rpc-gateway",
+                "recorder",
+                "dashboard",
+                "live-executor",
+            ),
+        )
+        self.assertEqual(
+            tuple(item["name"] for item in release_components.OPTIONAL_LIVE_COMPONENTS),
+            ("live-executor",),
+        )
         for component in release_components.COMPONENTS:
             self.assertTrue((ROOT / component["dockerfile"]).is_file())
             self.assertEqual(
@@ -140,6 +158,94 @@ class ReleaseComponentRegistryTests(unittest.TestCase):
             re.findall(r"^    name: ([a-z0-9-]+)\r?$", drifted.split("\njobs:\n", 1)[1], re.MULTILINE)
         )
         self.assertNotEqual(named_jobs, release_components.REQUIRED_CI_JOBS)
+
+    def test_current_and_legacy_manifest_environment_contracts(self) -> None:
+        def write_manifest(path: Path, image_names: tuple[str, ...]) -> None:
+            images = {}
+            for index, name in enumerate(image_names, start=1):
+                component = release_components.COMPONENTS_BY_NAME[name]
+                images[name] = {
+                    "repository": component["repository"],
+                    "tag": f"sha-{RELEASE_SHA}",
+                    "digest": f"sha256:{index:064x}",
+                }
+            path.write_text(
+                json.dumps(
+                    {
+                        "schema": "phoenix.release.v1",
+                        "release_sha": RELEASE_SHA,
+                        "created_at": "2026-07-24T00:00:00Z",
+                        "images": images,
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            current_manifest = root / "current.json"
+            current_env = root / "current.env"
+            write_manifest(current_manifest, release_components.RELEASE_IMAGES)
+            production_context.manifest_env(
+                argparse.Namespace(
+                    manifest=str(current_manifest),
+                    expected_sha=RELEASE_SHA,
+                    output=str(current_env),
+                )
+            )
+            current_values = production_context.read_env(
+                current_env, "RELEASE_ENV_MISSING"
+            )
+            expected_environment_names = {
+                component["image_environment"]
+                for component in release_components.IMAGE_ENVIRONMENT_COMPONENTS
+            }
+            self.assertEqual(
+                set(current_values),
+                expected_environment_names | {"PHOENIX_RELEASE_SHA"},
+            )
+            self.assertEqual(
+                current_values["LIVE_EXECUTOR_IMAGE"],
+                "ghcr.io/majidasgharitabrizi/live-executor@"
+                f"{json.loads(current_manifest.read_text(encoding='utf-8'))['images']['live-executor']['digest']}",
+            )
+
+            shadow_only = dict(current_values)
+            shadow_only.pop("LIVE_EXECUTOR_IMAGE")
+            _, _, current_references = production_context.load_manifest(
+                current_manifest
+            )
+            production_context.validate_release_env(
+                shadow_only, RELEASE_SHA, current_references
+            )
+
+            legacy_manifest = root / "legacy.json"
+            legacy_env = root / "legacy.env"
+            write_manifest(legacy_manifest, release_components.LEGACY_RELEASE_IMAGES)
+            production_context.manifest_env(
+                argparse.Namespace(
+                    manifest=str(legacy_manifest),
+                    expected_sha=RELEASE_SHA,
+                    output=str(legacy_env),
+                )
+            )
+            legacy_values = production_context.read_env(
+                legacy_env, "RELEASE_ENV_MISSING"
+            )
+            self.assertNotIn("LIVE_EXECUTOR_IMAGE", legacy_values)
+            _, _, legacy_references = production_context.load_manifest(legacy_manifest)
+            production_context.validate_release_env(
+                legacy_values, RELEASE_SHA, legacy_references
+            )
+            legacy_values["LIVE_EXECUTOR_IMAGE"] = current_values[
+                "LIVE_EXECUTOR_IMAGE"
+            ]
+            with self.assertRaisesRegex(
+                production_context.ContextError, "RELEASE_IMAGE_MISMATCH"
+            ):
+                production_context.validate_release_env(
+                    legacy_values, RELEASE_SHA, legacy_references
+                )
 
     def test_runtime_and_maintenance_contracts_derive_from_registry(self) -> None:
         self.assertEqual(production_context.RELEASE_IMAGES, EXPECTED_IMAGES)
@@ -425,6 +531,19 @@ class ReleaseRoundTripTests(unittest.TestCase):
             )
         )
         release_values = production_context.read_env(release_env, "RELEASE_ENV_MISSING")
+        self.assertEqual(
+            set(release_values),
+            {
+                component["image_environment"]
+                for component in release_components.IMAGE_ENVIRONMENT_COMPONENTS
+            }
+            | {"PHOENIX_RELEASE_SHA"},
+        )
+        self.assertEqual(
+            release_values["LIVE_EXECUTOR_IMAGE"],
+            f"{manifest['images']['live-executor']['repository']}@"
+            f"{manifest['images']['live-executor']['digest']}",
+        )
         for env_name, reference in release_values.items():
             if env_name.endswith("_IMAGE"):
                 self.assertRegex(reference, r"^ghcr\.io/.+@sha256:[0-9a-f]{64}$")

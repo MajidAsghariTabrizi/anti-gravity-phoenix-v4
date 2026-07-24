@@ -37,9 +37,11 @@ partial images or artifacts are release evidence.
 
 The manifest contains seven immutable images: feed-ingestor, phoenix-engine,
 rpc-gateway, recorder, fork-sandbox, live-executor, and dashboard. The
-production renderer uses the five SHADOW production image entries;
-fork-sandbox remains isolated for controlled fork evidence and live-executor
-remains disabled behind the explicit `live-canary` profile.
+canonical release environment exports all six Compose image references,
+including `LIVE_EXECUTOR_IMAGE`. The default production renderer requires only
+the five SHADOW production image entries; fork-sandbox remains isolated for
+controlled fork evidence and live-executor remains disabled behind the explicit
+`live-canary` profile.
 
 Nitro Relay, NATS, PostgreSQL, and Prometheus are pinned directly in
 `compose.prod.yml` by multi-platform manifest digest. Phoenix-owned image

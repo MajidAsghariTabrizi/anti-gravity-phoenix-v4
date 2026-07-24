@@ -31,12 +31,15 @@ Production Compose mounts `LIVE_EXECUTOR_SIGNER_FILE` read-only at
 container environment. `SIGNER_PRIVATE_KEY` remains mutually exclusive,
 local/test-only compatibility input.
 
-The profile is not part of `compose.prod.yml`. A future reviewed release must
-provide a digest-pinned `LIVE_EXECUTOR_IMAGE` and explicitly load the overlay:
+The profile is not part of `compose.prod.yml`. A reviewed seven-image release
+provides the digest-pinned `LIVE_EXECUTOR_IMAGE` through the same canonical
+release environment as the default SHADOW services. An operator must explicitly
+load both that release environment and the overlay:
 
 ```sh
 docker compose \
   --env-file /etc/phoenix/phoenix.env \
+  --env-file /opt/phoenix/deploy/current-release.env \
   -f compose.prod.yml \
   -f compose.live-canary.yml \
   --profile live-canary config

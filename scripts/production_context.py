@@ -13,12 +13,26 @@ try:
 except (ImportError, ModuleNotFoundError):  # Direct execution from scripts/.
     import release_components  # type: ignore[no-redef]
 
-OWNED_IMAGES = {
+RELEASE_ENVIRONMENT_IMAGES = {
+    component["name"]: (
+        component["image_environment"],
+        component["production_services"][0],
+    )
+    for component in release_components.IMAGE_ENVIRONMENT_COMPONENTS
+}
+DEFAULT_PRODUCTION_IMAGES = {
     component["name"]: (
         component["image_environment"],
         component["production_services"][0],
     )
     for component in release_components.DEFAULT_PRODUCTION_COMPONENTS
+}
+OPTIONAL_LIVE_IMAGES = {
+    component["name"]: (
+        component["image_environment"],
+        component["production_services"][0],
+    )
+    for component in release_components.OPTIONAL_LIVE_COMPONENTS
 }
 RELEASE_IMAGES = release_components.RELEASE_IMAGES
 LEGACY_RELEASE_IMAGES = release_components.LEGACY_RELEASE_IMAGES
@@ -282,7 +296,7 @@ def load_manifest(path: Path) -> tuple[dict, str, dict[str, str]]:
             or not DIGEST_PATTERN.fullmatch(digest)
         ):
             raise ContextError("RELEASE_IMAGE_MISMATCH")
-        if image_name in OWNED_IMAGES:
+        if image_name in RELEASE_ENVIRONMENT_IMAGES:
             references[image_name] = f"{repository}@{digest}"
     return manifest, release_sha, references
 
@@ -291,14 +305,21 @@ def validate_release_env(
     values: dict[str, str], release_sha: str | None, references: dict[str, str] | None
 ) -> dict[str, str]:
     rendered: dict[str, str] = {}
-    for image_name, (env_name, _) in OWNED_IMAGES.items():
+    for image_name, (env_name, _) in RELEASE_ENVIRONMENT_IMAGES.items():
         value = values.get(env_name, "")
+        required = image_name in DEFAULT_PRODUCTION_IMAGES
+        if not value:
+            if required:
+                raise ContextError("RELEASE_IMAGE_MISMATCH")
+            continue
         if value.startswith("app-") or "/app-" in value:
             raise ContextError("LOCAL_IMAGE_FALLBACK")
         if not IMAGE_PATTERN.fullmatch(value):
             raise ContextError("RELEASE_IMAGE_MISMATCH")
-        if references is not None and value != references[image_name]:
-            raise ContextError("RELEASE_IMAGE_MISMATCH")
+        if references is not None:
+            expected = references.get(image_name)
+            if expected is None or value != expected:
+                raise ContextError("RELEASE_IMAGE_MISMATCH")
         rendered[env_name] = value
     env_sha = values.get("PHOENIX_RELEASE_SHA")
     if release_sha is not None and env_sha not in (None, "", release_sha):
@@ -311,8 +332,10 @@ def manifest_env(args: argparse.Namespace) -> None:
     if args.expected_sha and args.expected_sha != release_sha:
         raise ContextError("RELEASE_IMAGE_MISMATCH")
     lines = []
-    for image_name, (env_name, _) in OWNED_IMAGES.items():
-        lines.append(f"{env_name}={references[image_name]}")
+    for image_name, (env_name, _) in RELEASE_ENVIRONMENT_IMAGES.items():
+        reference = references.get(image_name)
+        if reference is not None:
+            lines.append(f"{env_name}={reference}")
     lines.append(f"PHOENIX_RELEASE_SHA={release_sha}")
     atomic_write(Path(args.output), "\n".join(lines) + "\n")
 

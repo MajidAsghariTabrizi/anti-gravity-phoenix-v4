@@ -81,16 +81,22 @@ context_installer=$script_dir/install-production-release-context.sh
 [ -f "$context_installer" ] && [ ! -L "$context_installer" ] ||
   fail 'release-context installer is unavailable'
 
-PHOENIX_DEPLOY_ROOT="$deploy_root" \
-PHOENIX_OWNER_USER="$owner_user" \
-PHOENIX_OWNER_GROUP="$owner_group" \
+if ! PHOENIX_DEPLOY_ROOT="$deploy_root" \
+  PHOENIX_OWNER_USER="$owner_user" \
+  PHOENIX_OWNER_GROUP="$owner_group" \
   /bin/sh "$provisioner"
+then
+  fail 'host provisioning stage failed'
+fi
 
-PHOENIX_DEPLOY_ROOT="$deploy_root" \
-PHOENIX_ENV_FILE="$env_file" \
-PHOENIX_OWNER_USER="$owner_user" \
-PHOENIX_OWNER_GROUP="$owner_group" \
+if ! PHOENIX_DEPLOY_ROOT="$deploy_root" \
+  PHOENIX_ENV_FILE="$env_file" \
+  PHOENIX_OWNER_USER="$owner_user" \
+  PHOENIX_OWNER_GROUP="$owner_group" \
   /bin/sh "$context_installer" "$release_sha" "$repo_root"
+then
+  fail 'release context installation stage failed'
+fi
 
 echo "BOOTSTRAP_OK: first-host provisioning and release-context installation completed"
 echo "FIREWALL_EXPECTATION: expose SSH only as intended; dashboard and Prometheus bind to 127.0.0.1"

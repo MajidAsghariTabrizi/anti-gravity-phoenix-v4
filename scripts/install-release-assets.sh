@@ -1,6 +1,7 @@
 #!/usr/bin/env sh
 set -eu
 umask 027
+export PYTHONDONTWRITEBYTECODE=1
 
 release_sha=${1:-}
 archive=${2:-}
@@ -24,7 +25,7 @@ esac
 [ -f "$archive" ] || fail 'release archive is missing'
 [ -f "$manifest" ] || fail 'release-assets manifest is missing'
 [ -f "$checksums" ] || fail 'release-assets checksums are missing'
-command -v python3 >/dev/null 2>&1 || fail 'python3 is unavailable'
+[ -x /usr/bin/python3 ] || fail '/usr/bin/python3 is unavailable'
 command -v tar >/dev/null 2>&1 || fail 'tar is unavailable'
 command -v sha256sum >/dev/null 2>&1 || fail 'sha256sum is unavailable'
 command -v cmp >/dev/null 2>&1 || fail 'cmp is unavailable'
@@ -48,7 +49,7 @@ artifact_dir=$(dirname "$archive")
 ) || fail 'release-assets checksum validation failed'
 
 bundle_root="phoenix-release-$release_sha"
-python3 - "$archive" "$bundle_root" <<'PY' || fail 'release archive member validation failed'
+if ! /usr/bin/python3 -I -B - "$archive" "$bundle_root" <<'PY'
 import sys
 import tarfile
 from pathlib import PurePosixPath
@@ -70,6 +71,9 @@ with tarfile.open(archive_path, mode="r:gz") as archive:
         if total > 72 * 1024 * 1024:
             raise SystemExit(1)
 PY
+then
+  fail 'release archive member validation failed'
+fi
 
 install -d -m 0750 -o root -g root "$release_root"
 candidate=$(mktemp -d "$release_root/.candidate-$release_sha.XXXXXX") || fail 'release staging directory could not be created'
@@ -82,11 +86,17 @@ tar --extract --gzip --file "$archive" --directory "$candidate" --no-same-owner 
 candidate_root=$candidate/$bundle_root
 [ -d "$candidate_root" ] || fail 'release archive root is missing'
 
-python3 "$candidate_root/scripts/release_assets.py" verify \
+/usr/bin/python3 -I -B "$candidate_root/scripts/release_assets.py" verify \
   --archive "$archive" \
   --manifest "$manifest" \
   --checksums "$checksums" \
   --expected-sha "$release_sha" >/dev/null || fail 'release archive integrity verification failed'
+
+/usr/bin/python3 -I -B "$candidate_root/scripts/release_assets.py" verify-tree \
+  --root "$candidate_root" \
+  --manifest "$manifest" \
+  --expected-sha "$release_sha" >/dev/null ||
+  fail 'candidate release tree verification failed'
 
 final_root=$release_root/$release_sha
 if [ -e "$final_root" ]; then
@@ -99,13 +109,19 @@ else
   chmod -R go-w "$final_root"
 fi
 
-python3 "$final_root/scripts/release_assets.py" verify-tree \
+/usr/bin/python3 -I -B "$final_root/scripts/release_assets.py" verify-tree \
   --root "$final_root" \
   --manifest "$manifest" \
   --expected-sha "$release_sha" >/dev/null || fail 'immutable release tree verification failed'
 
 /bin/sh "$context_installer" "$release_sha" "$final_root" ||
   fail 'canonical release-context installation failed'
+
+/usr/bin/python3 -I -B "$final_root/scripts/release_assets.py" verify-tree \
+  --root "$final_root" \
+  --manifest "$manifest" \
+  --expected-sha "$release_sha" >/dev/null ||
+  fail 'immutable release tree changed during context installation'
 trap - EXIT HUP INT TERM
 rm -rf -- "$candidate"
 echo "RELEASE_ASSET_INSTALL_OK: $release_sha"

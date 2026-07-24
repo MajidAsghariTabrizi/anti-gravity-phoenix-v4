@@ -160,6 +160,31 @@ class ReleaseAssetsTests(unittest.TestCase):
             with self.assertRaisesRegex(release_assets.ReleaseAssetError, "member set"):
                 release_assets.verify_release_tree(root, manifest, RELEASE_SHA)
 
+    def test_generated_python_bytecode_is_rejected_explicitly(self) -> None:
+        for candidate in (
+            "scripts/__pycache__/release_assets.cpython-312.pyc",
+            "scripts/__PYCACHE__/unexpected.txt",
+            "scripts/release_assets.pyc",
+            "scripts/release_assets.pyo",
+        ):
+            with self.subTest(candidate=candidate), self.assertRaisesRegex(
+                release_assets.ReleaseAssetError, "generated Python bytecode"
+            ):
+                release_assets._validate_relative_path(candidate)
+
+        with tempfile.TemporaryDirectory() as raw, tempfile.TemporaryDirectory() as tree_raw:
+            archive, manifest, _ = self.build(Path(raw))
+            with tarfile.open(archive, mode="r:gz") as bundle:
+                bundle.extractall(tree_raw, filter="data")
+            root = Path(tree_raw) / f"phoenix-release-{RELEASE_SHA}"
+            cache = root / "scripts" / "__pycache__"
+            cache.mkdir()
+            (cache / "release_assets.cpython-312.pyc").write_bytes(b"generated")
+            with self.assertRaisesRegex(
+                release_assets.ReleaseAssetError, "generated Python bytecode"
+            ):
+                release_assets.verify_release_tree(root, manifest, RELEASE_SHA)
+
     def test_modified_live_canary_asset_in_release_tree_fails_closed(self) -> None:
         with tempfile.TemporaryDirectory() as raw, tempfile.TemporaryDirectory() as tree_raw:
             archive, manifest, _ = self.build(Path(raw))
@@ -228,6 +253,8 @@ class ReleaseAssetsTests(unittest.TestCase):
             "nested//double",
             "nested\\windows",
             "config/.env",
+            "scripts/__pycache__/module.pyc",
+            "scripts/module.pyo",
         ):
             with self.subTest(candidate=candidate):
                 with self.assertRaises(release_assets.ReleaseAssetError):

@@ -27,7 +27,7 @@ for command_name in chown chmod find install stat; do
     fail "required command is unavailable: $command_name"
 done
 
-ensure_directory() {
+ensure_owned_directory() {
   provision_path=$1
   provision_mode=$2
   if [ -L "$provision_path" ]; then
@@ -36,10 +36,29 @@ ensure_directory() {
   if [ -e "$provision_path" ]; then
     [ -d "$provision_path" ] ||
       fail "provisioning path is not a directory: $provision_path"
-    return
   fi
   install -d -m "$provision_mode" -o "$owner_user" -g "$owner_group" \
-    "$provision_path"
+    "$provision_path" ||
+    fail "directory ownership or mode could not be enforced: $provision_path"
+  provision_metadata=$(stat -c '%U:%G:%a' "$provision_path") ||
+    fail "directory metadata is unavailable: $provision_path"
+  [ "$provision_metadata" = "$owner_user:$owner_group:${provision_mode#0}" ] ||
+    fail "directory ownership or mode is invalid: $provision_path"
+}
+
+ensure_postgres_directory() {
+  if [ -L "$postgres_dir" ]; then
+    fail "provisioning path must not be a symlink: $postgres_dir"
+  fi
+  if [ -e "$postgres_dir" ]; then
+    [ -d "$postgres_dir" ] ||
+      fail "provisioning path is not a directory: $postgres_dir"
+    first_entry=$(find "$postgres_dir" -mindepth 1 -maxdepth 1 -print -quit) ||
+      fail 'PostgreSQL data directory inspection failed'
+    [ -z "$first_entry" ] || return 0
+  fi
+  install -d -m 0750 -o "$owner_user" -g "$owner_group" "$postgres_dir" ||
+    fail 'empty PostgreSQL data directory could not be provisioned'
 }
 
 provision_prometheus_directory() {
@@ -52,7 +71,8 @@ provision_prometheus_directory() {
   else
     install -d -m 0750 \
       -o "$prometheus_runtime_uid" -g "$prometheus_runtime_gid" \
-      "$prometheus_dir"
+      "$prometheus_dir" ||
+      fail 'Prometheus data directory could not be created'
   fi
 
   unsafe_entry=$(find "$prometheus_dir" -xdev -type l -print -quit)
@@ -83,9 +103,12 @@ provision_prometheus_directory() {
   fi
 
   find "$prometheus_dir" -xdev \
-    -exec chown "$prometheus_runtime_uid:$prometheus_runtime_gid" {} +
-  find "$prometheus_dir" -xdev -type d -exec chmod 0750 {} +
-  find "$prometheus_dir" -xdev -type f -exec chmod 0640 {} +
+    -exec chown "$prometheus_runtime_uid:$prometheus_runtime_gid" {} + ||
+    fail 'Prometheus data ownership could not be applied'
+  find "$prometheus_dir" -xdev -type d -exec chmod 0750 {} + ||
+    fail 'Prometheus directory mode could not be applied'
+  find "$prometheus_dir" -xdev -type f -exec chmod 0640 {} + ||
+    fail 'Prometheus file mode could not be applied'
 
   unsafe_entry=$(
     find "$prometheus_dir" -xdev \
@@ -108,7 +131,7 @@ provision_prometheus_directory() {
 
 validate_existing_postgres() {
   first_entry=$(find "$postgres_dir" -mindepth 1 -maxdepth 1 -print -quit)
-  [ -n "$first_entry" ] || return
+  [ -n "$first_entry" ] || return 0
 
   [ -f "$postgres_dir/PG_VERSION" ] && [ ! -L "$postgres_dir/PG_VERSION" ] ||
     fail 'non-empty PostgreSQL data directory is missing a regular PG_VERSION'
@@ -156,13 +179,13 @@ validate_existing_postgres() {
   done
 }
 
-ensure_directory "$deploy_root" 0750
-ensure_directory "$deploy_root/data" 0750
-ensure_directory "$postgres_dir" 0750
-ensure_directory "$deploy_root/data/feed" 0750
-ensure_directory "$deploy_root/logs" 0750
-ensure_directory "$deploy_root/evidence" 0755
-ensure_directory "$deploy_root/evidence/dashboard" 0755
+ensure_owned_directory "$deploy_root" 0750
+ensure_owned_directory "$deploy_root/data" 0750
+ensure_postgres_directory
+ensure_owned_directory "$deploy_root/data/feed" 0750
+ensure_owned_directory "$deploy_root/logs" 0750
+ensure_owned_directory "$deploy_root/evidence" 0755
+ensure_owned_directory "$deploy_root/evidence/dashboard" 0755
 validate_existing_postgres
 provision_prometheus_directory
 

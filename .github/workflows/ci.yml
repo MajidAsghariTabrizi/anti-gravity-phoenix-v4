@@ -417,12 +417,6 @@ jobs:
           RECORDER_PERSISTENCE_POLICY=money_path_v1
           WALLET_ADDRESS=
           EXECUTOR_ADDRESS=
-          FEED_INGESTOR_IMAGE=ghcr.io/majidasgharitabrizi/feed-ingestor@sha256:1111111111111111111111111111111111111111111111111111111111111111
-          PHOENIX_ENGINE_IMAGE=ghcr.io/majidasgharitabrizi/phoenix-engine@sha256:2222222222222222222222222222222222222222222222222222222222222222
-          RPC_GATEWAY_IMAGE=ghcr.io/majidasgharitabrizi/rpc-gateway@sha256:3333333333333333333333333333333333333333333333333333333333333333
-          RECORDER_IMAGE=ghcr.io/majidasgharitabrizi/recorder@sha256:4444444444444444444444444444444444444444444444444444444444444444
-          DASHBOARD_IMAGE=ghcr.io/majidasgharitabrizi/dashboard@sha256:5555555555555555555555555555555555555555555555555555555555555555
-          LIVE_EXECUTOR_IMAGE=ghcr.io/majidasgharitabrizi/live-executor@sha256:6666666666666666666666666666666666666666666666666666666666666666
           LIVE_EXECUTOR_PHOENIX_MODE=SHADOW
           LIVE_EXECUTOR_LIVE_EXECUTION=false
           LIVE_EXECUTOR_ARMED=false
@@ -443,25 +437,90 @@ jobs:
           LIVE_EXECUTOR_RECEIPT_TIMEOUT_SECONDS=90
           LIVE_EXECUTOR_POLL_INTERVAL_SECONDS=1
           EOF
+          cat > .ci-release-manifest.json <<'EOF'
+          {
+            "schema": "phoenix.release.v1",
+            "release_sha": "0000000000000000000000000000000000000000",
+            "created_at": "2026-07-24T00:00:00Z",
+            "images": {
+              "dashboard": {"repository": "ghcr.io/majidasgharitabrizi/dashboard", "tag": "sha-0000000000000000000000000000000000000000", "digest": "sha256:5555555555555555555555555555555555555555555555555555555555555555"},
+              "feed-ingestor": {"repository": "ghcr.io/majidasgharitabrizi/feed-ingestor", "tag": "sha-0000000000000000000000000000000000000000", "digest": "sha256:1111111111111111111111111111111111111111111111111111111111111111"},
+              "fork-sandbox": {"repository": "ghcr.io/majidasgharitabrizi/fork-sandbox", "tag": "sha-0000000000000000000000000000000000000000", "digest": "sha256:7777777777777777777777777777777777777777777777777777777777777777"},
+              "live-executor": {"repository": "ghcr.io/majidasgharitabrizi/live-executor", "tag": "sha-0000000000000000000000000000000000000000", "digest": "sha256:6666666666666666666666666666666666666666666666666666666666666666"},
+              "phoenix-engine": {"repository": "ghcr.io/majidasgharitabrizi/phoenix-engine", "tag": "sha-0000000000000000000000000000000000000000", "digest": "sha256:2222222222222222222222222222222222222222222222222222222222222222"},
+              "recorder": {"repository": "ghcr.io/majidasgharitabrizi/recorder", "tag": "sha-0000000000000000000000000000000000000000", "digest": "sha256:4444444444444444444444444444444444444444444444444444444444444444"},
+              "rpc-gateway": {"repository": "ghcr.io/majidasgharitabrizi/rpc-gateway", "tag": "sha-0000000000000000000000000000000000000000", "digest": "sha256:3333333333333333333333333333333333333333333333333333333333333333"}
+            }
+          }
+          EOF
+          python3 scripts/production_context.py manifest-env \
+            --manifest .ci-release-manifest.json \
+            --expected-sha 0000000000000000000000000000000000000000 \
+            --output .ci-release.env
+          cat > .ci-autonomous-live.env <<'EOF'
+          LIVE_EXECUTOR_PHOENIX_MODE=LIVE
+          LIVE_EXECUTOR_LIVE_EXECUTION=true
+          LIVE_EXECUTOR_ARMED=true
+          LIVE_EXECUTOR_KILL_SWITCH=false
+          EOF
           docker compose config
-          PHOENIX_ENV_FILE=.ci-prod.env docker compose --env-file .ci-prod.env -f compose.prod.yml config
-          PHOENIX_ENV_FILE=.ci-prod.env docker compose --env-file .ci-prod.env -f compose.prod.yml config --format json > .ci-prod-config.json
+          PHOENIX_ENV_FILE=.ci-prod.env docker compose \
+            --env-file .ci-prod.env --env-file .ci-release.env \
+            -f compose.prod.yml config
+          PHOENIX_ENV_FILE=.ci-prod.env docker compose \
+            --env-file .ci-prod.env --env-file .ci-release.env \
+            -f compose.prod.yml config --format json > .ci-prod-config.json
           python3 scripts/verify_dashboard_compose.py .ci-prod-config.json
-          PHOENIX_ENV_FILE=.ci-prod.env docker compose --env-file .ci-prod.env \
+          PHOENIX_ENV_FILE=.ci-prod.env docker compose \
+            --env-file .ci-prod.env --env-file .ci-release.env \
             -f compose.prod.yml -f compose.live-canary.yml config
-          PHOENIX_ENV_FILE=.ci-prod.env docker compose --env-file .ci-prod.env \
+          PHOENIX_ENV_FILE=.ci-prod.env docker compose \
+            --env-file .ci-prod.env --env-file .ci-release.env \
             -f compose.prod.yml -f compose.live-canary.yml \
             --profile live-canary config --format json > .ci-live-canary-config.json
+          PHOENIX_ENV_FILE=.ci-prod.env docker compose \
+            --env-file .ci-prod.env \
+            --env-file .ci-release.env \
+            --env-file .ci-autonomous-live.env \
+            -f compose.prod.yml -f compose.live-canary.yml \
+            --profile live-canary config --format json > .ci-autonomous-live-config.json
           python3 - <<'PY'
           import json
 
-          with open(".ci-live-canary-config.json", encoding="utf-8") as handle:
-              rendered = json.load(handle)
-          service = rendered["services"]["live-executor"]
-          environment = service.get("environment", {})
-          if "SIGNER_PRIVATE_KEY" in environment:
-              raise SystemExit("live-executor render exposes raw signer environment")
+          release_env = {}
+          with open(".ci-release.env", encoding="utf-8") as handle:
+              for line in handle:
+                  name, value = line.rstrip("\n").split("=", 1)
+                  release_env[name] = value
+          expected_names = {
+              "DASHBOARD_IMAGE",
+              "FEED_INGESTOR_IMAGE",
+              "LIVE_EXECUTOR_IMAGE",
+              "PHOENIX_ENGINE_IMAGE",
+              "PHOENIX_RELEASE_SHA",
+              "RECORDER_IMAGE",
+              "RPC_GATEWAY_IMAGE",
+          }
+          if set(release_env) != expected_names:
+              raise SystemExit("seven-image manifest environment is incomplete")
+
+          rendered_profiles = {}
+          for profile, path in (
+              ("manual", ".ci-live-canary-config.json"),
+              ("autonomous", ".ci-autonomous-live-config.json"),
+          ):
+              with open(path, encoding="utf-8") as handle:
+                  rendered_profiles[profile] = json.load(handle)["services"]["live-executor"]
+
+          for profile, service in rendered_profiles.items():
+              if service.get("image") != release_env["LIVE_EXECUTOR_IMAGE"]:
+                  raise SystemExit(f"{profile} LIVE image is not manifest-derived")
+              environment = service.get("environment", {})
+              if "SIGNER_PRIVATE_KEY" in environment:
+                  raise SystemExit(f"{profile} live-executor render exposes raw signer environment")
           signer_target = "/run/secrets/phoenix-live-executor-signer"
+          service = rendered_profiles["manual"]
+          environment = service.get("environment", {})
           if environment.get("SIGNER_PRIVATE_KEY_FILE") != signer_target:
               raise SystemExit("live-executor signer file target is not canonical")
           signer_mounts = [
@@ -478,6 +537,22 @@ jobs:
               raise SystemExit("live-executor signer mount source was not rendered exactly")
           if signer_mount.get("read_only") is not True:
               raise SystemExit("live-executor signer mount is not read-only")
+          manual_environment = rendered_profiles["manual"]["environment"]
+          if (
+              manual_environment.get("PHOENIX_MODE") != "SHADOW"
+              or manual_environment.get("LIVE_EXECUTION") != "false"
+              or manual_environment.get("LIVE_EXECUTOR_ARMED") != "false"
+              or manual_environment.get("LIVE_EXECUTOR_KILL_SWITCH") != "true"
+          ):
+              raise SystemExit("manual LIVE render lost fail-closed defaults")
+          autonomous_environment = rendered_profiles["autonomous"]["environment"]
+          if (
+              autonomous_environment.get("PHOENIX_MODE") != "LIVE"
+              or autonomous_environment.get("LIVE_EXECUTION") != "true"
+              or autonomous_environment.get("LIVE_EXECUTOR_ARMED") != "true"
+              or autonomous_environment.get("LIVE_EXECUTOR_KILL_SWITCH") != "false"
+          ):
+              raise SystemExit("autonomous LIVE render did not preserve explicit controls")
           PY
           cat > .ci-fork.env <<'EOF'
           FORK_ANVIL_DIGEST=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
@@ -499,14 +574,6 @@ jobs:
           EOF
           docker compose --env-file .ci-fork.env -f compose.fork.yml --profile fork-sandbox config
           printf 'ENGINE_ROUTE_REGISTRY_JSON=%s\n' "$(python3 -c 'import json; print(json.dumps(json.load(open("fixtures/routes/weth_usdc_uniswap_v3.json")), separators=(",", ":")))')" >> .ci-prod.env
-          cat > .ci-release.env <<'EOF'
-          FEED_INGESTOR_IMAGE=ghcr.io/majidasgharitabrizi/feed-ingestor@sha256:1111111111111111111111111111111111111111111111111111111111111111
-          PHOENIX_ENGINE_IMAGE=ghcr.io/majidasgharitabrizi/phoenix-engine@sha256:2222222222222222222222222222222222222222222222222222222222222222
-          RPC_GATEWAY_IMAGE=ghcr.io/majidasgharitabrizi/rpc-gateway@sha256:3333333333333333333333333333333333333333333333333333333333333333
-          RECORDER_IMAGE=ghcr.io/majidasgharitabrizi/recorder@sha256:4444444444444444444444444444444444444444444444444444444444444444
-          DASHBOARD_IMAGE=ghcr.io/majidasgharitabrizi/dashboard@sha256:5555555555555555555555555555555555555555555555555555555555555555
-          PHOENIX_RELEASE_SHA=0000000000000000000000000000000000000000
-          EOF
           ./scripts/render-production-compose.sh \
             --compose-file "$PWD/compose.prod.yml" \
             --env-file "$PWD/.ci-prod.env" \
