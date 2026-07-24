@@ -320,11 +320,12 @@ async fn event_to_hunter_to_persisted_outcome_is_exactly_once() {
         .expect("negative economics");
     assert!(negative.candidates.is_empty());
 
+    let executable_at = Utc::now() + ChronoDuration::seconds(1);
     let executable_event = HunterEvent {
         origin_event_id: format!("{}:executable", event.origin_event_id),
-        observed_at_unix_ms: u64::try_from(Utc::now().timestamp_millis())
+        observed_at_unix_ms: u64::try_from(executable_at.timestamp_millis())
             .expect("observed timestamp"),
-        evaluated_at_unix_ms: u64::try_from(Utc::now().timestamp_millis())
+        evaluated_at_unix_ms: u64::try_from(executable_at.timestamp_millis())
             .expect("evaluated timestamp"),
         ..event.clone()
     };
@@ -347,7 +348,7 @@ async fn event_to_hunter_to_persisted_outcome_is_exactly_once() {
         )
         .await
         .expect("materialize executable candidate"));
-    let materialized = materializer.step(Utc::now()).await.expect("approval");
+    let materialized = materializer.step(executable_at).await.expect("approval");
     assert!(matches!(
         materialized,
         MaterializationState::Materialized { .. }
