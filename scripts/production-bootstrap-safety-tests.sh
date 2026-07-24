@@ -91,6 +91,8 @@ then
 fi
 grep -F '[ -z "$first_entry" ] || return 0' "$provisioner" >/dev/null ||
   fail 'non-empty PostgreSQL preservation does not return success explicitly'
+grep -F '[ -n "$first_entry" ] || return 0' "$provisioner" >/dev/null ||
+  fail 'empty PostgreSQL validation does not return success explicitly'
 
 if [ "$(uname -s)" != Linux ] ||
   ! command -v sudo >/dev/null 2>&1 ||

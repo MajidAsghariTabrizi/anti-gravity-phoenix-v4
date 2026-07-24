@@ -131,7 +131,7 @@ provision_prometheus_directory() {
 
 validate_existing_postgres() {
   first_entry=$(find "$postgres_dir" -mindepth 1 -maxdepth 1 -print -quit)
-  [ -n "$first_entry" ] || return
+  [ -n "$first_entry" ] || return 0
 
   [ -f "$postgres_dir/PG_VERSION" ] && [ ! -L "$postgres_dir/PG_VERSION" ] ||
     fail 'non-empty PostgreSQL data directory is missing a regular PG_VERSION'
