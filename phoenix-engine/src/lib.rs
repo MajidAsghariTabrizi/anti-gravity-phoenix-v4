@@ -7,6 +7,7 @@ pub mod engine_input;
 pub mod engine_jetstream;
 pub mod execution;
 pub mod graph;
+pub mod hunter;
 pub mod messaging;
 pub mod metrics;
 pub mod opportunity;

@@ -9,9 +9,14 @@
 /schemas/phoenix-release-*.json @MajidAsghariTabrizi
 /schemas/phoenix-autonomous-hunter-v1.schema.json @MajidAsghariTabrizi
 /config/phoenix-route-universe-v1.json @MajidAsghariTabrizi
+/config/phoenix-route-policy-v1.json @MajidAsghariTabrizi
 /fixtures/autonomous-hunter/** @MajidAsghariTabrizi
+/fixtures/hunter-a1/** @MajidAsghariTabrizi
 /docs/AUTONOMOUS_HUNTER_CONTRACTS_V1.md @MajidAsghariTabrizi
+/docs/AUTONOMOUS_HUNTER_A1_REVENUE_EVIDENCE.md @MajidAsghariTabrizi
 /scripts/hunter_contracts.py @MajidAsghariTabrizi
+/phoenix-engine/src/hunter/** @MajidAsghariTabrizi
+/rpc-gateway/src/hunter_state.rs @MajidAsghariTabrizi
 /contracts/** @MajidAsghariTabrizi
 /live-executor/** @MajidAsghariTabrizi
 /scripts/install-production-release-context.sh @MajidAsghariTabrizi

@@ -76,6 +76,9 @@ grep -F '"$deploy_dir/live-executor/schema/002_approval_evidence.sql" 0640' \
 grep -F '"$deploy_dir/live-executor/schema/003_autonomous_hunter_contracts.sql" 0640' \
   "$context_installer" >/dev/null ||
   fail 'autonomous Hunter schema does not use the existing data-file mode policy'
+grep -F '"$deploy_dir/routes/phoenix-route-policy-v1.json" 0640' \
+  "$context_installer" >/dev/null ||
+  fail 'autonomous Hunter route policy does not use the existing data-file mode policy'
 if grep -E '(^|[[:space:]])psql([[:space:]]|$)|migration-runner' \
   "$context_installer" "$release_installer" >/dev/null
 then

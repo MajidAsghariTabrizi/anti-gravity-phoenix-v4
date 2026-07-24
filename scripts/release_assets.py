@@ -29,16 +29,19 @@ MAX_ARCHIVE_BYTES = 72 * 1024 * 1024
 STATIC_PATHS = (
     "compose.live-canary.yml",
     "compose.prod.yml",
+    "config/phoenix-route-policy-v1.json",
     "config/phoenix-route-universe-v1.json",
     "release-components.json",
     "dashboard/snapshot_model.py",
     "deploy/nats-server.conf",
     "deploy/prelive-v5-release.example.json",
     "docs/AUTONOMOUS_HUNTER_CONTRACTS_V1.md",
+    "docs/AUTONOMOUS_HUNTER_A1_REVENUE_EVIDENCE.md",
     "fixtures/routes/arbitrum_uniswap_v3_pool_proofs.json",
     "live-executor/schema/001_live_canary.sql",
     "live-executor/schema/002_approval_evidence.sql",
     "live-executor/schema/003_autonomous_hunter_contracts.sql",
+    "phoenix-engine/examples/hunter_a1_replay.rs",
     "prometheus/prometheus.yml",
     "scripts/bootstrap-production.sh",
     "scripts/deploy-release.sh",
@@ -81,6 +84,7 @@ STATIC_PATHS = (
 )
 GLOB_PATHS = (
     "fixtures/autonomous-hunter/v1/**/*.json",
+    "fixtures/hunter-a1/v1/**/*.json",
     "migrations/*.sql",
     "schemas/*.json",
     "scripts/sql/*.sql",

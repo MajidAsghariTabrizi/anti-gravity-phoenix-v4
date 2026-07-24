@@ -1,0 +1,89 @@
+{
+  "schema_version": "phoenix.hunter-pinned-fork-parity.v1",
+  "evidence_class": "deterministic_offline_pinned_state_vector",
+  "provenance": "Synthetic Uniswap V3-compatible state used for exact integer-math parity; it is not production-profit evidence.",
+  "vectors": [
+    {
+      "direction": "zero_for_one",
+      "amount_in": "600000000",
+      "maximum_tick_crossings": 2,
+      "expected_amount_out": "599340571",
+      "expected_ticks_crossed": 1,
+      "expected_price_impact_bps": 6,
+      "state": {
+        "schema_version": "phoenix.hunter-pinned-v3-state.v1",
+        "chain_id": 42161,
+        "block_number": 48379269,
+        "block_hash": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "pool_id": "pool",
+        "pool_address": "0xc6962004f452be9203591991d15f6b388e09e8d0",
+        "factory_address": "0x1f98431c8ad98523631ae4a59f267346ea31f984",
+        "protocol_id": "uniswap-v3",
+        "token0": "0x82af49447d8a07e3bd95bd0d56f35241523fbab1",
+        "token1": "0xaf88d065e77c8cc2239327c5edb3a432268e5831",
+        "fee": 500,
+        "tick_spacing": 10,
+        "sqrt_price_x96": "79228162514264337593543950336",
+        "tick": 0,
+        "liquidity": "1000000000000",
+        "coverage_min_tick": -20,
+        "coverage_max_tick": 20,
+        "tick_bitmap_words": [
+          {
+            "word_position": -1,
+            "bitmap": "0x8000000000000000000000000000000000000000000000000000000000000000"
+          }
+        ],
+        "initialized_ticks": [
+          {
+            "tick": -10,
+            "liquidity_gross": "100000000",
+            "liquidity_net": "100000000"
+          }
+        ],
+        "state_hash": "d5d8ff9d98efe70a466c50e1cbec21c191a04b2bab1a686bea1f110bcfc033df"
+      }
+    },
+    {
+      "direction": "one_for_zero",
+      "amount_in": "600000000",
+      "maximum_tick_crossings": 2,
+      "expected_amount_out": "599340571",
+      "expected_ticks_crossed": 1,
+      "expected_price_impact_bps": 6,
+      "state": {
+        "schema_version": "phoenix.hunter-pinned-v3-state.v1",
+        "chain_id": 42161,
+        "block_number": 48379269,
+        "block_hash": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "pool_id": "pool",
+        "pool_address": "0xc6962004f452be9203591991d15f6b388e09e8d0",
+        "factory_address": "0x1f98431c8ad98523631ae4a59f267346ea31f984",
+        "protocol_id": "uniswap-v3",
+        "token0": "0x82af49447d8a07e3bd95bd0d56f35241523fbab1",
+        "token1": "0xaf88d065e77c8cc2239327c5edb3a432268e5831",
+        "fee": 500,
+        "tick_spacing": 10,
+        "sqrt_price_x96": "79228162514264337593543950336",
+        "tick": 0,
+        "liquidity": "1000000000000",
+        "coverage_min_tick": -20,
+        "coverage_max_tick": 20,
+        "tick_bitmap_words": [
+          {
+            "word_position": 0,
+            "bitmap": "0x0000000000000000000000000000000000000000000000000000000000000002"
+          }
+        ],
+        "initialized_ticks": [
+          {
+            "tick": 10,
+            "liquidity_gross": "100000000",
+            "liquidity_net": "-100000000"
+          }
+        ],
+        "state_hash": "594b2a29f190ccee84a1ce9b62459b0f5f1d7e7bed9640a132f5e915b06821b4"
+      }
+    }
+  ]
+}

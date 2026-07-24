@@ -17,7 +17,6 @@ use thiserror::Error;
 const MAX_ROUTE_CONFIG_BYTES: usize = 64 * 1024;
 const MAX_ROUTES: usize = 256;
 pub const MAX_CANDIDATE_SIZES_PER_ROUTE: usize = 32;
-const ARBITRUM_WETH: &str = "0x82af49447d8a07e3bd95bd0d56f35241523fbab1";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ProcessingAction {
@@ -208,9 +207,7 @@ impl RouteRegistry {
             {
                 return Err(RouteRegistryError::DuplicateRoute);
             }
-            registry
-                .graph
-                .add_two_pool_cycle(runtime_route.route.clone());
+            registry.graph.add_cycle(runtime_route.route.clone());
             registry.routes.insert(route_id, runtime_route);
         }
         Ok(registry)
@@ -340,7 +337,7 @@ impl ShadowProcessor {
         let routes = self.routes.affected_routes(&origin.candidate_touched_pools);
         if routes.is_empty() {
             return ProcessResult::no_route(
-                "no_affected_two_pool_route",
+                "no_affected_hunter_route",
                 json!({
                     "origin_classification": "supported_swap_origin",
                     "touched_pool_count": origin.candidate_touched_pools.len(),
@@ -514,7 +511,7 @@ impl RouteSpec {
         if !bounded(&route_id, 1, 128)
             || !bounded(&route_fingerprint, 1, 256)
             || !bounded(&trigger_pool_id, 1, 256)
-            || legs.len() != 2
+            || !(2..=4).contains(&legs.len())
         {
             return Err(RouteRegistryError::InvalidRoute);
         }
@@ -531,20 +528,38 @@ impl RouteSpec {
         let settlement_asset = Address::parse(&settlement_asset)
             .map(TokenAddress)
             .map_err(|_| RouteRegistryError::InvalidRoute)?;
-        if legs[0].pool_id.0 != trigger_pool_id
-            || legs[0].protocol != "UniswapV3"
+        let unique_pools = legs
+            .iter()
+            .map(|leg| leg.pool_id.clone())
+            .collect::<HashSet<_>>();
+        let unique_targets = state_targets.iter().cloned().collect::<HashSet<_>>();
+        let mut visited_tokens = HashSet::new();
+        visited_tokens.insert(legs[0].token_in.clone());
+        let simple_cycle = legs.iter().enumerate().all(|(index, leg)| {
+            let is_last = index + 1 == legs.len();
+            (is_last && leg.token_out == legs[0].token_in)
+                || (!is_last && visited_tokens.insert(leg.token_out.clone()))
+        });
+        let continuous = (0..legs.len().saturating_sub(1)).all(|index| {
+            legs[index].token_out == legs[index + 1].token_in
+                && leg_units[index].token_out_decimals == leg_units[index + 1].token_in_decimals
+        });
+        if !legs.iter().any(|leg| leg.pool_id.0 == trigger_pool_id)
             || legs.iter().any(|leg| !leg.protocol.ends_with("V3"))
-            || legs[0].token_out != legs[1].token_in
-            || legs[1].token_out != legs[0].token_in
-            || legs[0].pool_id == legs[1].pool_id
-            || state_targets[0] == state_targets[1]
+            || !continuous
+            || !simple_cycle
+            || unique_pools.len() != legs.len()
+            || unique_targets.len() != state_targets.len()
             || settlement_asset != legs[0].token_in
-            || settlement_asset != legs[1].token_out
-            || settlement_asset.0.as_str() != ARBITRUM_WETH
-            || settlement_asset_decimals != 18
+            || !legs
+                .last()
+                .is_some_and(|leg| settlement_asset == leg.token_out)
             || settlement_asset_decimals != leg_units[0].token_in_decimals
-            || settlement_asset_decimals != leg_units[1].token_out_decimals
-            || leg_units[0].token_out_decimals != leg_units[1].token_in_decimals
+            || settlement_asset_decimals
+                != leg_units
+                    .last()
+                    .map(|units| units.token_out_decimals)
+                    .unwrap_or_default()
         {
             return Err(RouteRegistryError::InvalidRoute);
         }

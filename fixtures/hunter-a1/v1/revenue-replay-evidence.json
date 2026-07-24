@@ -1,0 +1,37 @@
+{
+  "schema_version": "phoenix.hunter-a1-replay-evidence.v1",
+  "evidence_class": "deterministic_fixture_replay",
+  "baseline_routes": 1,
+  "enumerable_routes": 2,
+  "shadow_enabled_routes": 1,
+  "baseline_pools": 2,
+  "reviewed_pools": 2,
+  "new_reviewed_pools": 0,
+  "events_processed": 3,
+  "affected_routes_evaluated": 1,
+  "qualified_candidates": 1,
+  "candidate_rate_bps": 3333,
+  "positive_conservative_net_pnl": [
+    "263211006474615"
+  ],
+  "positive_conservative_net_pnl_p50": "263211006474615",
+  "positive_conservative_net_pnl_p95": "263211006474615",
+  "evaluation_latency_ns": [
+    "7637400",
+    "38900",
+    "10500"
+  ],
+  "evaluation_latency_p50_ns": "38900",
+  "evaluation_latency_p95_ns": "7637400",
+  "rpc_state_reads_per_event": [
+    2,
+    0,
+    0
+  ],
+  "state_incomplete_rate_bps": 0,
+  "prediction_vs_fork_simulation_error_bps": null,
+  "prediction_error_note": "not claimed by this deterministic replay; exact cross-tick parity is covered by the committed offline pinned-state fixture",
+  "duplicate_candidate_outputs": 0,
+  "unmatched_candidate_outputs": 0,
+  "candidate_hash": "ba591e7e0dadb1b96d0992eaa4e3588ae5e4caf5b956131708a72d4f87bc07db"
+}

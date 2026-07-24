@@ -29,13 +29,21 @@ impl PoolGraph {
         Self::default()
     }
 
-    pub fn add_two_pool_cycle(&mut self, route: Route) {
+    pub fn add_cycle(&mut self, route: Route) {
         for leg in &route.legs {
-            self.affected
-                .entry(leg.pool_id.clone())
-                .or_default()
-                .push(route.clone());
+            let routes = self.affected.entry(leg.pool_id.clone()).or_default();
+            if !routes
+                .iter()
+                .any(|existing| existing.route_id == route.route_id)
+            {
+                routes.push(route.clone());
+                routes.sort_by(|left, right| left.route_id.0.cmp(&right.route_id.0));
+            }
         }
+    }
+
+    pub fn add_two_pool_cycle(&mut self, route: Route) {
+        self.add_cycle(route);
     }
 
     pub fn affected_routes(&self, touched_pool: &PoolId) -> Vec<Route> {
@@ -64,7 +72,7 @@ mod tests {
                 direction: Direction::ZeroForOne,
             }],
         };
-        graph.add_two_pool_cycle(route);
+        graph.add_cycle(route);
         assert_eq!(graph.affected_routes(&PoolId("p1".to_string())).len(), 1);
         assert!(graph.affected_routes(&PoolId("p2".to_string())).is_empty());
     }
