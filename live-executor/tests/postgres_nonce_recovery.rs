@@ -85,6 +85,15 @@ async fn nonce_allocation_and_pending_state_survive_restart() {
     .execute(&pool)
     .await
     .expect("arm isolated database");
+    sqlx::query(
+        "UPDATE live_canary.autonomous_global_control
+         SET armed = true, kill_switch = false, execution_mode = 'live',
+             disarm_reason = NULL
+         WHERE singleton",
+    )
+    .execute(&pool)
+    .await
+    .expect("arm isolated autonomous control");
 
     let now = Utc::now();
     let first = request(Uuid::from_u128(10), now, config.pnl_asset_address);
