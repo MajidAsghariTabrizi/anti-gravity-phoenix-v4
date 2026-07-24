@@ -372,7 +372,7 @@ async fn event_to_hunter_to_persisted_outcome_is_exactly_once() {
         ReadyAnvilRpc(rpc.clone()),
     );
     assert!(matches!(
-        executor.step(Utc::now()).await.expect("submission"),
+        executor.step(executable_at).await.expect("submission"),
         ExecutionState::Pending { .. }
     ));
     let restarted = LiveExecutor::new(
@@ -382,7 +382,7 @@ async fn event_to_hunter_to_persisted_outcome_is_exactly_once() {
         ReadyAnvilRpc(rpc.clone()),
     );
     let terminal = restarted
-        .step(Utc::now() + ChronoDuration::seconds(1))
+        .step(executable_at + ChronoDuration::seconds(1))
         .await
         .expect("restart reconciliation");
     assert!(matches!(terminal, ExecutionState::Reverted { .. }));
