@@ -843,6 +843,7 @@ restore_context_backup() {
   restore_optional_path live-executor/schema/002_approval_evidence.sql || return 1
   restore_optional_path live-executor/schema/003_autonomous_hunter_contracts.sql || return 1
   restore_optional_path routes/phoenix-route-universe-v1.json || return 1
+  restore_optional_path routes/phoenix-route-policy-v1.json || return 1
   restore_optional_path schemas/phoenix-autonomous-hunter-v1.schema.json || return 1
   restore_optional_path manifests/$release_sha.json || return 1
   restore_optional_path manifests/$release_sha.env || return 1
@@ -872,6 +873,7 @@ backup_transition_state() {
     live-executor/schema/002_approval_evidence.sql \
     live-executor/schema/003_autonomous_hunter_contracts.sql \
     routes/phoenix-route-universe-v1.json \
+    routes/phoenix-route-policy-v1.json \
     schemas/phoenix-autonomous-hunter-v1.schema.json \
     manifests/$release_sha.json \
     manifests/$release_sha.env \

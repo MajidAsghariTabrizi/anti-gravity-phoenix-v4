@@ -148,6 +148,9 @@ install_source \
   "$source_root/config/phoenix-route-universe-v1.json" \
   "$deploy_dir/routes/phoenix-route-universe-v1.json" 0640
 install_source \
+  "$source_root/config/phoenix-route-policy-v1.json" \
+  "$deploy_dir/routes/phoenix-route-policy-v1.json" 0640
+install_source \
   "$source_root/live-executor/schema/001_live_canary.sql" \
   "$deploy_dir/live-executor/schema/001_live_canary.sql" 0640
 install_source \

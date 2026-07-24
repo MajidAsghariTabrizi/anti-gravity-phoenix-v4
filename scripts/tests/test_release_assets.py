@@ -81,12 +81,17 @@ class ReleaseAssetsTests(unittest.TestCase):
             self.assertIn("schemas/phoenix-prelive-v5-release.schema.json", paths)
             for hunter_asset in (
                 "config/phoenix-route-universe-v1.json",
+                "config/phoenix-route-policy-v1.json",
                 "docs/AUTONOMOUS_HUNTER_CONTRACTS_V1.md",
+                "docs/AUTONOMOUS_HUNTER_A1_REVENUE_EVIDENCE.md",
                 "fixtures/autonomous-hunter/v1/fixture-manifest.json",
                 "fixtures/autonomous-hunter/v1/valid/autonomous-candidate.json",
                 "fixtures/autonomous-hunter/v1/invalid/automatic-approval-mutated-plan.json",
                 "schemas/phoenix-autonomous-hunter-v1.schema.json",
                 "scripts/hunter_contracts.py",
+                "fixtures/hunter-a1/v1/autonomous-candidate.json",
+                "fixtures/hunter-a1/v1/revenue-replay-evidence.json",
+                "phoenix-engine/examples/hunter_a1_replay.rs",
             ):
                 self.assertIn(hunter_asset, paths)
             self.assertTrue(

@@ -232,7 +232,7 @@ fn current_range_target_tick(
     Ok(target)
 }
 
-fn sqrt_ratio_at_tick(tick: i32) -> Result<U256, DomainError> {
+pub fn sqrt_ratio_at_tick(tick: i32) -> Result<U256, DomainError> {
     if !(MIN_TICK..=MAX_TICK).contains(&tick) {
         return Err(DomainError::ArithmeticUnderflow);
     }
@@ -292,7 +292,7 @@ fn tick_ratio_factors() -> &'static [U256; 20] {
     })
 }
 
-fn next_sqrt_price_from_input(
+pub(crate) fn next_sqrt_price_from_input(
     sqrt_price: U256,
     liquidity: u128,
     amount_in: u128,
@@ -322,7 +322,7 @@ fn next_sqrt_price_from_input(
     }
 }
 
-fn amount_0_delta(
+pub(crate) fn amount_0_delta(
     sqrt_a: U256,
     sqrt_b: U256,
     liquidity: u128,
@@ -350,7 +350,7 @@ fn amount_0_delta(
     u512_to_u256(value)
 }
 
-fn amount_1_delta(
+pub(crate) fn amount_1_delta(
     sqrt_a: U256,
     sqrt_b: U256,
     liquidity: u128,
@@ -373,7 +373,7 @@ fn amount_1_delta(
     u512_to_u256(value)
 }
 
-fn spot_output(
+pub(crate) fn spot_output(
     sqrt_price: U256,
     amount_in: u128,
     direction: Direction,
@@ -403,7 +403,7 @@ fn ratio_bps_ceil(value: u128, denominator: u128) -> Result<u16, DomainError> {
     u16::try_from(ratio).map_err(|_| DomainError::ArithmeticOverflow)
 }
 
-fn div_rounding_up(numerator: U512, denominator: U512) -> Result<U512, DomainError> {
+pub(crate) fn div_rounding_up(numerator: U512, denominator: U512) -> Result<U512, DomainError> {
     if denominator.is_zero() {
         return Err(DomainError::ArithmeticUnderflow);
     }
@@ -415,14 +415,14 @@ fn div_rounding_up(numerator: U512, denominator: U512) -> Result<U512, DomainErr
         .ok_or(DomainError::ArithmeticOverflow)
 }
 
-fn u512_to_u128(value: U512) -> Result<u128, DomainError> {
+pub(crate) fn u512_to_u128(value: U512) -> Result<u128, DomainError> {
     if value > U512::from(u128::MAX) {
         return Err(DomainError::ArithmeticOverflow);
     }
     Ok(value.low_u128())
 }
 
-fn u256_to_u128(value: U256) -> Result<u128, DomainError> {
+pub(crate) fn u256_to_u128(value: U256) -> Result<u128, DomainError> {
     if value > U256::from(u128::MAX) {
         return Err(DomainError::ArithmeticOverflow);
     }
