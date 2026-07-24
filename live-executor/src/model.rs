@@ -93,6 +93,8 @@ impl fmt::Display for TransactionHash {
 #[serde(deny_unknown_fields)]
 pub struct ExecutionLeg {
     pub pool: String,
+    #[serde(default)]
+    pub factory: Option<String>,
     pub token_in: String,
     pub token_out: String,
     pub fee: u32,
@@ -103,6 +105,7 @@ pub struct ExecutionLeg {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ValidatedLeg {
     pub pool: CanonicalAddress,
+    pub factory: Option<CanonicalAddress>,
     pub token_in: CanonicalAddress,
     pub token_out: CanonicalAddress,
     pub fee: u32,
@@ -221,6 +224,7 @@ impl Serialize for ValidatedLeg {
     {
         ExecutionLeg {
             pool: self.pool.to_string(),
+            factory: self.factory.map(|address| address.to_string()),
             token_in: self.token_in.to_string(),
             token_out: self.token_out.to_string(),
             fee: self.fee,
@@ -413,6 +417,10 @@ impl TryFrom<ExecutionLeg> for ValidatedLeg {
         }
         Ok(Self {
             pool: CanonicalAddress::parse(&value.pool)?,
+            factory: value
+                .factory
+                .map(|address| CanonicalAddress::parse(&address))
+                .transpose()?,
             token_in: CanonicalAddress::parse(&value.token_in)?,
             token_out: CanonicalAddress::parse(&value.token_out)?,
             fee: value.fee,
@@ -541,6 +549,7 @@ pub struct ReceiptOutcome {
     pub gas_used: u64,
     pub effective_gas_price: u128,
     pub actual_fee_wei: u128,
+    pub actual_l1_cost_wei: u128,
     pub settlement: Settlement,
     pub net_pnl_wei: i128,
 }

@@ -5,8 +5,8 @@ use crate::model::{
 };
 use crate::{
     APPROVAL_POLICY_VERSION, ARBITRUM_NATIVE_USDC_ADDRESS, ARBITRUM_ONE_CHAIN_ID,
-    ARBITRUM_WETH_ADDRESS, CURRENT_ROUTE_FINGERPRINT, CURRENT_ROUTE_POOL_3000_ADDRESS,
-    CURRENT_ROUTE_POOL_500_ADDRESS, REQUEST_SCHEMA_VERSION,
+    ARBITRUM_UNISWAP_V3_FACTORY_ADDRESS, ARBITRUM_WETH_ADDRESS, CURRENT_ROUTE_FINGERPRINT,
+    CURRENT_ROUTE_POOL_3000_ADDRESS, CURRENT_ROUTE_POOL_500_ADDRESS, REQUEST_SCHEMA_VERSION,
 };
 use chrono::{DateTime, Duration, Timelike, Utc};
 use phoenix_fork_sandbox::model::{
@@ -388,6 +388,10 @@ fn build_request(
         .map(|(index, pool)| {
             Ok(ValidatedLeg {
                 pool: CanonicalAddress::parse(pool).map_err(|_| ApprovalError::InvalidCandidate)?,
+                factory: Some(
+                    CanonicalAddress::parse(ARBITRUM_UNISWAP_V3_FACTORY_ADDRESS)
+                        .map_err(|_| ApprovalError::InvalidCandidate)?,
+                ),
                 token_in: token_path[index],
                 token_out: token_path[index + 1],
                 fee: plan.route.fees[index],
@@ -480,7 +484,7 @@ async fn load_existing_request(
         .transpose()
 }
 
-async fn insert_approved_request(
+pub(crate) async fn insert_approved_request(
     transaction: &mut Transaction<'_, Postgres>,
     request: &ExecutionRequest,
 ) -> Result<(), ApprovalError> {
@@ -1014,6 +1018,10 @@ mod tests {
             legs: vec![
                 ValidatedLeg {
                     pool: CanonicalAddress::parse(&plan.route.pool_addresses[0]).expect("pool"),
+                    factory: Some(
+                        CanonicalAddress::parse(ARBITRUM_UNISWAP_V3_FACTORY_ADDRESS)
+                            .expect("factory"),
+                    ),
                     token_in: weth,
                     token_out: usdc,
                     fee: 500,
@@ -1022,6 +1030,10 @@ mod tests {
                 },
                 ValidatedLeg {
                     pool: CanonicalAddress::parse(&plan.route.pool_addresses[1]).expect("pool"),
+                    factory: Some(
+                        CanonicalAddress::parse(ARBITRUM_UNISWAP_V3_FACTORY_ADDRESS)
+                            .expect("factory"),
+                    ),
                     token_in: usdc,
                     token_out: weth,
                     fee: 3_000,

@@ -52,6 +52,6 @@
   "minimum_recent_fork_pass_rate_bps": 9500,
   "maximum_prediction_error_bps": 1000,
   "enabled_for_shadow": true,
-  "enabled_for_autonomous_live": false,
-  "policy_hash": "53d8d4921eb694e9cc6edbe9b47b7220eda579551f802fc75756ff0218624c16"
+  "enabled_for_autonomous_live": true,
+  "policy_hash": "d7aff21eb025696208c646631772a45c241fc2971ef0c9866646d12dca12d476"
 }

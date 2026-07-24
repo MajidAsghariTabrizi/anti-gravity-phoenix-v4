@@ -1,0 +1,19 @@
+[package]
+name = "phoenix-autonomous-live-e2e"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+async-nats = "=0.37.0"
+async-trait = "=0.1.81"
+chrono = "=0.4.38"
+futures-util = "=0.3.31"
+phoenix-engine = { path = "../phoenix-engine" }
+phoenix-live-executor = { path = "../live-executor" }
+rpc-gateway = { path = "../rpc-gateway" }
+serde_json = "=1.0.128"
+sqlx = { version = "=0.8.2", default-features = false, features = ["runtime-tokio-rustls", "postgres"] }
+tokio = { version = "=1.40.0", features = ["full"] }
+url = "=2.5.2"
+zeroize = "=1.8.1"

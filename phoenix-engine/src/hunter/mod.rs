@@ -226,6 +226,7 @@ pub struct RouteGraphSummary {
     pub pool_count: usize,
     pub enumerable_route_count: usize,
     pub shadow_enabled_route_count: usize,
+    pub autonomous_live_enabled_route_count: usize,
     pub routes_per_leg_count: BTreeMap<usize, usize>,
 }
 
@@ -296,7 +297,7 @@ impl HunterRouteGraph {
             }
             if let Some((index, policy)) = matches.first() {
                 matched_policies.insert(*index);
-                if policy.enabled_for_shadow {
+                if policy.enabled_for_shadow || policy.enabled_for_autonomous_live {
                     let settlement_maximum_input = *asset_limits
                         .get(&route.settlement_asset)
                         .ok_or(HunterError::InvalidUniverse)?;
@@ -323,7 +324,14 @@ impl HunterRouteGraph {
             asset_count: universe.settlement_assets.len() + universe.intermediate_assets.len(),
             pool_count: universe.pools.len(),
             enumerable_route_count: routes.len(),
-            shadow_enabled_route_count: bound_routes.len(),
+            shadow_enabled_route_count: bound_routes
+                .iter()
+                .filter(|route| route.policy.enabled_for_shadow)
+                .count(),
+            autonomous_live_enabled_route_count: bound_routes
+                .iter()
+                .filter(|route| route.policy.enabled_for_autonomous_live)
+                .count(),
             routes_per_leg_count,
         };
         Ok(Self {
@@ -341,6 +349,21 @@ impl HunterRouteGraph {
 
     pub fn enumerable_routes(&self) -> &[EnumerableRoute] {
         &self.routes
+    }
+
+    pub fn affected_routes_for_pools(
+        &self,
+        pool_addresses: &[String],
+        maximum: usize,
+    ) -> Result<Vec<EnumerableRoute>, HunterError> {
+        self.affected_route_indices(pool_addresses, maximum)
+            .map(|indices| {
+                indices
+                    .into_iter()
+                    .filter_map(|index| self.bound_routes.get(index))
+                    .map(|route| route.route.clone())
+                    .collect()
+            })
     }
 
     fn affected_route_indices(
@@ -368,6 +391,7 @@ impl HunterRouteGraph {
 pub enum HunterMode {
     Shadow,
     DryRun,
+    Live,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -420,17 +444,30 @@ pub struct HunterProcessResult {
     pub metrics: HunterMetrics,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MaterializedCandidate {
+    pub contract: Value,
+    pub plan: Value,
+    pub calldata: Vec<u8>,
+}
+
 pub trait CandidateSink {
-    fn materialize(&mut self, candidate: Value) -> Result<bool, HunterError>;
+    fn materialize(&mut self, candidate: MaterializedCandidate) -> Result<bool, HunterError>;
 }
 
 #[derive(Clone, Debug, Default)]
 pub struct InMemoryCandidateSink {
-    candidates: BTreeMap<String, Value>,
+    candidates: BTreeMap<String, MaterializedCandidate>,
 }
 
 impl InMemoryCandidateSink {
     pub fn candidates(&self) -> impl Iterator<Item = &Value> {
+        self.candidates
+            .values()
+            .map(|candidate| &candidate.contract)
+    }
+
+    pub fn artifacts(&self) -> impl Iterator<Item = &MaterializedCandidate> {
         self.candidates.values()
     }
 
@@ -444,8 +481,9 @@ impl InMemoryCandidateSink {
 }
 
 impl CandidateSink for InMemoryCandidateSink {
-    fn materialize(&mut self, candidate: Value) -> Result<bool, HunterError> {
+    fn materialize(&mut self, candidate: MaterializedCandidate) -> Result<bool, HunterError> {
         let hash = candidate
+            .contract
             .get("candidate_hash")
             .and_then(Value::as_str)
             .filter(|hash| canonical_digest(hash))
@@ -511,7 +549,7 @@ impl HunterCore {
         let affected_limit = self
             .bounds
             .maximum_affected_routes_per_event
-            .min(self.graph.summary.shadow_enabled_route_count.max(1));
+            .min(self.enabled_route_count().max(1));
         let route_indices = self
             .graph
             .affected_route_indices(&event.touched_pool_addresses, affected_limit)?;
@@ -541,6 +579,9 @@ impl HunterCore {
                 .get(index)
                 .ok_or(HunterError::InvalidRoute)?
                 .clone();
+            if !self.route_enabled(&route) {
+                continue;
+            }
             fingerprints.push(route.route_fingerprint.clone());
             let dedupe_key = format!(
                 "{}:{}:{}:{}",
@@ -570,7 +611,7 @@ impl HunterCore {
                     if sink.materialize(candidate.clone())? {
                         self.metrics.candidates_produced =
                             self.metrics.candidates_produced.saturating_add(1);
-                        produced.push(candidate);
+                        produced.push(candidate.contract);
                     }
                 }
                 Ok(None) => {
@@ -594,6 +635,22 @@ impl HunterCore {
 
     pub fn metrics(&self) -> &HunterMetrics {
         &self.metrics
+    }
+
+    fn enabled_route_count(&self) -> usize {
+        match self.mode {
+            HunterMode::Shadow | HunterMode::DryRun => {
+                self.graph.summary.shadow_enabled_route_count
+            }
+            HunterMode::Live => self.graph.summary.autonomous_live_enabled_route_count,
+        }
+    }
+
+    fn route_enabled(&self, route: &BoundRoute) -> bool {
+        match self.mode {
+            HunterMode::Shadow | HunterMode::DryRun => route.policy.enabled_for_shadow,
+            HunterMode::Live => route.policy.enabled_for_autonomous_live,
+        }
     }
 
     fn remember(&mut self, key: String) -> bool {
@@ -681,7 +738,9 @@ impl From<HunterStateError> for HunterError {
             HunterStateError::ProviderDisagreement
             | HunterStateError::HashMismatch
             | HunterStateError::InvalidContract => Self::StateIntegrity,
-            HunterStateError::LimitExceeded => Self::StateIncomplete,
+            HunterStateError::LimitExceeded | HunterStateError::StateIncomplete => {
+                Self::StateIncomplete
+            }
         }
     }
 }
@@ -784,8 +843,7 @@ fn validate_policy(policy: &RoutePolicy, universe: &RouteUniverse) -> Result<(),
         || policy.maximum_tick_crossings == 0
         || policy.maximum_tick_crossings > universe.default_hard_caps.maximum_tick_crossings
         || policy.maximum_candidate_age_ms == 0
-        || !policy.enabled_for_shadow
-        || policy.enabled_for_autonomous_live
+        || (!policy.enabled_for_shadow && !policy.enabled_for_autonomous_live)
     {
         return Err(HunterError::InvalidPolicy);
     }
@@ -1406,10 +1464,7 @@ fn materialize_candidate(
     event: &HunterEvent,
     bindings: &CandidateBindings,
     evaluation: RouteEvaluation,
-) -> Result<Value, HunterError> {
-    if !matches!(mode, HunterMode::Shadow | HunterMode::DryRun) {
-        return Err(HunterError::CandidateIntegrity);
-    }
+) -> Result<MaterializedCandidate, HunterError> {
     let expires_ms = event
         .observed_at_unix_ms
         .checked_add(route.policy.maximum_candidate_age_ms)
@@ -1435,10 +1490,18 @@ fn materialize_candidate(
         expires_ms.div_ceil(1_000),
         &minimum_leg_outputs,
     )?;
-    let calldata_hash = hex::encode(Sha256::digest(calldata));
-    let plan = json!({
-        "schema_version": "phoenix.hunter-shadow-plan.v1",
-        "mode": match mode { HunterMode::Shadow => "shadow", HunterMode::DryRun => "dry_run" },
+    let calldata_hash = hex::encode(Sha256::digest(&calldata));
+    let plan_schema = match mode {
+        HunterMode::Shadow | HunterMode::DryRun => "phoenix.hunter-shadow-plan.v1",
+        HunterMode::Live => "phoenix.hunter-live-plan.v1",
+    };
+    let mut plan = json!({
+        "schema_version": plan_schema,
+        "mode": match mode {
+            HunterMode::Shadow => "shadow",
+            HunterMode::DryRun => "dry_run",
+            HunterMode::Live => "live"
+        },
         "route_fingerprint": route.route_fingerprint,
         "route_semantic_hash": route.route.semantic_hash,
         "route_policy_hash": route.policy.policy_hash,
@@ -1462,13 +1525,45 @@ fn materialize_candidate(
         "executor_address": bindings.executor_address,
         "executor_code_hash": bindings.executor_code_hash,
         "unsigned": true,
-        "shadow_only": true,
-        "execution_eligible": false,
+        "shadow_only": !matches!(mode, HunterMode::Live),
+        "execution_eligible": matches!(mode, HunterMode::Live),
         "execution_request_created": false,
         "signer_used": false,
         "public_broadcast": false
     });
-    let plan_hash = digest_json("phoenix.hunter-shadow-plan.v1", &plan)?;
+    if matches!(mode, HunterMode::Live) {
+        plan["route"] =
+            serde_json::to_value(&route.route).map_err(|_| HunterError::PlanIntegrity)?;
+        plan["origin_router"] = Value::String(event.origin_router.clone());
+        plan["maximum_input_amount"] = Value::String(
+            route
+                .universe_maximum_input
+                .min(parse_u128(&route.policy.maximum_input_amount)?)
+                .to_string(),
+        );
+        plan["minimum_retained_profit"] =
+            Value::String(route.policy.minimum_retained_profit.clone());
+        plan["maximum_slippage_bps"] =
+            Value::Number(serde_json::Number::from(route.policy.maximum_slippage_bps));
+        plan["maximum_price_impact_bps"] = Value::Number(serde_json::Number::from(
+            route.policy.maximum_price_impact_bps,
+        ));
+        plan["maximum_tick_crossings"] = Value::Number(serde_json::Number::from(
+            route.policy.maximum_tick_crossings,
+        ));
+        plan["per_transaction_maximum_loss"] =
+            Value::String(route.policy.per_transaction_maximum_loss.clone());
+        plan["per_route_daily_loss"] = Value::String(route.policy.per_route_daily_loss.clone());
+        plan["maximum_consecutive_losses"] = Value::Number(serde_json::Number::from(
+            route.policy.maximum_consecutive_losses,
+        ));
+        plan["maximum_state_age_blocks"] = Value::Number(serde_json::Number::from(
+            route.policy.maximum_state_age_blocks,
+        ));
+        plan["maximum_quote_age_ms"] =
+            Value::Number(serde_json::Number::from(route.policy.maximum_quote_age_ms));
+    }
+    let plan_hash = digest_json(plan_schema, &plan)?;
     let identity_seed = format!(
         "{}:{}:{}:{}",
         event.origin_event_id, route.route_fingerprint, event.block_hash, plan_hash
@@ -1512,7 +1607,11 @@ fn materialize_candidate(
         CANDIDATE_SCHEMA,
     )?;
     candidate["candidate_hash"] = Value::String(hash);
-    Ok(candidate)
+    Ok(MaterializedCandidate {
+        contract: candidate,
+        plan,
+        calldata,
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1870,6 +1969,7 @@ mod tests {
             block_hash: format!("0x{}", "a".repeat(64)),
             pool_id: pool_id.to_string(),
             pool_address: pool_address.to_string(),
+            pool_code_hash: "b".repeat(64),
             factory_address: FACTORY.to_string(),
             protocol_id: "uniswap-v3".to_string(),
             token0: WETH.to_string(),
@@ -2192,14 +2292,13 @@ mod tests {
     }
 
     #[test]
-    fn bounds_have_no_live_or_submission_mode() {
+    fn live_evaluation_mode_has_no_signer_or_submission_surface() {
         assert_eq!(HunterMode::Shadow, HunterMode::Shadow);
         assert_eq!(HunterMode::DryRun, HunterMode::DryRun);
+        assert_eq!(HunterMode::Live, HunterMode::Live);
         let source = include_str!("mod.rs");
-        let live_variant = ["HunterMode::", "Live"].concat();
         let private_signer = ["signer", "_private"].concat();
         let raw_submission = ["send", "_raw_transaction"].concat();
-        assert!(!source.contains(&live_variant));
         assert!(!source.contains(&private_signer));
         assert!(!source.contains(&raw_submission));
     }

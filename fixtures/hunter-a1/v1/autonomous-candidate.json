@@ -1,7 +1,7 @@
 {
   "schema_version": "phoenix.autonomous-candidate.v1",
-  "candidate_id": "3bdfdb0c-4b95-5aa1-b859-963fe855957a",
-  "opportunity_id": "17c84022-6447-587e-bcd6-a8ad003d69fb",
+  "candidate_id": "8c003541-dea3-5da6-a7e8-f983676b1a57",
+  "opportunity_id": "307e2c17-719f-5c5f-81d4-3e5239f3aebf",
   "origin_event_id": "phoenix.engine.input.v1:48379269:fixture",
   "chain_id": 42161,
   "route_fingerprint": "arbitrum-weth-usdc-uniswap-v3-500-3000-v1",
@@ -10,12 +10,12 @@
   "risk_policy_hash": "53d8d4921eb694e9cc6edbe9b47b7220eda579551f802fc75756ff0218624c16",
   "state_block_number": 48379269,
   "state_block_hash": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-  "state_hash": "2c95a3053eaa5d005075351f12b6ed0ed54039410abe5b74533db3de82211f2f",
+  "state_hash": "a5efa6d0bc2aac8034163555cdf82b5a15f481a3db24454807476e1a3ae00a6e",
   "selected_size": "10000000000000000",
   "predicted_gross_profit": "268479485960577",
   "predicted_total_cost": "5268479485962",
   "conservative_predicted_net_pnl": "263211006474615",
-  "plan_hash": "d2e3617f5f3f1ef5494fdbaf8a9336bc64d2c365528782f53e38f6b005973404",
+  "plan_hash": "b7fbe7a88b332cf62ad1b8711673a9c594c74069de438cdca587652067856987",
   "calldata_hash": "8860841a2fdb6ab31a157d8c06658e4c339d591a55649eb231b94fd5b9ee162f",
   "executor_address": "0x17a27f2a51983b574756c2e151ada767e7d54635",
   "executor_code_hash": "7457a6963c32510f8714d6de4f9291e8b4394933c11db186b5e82c0e681ec697",
@@ -25,5 +25,5 @@
   "candidate_created_at": "2026-07-24T07:40:02Z",
   "candidate_expires_at": "2026-07-24T07:40:05Z",
   "status": "materialized",
-  "candidate_hash": "ba591e7e0dadb1b96d0992eaa4e3588ae5e4caf5b956131708a72d4f87bc07db"
+  "candidate_hash": "4fd4f9a648d4c83f3b690ffad030d4d47269b869c9dcda2e6ec309b4fc8c5144"
 }

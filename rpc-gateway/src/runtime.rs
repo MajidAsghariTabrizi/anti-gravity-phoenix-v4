@@ -3,6 +3,10 @@ use crate::cache::TtlCache;
 use crate::economic::{
     compare_provider_results, MethodTimeouts, PinnedBlock, ProviderResult, RpcMethod,
 };
+use crate::hunter_state::{
+    HunterStateError, HunterStateRequest, HunterStateResponse, InitializedTick, PinnedV3PoolState,
+    ProviderStateAgreement, TickBitmapWord, HUNTER_STATE_RESPONSE_SCHEMA,
+};
 use crate::metrics::{ProviderSlot, RuntimeRpcMetrics, UpstreamOutcome};
 use crate::multicall::{decode_aggregate3, encode_aggregate3, EthCall, MULTICALL3_ADDRESS};
 use crate::providers::{ProviderConfig, ProviderLease, ProviderPool};
@@ -14,6 +18,8 @@ use crate::shadow_state::{
     MAX_GATEWAY_RESPONSE_BYTES, SHADOW_STATE_SCHEMA_VERSION,
 };
 use crate::transport::{JsonRpcClient, RpcCallResult, TransportError};
+use ethabi::{ParamType, Token};
+use primitive_types::U256;
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -28,6 +34,7 @@ const TOKEN0_SELECTOR: &str = "0x0dfe1681";
 const TOKEN1_SELECTOR: &str = "0xd21220a7";
 const FEE_SELECTOR: &str = "0xddca3f43";
 const TICK_SPACING_SELECTOR: &str = "0xd0c93a7c";
+const FACTORY_SELECTOR: &str = "0xc45a0155";
 const DECIMALS_SELECTOR: &str = "0x313ce567";
 const MAX_STATE_RESPONSE_DATA_BYTES: usize = 4096;
 const MAX_MULTICALL_CODE_BYTES: usize = 1024 * 1024;
@@ -38,6 +45,7 @@ const HEAD_MAX_AGE: Duration = Duration::from_secs(2);
 const MAX_IN_FLIGHT_REQUESTS: usize = 64;
 const MAX_STATE_RESOLUTION: Duration = Duration::from_secs(25);
 const MAX_COALESCE_WAIT: Duration = Duration::from_secs(26);
+const HUNTER_STATE_CACHE_TTL: Duration = Duration::from_secs(5);
 
 type SharedBundleResult = Option<Result<ProviderBundle, GatewayError>>;
 type SharedVerificationResult = Option<Result<VerificationEvidence, GatewayError>>;
@@ -72,6 +80,10 @@ pub enum GatewayError {
     ProviderUnavailable,
     #[error("RPC Gateway provider evidence failed integrity validation")]
     ProviderIntegrity,
+    #[error("RPC Gateway providers disagree on canonical Hunter state")]
+    ProviderDisagreement,
+    #[error("RPC Gateway Hunter state coverage is incomplete")]
+    StateIncomplete,
     #[error("RPC Gateway response exceeded the configured bound")]
     ResponseOversized,
 }
@@ -84,6 +96,8 @@ impl GatewayError {
             Self::UpstreamBudgetExhausted => "upstream_call_budget_exhausted",
             Self::ProviderUnavailable => "provider_unavailable",
             Self::ProviderIntegrity => "provider_integrity_failure",
+            Self::ProviderDisagreement => "provider_disagreement",
+            Self::StateIncomplete => "state_incomplete",
             Self::ResponseOversized => "gateway_response_oversized",
         }
     }
@@ -102,7 +116,10 @@ impl GatewayError {
             Self::InvalidRequest => 400,
             Self::RequestBudgetExhausted | Self::UpstreamBudgetExhausted => 429,
             Self::ProviderUnavailable => 503,
-            Self::ProviderIntegrity | Self::ResponseOversized => 502,
+            Self::ProviderIntegrity
+            | Self::ProviderDisagreement
+            | Self::StateIncomplete
+            | Self::ResponseOversized => 502,
         }
     }
 
@@ -123,6 +140,7 @@ pub struct GatewayRuntime {
     static_cache: Arc<Mutex<TtlCache<()>>>,
     route_cache: Arc<Mutex<TtlCache<ProviderBundle>>>,
     verification_cache: Arc<Mutex<TtlCache<VerificationEvidence>>>,
+    hunter_state_cache: Arc<Mutex<TtlCache<Vec<ProviderStateAgreement>>>>,
     primary_in_flight: Arc<Mutex<HashMap<String, watch::Receiver<SharedBundleResult>>>>,
     verification_in_flight: Arc<Mutex<HashMap<String, watch::Receiver<SharedVerificationResult>>>>,
     head: Arc<Mutex<Option<HeadSnapshot>>>,
@@ -190,6 +208,7 @@ impl GatewayRuntime {
             static_cache: Arc::new(Mutex::new(TtlCache::new(CACHE_CAPACITY))),
             route_cache: Arc::new(Mutex::new(TtlCache::new(CACHE_CAPACITY))),
             verification_cache: Arc::new(Mutex::new(TtlCache::new(CACHE_CAPACITY))),
+            hunter_state_cache: Arc::new(Mutex::new(TtlCache::new(CACHE_CAPACITY))),
             primary_in_flight: Arc::new(Mutex::new(HashMap::new())),
             verification_in_flight: Arc::new(Mutex::new(HashMap::new())),
             head: Arc::new(Mutex::new(None)),
@@ -228,6 +247,386 @@ impl GatewayRuntime {
             self.metrics.provider_unavailable();
         }
         result
+    }
+
+    pub async fn resolve_hunter_state(
+        &self,
+        request: HunterStateRequest,
+    ) -> Result<HunterStateResponse, GatewayError> {
+        request
+            .validate()
+            .map_err(|_| GatewayError::InvalidRequest)?;
+        if !self.request_budget.lock().await.admit(Instant::now()) {
+            return Err(GatewayError::RequestBudgetExhausted);
+        }
+        let head = self.current_head().await?;
+        let request_bytes =
+            serde_json::to_vec(&request).map_err(|_| GatewayError::InvalidRequest)?;
+        let request_hash = canonical_hash_bytes(&request_bytes);
+        let cache_key = format!("{request_hash}:{}:{}", head.block.number, head.block.hash);
+        if let Some(agreements) = self
+            .hunter_state_cache
+            .lock()
+            .await
+            .get(&cache_key, Instant::now())
+        {
+            let response = HunterStateResponse {
+                schema_version: HUNTER_STATE_RESPONSE_SCHEMA.to_string(),
+                chain_id: ARBITRUM_ONE_CHAIN_ID,
+                request_id: request.request_id.clone(),
+                block_number: head.block.number,
+                block_hash: head.block.hash,
+                agreements,
+                resolved_at_unix_ms: unix_time_ms(),
+            };
+            response
+                .validate(&request)
+                .map_err(map_hunter_contract_error)?;
+            return Ok(response);
+        }
+
+        let _operation_guard = self.upstream_operation_lock.lock().await;
+        if self.provider_count().await < 2 {
+            return Err(GatewayError::ProviderUnavailable);
+        }
+        let primary = self
+            .reserve_named_provider(&head.provider_id)
+            .await
+            .ok_or(GatewayError::ProviderUnavailable)?;
+        self.ensure_provider_verified(&primary)
+            .await
+            .map_err(map_call_failure)?;
+        let excluded = HashSet::from([primary.provider_id().to_string()]);
+        let secondary = self
+            .reserve_provider(&excluded)
+            .await
+            .ok_or(GatewayError::ProviderUnavailable)?;
+        self.ensure_provider_verified(&secondary)
+            .await
+            .map_err(map_call_failure)?;
+
+        let primary_states = self
+            .perform_hunter_state_bundle(&primary, &request, &head.block, ProviderSlot::Primary)
+            .await?;
+        let secondary_states = self
+            .perform_hunter_state_bundle(&secondary, &request, &head.block, ProviderSlot::Secondary)
+            .await?;
+        self.mark_provider_success(primary.provider_id()).await;
+        self.mark_provider_success(secondary.provider_id()).await;
+
+        let agreements = primary_states
+            .into_iter()
+            .zip(secondary_states)
+            .map(|(primary_state, secondary_state)| {
+                let agreement = ProviderStateAgreement {
+                    primary_provider_id: primary.provider_id().to_string(),
+                    secondary_provider_id: secondary.provider_id().to_string(),
+                    primary: primary_state,
+                    secondary: secondary_state,
+                };
+                agreement.agreed().map_err(map_hunter_contract_error)?;
+                Ok(agreement)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        self.hunter_state_cache.lock().await.insert(
+            cache_key,
+            agreements.clone(),
+            HUNTER_STATE_CACHE_TTL,
+            Instant::now(),
+        );
+        let response = HunterStateResponse {
+            schema_version: HUNTER_STATE_RESPONSE_SCHEMA.to_string(),
+            chain_id: ARBITRUM_ONE_CHAIN_ID,
+            request_id: request.request_id.clone(),
+            block_number: head.block.number,
+            block_hash: head.block.hash,
+            agreements,
+            resolved_at_unix_ms: unix_time_ms(),
+        };
+        response
+            .validate(&request)
+            .map_err(map_hunter_contract_error)?;
+        Ok(response)
+    }
+
+    async fn perform_hunter_state_bundle(
+        &self,
+        provider: &ProviderLease,
+        request: &HunterStateRequest,
+        block: &PinnedBlock,
+        slot: ProviderSlot,
+    ) -> Result<Vec<PinnedV3PoolState>, GatewayError> {
+        let block_quantity = format_quantity(block.number);
+        let mut code_hashes = Vec::with_capacity(request.pools.len());
+        for pool in &request.pools {
+            let code = self
+                .recorded_call(
+                    provider,
+                    RpcMethod::EthGetCode,
+                    json!([pool.pool_address, block_quantity.clone()]),
+                    Some(block),
+                    0,
+                    slot,
+                    None,
+                    false,
+                )
+                .await
+                .map_err(|failure| map_call_failure(failure.cause))?;
+            let code = code
+                .value
+                .as_str()
+                .map(str::to_ascii_lowercase)
+                .filter(|value| {
+                    value != "0x"
+                        && canonical_data(value, MAX_MULTICALL_CODE_BYTES)
+                        && value[2..].bytes().any(|byte| byte != b'0')
+                })
+                .ok_or(GatewayError::ProviderIntegrity)?;
+            let bytes = hex::decode(&code[2..]).map_err(|_| GatewayError::ProviderIntegrity)?;
+            code_hashes.push(canonical_hash_bytes(&bytes));
+        }
+
+        let mut identity_calls = Vec::with_capacity(request.pools.len() * 7);
+        for pool in &request.pools {
+            for selector in [
+                FACTORY_SELECTOR,
+                TOKEN0_SELECTOR,
+                TOKEN1_SELECTOR,
+                FEE_SELECTOR,
+                TICK_SPACING_SELECTOR,
+                SLOT0_SELECTOR,
+                LIQUIDITY_SELECTOR,
+            ] {
+                identity_calls.push(EthCall {
+                    target: pool.pool_address.clone(),
+                    calldata: selector.to_string(),
+                });
+            }
+        }
+        let identity_results = self
+            .hunter_multicall(provider, block, slot, &identity_calls)
+            .await?;
+        let mut interim = Vec::with_capacity(request.pools.len());
+        for (pool_index, pool) in request.pools.iter().enumerate() {
+            let offset = pool_index * 7;
+            let factory = parse_address_bytes(&identity_results[offset])
+                .ok_or(GatewayError::ProviderIntegrity)?;
+            let token0 = parse_address_bytes(&identity_results[offset + 1])
+                .ok_or(GatewayError::ProviderIntegrity)?;
+            let token1 = parse_address_bytes(&identity_results[offset + 2])
+                .ok_or(GatewayError::ProviderIntegrity)?;
+            let fee = parse_u32_bytes(&identity_results[offset + 3])
+                .ok_or(GatewayError::ProviderIntegrity)?;
+            let tick_spacing = parse_i24_bytes(&identity_results[offset + 4])
+                .ok_or(GatewayError::ProviderIntegrity)?;
+            let (sqrt_price_x96, tick) = parse_slot0_bytes(&identity_results[offset + 5])
+                .ok_or(GatewayError::ProviderIntegrity)?;
+            let liquidity = parse_u128_word(&identity_results[offset + 6])
+                .filter(|value| *value > 0)
+                .ok_or(GatewayError::StateIncomplete)?;
+            if factory != pool.factory_address
+                || token0 != pool.token0
+                || token1 != pool.token1
+                || fee != pool.fee
+                || tick_spacing != pool.tick_spacing
+            {
+                return Err(GatewayError::ProviderIntegrity);
+            }
+            interim.push(HunterPoolInterim {
+                sqrt_price_x96,
+                tick,
+                liquidity,
+                word_positions: centered_word_positions(
+                    tick,
+                    tick_spacing,
+                    request.maximum_tick_words_per_pool,
+                )?,
+            });
+        }
+
+        let mut bitmap_calls = Vec::new();
+        for (pool, state) in request.pools.iter().zip(&interim) {
+            for position in &state.word_positions {
+                bitmap_calls.push(EthCall {
+                    target: pool.pool_address.clone(),
+                    calldata: encode_signed_call("tickBitmap", 16, i128::from(*position)),
+                });
+            }
+        }
+        let bitmap_results = self
+            .hunter_multicall(provider, block, slot, &bitmap_calls)
+            .await?;
+        let mut bitmap_offset = 0;
+        let mut bitmaps_by_pool = Vec::with_capacity(request.pools.len());
+        let mut initialized_by_pool = Vec::with_capacity(request.pools.len());
+        let mut total_initialized = 0_usize;
+        for state in &interim {
+            let mut words = Vec::with_capacity(state.word_positions.len());
+            let mut ticks = Vec::new();
+            for position in &state.word_positions {
+                let bitmap = parse_u256_word(&bitmap_results[bitmap_offset])
+                    .ok_or(GatewayError::ProviderIntegrity)?;
+                bitmap_offset += 1;
+                words.push(TickBitmapWord {
+                    word_position: *position,
+                    bitmap: format!("0x{bitmap:064x}"),
+                });
+                for bit in 0..256_usize {
+                    if bitmap.bit(bit) {
+                        let compressed = i32::from(*position)
+                            .checked_mul(256)
+                            .and_then(|value| value.checked_add(bit as i32))
+                            .ok_or(GatewayError::ProviderIntegrity)?;
+                        let tick = compressed
+                            .checked_mul(request.pools[bitmaps_by_pool.len()].tick_spacing)
+                            .ok_or(GatewayError::ProviderIntegrity)?;
+                        if (-887_272..=887_272).contains(&tick) {
+                            ticks.push(tick);
+                        }
+                    }
+                }
+            }
+            total_initialized = total_initialized.saturating_add(ticks.len());
+            if total_initialized > request.maximum_initialized_ticks {
+                return Err(GatewayError::StateIncomplete);
+            }
+            bitmaps_by_pool.push(words);
+            initialized_by_pool.push(ticks);
+        }
+
+        let mut tick_calls = Vec::with_capacity(total_initialized);
+        for (pool, ticks) in request.pools.iter().zip(&initialized_by_pool) {
+            for tick in ticks {
+                tick_calls.push(EthCall {
+                    target: pool.pool_address.clone(),
+                    calldata: encode_signed_call("ticks", 24, i128::from(*tick)),
+                });
+            }
+        }
+        let tick_results = if tick_calls.is_empty() {
+            Vec::new()
+        } else {
+            self.hunter_multicall(provider, block, slot, &tick_calls)
+                .await?
+        };
+        let mut tick_offset = 0;
+        let mut states = Vec::with_capacity(request.pools.len());
+        for (index, pool) in request.pools.iter().enumerate() {
+            let initialized_ticks = initialized_by_pool[index]
+                .iter()
+                .map(|tick| {
+                    let result = tick_results
+                        .get(tick_offset)
+                        .ok_or(GatewayError::ProviderIntegrity)?;
+                    tick_offset += 1;
+                    let (liquidity_gross, liquidity_net) =
+                        parse_tick_bytes(result).ok_or(GatewayError::ProviderIntegrity)?;
+                    if liquidity_gross == 0 {
+                        return Err(GatewayError::ProviderIntegrity);
+                    }
+                    Ok(InitializedTick {
+                        tick: *tick,
+                        liquidity_gross: liquidity_gross.to_string(),
+                        liquidity_net: liquidity_net.to_string(),
+                    })
+                })
+                .collect::<Result<Vec<_>, GatewayError>>()?;
+            let first_word = interim[index]
+                .word_positions
+                .first()
+                .copied()
+                .ok_or(GatewayError::StateIncomplete)?;
+            let last_word = interim[index]
+                .word_positions
+                .last()
+                .copied()
+                .ok_or(GatewayError::StateIncomplete)?;
+            let coverage_min_tick =
+                (i64::from(first_word) * 256 * i64::from(pool.tick_spacing)).max(-887_272) as i32;
+            let coverage_max_tick = (((i64::from(last_word) + 1) * 256 - 1)
+                * i64::from(pool.tick_spacing))
+            .min(887_272) as i32;
+            let mut state = PinnedV3PoolState {
+                schema_version: crate::hunter_state::PINNED_V3_STATE_SCHEMA.to_string(),
+                chain_id: ARBITRUM_ONE_CHAIN_ID,
+                block_number: block.number,
+                block_hash: block.hash.clone(),
+                pool_id: pool.pool_id.clone(),
+                pool_address: pool.pool_address.clone(),
+                pool_code_hash: code_hashes[index].clone(),
+                factory_address: pool.factory_address.clone(),
+                protocol_id: pool.protocol_id.clone(),
+                token0: pool.token0.clone(),
+                token1: pool.token1.clone(),
+                fee: pool.fee,
+                tick_spacing: pool.tick_spacing,
+                sqrt_price_x96: interim[index].sqrt_price_x96.to_string(),
+                tick: interim[index].tick,
+                liquidity: interim[index].liquidity.to_string(),
+                coverage_min_tick,
+                coverage_max_tick,
+                tick_bitmap_words: bitmaps_by_pool[index].clone(),
+                initialized_ticks,
+                state_hash: "0".repeat(64),
+            };
+            state.state_hash = state.canonical_hash().map_err(map_hunter_contract_error)?;
+            state.validate().map_err(map_hunter_contract_error)?;
+            states.push(state);
+        }
+
+        let verify = self
+            .recorded_call(
+                provider,
+                RpcMethod::EthGetBlockByNumber,
+                json!([block_quantity, false]),
+                Some(block),
+                0,
+                slot,
+                None,
+                false,
+            )
+            .await
+            .map_err(|failure| map_call_failure(failure.cause))?;
+        if parse_block(&verify.value).as_ref() != Some(block) {
+            return Err(GatewayError::ProviderIntegrity);
+        }
+        Ok(states)
+    }
+
+    async fn hunter_multicall(
+        &self,
+        provider: &ProviderLease,
+        block: &PinnedBlock,
+        slot: ProviderSlot,
+        calls: &[EthCall],
+    ) -> Result<Vec<Vec<u8>>, GatewayError> {
+        if calls.is_empty() || calls.len() > 1_024 {
+            return Err(GatewayError::InvalidRequest);
+        }
+        let calldata = encode_aggregate3(calls).map_err(|_| GatewayError::ProviderIntegrity)?;
+        let response = self
+            .recorded_call(
+                provider,
+                RpcMethod::EthCall,
+                json!([
+                    {"to": MULTICALL3_ADDRESS, "data": calldata},
+                    format_quantity(block.number)
+                ]),
+                Some(block),
+                0,
+                slot,
+                Some(calls.len()),
+                false,
+            )
+            .await
+            .map_err(|failure| map_call_failure(failure.cause))?;
+        response
+            .value
+            .as_str()
+            .ok_or(GatewayError::ProviderIntegrity)
+            .and_then(|value| {
+                decode_aggregate3(value, calls.len()).map_err(|_| GatewayError::ProviderIntegrity)
+            })
     }
 
     async fn resolve_shadow_state_inner(
@@ -1166,6 +1565,14 @@ struct HeadSnapshot {
     observed_at: Instant,
 }
 
+#[derive(Clone, Debug)]
+struct HunterPoolInterim {
+    sqrt_price_x96: U256,
+    tick: i32,
+    liquidity: u128,
+    word_positions: Vec<i16>,
+}
+
 enum HeadRole {
     Leader(watch::Sender<SharedHeadResult>),
     Follower(watch::Receiver<SharedHeadResult>),
@@ -1347,6 +1754,108 @@ fn parse_i24_bytes(value: &[u8]) -> Option<i32> {
     } else {
         raw as i32
     })
+}
+
+fn parse_u256_word(value: &[u8]) -> Option<U256> {
+    if value.len() != 32 {
+        return None;
+    }
+    Some(U256::from_big_endian(value))
+}
+
+fn parse_u128_word(value: &[u8]) -> Option<u128> {
+    if value.len() != 32 || value[..16].iter().any(|byte| *byte != 0) {
+        return None;
+    }
+    Some(u128::from_be_bytes(value[16..].try_into().ok()?))
+}
+
+fn parse_slot0_bytes(value: &[u8]) -> Option<(U256, i32)> {
+    if value.len() < 64 || value.len() > MAX_STATE_RESPONSE_DATA_BYTES {
+        return None;
+    }
+    let sqrt_price_x96 = parse_u256_word(&value[..32])?;
+    if sqrt_price_x96.is_zero() || sqrt_price_x96.bits() > 160 {
+        return None;
+    }
+    let tick = parse_i24_bytes(&value[32..64])?;
+    if !(-887_272..=887_272).contains(&tick) {
+        return None;
+    }
+    Some((sqrt_price_x96, tick))
+}
+
+fn parse_tick_bytes(value: &[u8]) -> Option<(u128, i128)> {
+    if value.len() < 64 || value.len() > MAX_STATE_RESPONSE_DATA_BYTES {
+        return None;
+    }
+    let gross = parse_u128_word(&value[..32])?;
+    let signed = &value[32..64];
+    let negative = signed[16] & 0x80 != 0;
+    let prefix = if negative { 0xff } else { 0x00 };
+    if signed[..16].iter().any(|byte| *byte != prefix) {
+        return None;
+    }
+    let net = u128::from_be_bytes(signed[16..].try_into().ok()?) as i128;
+    Some((gross, net))
+}
+
+fn centered_word_positions(
+    tick: i32,
+    tick_spacing: i32,
+    maximum_words: usize,
+) -> Result<Vec<i16>, GatewayError> {
+    if tick_spacing <= 0 || maximum_words == 0 || maximum_words > 32 {
+        return Err(GatewayError::InvalidRequest);
+    }
+    let mut compressed = tick / tick_spacing;
+    if tick < 0 && tick % tick_spacing != 0 {
+        compressed -= 1;
+    }
+    let center = compressed >> 8;
+    let left = i32::try_from((maximum_words - 1) / 2).map_err(|_| GatewayError::InvalidRequest)?;
+    let start = center
+        .checked_sub(left)
+        .ok_or(GatewayError::StateIncomplete)?;
+    (0..maximum_words)
+        .map(|offset| {
+            start
+                .checked_add(i32::try_from(offset).map_err(|_| GatewayError::InvalidRequest)?)
+                .and_then(|value| i16::try_from(value).ok())
+                .ok_or(GatewayError::StateIncomplete)
+        })
+        .collect()
+}
+
+fn encode_signed_call(name: &str, bits: usize, value: i128) -> String {
+    let encoded = if value < 0 {
+        U256::MAX - U256::from(value.unsigned_abs()) + U256::one()
+    } else {
+        U256::from(value as u128)
+    };
+    let mut data = ethabi::short_signature(name, &[ParamType::Int(bits)]).to_vec();
+    data.extend(ethabi::encode(&[Token::Int(encoded)]));
+    format!("0x{}", hex::encode(data))
+}
+
+fn map_call_failure(failure: CallFailure) -> GatewayError {
+    match failure {
+        CallFailure::Budget => GatewayError::UpstreamBudgetExhausted,
+        CallFailure::Transport(_) => GatewayError::ProviderUnavailable,
+        CallFailure::Integrity => GatewayError::ProviderIntegrity,
+    }
+}
+
+fn map_hunter_contract_error(error: HunterStateError) -> GatewayError {
+    match error {
+        HunterStateError::ProviderDisagreement => GatewayError::ProviderDisagreement,
+        HunterStateError::StateIncomplete | HunterStateError::LimitExceeded => {
+            GatewayError::StateIncomplete
+        }
+        HunterStateError::InvalidContract | HunterStateError::HashMismatch => {
+            GatewayError::ProviderIntegrity
+        }
+    }
 }
 
 fn canonical_quantity(value: &str) -> bool {

@@ -1,4 +1,5 @@
 use rpc_gateway::economic::MethodTimeouts;
+use rpc_gateway::hunter_state::{HunterStateRequest, HUNTER_STATE_REQUEST_SCHEMA};
 use rpc_gateway::metrics::RuntimeRpcMetrics;
 use rpc_gateway::providers::parse_provider_config;
 use rpc_gateway::runtime::{GatewayError, GatewayLimits, GatewayRuntime};
@@ -35,6 +36,13 @@ impl Config {
         let priorities = required_env("RPC_PROVIDER_WEIGHTS")?;
         let providers = parse_provider_config(&urls, &priorities)
             .map_err(|_| "invalid RPC provider configuration")?;
+        if std::env::var("AUTONOMOUS_EXECUTION")
+            .map(|value| value.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
+            && providers.providers.len() < 2
+        {
+            return Err("autonomous execution requires two independent RPC providers");
+        }
         Ok(Self {
             address: std::env::var("RPC_GATEWAY_ADDR")
                 .unwrap_or_else(|_| "0.0.0.0:9300".to_string()),
@@ -103,6 +111,7 @@ async fn run() -> Result<(), &'static str> {
     tracing::info!(
         event = "rpc_gateway_startup",
         shadow_state_schema = SHADOW_STATE_SCHEMA_VERSION,
+        hunter_state_schema = HUNTER_STATE_REQUEST_SCHEMA,
         provider_urls_logged = false
     );
     let probe_task = tokio::spawn(monitor_providers(
@@ -227,6 +236,27 @@ async fn handle_request(
                 }
             };
             match tokio::time::timeout(STATE_REQUEST_TIMEOUT, runtime.resolve_shadow_state(parsed))
+                .await
+            {
+                Ok(Ok(response)) => write_json(&mut stream, 200, &response).await,
+                Ok(Err(error)) => {
+                    write_json(&mut stream, error.http_status(), &error.response()).await
+                }
+                Err(_) => {
+                    let error = GatewayError::ProviderUnavailable;
+                    write_json(&mut stream, error.http_status(), &error.response()).await
+                }
+            }
+        }
+        ("POST", "/v1/hunter/state") => {
+            let parsed: HunterStateRequest = match serde_json::from_slice(&request.body) {
+                Ok(parsed) => parsed,
+                Err(_) => {
+                    return write_json(&mut stream, 400, &GatewayError::InvalidRequest.response())
+                        .await;
+                }
+            };
+            match tokio::time::timeout(STATE_REQUEST_TIMEOUT, runtime.resolve_hunter_state(parsed))
                 .await
             {
                 Ok(Ok(response)) => write_json(&mut stream, 200, &response).await,

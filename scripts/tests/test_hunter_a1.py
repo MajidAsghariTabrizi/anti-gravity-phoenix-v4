@@ -17,7 +17,7 @@ class HunterA1Tests(unittest.TestCase):
         validated = hunter_contracts.validate_document(candidate, validator)
         self.assertEqual(
             validated["candidate_hash"],
-            "ba591e7e0dadb1b96d0992eaa4e3588ae5e4caf5b956131708a72d4f87bc07db",
+            "4fd4f9a648d4c83f3b690ffad030d4d47269b869c9dcda2e6ec309b4fc8c5144",
         )
         self.assertEqual(validated["status"], "materialized")
 
@@ -28,7 +28,22 @@ class HunterA1Tests(unittest.TestCase):
         reviewed_policy = hunter_contracts.load_json(
             ROOT / "fixtures/autonomous-hunter/v1/valid/route-policy.json"
         )
-        self.assertEqual(release_policy, reviewed_policy)
+        hunter_contracts.validate_document(release_policy, hunter_contracts._validator(ROOT))
+        for field in (
+            "chain_id",
+            "route_fingerprint",
+            "route_universe_hash",
+            "settlement_asset",
+            "token_path",
+            "pool_addresses",
+            "factory_addresses",
+            "protocol_ids",
+            "fees",
+            "directions",
+        ):
+            self.assertEqual(release_policy[field], reviewed_policy[field])
+        self.assertTrue(release_policy["enabled_for_shadow"])
+        self.assertTrue(release_policy["enabled_for_autonomous_live"])
 
     def test_revenue_report_is_bounded_and_honest(self) -> None:
         report = json.loads(
@@ -73,7 +88,7 @@ class HunterA1Tests(unittest.TestCase):
             all(vector["expected_ticks_crossed"] == 1 for vector in fixture["vectors"])
         )
 
-    def test_core_has_explicit_bounds_and_no_live_execution_surface(self) -> None:
+    def test_core_has_explicit_bounds_and_no_submission_surface(self) -> None:
         core = (ROOT / "phoenix-engine/src/hunter/mod.rs").read_text(encoding="utf-8")
         state = (ROOT / "rpc-gateway/src/hunter_state.rs").read_text(encoding="utf-8")
         for required in (
@@ -93,7 +108,7 @@ class HunterA1Tests(unittest.TestCase):
         ):
             self.assertIn(required, core)
         self.assertIn("MAX_CACHE_ENTRIES", state)
-        self.assertNotIn("HunterMode::Live", core)
+        self.assertIn("HunterMode::Live", core)
         self.assertNotIn("eth_sendRaw" + "Transaction", core)
         self.assertNotIn("SIGNER_PRIVATE_KEY", core)
         self.assertNotIn("private_key", core.lower())
