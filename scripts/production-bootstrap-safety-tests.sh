@@ -33,6 +33,10 @@ grep -F 'provision-production-host.sh' "$bootstrap" >/dev/null ||
   fail 'bootstrap does not delegate first-host provisioning'
 grep -F 'install-production-release-context.sh' "$bootstrap" >/dev/null ||
   fail 'bootstrap does not delegate release-context installation'
+grep -F "fail 'host provisioning stage failed'" "$bootstrap" >/dev/null ||
+  fail 'bootstrap lacks a stage-specific host provisioning diagnostic'
+grep -F "fail 'release context installation stage failed'" "$bootstrap" >/dev/null ||
+  fail 'bootstrap lacks a stage-specific release-context diagnostic'
 grep -F 'install-production-release-context.sh' "$release_installer" >/dev/null ||
   fail 'release installer does not use the scoped context installer'
 if grep -F 'bootstrap-production.sh' "$release_installer" >/dev/null; then
