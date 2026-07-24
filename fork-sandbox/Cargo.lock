@@ -1682,6 +1682,7 @@ dependencies = [
  "futures-util",
  "hex",
  "httpdate",
+ "primitive-types",
  "reqwest",
  "serde",
  "serde_json",

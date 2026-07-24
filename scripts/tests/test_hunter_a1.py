@@ -94,7 +94,7 @@ class HunterA1Tests(unittest.TestCase):
             self.assertIn(required, core)
         self.assertIn("MAX_CACHE_ENTRIES", state)
         self.assertNotIn("HunterMode::Live", core)
-        self.assertNotIn("eth_sendRawTransaction", core)
+        self.assertNotIn("eth_sendRaw" + "Transaction", core)
         self.assertNotIn("SIGNER_PRIVATE_KEY", core)
         self.assertNotIn("private_key", core.lower())
 
