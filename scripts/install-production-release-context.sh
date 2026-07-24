@@ -130,6 +130,11 @@ ensure_deploy_directory "$deploy_dir/.runtime" "$owner_user" "$owner_group" 0750
 ensure_deploy_directory "$deploy_dir/.deploy-runtime" root root 0700
 
 install_source "$source_root/compose.prod.yml" "$deploy_dir/compose.prod.yml" 0640
+if [ -f "$source_root/compose.live-autonomous.yml" ]; then
+  install_source \
+    "$source_root/compose.live-autonomous.yml" \
+    "$deploy_dir/compose.live-autonomous.yml" 0640
+fi
 install_source \
   "$source_root/compose.live-canary.yml" "$deploy_dir/compose.live-canary.yml" 0640
 install_source \
@@ -159,6 +164,11 @@ install_source \
 install_source \
   "$source_root/live-executor/schema/003_autonomous_hunter_contracts.sql" \
   "$deploy_dir/live-executor/schema/003_autonomous_hunter_contracts.sql" 0640
+if [ -f "$source_root/live-executor/schema/004_autonomous_live_runtime.sql" ]; then
+  install_source \
+    "$source_root/live-executor/schema/004_autonomous_live_runtime.sql" \
+    "$deploy_dir/live-executor/schema/004_autonomous_live_runtime.sql" 0640
+fi
 
 for sql_name in \
   shadow-profitability-report.sql \
@@ -211,6 +221,7 @@ done
 for safety_script in \
   install-release-assets.sh \
   install-production-release-context.sh \
+  production_mode.py \
   production-healthcheck.sh \
   prelive-protected-maintenance.sh \
   prelive_protected_maintenance.py \

@@ -6,8 +6,10 @@ deploy_dir="$deploy_root/deploy"
 release_root="${PHOENIX_RELEASE_ROOT:-$deploy_root/releases}"
 env_file="${PHOENIX_ENV_FILE:-/etc/phoenix/phoenix.env}"
 compose_file="$deploy_dir/compose.prod.yml"
+overlay_file="$deploy_dir/compose.live-autonomous.yml"
 current_file="$deploy_dir/current-release"
 current_env="$deploy_dir/current-release.env"
+live_release_env="${PHOENIX_CURRENT_LIVE_RELEASE_ENV:-$current_env}"
 current_state="$deploy_dir/current-release.json"
 current_context="$deploy_dir/current-release-context.json"
 previous_file="$deploy_dir/previous-release"
@@ -15,6 +17,7 @@ runtime_dir="${PHOENIX_DEPLOY_RUNTIME_DIR:-$deploy_dir/.deploy-runtime}"
 protected_services='nitro-feed-relay feed-ingestor nats postgres recorder'
 optional_services='prometheus rpc-gateway shadow-dispatcher phoenix-engine dashboard'
 service_wait_seconds=${PHOENIX_DEPLOY_SERVICE_WAIT_SECONDS:-300}
+reconciliation_seconds=${PHOENIX_ROLLBACK_RECONCILIATION_SECONDS:-180}
 
 fail() {
   echo "ROLLBACK_FAILED: $1"
@@ -47,9 +50,58 @@ case "$service_wait_seconds" in
 esac
 [ "$service_wait_seconds" -ge 30 ] && [ "$service_wait_seconds" -le 900 ] ||
   fail "service wait seconds must be from 30 through 900"
+case "$reconciliation_seconds" in
+  ''|*[!0-9]*) fail "reconciliation seconds must be an integer" ;;
+esac
+[ "$reconciliation_seconds" -ge 30 ] && [ "$reconciliation_seconds" -le 900 ] ||
+  fail "reconciliation seconds must be from 30 through 900"
 
 command -v python3 >/dev/null 2>&1 || fail "python3 is unavailable"
 command -v cmp >/dev/null 2>&1 || fail "cmp is unavailable"
+mkdir -p "$runtime_dir"
+chmod 0700 "$runtime_dir"
+
+current_live_compose() {
+  PHOENIX_ENV_FILE="$env_file" PHOENIX_RELEASE_ENV="$live_release_env" \
+    docker compose \
+      --env-file "$env_file" \
+      --env-file "$live_release_env" \
+      -f "$compose_file" \
+      -f "$overlay_file" \
+      --profile live-autonomous "$@"
+}
+
+if [ -f "$overlay_file" ] && [ -s "$live_release_env" ]; then
+  live_executor_id=$(current_live_compose ps -a -q live-executor | awk 'NF { print; exit }')
+  if [ -n "$live_executor_id" ]; then
+    current_live_compose run --rm --no-deps \
+      -e PHOENIX_AUTONOMOUS_DISARM_ACK=DISARM_AUTONOMOUS_LIVE_42161 \
+      -e PHOENIX_AUTONOMOUS_DISARM_REASON=operator_rollback \
+      --entrypoint /usr/local/bin/autonomous-live-control \
+      live-executor disarm ||
+      fail "autonomous LIVE controls could not be disarmed"
+    reconciliation_deadline=$(( $(date +%s) + reconciliation_seconds ))
+    reconciled=0
+    while [ "$(date +%s)" -lt "$reconciliation_deadline" ]; do
+      if current_live_compose run --rm --no-deps \
+        --entrypoint /usr/local/bin/autonomous-live-control \
+        live-executor reconciliation-status >/dev/null 2>&1
+      then
+        reconciled=1
+        break
+      fi
+      sleep 3
+    done
+    if [ "$reconciled" -eq 0 ]; then
+      echo "ROLLBACK_NOTICE: receipt reconciliation timeout elapsed"
+    fi
+    current_live_compose stop -t 30 live-executor ||
+      fail "autonomous LIVE executor could not be stopped"
+  fi
+fi
+python3 "$deploy_dir/production_mode.py" shadow --env-file "$env_file" ||
+  fail "SHADOW production mode could not be restored"
+
 python3 "$deploy_dir/release_assets.py" verify-tree \
   --root "$release_assets_root" \
   --manifest "$release_assets_root/release-assets-manifest.json" \
@@ -62,8 +114,6 @@ PHOENIX_ENV_FILE="$env_file" \
 [ -s "$deploy_dir/release-assets.sha" ] || fail "rollback release-assets marker is missing"
 installed_assets_sha=$(tr -d '\r\n' <"$deploy_dir/release-assets.sha")
 [ "$installed_assets_sha" = "$release_sha" ] || fail "rollback release-assets marker is invalid"
-mkdir -p "$runtime_dir"
-chmod 0700 "$runtime_dir"
 python3 "$deploy_dir/production_context.py" manifest-env \
   --manifest "$manifest" \
   --expected-sha "$release_sha" \

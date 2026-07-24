@@ -52,9 +52,7 @@ EXPECTED_SERVICES = (
     "prometheus",
 )
 
-RUNNING_SERVICES = tuple(
-    service for service in EXPECTED_SERVICES if service != "migration-runner"
-)
+LIVE_EXPECTED_SERVICES = EXPECTED_SERVICES + ("live-executor",)
 
 RENDERED_OWNED_IMAGES = {
     service: component["image_environment"]
@@ -393,10 +391,15 @@ def validate_render(args: argparse.Namespace) -> None:
     if not isinstance(compose, dict) or not isinstance(compose.get("services"), dict):
         raise ContextError("PRODUCTION_COMPOSE_CONTEXT_MISSING")
     services = compose["services"]
-    if any(service not in services for service in EXPECTED_SERVICES):
-        raise ContextError("PRODUCTION_COMPOSE_CONTEXT_MISSING")
-
     operator_env = read_env(Path(args.env_file), "PRODUCTION_ENV_MISSING")
+    autonomous_live = (
+        operator_env.get("PHOENIX_MODE") == "LIVE"
+        and operator_env.get("LIVE_EXECUTION") == "true"
+        and operator_env.get("AUTONOMOUS_EXECUTION") == "true"
+    )
+    expected_services = LIVE_EXPECTED_SERVICES if autonomous_live else EXPECTED_SERVICES
+    if any(service not in services for service in expected_services):
+        raise ContextError("PRODUCTION_COMPOSE_CONTEXT_MISSING")
     release_env = read_env(Path(args.release_env), "RELEASE_ENV_MISSING")
     release_sha = None
     references = None
@@ -408,7 +411,7 @@ def validate_render(args: argparse.Namespace) -> None:
         raise ContextError("RELEASE_IMAGE_MISMATCH")
 
     images: dict[str, str] = {}
-    for service in EXPECTED_SERVICES:
+    for service in expected_services:
         service_config = services.get(service)
         if not isinstance(service_config, dict):
             raise ContextError("PRODUCTION_COMPOSE_CONTEXT_MISSING")
@@ -421,7 +424,11 @@ def validate_render(args: argparse.Namespace) -> None:
             raise ContextError("RELEASE_IMAGE_MISMATCH")
         images[service] = image
 
-    for service, env_name in RENDERED_OWNED_IMAGES.items():
+    rendered_owned_images = dict(RENDERED_OWNED_IMAGES)
+    if autonomous_live:
+        for _, (env_name, service) in OPTIONAL_LIVE_IMAGES.items():
+            rendered_owned_images[service] = env_name
+    for service, env_name in rendered_owned_images.items():
         if images[service] != release_images[env_name]:
             raise ContextError("RELEASE_IMAGE_MISMATCH")
     for service, expected in EXTERNAL_IMAGES.items():
@@ -465,26 +472,97 @@ def validate_render(args: argparse.Namespace) -> None:
         "RECORDER_PERSISTENCE_POLICY"
     ) != "money_path_v1":
         raise ContextError("RECORDER_PERSISTENCE_POLICY_INVALID")
-    if operator_env.get("PHOENIX_MODE") != "SHADOW" or any(
-        environment.get("PHOENIX_MODE") != "SHADOW"
-        for environment in (engine_env, dispatcher_env, recorder_env)
-    ):
-        raise ContextError("SHADOW_MODE_REQUIRED")
-    if operator_env.get("LIVE_EXECUTION") != "false" or any(
-        str(environment.get("LIVE_EXECUTION", "")).lower() != "false"
-        for environment in (engine_env, dispatcher_env, recorder_env)
-    ):
-        raise ContextError("LIVE_EXECUTION_MUST_BE_FALSE")
-    for name, code in (
-        ("SIGNER_PRIVATE_KEY", "SIGNER_MUST_BE_EMPTY"),
-        ("WALLET_ADDRESS", "WALLET_MUST_BE_EMPTY"),
-        ("EXECUTOR_ADDRESS", "EXECUTOR_MUST_BE_EMPTY"),
-    ):
-        if operator_env.get(name, "") != "" or any(
-            environment.get(name, "") != ""
+    if autonomous_live:
+        live_env = service_environment(services, "live-executor")
+        if (
+            engine_env.get("PHOENIX_MODE") != "LIVE"
+            or str(engine_env.get("LIVE_EXECUTION", "")).lower() != "true"
+            or str(engine_env.get("AUTONOMOUS_EXECUTION", "")).lower() != "true"
+        ):
+            raise ContextError("AUTONOMOUS_LIVE_MODE_REQUIRED")
+        if any(
+            environment.get("PHOENIX_MODE") != "SHADOW"
+            or str(environment.get("LIVE_EXECUTION", "")).lower() != "false"
+            for environment in (dispatcher_env, recorder_env)
+        ):
+            raise ContextError("NON_EXECUTING_SERVICE_MODE_INVALID")
+        if (
+            live_env.get("PHOENIX_MODE") != "LIVE"
+            or str(live_env.get("LIVE_EXECUTION", "")).lower() != "true"
+            or str(live_env.get("AUTONOMOUS_EXECUTION", "")).lower() != "true"
+            or str(live_env.get("LIVE_EXECUTOR_ARMED", "")).lower() != "true"
+            or str(live_env.get("LIVE_EXECUTOR_KILL_SWITCH", "")).lower() != "false"
+            or str(live_env.get("LIVE_EXECUTOR_ONE_TRANSACTION_AT_A_TIME", "")).lower()
+            != "true"
+        ):
+            raise ContextError("AUTONOMOUS_EXECUTOR_CONTROL_INVALID")
+        if operator_env.get("SIGNER_PRIVATE_KEY", "") != "" or any(
+            environment.get("SIGNER_PRIVATE_KEY", "") != ""
+            for environment in (engine_env, dispatcher_env, recorder_env, live_env)
+        ):
+            raise ContextError("SIGNER_MUST_BE_EMPTY")
+        if (
+            live_env.get("WALLET_ADDRESS")
+            != operator_env.get("LIVE_EXECUTOR_WALLET_ADDRESS")
+            or live_env.get("EXECUTOR_ADDRESS")
+            != operator_env.get("LIVE_EXECUTOR_EXECUTOR_ADDRESS")
+            or engine_env.get("EXECUTOR_ADDRESS")
+            != operator_env.get("LIVE_EXECUTOR_EXECUTOR_ADDRESS")
+            or live_env.get("LIVE_EXECUTOR_EXECUTOR_CODE_HASH")
+            != operator_env.get("LIVE_EXECUTOR_EXECUTOR_CODE_HASH")
+            or live_env.get("LIVE_EXECUTOR_EXPECTED_OWNER")
+            != operator_env.get("LIVE_EXECUTOR_EXPECTED_OWNER")
+            or live_env.get("LIVE_EXECUTOR_EXPECTED_FLASH_PROVIDER")
+            != operator_env.get("LIVE_EXECUTOR_EXPECTED_FLASH_PROVIDER")
+            or live_env.get("PRODUCTION_RPC_URL")
+            != operator_env.get("PRODUCTION_RPC_URL")
+            or live_env.get("SECONDARY_RPC_URL")
+            != operator_env.get("SECONDARY_RPC_URL")
+        ):
+            raise ContextError("AUTONOMOUS_EXECUTOR_IDENTITY_MISMATCH")
+        signer_target = "/run/secrets/phoenix-live-executor-signer"
+        if live_env.get("SIGNER_PRIVATE_KEY_FILE") != signer_target:
+            raise ContextError("SIGNER_FILE_INVALID")
+        signer_mounts = [
+            mount
+            for mount in services["live-executor"].get("volumes", [])
+            if isinstance(mount, dict) and mount.get("target") == signer_target
+        ]
+        if (
+            len(signer_mounts) != 1
+            or signer_mounts[0].get("type") != "bind"
+            or signer_mounts[0].get("source")
+            != operator_env.get("LIVE_EXECUTOR_SIGNER_FILE")
+            or signer_mounts[0].get("read_only") is not True
+            or services["live-executor"].get("read_only") is not True
+            or services["live-executor"].get("user") != "65532:65532"
+            or services["live-executor"].get("cap_drop") != ["ALL"]
+            or "no-new-privileges:true"
+            not in services["live-executor"].get("security_opt", [])
+            or services["live-executor"].get("restart") != "unless-stopped"
+        ):
+            raise ContextError("AUTONOMOUS_EXECUTOR_CONTAINMENT_INVALID")
+    else:
+        if operator_env.get("PHOENIX_MODE") != "SHADOW" or any(
+            environment.get("PHOENIX_MODE") != "SHADOW"
             for environment in (engine_env, dispatcher_env, recorder_env)
         ):
-            raise ContextError(code)
+            raise ContextError("SHADOW_MODE_REQUIRED")
+        if operator_env.get("LIVE_EXECUTION") != "false" or any(
+            str(environment.get("LIVE_EXECUTION", "")).lower() != "false"
+            for environment in (engine_env, dispatcher_env, recorder_env)
+        ):
+            raise ContextError("LIVE_EXECUTION_MUST_BE_FALSE")
+        for name, code in (
+            ("SIGNER_PRIVATE_KEY", "SIGNER_MUST_BE_EMPTY"),
+            ("WALLET_ADDRESS", "WALLET_MUST_BE_EMPTY"),
+            ("EXECUTOR_ADDRESS", "EXECUTOR_MUST_BE_EMPTY"),
+        ):
+            if operator_env.get(name, "") != "" or any(
+                environment.get(name, "") != ""
+                for environment in (engine_env, dispatcher_env, recorder_env)
+            ):
+                raise ContextError(code)
 
     rpc_env = service_environment(services, "rpc-gateway")
     try:
@@ -495,11 +573,12 @@ def validate_render(args: argparse.Namespace) -> None:
         raise ContextError("RPC_STATE_BUDGET_TOO_LOW")
 
     metadata = {
+        "autonomous_execution": autonomous_live,
         "chain_id": 42161,
-        "expected_services": list(EXPECTED_SERVICES),
+        "expected_services": list(expected_services),
         "images": images,
-        "live_execution": False,
-        "mode": "SHADOW",
+        "live_execution": autonomous_live,
+        "mode": "LIVE" if autonomous_live else "SHADOW",
         "release_sha": release_sha,
         "route_count": len(json.loads(expected_route_raw)),
         "route_registry_hash": route_hash,
@@ -534,11 +613,14 @@ def state_payload(args: argparse.Namespace) -> dict:
     if metadata.get("release_sha") != release_sha:
         raise ContextError("RELEASE_IMAGE_MISMATCH")
     return {
+        "autonomous_execution": metadata.get("autonomous_execution", False),
         "compose_config_sha256": sha256_file(
             Path(args.compose_config), "PRODUCTION_COMPOSE_CONTEXT_MISSING"
         ),
         "images": metadata["images"],
         "manifest_sha256": sha256_file(Path(args.manifest), "RELEASE_MANIFEST_MISSING"),
+        "live_execution": metadata.get("live_execution", False),
+        "mode": metadata.get("mode", "SHADOW"),
         "release_env_sha256": sha256_file(Path(args.release_env), "RELEASE_ENV_MISSING"),
         "release_sha": release_sha,
         "route_registry_hash": metadata["route_registry_hash"],
@@ -610,7 +692,11 @@ def validate_active(args: argparse.Namespace) -> None:
     ):
         raise ContextError("RUNNING_IMAGE_MISMATCH")
     running_services = running["services"]
-    for service in RUNNING_SERVICES:
+    for service in (
+        service
+        for service in expected_state["images"]
+        if service != "migration-runner"
+    ):
         item = running_services.get(service)
         expected_image = expected_state["images"].get(service)
         if not isinstance(item, dict) or not isinstance(expected_image, str):
@@ -625,9 +711,10 @@ def validate_active(args: argparse.Namespace) -> None:
             raise ContextError("RUNNING_IMAGE_MISMATCH")
 
     result = {
+        "autonomous_execution": expected_state["autonomous_execution"],
         "chain_id": 42161,
-        "live_execution": False,
-        "mode": "SHADOW",
+        "live_execution": expected_state["live_execution"],
+        "mode": expected_state["mode"],
         "release_sha": expected_state["release_sha"],
         "route_registry_hash": expected_state["route_registry_hash"],
         "schema": "phoenix.release-context.v1",

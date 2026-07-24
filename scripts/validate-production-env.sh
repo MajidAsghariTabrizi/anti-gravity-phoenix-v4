@@ -69,6 +69,25 @@ trim_value() {
   printf '%s' "$1" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//'
 }
 
+csv_contains_exact() {
+  expected=$1
+  rest=$2
+  while :; do
+    case "$rest" in
+      *,*)
+        item=$(trim_value "${rest%%,*}")
+        rest=${rest#*,}
+        ;;
+      *)
+        item=$(trim_value "$rest")
+        rest=
+        ;;
+    esac
+    [ "$item" = "$expected" ] && return 0
+    [ -z "$rest" ] && return 1
+  done
+}
+
 validate_positive_integer() {
   name="$1"
   value="$2"
@@ -228,8 +247,6 @@ do
 done
 
 [ "${PHOENIX_ENV:-}" = "production" ] || fail "PHOENIX_ENV must be production"
-[ "${PHOENIX_MODE:-}" = "SHADOW" ] || fail "PHOENIX_MODE must be SHADOW"
-[ "${LIVE_EXECUTION:-}" = "false" ] || fail "LIVE_EXECUTION must be false for shadow production"
 [ "${CHAIN_ID:-}" = "42161" ] || fail "CHAIN_ID must be 42161"
 [ "${PHOENIX_FEED_SOURCE:-}" = "relay" ] || fail "PHOENIX_FEED_SOURCE must be relay"
 [ "${RECORDER_PERSISTENCE_POLICY:-}" = "money_path_v1" ] ||
@@ -271,16 +288,83 @@ validate_rpc_providers
 validate_engine_routers
 validate_postgres_consistency
 
-[ -z "${SIGNER_PRIVATE_KEY:-}" ] || fail "SIGNER_PRIVATE_KEY must be empty in SHADOW production"
-[ -z "${WALLET_ADDRESS:-}" ] || fail "WALLET_ADDRESS must be empty in SHADOW production"
-[ -z "${EXECUTOR_ADDRESS:-}" ] || fail "EXECUTOR_ADDRESS must be empty in SHADOW production"
+if [ "${PHOENIX_MODE:-}" = LIVE ]; then
+  for name in \
+    AUTONOMOUS_EXECUTION \
+    PRODUCTION_RPC_URL \
+    SECONDARY_RPC_URL \
+    LIVE_EXECUTOR_RPC_ALLOWLIST \
+    LIVE_EXECUTOR_SIGNER_FILE \
+    LIVE_EXECUTOR_WALLET_ADDRESS \
+    LIVE_EXECUTOR_EXECUTOR_ADDRESS \
+    LIVE_EXECUTOR_EXECUTOR_CODE_HASH \
+    LIVE_EXECUTOR_EXPECTED_OWNER \
+    LIVE_EXECUTOR_EXPECTED_FLASH_PROVIDER \
+    LIVE_EXECUTOR_PNL_ASSET_ADDRESS \
+    LIVE_EXECUTOR_MAX_GAS_LIMIT \
+    LIVE_EXECUTOR_MAX_MAX_FEE_PER_GAS_WEI \
+    LIVE_EXECUTOR_MAX_PRIORITY_FEE_PER_GAS_WEI \
+    LIVE_EXECUTOR_MAX_INPUT_AMOUNT \
+    LIVE_EXECUTOR_MIN_EXPECTED_PROFIT \
+    LIVE_EXECUTOR_MAX_DAILY_LOSS_WEI \
+    LIVE_EXECUTOR_RECEIPT_TIMEOUT_SECONDS \
+    LIVE_EXECUTOR_POLL_INTERVAL_SECONDS
+  do
+    require_var "$name"
+  done
+  [ "${LIVE_EXECUTION:-}" = true ] ||
+    fail "LIVE_EXECUTION must be true for autonomous LIVE production"
+  [ "${AUTONOMOUS_EXECUTION:-}" = true ] ||
+    fail "AUTONOMOUS_EXECUTION must be true for autonomous LIVE production"
+  [ "$(csv_count "${RPC_PROVIDER_URLS:-}")" -ge 2 ] ||
+    fail "autonomous LIVE requires at least two RPC providers"
+  [ "${PRODUCTION_RPC_URL:-}" != "${SECONDARY_RPC_URL:-}" ] ||
+    fail "primary and secondary RPC URLs must be independent"
+  csv_contains_exact "$PRODUCTION_RPC_URL" "$LIVE_EXECUTOR_RPC_ALLOWLIST" ||
+    fail "LIVE_EXECUTOR_RPC_ALLOWLIST must contain PRODUCTION_RPC_URL exactly"
+  csv_contains_exact "$SECONDARY_RPC_URL" "$LIVE_EXECUTOR_RPC_ALLOWLIST" ||
+    fail "LIVE_EXECUTOR_RPC_ALLOWLIST must contain SECONDARY_RPC_URL exactly"
+  [ -z "${SIGNER_PRIVATE_KEY:-}" ] ||
+    fail "SIGNER_PRIVATE_KEY must be empty in autonomous LIVE production"
+  require_shape PRODUCTION_RPC_URL '^https://.+'
+  require_shape SECONDARY_RPC_URL '^https://.+'
+  require_shape LIVE_EXECUTOR_SIGNER_FILE '^/.+'
+  require_shape LIVE_EXECUTOR_WALLET_ADDRESS '^0x[0-9a-f]{40}$'
+  require_shape LIVE_EXECUTOR_EXECUTOR_ADDRESS '^0x[0-9a-f]{40}$'
+  require_shape LIVE_EXECUTOR_EXECUTOR_CODE_HASH '^[0-9a-f]{64}$'
+  require_shape LIVE_EXECUTOR_EXPECTED_OWNER '^0x[0-9a-f]{40}$'
+  require_shape LIVE_EXECUTOR_EXPECTED_FLASH_PROVIDER '^0x[0-9a-f]{40}$'
+  require_shape LIVE_EXECUTOR_PNL_ASSET_ADDRESS '^0x[0-9a-f]{40}$'
+  for name in \
+    LIVE_EXECUTOR_MAX_GAS_LIMIT \
+    LIVE_EXECUTOR_MAX_MAX_FEE_PER_GAS_WEI \
+    LIVE_EXECUTOR_MAX_PRIORITY_FEE_PER_GAS_WEI \
+    LIVE_EXECUTOR_MAX_INPUT_AMOUNT \
+    LIVE_EXECUTOR_MIN_EXPECTED_PROFIT \
+    LIVE_EXECUTOR_MAX_DAILY_LOSS_WEI \
+    LIVE_EXECUTOR_RECEIPT_TIMEOUT_SECONDS \
+    LIVE_EXECUTOR_POLL_INTERVAL_SECONDS
+  do
+    eval "value=\${$name:-}"
+    validate_positive_integer "$name" "$value"
+  done
+else
+  [ "${PHOENIX_MODE:-}" = "SHADOW" ] || fail "PHOENIX_MODE must be SHADOW or LIVE"
+  [ "${LIVE_EXECUTION:-}" = "false" ] ||
+    fail "LIVE_EXECUTION must be false for shadow production"
+  [ -z "${SIGNER_PRIVATE_KEY:-}" ] ||
+    fail "SIGNER_PRIVATE_KEY must be empty in SHADOW production"
+  [ -z "${WALLET_ADDRESS:-}" ] || fail "WALLET_ADDRESS must be empty in SHADOW production"
+  [ -z "${EXECUTOR_ADDRESS:-}" ] ||
+    fail "EXECUTOR_ADDRESS must be empty in SHADOW production"
+fi
 
 if [ "$failed" -ne 0 ]; then
   exit 1
 fi
 
-ok "Phoenix mode: SHADOW"
-ok "Live execution disabled"
+ok "Phoenix mode: ${PHOENIX_MODE}"
+ok "Live execution: ${LIVE_EXECUTION}"
 ok "Chain ID: 42161"
 ok "Feed source: relay"
 ok "Sequencer feed configured"
@@ -294,5 +378,10 @@ ok "Recorder persistence policy: money_path_v1"
 ok "Parent-chain RPC configured"
 ok "Arbitrum RPC configured"
 ok "PostgreSQL configuration consistent"
-ok "LIVE-only signer, wallet, and executor configuration empty"
-echo "ENV_VALID: required SHADOW variables are present and shaped correctly"
+if [ "${PHOENIX_MODE}" = LIVE ]; then
+  ok "Autonomous LIVE identity, signer path, RPC, and limits configured"
+  echo "ENV_VALID: required autonomous LIVE variables are present and shaped correctly"
+else
+  ok "LIVE-only signer, wallet, and executor configuration empty"
+  echo "ENV_VALID: required SHADOW variables are present and shaped correctly"
+fi

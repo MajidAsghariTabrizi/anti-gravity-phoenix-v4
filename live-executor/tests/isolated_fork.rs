@@ -114,6 +114,7 @@ fn deliberately_reverting_request(executor_address: CanonicalAddress) -> Executi
             ValidatedLeg {
                 pool: CanonicalAddress::parse("0x5555555555555555555555555555555555555555")
                     .expect("pool"),
+                factory: None,
                 token_in: flash_asset,
                 token_out: token_b,
                 fee: 500,
@@ -123,6 +124,7 @@ fn deliberately_reverting_request(executor_address: CanonicalAddress) -> Executi
             ValidatedLeg {
                 pool: CanonicalAddress::parse("0x6666666666666666666666666666666666666666")
                     .expect("pool"),
+                factory: None,
                 token_in: token_b,
                 token_out: flash_asset,
                 fee: 500,

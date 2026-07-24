@@ -98,4 +98,45 @@ for live_only_name in SIGNER_PRIVATE_KEY WALLET_ADDRESS EXECUTOR_ADDRESS; do
   printf '%s' "$output" | grep -q "$live_only_name must be empty in SHADOW production"
 done
 
+live_env="$tmp_dir/live.env"
+sed \
+  -e 's/^PHOENIX_MODE=SHADOW$/PHOENIX_MODE=LIVE/' \
+  -e 's/^LIVE_EXECUTION=false$/LIVE_EXECUTION=true/' \
+  "$valid_env" >"$live_env"
+cat >>"$live_env" <<'ENV'
+AUTONOMOUS_EXECUTION=true
+PRODUCTION_RPC_URL=https://credential-bearing-rpc.example/private-token
+SECONDARY_RPC_URL=https://arbitrum.drpc.org
+LIVE_EXECUTOR_RPC_ALLOWLIST=https://credential-bearing-rpc.example/private-token,https://arbitrum.drpc.org
+LIVE_EXECUTOR_SIGNER_FILE=/run/secrets/phoenix-live-executor-signer
+LIVE_EXECUTOR_WALLET_ADDRESS=0x1111111111111111111111111111111111111111
+LIVE_EXECUTOR_EXECUTOR_ADDRESS=0x2222222222222222222222222222222222222222
+LIVE_EXECUTOR_EXECUTOR_CODE_HASH=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+LIVE_EXECUTOR_EXPECTED_OWNER=0x3333333333333333333333333333333333333333
+LIVE_EXECUTOR_EXPECTED_FLASH_PROVIDER=0x4444444444444444444444444444444444444444
+LIVE_EXECUTOR_PNL_ASSET_ADDRESS=0x82af49447d8a07e3bd95bd0d56f35241523fbab1
+LIVE_EXECUTOR_MAX_GAS_LIMIT=500000
+LIVE_EXECUTOR_MAX_MAX_FEE_PER_GAS_WEI=10000000000
+LIVE_EXECUTOR_MAX_PRIORITY_FEE_PER_GAS_WEI=2000000000
+LIVE_EXECUTOR_MAX_INPUT_AMOUNT=100000000000000
+LIVE_EXECUTOR_MIN_EXPECTED_PROFIT=1000000000000
+LIVE_EXECUTOR_MAX_DAILY_LOSS_WEI=10000000000000000
+LIVE_EXECUTOR_RECEIPT_TIMEOUT_SECONDS=180
+LIVE_EXECUTOR_POLL_INTERVAL_SECONDS=1
+ENV
+output=$("$validator" "$live_env" 2>&1)
+assert_redacted "$output"
+printf '%s' "$output" | grep -q 'required autonomous LIVE variables'
+
+bad_allowlist="$tmp_dir/live-bad-allowlist.env"
+sed \
+  's#LIVE_EXECUTOR_RPC_ALLOWLIST=.*#LIVE_EXECUTOR_RPC_ALLOWLIST=https://credential-bearing-rpc.example/private-token#' \
+  "$live_env" >"$bad_allowlist"
+if output=$("$validator" "$bad_allowlist" 2>&1); then
+  echo "expected incomplete autonomous RPC allowlist to fail"
+  exit 1
+fi
+assert_redacted "$output"
+printf '%s' "$output" | grep -q 'must contain SECONDARY_RPC_URL exactly'
+
 echo "validate-production-env-tests: ok"

@@ -67,6 +67,10 @@ async fn nonce_allocation_and_pending_state_survive_restart() {
     .execute(&pool)
     .await
     .expect("apply autonomous Hunter contract schema");
+    sqlx::raw_sql(include_str!("../schema/004_autonomous_live_runtime.sql"))
+        .execute(&pool)
+        .await
+        .expect("apply autonomous LIVE runtime schema");
 
     let signer = TransactionSigner::from_secret(&hex::encode([13_u8; 32]), ARBITRUM_ONE_CHAIN_ID)
         .expect("signer");
@@ -81,6 +85,15 @@ async fn nonce_allocation_and_pending_state_survive_restart() {
     .execute(&pool)
     .await
     .expect("arm isolated database");
+    sqlx::query(
+        "UPDATE live_canary.autonomous_global_control
+         SET armed = true, kill_switch = false, execution_mode = 'live',
+             disarm_reason = NULL
+         WHERE singleton",
+    )
+    .execute(&pool)
+    .await
+    .expect("arm isolated autonomous control");
 
     let now = Utc::now();
     let first = request(Uuid::from_u128(10), now, config.pnl_asset_address);
@@ -255,6 +268,7 @@ async fn nonce_allocation_and_pending_state_survive_restart() {
         gas_used: 10,
         effective_gas_price: 10,
         actual_fee_wei: 100,
+        actual_l1_cost_wei: 0,
         settlement: Settlement {
             asset: config.pnl_asset_address,
             flash_amount: second.flash_amount,
@@ -297,6 +311,7 @@ async fn nonce_allocation_and_pending_state_survive_restart() {
         gas_used: 10,
         effective_gas_price: 10,
         actual_fee_wei: 100,
+        actual_l1_cost_wei: 0,
         settlement: Settlement {
             asset: config.pnl_asset_address,
             flash_amount: third.flash_amount,
@@ -738,6 +753,7 @@ fn request(
         legs: vec![
             ValidatedLeg {
                 pool: CanonicalAddress::parse(CURRENT_ROUTE_POOL_500_ADDRESS).expect("pool"),
+                factory: None,
                 token_in: flash_asset,
                 token_out: token_b,
                 fee: 500,
@@ -746,6 +762,7 @@ fn request(
             },
             ValidatedLeg {
                 pool: CanonicalAddress::parse(CURRENT_ROUTE_POOL_3000_ADDRESS).expect("pool"),
+                factory: None,
                 token_in: token_b,
                 token_out: flash_asset,
                 fee: 3_000,

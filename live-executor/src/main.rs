@@ -1,3 +1,6 @@
+use phoenix_live_executor::autonomous::{
+    AutonomousMaterializer, AutonomousMaterializerError, MaterializationState,
+};
 use phoenix_live_executor::config::{Bootstrap, DisabledReason};
 use phoenix_live_executor::engine::LiveExecutor;
 use phoenix_live_executor::rpc::HttpExecutionRpc;
@@ -61,6 +64,17 @@ async fn main() {
             std::process::exit(1);
         }
     };
+    let materializer = match AutonomousMaterializer::connect(config.clone(), rpc.clone()).await {
+        Ok(materializer) => materializer,
+        Err(_) => {
+            let _ = store.disarm("autonomous_materializer_startup").await;
+            error!(
+                error_code = "autonomous_materializer_startup",
+                "live executor failed closed"
+            );
+            std::process::exit(1);
+        }
+    };
     let executor = LiveExecutor::new(config, signer, store.clone(), rpc);
     info!(
         state = "started_disarmed_until_db_gate",
@@ -68,7 +82,44 @@ async fn main() {
     );
 
     loop {
-        match executor.step(chrono::Utc::now()).await {
+        let now = chrono::Utc::now();
+        match materializer.step(now).await {
+            Ok(MaterializationState::Idle) => {}
+            Ok(MaterializationState::Materialized { .. }) => {
+                info!(
+                    state = "request_materialized",
+                    "autonomous request materialized"
+                );
+            }
+            Ok(MaterializationState::Rejected { reason, .. }) => {
+                info!(
+                    state = "candidate_rejected",
+                    reason, "autonomous candidate rejected"
+                );
+            }
+            Err(AutonomousMaterializerError::Dependency) => {
+                error!(
+                    error_code = "autonomous_dependency",
+                    "autonomous materializer dependency unavailable"
+                );
+            }
+            Err(AutonomousMaterializerError::Policy) => {
+                info!(
+                    state = "candidate_rejected",
+                    reason = "policy",
+                    "autonomous candidate rejected"
+                );
+            }
+            Err(_) => {
+                let _ = store.disarm("autonomous_materializer_integrity").await;
+                error!(
+                    error_code = "autonomous_materializer_integrity",
+                    "live executor failed closed"
+                );
+                std::process::exit(1);
+            }
+        }
+        match executor.step(now).await {
             Ok(state) => info!(state = state.code(), "live executor state transition"),
             Err(_) => {
                 let _ = store.disarm("executor_runtime_failure").await;

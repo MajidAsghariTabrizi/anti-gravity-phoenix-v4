@@ -1,3 +1,4 @@
+use crate::autonomous::AutonomousHunterProcessor;
 use crate::domain::{Address, Amount, Direction, PoolId, RouteId, TokenAddress};
 use crate::engine_input::{EngineClassification, EngineInput};
 use crate::graph::{PoolEdge, PoolGraph, Route};
@@ -253,6 +254,7 @@ pub struct ShadowProcessor {
     detector: OriginDetector,
     routes: RouteRegistry,
     evaluator: Arc<dyn CandidateEvaluator>,
+    autonomous: Option<Arc<AutonomousHunterProcessor>>,
 }
 
 impl std::fmt::Debug for ShadowProcessor {
@@ -275,11 +277,17 @@ impl ShadowProcessor {
             detector: OriginDetector::new(routers)?,
             routes,
             evaluator,
+            autonomous: None,
         })
     }
 
+    pub fn with_autonomous(mut self, autonomous: Arc<AutonomousHunterProcessor>) -> Self {
+        self.autonomous = Some(autonomous);
+        self
+    }
+
     pub fn strategy_configured(&self) -> bool {
-        !self.routes.is_empty()
+        !self.routes.is_empty() || self.autonomous.is_some()
     }
 
     pub async fn process(&self, input: &EngineInput) -> ProcessResult {
@@ -334,6 +342,12 @@ impl ShadowProcessor {
             }
         };
         let origin_evidence = origin.classification_evidence.clone();
+        if let Some(autonomous) = &self.autonomous {
+            return autonomous
+                .process(input, &origin)
+                .await
+                .with_origin_metric(origin_metric);
+        }
         let routes = self.routes.affected_routes(&origin.candidate_touched_pools);
         if routes.is_empty() {
             return ProcessResult::no_route(

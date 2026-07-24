@@ -17,6 +17,10 @@ path = "src/main.rs"
 name = "approve-execution-request"
 path = "src/approve_execution_request_main.rs"
 
+[[bin]]
+name = "autonomous-live-control"
+path = "src/autonomous_live_control_main.rs"
+
 [dependencies]
 alloy-consensus = { version = "=0.6.4", default-features = false, features = ["std", "k256"] }
 alloy-eips = { version = "=0.6.4", default-features = false, features = ["std"] }

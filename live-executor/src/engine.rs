@@ -67,6 +67,44 @@ where
         let Some(request) = self.store.claim_approved(&self.config, now).await? else {
             return Ok(ExecutionState::ArmedIdle);
         };
+        match self
+            .rpc
+            .execution_contract_ready(
+                &request,
+                self.config.wallet_address,
+                &self.config.executor_code_hash,
+            )
+            .await
+        {
+            Ok(true) => {}
+            Ok(false) => {
+                self.store
+                    .mark_terminal(
+                        request.id,
+                        AttemptStatus::Failed,
+                        Some("unexpected_executor_state"),
+                        None,
+                        now,
+                    )
+                    .await?;
+                self.store.disarm("unexpected_executor_state").await?;
+                return Ok(ExecutionState::Disarmed {
+                    reason: DisarmReason::Policy,
+                });
+            }
+            Err(_error) => {
+                self.store
+                    .mark_terminal(
+                        request.id,
+                        AttemptStatus::Failed,
+                        Some("executor_state_rpc_failure"),
+                        None,
+                        now,
+                    )
+                    .await?;
+                return Ok(ExecutionState::ArmedIdle);
+            }
+        }
         let calldata = match validate_and_encode(&request, &self.config, now) {
             Ok(calldata) => calldata,
             Err(error) => {
@@ -116,6 +154,7 @@ where
                 return Err(EngineError::Signer(error));
             }
         };
+        self.store.mark_signed(request.id, now).await?;
 
         let control = self.store.control_state().await?;
         if !control.armed || control.kill_switch {
@@ -345,6 +384,15 @@ where
         let actual_fee_wei = u128::from(receipt.gas_used)
             .checked_mul(receipt.effective_gas_price)
             .ok_or(EngineError::Arithmetic)?;
+        if receipt.l1_fee > actual_fee_wei {
+            self.store
+                .record_monitor_error(request.id, "receipt_l1_economics_invalid")
+                .await?;
+            self.store.disarm("receipt_l1_economics_invalid").await?;
+            return Ok(ExecutionState::Disarmed {
+                reason: DisarmReason::Settlement,
+            });
+        }
         let fee = i128::try_from(actual_fee_wei).map_err(|_| EngineError::Arithmetic)?;
         if receipt.status == 0 {
             let outcome = ReceiptOutcome {
@@ -354,6 +402,7 @@ where
                 gas_used: receipt.gas_used,
                 effective_gas_price: receipt.effective_gas_price,
                 actual_fee_wei,
+                actual_l1_cost_wei: receipt.l1_fee,
                 settlement: Settlement {
                     asset: self.config.pnl_asset_address,
                     flash_amount: request.flash_amount,
@@ -371,7 +420,6 @@ where
                     now,
                 )
                 .await?;
-            self.store.disarm("transaction_reverted").await?;
             return Ok(ExecutionState::Reverted {
                 request_id: request.id,
                 tx_hash,
@@ -408,6 +456,7 @@ where
             gas_used: receipt.gas_used,
             effective_gas_price: receipt.effective_gas_price,
             actual_fee_wei,
+            actual_l1_cost_wei: receipt.l1_fee,
             settlement,
             net_pnl_wei: realized_profit
                 .checked_sub(fee)
