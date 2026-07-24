@@ -16,6 +16,8 @@ LIVE_CANARY_ASSETS = (
     "live-executor/schema/001_live_canary.sql",
     "live-executor/schema/002_approval_evidence.sql",
     "live-executor/schema/003_autonomous_hunter_contracts.sql",
+    "live-executor/schema/004_autonomous_live_runtime.sql",
+    "compose.live-autonomous.yml",
 )
 
 
@@ -68,6 +70,10 @@ class ReleaseAssetsTests(unittest.TestCase):
             self.assertIn("scripts/prelive_protected_maintenance.py", paths)
             self.assertIn("scripts/provision-production-host.sh", paths)
             self.assertIn("scripts/install-production-release-context.sh", paths)
+            self.assertIn("scripts/install-autonomous-live-deploy-gateway.sh", paths)
+            self.assertIn("scripts/phoenix-autonomous-live-deploy-gateway.sh", paths)
+            self.assertIn("scripts/production_mode.py", paths)
+            self.assertIn("docs/AUTONOMOUS_LIVE_OPERATIONS.md", paths)
             self.assertIn("scripts/prelive-protected-maintenance-launch.sh", paths)
             self.assertIn("scripts/prelive-protected-maintenance-unit.sh", paths)
             self.assertIn("scripts/prelive-v5-fresh-database-gate.sh", paths)
