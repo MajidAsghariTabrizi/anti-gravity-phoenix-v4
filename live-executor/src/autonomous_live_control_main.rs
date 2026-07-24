@@ -691,7 +691,7 @@ async fn activate(pool: &PgPool) -> Result<(), &'static str> {
     sqlx::query(
         "UPDATE live_canary.control
          SET armed = true, kill_switch = false, disarm_reason = 'armed',
-             updated_at = $1
+             updated_at = $1::timestamptz
          WHERE singleton",
     )
     .bind(&updated_at)
@@ -704,7 +704,7 @@ async fn activate(pool: &PgPool) -> Result<(), &'static str> {
              maximum_input_amount = $1::numeric, daily_loss_limit = $2::numeric,
              daily_ordering_budget = 0, maximum_concurrent_candidates = 1,
              control_epoch = $3, disarm_reason = NULL, control_hash = $4,
-             control_contract = $5, updated_at = $6
+             control_contract = $5, updated_at = $6::timestamptz
          WHERE singleton",
     )
     .bind(maximum_input.to_string())
@@ -723,7 +723,7 @@ async fn activate(pool: &PgPool) -> Result<(), &'static str> {
             control_epoch, disarm_reason, control_hash, control_contract, updated_at
          ) VALUES (
             $1, $2, true, false, '0.25x', $3::numeric, NULL,
-            $4, NULL, $5, $6, $7
+            $4, NULL, $5, $6, $7::timestamptz
          )
          ON CONFLICT (route_fingerprint) DO UPDATE SET
             route_policy_hash = EXCLUDED.route_policy_hash,
