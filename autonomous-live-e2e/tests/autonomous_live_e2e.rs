@@ -261,10 +261,9 @@ async fn event_to_hunter_to_persisted_outcome_is_exactly_once() {
         .expect("deduplicate candidate"));
     sqlx::query(
         "UPDATE live_canary.autonomous_candidates
-         SET candidate_expires_at = $1
-         WHERE candidate_id::text = $2",
+         SET candidate_expires_at = candidate_created_at + interval '1 microsecond'
+         WHERE candidate_id::text = $1",
     )
-    .bind(Utc::now() - ChronoDuration::seconds(1))
     .bind(text(&artifact.contract, "candidate_id"))
     .execute(&pool)
     .await
