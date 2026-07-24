@@ -96,7 +96,7 @@ then
   exit 0
 fi
 
-for command_name in docker python3 sha256sum stat find; do
+for command_name in docker python3 setpriv sha256sum stat find; do
   command -v "$command_name" >/dev/null 2>&1 ||
     fail "integration command is unavailable: $command_name"
 done
@@ -231,6 +231,16 @@ snapshot_tree() {
     fail "tree snapshot failed: $snapshot_root"
 }
 
+prometheus_runtime_write_probe() {
+  probe_dir=$1
+  sudo /bin/sh -c '
+    set -eu
+    cd "$1"
+    exec setpriv --reuid=65534 --regid=65534 --clear-groups \
+      /bin/sh -c ": >.runtime-write-probe && rm -f -- .runtime-write-probe"
+  ' sh "$probe_dir"
+}
+
 assert_live_canary_context() {
   context_source=$1
   context_target=$2
@@ -252,7 +262,7 @@ before=$tmp_dir/protected.before
 after=$tmp_dir/protected.after
 snapshot_metadata "$before"
 
-if sudo -u '#65534' -g '#65534' test -w "$prometheus_dir"; then
+if prometheus_runtime_write_probe "$prometheus_dir" 2>/dev/null; then
   fail 'Prometheus fixture unexpectedly started writable by the runtime identity'
 fi
 sudo env \
@@ -271,9 +281,7 @@ cmp "$before" "$after" >/dev/null ||
   fail 'Prometheus data file runtime ownership or mode is incorrect'
 [ "$prometheus_payload_sha" = "$(sudo sha256sum "$prometheus_payload")" ] ||
   fail 'Prometheus provisioning changed existing data contents'
-sudo -u '#65534' -g '#65534' /bin/sh -c \
-  ': >"$1/.runtime-write-probe" && rm -f -- "$1/.runtime-write-probe"' \
-  sh "$prometheus_dir" ||
+prometheus_runtime_write_probe "$prometheus_dir" ||
   fail 'Prometheus data directory is not writable by the runtime identity'
 
 prometheus_config=$host_root/deploy/prometheus/prometheus.yml
