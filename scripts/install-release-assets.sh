@@ -49,8 +49,7 @@ artifact_dir=$(dirname "$archive")
 ) || fail 'release-assets checksum validation failed'
 
 bundle_root="phoenix-release-$release_sha"
-/usr/bin/python3 -I -B - "$archive" "$bundle_root" <<'PY' ||
-  fail 'release archive member validation failed'
+if ! /usr/bin/python3 -I -B - "$archive" "$bundle_root" <<'PY'
 import sys
 import tarfile
 from pathlib import PurePosixPath
@@ -72,6 +71,9 @@ with tarfile.open(archive_path, mode="r:gz") as archive:
         if total > 72 * 1024 * 1024:
             raise SystemExit(1)
 PY
+then
+  fail 'release archive member validation failed'
+fi
 
 install -d -m 0750 -o root -g root "$release_root"
 candidate=$(mktemp -d "$release_root/.candidate-$release_sha.XXXXXX") || fail 'release staging directory could not be created'

@@ -135,6 +135,9 @@ grep -F 'export PYTHONDONTWRITEBYTECODE=1' "$installer" >/dev/null ||
 if [ "$(grep -c '/usr/bin/python3 -I -B' "$installer")" -lt 4 ]; then
   fail 'release installer Python checks are not isolated and no-bytecode'
 fi
+grep -F 'if ! /usr/bin/python3 -I -B - "$archive" "$bundle_root"' \
+  "$installer" >/dev/null ||
+  fail 'release archive precheck does not fail closed around its heredoc'
 if [ "$(grep -c 'release_assets.py" verify-tree' "$installer")" -lt 3 ]; then
   fail 'release installer does not verify candidate and final immutable trees'
 fi
