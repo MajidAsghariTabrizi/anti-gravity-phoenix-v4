@@ -14,18 +14,18 @@ name = "rpc-gateway"
 path = "src/main.rs"
 
 [dependencies]
-async-trait = "=0.1.81"
+async-trait = "=0.1.91"
 ethabi = "=18.0.0"
-futures-util = "=0.3.31"
+futures-util = "=0.3.32"
 hex = "=0.4.3"
 httpdate = "=1.0.3"
 primitive-types = { version = "=0.12.2", default-features = false }
-reqwest = { version = "=0.12.7", default-features = false, features = ["json", "rustls-tls", "stream"] }
-serde = { version = "=1.0.210", features = ["derive"] }
-serde_json = "=1.0.128"
+reqwest = { version = "=0.12.28", default-features = false, features = ["json", "rustls-tls", "stream"] }
+serde = { version = "=1.0.229", features = ["derive"] }
+serde_json = "=1.0.151"
 sha2 = "=0.10.9"
-thiserror = "=1.0.63"
-tokio = { version = "=1.40.0", features = ["full"] }
-tokio-util = "=0.7.12"
-tracing = "=0.1.40"
-tracing-subscriber = { version = "=0.3.18", features = ["env-filter", "fmt", "json"] }
+thiserror = "=1.0.69"
+tokio = { version = "=1.53.1", features = ["full"] }
+tokio-util = "=0.7.19"
+tracing = "=0.1.44"
+tracing-subscriber = { version = "=0.3.23", features = ["env-filter", "fmt", "json"] }
