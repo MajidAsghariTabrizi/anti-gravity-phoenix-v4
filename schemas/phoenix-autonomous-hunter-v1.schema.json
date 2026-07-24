@@ -1,0 +1,1365 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://phoenix.invalid/schemas/phoenix-autonomous-hunter-v1.schema.json",
+  "title": "Phoenix Autonomous Hunter v1 canonical contracts",
+  "oneOf": [
+    {
+      "$ref": "#/$defs/route_universe"
+    },
+    {
+      "$ref": "#/$defs/route_policy"
+    },
+    {
+      "$ref": "#/$defs/global_control"
+    },
+    {
+      "$ref": "#/$defs/route_control"
+    },
+    {
+      "$ref": "#/$defs/risk_snapshot"
+    },
+    {
+      "$ref": "#/$defs/submission_quote"
+    },
+    {
+      "$ref": "#/$defs/autonomous_candidate"
+    },
+    {
+      "$ref": "#/$defs/automatic_approval"
+    },
+    {
+      "$ref": "#/$defs/outcome"
+    }
+  ],
+  "$defs": {
+    "address": {
+      "type": "string",
+      "pattern": "^0x[0-9a-f]{40}$"
+    },
+    "digest": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "transaction_hash": {
+      "type": "string",
+      "pattern": "^0x[0-9a-f]{64}$"
+    },
+    "identifier": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[a-z0-9][a-z0-9._:-]*$"
+    },
+    "route_fingerprint": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256,
+      "pattern": "^[a-z0-9][a-z0-9._:-]*$"
+    },
+    "uint": {
+      "type": "string",
+      "pattern": "^(0|[1-9][0-9]{0,77})$"
+    },
+    "positive_uint": {
+      "type": "string",
+      "pattern": "^[1-9][0-9]{0,77}$"
+    },
+    "signed_integer": {
+      "type": "string",
+      "pattern": "^-?(0|[1-9][0-9]{0,77})$"
+    },
+    "timestamp": {
+      "type": "string",
+      "format": "date-time",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"
+    },
+    "nullable_timestamp": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/timestamp"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "size_level": {
+      "enum": [
+        "0.25x",
+        "0.50x",
+        "1.00x",
+        "1.25x",
+        "1.50x",
+        "2.00x"
+      ]
+    },
+    "submission_channel": {
+      "enum": [
+        "standard_rpc",
+        "disabled_ordering"
+      ]
+    },
+    "asset": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "asset_id",
+        "address",
+        "symbol",
+        "decimals",
+        "maximum_input_amount"
+      ],
+      "properties": {
+        "asset_id": {
+          "$ref": "#/$defs/identifier"
+        },
+        "address": {
+          "$ref": "#/$defs/address"
+        },
+        "symbol": {
+          "type": "string",
+          "pattern": "^[A-Z0-9]{2,16}$"
+        },
+        "decimals": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 36
+        },
+        "maximum_input_amount": {
+          "$ref": "#/$defs/positive_uint"
+        }
+      }
+    },
+    "router": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "router_id",
+        "protocol_id",
+        "address"
+      ],
+      "properties": {
+        "router_id": {
+          "$ref": "#/$defs/identifier"
+        },
+        "protocol_id": {
+          "$ref": "#/$defs/identifier"
+        },
+        "address": {
+          "$ref": "#/$defs/address"
+        }
+      }
+    },
+    "factory": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "factory_id",
+        "protocol_id",
+        "address",
+        "pool_init_code_hash"
+      ],
+      "properties": {
+        "factory_id": {
+          "$ref": "#/$defs/identifier"
+        },
+        "protocol_id": {
+          "$ref": "#/$defs/identifier"
+        },
+        "address": {
+          "$ref": "#/$defs/address"
+        },
+        "pool_init_code_hash": {
+          "type": "string",
+          "pattern": "^0x[0-9a-f]{64}$"
+        }
+      }
+    },
+    "pool": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "pool_id",
+        "protocol_id",
+        "factory_address",
+        "address",
+        "token0",
+        "token1",
+        "fee",
+        "tick_spacing"
+      ],
+      "properties": {
+        "pool_id": {
+          "$ref": "#/$defs/identifier"
+        },
+        "protocol_id": {
+          "$ref": "#/$defs/identifier"
+        },
+        "factory_address": {
+          "$ref": "#/$defs/address"
+        },
+        "address": {
+          "$ref": "#/$defs/address"
+        },
+        "token0": {
+          "$ref": "#/$defs/address"
+        },
+        "token1": {
+          "$ref": "#/$defs/address"
+        },
+        "fee": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 1000000
+        },
+        "tick_spacing": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 32767
+        }
+      }
+    },
+    "route_universe": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_version",
+        "universe_id",
+        "universe_version",
+        "chain_id",
+        "settlement_assets",
+        "intermediate_assets",
+        "routers",
+        "factories",
+        "pools",
+        "maximum_route_legs",
+        "maximum_total_routes",
+        "maximum_routes_per_event",
+        "default_hard_caps",
+        "universe_hash"
+      ],
+      "properties": {
+        "schema_version": {
+          "const": "phoenix.route-universe.v1"
+        },
+        "universe_id": {
+          "$ref": "#/$defs/identifier"
+        },
+        "universe_version": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 2147483647
+        },
+        "chain_id": {
+          "const": 42161
+        },
+        "settlement_assets": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 8,
+          "items": {
+            "$ref": "#/$defs/asset"
+          }
+        },
+        "intermediate_assets": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 32,
+          "items": {
+            "$ref": "#/$defs/asset"
+          }
+        },
+        "routers": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 16,
+          "items": {
+            "$ref": "#/$defs/router"
+          }
+        },
+        "factories": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 16,
+          "items": {
+            "$ref": "#/$defs/factory"
+          }
+        },
+        "pools": {
+          "type": "array",
+          "minItems": 2,
+          "maxItems": 256,
+          "items": {
+            "$ref": "#/$defs/pool"
+          }
+        },
+        "maximum_route_legs": {
+          "const": 4
+        },
+        "maximum_total_routes": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 4096
+        },
+        "maximum_routes_per_event": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 256
+        },
+        "default_hard_caps": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "global_maximum_input_amount",
+            "maximum_tick_crossings",
+            "maximum_size_evaluations"
+          ],
+          "properties": {
+            "global_maximum_input_amount": {
+              "$ref": "#/$defs/positive_uint"
+            },
+            "maximum_tick_crossings": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 4096
+            },
+            "maximum_size_evaluations": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 256
+            }
+          }
+        },
+        "universe_hash": {
+          "$ref": "#/$defs/digest"
+        }
+      }
+    },
+    "route_policy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_version",
+        "policy_id",
+        "policy_version",
+        "chain_id",
+        "route_fingerprint",
+        "route_universe_hash",
+        "settlement_asset",
+        "token_path",
+        "pool_addresses",
+        "factory_addresses",
+        "protocol_ids",
+        "fees",
+        "directions",
+        "minimum_input_amount",
+        "maximum_input_amount",
+        "minimum_retained_profit",
+        "maximum_price_impact_bps",
+        "maximum_slippage_bps",
+        "maximum_pool_utilization_bps",
+        "maximum_tick_crossings",
+        "maximum_state_age_blocks",
+        "maximum_quote_age_ms",
+        "maximum_candidate_age_ms",
+        "allowed_submission_channels",
+        "maximum_ordering_payment",
+        "per_transaction_maximum_loss",
+        "per_route_daily_loss",
+        "maximum_consecutive_losses",
+        "minimum_observation_count",
+        "minimum_recent_fork_pass_rate_bps",
+        "maximum_prediction_error_bps",
+        "enabled_for_shadow",
+        "enabled_for_autonomous_live",
+        "policy_hash"
+      ],
+      "properties": {
+        "schema_version": {
+          "const": "phoenix.route-policy.v1"
+        },
+        "policy_id": {
+          "$ref": "#/$defs/identifier"
+        },
+        "policy_version": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 2147483647
+        },
+        "chain_id": {
+          "const": 42161
+        },
+        "route_fingerprint": {
+          "$ref": "#/$defs/route_fingerprint"
+        },
+        "route_universe_hash": {
+          "$ref": "#/$defs/digest"
+        },
+        "settlement_asset": {
+          "$ref": "#/$defs/address"
+        },
+        "token_path": {
+          "type": "array",
+          "minItems": 3,
+          "maxItems": 5,
+          "items": {
+            "$ref": "#/$defs/address"
+          }
+        },
+        "pool_addresses": {
+          "type": "array",
+          "minItems": 2,
+          "maxItems": 4,
+          "items": {
+            "$ref": "#/$defs/address"
+          },
+          "uniqueItems": true
+        },
+        "factory_addresses": {
+          "type": "array",
+          "minItems": 2,
+          "maxItems": 4,
+          "items": {
+            "$ref": "#/$defs/address"
+          }
+        },
+        "protocol_ids": {
+          "type": "array",
+          "minItems": 2,
+          "maxItems": 4,
+          "items": {
+            "$ref": "#/$defs/identifier"
+          }
+        },
+        "fees": {
+          "type": "array",
+          "minItems": 2,
+          "maxItems": 4,
+          "items": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 1000000
+          }
+        },
+        "directions": {
+          "type": "array",
+          "minItems": 2,
+          "maxItems": 4,
+          "items": {
+            "enum": [
+              "zero_for_one",
+              "one_for_zero"
+            ]
+          }
+        },
+        "minimum_input_amount": {
+          "$ref": "#/$defs/positive_uint"
+        },
+        "maximum_input_amount": {
+          "$ref": "#/$defs/positive_uint"
+        },
+        "minimum_retained_profit": {
+          "$ref": "#/$defs/positive_uint"
+        },
+        "maximum_price_impact_bps": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 10000
+        },
+        "maximum_slippage_bps": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 10000
+        },
+        "maximum_pool_utilization_bps": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 10000
+        },
+        "maximum_tick_crossings": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 4096
+        },
+        "maximum_state_age_blocks": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 128
+        },
+        "maximum_quote_age_ms": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 60000
+        },
+        "maximum_candidate_age_ms": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 300000
+        },
+        "allowed_submission_channels": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 2,
+          "items": {
+            "$ref": "#/$defs/submission_channel"
+          },
+          "uniqueItems": true
+        },
+        "maximum_ordering_payment": {
+          "$ref": "#/$defs/uint"
+        },
+        "per_transaction_maximum_loss": {
+          "$ref": "#/$defs/uint"
+        },
+        "per_route_daily_loss": {
+          "$ref": "#/$defs/uint"
+        },
+        "maximum_consecutive_losses": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 100
+        },
+        "minimum_observation_count": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 1000000
+        },
+        "minimum_recent_fork_pass_rate_bps": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 10000
+        },
+        "maximum_prediction_error_bps": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 10000
+        },
+        "enabled_for_shadow": {
+          "type": "boolean"
+        },
+        "enabled_for_autonomous_live": {
+          "type": "boolean"
+        },
+        "policy_hash": {
+          "$ref": "#/$defs/digest"
+        }
+      }
+    },
+    "global_control": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_version",
+        "chain_id",
+        "armed",
+        "kill_switch",
+        "execution_mode",
+        "maximum_input_amount",
+        "daily_loss_limit",
+        "daily_ordering_budget",
+        "maximum_concurrent_candidates",
+        "control_epoch",
+        "updated_at",
+        "disarm_reason",
+        "control_hash"
+      ],
+      "properties": {
+        "schema_version": {
+          "const": "phoenix.autonomous-global-control.v1"
+        },
+        "chain_id": {
+          "const": 42161
+        },
+        "armed": {
+          "type": "boolean"
+        },
+        "kill_switch": {
+          "type": "boolean"
+        },
+        "execution_mode": {
+          "enum": [
+            "disabled",
+            "dry_run",
+            "armed_idle",
+            "live",
+            "disarmed"
+          ]
+        },
+        "maximum_input_amount": {
+          "$ref": "#/$defs/positive_uint"
+        },
+        "daily_loss_limit": {
+          "$ref": "#/$defs/uint"
+        },
+        "daily_ordering_budget": {
+          "$ref": "#/$defs/uint"
+        },
+        "maximum_concurrent_candidates": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 64
+        },
+        "control_epoch": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "updated_at": {
+          "$ref": "#/$defs/timestamp"
+        },
+        "disarm_reason": {
+          "oneOf": [
+            {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128,
+              "pattern": "^[a-z0-9][a-z0-9._:-]*$"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "control_hash": {
+          "$ref": "#/$defs/digest"
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "execution_mode": {
+                "const": "live"
+              }
+            },
+            "required": [
+              "execution_mode"
+            ]
+          },
+          "then": {
+            "properties": {
+              "armed": {
+                "const": true
+              },
+              "kill_switch": {
+                "const": false
+              },
+              "disarm_reason": {
+                "type": "null"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "kill_switch": {
+                "const": true
+              }
+            },
+            "required": [
+              "kill_switch"
+            ]
+          },
+          "then": {
+            "properties": {
+              "execution_mode": {
+                "not": {
+                  "const": "live"
+                }
+              },
+              "disarm_reason": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      ]
+    },
+    "route_control": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_version",
+        "chain_id",
+        "route_fingerprint",
+        "route_policy_hash",
+        "enabled",
+        "kill_switch",
+        "current_size_level",
+        "maximum_permitted_size",
+        "cooldown_until",
+        "control_epoch",
+        "updated_at",
+        "disarm_reason",
+        "control_hash"
+      ],
+      "properties": {
+        "schema_version": {
+          "const": "phoenix.autonomous-route-control.v1"
+        },
+        "chain_id": {
+          "const": 42161
+        },
+        "route_fingerprint": {
+          "$ref": "#/$defs/route_fingerprint"
+        },
+        "route_policy_hash": {
+          "$ref": "#/$defs/digest"
+        },
+        "enabled": {
+          "type": "boolean"
+        },
+        "kill_switch": {
+          "type": "boolean"
+        },
+        "current_size_level": {
+          "$ref": "#/$defs/size_level"
+        },
+        "maximum_permitted_size": {
+          "$ref": "#/$defs/positive_uint"
+        },
+        "cooldown_until": {
+          "$ref": "#/$defs/nullable_timestamp"
+        },
+        "control_epoch": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "updated_at": {
+          "$ref": "#/$defs/timestamp"
+        },
+        "disarm_reason": {
+          "oneOf": [
+            {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128,
+              "pattern": "^[a-z0-9][a-z0-9._:-]*$"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "control_hash": {
+          "$ref": "#/$defs/digest"
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "kill_switch": {
+                "const": false
+              }
+            },
+            "required": [
+              "kill_switch"
+            ]
+          },
+          "then": {
+            "properties": {
+              "enabled": {
+                "const": true
+              },
+              "disarm_reason": {
+                "type": "null"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "kill_switch": {
+                "const": true
+              }
+            },
+            "required": [
+              "kill_switch"
+            ]
+          },
+          "then": {
+            "properties": {
+              "disarm_reason": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      ]
+    },
+    "risk_snapshot": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_version",
+        "route_policy_hash",
+        "evaluated_at",
+        "global_control_state",
+        "route_control_state",
+        "daily_realized_loss",
+        "consecutive_losses",
+        "current_size_level",
+        "maximum_permitted_size",
+        "remaining_ordering_budget",
+        "remaining_daily_loss_budget",
+        "cooldown_until",
+        "downgrade_reason",
+        "risk_snapshot_hash"
+      ],
+      "properties": {
+        "schema_version": {
+          "const": "phoenix.risk-snapshot.v1"
+        },
+        "route_policy_hash": {
+          "$ref": "#/$defs/digest"
+        },
+        "evaluated_at": {
+          "$ref": "#/$defs/timestamp"
+        },
+        "global_control_state": {
+          "$ref": "#/$defs/global_control"
+        },
+        "route_control_state": {
+          "$ref": "#/$defs/route_control"
+        },
+        "daily_realized_loss": {
+          "$ref": "#/$defs/uint"
+        },
+        "consecutive_losses": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 1000000
+        },
+        "current_size_level": {
+          "$ref": "#/$defs/size_level"
+        },
+        "maximum_permitted_size": {
+          "$ref": "#/$defs/positive_uint"
+        },
+        "remaining_ordering_budget": {
+          "$ref": "#/$defs/uint"
+        },
+        "remaining_daily_loss_budget": {
+          "$ref": "#/$defs/uint"
+        },
+        "cooldown_until": {
+          "$ref": "#/$defs/nullable_timestamp"
+        },
+        "downgrade_reason": {
+          "oneOf": [
+            {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128,
+              "pattern": "^[a-z0-9][a-z0-9._:-]*$"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "risk_snapshot_hash": {
+          "$ref": "#/$defs/digest"
+        }
+      }
+    },
+    "submission_quote": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_version",
+        "logical_channel_id",
+        "quote_created_at",
+        "quote_expires_at",
+        "maximum_ordering_payment",
+        "estimated_ordering_payment",
+        "minimum_retained_profit",
+        "expected_net_after_ordering",
+        "fallback_allowed",
+        "fallback_channel_id",
+        "quote_evidence_hash"
+      ],
+      "properties": {
+        "schema_version": {
+          "const": "phoenix.submission-quote.v1"
+        },
+        "logical_channel_id": {
+          "$ref": "#/$defs/submission_channel"
+        },
+        "quote_created_at": {
+          "$ref": "#/$defs/timestamp"
+        },
+        "quote_expires_at": {
+          "$ref": "#/$defs/timestamp"
+        },
+        "maximum_ordering_payment": {
+          "$ref": "#/$defs/uint"
+        },
+        "estimated_ordering_payment": {
+          "$ref": "#/$defs/uint"
+        },
+        "minimum_retained_profit": {
+          "$ref": "#/$defs/positive_uint"
+        },
+        "expected_net_after_ordering": {
+          "$ref": "#/$defs/signed_integer"
+        },
+        "inclusion_probability_bps": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 10000
+        },
+        "fallback_allowed": {
+          "type": "boolean"
+        },
+        "fallback_channel_id": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/submission_channel"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "quote_evidence_hash": {
+          "$ref": "#/$defs/digest"
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "fallback_allowed": {
+                "const": false
+              }
+            },
+            "required": [
+              "fallback_allowed"
+            ]
+          },
+          "then": {
+            "properties": {
+              "fallback_channel_id": {
+                "type": "null"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "fallback_allowed": {
+                "const": true
+              }
+            },
+            "required": [
+              "fallback_allowed"
+            ]
+          },
+          "then": {
+            "properties": {
+              "fallback_channel_id": {
+                "$ref": "#/$defs/submission_channel"
+              }
+            }
+          }
+        }
+      ]
+    },
+    "autonomous_candidate": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_version",
+        "candidate_id",
+        "opportunity_id",
+        "origin_event_id",
+        "chain_id",
+        "route_fingerprint",
+        "route_universe_hash",
+        "route_policy_hash",
+        "risk_policy_hash",
+        "state_block_number",
+        "state_block_hash",
+        "state_hash",
+        "selected_size",
+        "predicted_gross_profit",
+        "predicted_total_cost",
+        "conservative_predicted_net_pnl",
+        "plan_hash",
+        "calldata_hash",
+        "executor_address",
+        "executor_code_hash",
+        "submission_channel",
+        "submission_quote_hash",
+        "risk_snapshot_hash",
+        "candidate_created_at",
+        "candidate_expires_at",
+        "status",
+        "candidate_hash"
+      ],
+      "properties": {
+        "schema_version": {
+          "const": "phoenix.autonomous-candidate.v1"
+        },
+        "candidate_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "opportunity_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "origin_event_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256,
+          "pattern": "^[a-zA-Z0-9._:-]+$"
+        },
+        "chain_id": {
+          "const": 42161
+        },
+        "route_fingerprint": {
+          "$ref": "#/$defs/route_fingerprint"
+        },
+        "route_universe_hash": {
+          "$ref": "#/$defs/digest"
+        },
+        "route_policy_hash": {
+          "$ref": "#/$defs/digest"
+        },
+        "risk_policy_hash": {
+          "$ref": "#/$defs/digest"
+        },
+        "state_block_number": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "state_block_hash": {
+          "$ref": "#/$defs/transaction_hash"
+        },
+        "state_hash": {
+          "$ref": "#/$defs/digest"
+        },
+        "selected_size": {
+          "$ref": "#/$defs/positive_uint"
+        },
+        "predicted_gross_profit": {
+          "$ref": "#/$defs/uint"
+        },
+        "predicted_total_cost": {
+          "$ref": "#/$defs/uint"
+        },
+        "conservative_predicted_net_pnl": {
+          "$ref": "#/$defs/signed_integer"
+        },
+        "plan_hash": {
+          "$ref": "#/$defs/digest"
+        },
+        "calldata_hash": {
+          "$ref": "#/$defs/digest"
+        },
+        "executor_address": {
+          "$ref": "#/$defs/address"
+        },
+        "executor_code_hash": {
+          "$ref": "#/$defs/digest"
+        },
+        "submission_channel": {
+          "$ref": "#/$defs/submission_channel"
+        },
+        "submission_quote_hash": {
+          "$ref": "#/$defs/digest"
+        },
+        "risk_snapshot_hash": {
+          "$ref": "#/$defs/digest"
+        },
+        "candidate_created_at": {
+          "$ref": "#/$defs/timestamp"
+        },
+        "candidate_expires_at": {
+          "$ref": "#/$defs/timestamp"
+        },
+        "status": {
+          "enum": [
+            "materialized",
+            "claimed",
+            "revalidated",
+            "nonce_reserved",
+            "signed",
+            "submitted",
+            "included",
+            "settled",
+            "expired",
+            "policy_rejected",
+            "risk_rejected",
+            "state_changed",
+            "simulation_mismatch",
+            "submission_unknown",
+            "replaced",
+            "reverted",
+            "receipt_timed_out",
+            "integrity_failure",
+            "operator_killed"
+          ]
+        },
+        "candidate_hash": {
+          "$ref": "#/$defs/digest"
+        }
+      }
+    },
+    "automatic_approval": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_version",
+        "candidate_id",
+        "candidate_hash",
+        "route_policy_hash",
+        "route_universe_hash",
+        "risk_snapshot_hash",
+        "submission_quote_hash",
+        "state_hash",
+        "plan_hash",
+        "simulation_result_hash",
+        "calldata_hash",
+        "executor_address",
+        "executor_code_hash",
+        "approval_source",
+        "approval_created_at",
+        "approval_expires_at",
+        "automatic_approval_digest"
+      ],
+      "properties": {
+        "schema_version": {
+          "const": "phoenix.automatic-approval.v1"
+        },
+        "candidate_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "candidate_hash": {
+          "$ref": "#/$defs/digest"
+        },
+        "route_policy_hash": {
+          "$ref": "#/$defs/digest"
+        },
+        "route_universe_hash": {
+          "$ref": "#/$defs/digest"
+        },
+        "risk_snapshot_hash": {
+          "$ref": "#/$defs/digest"
+        },
+        "submission_quote_hash": {
+          "$ref": "#/$defs/digest"
+        },
+        "state_hash": {
+          "$ref": "#/$defs/digest"
+        },
+        "plan_hash": {
+          "$ref": "#/$defs/digest"
+        },
+        "simulation_result_hash": {
+          "$ref": "#/$defs/digest"
+        },
+        "calldata_hash": {
+          "$ref": "#/$defs/digest"
+        },
+        "executor_address": {
+          "$ref": "#/$defs/address"
+        },
+        "executor_code_hash": {
+          "$ref": "#/$defs/digest"
+        },
+        "approval_source": {
+          "const": "autonomous_policy"
+        },
+        "approval_created_at": {
+          "$ref": "#/$defs/timestamp"
+        },
+        "approval_expires_at": {
+          "$ref": "#/$defs/timestamp"
+        },
+        "automatic_approval_digest": {
+          "$ref": "#/$defs/digest"
+        }
+      }
+    },
+    "outcome": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_version",
+        "candidate_id",
+        "opportunity_id",
+        "route_fingerprint",
+        "route_universe_hash",
+        "route_policy_hash",
+        "risk_snapshot_hash",
+        "submission_quote_hash",
+        "automatic_approval_digest",
+        "candidate_hash",
+        "state_hash",
+        "plan_hash",
+        "calldata_hash",
+        "executor_code_hash",
+        "outcome_class",
+        "transaction_hash",
+        "block_number",
+        "receipt_status",
+        "predicted_gross_profit",
+        "predicted_total_cost",
+        "conservative_predicted_net_pnl",
+        "realized_gross_profit",
+        "actual_gas_cost",
+        "actual_ordering_cost",
+        "realized_chain_net_pnl",
+        "allocated_infrastructure_cost",
+        "realized_business_net_pnl",
+        "terminal_at",
+        "attributed_at",
+        "outcome_hash"
+      ],
+      "properties": {
+        "schema_version": {
+          "const": "phoenix.outcome.v1"
+        },
+        "candidate_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "opportunity_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "route_fingerprint": {
+          "$ref": "#/$defs/route_fingerprint"
+        },
+        "route_universe_hash": {
+          "$ref": "#/$defs/digest"
+        },
+        "route_policy_hash": {
+          "$ref": "#/$defs/digest"
+        },
+        "risk_snapshot_hash": {
+          "$ref": "#/$defs/digest"
+        },
+        "submission_quote_hash": {
+          "$ref": "#/$defs/digest"
+        },
+        "automatic_approval_digest": {
+          "$ref": "#/$defs/digest"
+        },
+        "candidate_hash": {
+          "$ref": "#/$defs/digest"
+        },
+        "state_hash": {
+          "$ref": "#/$defs/digest"
+        },
+        "plan_hash": {
+          "$ref": "#/$defs/digest"
+        },
+        "calldata_hash": {
+          "$ref": "#/$defs/digest"
+        },
+        "executor_code_hash": {
+          "$ref": "#/$defs/digest"
+        },
+        "outcome_class": {
+          "enum": [
+            "confirmed_profitable",
+            "confirmed_below_prediction",
+            "confirmed_negative",
+            "reverted",
+            "not_included",
+            "transaction_replaced",
+            "receipt_timed_out",
+            "submission_unknown",
+            "submitted_too_late",
+            "competitor_or_state_changed",
+            "ordering_bid_too_low",
+            "rpc_failure",
+            "model_mismatch",
+            "policy_rejected",
+            "risk_rejected",
+            "integrity_failure",
+            "operator_killed"
+          ]
+        },
+        "transaction_hash": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/transaction_hash"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "block_number": {
+          "oneOf": [
+            {
+              "type": "integer",
+              "minimum": 1
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "receipt_status": {
+          "oneOf": [
+            {
+              "enum": [
+                0,
+                1
+              ]
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "predicted_gross_profit": {
+          "$ref": "#/$defs/uint"
+        },
+        "predicted_total_cost": {
+          "$ref": "#/$defs/uint"
+        },
+        "conservative_predicted_net_pnl": {
+          "$ref": "#/$defs/signed_integer"
+        },
+        "realized_gross_profit": {
+          "$ref": "#/$defs/signed_integer"
+        },
+        "actual_gas_cost": {
+          "$ref": "#/$defs/uint"
+        },
+        "actual_ordering_cost": {
+          "$ref": "#/$defs/uint"
+        },
+        "realized_chain_net_pnl": {
+          "$ref": "#/$defs/signed_integer"
+        },
+        "allocated_infrastructure_cost": {
+          "$ref": "#/$defs/uint"
+        },
+        "realized_business_net_pnl": {
+          "$ref": "#/$defs/signed_integer"
+        },
+        "terminal_at": {
+          "$ref": "#/$defs/timestamp"
+        },
+        "attributed_at": {
+          "$ref": "#/$defs/timestamp"
+        },
+        "outcome_hash": {
+          "$ref": "#/$defs/digest"
+        }
+      }
+    }
+  }
+}

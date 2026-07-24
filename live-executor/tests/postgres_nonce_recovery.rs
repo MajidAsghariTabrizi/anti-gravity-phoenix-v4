@@ -61,6 +61,12 @@ async fn nonce_allocation_and_pending_state_survive_restart() {
         .execute(&pool)
         .await
         .expect("apply approval evidence schema");
+    sqlx::raw_sql(include_str!(
+        "../schema/003_autonomous_hunter_contracts.sql"
+    ))
+    .execute(&pool)
+    .await
+    .expect("apply autonomous Hunter contract schema");
 
     let signer = TransactionSigner::from_secret(&hex::encode([13_u8; 32]), ARBITRUM_ONE_CHAIN_ID)
         .expect("signer");

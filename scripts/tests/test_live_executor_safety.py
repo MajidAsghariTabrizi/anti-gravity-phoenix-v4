@@ -62,6 +62,9 @@ class LiveExecutorSafetyTests(unittest.TestCase):
         approval_schema = (
             ROOT / "live-executor/schema/002_approval_evidence.sql"
         ).read_text(encoding="utf-8")
+        autonomous_schema = (
+            ROOT / "live-executor/schema/003_autonomous_hunter_contracts.sql"
+        ).read_text(encoding="utf-8")
         self.assertIn("armed BOOLEAN NOT NULL DEFAULT false", schema)
         self.assertIn("kill_switch BOOLEAN NOT NULL DEFAULT true", schema)
         self.assertIn("WHERE status = 'approved'", schema)
@@ -105,6 +108,16 @@ class LiveExecutorSafetyTests(unittest.TestCase):
             "live_canary_execution_request_simulation_result", approval_schema
         )
         self.assertIn("live_canary_execution_request_plan", approval_schema)
+        for table in (
+            "autonomous_global_control",
+            "autonomous_route_controls",
+            "autonomous_candidates",
+            "autonomous_approvals",
+            "autonomous_outcome_attributions",
+        ):
+            self.assertIn(table, autonomous_schema)
+        self.assertIn("'phoenix.live-canary-schema.v2'", autonomous_schema)
+        self.assertIn("'phoenix.live-canary-schema.v3'", autonomous_schema)
         store = (ROOT / "live-executor/src/store.rs").read_text(encoding="utf-8")
         self.assertIn("AT TIME ZONE 'UTC'", store)
 

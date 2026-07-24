@@ -50,11 +50,13 @@ the service, or run the profile.
 
 ## Service-owned schema
 
-`live-executor/schema/001_live_canary.sql` and
-`live-executor/schema/002_approval_evidence.sql` are intentionally outside the
-exact v5 root migration set. The runtime never installs or modifies schema. It
-validates `phoenix.live-canary-schema.v2` at startup and fails closed when the
-schema is absent.
+`live-executor/schema/001_live_canary.sql`,
+`live-executor/schema/002_approval_evidence.sql`, and the additive
+`live-executor/schema/003_autonomous_hunter_contracts.sql` are intentionally
+outside the exact v5 root migration set. The runtime never installs or modifies
+schema. The manual Canary binary continues to validate
+`phoenix.live-canary-schema.v2` at startup and fails closed when the schema is
+absent. The v3 row and autonomous tables are unused by the manual binary.
 
 Only rows in `live_canary.execution_requests` with `status='approved'`, complete
 v2 approval evidence, a future approval deadline, and a matching canonical

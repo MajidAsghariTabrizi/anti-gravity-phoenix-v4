@@ -1,0 +1,15 @@
+{
+  "schema_version": "phoenix.autonomous-route-control.v1",
+  "chain_id": 42161,
+  "route_fingerprint": "arbitrum-weth-usdc-uniswap-v3-500-3000-v1",
+  "route_policy_hash": "53d8d4921eb694e9cc6edbe9b47b7220eda579551f802fc75756ff0218624c16",
+  "enabled": false,
+  "kill_switch": true,
+  "current_size_level": "0.25x",
+  "maximum_permitted_size": "2500000000000000",
+  "cooldown_until": null,
+  "control_epoch": 0,
+  "updated_at": "2026-07-24T06:30:00Z",
+  "disarm_reason": "not_armed",
+  "control_hash": "61c8cedc2e0e8ddf5dbc427e268b8be0f59fb6b75b5124ca8ceaefa4f0d97157"
+}

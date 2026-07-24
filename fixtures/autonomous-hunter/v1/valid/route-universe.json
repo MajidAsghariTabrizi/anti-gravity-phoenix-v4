@@ -1,0 +1,80 @@
+{
+  "schema_version": "phoenix.route-universe.v1",
+  "universe_id": "arbitrum-one-reviewed-v3-v1",
+  "universe_version": 1,
+  "chain_id": 42161,
+  "settlement_assets": [
+    {
+      "asset_id": "weth",
+      "address": "0x82af49447d8a07e3bd95bd0d56f35241523fbab1",
+      "symbol": "WETH",
+      "decimals": 18,
+      "maximum_input_amount": "10000000000000000"
+    }
+  ],
+  "intermediate_assets": [
+    {
+      "asset_id": "usdc-native",
+      "address": "0xaf88d065e77c8cc2239327c5edb3a432268e5831",
+      "symbol": "USDC",
+      "decimals": 6,
+      "maximum_input_amount": "10000000000"
+    }
+  ],
+  "routers": [
+    {
+      "router_id": "uniswap-v3-swap-router",
+      "protocol_id": "uniswap-v3",
+      "address": "0xe592427a0aece92de3edee1f18e0157c05861564"
+    },
+    {
+      "router_id": "uniswap-swap-router-02",
+      "protocol_id": "uniswap-v3",
+      "address": "0x68b3465833fb72a70ecdf485e0e4c7bd8665fc45"
+    },
+    {
+      "router_id": "uniswap-universal-router",
+      "protocol_id": "uniswap-v3",
+      "address": "0xa51afafe0263b40edaef0df8781ea9aa03e381a3"
+    }
+  ],
+  "factories": [
+    {
+      "factory_id": "uniswap-v3-arbitrum",
+      "protocol_id": "uniswap-v3",
+      "address": "0x1f98431c8ad98523631ae4a59f267346ea31f984",
+      "pool_init_code_hash": "0xe34f199b19b2b4f47f68442619d555527d244f78a3297ea89325f843f87b8b54"
+    }
+  ],
+  "pools": [
+    {
+      "pool_id": "uniswap-v3-weth-usdc-500",
+      "protocol_id": "uniswap-v3",
+      "factory_address": "0x1f98431c8ad98523631ae4a59f267346ea31f984",
+      "address": "0xc6962004f452be9203591991d15f6b388e09e8d0",
+      "token0": "0x82af49447d8a07e3bd95bd0d56f35241523fbab1",
+      "token1": "0xaf88d065e77c8cc2239327c5edb3a432268e5831",
+      "fee": 500,
+      "tick_spacing": 10
+    },
+    {
+      "pool_id": "uniswap-v3-weth-usdc-3000",
+      "protocol_id": "uniswap-v3",
+      "factory_address": "0x1f98431c8ad98523631ae4a59f267346ea31f984",
+      "address": "0xc473e2aee3441bf9240be85eb122abb059a3b57c",
+      "token0": "0x82af49447d8a07e3bd95bd0d56f35241523fbab1",
+      "token1": "0xaf88d065e77c8cc2239327c5edb3a432268e5831",
+      "fee": 3000,
+      "tick_spacing": 60
+    }
+  ],
+  "maximum_route_legs": 4,
+  "maximum_total_routes": 64,
+  "maximum_routes_per_event": 16,
+  "default_hard_caps": {
+    "global_maximum_input_amount": "10000000000000000",
+    "maximum_tick_crossings": 64,
+    "maximum_size_evaluations": 16
+  },
+  "universe_hash": "84adac686635535486e06e44fcaf90c812dc27273affc5bffc4eebd6c164928c"
+}

@@ -15,6 +15,7 @@ LIVE_CANARY_ASSETS = (
     "compose.live-canary.yml",
     "live-executor/schema/001_live_canary.sql",
     "live-executor/schema/002_approval_evidence.sql",
+    "live-executor/schema/003_autonomous_hunter_contracts.sql",
 )
 
 
@@ -78,6 +79,16 @@ class ReleaseAssetsTests(unittest.TestCase):
             self.assertIn("schemas/phoenix-release-provenance.schema.json", paths)
             self.assertIn("schemas/release-components.schema.json", paths)
             self.assertIn("schemas/phoenix-prelive-v5-release.schema.json", paths)
+            for hunter_asset in (
+                "config/phoenix-route-universe-v1.json",
+                "docs/AUTONOMOUS_HUNTER_CONTRACTS_V1.md",
+                "fixtures/autonomous-hunter/v1/fixture-manifest.json",
+                "fixtures/autonomous-hunter/v1/valid/autonomous-candidate.json",
+                "fixtures/autonomous-hunter/v1/invalid/automatic-approval-mutated-plan.json",
+                "schemas/phoenix-autonomous-hunter-v1.schema.json",
+                "scripts/hunter_contracts.py",
+            ):
+                self.assertIn(hunter_asset, paths)
             self.assertTrue(
                 all(
                     item["size_bytes"] <= release_assets.MAX_FILE_BYTES

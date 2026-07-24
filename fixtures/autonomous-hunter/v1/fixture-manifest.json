@@ -1,0 +1,25 @@
+{
+  "schema": "phoenix.autonomous-hunter-fixtures.v1",
+  "valid": [
+    "valid/route-universe.json",
+    "valid/route-policy.json",
+    "valid/global-control.json",
+    "valid/route-control.json",
+    "valid/risk-snapshot.json",
+    "valid/submission-quote.json",
+    "valid/autonomous-candidate.json",
+    "valid/automatic-approval.json",
+    "valid/outcome.json"
+  ],
+  "invalid": [
+    "invalid/route-universe-duplicate-pool.json",
+    "invalid/route-policy-broken-path.json",
+    "invalid/global-control-unsafe-live.json",
+    "invalid/route-control-open-disabled.json",
+    "invalid/risk-snapshot-hash-mismatch.json",
+    "invalid/submission-quote-uncapped-ordering.json",
+    "invalid/autonomous-candidate-unknown-field.json",
+    "invalid/automatic-approval-mutated-plan.json",
+    "invalid/outcome-unknown-class.json"
+  ]
+}

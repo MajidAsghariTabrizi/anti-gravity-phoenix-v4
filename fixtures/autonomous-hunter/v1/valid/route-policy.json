@@ -1,0 +1,57 @@
+{
+  "schema_version": "phoenix.route-policy.v1",
+  "policy_id": "weth-usdc-uniswap-v3-500-3000",
+  "policy_version": 1,
+  "chain_id": 42161,
+  "route_fingerprint": "arbitrum-weth-usdc-uniswap-v3-500-3000-v1",
+  "route_universe_hash": "84adac686635535486e06e44fcaf90c812dc27273affc5bffc4eebd6c164928c",
+  "settlement_asset": "0x82af49447d8a07e3bd95bd0d56f35241523fbab1",
+  "token_path": [
+    "0x82af49447d8a07e3bd95bd0d56f35241523fbab1",
+    "0xaf88d065e77c8cc2239327c5edb3a432268e5831",
+    "0x82af49447d8a07e3bd95bd0d56f35241523fbab1"
+  ],
+  "pool_addresses": [
+    "0xc6962004f452be9203591991d15f6b388e09e8d0",
+    "0xc473e2aee3441bf9240be85eb122abb059a3b57c"
+  ],
+  "factory_addresses": [
+    "0x1f98431c8ad98523631ae4a59f267346ea31f984",
+    "0x1f98431c8ad98523631ae4a59f267346ea31f984"
+  ],
+  "protocol_ids": [
+    "uniswap-v3",
+    "uniswap-v3"
+  ],
+  "fees": [
+    500,
+    3000
+  ],
+  "directions": [
+    "zero_for_one",
+    "one_for_zero"
+  ],
+  "minimum_input_amount": "100000000000000",
+  "maximum_input_amount": "10000000000000000",
+  "minimum_retained_profit": "1000000000000",
+  "maximum_price_impact_bps": 50,
+  "maximum_slippage_bps": 100,
+  "maximum_pool_utilization_bps": 1000,
+  "maximum_tick_crossings": 64,
+  "maximum_state_age_blocks": 1,
+  "maximum_quote_age_ms": 2000,
+  "maximum_candidate_age_ms": 3000,
+  "allowed_submission_channels": [
+    "standard_rpc"
+  ],
+  "maximum_ordering_payment": "0",
+  "per_transaction_maximum_loss": "1000000000000000",
+  "per_route_daily_loss": "10000000000000000",
+  "maximum_consecutive_losses": 3,
+  "minimum_observation_count": 100,
+  "minimum_recent_fork_pass_rate_bps": 9500,
+  "maximum_prediction_error_bps": 1000,
+  "enabled_for_shadow": true,
+  "enabled_for_autonomous_live": false,
+  "policy_hash": "53d8d4921eb694e9cc6edbe9b47b7220eda579551f802fc75756ff0218624c16"
+}
