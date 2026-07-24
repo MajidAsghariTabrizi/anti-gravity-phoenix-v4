@@ -11,6 +11,7 @@ COPY money-path-classifier ./money-path-classifier
 COPY fixtures/routes ./fixtures/routes
 COPY fixtures/engine ./fixtures/engine
 COPY config/phoenix-route-universe-v1.json ./config/phoenix-route-universe-v1.json
+COPY config/phoenix-route-policy-v1.json ./config/phoenix-route-policy-v1.json
 COPY fixtures/autonomous-hunter/v1/valid/route-policy.json ./fixtures/autonomous-hunter/v1/valid/route-policy.json
 COPY fixtures/hunter-a1/v1/pinned-fork-cross-tick.json ./fixtures/hunter-a1/v1/pinned-fork-cross-tick.json
 COPY fixtures/hunter-a1/v1/autonomous-candidate.json ./fixtures/hunter-a1/v1/autonomous-candidate.json
