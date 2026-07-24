@@ -56,6 +56,10 @@ python3 "$helper" manifest-env \
   --manifest "$manifest" \
   --expected-sha "$release_sha" \
   --output "$release_env"
+grep -Fx \
+  'LIVE_EXECUTOR_IMAGE=ghcr.io/majidasgharitabrizi/live-executor@sha256:7777777777777777777777777777777777777777777777777777777777777777' \
+  "$release_env" >/dev/null ||
+  fail "current seven-image manifest omitted the optional LIVE image"
 
 route_json=$(python3 -c 'import json,sys; print(json.dumps(json.load(open(sys.argv[1], encoding="utf-8")), separators=(",", ":")))' \
   "$repo_dir/fixtures/routes/weth_usdc_uniswap_v3.json")
@@ -190,6 +194,8 @@ assert value["status"] == "ok"
 assert value["mode"] == "SHADOW"
 assert value["live_execution"] is False
 assert value["rpc_state_requests_per_minute"] == 12
+assert "live-executor" not in value["expected_services"]
+assert "live-executor" not in value["images"]
 ' || fail "renderer output is not bounded machine-readable JSON"
 if printf '%s' "$render_stdout" | grep -F "$provider_secret" >/dev/null; then
   fail "renderer printed a provider URL"

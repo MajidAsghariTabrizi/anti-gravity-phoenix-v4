@@ -241,15 +241,26 @@ BUILT_IMAGES = tuple(name for name in RELEASE_IMAGES if name not in PROTECTED_IM
 LEGACY_RELEASE_IMAGES = tuple(
     component["name"] for component in COMPONENTS if not component["live_canary_only"]
 )
-DEFAULT_PRODUCTION_COMPONENTS = tuple(
+IMAGE_ENVIRONMENT_COMPONENTS = tuple(
     sorted(
         (
             component
             for component in COMPONENTS
-            if component["production_compose"] and not component["live_canary_only"]
+            if component["production_compose"]
+            and component["image_environment"] is not None
         ),
         key=lambda component: component["production_order"],
     )
+)
+DEFAULT_PRODUCTION_COMPONENTS = tuple(
+    component
+    for component in IMAGE_ENVIRONMENT_COMPONENTS
+    if not component["live_canary_only"]
+)
+OPTIONAL_LIVE_COMPONENTS = tuple(
+    component
+    for component in IMAGE_ENVIRONMENT_COMPONENTS
+    if component["live_canary_only"]
 )
 REQUIRED_CI = REGISTRY["required_ci"]
 REQUIRED_CI_JOBS = tuple(REQUIRED_CI["jobs"])

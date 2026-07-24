@@ -116,6 +116,10 @@ def _validate_relative_path(value: str) -> str:
     if path.is_absolute() or any(part in ("", ".", "..") for part in path.parts):
         raise ReleaseAssetError("release asset path is invalid")
     lowered = value.lower()
+    if "__pycache__" in (part.lower() for part in path.parts) or lowered.endswith(
+        (".pyc", ".pyo")
+    ):
+        raise ReleaseAssetError("release asset path is generated Python bytecode")
     sensitive_names = (
         ".env",
         ".pem",

@@ -130,6 +130,14 @@ grep -F 'not member.isfile()' "$installer" >/dev/null ||
   fail 'release installer does not reject non-file archive members'
 grep -F 'release_assets.py" verify' "$installer" >/dev/null ||
   fail 'release installer does not run the canonical verifier'
+grep -F 'export PYTHONDONTWRITEBYTECODE=1' "$installer" >/dev/null ||
+  fail 'release installer does not disable Python bytecode writes for child helpers'
+if [ "$(grep -c '/usr/bin/python3 -I -B' "$installer")" -lt 4 ]; then
+  fail 'release installer Python checks are not isolated and no-bytecode'
+fi
+if [ "$(grep -c 'release_assets.py" verify-tree' "$installer")" -lt 3 ]; then
+  fail 'release installer does not verify candidate and final immutable trees'
+fi
 grep -F '/bin/sh "$context_installer" "$release_sha" "$final_root"' "$installer" \
   >/dev/null ||
   fail 'release installer does not bind scoped context installation to the exact tree'
