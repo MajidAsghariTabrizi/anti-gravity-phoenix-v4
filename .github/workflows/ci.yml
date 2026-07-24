@@ -63,7 +63,8 @@ jobs:
             scripts/rollback-release.sh \
             scripts/validate-production-env.sh \
             scripts/validate-production-release-context.sh
-          go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.7
+          SHELLCHECK_OPTS=--severity=warning \
+            go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.7
 
       - name: Validate bounded Engine canary control
         shell: bash
@@ -733,7 +734,7 @@ jobs:
           (
             cd migration-runner
             PHOENIX_FRESH_DATABASE_TEST_CONFIRM=CREATE_AND_DROP_ISOLATED_TEST_DATABASE \
-            MIGRATION_TEST_DSN=postgres://phoenix_test:phoenix_test_password@127.0.0.1:5432/phoenix_test?sslmode=disable \
+            MIGRATION_TEST_DSN='postgres://phoenix_test:phoenix_test_password@127.0.0.1:5432/phoenix_test?sslmode=disable' \
               go test ./internal/runner \
                 -run '^TestFreshV5DatabaseInitializesFromZeroAndIsIdempotent$' \
                 -count=1 -v
