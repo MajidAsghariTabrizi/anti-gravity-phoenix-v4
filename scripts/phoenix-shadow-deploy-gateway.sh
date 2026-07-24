@@ -31,6 +31,7 @@ for specification in \
   'release_provenance.py:600' \
   'install-release-assets.sh:700' \
   'install-production-release-context.sh:700' \
+  'production_mode.py:600' \
   'production-healthcheck.sh:700' \
   'prelive-protected-maintenance.sh:700' \
   'prelive_protected_maintenance.py:600' \
