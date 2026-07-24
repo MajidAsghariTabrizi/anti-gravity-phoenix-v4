@@ -241,6 +241,18 @@ prometheus_runtime_write_probe() {
   ' sh "$probe_dir"
 }
 
+prometheus_runtime_read_probe() {
+  probe_file=$1
+  probe_parent=$(dirname -- "$probe_file")
+  probe_name=$(basename -- "$probe_file")
+  sudo /bin/sh -c '
+    set -eu
+    cd "$1"
+    exec setpriv --reuid=65534 --regid=65534 --clear-groups \
+      /bin/sh -c "test -r \"\$1\"" sh "$2"
+  ' sh "$probe_parent" "$probe_name"
+}
+
 assert_live_canary_context() {
   context_source=$1
   context_target=$2
@@ -291,7 +303,7 @@ chmod 0755 "$host_root/deploy" "$host_root/deploy/prometheus"
 chmod 0640 "$prometheus_config"
 [ "$(stat -c '%a' "$prometheus_config")" = 640 ] ||
   fail 'Prometheus configuration regression fixture is not mode 0640'
-if sudo -u '#65534' -g '#65534' test -r "$prometheus_config"; then
+if prometheus_runtime_read_probe "$prometheus_config"; then
   fail 'mode 0640 Prometheus configuration fixture is unexpectedly readable'
 fi
 sudo env \
@@ -315,7 +327,7 @@ cmp "$before" "$after" >/dev/null ||
 [ "$(stat -c '%a' "$prometheus_config")" = 644 ] ||
   fail 'installed Prometheus configuration is not mode 0644'
 sudo chmod 0755 "$host_root/deploy" "$host_root/deploy/prometheus"
-sudo -u '#65534' -g '#65534' test -r "$prometheus_config" ||
+prometheus_runtime_read_probe "$prometheus_config" ||
   fail 'mode 0644 Prometheus configuration is unreadable by the runtime identity'
 sudo chmod 0750 "$host_root/deploy" "$host_root/deploy/prometheus"
 [ "$prometheus_payload_sha" = "$(sudo sha256sum "$prometheus_payload")" ] ||
