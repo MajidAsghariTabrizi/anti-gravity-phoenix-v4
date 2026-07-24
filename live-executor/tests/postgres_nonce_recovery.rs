@@ -88,9 +88,10 @@ async fn nonce_allocation_and_pending_state_survive_restart() {
     sqlx::query(
         "UPDATE live_canary.autonomous_global_control
          SET armed = true, kill_switch = false, execution_mode = 'live',
-             disarm_reason = NULL
+             daily_loss_limit = $1::numeric, disarm_reason = NULL
          WHERE singleton",
     )
+    .bind(config.limits.maximum_daily_loss_wei.to_string())
     .execute(&pool)
     .await
     .expect("arm isolated autonomous control");
