@@ -273,7 +273,10 @@ async fn event_to_hunter_to_persisted_outcome_is_exactly_once() {
         .await
         .expect("materializer");
     assert_eq!(
-        materializer.step(Utc::now()).await.expect("expire step"),
+        materializer
+            .step(Utc::now() + ChronoDuration::seconds(1))
+            .await
+            .expect("expire step"),
         MaterializationState::Idle
     );
     let expired_status: String = sqlx::query_scalar(
