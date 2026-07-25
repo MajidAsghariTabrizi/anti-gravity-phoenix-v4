@@ -9,6 +9,45 @@ pub const PINNED_V3_STATE_SCHEMA: &str = "phoenix.hunter-pinned-v3-state.v1";
 pub const MAX_TICK_BITMAP_WORDS: usize = 32;
 pub const MAX_INITIALIZED_TICKS: usize = 512;
 pub const MAX_CACHE_ENTRIES: usize = 1_024;
+pub const HUNTER_STATE_REQUEST_SCHEMA: &str = "phoenix.rpc.hunter-state-request.v1";
+pub const HUNTER_STATE_RESPONSE_SCHEMA: &str = "phoenix.rpc.hunter-state-response.v1";
+pub const MAX_HUNTER_POOLS_PER_REQUEST: usize = 16;
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct HunterPoolRequest {
+    pub pool_id: String,
+    pub pool_address: String,
+    pub factory_address: String,
+    pub protocol_id: String,
+    pub token0: String,
+    pub token1: String,
+    pub fee: u32,
+    pub tick_spacing: i32,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct HunterStateRequest {
+    pub schema_version: String,
+    pub chain_id: u64,
+    pub request_id: String,
+    pub pools: Vec<HunterPoolRequest>,
+    pub maximum_tick_words_per_pool: usize,
+    pub maximum_initialized_ticks: usize,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct HunterStateResponse {
+    pub schema_version: String,
+    pub chain_id: u64,
+    pub request_id: String,
+    pub block_number: u64,
+    pub block_hash: String,
+    pub agreements: Vec<ProviderStateAgreement>,
+    pub resolved_at_unix_ms: u64,
+}
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -34,6 +73,7 @@ pub struct PinnedV3PoolState {
     pub block_hash: String,
     pub pool_id: String,
     pub pool_address: String,
+    pub pool_code_hash: String,
     pub factory_address: String,
     pub protocol_id: String,
     pub token0: String,
@@ -69,6 +109,78 @@ pub enum HunterStateError {
     HashMismatch,
     #[error("hunter state providers disagree")]
     ProviderDisagreement,
+    #[error("hunter state provider evidence is incomplete")]
+    StateIncomplete,
+}
+
+impl HunterStateRequest {
+    pub fn validate(&self) -> Result<(), HunterStateError> {
+        if self.schema_version != HUNTER_STATE_REQUEST_SCHEMA
+            || self.chain_id != 42_161
+            || !bounded_identifier(&self.request_id, 1, 256)
+            || self.pools.is_empty()
+            || self.pools.len() > MAX_HUNTER_POOLS_PER_REQUEST
+            || self.maximum_tick_words_per_pool == 0
+            || self.maximum_tick_words_per_pool > MAX_TICK_BITMAP_WORDS
+            || self.maximum_initialized_ticks == 0
+            || self.maximum_initialized_ticks > MAX_INITIALIZED_TICKS
+        {
+            return Err(HunterStateError::InvalidContract);
+        }
+        let mut ids = std::collections::HashSet::new();
+        let mut addresses = std::collections::HashSet::new();
+        for pool in &self.pools {
+            if !bounded_identifier(&pool.pool_id, 1, 256)
+                || !ids.insert(pool.pool_id.as_str())
+                || !canonical_address(&pool.pool_address)
+                || !addresses.insert(pool.pool_address.as_str())
+                || !canonical_address(&pool.factory_address)
+                || !bounded_identifier(&pool.protocol_id, 1, 64)
+                || !canonical_address(&pool.token0)
+                || !canonical_address(&pool.token1)
+                || pool.token0 >= pool.token1
+                || pool.fee == 0
+                || pool.fee >= 1_000_000
+                || pool.tick_spacing <= 0
+                || pool.tick_spacing > 887_272
+            {
+                return Err(HunterStateError::InvalidContract);
+            }
+        }
+        Ok(())
+    }
+}
+
+impl HunterStateResponse {
+    pub fn validate(&self, request: &HunterStateRequest) -> Result<(), HunterStateError> {
+        request.validate()?;
+        if self.schema_version != HUNTER_STATE_RESPONSE_SCHEMA
+            || self.chain_id != request.chain_id
+            || self.request_id != request.request_id
+            || self.block_number == 0
+            || !canonical_hash(&self.block_hash, true)
+            || self.agreements.len() != request.pools.len()
+        {
+            return Err(HunterStateError::InvalidContract);
+        }
+        for (agreement, expected) in self.agreements.iter().zip(&request.pools) {
+            let state = agreement.agreed()?;
+            if state.block_number != self.block_number
+                || state.block_hash != self.block_hash
+                || state.pool_id != expected.pool_id
+                || state.pool_address != expected.pool_address
+                || state.factory_address != expected.factory_address
+                || state.protocol_id != expected.protocol_id
+                || state.token0 != expected.token0
+                || state.token1 != expected.token1
+                || state.fee != expected.fee
+                || state.tick_spacing != expected.tick_spacing
+            {
+                return Err(HunterStateError::InvalidContract);
+            }
+        }
+        Ok(())
+    }
 }
 
 impl PinnedV3PoolState {
@@ -79,6 +191,7 @@ impl PinnedV3PoolState {
             || !canonical_hash(&self.block_hash, true)
             || !bounded_identifier(&self.pool_id, 1, 256)
             || !canonical_address(&self.pool_address)
+            || !canonical_hash(&self.pool_code_hash, false)
             || !canonical_address(&self.factory_address)
             || !bounded_identifier(&self.protocol_id, 1, 64)
             || !canonical_address(&self.token0)
@@ -368,6 +481,7 @@ mod tests {
             block_hash: format!("0x{}", "a".repeat(64)),
             pool_id: "pool-500".to_string(),
             pool_address: pool.to_string(),
+            pool_code_hash: "b".repeat(64),
             factory_address: "0x1111111111111111111111111111111111111111".to_string(),
             protocol_id: "uniswap-v3".to_string(),
             token0: "0x2222222222222222222222222222222222222222".to_string(),

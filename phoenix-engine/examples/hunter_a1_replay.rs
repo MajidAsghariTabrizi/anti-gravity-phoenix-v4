@@ -31,6 +31,7 @@ fn state(
         block_hash: format!("0x{}", "a".repeat(64)),
         pool_id: pool_id.to_string(),
         pool_address: pool_address.to_string(),
+        pool_code_hash: "b".repeat(64),
         factory_address: FACTORY.to_string(),
         protocol_id: "uniswap-v3".to_string(),
         token0: WETH.to_string(),

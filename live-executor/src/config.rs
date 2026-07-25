@@ -16,6 +16,7 @@ const MAX_POLL_INTERVAL_SECONDS: u64 = 30;
 const ENVIRONMENT_NAMES: &[&str] = &[
     "PHOENIX_MODE",
     "LIVE_EXECUTION",
+    "AUTONOMOUS_EXECUTION",
     "LIVE_EXECUTOR_ARMED",
     "LIVE_EXECUTOR_KILL_SWITCH",
     "CHAIN_ID",
@@ -107,12 +108,13 @@ impl Bootstrap {
             .filter(|value| !value.trim().is_empty());
         let mode = get_or(&values, "PHOENIX_MODE", "SHADOW");
         let live_execution = parse_bool(get_or(&values, "LIVE_EXECUTION", "false"))?;
+        let autonomous_execution = parse_bool(get_or(&values, "AUTONOMOUS_EXECUTION", "false"))?;
         let armed = parse_bool(get_or(&values, "LIVE_EXECUTOR_ARMED", "false"))?;
 
-        if mode == "SHADOW" && !live_execution && !armed {
+        if mode == "SHADOW" && !live_execution && !autonomous_execution && !armed {
             return Ok(Self::Disabled(DisabledReason::SafeDefaults));
         }
-        if mode != "LIVE" || !live_execution || !armed {
+        if mode != "LIVE" || !live_execution || !autonomous_execution || !armed {
             return Err(ConfigError::IncompleteArming);
         }
         if parse_bool(get_or(&values, "LIVE_EXECUTOR_KILL_SWITCH", "true"))? {
@@ -120,6 +122,9 @@ impl Bootstrap {
         }
         if environment_key_material.is_some() && signer_file_path.is_some() {
             return Err(ConfigError::SignerSourceConflict);
+        }
+        if environment_key_material.is_some() && !cfg!(test) {
+            return Err(ConfigError::EnvironmentSignerForbidden);
         }
 
         let chain_id = required(&values, "CHAIN_ID")?
@@ -348,6 +353,8 @@ pub enum ConfigError {
     MissingSigner,
     #[error("signer sources conflict")]
     SignerSourceConflict,
+    #[error("production environment-backed signer material is forbidden")]
+    EnvironmentSignerForbidden,
     #[error("signer file path is invalid")]
     SignerFilePath,
     #[error("signer file is unavailable")]
@@ -388,6 +395,7 @@ impl ConfigError {
             Self::UnsupportedProfitAsset => "unsupported_profit_asset",
             Self::MissingSigner => "missing_signer",
             Self::SignerSourceConflict => "signer_source_conflict",
+            Self::EnvironmentSignerForbidden => "environment_signer_forbidden",
             Self::SignerFilePath => "signer_file_path",
             Self::SignerFileUnavailable => "signer_file_unavailable",
             Self::SignerFileSymlink => "signer_file_symlink",
@@ -424,6 +432,7 @@ mod tests {
         BTreeMap::from([
             ("PHOENIX_MODE".to_string(), "LIVE".to_string()),
             ("LIVE_EXECUTION".to_string(), "true".to_string()),
+            ("AUTONOMOUS_EXECUTION".to_string(), "true".to_string()),
             ("LIVE_EXECUTOR_ARMED".to_string(), "true".to_string()),
             ("LIVE_EXECUTOR_KILL_SWITCH".to_string(), "false".to_string()),
             ("CHAIN_ID".to_string(), ARBITRUM_ONE_CHAIN_ID.to_string()),

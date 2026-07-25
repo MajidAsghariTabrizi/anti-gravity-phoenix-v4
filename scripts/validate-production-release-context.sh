@@ -2,8 +2,9 @@
 set -eu
 umask 077
 
-script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 compose_file=
+overlay_file=
 env_file=
 release_env=
 release_manifest=
@@ -27,6 +28,7 @@ usage() {
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --compose-file) [ "$#" -ge 2 ] || usage; compose_file=$2; shift 2 ;;
+    --overlay-file) [ "$#" -ge 2 ] || usage; overlay_file=$2; shift 2 ;;
     --env-file) [ "$#" -ge 2 ] || usage; env_file=$2; shift 2 ;;
     --release-env) [ "$#" -ge 2 ] || usage; release_env=$2; shift 2 ;;
     --release-manifest) [ "$#" -ge 2 ] || usage; release_manifest=$2; shift 2 ;;
@@ -76,13 +78,17 @@ cleanup_state() {
 trap cleanup_state EXIT
 trap 'exit 1' HUP INT TERM
 
-"$script_dir/render-production-compose.sh" \
+set -- \
   --compose-file "$compose_file" \
   --env-file "$env_file" \
   --release-env "$release_env" \
   --release-manifest "$release_manifest" \
   --output "$rendered_output" \
-  --metadata-output "$metadata_output" >/dev/null || exit 1
+  --metadata-output "$metadata_output"
+if [ -n "$overlay_file" ]; then
+  set -- "$@" --overlay-file "$overlay_file"
+fi
+"$script_dir/render-production-compose.sh" "$@" >/dev/null || exit 1
 
 if [ "$inspect_running" -eq 1 ]; then
   running_tsv=$state_dir/running-images.tsv
@@ -100,10 +106,16 @@ if [ "$inspect_running" -eq 1 ]; then
   if [ -z "${PHOENIX_DOCKER_BIN:-}" ]; then
     command -v docker >/dev/null 2>&1 || fail RUNNING_IMAGE_MISMATCH
   fi
-  for service in \
-    nitro-feed-relay nats postgres rpc-gateway feed-ingestor \
-    phoenix-engine shadow-dispatcher recorder dashboard prometheus
+  services='nitro-feed-relay nats postgres rpc-gateway feed-ingestor phoenix-engine shadow-dispatcher recorder dashboard prometheus'
+  if [ -n "$overlay_file" ]; then
+    services="$services live-executor"
+  fi
+  for service in $services
   do
+    set -- -f "$compose_file"
+    if [ -n "$overlay_file" ]; then
+      set -- "$@" -f "$overlay_file" --profile live-autonomous
+    fi
     container_id=$(env -i \
       PATH="${PATH:-}" \
       HOME="${HOME:-}" \
@@ -115,7 +127,7 @@ if [ "$inspect_running" -eq 1 ]; then
       "$compose_command" ${compose_prefix:+"$compose_prefix"} \
         --env-file "$env_file" \
         --env-file "$release_env" \
-        -f "$compose_file" ps -q "$service" 2>/dev/null) ||
+        "$@" ps -q "$service" 2>/dev/null) ||
       fail RUNNING_IMAGE_MISMATCH
     [ -n "$container_id" ] || fail RUNNING_IMAGE_MISMATCH
     image_pair=$(

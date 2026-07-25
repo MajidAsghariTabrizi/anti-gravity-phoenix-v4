@@ -2,8 +2,9 @@
 set -eu
 umask 077
 
-script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 compose_file=
+overlay_file=
 env_file=
 release_env=
 release_manifest=
@@ -22,6 +23,7 @@ usage() {
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --compose-file) [ "$#" -ge 2 ] || usage; compose_file=$2; shift 2 ;;
+    --overlay-file) [ "$#" -ge 2 ] || usage; overlay_file=$2; shift 2 ;;
     --env-file) [ "$#" -ge 2 ] || usage; env_file=$2; shift 2 ;;
     --release-env) [ "$#" -ge 2 ] || usage; release_env=$2; shift 2 ;;
     --release-manifest) [ "$#" -ge 2 ] || usage; release_manifest=$2; shift 2 ;;
@@ -36,6 +38,9 @@ done
 [ -n "$rendered_output" ] || usage
 [ -n "$metadata_output" ] || usage
 [ -f "$compose_file" ] || fail PRODUCTION_COMPOSE_CONTEXT_MISSING
+if [ -n "$overlay_file" ]; then
+  [ -f "$overlay_file" ] || fail PRODUCTION_COMPOSE_CONTEXT_MISSING
+fi
 [ -f "$env_file" ] || fail PRODUCTION_ENV_MISSING
 if [ -z "$release_env" ] && [ -z "$release_manifest" ]; then
   fail RELEASE_ENV_MISSING
@@ -77,6 +82,9 @@ set -- python3 "$script_dir/production_context.py" validate-output-paths \
   --input "$compose_file" \
   --input "$env_file" \
   --input "$release_env"
+if [ -n "$overlay_file" ]; then
+  set -- "$@" --input "$overlay_file"
+fi
 if [ -n "$release_manifest" ]; then
   set -- "$@" --input "$release_manifest"
 fi
@@ -94,6 +102,11 @@ else
   compose_prefix=compose
 fi
 
+set -- -f "$compose_file"
+if [ -n "$overlay_file" ]; then
+  set -- "$@" -f "$overlay_file" --profile live-autonomous
+fi
+
 if ! env -i \
   PATH="${PATH:-}" \
   HOME="${HOME:-}" \
@@ -105,7 +118,7 @@ if ! env -i \
   "$compose_command" ${compose_prefix:+"$compose_prefix"} \
     --env-file "$env_file" \
     --env-file "$release_env" \
-    -f "$compose_file" \
+    "$@" \
     config --format json >"$rendered_tmp" 2>/dev/null; then
   fail PRODUCTION_COMPOSE_CONTEXT_MISSING
 fi

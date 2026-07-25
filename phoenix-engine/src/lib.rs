@@ -1,4 +1,5 @@
 pub mod amm;
+pub mod autonomous;
 pub mod config;
 pub mod decision;
 pub mod domain;

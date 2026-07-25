@@ -351,6 +351,15 @@ impl ExecutionRpc for FakeRpc {
         Ok(self.state.lock().expect("state").chain_id)
     }
 
+    async fn execution_contract_ready(
+        &self,
+        _request: &ExecutionRequest,
+        _wallet: CanonicalAddress,
+        _expected_code_hash: &str,
+    ) -> Result<bool, RpcError> {
+        Ok(true)
+    }
+
     async fn pending_nonce(&self, _wallet: CanonicalAddress) -> Result<u64, RpcError> {
         Ok(self.state.lock().expect("state").pending_nonce)
     }
@@ -479,6 +488,7 @@ fn valid_request(now: DateTime<Utc>, flash_asset: CanonicalAddress) -> Execution
         legs: vec![
             ValidatedLeg {
                 pool: CanonicalAddress::parse(CURRENT_ROUTE_POOL_500_ADDRESS).expect("pool"),
+                factory: None,
                 token_in: flash_asset,
                 token_out: token_b,
                 fee: 500,
@@ -487,6 +497,7 @@ fn valid_request(now: DateTime<Utc>, flash_asset: CanonicalAddress) -> Execution
             },
             ValidatedLeg {
                 pool: CanonicalAddress::parse(CURRENT_ROUTE_POOL_3000_ADDRESS).expect("pool"),
+                factory: None,
                 token_in: token_b,
                 token_out: flash_asset,
                 fee: 3_000,
@@ -541,6 +552,8 @@ fn successful_receipt(
         block_number: 100,
         gas_used: 10,
         effective_gas_price: 10,
+        l1_gas_used: 0,
+        l1_fee: 0,
         logs: vec![RpcLog {
             address: executor,
             topics: vec![signature.0, request.route_id, asset_topic],
@@ -593,7 +606,7 @@ async fn receipt_success_reconciles_realized_pnl() {
 }
 
 #[tokio::test]
-async fn revert_disarms_the_canary() {
+async fn known_revert_records_loss_without_global_disarm() {
     let harness = harness(1);
     harness.executor.step(harness.now).await.expect("submit");
     let tx_hash = harness.rpc.last_hash();
@@ -603,6 +616,8 @@ async fn revert_disarms_the_canary() {
         block_number: 100,
         gas_used: 10,
         effective_gas_price: 10,
+        l1_gas_used: 0,
+        l1_fee: 0,
         logs: Vec::new(),
     });
     let state = harness
@@ -611,7 +626,7 @@ async fn revert_disarms_the_canary() {
         .await
         .expect("receipt");
     assert!(matches!(state, ExecutionState::Reverted { .. }));
-    assert_eq!(harness.store.disarm_reason(), Some("transaction_reverted"));
+    assert_eq!(harness.store.disarm_reason(), None);
     assert_eq!(harness.store.daily_loss(), 100);
 }
 
@@ -626,6 +641,8 @@ async fn invalid_settlement_disarms_and_preserves_the_submitted_hash() {
         block_number: 100,
         gas_used: 10,
         effective_gas_price: 10,
+        l1_gas_used: 0,
+        l1_fee: 0,
         logs: Vec::new(),
     });
     let state = harness

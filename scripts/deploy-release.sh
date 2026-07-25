@@ -6,6 +6,7 @@ deploy_root="${PHOENIX_DEPLOY_ROOT:-/opt/phoenix}"
 deploy_dir="$deploy_root/deploy"
 env_file="${PHOENIX_ENV_FILE:-/etc/phoenix/phoenix.env}"
 compose_file="$deploy_dir/compose.prod.yml"
+overlay_file="$deploy_dir/compose.live-autonomous.yml"
 manifest="$deploy_dir/manifests/$release_sha.json"
 release_env="$deploy_dir/manifests/$release_sha.env"
 release_metadata="$deploy_dir/manifests/$release_sha.render.json"
@@ -33,6 +34,7 @@ esac
 [ "${#release_sha}" -eq 40 ] || fail "release SHA must be 40 lowercase hex characters"
 [ -f "$manifest" ] || fail "missing release manifest"
 [ -f "$compose_file" ] || fail "missing production compose file"
+[ -f "$overlay_file" ] || fail "missing autonomous LIVE compose overlay"
 [ -f "$env_file" ] || fail "missing production environment file"
 [ -s "$release_assets_file" ] || fail "exact release assets are not installed"
 installed_assets_sha=$(tr -d '\r\n' <"$release_assets_file")
@@ -57,6 +59,29 @@ chmod 0640 "$release_env"
 
 "$deploy_dir/validate-production-env.sh" "$env_file"
 
+set -a
+# shellcheck disable=SC1090
+. "$env_file"
+set +a
+[ -n "${LIVE_EXECUTOR_SIGNER_FILE:-}" ] &&
+  [ -f "$LIVE_EXECUTOR_SIGNER_FILE" ] &&
+  [ ! -L "$LIVE_EXECUTOR_SIGNER_FILE" ] || {
+    echo EXTERNAL_SIGNER_FILE_REQUIRED
+    exit 1
+  }
+signer_metadata=$(stat -c '%u:%g:%a:%h' "$LIVE_EXECUTOR_SIGNER_FILE") ||
+  fail "signer file metadata is unavailable"
+case "$signer_metadata" in
+  65532:65532:400:1|65532:65532:440:1) ;;
+  *) fail "signer file ownership, mode, or link count is unsafe" ;;
+esac
+if [ -z "${PRODUCTION_RPC_URL:-}" ] || [ -z "${SECONDARY_RPC_URL:-}" ] ||
+  [ -z "${LIVE_EXECUTOR_RPC_ALLOWLIST:-}" ]
+then
+  echo EXTERNAL_RPC_CREDENTIAL_REQUIRED
+  exit 1
+fi
+
 state_dir=$(mktemp -d "$runtime_dir/deploy-$release_sha.XXXXXX") ||
   fail "temporary release state could not be created"
 cleanup_candidate() {
@@ -73,22 +98,16 @@ context_rendered="$state_dir/context.compose.json"
 context_metadata="$state_dir/context.metadata.json"
 protected_before="$state_dir/protected.before.tsv"
 protected_after="$state_dir/protected.after.tsv"
-
-"$deploy_dir/render-production-compose.sh" \
-  --compose-file "$compose_file" \
-  --env-file "$env_file" \
-  --release-env "$release_env" \
-  --release-manifest "$manifest" \
-  --output "$rendered_candidate" \
-  --metadata-output "$metadata_candidate" >/dev/null ||
-  fail "canonical production rendering failed"
+owner_plan="$runtime_dir/owner-plan-$release_sha.json"
 
 compose() {
   PHOENIX_ENV_FILE="$env_file" PHOENIX_RELEASE_ENV="$release_env" \
     docker compose \
       --env-file "$env_file" \
       --env-file "$release_env" \
-      -f "$compose_file" "$@"
+      -f "$compose_file" \
+      -f "$overlay_file" \
+      --profile live-autonomous "$@"
 }
 
 capture_protected_ids() {
@@ -133,28 +152,81 @@ install_active_file() {
 
 capture_protected_ids "$protected_before" || fail "protected services are not ready before deployment"
 
-if [ -s "$current_file" ]; then
-  cp "$current_file" "$previous_file"
-fi
-
 rollback_on_failure() {
   code=$?
   trap - EXIT
-  if [ "$code" -ne 0 ]; then
+  if [ "$code" -ne 0 ] && [ "$mutation_started" -eq 1 ]; then
     echo "DEPLOY_FAILED: invoking rollback"
-    "$rollback_script" || echo "ROLLBACK_FAILED"
+    PHOENIX_CURRENT_LIVE_RELEASE_ENV="$release_env" \
+      "$rollback_script" || echo "ROLLBACK_FAILED"
   fi
   rm -rf "$state_dir"
   exit "$code"
 }
+mutation_started=0
 trap rollback_on_failure EXIT
 
 compose pull
+set +e
+preflight_output=$(compose run --rm --no-deps \
+  --entrypoint /usr/local/bin/autonomous-live-control \
+  live-executor preflight 2>&1)
+preflight_code=$?
+set -e
+printf '%s\n' "$preflight_output"
+if [ "$preflight_code" -ne 0 ]; then
+  case "$preflight_output" in
+    *"wallet has no native gas balance"*)
+      echo EXTERNAL_GAS_FUNDING_REQUIRED
+      exit 1
+      ;;
+    *"executor configuration is not LIVE-ready"*)
+      compose run --rm --no-deps \
+        --entrypoint /usr/local/bin/autonomous-live-control \
+        live-executor owner-plan >"$owner_plan" ||
+        fail "executor owner plan could not be materialized"
+      chmod 0640 "$owner_plan"
+      cat "$owner_plan"
+      echo "EXTERNAL_OWNER_AUTHORIZATION_REQUIRED: $owner_plan"
+      exit 1
+      ;;
+    *) fail "read-only autonomous preflight failed" ;;
+  esac
+fi
+if [ -s "$current_file" ]; then
+  cp "$current_file" "$previous_file"
+fi
+python3 "$deploy_dir/production_mode.py" live --env-file "$env_file" ||
+  fail "autonomous production mode could not be installed"
+mutation_started=1
+"$deploy_dir/validate-production-env.sh" "$env_file"
+"$deploy_dir/render-production-compose.sh" \
+  --compose-file "$compose_file" \
+  --overlay-file "$overlay_file" \
+  --env-file "$env_file" \
+  --release-env "$release_env" \
+  --release-manifest "$manifest" \
+  --output "$rendered_candidate" \
+  --metadata-output "$metadata_candidate" >/dev/null ||
+  fail "canonical production rendering failed"
+compose run --rm --no-deps \
+  --entrypoint /usr/local/bin/autonomous-live-control \
+  live-executor migrate
 compose run --rm --no-deps migration-runner
 for service in $optional_services; do
   compose up -d --no-deps "$service"
   wait_service_healthy "$service" || fail "optional service did not become healthy: $service"
 done
+compose run --rm --no-deps \
+  -e PHOENIX_AUTONOMOUS_ACTIVATION_ACK=ACTIVATE_AUTONOMOUS_LIVE_42161 \
+  --entrypoint /usr/local/bin/autonomous-live-control \
+  live-executor activate
+compose up -d --no-deps live-executor
+wait_service_healthy live-executor ||
+  fail "autonomous LIVE executor did not become healthy"
+compose run --rm --no-deps \
+  --entrypoint /usr/local/bin/autonomous-live-control \
+  live-executor status
 capture_protected_ids "$protected_after" || fail "protected services are not ready after deployment"
 cmp "$protected_before" "$protected_after" >/dev/null || fail "protected service identity changed during deployment"
 PHOENIX_RELEASE_ENV="$release_env" "$deploy_dir/production-healthcheck.sh"
@@ -169,6 +241,7 @@ python3 "$deploy_dir/production_context.py" write-state \
 
 "$deploy_dir/validate-production-release-context.sh" \
   --compose-file "$compose_file" \
+  --overlay-file "$overlay_file" \
   --env-file "$env_file" \
   --release-env "$release_env" \
   --release-manifest "$manifest" \

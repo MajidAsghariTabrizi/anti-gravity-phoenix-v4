@@ -40,7 +40,9 @@ RUN case "${CRATE}" in \
     fi && \
     if [ "${CRATE}" = "live-executor" ]; then \
       cargo build --release --bin approve-execution-request && \
-      cp target/release/approve-execution-request /out/approve-execution-request; \
+      cp target/release/approve-execution-request /out/approve-execution-request && \
+      cargo build --release --bin autonomous-live-control && \
+      cp target/release/autonomous-live-control /out/autonomous-live-control; \
     fi
 
 FROM debian:bookworm-slim

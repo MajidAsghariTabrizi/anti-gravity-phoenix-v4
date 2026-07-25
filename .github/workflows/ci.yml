@@ -23,6 +23,12 @@ jobs:
       - name: Checkout
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
 
+      - name: Setup Go for workflow lint
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff
+        with:
+          go-version-file: feed-ingestor/go.mod
+          cache: false
+
       - name: Install release schema validator
         shell: bash
         run: python3 -m pip install --disable-pip-version-check jsonschema==4.25.1
@@ -46,6 +52,19 @@ jobs:
         run: |
           set -euo pipefail
           sh -n scripts/*.sh
+          shellcheck --severity=warning \
+            scripts/deploy-release.sh \
+            scripts/install-autonomous-live-deploy-gateway.sh \
+            scripts/install-production-release-context.sh \
+            scripts/live-executor-isolated-fork-tests.sh \
+            scripts/phoenix-autonomous-live-deploy-gateway.sh \
+            scripts/production-healthcheck.sh \
+            scripts/render-production-compose.sh \
+            scripts/rollback-release.sh \
+            scripts/validate-production-env.sh \
+            scripts/validate-production-release-context.sh
+          SHELLCHECK_OPTS=--severity=warning \
+            go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.7
 
       - name: Validate bounded Engine canary control
         shell: bash
@@ -71,7 +90,8 @@ jobs:
           python3 -m unittest scripts.tests.test_hunter_contracts
           python3 scripts/hunter_contracts.py validate fixtures/hunter-a1/v1/autonomous-candidate.json
           python3 -m unittest scripts.tests.test_hunter_a1
-          python3 -m py_compile scripts/release_components.py scripts/release_provenance.py scripts/prelive_v5_release.py
+          python3 -m py_compile scripts/release_components.py scripts/release_provenance.py scripts/prelive_v5_release.py scripts/production_mode.py scripts/anvil_quote_proxy.py
+          python3 -m unittest scripts.tests.test_production_mode
           python3 -m unittest scripts.tests.test_release_components scripts.tests.test_release_provenance scripts.tests.test_prelive_v5_release
           python3 -m py_compile scripts/phoenix_shadow_deploy.py
           python3 -m unittest scripts.tests.test_shadow_deploy_gateway
@@ -161,6 +181,10 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     services:
+      nats:
+        image: nats@sha256:b83efabe3e7def1e0a4a31ec6e078999bb17c80363f881df35edc70fcb6bb927
+        ports:
+          - 4222:4222
       postgres:
         image: postgres@sha256:57c72fd2a128e416c7fcc499958864df5301e940bca0a56f58fddf30ffc07777
         env:
@@ -294,6 +318,10 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     services:
+      nats:
+        image: nats@sha256:b83efabe3e7def1e0a4a31ec6e078999bb17c80363f881df35edc70fcb6bb927
+        ports:
+          - 4222:4222
       postgres:
         image: postgres@sha256:57c72fd2a128e416c7fcc499958864df5301e940bca0a56f58fddf30ffc07777
         env:
@@ -402,6 +430,7 @@ jobs:
           PHOENIX_ENV=production
           PHOENIX_MODE=SHADOW
           LIVE_EXECUTION=false
+          AUTONOMOUS_EXECUTION=false
           CHAIN_ID=42161
           POSTGRES_USER=phoenix_app
           POSTGRES_PASSWORD=ci-placeholder-not-production
@@ -418,6 +447,8 @@ jobs:
           RPC_UPSTREAM_CALL_BURST=4
           RPC_STATE_REQUESTS_PER_MINUTE=12
           RPC_PROVIDER_PROBE_INTERVAL_SECONDS=60
+          PRODUCTION_RPC_URL=https://primary-rpc-placeholder.invalid
+          SECONDARY_RPC_URL=https://secondary-rpc-placeholder.invalid
           ENGINE_ROUTER_ADDRESSES=0xe592427a0aece92de3edee1f18e0157c05861564,0x68b3465833fb72a70ecdf485e0e4c7bd8665fc45,0xa51afafe0263b40edaef0df8781ea9aa03e381a3
           RECORDER_PERSISTENCE_POLICY=money_path_v1
           WALLET_ADDRESS=
@@ -430,9 +461,12 @@ jobs:
           LIVE_EXECUTOR_SIGNER_FILE=/tmp/phoenix-live-executor-signer
           LIVE_EXECUTOR_WALLET_ADDRESS=0x1111111111111111111111111111111111111111
           LIVE_EXECUTOR_EXECUTOR_ADDRESS=0x2222222222222222222222222222222222222222
+          LIVE_EXECUTOR_EXECUTOR_CODE_HASH=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+          LIVE_EXECUTOR_EXPECTED_OWNER=0x3333333333333333333333333333333333333333
+          LIVE_EXECUTOR_EXPECTED_FLASH_PROVIDER=0x4444444444444444444444444444444444444444
           LIVE_EXECUTOR_PNL_ASSET_ADDRESS=0x82af49447d8a07e3bd95bd0d56f35241523fbab1
-          LIVE_EXECUTOR_RPC_URL=https://live-executor-rpc-placeholder.invalid
-          LIVE_EXECUTOR_RPC_ALLOWLIST=https://live-executor-rpc-placeholder.invalid
+          LIVE_EXECUTOR_RPC_URL=https://primary-rpc-placeholder.invalid
+          LIVE_EXECUTOR_RPC_ALLOWLIST=https://primary-rpc-placeholder.invalid,https://secondary-rpc-placeholder.invalid
           LIVE_EXECUTOR_MAX_GAS_LIMIT=500000
           LIVE_EXECUTOR_MAX_MAX_FEE_PER_GAS_WEI=1000000000
           LIVE_EXECUTOR_MAX_PRIORITY_FEE_PER_GAS_WEI=100000000
@@ -462,12 +496,13 @@ jobs:
             --manifest .ci-release-manifest.json \
             --expected-sha 0000000000000000000000000000000000000000 \
             --output .ci-release.env
-          cat > .ci-autonomous-live.env <<'EOF'
-          LIVE_EXECUTOR_PHOENIX_MODE=LIVE
-          LIVE_EXECUTOR_LIVE_EXECUTION=true
-          LIVE_EXECUTOR_ARMED=true
-          LIVE_EXECUTOR_KILL_SWITCH=false
-          EOF
+          sed \
+            -e 's/^PHOENIX_MODE=SHADOW$/PHOENIX_MODE=LIVE/' \
+            -e 's/^LIVE_EXECUTION=false$/LIVE_EXECUTION=true/' \
+            -e 's/^AUTONOMOUS_EXECUTION=false$/AUTONOMOUS_EXECUTION=true/' \
+            -e 's#^RPC_PROVIDER_URLS=.*#RPC_PROVIDER_URLS=https://primary-rpc-placeholder.invalid,https://secondary-rpc-placeholder.invalid#' \
+            -e 's/^RPC_PROVIDER_WEIGHTS=1$/RPC_PROVIDER_WEIGHTS=1,2/' \
+            .ci-prod.env > .ci-autonomous-live.env
           docker compose config
           PHOENIX_ENV_FILE=.ci-prod.env docker compose \
             --env-file .ci-prod.env --env-file .ci-release.env \
@@ -483,12 +518,11 @@ jobs:
             --env-file .ci-prod.env --env-file .ci-release.env \
             -f compose.prod.yml -f compose.live-canary.yml \
             --profile live-canary config --format json > .ci-live-canary-config.json
-          PHOENIX_ENV_FILE=.ci-prod.env docker compose \
-            --env-file .ci-prod.env \
-            --env-file .ci-release.env \
+          PHOENIX_ENV_FILE=.ci-autonomous-live.env docker compose \
             --env-file .ci-autonomous-live.env \
-            -f compose.prod.yml -f compose.live-canary.yml \
-            --profile live-canary config --format json > .ci-autonomous-live-config.json
+            --env-file .ci-release.env \
+            -f compose.prod.yml -f compose.live-autonomous.yml \
+            --profile live-autonomous config --format json > .ci-autonomous-live-config.json
           python3 - <<'PY'
           import json
 
@@ -579,12 +613,20 @@ jobs:
           EOF
           docker compose --env-file .ci-fork.env -f compose.fork.yml --profile fork-sandbox config
           printf 'ENGINE_ROUTE_REGISTRY_JSON=%s\n' "$(python3 -c 'import json; print(json.dumps(json.load(open("fixtures/routes/weth_usdc_uniswap_v3.json")), separators=(",", ":")))')" >> .ci-prod.env
+          printf 'ENGINE_ROUTE_REGISTRY_JSON=%s\n' "$(python3 -c 'import json; print(json.dumps(json.load(open("fixtures/routes/weth_usdc_uniswap_v3.json")), separators=(",", ":")))')" >> .ci-autonomous-live.env
           ./scripts/render-production-compose.sh \
             --compose-file "$PWD/compose.prod.yml" \
             --env-file "$PWD/.ci-prod.env" \
             --release-env "$PWD/.ci-release.env" \
             --output "$PWD/.ci-rendered.json" \
             --metadata-output "$PWD/.ci-render-metadata.json" >/dev/null
+          ./scripts/render-production-compose.sh \
+            --compose-file "$PWD/compose.prod.yml" \
+            --overlay-file "$PWD/compose.live-autonomous.yml" \
+            --env-file "$PWD/.ci-autonomous-live.env" \
+            --release-env "$PWD/.ci-release.env" \
+            --output "$PWD/.ci-live-rendered.json" \
+            --metadata-output "$PWD/.ci-live-render-metadata.json" >/dev/null
 
       - name: Validate Compose route registry preservation
         shell: bash
@@ -692,7 +734,7 @@ jobs:
           (
             cd migration-runner
             PHOENIX_FRESH_DATABASE_TEST_CONFIRM=CREATE_AND_DROP_ISOLATED_TEST_DATABASE \
-            MIGRATION_TEST_DSN=postgres://phoenix_test:phoenix_test_password@127.0.0.1:5432/phoenix_test?sslmode=disable \
+            MIGRATION_TEST_DSN='postgres://phoenix_test:phoenix_test_password@127.0.0.1:5432/phoenix_test?sslmode=disable' \
               go test ./internal/runner \
                 -run '^TestFreshV5DatabaseInitializesFromZeroAndIsIdempotent$' \
                 -count=1 -v

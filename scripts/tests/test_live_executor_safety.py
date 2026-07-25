@@ -52,6 +52,32 @@ class LiveExecutorSafetyTests(unittest.TestCase):
         self.assertIn("no-new-privileges:true", overlay)
         self.assertNotRegex(overlay, r"ports:\s*\n")
 
+    def test_autonomous_live_profile_is_explicit_continuous_and_file_signed(self) -> None:
+        overlay = (ROOT / "compose.live-autonomous.yml").read_text(encoding="utf-8")
+        for required in (
+            'profiles: ["live-autonomous"]',
+            "PHOENIX_MODE: LIVE",
+            'LIVE_EXECUTION: "true"',
+            'AUTONOMOUS_EXECUTION: "true"',
+            'LIVE_EXECUTOR_ARMED: "true"',
+            'LIVE_EXECUTOR_KILL_SWITCH: "false"',
+            "PRODUCTION_RPC_URL: ${PRODUCTION_RPC_URL:?PRODUCTION_RPC_URL is required}",
+            "SECONDARY_RPC_URL: ${SECONDARY_RPC_URL:?SECONDARY_RPC_URL is required}",
+            "LIVE_EXECUTOR_EXPECTED_OWNER: ${LIVE_EXECUTOR_EXPECTED_OWNER:?LIVE_EXECUTOR_EXPECTED_OWNER is required}",
+            "LIVE_EXECUTOR_EXPECTED_FLASH_PROVIDER: ${LIVE_EXECUTOR_EXPECTED_FLASH_PROVIDER:?LIVE_EXECUTOR_EXPECTED_FLASH_PROVIDER is required}",
+            "SIGNER_PRIVATE_KEY_FILE: /run/secrets/phoenix-live-executor-signer",
+            "source: ${LIVE_EXECUTOR_SIGNER_FILE:?LIVE_EXECUTOR_SIGNER_FILE is required}",
+            "create_host_path: false",
+            "restart: unless-stopped",
+            'user: "65532:65532"',
+            "read_only: true",
+            "cap_drop: [ALL]",
+            "no-new-privileges:true",
+        ):
+            self.assertIn(required, overlay)
+        self.assertNotRegex(overlay, r"(?m)^\s+SIGNER_PRIVATE_KEY\s*:")
+        self.assertNotRegex(overlay, r"ports:\s*\n")
+
     def test_canary_schema_does_not_change_root_migrations(self) -> None:
         root_migrations = sorted(path.name for path in (ROOT / "migrations").glob("*.sql"))
         self.assertEqual(root_migrations[-1], "011_money_path_selective_persistence.sql")
@@ -64,6 +90,9 @@ class LiveExecutorSafetyTests(unittest.TestCase):
         ).read_text(encoding="utf-8")
         autonomous_schema = (
             ROOT / "live-executor/schema/003_autonomous_hunter_contracts.sql"
+        ).read_text(encoding="utf-8")
+        runtime_schema = (
+            ROOT / "live-executor/schema/004_autonomous_live_runtime.sql"
         ).read_text(encoding="utf-8")
         self.assertIn("armed BOOLEAN NOT NULL DEFAULT false", schema)
         self.assertIn("kill_switch BOOLEAN NOT NULL DEFAULT true", schema)
@@ -118,6 +147,9 @@ class LiveExecutorSafetyTests(unittest.TestCase):
             self.assertIn(table, autonomous_schema)
         self.assertIn("'phoenix.live-canary-schema.v2'", autonomous_schema)
         self.assertIn("'phoenix.live-canary-schema.v3'", autonomous_schema)
+        self.assertIn("'phoenix.live-canary-schema.v4'", runtime_schema)
+        self.assertIn("autonomous_candidate_transition", runtime_schema)
+        self.assertIn("autonomous_outcome_chain_pnl_v4", runtime_schema)
         store = (ROOT / "live-executor/src/store.rs").read_text(encoding="utf-8")
         self.assertIn("AT TIME ZONE 'UTC'", store)
 
@@ -180,6 +212,62 @@ class LiveExecutorSafetyTests(unittest.TestCase):
             workflow,
         )
         self.assertIn('if "SIGNER_PRIVATE_KEY" in environment:', workflow)
+
+    def test_autonomous_deployment_is_exact_release_gated_and_preflight_first(self) -> None:
+        workflow = (
+            ROOT / ".github/workflows/deploy-autonomous-live.yml"
+        ).read_text(encoding="utf-8")
+        for required in (
+            "environment: production-live",
+            '[ "$(git rev-parse FETCH_HEAD)" = "$RELEASE_SHA" ]',
+            "validate-source-ci-api",
+            "validate-deploy-pair",
+            "phoenix-release-assets-${{ inputs.release_sha }}",
+            "$remote:$stage/rollback-manifest.json",
+            "$remote:$stage/rollback-provenance.json",
+            "/usr/local/sbin/phoenix-autonomous-live-deploy-gateway",
+        ):
+            self.assertIn(required, workflow)
+
+        gateway = (
+            ROOT / "scripts/phoenix-autonomous-live-deploy-gateway.sh"
+        ).read_text(encoding="utf-8")
+        active_context = gateway.index('"$current_validator"')
+        immutable_install = gateway.index('"$libexec/install-release-assets.sh"')
+        live_deploy = gateway.index('"$deploy_dir/deploy-release.sh"')
+        self.assertLess(active_context, immutable_install)
+        self.assertLess(immutable_install, live_deploy)
+        self.assertIn("validate-deploy-pair", gateway)
+        self.assertIn("verify-tree", gateway)
+        self.assertIn("current_release_mismatch", gateway)
+
+        deployment = (ROOT / "scripts/deploy-release.sh").read_text(encoding="utf-8")
+        preflight = deployment.index("live-executor preflight")
+        previous_release = deployment.index('cp "$current_file" "$previous_file"')
+        mode_live = deployment.index("production_mode.py\" live")
+        migration = deployment.index("live-executor migrate")
+        activation = deployment.index("live-executor activate")
+        executor_start = deployment.index("compose up -d --no-deps live-executor")
+        self.assertLess(preflight, previous_release)
+        self.assertLess(previous_release, mode_live)
+        self.assertLess(mode_live, migration)
+        self.assertLess(migration, activation)
+        self.assertLess(activation, executor_start)
+        self.assertIn("EXTERNAL_OWNER_AUTHORIZATION_REQUIRED", deployment)
+        self.assertIn("EXTERNAL_GAS_FUNDING_REQUIRED", deployment)
+
+    def test_autonomous_rollback_disarms_reconciles_then_restores(self) -> None:
+        rollback = (ROOT / "scripts/rollback-release.sh").read_text(encoding="utf-8")
+        disarm = rollback.index("live-executor disarm")
+        reconciliation = rollback.index("live-executor reconciliation-status")
+        executor_stop = rollback.index("stop -t 30 live-executor")
+        shadow_mode = rollback.index("production_mode.py\" shadow")
+        immutable_verify = rollback.index("verify-tree")
+        self.assertLess(disarm, reconciliation)
+        self.assertLess(reconciliation, executor_stop)
+        self.assertLess(executor_stop, shadow_mode)
+        self.assertLess(shadow_mode, immutable_verify)
+        self.assertNotIn("TRUNCATE", rollback)
 
     def test_config_failures_are_logged_by_sanitized_code_only(self) -> None:
         runtime = (ROOT / "live-executor/src/main.rs").read_text(encoding="utf-8")

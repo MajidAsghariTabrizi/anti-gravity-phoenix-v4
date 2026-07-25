@@ -55,6 +55,22 @@ The Uniswap page states the listed deployments are current and warns integrators
 
 Engine origin decoding is pinned separately for each reviewed entrypoint. See `docs/UNISWAP_ENTRYPOINTS.md`; no ABI layout is shared between SwapRouter and SwapRouter02.
 
+Autonomous LIVE state reads use the official Uniswap V3 Core interfaces and
+the deployed pool bytecode contract:
+
+- `IUniswapV3PoolImmutables`: factory, token pair, fee, and tick spacing.
+- `IUniswapV3PoolState`: `slot0`, active liquidity, `tickBitmap`, and `ticks`.
+- Factory `getPool(token0, token1, fee)` is checked against every reviewed
+  pool before state is accepted.
+- Source: `https://github.com/Uniswap/v3-core/tree/main/contracts/interfaces`.
+- Pool implementation source:
+  `https://github.com/Uniswap/v3-core/blob/main/contracts/UniswapV3Pool.sol`.
+
+Pinned-block reads are batched through Multicall3 `aggregate3` at the canonical
+deployment `0xcA11bde05977b3631167028862bE2a173976CA11`. Each inner result must
+succeed and decode under its exact ABI; partial batches are rejected. Source:
+`https://github.com/mds1/multicall3`.
+
 ## SushiSwap V3 on Arbitrum One
 
 Official source inspected: Sushi docs and `llms-full.txt`, which identifies the public `sushi` / `sushi/evm` SDK entrypoints and references V3 factory/init-code constants.
@@ -70,6 +86,15 @@ Required next verification:
 ## Aave V3 Flash Liquidity
 
 Phoenix includes Aave V3 `flashLoanSimple` interfaces only. No Arbitrum provider address is hardcoded. The flash provider is a registry value validated through the cold RPC gateway before LIVE mode can be enabled.
+
+## Arbitrum Transaction Cost Components
+
+LIVE submission quotes use the official Nitro `NodeInterface` virtual contract
+at `0x00000000000000000000000000000000000000C8`. The
+`gasEstimateComponents(address,bool,bytes)` result binds total gas, the L1 gas
+component, L2 base fee, and the ArbOS L1 base-fee estimate to the same
+transaction calldata. Source:
+`https://github.com/OffchainLabs/nitro-contracts/blob/main/src/node-interface/NodeInterface.sol`.
 
 ## Message Encoding
 

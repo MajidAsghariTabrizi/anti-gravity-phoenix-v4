@@ -32,9 +32,10 @@ rpc-gateway = { path = "../rpc-gateway" }
 serde = { version = "=1.0.210", features = ["derive"] }
 serde_json = "=1.0.128"
 sha2 = "=0.10.9"
-sqlx = { version = "=0.8.2", default-features = false, features = ["runtime-tokio-rustls", "postgres", "chrono", "json"] }
+sqlx = { version = "=0.8.2", default-features = false, features = ["runtime-tokio-rustls", "postgres", "chrono", "json", "uuid"] }
 thiserror = "=1.0.63"
 tokio = { version = "=1.40.0", features = ["full"] }
 tokio-util = "=0.7.12"
 tracing = "=0.1.40"
 tracing-subscriber = { version = "=0.3.18", features = ["env-filter", "fmt", "json"] }
+uuid = { version = "=1.10.0", features = ["serde"] }

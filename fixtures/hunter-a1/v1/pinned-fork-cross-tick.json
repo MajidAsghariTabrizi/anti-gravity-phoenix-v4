@@ -17,6 +17,7 @@
         "block_hash": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         "pool_id": "pool",
         "pool_address": "0xc6962004f452be9203591991d15f6b388e09e8d0",
+        "pool_code_hash": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
         "factory_address": "0x1f98431c8ad98523631ae4a59f267346ea31f984",
         "protocol_id": "uniswap-v3",
         "token0": "0x82af49447d8a07e3bd95bd0d56f35241523fbab1",
@@ -41,7 +42,7 @@
             "liquidity_net": "100000000"
           }
         ],
-        "state_hash": "d5d8ff9d98efe70a466c50e1cbec21c191a04b2bab1a686bea1f110bcfc033df"
+        "state_hash": "0696b8e13743d3f3db89d8ac19865fc4c3b9903850988b4328c217b7f661963c"
       }
     },
     {
@@ -58,6 +59,7 @@
         "block_hash": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         "pool_id": "pool",
         "pool_address": "0xc6962004f452be9203591991d15f6b388e09e8d0",
+        "pool_code_hash": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
         "factory_address": "0x1f98431c8ad98523631ae4a59f267346ea31f984",
         "protocol_id": "uniswap-v3",
         "token0": "0x82af49447d8a07e3bd95bd0d56f35241523fbab1",
@@ -82,7 +84,7 @@
             "liquidity_net": "-100000000"
           }
         ],
-        "state_hash": "594b2a29f190ccee84a1ce9b62459b0f5f1d7e7bed9640a132f5e915b06821b4"
+        "state_hash": "29f4a0fa10c6a1c4c049e54dde55770c78b60884c40475882934bada14eb2253"
       }
     }
   ]

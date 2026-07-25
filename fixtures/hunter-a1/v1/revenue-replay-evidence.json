@@ -33,5 +33,5 @@
   "prediction_error_note": "not claimed by this deterministic replay; exact cross-tick parity is covered by the committed offline pinned-state fixture",
   "duplicate_candidate_outputs": 0,
   "unmatched_candidate_outputs": 0,
-  "candidate_hash": "ba591e7e0dadb1b96d0992eaa4e3588ae5e4caf5b956131708a72d4f87bc07db"
+  "candidate_hash": "4fd4f9a648d4c83f3b690ffad030d4d47269b869c9dcda2e6ec309b4fc8c5144"
 }

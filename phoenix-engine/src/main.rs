@@ -1,7 +1,13 @@
+use phoenix_engine::autonomous::{
+    AutonomousHunterProcessor, PostgresAutonomousCandidateStore, RpcHunterStateClient,
+};
 use phoenix_engine::config::EngineConfig;
 use phoenix_engine::domain::Address;
 use phoenix_engine::engine_jetstream::{JetStreamFetcher, MessageFetcher};
 use phoenix_engine::execution::ExecutionMode;
+use phoenix_engine::hunter::{
+    CandidateBindings, HunterBounds, HunterCore, HunterEconomicConfig, HunterMode, HunterRouteGraph,
+};
 use phoenix_engine::metrics::{RuntimeExitMetric, RuntimeMetrics};
 use phoenix_engine::origin::{reviewed_router_kind, REVIEWED_ROUTER_ADDRESSES};
 use phoenix_engine::persistence::{PostgresShadowStore, ShadowStore};
@@ -44,6 +50,10 @@ struct DaemonConfig {
     code_version: String,
     max_evaluation_concurrency: usize,
     dependency_retry_policy: DependencyRetryPolicy,
+    autonomous_execution: bool,
+    executor_address: Option<String>,
+    executor_code_hash: Option<String>,
+    hunter_maximum_input: u128,
 }
 
 impl DaemonConfig {
@@ -51,8 +61,13 @@ impl DaemonConfig {
         let engine = EngineConfig::from_env();
         let initialized =
             initialize_runtime(&engine).map_err(|_| "invalid Engine configuration")?;
-        if initialized.mode != ExecutionMode::Shadow {
-            return Err("Engine durable runtime requires SHADOW mode");
+        let autonomous_execution = std::env::var("AUTONOMOUS_EXECUTION")
+            .map(|value| value.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        if (initialized.mode == ExecutionMode::Live) != autonomous_execution
+            || initialized.mode == ExecutionMode::Simulate
+        {
+            return Err("Engine LIVE mode and autonomous execution must be explicitly paired");
         }
         let postgres_dsn = required_env("POSTGRES_DSN")?;
         let routers = parse_routers(
@@ -82,6 +97,19 @@ impl DaemonConfig {
                 .filter(|value| (1..=8).contains(value))
                 .ok_or("invalid Engine evaluation concurrency")?,
             dependency_retry_policy: DependencyRetryPolicy::engine_default()?,
+            autonomous_execution,
+            executor_address: autonomous_execution
+                .then(|| required_env("EXECUTOR_ADDRESS"))
+                .transpose()?,
+            executor_code_hash: autonomous_execution
+                .then(|| required_env("LIVE_EXECUTOR_EXECUTOR_CODE_HASH"))
+                .transpose()?,
+            hunter_maximum_input: std::env::var("LIVE_EXECUTOR_MAX_INPUT_AMOUNT")
+                .unwrap_or_else(|_| "10000000000000000".to_string())
+                .parse()
+                .ok()
+                .filter(|value| *value > 0)
+                .ok_or("invalid Hunter maximum input")?,
         })
     }
 }
@@ -114,7 +142,7 @@ async fn run_daemon() -> Result<(), &'static str> {
     let sampler = LogSampler::default();
     let shutdown = CancellationToken::new();
 
-    let strategy_configured = !config.routes.is_empty();
+    let strategy_configured = !config.routes.is_empty() || config.autonomous_execution;
     readiness.set_strategy_configured(strategy_configured);
     readiness.set_evaluation_dependencies_ready(false);
     let rpc_client = Arc::new(
@@ -130,14 +158,17 @@ async fn run_daemon() -> Result<(), &'static str> {
         )
         .map_err(|_| "invalid Engine evaluator configuration")?,
     );
-    let processor = Arc::new(
+    let base_processor =
         ShadowProcessor::new(config.routers.clone(), config.routes.clone(), evaluator)
-            .map_err(|_| "invalid Engine router registry")?,
-    );
+            .map_err(|_| "invalid Engine router registry")?;
 
     tracing::info!(
         event = "phoenix_engine_startup",
-        mode = "SHADOW",
+        mode = if config.autonomous_execution {
+            "LIVE"
+        } else {
+            "SHADOW"
+        },
         stream = ENGINE_STREAM_NAME,
         durable_consumer = ENGINE_DURABLE_NAME,
         strategy_configured,
@@ -145,7 +176,7 @@ async fn run_daemon() -> Result<(), &'static str> {
         simulation_level = "state_based",
         max_evaluation_concurrency = config.max_evaluation_concurrency,
         dependency_exhaustion_limit = config.dependency_retry_policy.max_deliveries(),
-        live_execution = false
+        live_execution = config.autonomous_execution
     );
 
     let health_task = tokio::spawn(serve_health(
@@ -181,6 +212,59 @@ async fn run_daemon() -> Result<(), &'static str> {
         .await
         .ok_or("Engine shutdown before PostgreSQL initialization")?;
     let store: Arc<dyn ShadowStore> = Arc::new(store);
+    let processor = if config.autonomous_execution {
+        let bounds = HunterBounds::default();
+        let graph = HunterRouteGraph::from_contracts(
+            include_str!("../../config/phoenix-route-universe-v1.json"),
+            &[include_str!("../../config/phoenix-route-policy-v1.json")],
+            bounds,
+        )
+        .map_err(|_| "invalid autonomous Hunter contracts")?;
+        let core = HunterCore::new(
+            HunterMode::Live,
+            graph.clone(),
+            bounds,
+            HunterEconomicConfig {
+                flash_premium_bps: 5,
+                gas_cost: 0,
+                tick_crossing_gas_cost: 0,
+                ordering_cost_reserve: 0,
+                model_error_reserve_bps: 100,
+                shadow_maximum_input: config.hunter_maximum_input,
+            },
+        )
+        .map_err(|_| "invalid autonomous Hunter economics")?;
+        let state_provider = Arc::new(
+            RpcHunterStateClient::new(&config.rpc_gateway_url)
+                .map_err(|_| "invalid Hunter state client")?,
+        );
+        let candidate_store = PostgresAutonomousCandidateStore::connect(&config.postgres_dsn)
+            .await
+            .map_err(|_| "autonomous candidate store unavailable")?;
+        let autonomous = Arc::new(AutonomousHunterProcessor::new(
+            graph,
+            core,
+            bounds,
+            CandidateBindings {
+                risk_snapshot_hash: "0".repeat(64),
+                submission_quote_hash: "0".repeat(64),
+                executor_address: config
+                    .executor_address
+                    .clone()
+                    .ok_or("missing executor address")?,
+                executor_code_hash: config
+                    .executor_code_hash
+                    .clone()
+                    .ok_or("missing executor code hash")?,
+                submission_channel: "standard_rpc".to_string(),
+            },
+            state_provider,
+            candidate_store,
+        ));
+        Arc::new(base_processor.with_autonomous(autonomous))
+    } else {
+        Arc::new(base_processor)
+    };
     let database_monitor = tokio::spawn(monitor_database(
         store.clone(),
         readiness.clone(),

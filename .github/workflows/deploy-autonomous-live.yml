@@ -1,0 +1,204 @@
+name: Deploy Autonomous LIVE Production
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_sha:
+        description: Exact current main SHA to deploy
+        required: true
+        type: string
+      build_run_id:
+        description: Successful seven-image build run for release_sha
+        required: true
+        type: string
+      rollback_sha:
+        description: Exact currently active immutable rollback SHA
+        required: true
+        type: string
+      rollback_build_run_id:
+        description: Successful build run for rollback_sha
+        required: true
+        type: string
+      acknowledgement:
+        description: Type DEPLOY_AUTONOMOUS_LIVE_42161
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: production-autonomous-live
+  cancel-in-progress: false
+
+jobs:
+  deploy-autonomous-live:
+    name: deploy-autonomous-live
+    runs-on: ubuntu-24.04
+    timeout-minutes: 50
+    environment: production-live
+    steps:
+      - name: Validate request
+        shell: bash
+        env:
+          RELEASE_SHA: ${{ inputs.release_sha }}
+          ROLLBACK_SHA: ${{ inputs.rollback_sha }}
+          BUILD_RUN_ID: ${{ inputs.build_run_id }}
+          ROLLBACK_BUILD_RUN_ID: ${{ inputs.rollback_build_run_id }}
+          ACKNOWLEDGEMENT: ${{ inputs.acknowledgement }}
+        run: |
+          set -euo pipefail
+          for value in "$RELEASE_SHA" "$ROLLBACK_SHA"; do
+            [[ "$value" =~ ^[0-9a-f]{40}$ ]] || { echo "release SHA is invalid"; exit 1; }
+          done
+          [ "$RELEASE_SHA" != "$ROLLBACK_SHA" ] || { echo "rollback SHA must differ"; exit 1; }
+          for value in "$BUILD_RUN_ID" "$ROLLBACK_BUILD_RUN_ID"; do
+            [[ "$value" =~ ^[1-9][0-9]*$ ]] || { echo "build run ID is invalid"; exit 1; }
+          done
+          [ "$ACKNOWLEDGEMENT" = DEPLOY_AUTONOMOUS_LIVE_42161 ] ||
+            { echo "deployment acknowledgement is invalid"; exit 1; }
+
+      - name: Checkout exact merged main release
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          ref: ${{ inputs.release_sha }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Verify current main and successful build identities
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_SHA: ${{ inputs.release_sha }}
+          ROLLBACK_SHA: ${{ inputs.rollback_sha }}
+          BUILD_RUN_ID: ${{ inputs.build_run_id }}
+          ROLLBACK_BUILD_RUN_ID: ${{ inputs.rollback_build_run_id }}
+        run: |
+          set -euo pipefail
+          [ "$(git rev-parse HEAD)" = "$RELEASE_SHA" ]
+          git fetch --no-tags --depth=1 origin main
+          [ "$(git rev-parse FETCH_HEAD)" = "$RELEASE_SHA" ] ||
+            { echo "release is not current main"; exit 1; }
+          mkdir -p build-runs
+          gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${BUILD_RUN_ID}" > build-runs/release.json
+          gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${ROLLBACK_BUILD_RUN_ID}" > build-runs/rollback.json
+          python3 scripts/release_provenance.py validate-github-run \
+            --run-evidence build-runs/release.json --expected-sha "$RELEASE_SHA" \
+            --expected-run-id "$BUILD_RUN_ID"
+          python3 scripts/release_provenance.py validate-github-run \
+            --run-evidence build-runs/rollback.json --expected-sha "$ROLLBACK_SHA" \
+            --expected-run-id "$ROLLBACK_BUILD_RUN_ID"
+
+      - name: Download release evidence
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: phoenix-release-manifest-${{ inputs.release_sha }}
+          run-id: ${{ inputs.build_run_id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          path: release
+
+      - name: Download release assets
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: phoenix-release-assets-${{ inputs.release_sha }}
+          run-id: ${{ inputs.build_run_id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          path: release-assets
+
+      - name: Download rollback evidence
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: phoenix-release-manifest-${{ inputs.rollback_sha }}
+          run-id: ${{ inputs.rollback_build_run_id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          path: rollback
+
+      - name: Verify immutable evidence and source CI
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_SHA: ${{ inputs.release_sha }}
+          ROLLBACK_SHA: ${{ inputs.rollback_sha }}
+          BUILD_RUN_ID: ${{ inputs.build_run_id }}
+          ROLLBACK_BUILD_RUN_ID: ${{ inputs.rollback_build_run_id }}
+        run: |
+          set -euo pipefail
+          source_run="$(jq -er '.source_ci.run_id' release/release-provenance.json)"
+          source_attempt="$(jq -er '.source_ci.run_attempt' release/release-provenance.json)"
+          mkdir -p source-ci
+          gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${source_run}/attempts/${source_attempt}" > source-ci/run.json
+          gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${source_run}/attempts/${source_attempt}/jobs?per_page=100" > source-ci/jobs.json
+          python3 scripts/release_provenance.py validate-source-ci-api \
+            --release-provenance release/release-provenance.json \
+            --run-evidence source-ci/run.json --jobs-evidence source-ci/jobs.json \
+            --expected-sha "$RELEASE_SHA"
+          python3 scripts/release_assets.py verify \
+            --archive "release-assets/phoenix-release-assets-${RELEASE_SHA}.tar.gz" \
+            --manifest release-assets/release-assets-manifest.json \
+            --checksums release-assets/release-assets-checksums.txt \
+            --expected-sha "$RELEASE_SHA"
+          python3 scripts/release_provenance.py validate-deploy-pair \
+            --release-manifest release/release-manifest.json \
+            --release-provenance release/release-provenance.json \
+            --release-sha "$RELEASE_SHA" --build-run-id "$BUILD_RUN_ID" \
+            --rollback-manifest rollback/release-manifest.json \
+            --rollback-provenance rollback/release-provenance.json \
+            --rollback-sha "$ROLLBACK_SHA" \
+            --rollback-build-run-id "$ROLLBACK_BUILD_RUN_ID"
+
+      - name: Install SSH material
+        shell: bash
+        env:
+          PROD_SSH_PRIVATE_KEY: ${{ secrets.PROD_SSH_PRIVATE_KEY }}
+          PROD_KNOWN_HOSTS: ${{ secrets.PROD_KNOWN_HOSTS }}
+        run: |
+          set -euo pipefail
+          [ -n "$PROD_SSH_PRIVATE_KEY" ] && [ -n "$PROD_KNOWN_HOSTS" ] || {
+            echo EXTERNAL_VPS_ACCESS_REQUIRED
+            exit 1
+          }
+          install -d -m 700 "$HOME/.ssh"
+          printf '%s\n' "$PROD_SSH_PRIVATE_KEY" > "$HOME/.ssh/id_ed25519"
+          printf '%s\n' "$PROD_KNOWN_HOSTS" > "$HOME/.ssh/known_hosts"
+          chmod 600 "$HOME/.ssh/id_ed25519" "$HOME/.ssh/known_hosts"
+
+      - name: Deploy exact autonomous LIVE release
+        shell: bash
+        env:
+          PROD_HOST: ${{ secrets.PROD_HOST }}
+          PROD_PORT: ${{ secrets.PROD_PORT }}
+          PROD_USER: ${{ secrets.PROD_USER }}
+          RELEASE_SHA: ${{ inputs.release_sha }}
+          ROLLBACK_SHA: ${{ inputs.rollback_sha }}
+          BUILD_RUN_ID: ${{ inputs.build_run_id }}
+          ROLLBACK_BUILD_RUN_ID: ${{ inputs.rollback_build_run_id }}
+        run: |
+          set -euo pipefail
+          [[ "$PROD_HOST" =~ ^[A-Za-z0-9._-]+$ ]] || {
+            echo EXTERNAL_VPS_ACCESS_REQUIRED
+            exit 1
+          }
+          [ "$PROD_USER" = phoenix ] || { echo EXTERNAL_VPS_ACCESS_REQUIRED; exit 1; }
+          port="${PROD_PORT:-22}"
+          [[ "$port" =~ ^[0-9]+$ ]] && [ "$port" -ge 1 ] && [ "$port" -le 65535 ] ||
+            { echo EXTERNAL_VPS_ACCESS_REQUIRED; exit 1; }
+          remote="${PROD_USER}@${PROD_HOST}"
+          opts=(-i "$HOME/.ssh/id_ed25519" -p "$port" -o UserKnownHostsFile="$HOME/.ssh/known_hosts" -o StrictHostKeyChecking=yes -o IdentitiesOnly=yes)
+          scp_opts=(-i "$HOME/.ssh/id_ed25519" -P "$port" -o UserKnownHostsFile="$HOME/.ssh/known_hosts" -o StrictHostKeyChecking=yes -o IdentitiesOnly=yes)
+          stage="/tmp/phoenix-autonomous-live-deploy-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${RELEASE_SHA}"
+          ssh "${opts[@]}" "$remote" "set -eu; umask 077; [ ! -e '$stage' ]; install -d -m 0700 '$stage'"
+          scp "${scp_opts[@]}" release/release-manifest.json "$remote:$stage/release-manifest.json"
+          scp "${scp_opts[@]}" release/release-provenance.json "$remote:$stage/release-provenance.json"
+          scp "${scp_opts[@]}" rollback/release-manifest.json "$remote:$stage/rollback-manifest.json"
+          scp "${scp_opts[@]}" rollback/release-provenance.json "$remote:$stage/rollback-provenance.json"
+          scp "${scp_opts[@]}" \
+            release-assets/release-assets-manifest.json \
+            release-assets/release-assets-checksums.txt \
+            "release-assets/phoenix-release-assets-${RELEASE_SHA}.tar.gz" \
+            "$remote:$stage/"
+          ssh "${opts[@]}" "$remote" "chmod 0600 '$stage'/*"
+          ssh "${opts[@]}" "$remote" sudo -n \
+            /usr/local/sbin/phoenix-autonomous-live-deploy-gateway \
+            "$RELEASE_SHA" "$ROLLBACK_SHA" "$BUILD_RUN_ID" "$ROLLBACK_BUILD_RUN_ID" \
+            "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT"

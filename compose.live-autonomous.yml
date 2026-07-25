@@ -1,0 +1,90 @@
+services:
+  rpc-gateway:
+    environment:
+      AUTONOMOUS_EXECUTION: "true"
+      RPC_PROVIDER_URLS: ${PRODUCTION_RPC_URL:?PRODUCTION_RPC_URL is required},${SECONDARY_RPC_URL:?SECONDARY_RPC_URL is required}
+      RPC_PROVIDER_WEIGHTS: ${RPC_PROVIDER_WEIGHTS:-1,2}
+      RPC_UPSTREAM_CALLS_PER_SECOND: ${RPC_UPSTREAM_CALLS_PER_SECOND:-16}
+      RPC_UPSTREAM_CALL_BURST: ${RPC_UPSTREAM_CALL_BURST:-64}
+      RPC_STATE_REQUESTS_PER_MINUTE: ${RPC_STATE_REQUESTS_PER_MINUTE:-60}
+
+  phoenix-engine:
+    environment:
+      PHOENIX_MODE: LIVE
+      LIVE_EXECUTION: "true"
+      AUTONOMOUS_EXECUTION: "true"
+      EXECUTOR_ADDRESS: ${LIVE_EXECUTOR_EXECUTOR_ADDRESS:?LIVE_EXECUTOR_EXECUTOR_ADDRESS is required}
+      LIVE_EXECUTOR_EXECUTOR_CODE_HASH: ${LIVE_EXECUTOR_EXECUTOR_CODE_HASH:?LIVE_EXECUTOR_EXECUTOR_CODE_HASH is required}
+      LIVE_EXECUTOR_EXPECTED_OWNER: ${LIVE_EXECUTOR_EXPECTED_OWNER:?LIVE_EXECUTOR_EXPECTED_OWNER is required}
+      LIVE_EXECUTOR_EXPECTED_FLASH_PROVIDER: ${LIVE_EXECUTOR_EXPECTED_FLASH_PROVIDER:?LIVE_EXECUTOR_EXPECTED_FLASH_PROVIDER is required}
+      LIVE_EXECUTOR_MAX_INPUT_AMOUNT: ${LIVE_EXECUTOR_MAX_INPUT_AMOUNT:?LIVE_EXECUTOR_MAX_INPUT_AMOUNT is required}
+
+  live-executor:
+    profiles: ["live-autonomous"]
+    image: ${LIVE_EXECUTOR_IMAGE:?LIVE_EXECUTOR_IMAGE is required}
+    build:
+      context: .
+      dockerfile: deploy/rust.Dockerfile
+      args:
+        CRATE: live-executor
+    environment:
+      PHOENIX_MODE: LIVE
+      LIVE_EXECUTION: "true"
+      AUTONOMOUS_EXECUTION: "true"
+      LIVE_EXECUTOR_ARMED: "true"
+      LIVE_EXECUTOR_KILL_SWITCH: "false"
+      LIVE_EXECUTOR_ONE_TRANSACTION_AT_A_TIME: "true"
+      CHAIN_ID: "42161"
+      POSTGRES_DSN: ${POSTGRES_DSN:?POSTGRES_DSN is required}
+      PRODUCTION_RPC_URL: ${PRODUCTION_RPC_URL:?PRODUCTION_RPC_URL is required}
+      SECONDARY_RPC_URL: ${SECONDARY_RPC_URL:?SECONDARY_RPC_URL is required}
+      ENGINE_ROUTER_ADDRESSES: ${ENGINE_ROUTER_ADDRESSES:?ENGINE_ROUTER_ADDRESSES is required}
+      SIGNER_PRIVATE_KEY_FILE: /run/secrets/phoenix-live-executor-signer
+      WALLET_ADDRESS: ${LIVE_EXECUTOR_WALLET_ADDRESS:?LIVE_EXECUTOR_WALLET_ADDRESS is required}
+      EXECUTOR_ADDRESS: ${LIVE_EXECUTOR_EXECUTOR_ADDRESS:?LIVE_EXECUTOR_EXECUTOR_ADDRESS is required}
+      LIVE_EXECUTOR_EXECUTOR_CODE_HASH: ${LIVE_EXECUTOR_EXECUTOR_CODE_HASH:?LIVE_EXECUTOR_EXECUTOR_CODE_HASH is required}
+      LIVE_EXECUTOR_EXPECTED_OWNER: ${LIVE_EXECUTOR_EXPECTED_OWNER:?LIVE_EXECUTOR_EXPECTED_OWNER is required}
+      LIVE_EXECUTOR_EXPECTED_FLASH_PROVIDER: ${LIVE_EXECUTOR_EXPECTED_FLASH_PROVIDER:?LIVE_EXECUTOR_EXPECTED_FLASH_PROVIDER is required}
+      LIVE_EXECUTOR_PNL_ASSET_ADDRESS: ${LIVE_EXECUTOR_PNL_ASSET_ADDRESS:?LIVE_EXECUTOR_PNL_ASSET_ADDRESS is required}
+      LIVE_EXECUTOR_RPC_URL: ${PRODUCTION_RPC_URL:?PRODUCTION_RPC_URL is required}
+      LIVE_EXECUTOR_RPC_ALLOWLIST: ${LIVE_EXECUTOR_RPC_ALLOWLIST:?LIVE_EXECUTOR_RPC_ALLOWLIST is required}
+      LIVE_EXECUTOR_MAX_GAS_LIMIT: ${LIVE_EXECUTOR_MAX_GAS_LIMIT:?LIVE_EXECUTOR_MAX_GAS_LIMIT is required}
+      LIVE_EXECUTOR_MAX_MAX_FEE_PER_GAS_WEI: ${LIVE_EXECUTOR_MAX_MAX_FEE_PER_GAS_WEI:?LIVE_EXECUTOR_MAX_MAX_FEE_PER_GAS_WEI is required}
+      LIVE_EXECUTOR_MAX_PRIORITY_FEE_PER_GAS_WEI: ${LIVE_EXECUTOR_MAX_PRIORITY_FEE_PER_GAS_WEI:?LIVE_EXECUTOR_MAX_PRIORITY_FEE_PER_GAS_WEI is required}
+      LIVE_EXECUTOR_MAX_INPUT_AMOUNT: ${LIVE_EXECUTOR_MAX_INPUT_AMOUNT:?LIVE_EXECUTOR_MAX_INPUT_AMOUNT is required}
+      LIVE_EXECUTOR_MIN_EXPECTED_PROFIT: ${LIVE_EXECUTOR_MIN_EXPECTED_PROFIT:?LIVE_EXECUTOR_MIN_EXPECTED_PROFIT is required}
+      LIVE_EXECUTOR_MAX_DAILY_LOSS_WEI: ${LIVE_EXECUTOR_MAX_DAILY_LOSS_WEI:?LIVE_EXECUTOR_MAX_DAILY_LOSS_WEI is required}
+      LIVE_EXECUTOR_RECEIPT_TIMEOUT_SECONDS: ${LIVE_EXECUTOR_RECEIPT_TIMEOUT_SECONDS:-180}
+      LIVE_EXECUTOR_POLL_INTERVAL_SECONDS: ${LIVE_EXECUTOR_POLL_INTERVAL_SECONDS:-1}
+    volumes:
+      - type: bind
+        source: ${LIVE_EXECUTOR_SIGNER_FILE:?LIVE_EXECUTOR_SIGNER_FILE is required}
+        target: /run/secrets/phoenix-live-executor-signer
+        read_only: true
+        bind:
+          create_host_path: false
+    depends_on:
+      migration-runner:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
+      rpc-gateway:
+        condition: service_healthy
+      phoenix-engine:
+        condition: service_healthy
+    networks: [phoenix-internal]
+    init: true
+    user: "65532:65532"
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1777,noexec,nosuid,nodev
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    restart: unless-stopped
+    stop_grace_period: 30s
+    healthcheck:
+      test: ["CMD-SHELL", "kill -0 1"]
+      interval: 10s
+      timeout: 3s
+      retries: 5

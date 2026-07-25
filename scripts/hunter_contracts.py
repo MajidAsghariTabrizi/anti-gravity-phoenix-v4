@@ -236,6 +236,16 @@ def _semantic_risk_snapshot(document: dict[str, Any]) -> None:
         raise ContractError("risk snapshot exceeds route control size")
     if document["cooldown_until"] != route_control["cooldown_until"]:
         raise ContractError("risk snapshot cooldown mismatch")
+    identity_fields = (
+        "candidate_hash",
+        "submission_quote_hash",
+        "wallet_address",
+        "executor_address",
+        "executor_code_hash",
+    )
+    present_identity_fields = [field for field in identity_fields if field in document]
+    if present_identity_fields and len(present_identity_fields) != len(identity_fields):
+        raise ContractError("risk snapshot execution identity is incomplete")
 
 
 def _semantic_submission_quote(document: dict[str, Any]) -> None:
@@ -256,6 +266,36 @@ def _semantic_submission_quote(document: dict[str, Any]) -> None:
         raise ContractError("submission fallback identity is inconsistent")
     if fallback == document["logical_channel_id"]:
         raise ContractError("submission fallback must be a different channel")
+    execution_fields = (
+        "candidate_hash",
+        "route_policy_hash",
+        "rpc_endpoint_identity",
+        "gas_limit",
+        "max_fee_per_gas",
+        "max_priority_fee_per_gas",
+        "estimated_gas_cost",
+        "estimated_l1_cost",
+        "flash_premium",
+        "tick_crossing_gas_increment",
+        "failure_reserve",
+        "model_error_reserve",
+        "quote_block_number",
+        "quote_block_hash",
+    )
+    present_execution_fields = [field for field in execution_fields if field in document]
+    if present_execution_fields and len(present_execution_fields) != len(execution_fields):
+        raise ContractError("submission quote execution evidence is incomplete")
+    if present_execution_fields:
+        maximum_gas_cost = int(document["gas_limit"]) * int(document["max_fee_per_gas"])
+        estimated_total_gas_cost = int(document["estimated_gas_cost"]) + int(
+            document["estimated_l1_cost"]
+        )
+        if estimated_total_gas_cost != maximum_gas_cost:
+            raise ContractError("submission quote gas-cost equation is inconsistent")
+        if int(document["max_priority_fee_per_gas"]) > int(
+            document["max_fee_per_gas"]
+        ):
+            raise ContractError("submission quote priority fee exceeds maximum fee")
 
 
 def _semantic_candidate(document: dict[str, Any]) -> None:
@@ -294,6 +334,7 @@ def _semantic_outcome(document: dict[str, Any]) -> None:
     realized_chain = (
         int(document["realized_gross_profit"])
         - int(document["actual_gas_cost"])
+        - int(document.get("actual_l1_cost", 0))
         - int(document["actual_ordering_cost"])
     )
     if int(document["realized_chain_net_pnl"]) != realized_chain:
@@ -301,6 +342,12 @@ def _semantic_outcome(document: dict[str, Any]) -> None:
     realized_business = realized_chain - int(document["allocated_infrastructure_cost"])
     if int(document["realized_business_net_pnl"]) != realized_business:
         raise ContractError("outcome business net PnL is inconsistent")
+    if "prediction_error" in document:
+        prediction_error = realized_chain - int(
+            document["conservative_predicted_net_pnl"]
+        )
+        if int(document["prediction_error"]) != prediction_error:
+            raise ContractError("outcome prediction error is inconsistent")
     if _parse_timestamp(document["attributed_at"]) < _parse_timestamp(
         document["terminal_at"]
     ):
