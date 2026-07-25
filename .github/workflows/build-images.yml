@@ -266,7 +266,7 @@ jobs:
           cache-to: type=gha,mode=max,scope=${{ matrix.image }}
 
       - name: Verify immutable image runtime contract
-        if: ${{ (inputs.protected_base_sha == '' || matrix.protected == false) && matrix.image == 'live-executor' }}
+        if: ${{ (inputs.protected_base_sha == '' || matrix.protected == false) && matrix.live_canary_only == true }}
         shell: bash
         env:
           IMAGE_NAME: ${{ matrix.image }}

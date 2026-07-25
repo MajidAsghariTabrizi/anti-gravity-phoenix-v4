@@ -657,7 +657,7 @@ jobs:
               command+=(--build-arg "$build_arg")
             done < <(jq -r '.build_args | select(length > 0) | split("\n")[]' <<<"$component")
             "${command[@]}" "$context"
-            if [ "$image" = live-executor ]; then
+            if [ "$(jq -r .live_canary_only <<<"$component")" = true ]; then
               sh scripts/verify-image-runtime.sh \
                 "$image" "phoenix/$image:ci" ""
             fi

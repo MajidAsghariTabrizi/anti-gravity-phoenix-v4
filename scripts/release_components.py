@@ -224,6 +224,7 @@ def build_matrix(registry: dict[str, Any] | None = None) -> dict[str, list[dict[
                     for key, item in sorted(component["build_args"].items())
                 ),
                 "protected": component["protected"],
+                "live_canary_only": component["live_canary_only"],
             }
         )
     return {"include": include}
