@@ -34,6 +34,10 @@ for specification in \
   'install-production-release-context.sh:0700' \
   'production-healthcheck.sh:0700' \
   'production_mode.py:0700' \
+  'prelive-protected-maintenance.sh:0700' \
+  'prelive_protected_maintenance.py:0600' \
+  'prelive-protected-maintenance-launch.sh:0700' \
+  'prelive-protected-maintenance-unit.sh:0700' \
   'rollback-release.sh:0700'
 do
   name=${specification%%:*}

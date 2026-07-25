@@ -265,6 +265,19 @@ jobs:
           cache-from: type=gha,scope=${{ matrix.image }}
           cache-to: type=gha,mode=max,scope=${{ matrix.image }}
 
+      - name: Verify immutable image runtime contract
+        if: ${{ (inputs.protected_base_sha == '' || matrix.protected == false) && matrix.live_canary_only == true }}
+        shell: bash
+        env:
+          IMAGE_NAME: ${{ matrix.image }}
+          IMAGE_REFERENCE: ${{ matrix.repository }}@${{ steps.build.outputs.digest }}
+          EXPECTED_REVISION: ${{ inputs.release_sha }}
+        run: |
+          set -euo pipefail
+          docker pull "$IMAGE_REFERENCE"
+          sh scripts/verify-image-runtime.sh \
+            "$IMAGE_NAME" "$IMAGE_REFERENCE" "$EXPECTED_REVISION"
+
       - name: Write image manifest fragment
         if: ${{ inputs.protected_base_sha == '' || matrix.protected == false }}
         shell: bash

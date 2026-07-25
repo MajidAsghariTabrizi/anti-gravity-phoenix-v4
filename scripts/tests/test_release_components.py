@@ -112,6 +112,9 @@ class ReleaseComponentRegistryTests(unittest.TestCase):
             self.assertEqual(item["context"], component["build_context"])
             self.assertEqual(item["dockerfile"], component["dockerfile"])
             self.assertEqual(item["protected"], component["protected"])
+            self.assertEqual(
+                item["live_canary_only"], component["live_canary_only"]
+            )
 
     def test_six_eight_and_duplicate_component_registries_fail_closed(self) -> None:
         for mutation in ("six", "eight", "duplicate"):
