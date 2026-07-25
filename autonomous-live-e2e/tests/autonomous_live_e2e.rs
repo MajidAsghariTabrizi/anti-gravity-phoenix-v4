@@ -47,6 +47,8 @@ const GLOBAL_LOSS_LIMIT: u128 = 10_000_000_000_000_000;
 const ROUTE_LOSS_LIMIT: u128 = 10_000_000_000_000_000;
 const CANDIDATE_TTL_SECONDS: i64 = 3;
 const QUOTE_TTL_SECONDS: i64 = 2;
+const PREAPPROVAL_ZERO_DIGEST: &str =
+    "0000000000000000000000000000000000000000000000000000000000000000";
 
 type TestResult<T = ()> = Result<T, Box<dyn Error + Send + Sync>>;
 
@@ -400,12 +402,13 @@ impl Fixture {
                 .ok_or_else(|| failure("state seed overflow"))?,
         );
         let bindings = CandidateBindings {
-            risk_snapshot_hash: format!("{:064x}", self.seed + variant + 1),
-            submission_quote_hash: format!("{:064x}", self.seed + variant + 2),
+            risk_snapshot_hash: PREAPPROVAL_ZERO_DIGEST.to_string(),
+            submission_quote_hash: PREAPPROVAL_ZERO_DIGEST.to_string(),
             executor_address: self.config.executor_address.to_string(),
             executor_code_hash: self.config.executor_code_hash.clone(),
             submission_channel: "standard_rpc".to_string(),
         };
+        assert_pre_persistence_invariant(self.scenario, &bindings)?;
         Ok((event, states, bindings))
     }
 
@@ -609,6 +612,17 @@ impl Fixture {
             RETAINED_PROFIT,
         );
     }
+}
+
+fn assert_pre_persistence_invariant(scenario: &str, bindings: &CandidateBindings) -> TestResult {
+    require(
+        bindings.risk_snapshot_hash == PREAPPROVAL_ZERO_DIGEST,
+        format!("{scenario}: pre-approval risk_snapshot_hash must be the zero digest"),
+    )?;
+    require(
+        bindings.submission_quote_hash == PREAPPROVAL_ZERO_DIGEST,
+        format!("{scenario}: pre-approval submission_quote_hash must be the zero digest"),
+    )
 }
 
 #[tokio::test(flavor = "current_thread")]
