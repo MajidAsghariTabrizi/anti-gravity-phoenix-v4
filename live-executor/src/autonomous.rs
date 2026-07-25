@@ -1119,6 +1119,18 @@ fn build_execution_request(
         .and_then(Value::as_str)
         .ok_or(AutonomousMaterializerError::Integrity)
         .and_then(decimal_u128)?;
+    let executable_gas_cost = candidate
+        .plan
+        .get("economics")
+        .and_then(Value::as_object)
+        .ok_or(AutonomousMaterializerError::Integrity)
+        .and_then(|economics| object_u128(economics, "gas_cost"))?;
+    // PhoenixExecutor enforces profit before transaction gas is paid, so the
+    // committed calldata floor is retained profit plus the plan's executable
+    // gas reserve. This must remain identical to Hunter materialization.
+    let calldata_minimum_profit = minimum_retained_profit
+        .checked_add(executable_gas_cost)
+        .ok_or(AutonomousMaterializerError::Arithmetic)?;
     let request_id = deterministic_uuid("request", &candidate.candidate_hash);
     let mut request = ExecutionRequest {
         id: request_id,
@@ -1147,7 +1159,7 @@ fn build_execution_request(
         flash_asset: settlement_asset,
         flash_amount: candidate.selected_size,
         maximum_input_amount: maximum_input,
-        minimum_profit: minimum_retained_profit,
+        minimum_profit: calldata_minimum_profit,
         expected_profit: u128::try_from(executable_net)
             .map_err(|_| AutonomousMaterializerError::Arithmetic)?,
         deadline: candidate.expires_at,
@@ -1452,4 +1464,154 @@ pub enum AutonomousMaterializerError {
     Integrity,
     #[error("autonomous materializer arithmetic failed")]
     Arithmetic,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::abi::encode_execute_opportunity;
+    use crate::{
+        ARBITRUM_NATIVE_USDC_ADDRESS, ARBITRUM_ONE_CHAIN_ID, ARBITRUM_WETH_ADDRESS,
+        CURRENT_ROUTE_FINGERPRINT, CURRENT_ROUTE_POOL_3000_ADDRESS, CURRENT_ROUTE_POOL_500_ADDRESS,
+    };
+    use chrono::Duration;
+
+    const FACTORY: &str = "0x1f98431c8ad98523631ae4a59f267346ea31f984";
+    const ROUTER: &str = "0x68b3465833fb72a70ecdf485e0e4c7bd8665fc45";
+    const EXECUTOR: &str = "0x17a27f2a51983b574756c2e151ada767e7d54635";
+    const RETAINED_PROFIT: u128 = 1_000_000_000_000;
+    const EXECUTABLE_GAS_COST: u128 = 1;
+
+    #[test]
+    fn materialized_request_preserves_whole_second_candidate_calldata() {
+        assert_materialized_calldata_binding(
+            Utc.with_ymd_and_hms(2026, 7, 24, 8, 0, 0).single().unwrap(),
+        );
+    }
+
+    #[test]
+    fn materialized_request_preserves_subsecond_candidate_calldata() {
+        assert_materialized_calldata_binding(
+            Utc.with_ymd_and_hms(2026, 7, 24, 8, 0, 0).single().unwrap()
+                + Duration::milliseconds(917),
+        );
+    }
+
+    fn assert_materialized_calldata_binding(created_at: DateTime<Utc>) {
+        let deadline = canonical_time(created_at).unwrap() + Duration::seconds(3);
+        let mut candidate = candidate(created_at, deadline);
+        let quote = quote();
+        let initial = build_execution_request(
+            &candidate,
+            &json!({}),
+            2_000_000_000_000,
+            RETAINED_PROFIT,
+            quote.clone(),
+            canonical_time(created_at).unwrap(),
+            canonical_time(created_at).unwrap() + Duration::seconds(2),
+        )
+        .unwrap();
+        let committed =
+            encode_execute_opportunity(&initial, initial.executor_address).expect("calldata");
+        candidate.calldata_hash = hex::encode(Sha256::digest(&committed));
+        candidate.calldata.clone_from(&committed);
+
+        let rebuilt = build_execution_request(
+            &candidate,
+            &json!({}),
+            2_000_000_000_000,
+            RETAINED_PROFIT,
+            quote,
+            canonical_time(created_at).unwrap(),
+            canonical_time(created_at).unwrap() + Duration::seconds(2),
+        )
+        .unwrap();
+        let rebuilt_calldata =
+            encode_execute_opportunity(&rebuilt, rebuilt.executor_address).expect("calldata");
+
+        assert_eq!(
+            rebuilt.minimum_profit,
+            RETAINED_PROFIT + EXECUTABLE_GAS_COST
+        );
+        assert_eq!(rebuilt.deadline, deadline);
+        assert_eq!(rebuilt_calldata, committed);
+        assert_eq!(
+            hex::encode(Sha256::digest(&rebuilt_calldata)),
+            candidate.calldata_hash
+        );
+    }
+
+    fn candidate(created_at: DateTime<Utc>, deadline: DateTime<Utc>) -> AutonomousCandidate {
+        AutonomousCandidate {
+            candidate_id: Uuid::from_u128(1),
+            opportunity_id: Uuid::from_u128(2),
+            origin_event_id: "unit:calldata-binding".to_string(),
+            chain_id: ARBITRUM_ONE_CHAIN_ID,
+            route_fingerprint: CURRENT_ROUTE_FINGERPRINT.to_string(),
+            route_universe_hash: "1".repeat(64),
+            route_policy_hash: "2".repeat(64),
+            state_block_number: 1,
+            state_block_hash: format!("0x{}", "3".repeat(64)),
+            state_hash: "4".repeat(64),
+            selected_size: 1_000_000_000_000_000,
+            predicted_gross_profit: 3_000_000_000_000,
+            plan_hash: "5".repeat(64),
+            calldata_hash: "0".repeat(64),
+            executor_address: CanonicalAddress::parse(EXECUTOR).unwrap(),
+            executor_code_hash: "6".repeat(64),
+            candidate_hash: "7".repeat(64),
+            created_at,
+            expires_at: deadline,
+            contract: json!({}),
+            plan: json!({
+                "origin_router": ROUTER,
+                "maximum_input_amount": "10000000000000000",
+                "economics": {
+                    "gas_cost": EXECUTABLE_GAS_COST.to_string()
+                },
+                "route": {
+                    "semantic_hash": "04".repeat(32),
+                    "settlement_asset": ARBITRUM_WETH_ADDRESS,
+                    "legs": [
+                        {
+                            "pool_address": CURRENT_ROUTE_POOL_500_ADDRESS,
+                            "factory_address": FACTORY,
+                            "token_in": ARBITRUM_WETH_ADDRESS,
+                            "token_out": ARBITRUM_NATIVE_USDC_ADDRESS,
+                            "fee": 500,
+                            "direction": "zero_for_one"
+                        },
+                        {
+                            "pool_address": CURRENT_ROUTE_POOL_3000_ADDRESS,
+                            "factory_address": FACTORY,
+                            "token_in": ARBITRUM_NATIVE_USDC_ADDRESS,
+                            "token_out": ARBITRUM_WETH_ADDRESS,
+                            "fee": 3000,
+                            "direction": "one_for_zero"
+                        }
+                    ]
+                },
+                "legs": [
+                    {"minimum_output": "1"},
+                    {"minimum_output": "1"}
+                ]
+            }),
+            calldata: Vec::new(),
+            state_contract: json!({}),
+        }
+    }
+
+    fn quote() -> TransactionQuote {
+        TransactionQuote {
+            block_number: 1,
+            block_hash: format!("0x{}", "8".repeat(64)),
+            gas_limit: 120_000,
+            l1_gas_units: 0,
+            base_fee_per_gas: 1,
+            max_fee_per_gas: 3,
+            max_priority_fee_per_gas: 1,
+            estimated_l1_cost: 0,
+            endpoint_identity: "unit".to_string(),
+        }
+    }
 }

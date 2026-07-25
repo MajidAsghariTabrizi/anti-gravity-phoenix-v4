@@ -9,11 +9,14 @@ async-nats = "=0.37.0"
 async-trait = "=0.1.81"
 chrono = "=0.4.38"
 futures-util = "=0.3.31"
+hex = "=0.4.3"
 phoenix-engine = { path = "../phoenix-engine" }
 phoenix-live-executor = { path = "../live-executor" }
 rpc-gateway = { path = "../rpc-gateway" }
 serde_json = "=1.0.128"
-sqlx = { version = "=0.8.2", default-features = false, features = ["runtime-tokio-rustls", "postgres"] }
+sha2 = "=0.10.9"
+sqlx = { version = "=0.8.2", default-features = false, features = ["runtime-tokio-rustls", "postgres", "chrono", "json", "uuid"] }
 tokio = { version = "=1.40.0", features = ["full"] }
 url = "=2.5.2"
+uuid = { version = "=1.10.0", features = ["serde"] }
 zeroize = "=1.8.1"

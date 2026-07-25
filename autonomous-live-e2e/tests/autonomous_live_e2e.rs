@@ -1,37 +1,58 @@
 use async_trait::async_trait;
-use chrono::{Duration as ChronoDuration, Utc};
+use chrono::{DateTime, Duration as ChronoDuration, SecondsFormat, TimeZone, Utc};
 use futures_util::StreamExt;
 use phoenix_engine::amm::v3::sqrt_ratio_at_tick;
 use phoenix_engine::autonomous::PostgresAutonomousCandidateStore;
 use phoenix_engine::hunter::{
     CandidateBindings, HunterBounds, HunterCore, HunterEconomicConfig, HunterEvent, HunterMode,
-    HunterRouteGraph, InMemoryCandidateSink,
+    HunterRouteGraph, InMemoryCandidateSink, MaterializedCandidate,
 };
+use phoenix_live_executor::abi::encode_execute_opportunity;
 use phoenix_live_executor::autonomous::{AutonomousMaterializer, MaterializationState};
 use phoenix_live_executor::config::{ExecutorConfig, SafetyLimits};
-use phoenix_live_executor::engine::{ExecutionState, LiveExecutor};
-use phoenix_live_executor::model::{CanonicalAddress, TransactionHash};
+use phoenix_live_executor::engine::{DisarmReason, ExecutionState, LiveExecutor};
+use phoenix_live_executor::model::{
+    CanonicalAddress, ExecutionLeg, ExecutionRequest, RawExecutionRequest, TransactionHash,
+};
 use phoenix_live_executor::rpc::{ExecutionRpc, HttpExecutionRpc, RpcError, TransactionReceipt};
 use phoenix_live_executor::signer::TransactionSigner;
-use phoenix_live_executor::store::PostgresExecutorStore;
+use phoenix_live_executor::store::{ExecutorStore, PostgresExecutorStore};
 use phoenix_live_executor::{
     ARBITRUM_NATIVE_USDC_ADDRESS, ARBITRUM_ONE_CHAIN_ID, ARBITRUM_WETH_ADDRESS,
-    CURRENT_ROUTE_POOL_3000_ADDRESS, CURRENT_ROUTE_POOL_500_ADDRESS,
+    CURRENT_ROUTE_FINGERPRINT, CURRENT_ROUTE_POOL_3000_ADDRESS, CURRENT_ROUTE_POOL_500_ADDRESS,
 };
 use rpc_gateway::hunter_state::{
     HunterStateResponse, PinnedV3PoolState, ProviderStateAgreement, HUNTER_STATE_RESPONSE_SCHEMA,
     PINNED_V3_STATE_SCHEMA,
 };
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
+use sqlx::types::Json;
 use sqlx::{PgPool, Row};
 use std::collections::BTreeMap;
+use std::error::Error;
+use std::io;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
+use tokio::sync::{Mutex, OnceCell};
 use url::Url;
+use uuid::Uuid;
+use zeroize::Zeroize;
 
 const FACTORY: &str = "0x1f98431c8ad98523631ae4a59f267346ea31f984";
 const ROUTER: &str = "0x68b3465833fb72a70ecdf485e0e4c7bd8665fc45";
+const RETAINED_PROFIT: u128 = 1_000_000_000_000;
+const GLOBAL_LOSS_LIMIT: u128 = 10_000_000_000_000_000;
+const ROUTE_LOSS_LIMIT: u128 = 10_000_000_000_000_000;
+const CANDIDATE_TTL_SECONDS: i64 = 3;
+const QUOTE_TTL_SECONDS: i64 = 2;
+
+type TestResult<T = ()> = Result<T, Box<dyn Error + Send + Sync>>;
+
+static SERVICE_LOCK: Mutex<()> = Mutex::const_new(());
+static CONTROL_SNAPSHOT: OnceCell<ControlSnapshot> = OnceCell::const_new();
+static BASE_EPOCH: OnceLock<i64> = OnceLock::new();
 
 #[derive(Clone)]
 struct ReadyAnvilRpc(HttpExecutionRpc);
@@ -44,7 +65,7 @@ impl ExecutionRpc for ReadyAnvilRpc {
 
     async fn execution_contract_ready(
         &self,
-        _request: &phoenix_live_executor::model::ExecutionRequest,
+        _request: &ExecutionRequest,
         _wallet: CanonicalAddress,
         _expected_code_hash: &str,
     ) -> Result<bool, RpcError> {
@@ -88,7 +109,7 @@ impl ExecutionRpc for UnknownSubmissionRpc {
 
     async fn execution_contract_ready(
         &self,
-        _request: &phoenix_live_executor::model::ExecutionRequest,
+        _request: &ExecutionRequest,
         _wallet: CanonicalAddress,
         _expected_code_hash: &str,
     ) -> Result<bool, RpcError> {
@@ -122,429 +143,1328 @@ impl ExecutionRpc for UnknownSubmissionRpc {
     }
 }
 
-#[tokio::test]
-async fn event_to_hunter_to_persisted_outcome_is_exactly_once() {
-    let Some(dsn) = std::env::var("PHOENIX_TEST_POSTGRES_DSN").ok() else {
-        eprintln!("PHOENIX_TEST_POSTGRES_DSN is unset; skipping autonomous E2E");
-        return;
-    };
-    let rpc_url = required("PHOENIX_TEST_QUOTE_PROXY_RPC_URL");
-    let nats_url = required("PHOENIX_TEST_NATS_URL");
-    let executor_address =
-        CanonicalAddress::parse(&required("PHOENIX_TEST_EXECUTOR_ADDRESS").to_ascii_lowercase())
-            .expect("executor address");
-    let executor_code_hash = required("PHOENIX_TEST_EXECUTOR_CODE_HASH");
-    let block_number = required("PHOENIX_TEST_BLOCK_NUMBER")
-        .parse::<u64>()
-        .expect("block number");
-    let block_hash = required("PHOENIX_TEST_BLOCK_HASH").to_ascii_lowercase();
-    let mut signer_secret = required("PHOENIX_TEST_ISOLATED_FORK_SIGNER_KEY");
-    let signer =
-        TransactionSigner::from_secret(&signer_secret, ARBITRUM_ONE_CHAIN_ID).expect("signer");
-    let restarted_signer =
-        TransactionSigner::from_secret(&signer_secret, ARBITRUM_ONE_CHAIN_ID).expect("signer");
-    let kill_switch_signer =
-        TransactionSigner::from_secret(&signer_secret, ARBITRUM_ONE_CHAIN_ID).expect("signer");
-    let unknown_submission_signer =
-        TransactionSigner::from_secret(&signer_secret, ARBITRUM_ONE_CHAIN_ID).expect("signer");
-    zeroize::Zeroize::zeroize(&mut signer_secret);
-    let rpc = HttpExecutionRpc::new_isolated_fork(
-        Url::parse(&rpc_url).expect("quote proxy URL"),
-        "CONFIRMED_LOCAL_ANVIL",
-    )
-    .expect("isolated RPC");
-    let config = ExecutorConfig {
-        postgres_dsn: dsn.clone(),
-        rpc_url: Url::parse(&rpc_url).expect("RPC URL"),
-        rpc_allowlist: Vec::new(),
-        wallet_address: signer.address(),
-        executor_address,
-        executor_code_hash: executor_code_hash.clone(),
-        pnl_asset_address: CanonicalAddress::parse(ARBITRUM_WETH_ADDRESS).expect("PnL asset"),
-        chain_id: ARBITRUM_ONE_CHAIN_ID,
-        limits: SafetyLimits {
-            maximum_gas_limit: 500_000,
-            maximum_max_fee_per_gas: 10_000_000_000,
-            maximum_priority_fee_per_gas: 2_000_000_000,
-            maximum_input_amount: 10_000_000_000_000_000,
-            minimum_expected_profit: 1,
-            maximum_daily_loss_wei: 10_000_000_000_000_000,
-        },
-        receipt_timeout: Duration::from_secs(10),
-        poll_interval: Duration::from_millis(10),
-        one_transaction_at_a_time: true,
-    };
-    let pool = PgPool::connect(&dsn).await.expect("PostgreSQL");
-    sqlx::raw_sql(
-        "TRUNCATE
-            live_canary.autonomous_candidates,
-            live_canary.execution_requests
-         CASCADE",
-    )
-    .execute(&pool)
-    .await
-    .expect("reset autonomous E2E history");
+#[derive(Clone)]
+struct ControlSnapshot {
+    legacy_armed: bool,
+    legacy_kill_switch: bool,
+    legacy_reason: Option<String>,
+    global_armed: bool,
+    global_kill_switch: bool,
+    global_mode: String,
+    global_reason: Option<String>,
+    global_hash: Option<String>,
+    global_contract: Option<Json<Value>>,
+    route_enabled: bool,
+    route_kill_switch: bool,
+    route_reason: Option<String>,
+    route_hash: Option<String>,
+    route_contract: Option<Json<Value>>,
+}
 
-    let nats = async_nats::connect(&nats_url).await.expect("NATS");
-    let subject = "phoenix.test.autonomous-live-e2e";
-    let mut subscriber = nats.subscribe(subject).await.expect("subscribe");
-    let event_value = json!({
-        "origin_event_id": format!("phoenix.engine.input.v1:{block_number}:autonomous-e2e"),
-        "origin_router": ROUTER,
-        "chain_id": 42161,
-        "block_number": block_number,
-        "block_hash": block_hash,
-        "observed_at_unix_ms": Utc::now().timestamp_millis(),
-        "touched_pool_addresses": [CURRENT_ROUTE_POOL_500_ADDRESS]
-    });
-    nats.publish(subject, serde_json::to_vec(&event_value).unwrap().into())
-        .await
-        .expect("publish event");
-    nats.flush().await.expect("flush event");
-    let message = tokio::time::timeout(Duration::from_secs(2), subscriber.next())
-        .await
-        .expect("event timeout")
-        .expect("event");
-    let received: Value = serde_json::from_slice(&message.payload).expect("event JSON");
-    let now_ms = Utc::now().timestamp_millis();
-    let event = HunterEvent {
-        origin_event_id: text(&received, "origin_event_id"),
-        origin_router: text(&received, "origin_router"),
-        chain_id: received["chain_id"].as_u64().expect("chain id"),
-        block_number,
-        block_hash: text(&received, "block_hash"),
-        observed_at_unix_ms: u64::try_from(now_ms).expect("observed timestamp"),
-        evaluated_at_unix_ms: u64::try_from(now_ms).expect("evaluated timestamp"),
-        touched_pool_addresses: vec![CURRENT_ROUTE_POOL_500_ADDRESS.to_string()],
-    };
+impl ControlSnapshot {
+    async fn load(pool: &PgPool) -> TestResult<Self> {
+        let legacy = sqlx::query(
+            "SELECT armed, kill_switch, disarm_reason
+             FROM live_canary.control WHERE singleton",
+        )
+        .fetch_one(pool)
+        .await?;
+        let global = sqlx::query(
+            "SELECT armed, kill_switch, execution_mode, disarm_reason,
+                    control_hash, control_contract
+             FROM live_canary.autonomous_global_control WHERE singleton",
+        )
+        .fetch_one(pool)
+        .await?;
+        let route = sqlx::query(
+            "SELECT enabled, kill_switch, disarm_reason, control_hash, control_contract
+             FROM live_canary.autonomous_route_controls
+             WHERE route_fingerprint = $1",
+        )
+        .bind(CURRENT_ROUTE_FINGERPRINT)
+        .fetch_one(pool)
+        .await?;
+        Ok(Self {
+            legacy_armed: legacy.try_get("armed")?,
+            legacy_kill_switch: legacy.try_get("kill_switch")?,
+            legacy_reason: legacy.try_get("disarm_reason")?,
+            global_armed: global.try_get("armed")?,
+            global_kill_switch: global.try_get("kill_switch")?,
+            global_mode: global.try_get("execution_mode")?,
+            global_reason: global.try_get("disarm_reason")?,
+            global_hash: global.try_get("control_hash")?,
+            global_contract: global.try_get("control_contract")?,
+            route_enabled: route.try_get("enabled")?,
+            route_kill_switch: route.try_get("kill_switch")?,
+            route_reason: route.try_get("disarm_reason")?,
+            route_hash: route.try_get("control_hash")?,
+            route_contract: route.try_get("control_contract")?,
+        })
+    }
 
+    async fn restore(&self, pool: &PgPool, restored_at: DateTime<Utc>) -> TestResult {
+        sqlx::query(
+            "UPDATE live_canary.control
+             SET armed = $1, kill_switch = $2, disarm_reason = $3, updated_at = $4
+             WHERE singleton",
+        )
+        .bind(self.legacy_armed)
+        .bind(self.legacy_kill_switch)
+        .bind(&self.legacy_reason)
+        .bind(restored_at)
+        .execute(pool)
+        .await?;
+        sqlx::query(
+            "UPDATE live_canary.autonomous_global_control
+             SET armed = $1, kill_switch = $2, execution_mode = $3,
+                 disarm_reason = $4, control_hash = $5, control_contract = $6,
+                 updated_at = $7
+             WHERE singleton",
+        )
+        .bind(self.global_armed)
+        .bind(self.global_kill_switch)
+        .bind(&self.global_mode)
+        .bind(&self.global_reason)
+        .bind(&self.global_hash)
+        .bind(&self.global_contract)
+        .bind(restored_at)
+        .execute(pool)
+        .await?;
+        sqlx::query(
+            "UPDATE live_canary.autonomous_route_controls
+             SET enabled = $2, kill_switch = $3, disarm_reason = $4,
+                 control_hash = $5, control_contract = $6, updated_at = $7
+             WHERE route_fingerprint = $1",
+        )
+        .bind(CURRENT_ROUTE_FINGERPRINT)
+        .bind(self.route_enabled)
+        .bind(self.route_kill_switch)
+        .bind(&self.route_reason)
+        .bind(&self.route_hash)
+        .bind(&self.route_contract)
+        .bind(restored_at)
+        .execute(pool)
+        .await?;
+        Ok(())
+    }
+}
+
+struct Fixture {
+    scenario: &'static str,
+    seed: u64,
+    base: DateTime<Utc>,
+    dsn: String,
+    pool: PgPool,
+    rpc: HttpExecutionRpc,
+    config: ExecutorConfig,
+    controls: ControlSnapshot,
+}
+
+#[derive(Clone)]
+struct CandidateBundle {
+    event: HunterEvent,
+    states: BTreeMap<String, ProviderStateAgreement>,
+    artifact: MaterializedCandidate,
+}
+
+struct Prepared {
+    bundle: CandidateBundle,
+    candidate_id: Uuid,
+    request_id: Uuid,
+    approval_time: DateTime<Utc>,
+}
+
+impl Fixture {
+    async fn new(scenario: &'static str, seed: u64) -> TestResult<Option<Self>> {
+        let Some(dsn) = std::env::var("PHOENIX_TEST_POSTGRES_DSN").ok() else {
+            eprintln!("PHOENIX_TEST_POSTGRES_DSN is unset; skipping {scenario}");
+            return Ok(None);
+        };
+        let rpc_url = required("PHOENIX_TEST_QUOTE_PROXY_RPC_URL")?;
+        let executor_address = CanonicalAddress::parse(
+            &required("PHOENIX_TEST_EXECUTOR_ADDRESS")?.to_ascii_lowercase(),
+        )
+        .map_err(boxed)?;
+        let executor_code_hash = required("PHOENIX_TEST_EXECUTOR_CODE_HASH")?;
+        let signer = isolated_signer()?;
+        let rpc =
+            HttpExecutionRpc::new_isolated_fork(Url::parse(&rpc_url)?, "CONFIRMED_LOCAL_ANVIL")
+                .map_err(boxed)?;
+        let config = ExecutorConfig {
+            postgres_dsn: dsn.clone(),
+            rpc_url: Url::parse(&rpc_url)?,
+            rpc_allowlist: Vec::new(),
+            wallet_address: signer.address(),
+            executor_address,
+            executor_code_hash,
+            pnl_asset_address: CanonicalAddress::parse(ARBITRUM_WETH_ADDRESS).map_err(boxed)?,
+            chain_id: ARBITRUM_ONE_CHAIN_ID,
+            limits: SafetyLimits {
+                maximum_gas_limit: 500_000,
+                maximum_max_fee_per_gas: 10_000_000_000,
+                maximum_priority_fee_per_gas: 2_000_000_000,
+                maximum_input_amount: 10_000_000_000_000_000,
+                minimum_expected_profit: 1,
+                maximum_daily_loss_wei: GLOBAL_LOSS_LIMIT,
+            },
+            receipt_timeout: Duration::from_secs(10),
+            poll_interval: Duration::from_millis(10),
+            one_transaction_at_a_time: true,
+        };
+        let pool = PgPool::connect(&dsn).await?;
+        let controls = if let Some(snapshot) = CONTROL_SNAPSHOT.get() {
+            snapshot.clone()
+        } else {
+            let loaded = ControlSnapshot::load(&pool).await?;
+            CONTROL_SNAPSHOT
+                .set(loaded.clone())
+                .map_err(|_| failure("control snapshot initialized twice"))?;
+            loaded
+        };
+        let suite_base = *BASE_EPOCH.get_or_init(|| Utc::now().timestamp() + 300);
+        let base = Utc
+            .timestamp_opt(
+                suite_base
+                    .checked_add(
+                        i64::try_from(seed)
+                            .map_err(boxed)?
+                            .checked_mul(60)
+                            .ok_or_else(|| failure("scenario clock overflow"))?,
+                    )
+                    .ok_or_else(|| failure("scenario clock overflow"))?,
+                0,
+            )
+            .single()
+            .ok_or_else(|| failure("scenario clock is invalid"))?;
+        reset_history(&pool).await?;
+        controls.restore(&pool, base).await?;
+        validate_control_budgets(&pool).await?;
+        Ok(Some(Self {
+            scenario,
+            seed,
+            base,
+            dsn,
+            pool,
+            rpc,
+            config,
+            controls,
+        }))
+    }
+
+    fn time(&self, variant: u64) -> TestResult<DateTime<Utc>> {
+        let offset = i64::try_from(variant)
+            .map_err(boxed)?
+            .checked_mul(10)
+            .ok_or_else(|| failure("variant clock overflow"))?;
+        Ok(self.base + ChronoDuration::seconds(offset))
+    }
+
+    async fn hunter_input(
+        &self,
+        variant: u64,
+    ) -> TestResult<(
+        HunterEvent,
+        BTreeMap<String, ProviderStateAgreement>,
+        CandidateBindings,
+    )> {
+        let marker = u8::try_from((self.seed + variant) % 255 + 1).map_err(boxed)?;
+        let anchor = self
+            .rpc
+            .quote_transaction(
+                self.config.wallet_address,
+                self.config.executor_address,
+                &[marker],
+            )
+            .await
+            .map_err(boxed)?;
+        let at = self.time(variant)?;
+        let event = HunterEvent {
+            origin_event_id: format!(
+                "phoenix.engine.input.v1:{}:e2e-{}-{}",
+                anchor.block_number, self.seed, variant
+            ),
+            origin_router: ROUTER.to_string(),
+            chain_id: ARBITRUM_ONE_CHAIN_ID,
+            block_number: anchor.block_number,
+            block_hash: anchor.block_hash.clone(),
+            observed_at_unix_ms: u64::try_from(at.timestamp_millis()).map_err(boxed)?,
+            evaluated_at_unix_ms: u64::try_from(at.timestamp_millis()).map_err(boxed)?,
+            touched_pool_addresses: vec![CURRENT_ROUTE_POOL_500_ADDRESS.to_string()],
+        };
+        let states = states(
+            anchor.block_number,
+            &anchor.block_hash,
+            self.seed
+                .checked_mul(100)
+                .and_then(|value| value.checked_add(variant))
+                .ok_or_else(|| failure("state seed overflow"))?,
+        );
+        let bindings = CandidateBindings {
+            risk_snapshot_hash: format!("{:064x}", self.seed + variant + 1),
+            submission_quote_hash: format!("{:064x}", self.seed + variant + 2),
+            executor_address: self.config.executor_address.to_string(),
+            executor_code_hash: self.config.executor_code_hash.clone(),
+            submission_channel: "standard_rpc".to_string(),
+        };
+        Ok((event, states, bindings))
+    }
+
+    async fn candidate(&self, variant: u64) -> TestResult<CandidateBundle> {
+        let (event, states, bindings) = self.hunter_input(variant).await?;
+        let bounds = HunterBounds::default();
+        let graph = HunterRouteGraph::from_contracts(
+            include_str!("../../config/phoenix-route-universe-v1.json"),
+            &[include_str!("../../config/phoenix-route-policy-v1.json")],
+            bounds,
+        )
+        .map_err(boxed)?;
+        let mut core = HunterCore::new(HunterMode::Live, graph, bounds, profitable_economics())
+            .map_err(boxed)?;
+        let mut sink = InMemoryCandidateSink::default();
+        let first = core
+            .process_event(&event, &states, &bindings, &mut sink)
+            .map_err(boxed)?;
+        require(
+            first.candidates.len() == 1 && sink.len() == 1,
+            "Hunter did not produce exactly one candidate",
+        )?;
+        let duplicate = core
+            .process_event(&event, &states, &bindings, &mut sink)
+            .map_err(boxed)?;
+        require(
+            duplicate.candidates.is_empty() && sink.len() == 1,
+            "Hunter candidate deduplication failed",
+        )?;
+        let artifact = sink
+            .artifacts()
+            .next()
+            .cloned()
+            .ok_or_else(|| failure("candidate artifact is missing"))?;
+        let created = text(&artifact.contract, "candidate_created_at")?;
+        let expires = text(&artifact.contract, "candidate_expires_at")?;
+        require(
+            created == timestamp(at_whole_second(&event)?),
+            "candidate creation time is not canonical",
+        )?;
+        require(
+            expires
+                == timestamp(
+                    at_whole_second(&event)? + ChronoDuration::seconds(CANDIDATE_TTL_SECONDS),
+                ),
+            "candidate expiry is not the canonical deadline",
+        )?;
+        Ok(CandidateBundle {
+            event,
+            states,
+            artifact,
+        })
+    }
+
+    async fn store_candidate(&self, bundle: &CandidateBundle) -> TestResult {
+        let store = PostgresAutonomousCandidateStore::connect(&self.dsn)
+            .await
+            .map_err(boxed)?;
+        let contract = state_contract(&bundle.event, &bundle.states);
+        require(
+            store
+                .materialize(&bundle.artifact, &contract)
+                .await
+                .map_err(boxed)?,
+            "candidate was not inserted",
+        )?;
+        require(
+            !store
+                .materialize(&bundle.artifact, &contract)
+                .await
+                .map_err(boxed)?,
+            "candidate database deduplication failed",
+        )
+    }
+
+    async fn approved(&self, variant: u64) -> TestResult<Prepared> {
+        let bundle = self.candidate(variant).await?;
+        self.store_candidate(&bundle).await?;
+        let approval_time = at_whole_second(&bundle.event)? + ChronoDuration::seconds(1);
+        let materializer = AutonomousMaterializer::connect(self.config.clone(), self.rpc.clone())
+            .await
+            .map_err(boxed)?;
+        self.diagnose(
+            "candidate approval and request materialization",
+            "candidate persisted",
+        )
+        .await;
+        let state = materializer.step(approval_time).await.map_err(boxed)?;
+        let (candidate_id, request_id) = match state {
+            MaterializationState::Materialized {
+                candidate_id,
+                request_id,
+            } => (candidate_id, request_id),
+            actual => {
+                self.diagnose("approval materialization", &format!("{actual:?}"))
+                    .await;
+                return Err(failure("candidate was not approved"));
+            }
+        };
+        let request = load_request(&self.pool, request_id).await?;
+        assert_calldata_binding(&bundle, &request)?;
+        require(
+            request.minimum_profit
+                == RETAINED_PROFIT
+                    .checked_add(profitable_economics().gas_cost)
+                    .ok_or_else(|| failure("minimum profit overflow"))?,
+            "request minimum_profit does not preserve Hunter semantics",
+        )?;
+        require(
+            request.deadline
+                == at_whole_second(&bundle.event)? + ChronoDuration::seconds(CANDIDATE_TTL_SECONDS),
+            "request deadline differs from candidate expiry",
+        )?;
+        require(
+            request.approved_at == approval_time
+                && request.approval_deadline
+                    == approval_time + ChronoDuration::seconds(QUOTE_TTL_SECONDS),
+            "approval window is not derived from the canonical clock",
+        )?;
+        Ok(Prepared {
+            bundle,
+            candidate_id,
+            request_id,
+            approval_time,
+        })
+    }
+
+    async fn diagnose(&self, expected: &str, actual: &str) {
+        let candidate =
+            sqlx::query_as::<_, (String, String, String, String, String, String, String)>(
+                "SELECT candidate_id::text, candidate_hash, plan_hash, status,
+                    candidate_created_at::text, candidate_expires_at::text,
+                    predicted_gross_profit::text
+             FROM live_canary.autonomous_candidates
+             ORDER BY created_at DESC LIMIT 1",
+            )
+            .fetch_optional(&self.pool)
+            .await
+            .ok()
+            .flatten();
+        let request = sqlx::query_as::<
+            _,
+            (
+                String,
+                String,
+                String,
+                String,
+                String,
+                String,
+                String,
+                String,
+            ),
+        >(
+            "SELECT id::text, status, approved_at::text, approval_deadline::text,
+                    deadline::text, minimum_profit::text, expected_profit::text,
+                    (gas_limit::numeric * max_fee_per_gas)::text
+             FROM live_canary.execution_requests
+             ORDER BY created_at DESC LIMIT 1",
+        )
+        .fetch_optional(&self.pool)
+        .await
+        .ok()
+        .flatten();
+        let attempt = sqlx::query_as::<
+            _,
+            (
+                String,
+                String,
+                Option<String>,
+                Option<String>,
+                Option<String>,
+            ),
+        >(
+            "SELECT id::text, status, error_code, nonce::text, tx_hash
+             FROM live_canary.execution_attempts ORDER BY id DESC LIMIT 1",
+        )
+        .fetch_optional(&self.pool)
+        .await
+        .ok()
+        .flatten();
+        let controls = sqlx::query_as::<_, (bool, bool, bool, bool, String, bool, bool)>(
+            "SELECT c.armed, c.kill_switch, g.armed, g.kill_switch,
+                        g.execution_mode, r.enabled, r.kill_switch
+                 FROM live_canary.control c
+                 CROSS JOIN live_canary.autonomous_global_control g
+                 JOIN live_canary.autonomous_route_controls r
+                   ON r.route_fingerprint = $1
+                 WHERE c.singleton AND g.singleton",
+        )
+        .bind(CURRENT_ROUTE_FINGERPRINT)
+        .fetch_optional(&self.pool)
+        .await
+        .ok()
+        .flatten();
+        eprintln!(
+            "SCENARIO_DIAGNOSTIC scenario={} canonical_base={} expected={} actual={} retained_profit={} candidate={candidate:?} request={request:?} attempt={attempt:?} controls={controls:?}",
+            self.scenario,
+            timestamp(self.base),
+            expected,
+            actual,
+            RETAINED_PROFIT,
+        );
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn scenario_01_expired_candidate() -> TestResult {
+    let _guard = SERVICE_LOCK.lock().await;
+    let Some(fixture) = Fixture::new("expired_candidate", 1).await? else {
+        return Ok(());
+    };
+    let bundle = fixture.candidate(0).await?;
+    round_trip_nats_event(&bundle.event, fixture.seed).await?;
+    fixture.store_candidate(&bundle).await?;
+    let materializer = AutonomousMaterializer::connect(fixture.config.clone(), fixture.rpc.clone())
+        .await
+        .map_err(boxed)?;
+    let expiry = at_whole_second(&bundle.event)? + ChronoDuration::seconds(CANDIDATE_TTL_SECONDS);
+    fixture
+        .diagnose("candidate expiry without request", "candidate persisted")
+        .await;
+    let actual = materializer.step(expiry).await.map_err(boxed)?;
+    fixture
+        .diagnose("Idle with candidate expired", &format!("{actual:?}"))
+        .await;
+    require(
+        actual == MaterializationState::Idle,
+        "expiry step was not idle",
+    )?;
+    let status: String = sqlx::query_scalar(
+        "SELECT status FROM live_canary.autonomous_candidates
+         WHERE candidate_hash = $1",
+    )
+    .bind(text(&bundle.artifact.contract, "candidate_hash")?)
+    .fetch_one(&fixture.pool)
+    .await?;
+    require(status == "expired", "candidate was not expired")?;
+    let requests: i64 = sqlx::query_scalar("SELECT count(*) FROM live_canary.execution_requests")
+        .fetch_one(&fixture.pool)
+        .await?;
+    require(requests == 0, "expired candidate created a request")
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn scenario_02_economics_rejection() -> TestResult {
+    let _guard = SERVICE_LOCK.lock().await;
+    let Some(fixture) = Fixture::new("economics_rejection", 2).await? else {
+        return Ok(());
+    };
+    let (event, states, bindings) = fixture.hunter_input(0).await?;
     let bounds = HunterBounds::default();
     let graph = HunterRouteGraph::from_contracts(
         include_str!("../../config/phoenix-route-universe-v1.json"),
         &[include_str!("../../config/phoenix-route-policy-v1.json")],
         bounds,
     )
-    .expect("route graph");
-    let mut core =
-        HunterCore::new(HunterMode::Live, graph, bounds, profitable_economics()).expect("Hunter");
-    let states = states(block_number, &block_hash);
-    let bindings = CandidateBindings {
-        risk_snapshot_hash: "0".repeat(64),
-        submission_quote_hash: "0".repeat(64),
-        executor_address: executor_address.to_string(),
-        executor_code_hash,
-        submission_channel: "standard_rpc".to_string(),
-    };
-    let mut sink = InMemoryCandidateSink::default();
-    let first = core
-        .process_event(&event, &states, &bindings, &mut sink)
-        .expect("Hunter event");
-    assert_eq!(first.candidates.len(), 1);
-    let duplicate = core
-        .process_event(&event, &states, &bindings, &mut sink)
-        .expect("duplicate Hunter event");
-    assert!(duplicate.candidates.is_empty());
-    assert_eq!(sink.len(), 1);
-
-    let initial_state_contract = state_contract(&event, &states);
-    let candidate_store = PostgresAutonomousCandidateStore::connect(&dsn)
-        .await
-        .expect("candidate store");
-    let artifact = sink.artifacts().next().expect("candidate artifact");
-    assert!(candidate_store
-        .materialize(artifact, &initial_state_contract)
-        .await
-        .expect("materialize candidate"));
-    assert!(!candidate_store
-        .materialize(artifact, &initial_state_contract)
-        .await
-        .expect("deduplicate candidate"));
-    sqlx::query(
-        "UPDATE live_canary.autonomous_candidates
-         SET candidate_expires_at = candidate_created_at + interval '1 microsecond'
-         WHERE candidate_id::text = $1",
-    )
-    .bind(text(&artifact.contract, "candidate_id"))
-    .execute(&pool)
-    .await
-    .expect("expire candidate");
-
-    let materializer = AutonomousMaterializer::connect(config.clone(), rpc.clone())
-        .await
-        .expect("materializer");
-    assert_eq!(
-        materializer
-            .step(Utc::now() + ChronoDuration::seconds(1))
-            .await
-            .expect("expire step"),
-        MaterializationState::Idle
-    );
-    let expired_status: String = sqlx::query_scalar(
-        "SELECT status FROM live_canary.autonomous_candidates
-         WHERE candidate_id::text = $1",
-    )
-    .bind(text(&artifact.contract, "candidate_id"))
-    .fetch_one(&pool)
-    .await
-    .expect("expired status");
-    assert_eq!(expired_status, "expired");
-    let expired_request_count: i64 =
-        sqlx::query_scalar("SELECT count(*) FROM live_canary.execution_requests")
-            .fetch_one(&pool)
-            .await
-            .expect("expired request count");
-    assert_eq!(expired_request_count, 0);
-
-    let negative_event = HunterEvent {
-        origin_event_id: format!("{}:negative", event.origin_event_id),
-        ..event.clone()
-    };
-    let mut negative_core = HunterCore::new(
+    .map_err(boxed)?;
+    let mut core = HunterCore::new(
         HunterMode::Live,
-        HunterRouteGraph::from_contracts(
-            include_str!("../../config/phoenix-route-universe-v1.json"),
-            &[include_str!("../../config/phoenix-route-policy-v1.json")],
-            bounds,
-        )
-        .expect("negative route graph"),
+        graph,
         bounds,
         HunterEconomicConfig {
             gas_cost: u128::MAX / 4,
             ..profitable_economics()
         },
     )
-    .expect("negative Hunter");
-    let mut negative_sink = InMemoryCandidateSink::default();
-    let negative = negative_core
-        .process_event(&negative_event, &states, &bindings, &mut negative_sink)
-        .expect("negative economics");
-    assert!(negative.candidates.is_empty());
-
-    let executable_at = Utc::now() + ChronoDuration::seconds(1);
-    let executable_event = HunterEvent {
-        origin_event_id: format!("{}:executable", event.origin_event_id),
-        observed_at_unix_ms: u64::try_from(executable_at.timestamp_millis())
-            .expect("observed timestamp"),
-        evaluated_at_unix_ms: u64::try_from(executable_at.timestamp_millis())
-            .expect("evaluated timestamp"),
-        ..event.clone()
-    };
-    let mut executable_sink = InMemoryCandidateSink::default();
-    let executable = core
-        .process_event(&executable_event, &states, &bindings, &mut executable_sink)
-        .expect("executable Hunter event");
-    assert_eq!(executable.candidates.len(), 1);
-    let executable_duplicate = core
-        .process_event(&executable_event, &states, &bindings, &mut executable_sink)
-        .expect("duplicate executable event");
-    assert!(executable_duplicate.candidates.is_empty());
-    assert!(candidate_store
-        .materialize(
-            executable_sink
-                .artifacts()
-                .next()
-                .expect("executable candidate"),
-            &state_contract(&executable_event, &states),
-        )
-        .await
-        .expect("materialize executable candidate"));
-    let materialized = materializer.step(executable_at).await.expect("approval");
-    assert!(matches!(
-        materialized,
-        MaterializationState::Materialized { .. }
-    ));
-    let approved_count: i64 =
-        sqlx::query_scalar("SELECT count(*) FROM live_canary.execution_requests")
-            .fetch_one(&pool)
-            .await
-            .expect("approved request count");
-    assert_eq!(approved_count, 1);
-
-    let nonce_before = rpc
-        .pending_nonce(signer.address())
-        .await
-        .expect("nonce before submission");
-    let store = PostgresExecutorStore::from_pool(pool.clone());
-    let executor = LiveExecutor::new(
-        config.clone(),
-        signer,
-        PostgresExecutorStore::from_pool(pool.clone()),
-        ReadyAnvilRpc(rpc.clone()),
-    );
-    assert!(matches!(
-        executor.step(executable_at).await.expect("submission"),
-        ExecutionState::Pending { .. }
-    ));
-    let restarted = LiveExecutor::new(
-        config.clone(),
-        restarted_signer,
-        store,
-        ReadyAnvilRpc(rpc.clone()),
-    );
-    let terminal = restarted
-        .step(executable_at + ChronoDuration::seconds(1))
-        .await
-        .expect("restart reconciliation");
-    assert!(matches!(terminal, ExecutionState::Reverted { .. }));
-    assert_eq!(
-        rpc.pending_nonce(
-            CanonicalAddress::parse(&required("PHOENIX_TEST_WALLET_ADDRESS")).expect("wallet")
-        )
-        .await
-        .expect("nonce after submission"),
-        nonce_before + 1
-    );
-    let outcome = sqlx::query(
-        "SELECT outcome_status, realized_chain_net_pnl::text AS pnl
-         FROM live_canary.autonomous_outcome_attributions",
+    .map_err(boxed)?;
+    let mut sink = InMemoryCandidateSink::default();
+    let result = core
+        .process_event(&event, &states, &bindings, &mut sink)
+        .map_err(boxed)?;
+    fixture
+        .diagnose("no candidate", &format!("candidate_count={}", sink.len()))
+        .await;
+    require(
+        result.candidates.is_empty() && sink.is_empty(),
+        "negative economics produced a candidate",
+    )?;
+    let rows: i64 = sqlx::query_scalar(
+        "SELECT
+            (SELECT count(*) FROM live_canary.autonomous_candidates)
+            + (SELECT count(*) FROM live_canary.execution_requests)",
     )
-    .fetch_one(&pool)
-    .await
-    .expect("OutcomeV1");
-    assert_eq!(
-        outcome.try_get::<String, _>("outcome_status").unwrap(),
-        "reverted"
-    );
-    assert!(
-        outcome
-            .try_get::<String, _>("pnl")
-            .unwrap()
-            .parse::<i128>()
-            .unwrap()
-            < 0
-    );
+    .fetch_one(&fixture.pool)
+    .await?;
+    require(rows == 0, "economics rejection mutated execution state")
+}
 
-    let kill_event = HunterEvent {
-        origin_event_id: format!("{}:kill-switch", event.origin_event_id),
-        observed_at_unix_ms: u64::try_from(Utc::now().timestamp_millis())
-            .expect("observed timestamp"),
-        evaluated_at_unix_ms: u64::try_from(Utc::now().timestamp_millis())
-            .expect("evaluated timestamp"),
-        ..event.clone()
+#[tokio::test(flavor = "current_thread")]
+async fn scenario_03_approval_materialization() -> TestResult {
+    let _guard = SERVICE_LOCK.lock().await;
+    let Some(fixture) = Fixture::new("approval_materialization", 3).await? else {
+        return Ok(());
     };
-    let mut kill_sink = InMemoryCandidateSink::default();
-    assert_eq!(
-        core.process_event(&kill_event, &states, &bindings, &mut kill_sink)
-            .expect("kill-switch Hunter event")
-            .candidates
-            .len(),
-        1
+    let prepared = fixture.approved(0).await?;
+    fixture
+        .diagnose(
+            "approved request and request_materialized candidate",
+            "materialized",
+        )
+        .await;
+    let candidate_status: String = sqlx::query_scalar(
+        "SELECT status FROM live_canary.autonomous_candidates WHERE candidate_id = $1",
+    )
+    .bind(prepared.candidate_id)
+    .fetch_one(&fixture.pool)
+    .await?;
+    let request_status: String =
+        sqlx::query_scalar("SELECT status FROM live_canary.execution_requests WHERE id = $1")
+            .bind(prepared.request_id)
+            .fetch_one(&fixture.pool)
+            .await?;
+    let approvals: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM live_canary.autonomous_approvals")
+            .fetch_one(&fixture.pool)
+            .await?;
+    require(
+        candidate_status == "request_materialized"
+            && request_status == "approved"
+            && approvals == 1,
+        "approval lifecycle rows are inconsistent",
+    )
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn scenario_04_executor_eligibility_and_claim() -> TestResult {
+    let _guard = SERVICE_LOCK.lock().await;
+    let Some(fixture) = Fixture::new("executor_eligibility_and_claim", 4).await? else {
+        return Ok(());
+    };
+    let prepared = fixture.approved(0).await?;
+    let store = PostgresExecutorStore::from_pool(fixture.pool.clone());
+    fixture
+        .diagnose("eligible request claim", "request approved")
+        .await;
+    let request = store
+        .claim_approved(&fixture.config, prepared.approval_time)
+        .await
+        .map_err(boxed)?
+        .ok_or_else(|| failure("eligible request was not claimed"))?;
+    fixture
+        .diagnose("request/candidate/attempt claimed", "claimed")
+        .await;
+    require(
+        request.id == prepared.request_id,
+        "wrong request was claimed",
+    )?;
+    assert_calldata_binding(&prepared.bundle, &request)?;
+    let statuses: (String, String, String) = sqlx::query_as(
+        "SELECT r.status, a.status, c.status
+         FROM live_canary.execution_requests r
+         JOIN live_canary.execution_attempts a ON a.request_id = r.id
+         JOIN live_canary.autonomous_candidates c ON c.execution_request_id = r.id
+         WHERE r.id = $1",
+    )
+    .bind(prepared.request_id)
+    .fetch_one(&fixture.pool)
+    .await?;
+    require(
+        statuses
+            == (
+                "claimed".to_string(),
+                "claimed".to_string(),
+                "claimed".to_string(),
+            ),
+        "claim lifecycle transition is inconsistent",
+    )
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn scenario_05_signing_and_submission() -> TestResult {
+    let _guard = SERVICE_LOCK.lock().await;
+    let Some(fixture) = Fixture::new("signing_and_submission", 5).await? else {
+        return Ok(());
+    };
+    let prepared = fixture.approved(0).await?;
+    let nonce_before = fixture
+        .rpc
+        .pending_nonce(fixture.config.wallet_address)
+        .await
+        .map_err(boxed)?;
+    let executor = LiveExecutor::new(
+        fixture.config.clone(),
+        isolated_signer()?,
+        PostgresExecutorStore::from_pool(fixture.pool.clone()),
+        ReadyAnvilRpc(fixture.rpc.clone()),
     );
-    assert!(candidate_store
-        .materialize(
-            kill_sink.artifacts().next().expect("kill-switch candidate"),
-            &state_contract(&kill_event, &states),
-        )
+    fixture
+        .diagnose("sign and submit exactly once", "request approved")
+        .await;
+    let actual = executor.step(prepared.approval_time).await.map_err(boxed)?;
+    fixture
+        .diagnose("ExecutionState::Pending", &format!("{actual:?}"))
+        .await;
+    require(
+        matches!(actual, ExecutionState::Pending { .. }),
+        "submission did not become pending",
+    )?;
+    let statuses: (String, String, String) = sqlx::query_as(
+        "SELECT r.status, a.status, c.status
+         FROM live_canary.execution_requests r
+         JOIN live_canary.execution_attempts a ON a.request_id = r.id
+         JOIN live_canary.autonomous_candidates c ON c.execution_request_id = r.id
+         WHERE r.id = $1",
+    )
+    .bind(prepared.request_id)
+    .fetch_one(&fixture.pool)
+    .await?;
+    require(
+        statuses
+            == (
+                "pending".to_string(),
+                "pending".to_string(),
+                "submitted".to_string(),
+            ),
+        "submission lifecycle rows are inconsistent",
+    )?;
+    let nonce_after = fixture
+        .rpc
+        .pending_nonce(fixture.config.wallet_address)
         .await
-        .expect("materialize kill-switch candidate"));
-    assert!(matches!(
-        materializer
-            .step(Utc::now())
+        .map_err(boxed)?;
+    require(
+        nonce_after == nonce_before + 1,
+        "network nonce did not advance exactly once",
+    )
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn scenario_06_ambiguous_unknown_submission() -> TestResult {
+    let _guard = SERVICE_LOCK.lock().await;
+    let Some(fixture) = Fixture::new("ambiguous_unknown_submission", 6).await? else {
+        return Ok(());
+    };
+    let prepared = fixture.approved(0).await?;
+    let nonce_before = fixture
+        .rpc
+        .pending_nonce(fixture.config.wallet_address)
+        .await
+        .map_err(boxed)?;
+    let send_count = Arc::new(AtomicUsize::new(0));
+    let executor = LiveExecutor::new(
+        fixture.config.clone(),
+        isolated_signer()?,
+        PostgresExecutorStore::from_pool(fixture.pool.clone()),
+        UnknownSubmissionRpc {
+            inner: fixture.rpc.clone(),
+            send_count: Arc::clone(&send_count),
+        },
+    );
+    fixture
+        .diagnose(
+            "preserve ambiguous submission and disarm",
+            "request approved",
+        )
+        .await;
+    let actual = executor.step(prepared.approval_time).await.map_err(boxed)?;
+    fixture
+        .diagnose("ExecutionState::SubmissionUnknown", &format!("{actual:?}"))
+        .await;
+    require(
+        matches!(actual, ExecutionState::SubmissionUnknown { .. }),
+        "ambiguous submission was not preserved as unknown",
+    )?;
+    require(
+        send_count.load(Ordering::SeqCst) == 1,
+        "ambiguous submission retried",
+    )?;
+    require(
+        fixture
+            .rpc
+            .pending_nonce(fixture.config.wallet_address)
             .await
-            .expect("kill-switch approval"),
-        MaterializationState::Materialized { .. }
-    ));
-    let pending_nonce_before_kill = rpc
-        .pending_nonce(
-            CanonicalAddress::parse(&required("PHOENIX_TEST_WALLET_ADDRESS")).expect("wallet"),
-        )
+            .map_err(boxed)?
+            == nonce_before,
+        "unknown submission changed the network nonce",
+    )?;
+    let attempt: (String, Option<String>) = sqlx::query_as(
+        "SELECT status, error_code FROM live_canary.execution_attempts
+         WHERE request_id = $1",
+    )
+    .bind(prepared.request_id)
+    .fetch_one(&fixture.pool)
+    .await?;
+    let controls: (bool, bool, Option<String>) = sqlx::query_as(
+        "SELECT armed, kill_switch, disarm_reason
+         FROM live_canary.autonomous_global_control WHERE singleton",
+    )
+    .fetch_one(&fixture.pool)
+    .await?;
+    require(
+        attempt
+            == (
+                "submission_unknown".to_string(),
+                Some("nonce_conflict".to_string()),
+            )
+            && controls == (false, true, Some("nonce_conflict".to_string())),
+        "unknown-submission fail-closed state is inconsistent",
+    )
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn scenario_07_receipt_reconciliation() -> TestResult {
+    let _guard = SERVICE_LOCK.lock().await;
+    let Some(fixture) = Fixture::new("receipt_reconciliation", 7).await? else {
+        return Ok(());
+    };
+    let prepared = fixture.approved(0).await?;
+    let executor = LiveExecutor::new(
+        fixture.config.clone(),
+        isolated_signer()?,
+        PostgresExecutorStore::from_pool(fixture.pool.clone()),
+        ReadyAnvilRpc(fixture.rpc.clone()),
+    );
+    let pending = executor.step(prepared.approval_time).await.map_err(boxed)?;
+    require(
+        matches!(pending, ExecutionState::Pending { .. }),
+        "receipt scenario did not submit",
+    )?;
+    fixture
+        .diagnose("reconcile mined receipt", "request pending")
+        .await;
+    let actual = executor
+        .step(prepared.approval_time + ChronoDuration::seconds(1))
         .await
-        .expect("nonce before kill switch");
+        .map_err(boxed)?;
+    fixture
+        .diagnose("ExecutionState::Reverted", &format!("{actual:?}"))
+        .await;
+    require(
+        matches!(actual, ExecutionState::Reverted { .. }),
+        "reverted receipt was not reconciled",
+    )?;
+    let outcome: (String, String) = sqlx::query_as(
+        "SELECT outcome_status, actual_fee_wei::text
+         FROM live_canary.execution_outcomes WHERE request_id = $1",
+    )
+    .bind(prepared.request_id)
+    .fetch_one(&fixture.pool)
+    .await?;
+    require(
+        outcome.0 == "reverted" && outcome.1.parse::<u128>()? > 0,
+        "receipt economics were not persisted",
+    )
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn scenario_08_outcome_v1_and_realized_pnl() -> TestResult {
+    let _guard = SERVICE_LOCK.lock().await;
+    let Some(fixture) = Fixture::new("outcome_v1_and_realized_pnl", 8).await? else {
+        return Ok(());
+    };
+    let prepared = fixture.approved(0).await?;
+    let executor = LiveExecutor::new(
+        fixture.config.clone(),
+        isolated_signer()?,
+        PostgresExecutorStore::from_pool(fixture.pool.clone()),
+        ReadyAnvilRpc(fixture.rpc.clone()),
+    );
+    require(
+        matches!(
+            executor.step(prepared.approval_time).await.map_err(boxed)?,
+            ExecutionState::Pending { .. }
+        ),
+        "OutcomeV1 scenario did not submit",
+    )?;
+    fixture
+        .diagnose("persist OutcomeV1 and realized PnL", "request pending")
+        .await;
+    let terminal = executor
+        .step(prepared.approval_time + ChronoDuration::seconds(1))
+        .await
+        .map_err(boxed)?;
+    fixture
+        .diagnose(
+            "reverted OutcomeV1 with negative PnL",
+            &format!("{terminal:?}"),
+        )
+        .await;
+    require(
+        matches!(terminal, ExecutionState::Reverted { .. }),
+        "OutcomeV1 scenario did not reconcile",
+    )?;
+    let row = sqlx::query(
+        "SELECT outcome_class, realized_chain_net_pnl::text AS pnl,
+                actual_gas_cost::text, actual_l1_cost::text,
+                outcome_hash, outcome_contract
+         FROM live_canary.autonomous_outcome_attributions
+         WHERE candidate_id = $1",
+    )
+    .bind(prepared.candidate_id)
+    .fetch_one(&fixture.pool)
+    .await?;
+    let outcome_class: String = row.try_get("outcome_class")?;
+    let pnl: i128 = row.try_get::<String, _>("pnl")?.parse()?;
+    let gas: i128 = row.try_get::<String, _>("actual_gas_cost")?.parse()?;
+    let l1: i128 = row.try_get::<String, _>("actual_l1_cost")?.parse()?;
+    let outcome_hash: String = row.try_get("outcome_hash")?;
+    let contract: Json<Value> = row.try_get("outcome_contract")?;
+    require(
+        outcome_class == "reverted"
+            && pnl < 0
+            && pnl == -(gas + l1)
+            && contract.0["outcome_hash"] == outcome_hash
+            && contract.0["candidate_hash"]
+                == text(&prepared.bundle.artifact.contract, "candidate_hash")?,
+        "OutcomeV1 binding or realized PnL is invalid",
+    )
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn scenario_09_disarm_kill_switch_and_valid_rearm() -> TestResult {
+    let _guard = SERVICE_LOCK.lock().await;
+    let Some(fixture) = Fixture::new("disarm_kill_switch_and_valid_rearm", 9).await? else {
+        return Ok(());
+    };
+    let prepared = fixture.approved(0).await?;
+    let nonce_before = fixture
+        .rpc
+        .pending_nonce(fixture.config.wallet_address)
+        .await
+        .map_err(boxed)?;
     sqlx::query(
         "UPDATE live_canary.autonomous_global_control
          SET armed = false, kill_switch = true, execution_mode = 'disarmed',
              disarm_reason = 'e2e_kill_switch', control_hash = NULL,
-             control_contract = NULL",
-    )
-    .execute(&pool)
-    .await
-    .expect("kill switch");
-    let approved_before_kill: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM live_canary.execution_requests WHERE status = 'approved'",
-    )
-    .fetch_one(&pool)
-    .await
-    .expect("approved before kill");
-    assert_eq!(approved_before_kill, 1);
-    let killed_executor = LiveExecutor::new(
-        config.clone(),
-        kill_switch_signer,
-        PostgresExecutorStore::from_pool(pool.clone()),
-        ReadyAnvilRpc(rpc.clone()),
-    );
-    assert!(matches!(
-        killed_executor.step(Utc::now()).await.expect("kill switch"),
-        ExecutionState::DisarmedShadow
-    ));
-    assert_eq!(
-        rpc.pending_nonce(
-            CanonicalAddress::parse(&required("PHOENIX_TEST_WALLET_ADDRESS")).expect("wallet"),
-        )
-        .await
-        .expect("nonce after kill switch"),
-        pending_nonce_before_kill
-    );
-    let attempts_after_kill: i64 =
-        sqlx::query_scalar("SELECT count(*) FROM live_canary.execution_attempts")
-            .fetch_one(&pool)
-            .await
-            .expect("attempts after kill");
-    assert_eq!(attempts_after_kill, 1);
-
-    sqlx::query(
-        "UPDATE live_canary.autonomous_global_control
-         SET armed = true, kill_switch = false, execution_mode = 'live',
-             disarm_reason = NULL
+             control_contract = NULL, updated_at = $1
          WHERE singleton",
     )
-    .execute(&pool)
-    .await
-    .expect("rearm unknown-submission proof");
-    let unknown_send_count = Arc::new(AtomicUsize::new(0));
-    let unknown_executor = LiveExecutor::new(
-        config,
-        unknown_submission_signer,
-        PostgresExecutorStore::from_pool(pool.clone()),
-        UnknownSubmissionRpc {
-            inner: rpc.clone(),
-            send_count: Arc::clone(&unknown_send_count),
-        },
+    .bind(prepared.approval_time)
+    .execute(&fixture.pool)
+    .await?;
+    let executor = LiveExecutor::new(
+        fixture.config.clone(),
+        isolated_signer()?,
+        PostgresExecutorStore::from_pool(fixture.pool.clone()),
+        ReadyAnvilRpc(fixture.rpc.clone()),
     );
-    assert!(matches!(
-        unknown_executor
-            .step(Utc::now())
+    fixture
+        .diagnose("kill switch blocks claim", "global control disarmed")
+        .await;
+    let actual = executor.step(prepared.approval_time).await.map_err(boxed)?;
+    fixture
+        .diagnose("ExecutionState::DisarmedShadow", &format!("{actual:?}"))
+        .await;
+    require(
+        actual == ExecutionState::DisarmedShadow,
+        "kill switch did not block claim",
+    )?;
+    let attempts: i64 = sqlx::query_scalar("SELECT count(*) FROM live_canary.execution_attempts")
+        .fetch_one(&fixture.pool)
+        .await?;
+    require(attempts == 0, "kill switch created an attempt")?;
+    require(
+        fixture
+            .rpc
+            .pending_nonce(fixture.config.wallet_address)
             .await
-            .expect("unknown submission"),
-        ExecutionState::SubmissionUnknown { .. }
-    ));
-    assert_eq!(unknown_send_count.load(Ordering::SeqCst), 1);
-    assert_eq!(
-        rpc.pending_nonce(
-            CanonicalAddress::parse(&required("PHOENIX_TEST_WALLET_ADDRESS")).expect("wallet"),
+            .map_err(boxed)?
+            == nonce_before,
+        "kill switch changed the network nonce",
+    )?;
+    fixture
+        .controls
+        .restore(
+            &fixture.pool,
+            prepared.approval_time + ChronoDuration::seconds(1),
         )
-        .await
-        .expect("nonce after unknown submission"),
-        pending_nonce_before_kill
-    );
-    let unknown_status: String = sqlx::query_scalar(
-        "SELECT status FROM live_canary.execution_attempts
-         ORDER BY id DESC LIMIT 1",
+        .await?;
+    let restored: (bool, bool, bool, bool, String, bool, bool) = sqlx::query_as(
+        "SELECT c.armed, c.kill_switch, g.armed, g.kill_switch,
+                g.execution_mode, g.control_hash IS NOT NULL,
+                g.control_contract IS NOT NULL
+         FROM live_canary.control c
+         CROSS JOIN live_canary.autonomous_global_control g
+         WHERE c.singleton AND g.singleton",
     )
-    .fetch_one(&pool)
-    .await
-    .expect("unknown attempt status");
-    assert_eq!(unknown_status, "submission_unknown");
-    let global_control: (bool, bool, Option<String>) = sqlx::query_as(
-        "SELECT armed, kill_switch, disarm_reason
+    .fetch_one(&fixture.pool)
+    .await?;
+    require(
+        restored == (true, false, true, false, "live".to_string(), true, true),
+        "rearm did not restore both valid control contracts",
+    )
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn scenario_10_restart_and_nonce_recovery() -> TestResult {
+    let _guard = SERVICE_LOCK.lock().await;
+    let Some(fixture) = Fixture::new("restart_and_nonce_recovery", 10).await? else {
+        return Ok(());
+    };
+    let prepared = fixture.approved(0).await?;
+    let nonce_before = fixture
+        .rpc
+        .pending_nonce(fixture.config.wallet_address)
+        .await
+        .map_err(boxed)?;
+    let executor = LiveExecutor::new(
+        fixture.config.clone(),
+        isolated_signer()?,
+        PostgresExecutorStore::from_pool(fixture.pool.clone()),
+        ReadyAnvilRpc(fixture.rpc.clone()),
+    );
+    require(
+        matches!(
+            executor.step(prepared.approval_time).await.map_err(boxed)?,
+            ExecutionState::Pending { .. }
+        ),
+        "restart scenario did not submit",
+    )?;
+    drop(executor);
+    let restarted = LiveExecutor::new(
+        fixture.config.clone(),
+        isolated_signer()?,
+        PostgresExecutorStore::from_pool(fixture.pool.clone()),
+        ReadyAnvilRpc(fixture.rpc.clone()),
+    );
+    fixture
+        .diagnose(
+            "restart reconciles pending nonce ownership",
+            "request pending",
+        )
+        .await;
+    let actual = restarted
+        .step(prepared.approval_time + ChronoDuration::seconds(1))
+        .await
+        .map_err(boxed)?;
+    fixture
+        .diagnose("restart reconciliation to Reverted", &format!("{actual:?}"))
+        .await;
+    require(
+        matches!(actual, ExecutionState::Reverted { .. }),
+        "restart did not recover the pending attempt",
+    )?;
+    let nonce_state: String = sqlx::query_scalar(
+        "SELECT next_nonce::text FROM live_canary.nonce_state
+         WHERE chain_id = $1 AND wallet_address = $2",
+    )
+    .bind(i64::try_from(ARBITRUM_ONE_CHAIN_ID).map_err(boxed)?)
+    .bind(fixture.config.wallet_address.to_string())
+    .fetch_one(&fixture.pool)
+    .await?;
+    require(
+        nonce_state.parse::<u64>()? == nonce_before + 1
+            && fixture
+                .rpc
+                .pending_nonce(fixture.config.wallet_address)
+                .await
+                .map_err(boxed)?
+                == nonce_before + 1,
+        "restart nonce authority diverged from the network",
+    )
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn scenario_11_route_risk_feedback_at_threshold() -> TestResult {
+    let _guard = SERVICE_LOCK.lock().await;
+    let Some(fixture) = Fixture::new("route_risk_feedback_at_threshold", 11).await? else {
+        return Ok(());
+    };
+    for loss_number in 1_u64..=3 {
+        let prepared = fixture.approved(loss_number).await?;
+        let executor = LiveExecutor::new(
+            fixture.config.clone(),
+            isolated_signer()?,
+            PostgresExecutorStore::from_pool(fixture.pool.clone()),
+            ReadyAnvilRpc(fixture.rpc.clone()),
+        );
+        fixture
+            .diagnose(
+                "submit route-risk observation",
+                &format!("route loss {loss_number} approved"),
+            )
+            .await;
+        require(
+            matches!(
+                executor.step(prepared.approval_time).await.map_err(boxed)?,
+                ExecutionState::Pending { .. }
+            ),
+            format!("route loss {loss_number} did not submit"),
+        )?;
+        fixture
+            .diagnose(
+                "reconcile route loss and update feedback",
+                &format!("route loss {loss_number} pending"),
+            )
+            .await;
+        require(
+            matches!(
+                executor
+                    .step(prepared.approval_time + ChronoDuration::seconds(1))
+                    .await
+                    .map_err(boxed)?,
+                ExecutionState::Reverted { .. }
+            ),
+            format!("route loss {loss_number} did not reconcile"),
+        )?;
+        let route: (bool, bool, Option<String>) = sqlx::query_as(
+            "SELECT enabled, kill_switch, disarm_reason
+             FROM live_canary.autonomous_route_controls
+             WHERE route_fingerprint = $1",
+        )
+        .bind(CURRENT_ROUTE_FINGERPRINT)
+        .fetch_one(&fixture.pool)
+        .await?;
+        fixture
+            .diagnose(
+                if loss_number < 3 {
+                    "route remains enabled below three consecutive losses"
+                } else {
+                    "route disarmed at three consecutive losses"
+                },
+                &format!("{route:?}"),
+            )
+            .await;
+        if loss_number < 3 {
+            require(
+                route == (true, false, None),
+                "route disarmed below threshold",
+            )?;
+        } else {
+            require(
+                route == (false, true, Some("maximum_consecutive_losses".to_string())),
+                "route did not disarm at the consecutive-loss threshold",
+            )?;
+        }
+    }
+    let global: (bool, bool) = sqlx::query_as(
+        "SELECT armed, kill_switch
          FROM live_canary.autonomous_global_control WHERE singleton",
     )
-    .fetch_one(&pool)
-    .await
-    .expect("unknown global control");
-    assert_eq!(
-        global_control,
-        (false, true, Some("nonce_conflict".to_string()))
+    .fetch_one(&fixture.pool)
+    .await?;
+    require(
+        global == (true, false),
+        "route threshold incorrectly disarmed global control",
+    )
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn scenario_12_global_risk_feedback_at_threshold() -> TestResult {
+    let _guard = SERVICE_LOCK.lock().await;
+    let Some(fixture) = Fixture::new("global_risk_feedback_at_threshold", 12).await? else {
+        return Ok(());
+    };
+    let prepared = fixture.approved(0).await?;
+    let synthetic_hash = format!("0x{:064x}", fixture.seed);
+    sqlx::query(
+        "INSERT INTO live_canary.execution_outcomes(
+            request_id, tx_hash, outcome_status, receipt_status,
+            settled_event_found, block_number, gas_used, effective_gas_price,
+            actual_fee_wei, asset, flash_amount, premium, realized_profit,
+            net_pnl_wei, recorded_at
+         )
+         SELECT id, $2, 'reverted', 0, false, 1, 1, $3::numeric,
+                $3::numeric, flash_asset, flash_amount, 0, 0,
+                -($3::numeric), $4
+         FROM live_canary.execution_requests WHERE id = $1",
+    )
+    .bind(prepared.request_id)
+    .bind(synthetic_hash)
+    .bind(GLOBAL_LOSS_LIMIT.to_string())
+    .bind(prepared.approval_time)
+    .execute(&fixture.pool)
+    .await?;
+    let executor = LiveExecutor::new(
+        fixture.config.clone(),
+        isolated_signer()?,
+        PostgresExecutorStore::from_pool(fixture.pool.clone()),
+        ReadyAnvilRpc(fixture.rpc.clone()),
     );
+    fixture
+        .diagnose(
+            "global exact-threshold loss blocks claim",
+            "request approved with threshold outcome",
+        )
+        .await;
+    let actual = executor.step(prepared.approval_time).await.map_err(boxed)?;
+    fixture
+        .diagnose(
+            "ExecutionState::Disarmed(DailyLossBudget) at exact global threshold",
+            &format!("{actual:?}"),
+        )
+        .await;
+    require(
+        actual
+            == ExecutionState::Disarmed {
+                reason: DisarmReason::DailyLossBudget,
+            },
+        "global control did not disarm at the exact loss threshold",
+    )?;
+    let attempts: i64 = sqlx::query_scalar("SELECT count(*) FROM live_canary.execution_attempts")
+        .fetch_one(&fixture.pool)
+        .await?;
+    let controls: (bool, bool, bool, bool, Option<String>) = sqlx::query_as(
+        "SELECT c.armed, c.kill_switch, g.armed, g.kill_switch, g.disarm_reason
+         FROM live_canary.control c
+         CROSS JOIN live_canary.autonomous_global_control g
+         WHERE c.singleton AND g.singleton",
+    )
+    .fetch_one(&fixture.pool)
+    .await?;
+    require(
+        attempts == 0
+            && controls
+                == (
+                    false,
+                    true,
+                    false,
+                    true,
+                    Some("daily_loss_budget".to_string()),
+                ),
+        "global threshold did not fail closed before claim",
+    )
+}
+
+async fn reset_history(pool: &PgPool) -> TestResult {
+    sqlx::raw_sql(
+        "TRUNCATE
+            live_canary.execution_requests,
+            live_canary.autonomous_candidates,
+            live_canary.nonce_state
+         RESTART IDENTITY CASCADE",
+    )
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+async fn validate_control_budgets(pool: &PgPool) -> TestResult {
+    let global: (String, String) = sqlx::query_as(
+        "SELECT daily_loss_limit::text, maximum_input_amount::text
+         FROM live_canary.autonomous_global_control WHERE singleton",
+    )
+    .fetch_one(pool)
+    .await?;
+    let route: Json<Value> = sqlx::query_scalar(
+        "SELECT control_contract FROM live_canary.autonomous_route_controls
+         WHERE route_fingerprint = $1",
+    )
+    .bind(CURRENT_ROUTE_FINGERPRINT)
+    .fetch_one(pool)
+    .await?;
+    let route_loss = route
+        .0
+        .get("daily_loss_limit")
+        .and_then(Value::as_str)
+        .ok_or_else(|| failure("route loss budget is missing"))?
+        .parse::<u128>()?;
+    require(
+        global.0.parse::<u128>()? == GLOBAL_LOSS_LIMIT
+            && global.1.parse::<u128>()? > 0
+            && route_loss == ROUTE_LOSS_LIMIT,
+        "control budgets are zero or differ from the reviewed thresholds",
+    )
+}
+
+async fn load_request(pool: &PgPool, request_id: Uuid) -> TestResult<ExecutionRequest> {
+    let row = sqlx::query(
+        "SELECT id, opportunity_id, schema_version, chain_id, route_id,
+                route_fingerprint, selected_size::text AS selected_size,
+                token_path, origin_router, executor_address, executor_code_hash,
+                calldata_hash, simulation_result_hash, plan_hash,
+                pinned_block_number::text AS pinned_block_number,
+                pinned_block_hash, flash_asset, flash_amount::text AS flash_amount,
+                maximum_input_amount::text AS maximum_input_amount,
+                minimum_profit::text AS minimum_profit,
+                expected_profit::text AS expected_profit, deadline, legs,
+                gas_limit, max_fee_per_gas::text AS max_fee_per_gas,
+                max_priority_fee_per_gas::text AS max_priority_fee_per_gas,
+                approved_by, approved_at, approval_deadline, policy_version,
+                approval_digest
+         FROM live_canary.execution_requests WHERE id = $1",
+    )
+    .bind(request_id)
+    .fetch_one(pool)
+    .await?;
+    let token_path: Json<Vec<String>> = row.try_get("token_path")?;
+    let legs: Json<Vec<ExecutionLeg>> = row.try_get("legs")?;
+    RawExecutionRequest {
+        id: row.try_get("id")?,
+        opportunity_id: row.try_get("opportunity_id")?,
+        schema_version: row.try_get("schema_version")?,
+        chain_id: row.try_get("chain_id")?,
+        route_id: row.try_get("route_id")?,
+        route_fingerprint: row.try_get("route_fingerprint")?,
+        selected_size: row.try_get("selected_size")?,
+        token_path: token_path.0,
+        origin_router: row.try_get("origin_router")?,
+        executor_address: row.try_get("executor_address")?,
+        executor_code_hash: row.try_get("executor_code_hash")?,
+        calldata_hash: row.try_get("calldata_hash")?,
+        simulation_result_hash: row.try_get("simulation_result_hash")?,
+        plan_hash: row.try_get("plan_hash")?,
+        pinned_block_number: row.try_get::<String, _>("pinned_block_number")?.parse()?,
+        pinned_block_hash: row.try_get("pinned_block_hash")?,
+        flash_asset: row.try_get("flash_asset")?,
+        flash_amount: row.try_get("flash_amount")?,
+        maximum_input_amount: row.try_get("maximum_input_amount")?,
+        minimum_profit: row.try_get("minimum_profit")?,
+        expected_profit: row.try_get("expected_profit")?,
+        deadline: row.try_get("deadline")?,
+        legs: legs.0,
+        gas_limit: row.try_get("gas_limit")?,
+        max_fee_per_gas: row.try_get("max_fee_per_gas")?,
+        max_priority_fee_per_gas: row.try_get("max_priority_fee_per_gas")?,
+        approved_by: row.try_get("approved_by")?,
+        approved_at: row.try_get("approved_at")?,
+        approval_deadline: row.try_get("approval_deadline")?,
+        policy_version: row.try_get("policy_version")?,
+        approval_digest: row.try_get("approval_digest")?,
+    }
+    .validate()
+    .map_err(boxed)
+}
+
+fn assert_calldata_binding(bundle: &CandidateBundle, request: &ExecutionRequest) -> TestResult {
+    let rebuilt = encode_execute_opportunity(request, request.executor_address).map_err(boxed)?;
+    let rebuilt_hash = hex::encode(Sha256::digest(&rebuilt));
+    let candidate_hash = text(&bundle.artifact.contract, "calldata_hash")?;
+    require(
+        rebuilt == bundle.artifact.calldata
+            && rebuilt_hash == candidate_hash
+            && request.calldata_hash == candidate_hash,
+        "Hunter and materializer calldata differ",
+    )
+}
+
+async fn round_trip_nats_event(event: &HunterEvent, seed: u64) -> TestResult {
+    let nats = async_nats::connect(required("PHOENIX_TEST_NATS_URL")?).await?;
+    let subject = format!("phoenix.test.autonomous-live-e2e.{seed}");
+    let mut subscriber = nats.subscribe(subject.clone()).await?;
+    let event_value = json!({
+        "origin_event_id": event.origin_event_id,
+        "origin_router": event.origin_router,
+        "chain_id": event.chain_id,
+        "block_number": event.block_number,
+        "block_hash": event.block_hash,
+        "observed_at_unix_ms": event.observed_at_unix_ms,
+        "touched_pool_addresses": event.touched_pool_addresses,
+    });
+    nats.publish(subject, serde_json::to_vec(&event_value)?.into())
+        .await?;
+    nats.flush().await?;
+    let message = tokio::time::timeout(Duration::from_secs(2), subscriber.next())
+        .await?
+        .ok_or_else(|| failure("NATS event stream ended"))?;
+    let received: Value = serde_json::from_slice(&message.payload)?;
+    require(
+        received == event_value,
+        "NATS event changed during round trip",
+    )
+}
+
+fn isolated_signer() -> TestResult<TransactionSigner> {
+    let mut secret = required("PHOENIX_TEST_ISOLATED_FORK_SIGNER_KEY")?;
+    let signer = TransactionSigner::from_secret(&secret, ARBITRUM_ONE_CHAIN_ID).map_err(boxed);
+    secret.zeroize();
+    signer
 }
 
 fn profitable_economics() -> HunterEconomicConfig {
@@ -561,27 +1481,26 @@ fn profitable_economics() -> HunterEconomicConfig {
 fn state(
     block_number: u64,
     block_hash: &str,
-    pool_id: &str,
-    pool_address: &str,
-    fee: u32,
-    spacing: i32,
-    tick: i32,
+    seed: u64,
+    (pool_id, pool_address, fee, spacing, tick): (&str, &str, u32, i32, i32),
 ) -> PinnedV3PoolState {
     let mut value = PinnedV3PoolState {
         schema_version: PINNED_V3_STATE_SCHEMA.to_string(),
-        chain_id: 42_161,
+        chain_id: ARBITRUM_ONE_CHAIN_ID,
         block_number,
         block_hash: block_hash.to_string(),
         pool_id: pool_id.to_string(),
         pool_address: pool_address.to_string(),
-        pool_code_hash: "b".repeat(64),
+        pool_code_hash: format!("{seed:064x}"),
         factory_address: FACTORY.to_string(),
         protocol_id: "uniswap-v3".to_string(),
         token0: ARBITRUM_WETH_ADDRESS.to_string(),
         token1: ARBITRUM_NATIVE_USDC_ADDRESS.to_string(),
         fee,
         tick_spacing: spacing,
-        sqrt_price_x96: sqrt_ratio_at_tick(tick).expect("sqrt price").to_string(),
+        sqrt_price_x96: sqrt_ratio_at_tick(tick)
+            .expect("reviewed fixture tick")
+            .to_string(),
         tick,
         liquidity: "1000000000000000000000000000000".to_string(),
         coverage_min_tick: tick - spacing * 4,
@@ -590,14 +1509,19 @@ fn state(
         initialized_ticks: Vec::new(),
         state_hash: "0".repeat(64),
     };
-    value.state_hash = value.canonical_hash().expect("state hash");
+    value.state_hash = value.canonical_hash().expect("canonical state hash");
     value
 }
 
-fn states(block_number: u64, block_hash: &str) -> BTreeMap<String, ProviderStateAgreement> {
+fn states(
+    block_number: u64,
+    block_hash: &str,
+    seed: u64,
+) -> BTreeMap<String, ProviderStateAgreement> {
     let mut states = BTreeMap::new();
-    for (pool_id, address, fee, spacing, tick) in [
+    for (index, pool_id, address, fee, spacing, tick) in [
         (
+            1_u64,
             "uniswap-v3-weth-usdc-500",
             CURRENT_ROUTE_POOL_500_ADDRESS,
             500,
@@ -605,6 +1529,7 @@ fn states(block_number: u64, block_hash: &str) -> BTreeMap<String, ProviderState
             0,
         ),
         (
+            2_u64,
             "uniswap-v3-weth-usdc-3000",
             CURRENT_ROUTE_POOL_3000_ADDRESS,
             3000,
@@ -615,17 +1540,14 @@ fn states(block_number: u64, block_hash: &str) -> BTreeMap<String, ProviderState
         let state = state(
             block_number,
             block_hash,
-            pool_id,
-            address,
-            fee,
-            spacing,
-            tick,
+            seed + index,
+            (pool_id, address, fee, spacing, tick),
         );
         states.insert(
             address.to_string(),
             ProviderStateAgreement {
-                primary_provider_id: "e2e-primary".to_string(),
-                secondary_provider_id: "e2e-secondary".to_string(),
+                primary_provider_id: format!("e2e-primary-{seed}-{index}"),
+                secondary_provider_id: format!("e2e-secondary-{seed}-{index}"),
                 primary: state.clone(),
                 secondary: state,
             },
@@ -650,10 +1572,41 @@ fn state_contract(event: &HunterEvent, states: &BTreeMap<String, ProviderStateAg
     .expect("state contract")
 }
 
-fn text(value: &Value, field: &str) -> String {
-    value[field].as_str().expect("event field").to_string()
+fn at_whole_second(event: &HunterEvent) -> TestResult<DateTime<Utc>> {
+    let seconds = i64::try_from(event.observed_at_unix_ms / 1_000).map_err(boxed)?;
+    Utc.timestamp_opt(seconds, 0)
+        .single()
+        .ok_or_else(|| failure("event time is invalid"))
 }
 
-fn required(name: &str) -> String {
-    std::env::var(name).unwrap_or_else(|_| panic!("{name} is required"))
+fn timestamp(value: DateTime<Utc>) -> String {
+    value.to_rfc3339_opts(SecondsFormat::Secs, true)
+}
+
+fn text(value: &Value, field: &str) -> TestResult<String> {
+    value
+        .get(field)
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .ok_or_else(|| failure(format!("{field} is missing")))
+}
+
+fn required(name: &str) -> TestResult<String> {
+    std::env::var(name).map_err(|_| failure(format!("{name} is required")))
+}
+
+fn require(condition: bool, message: impl Into<String>) -> TestResult {
+    if condition {
+        Ok(())
+    } else {
+        Err(failure(message))
+    }
+}
+
+fn failure(message: impl Into<String>) -> Box<dyn Error + Send + Sync> {
+    Box::new(io::Error::other(message.into()))
+}
+
+fn boxed(error: impl Error + Send + Sync + 'static) -> Box<dyn Error + Send + Sync> {
+    Box::new(error)
 }

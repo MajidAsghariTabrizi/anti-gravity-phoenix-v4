@@ -2112,13 +2112,16 @@ dependencies = [
  "async-trait",
  "chrono",
  "futures-util",
+ "hex",
  "phoenix-engine",
  "phoenix-live-executor",
  "rpc-gateway",
  "serde_json",
+ "sha2",
  "sqlx",
  "tokio",
  "url",
+ "uuid",
  "zeroize",
 ]
 

@@ -1465,17 +1465,22 @@ fn materialize_candidate(
     bindings: &CandidateBindings,
     evaluation: RouteEvaluation,
 ) -> Result<MaterializedCandidate, HunterError> {
-    let expires_ms = event
-        .observed_at_unix_ms
-        .checked_add(route.policy.maximum_candidate_age_ms)
-        .ok_or(HunterError::Arithmetic)?;
+    let (deadline, expires) = canonical_candidate_deadline(
+        event.observed_at_unix_ms,
+        route.policy.maximum_candidate_age_ms,
+    )?;
     let created = canonical_timestamp(event.evaluated_at_unix_ms)?;
-    let expires = canonical_timestamp(expires_ms)?;
     let minimum_leg_outputs = evaluation
         .legs
         .iter()
         .map(|leg| parse_u128(&leg.minimum_output))
         .collect::<Result<Vec<_>, _>>()?;
+    // PhoenixExecutor observes token profit before transaction gas is paid. Its
+    // calldata floor therefore commits both the retained-profit requirement and
+    // the Hunter plan's executable gas reserve.
+    let calldata_minimum_profit = parse_u128(&route.policy.minimum_retained_profit)?
+        .checked_add(evaluation.gas_cost)
+        .ok_or(HunterError::Arithmetic)?;
     let calldata = encode_shadow_calldata(
         &route.route,
         &event.origin_router,
@@ -1484,10 +1489,8 @@ fn materialize_candidate(
         route
             .universe_maximum_input
             .min(parse_u128(&route.policy.maximum_input_amount)?),
-        parse_u128(&route.policy.minimum_retained_profit)?
-            .checked_add(evaluation.gas_cost)
-            .ok_or(HunterError::Arithmetic)?,
-        expires_ms.div_ceil(1_000),
+        calldata_minimum_profit,
+        deadline,
         &minimum_leg_outputs,
     )?;
     let calldata_hash = hex::encode(Sha256::digest(&calldata));
@@ -1893,6 +1896,20 @@ fn canonical_timestamp(unix_ms: u64) -> Result<String, HunterError> {
         .single()
         .map(|value| value.to_rfc3339_opts(SecondsFormat::Secs, true))
         .ok_or(HunterError::Arithmetic)
+}
+
+fn canonical_candidate_deadline(
+    observed_at_unix_ms: u64,
+    maximum_candidate_age_ms: u64,
+) -> Result<(u64, String), HunterError> {
+    let expires_ms = observed_at_unix_ms
+        .checked_add(maximum_candidate_age_ms)
+        .ok_or(HunterError::Arithmetic)?;
+    // Flooring is conservative: neither persisted eligibility nor calldata can
+    // extend the candidate beyond the reviewed millisecond TTL.
+    let deadline = expires_ms / 1_000;
+    let canonical_ms = deadline.checked_mul(1_000).ok_or(HunterError::Arithmetic)?;
+    Ok((deadline, canonical_timestamp(canonical_ms)?))
 }
 
 fn deterministic_uuid(domain: &str, seed: &str) -> String {
@@ -2301,5 +2318,21 @@ mod tests {
         let raw_submission = ["send", "_raw_transaction"].concat();
         assert!(!source.contains(&private_signer));
         assert!(!source.contains(&raw_submission));
+    }
+
+    #[test]
+    fn candidate_deadline_is_one_conservative_whole_second_contract() {
+        let whole_second = 1_784_878_802_000;
+        let subsecond = whole_second + 917;
+
+        let (whole_deadline, whole_expiry) =
+            canonical_candidate_deadline(whole_second, 3_000).unwrap();
+        let (subsecond_deadline, subsecond_expiry) =
+            canonical_candidate_deadline(subsecond, 3_000).unwrap();
+
+        assert_eq!(whole_deadline, 1_784_878_805);
+        assert_eq!(whole_expiry, "2026-07-24T07:40:05Z");
+        assert_eq!(subsecond_deadline, whole_deadline);
+        assert_eq!(subsecond_expiry, whole_expiry);
     }
 }
