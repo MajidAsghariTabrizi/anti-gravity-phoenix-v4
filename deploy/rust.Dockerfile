@@ -20,34 +20,57 @@ COPY deploy/nats-server.conf ./deploy/nats-server.conf
 COPY scripts/recorder-live-smoke.sh ./scripts/recorder-live-smoke.sh
 COPY scripts/sql/prelive-money-path-report.sql ./scripts/sql/prelive-money-path-report.sql
 RUN cd "${CRATE}" && cargo test --all
-RUN case "${CRATE}" in \
+RUN set -eux; \
+    case "${CRATE}" in \
       phoenix-engine) BIN=phoenix-engine ;; \
       rpc-gateway) BIN=rpc-gateway ;; \
       recorder) BIN=phoenix-recorder ;; \
       replay) BIN=phoenix-replay ;; \
       live-executor) BIN=live-executor ;; \
       *) echo "unknown crate ${CRATE}" && exit 1 ;; \
-    esac && \
-    cd "${CRATE}" && cargo build --release --bin "${BIN}" && \
-    mkdir -p /out && cp "target/release/${BIN}" /out/service && \
+    esac; \
+    cd "${CRATE}"; \
+    cargo build --release --bin "${BIN}"; \
+    mkdir -p /out; \
+    cp "target/release/${BIN}" /out/service; \
     if [ "${CRATE}" = "phoenix-engine" ]; then \
-      cargo build --release --bin shadow-positive-route-evidence && \
+      cargo build --release --bin shadow-positive-route-evidence; \
       cp target/release/shadow-positive-route-evidence /out/shadow-positive-route-evidence; \
-    fi && \
+    fi; \
     if [ "${CRATE}" = "recorder" ]; then \
-      cargo build --release --bin shadow-dispatcher && \
+      cargo build --release --bin shadow-dispatcher; \
       cp target/release/shadow-dispatcher /out/shadow-dispatcher; \
-    fi && \
+    fi; \
     if [ "${CRATE}" = "live-executor" ]; then \
-      cargo build --release --bin approve-execution-request && \
-      cp target/release/approve-execution-request /out/approve-execution-request && \
-      cargo build --release --bin autonomous-live-control && \
+      cargo build --release --bin approve-execution-request; \
+      cp target/release/approve-execution-request /out/approve-execution-request; \
+      cargo build --release --bin autonomous-live-control; \
       cp target/release/autonomous-live-control /out/autonomous-live-control; \
+    fi; \
+    test -x /out/service; \
+    if [ "${CRATE}" = "live-executor" ]; then \
+      test -x /out/approve-execution-request; \
+      test -x /out/autonomous-live-control; \
     fi
 
 FROM debian:bookworm-slim
+ARG CRATE
 WORKDIR /app
-RUN apt-get update && apt-get install -y --no-install-recommends wget ca-certificates && rm -rf /var/lib/apt/lists/*
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends wget ca-certificates libgcc-s1 \
+    && rm -rf /var/lib/apt/lists/*
 COPY --from=build /out/ /usr/local/bin/
+RUN set -eux; \
+    test -x /usr/local/bin/service; \
+    if [ "${CRATE}" = "live-executor" ]; then \
+      test -x /usr/local/bin/approve-execution-request; \
+      test -x /usr/local/bin/autonomous-live-control; \
+      set +e; \
+      probe_output="$(/usr/local/bin/autonomous-live-control __image_runtime_probe__ 2>&1)"; \
+      probe_status=$?; \
+      set -e; \
+      [ "$probe_status" -lt 125 ]; \
+      printf '%s\n' "$probe_output" | grep -F 'AUTONOMOUS_CONTROL_FAILED:' >/dev/null; \
+    fi
 USER 65532:65532
 ENTRYPOINT ["/usr/local/bin/service"]

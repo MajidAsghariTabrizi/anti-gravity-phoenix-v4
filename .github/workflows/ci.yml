@@ -56,10 +56,12 @@ jobs:
             scripts/deploy-release.sh \
             scripts/install-autonomous-live-deploy-gateway.sh \
             scripts/install-production-release-context.sh \
+            scripts/autonomous-live-release-contract-tests.sh \
             scripts/live-executor-isolated-fork-tests.sh \
             scripts/phoenix-autonomous-live-deploy-gateway.sh \
             scripts/production-healthcheck.sh \
             scripts/render-production-compose.sh \
+            scripts/verify-image-runtime.sh \
             scripts/rollback-release.sh \
             scripts/validate-production-env.sh \
             scripts/validate-production-release-context.sh
@@ -107,6 +109,7 @@ jobs:
           python3 -m py_compile scripts/prelive_shadow_contract_transition.py
           python3 -m unittest scripts.tests.test_prelive_shadow_contract_transition
           sh ./scripts/production-bootstrap-safety-tests.sh
+          sh ./scripts/autonomous-live-release-contract-tests.sh
           python3 -m unittest scripts.tests.test_live_executor_safety -v
 
       - name: Validate tracked hygiene
@@ -654,6 +657,10 @@ jobs:
               command+=(--build-arg "$build_arg")
             done < <(jq -r '.build_args | select(length > 0) | split("\n")[]' <<<"$component")
             "${command[@]}" "$context"
+            if [ "$image" = live-executor ]; then
+              sh scripts/verify-image-runtime.sh \
+                "$image" "phoenix/$image:ci" ""
+            fi
           done < <(python3 scripts/release_components.py build-matrix | jq -c '.include[]')
 
   integration-fixtures:
