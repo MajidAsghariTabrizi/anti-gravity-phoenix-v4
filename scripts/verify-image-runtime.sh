@@ -52,21 +52,33 @@ docker run --rm --entrypoint /bin/sh "$image_reference" -c '
   test -x /usr/local/bin/autonomous-live-control
 ' >/dev/null || fail required_binary_missing
 
+probe_stderr=$(mktemp)
+trap 'rm -f "$probe_stderr"' 0 1 2 15
+
 set +e
 probe_output=$(
   docker run --rm \
     --entrypoint /usr/local/bin/autonomous-live-control \
     "$image_reference" \
-    __image_runtime_contract_probe__ 2>&1
+    __image_runtime_probe__ 2>"$probe_stderr"
 )
 probe_status=$?
 set -e
 
-[ "$probe_status" -lt 125 ] ||
-  fail autonomous_control_not_executable
+[ "$probe_status" -eq 0 ] ||
+  fail autonomous_control_probe_failed
 
-printf '%s\n' "$probe_output" |
-  grep -F 'AUTONOMOUS_CONTROL_FAILED:' >/dev/null ||
-  fail autonomous_control_did_not_start
+[ ! -s "$probe_stderr" ] ||
+  fail autonomous_control_probe_stderr
+
+[ "$probe_output" = AUTONOMOUS_CONTROL_RUNTIME_OK ] ||
+  fail autonomous_control_probe_stdout
+
+case "$probe_output" in
+  *AUTONOMOUS_CONTROL_FAILED:*) fail autonomous_control_reported_failure ;;
+esac
+
+rm -f "$probe_stderr"
+trap - 0 1 2 15
 
 echo "IMAGE_RUNTIME_CONTRACT_OK: image=$image_name reference=$image_reference"

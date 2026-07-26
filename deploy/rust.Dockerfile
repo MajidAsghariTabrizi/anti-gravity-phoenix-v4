@@ -65,12 +65,12 @@ RUN set -eux; \
     if [ "${CRATE}" = "live-executor" ]; then \
       test -x /usr/local/bin/approve-execution-request; \
       test -x /usr/local/bin/autonomous-live-control; \
-      set +e; \
-      probe_output="$(/usr/local/bin/autonomous-live-control __image_runtime_probe__ 2>&1)"; \
-      probe_status=$?; \
-      set -e; \
-      [ "$probe_status" -lt 125 ]; \
-      printf '%s\n' "$probe_output" | grep -F 'AUTONOMOUS_CONTROL_FAILED:' >/dev/null; \
+      probe_stderr="$(mktemp)"; \
+      probe_output="$(/usr/local/bin/autonomous-live-control __image_runtime_probe__ 2>"$probe_stderr")"; \
+      [ ! -s "$probe_stderr" ]; \
+      [ "$probe_output" = "AUTONOMOUS_CONTROL_RUNTIME_OK" ]; \
+      case "$probe_output" in *AUTONOMOUS_CONTROL_FAILED:*) exit 1 ;; esac; \
+      rm -f "$probe_stderr"; \
     fi
 USER 65532:65532
 ENTRYPOINT ["/usr/local/bin/service"]
