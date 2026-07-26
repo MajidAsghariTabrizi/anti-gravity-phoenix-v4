@@ -1,9 +1,12 @@
 use chrono::{SecondsFormat, Utc};
-use ethabi::{ParamType, Token};
 use phoenix_live_executor::control_environment::{
     control_address_environment_with, required_environment_with, MissingEnvironment,
 };
 use phoenix_live_executor::model::{CanonicalAddress, ExecutionRequest, ValidatedLeg};
+use phoenix_live_executor::owner_bootstrap::{
+    configured_preflight_from_environment, execute_from_environment, owner_plan_from_environment,
+    OwnerBootstrapError, OwnerMutation,
+};
 use phoenix_live_executor::rpc::{ExecutionRpc, HttpExecutionRpc};
 use phoenix_live_executor::{
     APPROVAL_POLICY_VERSION, CURRENT_ROUTE_FINGERPRINT, REQUEST_SCHEMA_VERSION,
@@ -49,6 +52,7 @@ const IMAGE_RUNTIME_OK: &str = "AUTONOMOUS_CONTROL_RUNTIME_OK";
 enum ControlError {
     Message(&'static str),
     MissingEnvironment(MissingEnvironment),
+    OwnerBootstrap(OwnerBootstrapError),
 }
 
 impl Display for ControlError {
@@ -56,6 +60,7 @@ impl Display for ControlError {
         match self {
             Self::Message(message) => formatter.write_str(message),
             Self::MissingEnvironment(error) => Display::fmt(error, formatter),
+            Self::OwnerBootstrap(error) => Display::fmt(error, formatter),
         }
     }
 }
@@ -71,6 +76,12 @@ impl From<&'static str> for ControlError {
 impl From<MissingEnvironment> for ControlError {
     fn from(error: MissingEnvironment) -> Self {
         Self::MissingEnvironment(error)
+    }
+}
+
+impl From<OwnerBootstrapError> for ControlError {
+    fn from(error: OwnerBootstrapError) -> Self {
+        Self::OwnerBootstrap(error)
     }
 }
 
@@ -91,6 +102,10 @@ async fn run() -> ControlResult<()> {
         IMAGE_RUNTIME_PROBE_COMMAND => println!("{IMAGE_RUNTIME_OK}"),
         "preflight" => preflight().await?,
         "owner-plan" => owner_plan().await?,
+        "owner-configure" => owner_mutation(OwnerMutation::Configure).await?,
+        "owner-configured-preflight" => owner_configured_preflight().await?,
+        "owner-unpause" => owner_mutation(OwnerMutation::Unpause).await?,
+        "owner-pause" => owner_mutation(OwnerMutation::Pause).await?,
         "migrate" => migrate(&database_pool().await?).await?,
         "activate" => activate(&database_pool().await?).await?,
         "disarm" => disarm(&database_pool().await?).await?,
@@ -266,237 +281,7 @@ async fn preflight() -> ControlResult<()> {
 }
 
 async fn owner_plan() -> ControlResult<()> {
-    let addresses = control_address_environment_with(|name| env::var(name).ok())?;
-    let wallet = CanonicalAddress::parse(&addresses.wallet_address)
-        .map_err(|_| "wallet address is invalid")?;
-    let executor = CanonicalAddress::parse(&addresses.executor_address)
-        .map_err(|_| "executor address is invalid")?;
-    let primary_url =
-        Url::parse(&required("PRODUCTION_RPC_URL")?).map_err(|_| "primary RPC URL is invalid")?;
-    let allowlist = required("LIVE_EXECUTOR_RPC_ALLOWLIST")?
-        .split(',')
-        .map(|value| Url::parse(value).map_err(|_| "RPC allowlist is invalid"))
-        .collect::<Result<Vec<_>, _>>()?;
-    let primary = HttpExecutionRpc::new_production(primary_url, &allowlist)
-        .map_err(|_| "primary RPC is not allowlisted")?;
-    if primary
-        .chain_id()
-        .await
-        .map_err(|_| "primary chain identity is unavailable")?
-        != 42_161
-    {
-        return Err("RPC chain identity mismatch".into());
-    }
-    let expected_owner = CanonicalAddress::parse(&required("LIVE_EXECUTOR_EXPECTED_OWNER")?)
-        .map_err(|_| "expected owner is invalid")?;
-    let expected_flash_provider =
-        CanonicalAddress::parse(&required("LIVE_EXECUTOR_EXPECTED_FLASH_PROVIDER")?)
-            .map_err(|_| "expected flash provider is invalid")?;
-    let expected_code_hash = required("LIVE_EXECUTOR_EXECUTOR_CODE_HASH")?;
-    let maximum_input = required_u128("LIVE_EXECUTOR_MAX_INPUT_AMOUNT")?;
-    let policy: Value = serde_json::from_str(POLICY).map_err(|_| "route policy is invalid")?;
-    verify_hash(
-        &policy,
-        "policy_hash",
-        "route-policy",
-        "phoenix.route-policy.v1",
-    )?;
-    let token_path = policy
-        .get("token_path")
-        .and_then(Value::as_array)
-        .ok_or("route token path is invalid")?
-        .iter()
-        .map(|value| {
-            CanonicalAddress::parse(value.as_str().ok_or("route token path is invalid")?)
-                .map_err(|_| "route token path is invalid")
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    let pools = policy
-        .get("pool_addresses")
-        .and_then(Value::as_array)
-        .ok_or("route pools are invalid")?;
-    let factories = policy
-        .get("factory_addresses")
-        .and_then(Value::as_array)
-        .ok_or("route factories are invalid")?;
-    let fees = policy
-        .get("fees")
-        .and_then(Value::as_array)
-        .ok_or("route fees are invalid")?;
-    if pools.len() + 1 != token_path.len()
-        || factories.len() != pools.len()
-        || fees.len() != pools.len()
-    {
-        return Err("route path is inconsistent".into());
-    }
-    let legs = (0..pools.len())
-        .map(|index| {
-            Ok(ValidatedLeg {
-                pool: CanonicalAddress::parse(
-                    pools[index].as_str().ok_or("route pool is invalid")?,
-                )
-                .map_err(|_| "route pool is invalid")?,
-                factory: Some(
-                    CanonicalAddress::parse(
-                        factories[index]
-                            .as_str()
-                            .ok_or("route factory is invalid")?,
-                    )
-                    .map_err(|_| "route factory is invalid")?,
-                ),
-                token_in: token_path[index],
-                token_out: token_path[index + 1],
-                fee: fees[index]
-                    .as_u64()
-                    .and_then(|value| value.try_into().ok())
-                    .ok_or("route fee is invalid")?,
-                zero_for_one: token_path[index].as_bytes() < token_path[index + 1].as_bytes(),
-                min_amount_out: 1,
-            })
-        })
-        .collect::<Result<Vec<_>, &'static str>>()?;
-    let routers = required("ENGINE_ROUTER_ADDRESSES")?
-        .split(',')
-        .map(|value| {
-            CanonicalAddress::parse(value.trim()).map_err(|_| "reviewed router is invalid")
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    if routers.is_empty() || routers.len() > 3 {
-        return Err("reviewed router set is invalid".into());
-    }
-
-    let mut snapshots = Vec::with_capacity(routers.len());
-    for router in &routers {
-        let snapshot = primary
-            .executor_configuration_snapshot(executor, wallet, token_path[0], *router, &legs)
-            .await
-            .map_err(|_| "executor configuration state is unavailable")?;
-        if snapshot.runtime_code_hash != expected_code_hash
-            || snapshot.owner != Some(expected_owner)
-            || snapshot.flash_provider != Some(expected_flash_provider)
-        {
-            return Err("executor immutable identity or ownership state mismatch".into());
-        }
-        snapshots.push(snapshot);
-    }
-    let first = snapshots.first().ok_or("reviewed router set is invalid")?;
-    let mut transactions = Vec::new();
-    if !first.searcher_authorized {
-        transactions.push(owner_transaction(
-            executor,
-            "authorize autonomous searcher",
-            "setSearcher",
-            &[ParamType::Address, ParamType::Bool],
-            &[address_token(wallet), Token::Bool(true)],
-        ));
-    }
-    if !first.asset_approved {
-        transactions.push(owner_transaction(
-            executor,
-            "approve settlement asset",
-            "setAsset",
-            &[ParamType::Address, ParamType::Bool],
-            &[address_token(token_path[0]), Token::Bool(true)],
-        ));
-    }
-    for (router, snapshot) in routers.iter().zip(&snapshots) {
-        if !snapshot.router_approved {
-            transactions.push(owner_transaction(
-                executor,
-                "approve reviewed router",
-                "setRouter",
-                &[ParamType::Address, ParamType::Bool],
-                &[address_token(*router), Token::Bool(true)],
-            ));
-        }
-    }
-    for (index, leg) in legs.iter().enumerate() {
-        if !first.factories_approved[index] {
-            let factory = leg.factory.ok_or("route factory is invalid")?;
-            if !legs[..index]
-                .iter()
-                .any(|prior| prior.factory == Some(factory))
-            {
-                transactions.push(owner_transaction(
-                    executor,
-                    "approve reviewed factory",
-                    "setFactory",
-                    &[ParamType::Address, ParamType::Bool],
-                    &[address_token(factory), Token::Bool(true)],
-                ));
-            }
-        }
-    }
-    for (index, leg) in legs.iter().enumerate() {
-        if !first.pools_approved[index] {
-            let factory = leg.factory.ok_or("route factory is invalid")?;
-            let (token0, token1) = ordered_pair(leg.token_in, leg.token_out);
-            transactions.push(owner_transaction(
-                executor,
-                "approve reviewed pool",
-                "approvePool",
-                &[
-                    ParamType::Address,
-                    ParamType::Address,
-                    ParamType::Address,
-                    ParamType::Address,
-                    ParamType::Uint(24),
-                    ParamType::Bool,
-                ],
-                &[
-                    address_token(leg.pool),
-                    address_token(factory),
-                    address_token(token0),
-                    address_token(token1),
-                    Token::Uint(leg.fee.into()),
-                    Token::Bool(true),
-                ],
-            ));
-        }
-    }
-    if first.maximum_input_amount != maximum_input {
-        transactions.push(owner_transaction(
-            executor,
-            "set conservative maximum input",
-            "setMaximumInputAmount",
-            &[ParamType::Uint(256)],
-            &[Token::Uint(maximum_input.into())],
-        ));
-    }
-    if first.paused {
-        transactions.push(owner_transaction(
-            executor,
-            "unpause executor after reviewed configuration",
-            "setPaused",
-            &[ParamType::Bool],
-            &[Token::Bool(false)],
-        ));
-    }
-    let status = if transactions.is_empty() {
-        "ready"
-    } else {
-        "EXTERNAL_OWNER_AUTHORIZATION_REQUIRED"
-    };
-    let payload = json!({
-        "schema": "phoenix.executor-owner-plan.v1",
-        "status": status,
-        "chain_id": 42161,
-        "target": executor.to_string(),
-        "value": "0",
-        "expected_post_state": {
-            "runtime_code_hash": expected_code_hash,
-            "owner": expected_owner.to_string(),
-            "flash_provider": expected_flash_provider.to_string(),
-            "paused": false,
-            "maximum_input_amount": maximum_input.to_string(),
-            "authorized_searcher": wallet.to_string(),
-            "approved_asset": token_path[0].to_string(),
-            "approved_routers": routers.iter().map(ToString::to_string).collect::<Vec<_>>(),
-            "route_policy_hash": value_text(&policy, "policy_hash")?
-        },
-        "transactions": transactions,
-        "verification_command": "autonomous-live-control preflight"
-    });
+    let payload = owner_plan_from_environment().await?;
     println!(
         "{}",
         serde_json::to_string_pretty(&payload).map_err(|_| "owner plan serialization failed")?
@@ -504,37 +289,33 @@ async fn owner_plan() -> ControlResult<()> {
     Ok(())
 }
 
-fn owner_transaction(
-    target: CanonicalAddress,
-    description: &'static str,
-    name: &str,
-    input_types: &[ParamType],
-    arguments: &[Token],
-) -> Value {
-    let mut data = ethabi::short_signature(name, input_types).to_vec();
-    data.extend(ethabi::encode(arguments));
-    json!({
-        "chain_id": 42161,
-        "target": target.to_string(),
-        "value": "0",
-        "data": format!("0x{}", hex::encode(data)),
-        "description": description
-    })
+async fn owner_configured_preflight() -> ControlResult<()> {
+    let evidence = configured_preflight_from_environment().await?;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&evidence)
+            .map_err(|_| "owner preflight evidence serialization failed")?
+    );
+    println!("EXECUTOR_OWNER_CONFIGURED_PREFLIGHT_OK");
+    Ok(())
 }
 
-fn address_token(address: CanonicalAddress) -> Token {
-    Token::Address(primitive_types::H160::from_slice(address.as_bytes()))
-}
-
-fn ordered_pair(
-    left: CanonicalAddress,
-    right: CanonicalAddress,
-) -> (CanonicalAddress, CanonicalAddress) {
-    if left.as_bytes() < right.as_bytes() {
-        (left, right)
-    } else {
-        (right, left)
+async fn owner_mutation(mutation: OwnerMutation) -> ControlResult<()> {
+    let evidence = execute_from_environment(mutation).await?;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&evidence)
+            .map_err(|_| "owner mutation evidence serialization failed")?
+    );
+    let marker = evidence
+        .get("status")
+        .and_then(Value::as_str)
+        .ok_or("owner mutation evidence is invalid")?;
+    if mutation == OwnerMutation::Unpause {
+        preflight().await?;
     }
+    println!("{marker}");
+    Ok(())
 }
 
 fn preflight_request(
