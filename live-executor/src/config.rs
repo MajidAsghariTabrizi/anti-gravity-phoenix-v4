@@ -1,3 +1,4 @@
+use crate::control_environment::{EXECUTOR_ADDRESS_ENV, WALLET_ADDRESS_ENV};
 use crate::model::{canonical_digest, CanonicalAddress};
 use crate::signer::{SignerError, TransactionSigner};
 use crate::{ARBITRUM_ONE_CHAIN_ID, ARBITRUM_WETH_ADDRESS};
@@ -20,8 +21,8 @@ const ENVIRONMENT_NAMES: &[&str] = &[
     "LIVE_EXECUTOR_ARMED",
     "LIVE_EXECUTOR_KILL_SWITCH",
     "CHAIN_ID",
-    "WALLET_ADDRESS",
-    "EXECUTOR_ADDRESS",
+    WALLET_ADDRESS_ENV,
+    EXECUTOR_ADDRESS_ENV,
     "LIVE_EXECUTOR_EXECUTOR_CODE_HASH",
     "LIVE_EXECUTOR_PNL_ASSET_ADDRESS",
     "SIGNER_PRIVATE_KEY",
@@ -133,9 +134,9 @@ impl Bootstrap {
         if chain_id != ARBITRUM_ONE_CHAIN_ID {
             return Err(ConfigError::InvalidChain);
         }
-        let wallet_address = CanonicalAddress::parse(required(&values, "WALLET_ADDRESS")?)
+        let wallet_address = CanonicalAddress::parse(required(&values, WALLET_ADDRESS_ENV)?)
             .map_err(|_| ConfigError::InvalidAddress)?;
-        let executor_address = CanonicalAddress::parse(required(&values, "EXECUTOR_ADDRESS")?)
+        let executor_address = CanonicalAddress::parse(required(&values, EXECUTOR_ADDRESS_ENV)?)
             .map_err(|_| ConfigError::InvalidAddress)?;
         let executor_code_hash = required(&values, "LIVE_EXECUTOR_EXECUTOR_CODE_HASH")?.to_string();
         if !canonical_digest(&executor_code_hash) {

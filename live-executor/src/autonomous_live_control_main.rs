@@ -1,5 +1,8 @@
 use chrono::{SecondsFormat, Utc};
 use ethabi::{ParamType, Token};
+use phoenix_live_executor::control_environment::{
+    control_address_environment_with, required_environment_with, MissingEnvironment,
+};
 use phoenix_live_executor::model::{CanonicalAddress, ExecutionRequest, ValidatedLeg};
 use phoenix_live_executor::rpc::{ExecutionRpc, HttpExecutionRpc};
 use phoenix_live_executor::{
@@ -12,6 +15,7 @@ use sqlx::{PgPool, Row};
 use std::collections::BTreeMap;
 use std::env;
 use std::error::Error;
+use std::fmt::{Display, Formatter};
 use std::io;
 use std::time::Duration;
 use url::Url;
@@ -38,6 +42,39 @@ const MIGRATIONS: [(&str, &str); 4] = [
 ];
 const ACTIVATE_ACK: &str = "ACTIVATE_AUTONOMOUS_LIVE_42161";
 const DISARM_ACK: &str = "DISARM_AUTONOMOUS_LIVE_42161";
+const IMAGE_RUNTIME_PROBE_COMMAND: &str = "__image_runtime_probe__";
+const IMAGE_RUNTIME_OK: &str = "AUTONOMOUS_CONTROL_RUNTIME_OK";
+
+#[derive(Debug)]
+enum ControlError {
+    Message(&'static str),
+    MissingEnvironment(MissingEnvironment),
+}
+
+impl Display for ControlError {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Message(message) => formatter.write_str(message),
+            Self::MissingEnvironment(error) => Display::fmt(error, formatter),
+        }
+    }
+}
+
+impl Error for ControlError {}
+
+impl From<&'static str> for ControlError {
+    fn from(message: &'static str) -> Self {
+        Self::Message(message)
+    }
+}
+
+impl From<MissingEnvironment> for ControlError {
+    fn from(error: MissingEnvironment) -> Self {
+        Self::MissingEnvironment(error)
+    }
+}
+
+type ControlResult<T> = Result<T, ControlError>;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
@@ -48,35 +85,44 @@ async fn main() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-async fn run() -> Result<(), &'static str> {
+async fn run() -> ControlResult<()> {
     let command = env::args().nth(1).ok_or("command is required")?;
-    let dsn = required("POSTGRES_DSN")?;
-    let pool = PgPoolOptions::new()
-        .max_connections(1)
-        .acquire_timeout(Duration::from_secs(5))
-        .connect(&dsn)
-        .await
-        .map_err(|_| "database connection failed")?;
     match command.as_str() {
-        "migrate" => migrate(&pool).await?,
-        "activate" => activate(&pool).await?,
-        "disarm" => disarm(&pool).await?,
-        "status" => status(&pool).await?,
-        "reconciliation-status" => reconciliation_status(&pool).await?,
+        IMAGE_RUNTIME_PROBE_COMMAND => println!("{IMAGE_RUNTIME_OK}"),
         "preflight" => preflight().await?,
         "owner-plan" => owner_plan().await?,
-        _ => return Err("unsupported command"),
+        "migrate" => migrate(&database_pool().await?).await?,
+        "activate" => activate(&database_pool().await?).await?,
+        "disarm" => disarm(&database_pool().await?).await?,
+        "status" => status(&database_pool().await?).await?,
+        "reconciliation-status" => reconciliation_status(&database_pool().await?).await?,
+        _ => return Err("unsupported command".into()),
     }
     Ok(())
 }
 
-async fn preflight() -> Result<(), &'static str> {
+async fn database_pool() -> ControlResult<PgPool> {
+    let dsn = required("POSTGRES_DSN")?;
+    PgPoolOptions::new()
+        .max_connections(1)
+        .acquire_timeout(Duration::from_secs(5))
+        .connect(&dsn)
+        .await
+        .map_err(|_| "database connection failed".into())
+}
+
+async fn preflight() -> ControlResult<()> {
+    let addresses = control_address_environment_with(|name| env::var(name).ok())?;
+    let wallet = CanonicalAddress::parse(&addresses.wallet_address)
+        .map_err(|_| "wallet address is invalid")?;
+    let executor = CanonicalAddress::parse(&addresses.executor_address)
+        .map_err(|_| "executor address is invalid")?;
     let primary_url =
         Url::parse(&required("PRODUCTION_RPC_URL")?).map_err(|_| "primary RPC URL is invalid")?;
     let secondary_url =
         Url::parse(&required("SECONDARY_RPC_URL")?).map_err(|_| "secondary RPC URL is invalid")?;
     if primary_url == secondary_url {
-        return Err("primary and secondary RPC providers are not independent");
+        return Err("primary and secondary RPC providers are not independent".into());
     }
     let allowlist = required("LIVE_EXECUTOR_RPC_ALLOWLIST")?
         .split(',')
@@ -97,12 +143,8 @@ async fn preflight() -> Result<(), &'static str> {
             .map_err(|_| "secondary chain identity is unavailable")?
             != 42_161
     {
-        return Err("RPC chain identity mismatch");
+        return Err("RPC chain identity mismatch".into());
     }
-    let wallet = CanonicalAddress::parse(&required("LIVE_EXECUTOR_WALLET_ADDRESS")?)
-        .map_err(|_| "wallet address is invalid")?;
-    let executor = CanonicalAddress::parse(&required("LIVE_EXECUTOR_EXECUTOR_ADDRESS")?)
-        .map_err(|_| "executor address is invalid")?;
     let expected_owner = CanonicalAddress::parse(&required("LIVE_EXECUTOR_EXPECTED_OWNER")?)
         .map_err(|_| "expected owner is invalid")?;
     let expected_flash_provider =
@@ -116,14 +158,14 @@ async fn preflight() -> Result<(), &'static str> {
         .map_err(|_| "wallet balance is unavailable")?
         == 0
     {
-        return Err("wallet has no native gas balance");
+        return Err("wallet has no native gas balance".into());
     }
     let (owner, flash_provider) = primary
         .executor_owner_and_flash_provider(executor)
         .await
         .map_err(|_| "executor ownership state is unavailable")?;
     if owner != expected_owner || flash_provider != expected_flash_provider {
-        return Err("executor owner or flash provider mismatch");
+        return Err("executor owner or flash provider mismatch".into());
     }
 
     let policy: Value = serde_json::from_str(POLICY).map_err(|_| "route policy is invalid")?;
@@ -164,7 +206,7 @@ async fn preflight() -> Result<(), &'static str> {
         || fees.len() != pools.len()
         || directions.len() != pools.len()
     {
-        return Err("route path is inconsistent");
+        return Err("route path is inconsistent".into());
     }
     let legs = (0..pools.len())
         .map(|index| {
@@ -199,7 +241,7 @@ async fn preflight() -> Result<(), &'static str> {
         })
         .collect::<Result<Vec<_>, _>>()?;
     if routers.is_empty() || routers.len() > 3 {
-        return Err("reviewed router set is invalid");
+        return Err("reviewed router set is invalid".into());
     }
     for router in routers {
         let request = preflight_request(
@@ -214,7 +256,7 @@ async fn preflight() -> Result<(), &'static str> {
             .await
             .map_err(|_| "executor configuration state is unavailable")?
         {
-            return Err("executor configuration is not LIVE-ready");
+            return Err("executor configuration is not LIVE-ready".into());
         }
     }
     println!(
@@ -223,7 +265,12 @@ async fn preflight() -> Result<(), &'static str> {
     Ok(())
 }
 
-async fn owner_plan() -> Result<(), &'static str> {
+async fn owner_plan() -> ControlResult<()> {
+    let addresses = control_address_environment_with(|name| env::var(name).ok())?;
+    let wallet = CanonicalAddress::parse(&addresses.wallet_address)
+        .map_err(|_| "wallet address is invalid")?;
+    let executor = CanonicalAddress::parse(&addresses.executor_address)
+        .map_err(|_| "executor address is invalid")?;
     let primary_url =
         Url::parse(&required("PRODUCTION_RPC_URL")?).map_err(|_| "primary RPC URL is invalid")?;
     let allowlist = required("LIVE_EXECUTOR_RPC_ALLOWLIST")?
@@ -238,12 +285,8 @@ async fn owner_plan() -> Result<(), &'static str> {
         .map_err(|_| "primary chain identity is unavailable")?
         != 42_161
     {
-        return Err("RPC chain identity mismatch");
+        return Err("RPC chain identity mismatch".into());
     }
-    let wallet = CanonicalAddress::parse(&required("LIVE_EXECUTOR_WALLET_ADDRESS")?)
-        .map_err(|_| "wallet address is invalid")?;
-    let executor = CanonicalAddress::parse(&required("LIVE_EXECUTOR_EXECUTOR_ADDRESS")?)
-        .map_err(|_| "executor address is invalid")?;
     let expected_owner = CanonicalAddress::parse(&required("LIVE_EXECUTOR_EXPECTED_OWNER")?)
         .map_err(|_| "expected owner is invalid")?;
     let expected_flash_provider =
@@ -284,7 +327,7 @@ async fn owner_plan() -> Result<(), &'static str> {
         || factories.len() != pools.len()
         || fees.len() != pools.len()
     {
-        return Err("route path is inconsistent");
+        return Err("route path is inconsistent".into());
     }
     let legs = (0..pools.len())
         .map(|index| {
@@ -319,7 +362,7 @@ async fn owner_plan() -> Result<(), &'static str> {
         })
         .collect::<Result<Vec<_>, _>>()?;
     if routers.is_empty() || routers.len() > 3 {
-        return Err("reviewed router set is invalid");
+        return Err("reviewed router set is invalid".into());
     }
 
     let mut snapshots = Vec::with_capacity(routers.len());
@@ -332,7 +375,7 @@ async fn owner_plan() -> Result<(), &'static str> {
             || snapshot.owner != Some(expected_owner)
             || snapshot.flash_provider != Some(expected_flash_provider)
         {
-            return Err("executor immutable identity or ownership state mismatch");
+            return Err("executor immutable identity or ownership state mismatch".into());
         }
         snapshots.push(snapshot);
     }
@@ -500,7 +543,7 @@ fn preflight_request(
     maximum_input: u128,
     token_path: Vec<CanonicalAddress>,
     legs: Vec<ValidatedLeg>,
-) -> Result<ExecutionRequest, &'static str> {
+) -> ControlResult<ExecutionRequest> {
     let flash_asset = *token_path.first().ok_or("route token path is empty")?;
     let now = Utc::now();
     Ok(ExecutionRequest {
@@ -570,9 +613,9 @@ async fn migrate(pool: &PgPool) -> Result<(), &'static str> {
     Ok(())
 }
 
-async fn activate(pool: &PgPool) -> Result<(), &'static str> {
+async fn activate(pool: &PgPool) -> ControlResult<()> {
     if required("PHOENIX_AUTONOMOUS_ACTIVATION_ACK")? != ACTIVATE_ACK {
-        return Err("activation acknowledgement is invalid");
+        return Err("activation acknowledgement is invalid".into());
     }
     require_schema(pool).await?;
     let policy: Value = serde_json::from_str(POLICY).map_err(|_| "route policy is invalid")?;
@@ -587,18 +630,18 @@ async fn activate(pool: &PgPool) -> Result<(), &'static str> {
         .and_then(Value::as_bool)
         != Some(true)
     {
-        return Err("route policy is not enabled for autonomous LIVE");
+        return Err("route policy is not enabled for autonomous LIVE".into());
     }
     let configured_maximum = required_u128("LIVE_EXECUTOR_MAX_INPUT_AMOUNT")?;
     let policy_minimum = value_u128(&policy, "minimum_input_amount")?;
     let policy_maximum = value_u128(&policy, "maximum_input_amount")?;
     let maximum_input = configured_maximum.min(policy_maximum);
     if maximum_input < policy_minimum {
-        return Err("configured maximum input is economically inert");
+        return Err("configured maximum input is economically inert".into());
     }
     let daily_loss_limit = required_u128("LIVE_EXECUTOR_MAX_DAILY_LOSS_WEI")?;
     if daily_loss_limit == 0 {
-        return Err("global daily loss limit is economically inert");
+        return Err("global daily loss limit is economically inert".into());
     }
 
     let mut transaction = pool
@@ -616,7 +659,7 @@ async fn activate(pool: &PgPool) -> Result<(), &'static str> {
     .await
     .map_err(|_| "active-attempt inspection failed")?;
     if active_count != 0 {
-        return Err("activation is blocked by an active execution attempt");
+        return Err("activation is blocked by an active execution attempt".into());
     }
     let global_epoch: i64 = sqlx::query_scalar(
         "SELECT control_epoch + 1
@@ -759,9 +802,9 @@ async fn activate(pool: &PgPool) -> Result<(), &'static str> {
     Ok(())
 }
 
-async fn disarm(pool: &PgPool) -> Result<(), &'static str> {
+async fn disarm(pool: &PgPool) -> ControlResult<()> {
     if required("PHOENIX_AUTONOMOUS_DISARM_ACK")? != DISARM_ACK {
-        return Err("disarm acknowledgement is invalid");
+        return Err("disarm acknowledgement is invalid".into());
     }
     require_schema(pool).await?;
     let reason = env::var("PHOENIX_AUTONOMOUS_DISARM_REASON")
@@ -892,19 +935,18 @@ async fn require_schema(pool: &PgPool) -> Result<(), &'static str> {
     Ok(())
 }
 
-fn required(name: &str) -> Result<String, &'static str> {
-    env::var(name)
-        .ok()
-        .filter(|value| !value.is_empty())
-        .ok_or("required environment is missing")
+fn required(name: &'static str) -> ControlResult<String> {
+    required_environment_with(name, &mut |name| env::var(name).ok()).map_err(Into::into)
 }
 
-fn required_u128(name: &str) -> Result<u128, &'static str> {
+fn required_u128(name: &'static str) -> ControlResult<u128> {
     required(name)?
         .parse()
         .ok()
         .filter(|value| *value > 0)
-        .ok_or("required numeric environment is invalid")
+        .ok_or(ControlError::Message(
+            "required numeric environment is invalid",
+        ))
 }
 
 fn value_text<'a>(value: &'a Value, field: &str) -> Result<&'a str, &'static str> {
