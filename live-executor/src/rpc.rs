@@ -212,13 +212,7 @@ impl HttpExecutionRpc {
         let components = self
             .call(
                 "eth_call",
-                json!([
-                    {
-                        "to": ARBITRUM_NODE_INTERFACE,
-                        "data": encode_gas_estimate_components(to, calldata)
-                    },
-                    block_tag
-                ]),
+                gas_estimate_components_params(from, to, calldata, &block_tag),
             )
             .await?;
         let (component_gas, l1_gas_units) =
@@ -861,6 +855,22 @@ fn encode_gas_estimate_components(to: CanonicalAddress, calldata: &[u8]) -> Stri
     format!("0x{}", hex::encode(data))
 }
 
+fn gas_estimate_components_params(
+    from: CanonicalAddress,
+    to: CanonicalAddress,
+    calldata: &[u8],
+    block_tag: &str,
+) -> Value {
+    json!([
+        {
+            "from": from.to_string(),
+            "to": ARBITRUM_NODE_INTERFACE,
+            "data": encode_gas_estimate_components(to, calldata)
+        },
+        block_tag
+    ])
+}
+
 fn decode_gas_estimate_components(value: &str) -> Result<(u64, u64), RpcError> {
     use ethabi::ParamType;
 
@@ -927,5 +937,22 @@ mod tests {
         assert!(parse_hex_u64("0x00").is_err());
         assert!(parse_hex_u64("0x2A").is_err());
         assert!(parse_hex_u64("2a").is_err());
+    }
+
+    #[test]
+    fn node_interface_quote_preserves_sender_block_and_calldata() {
+        let from =
+            CanonicalAddress::parse("0x1111111111111111111111111111111111111111").expect("from");
+        let to = CanonicalAddress::parse("0x2222222222222222222222222222222222222222").expect("to");
+        let calldata = [0xde, 0xad, 0xbe, 0xef];
+        let block_tag = "0x1234";
+        let encoded = encode_gas_estimate_components(to, &calldata);
+
+        let params = gas_estimate_components_params(from, to, &calldata, block_tag);
+
+        assert_eq!(params[0]["from"], from.to_string());
+        assert_eq!(params[0]["to"], ARBITRUM_NODE_INTERFACE);
+        assert_eq!(params[0]["data"], encoded);
+        assert_eq!(params[1], block_tag);
     }
 }
