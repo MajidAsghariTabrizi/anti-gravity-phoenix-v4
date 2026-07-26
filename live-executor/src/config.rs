@@ -334,6 +334,14 @@ fn read_signer_file(path_value: &str) -> Result<Zeroizing<String>, ConfigError> 
     Ok(Zeroizing::new(trimmed.to_owned()))
 }
 
+pub(crate) fn transaction_signer_from_file(
+    path_value: &str,
+    chain_id: u64,
+) -> Result<TransactionSigner, ConfigError> {
+    let key_material = read_signer_file(path_value)?;
+    TransactionSigner::from_secret(&key_material, chain_id).map_err(ConfigError::Signer)
+}
+
 #[derive(Debug, Error)]
 pub enum ConfigError {
     #[error("live executor arming is incomplete")]

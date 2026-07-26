@@ -5,6 +5,7 @@ pub mod config;
 pub mod control_environment;
 pub mod engine;
 pub mod model;
+pub mod owner_bootstrap;
 pub mod rpc;
 pub mod signer;
 pub mod store;

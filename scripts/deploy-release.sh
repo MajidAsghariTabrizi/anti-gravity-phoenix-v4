@@ -17,6 +17,7 @@ current_state="$deploy_dir/current-release.json"
 current_context="$deploy_dir/current-release-context.json"
 previous_file="$deploy_dir/previous-release"
 runtime_dir="${PHOENIX_DEPLOY_RUNTIME_DIR:-$deploy_dir/.deploy-runtime}"
+owner_authorization=/etc/phoenix/authorizations/executor-owner-bootstrap.json
 rollback_script="${PHOENIX_ROLLBACK_SCRIPT:-$deploy_dir/rollback-release.sh}"
 release_assets_file="$deploy_dir/release-assets.sha"
 protected_services='nitro-feed-relay feed-ingestor nats postgres recorder'
@@ -49,8 +50,17 @@ command -v python3 >/dev/null 2>&1 || fail "python3 is unavailable"
 command -v cmp >/dev/null 2>&1 || fail "cmp is unavailable"
 [ -f "$rollback_script" ] && [ ! -L "$rollback_script" ] ||
   fail "rollback script is missing or unsafe"
-mkdir -p "$runtime_dir"
+if [ -e "$runtime_dir" ]; then
+  [ -d "$runtime_dir" ] && [ ! -L "$runtime_dir" ] ||
+    fail "deployment runtime directory is unsafe"
+else
+  mkdir -p "$runtime_dir"
+fi
 chmod 0700 "$runtime_dir"
+runtime_metadata=$(stat -c '%u:%g:%a' "$runtime_dir") ||
+  fail "deployment runtime metadata is unavailable"
+[ "$runtime_metadata" = 0:0:700 ] ||
+  fail "deployment runtime directory must be root-only"
 python3 "$deploy_dir/production_context.py" manifest-env \
   --manifest "$manifest" \
   --expected-sha "$release_sha" \
@@ -99,6 +109,11 @@ context_metadata="$state_dir/context.metadata.json"
 protected_before="$state_dir/protected.before.tsv"
 protected_after="$state_dir/protected.after.tsv"
 owner_plan="$runtime_dir/owner-plan-$release_sha.json"
+owner_configure_evidence="$runtime_dir/owner-configure-$release_sha.json"
+owner_configured_preflight_evidence="$runtime_dir/owner-configured-preflight-$release_sha.json"
+owner_unpause_evidence="$runtime_dir/owner-unpause-$release_sha.json"
+owner_pause_evidence="$runtime_dir/owner-pause-$release_sha.json"
+consumed_owner_authorization=
 
 compose() {
   PHOENIX_ENV_FILE="$env_file" PHOENIX_RELEASE_ENV="$release_env" \
@@ -150,20 +165,117 @@ install_active_file() {
   fi
 }
 
+validate_owner_authorization() {
+  [ -f "$owner_authorization" ] && [ ! -L "$owner_authorization" ] ||
+    fail "executor owner authorization is missing or unsafe"
+  authorization_size=$(stat -c '%s' "$owner_authorization") ||
+    fail "executor owner authorization size is unavailable"
+  [ "$authorization_size" -gt 0 ] && [ "$authorization_size" -le 2048 ] ||
+    fail "executor owner authorization size is invalid"
+  authorization_metadata=$(stat -c '%u:%g:%a:%h' "$owner_authorization") ||
+    fail "executor owner authorization metadata is unavailable"
+  [ "$authorization_metadata" = 0:0:600:1 ] ||
+    fail "executor owner authorization metadata is unsafe"
+  python3 -I -B - "$owner_authorization" "$release_sha" <<'PY' ||
+import json
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+release_sha = sys.argv[2]
+try:
+    raw = path.read_bytes()
+    text = raw.decode("utf-8")
+    value = json.loads(text)
+except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+    raise SystemExit(1)
+if not isinstance(value, dict):
+    raise SystemExit(1)
+if set(value) != {"schema", "release_sha", "chain_id", "acknowledgement"}:
+    raise SystemExit(1)
+if value != {
+    "schema": "phoenix.executor-owner-bootstrap-authorization.v1",
+    "release_sha": release_sha,
+    "chain_id": 42161,
+    "acknowledgement": "BOOTSTRAP_EXECUTOR_OWNER_42161",
+}:
+    raise SystemExit(1)
+PY
+    fail "executor owner authorization content is invalid"
+}
+
+consume_owner_authorization() {
+  authorization_device=$(stat -c '%d' "$owner_authorization") ||
+    fail "executor owner authorization filesystem is unavailable"
+  runtime_device=$(stat -c '%d' "$runtime_dir") ||
+    fail "deployment runtime filesystem is unavailable"
+  [ "$authorization_device" = "$runtime_device" ] ||
+    fail "executor owner authorization cannot be consumed atomically"
+  consumed_authorization_dir=$(mktemp -d \
+    "$runtime_dir/owner-authorization-consumed-$release_sha.XXXXXX") ||
+    fail "consumed executor owner authorization directory could not be created"
+  chmod 0700 "$consumed_authorization_dir"
+  consumed_owner_authorization="$consumed_authorization_dir/authorization.json"
+  mv -n "$owner_authorization" "$consumed_owner_authorization" ||
+    fail "executor owner authorization could not be consumed"
+  [ ! -e "$owner_authorization" ] && [ -f "$consumed_owner_authorization" ] ||
+    fail "executor owner authorization was not consumed exactly once"
+  consumed_metadata=$(stat -c '%u:%g:%a:%h' "$consumed_owner_authorization") ||
+    fail "consumed executor owner authorization metadata is unavailable"
+  [ "$consumed_metadata" = 0:0:600:1 ] ||
+    fail "consumed executor owner authorization metadata is unsafe"
+}
+
 capture_protected_ids "$protected_before" || fail "protected services are not ready before deployment"
 
 rollback_on_failure() {
   code=$?
   trap - EXIT
   if [ "$code" -ne 0 ] && [ "$mutation_started" -eq 1 ]; then
+    repause_ok=1
+    if [ "$owner_unpaused" -eq 1 ]; then
+      echo "DEPLOY_FAILED: compensating by re-pausing executor"
+      set +e
+      pause_output=$(compose run --rm --no-deps \
+        -e PHOENIX_RELEASE_SHA="$release_sha" \
+        -e PHOENIX_EXECUTOR_OWNER_PAUSE_ACK=PAUSE_EXECUTOR_AFTER_FAILED_DEPLOY_42161 \
+        --entrypoint /usr/local/bin/autonomous-live-control \
+        live-executor owner-pause 2>&1)
+      pause_code=$?
+      set -e
+      printf '%s\n' "$pause_output"
+      if [ "$pause_code" -eq 0 ]; then
+        printf '%s\n' "$pause_output" >"$owner_pause_evidence"
+        chmod 0600 "$owner_pause_evidence"
+        echo "DEPLOY_COMPENSATION_OK: executor paused before rollback"
+      else
+        repause_ok=0
+        echo "DEPLOY_COMPENSATION_FAILED: executor re-pause failed"
+      fi
+    fi
     echo "DEPLOY_FAILED: invoking rollback"
-    PHOENIX_CURRENT_LIVE_RELEASE_ENV="$release_env" \
-      "$rollback_script" || echo "ROLLBACK_FAILED"
+    set +e
+    rollback_output=$(PHOENIX_CURRENT_LIVE_RELEASE_ENV="$release_env" \
+      "$rollback_script" 2>&1)
+    rollback_code=$?
+    set -e
+    if [ "$rollback_code" -eq 0 ]; then
+      if [ "$repause_ok" -eq 1 ]; then
+        printf '%s\n' "$rollback_output"
+      else
+        echo "ROLLBACK_INCOMPLETE: executor re-pause was not proven"
+      fi
+    else
+      printf '%s\n' "$rollback_output"
+      echo "ROLLBACK_FAILED"
+    fi
   fi
   rm -rf "$state_dir"
   exit "$code"
 }
 mutation_started=0
+owner_unpaused=0
+owner_bootstrap_started=0
 trap rollback_on_failure EXIT
 
 compose pull
@@ -182,13 +294,45 @@ if [ "$preflight_code" -ne 0 ]; then
       ;;
     *"executor configuration is not LIVE-ready"*)
       compose run --rm --no-deps \
+        -e PHOENIX_RELEASE_SHA="$release_sha" \
         --entrypoint /usr/local/bin/autonomous-live-control \
         live-executor owner-plan >"$owner_plan" ||
         fail "executor owner plan could not be materialized"
       chmod 0640 "$owner_plan"
       cat "$owner_plan"
-      echo "EXTERNAL_OWNER_AUTHORIZATION_REQUIRED: $owner_plan"
-      exit 1
+      if [ ! -e "$owner_authorization" ]; then
+        echo "EXTERNAL_OWNER_AUTHORIZATION_REQUIRED: $owner_plan"
+        exit 1
+      fi
+      validate_owner_authorization
+      consume_owner_authorization
+      owner_bootstrap_started=1
+      set +e
+      owner_configure_output=$(compose run --rm --no-deps \
+        -e PHOENIX_RELEASE_SHA="$release_sha" \
+        -e PHOENIX_EXECUTOR_OWNER_BOOTSTRAP_ACK=BOOTSTRAP_EXECUTOR_OWNER_42161 \
+        --entrypoint /usr/local/bin/autonomous-live-control \
+        live-executor owner-configure 2>&1)
+      owner_configure_code=$?
+      set -e
+      printf '%s\n' "$owner_configure_output"
+      [ "$owner_configure_code" -eq 0 ] ||
+        fail "executor owner configuration failed"
+      printf '%s\n' "$owner_configure_output" >"$owner_configure_evidence"
+      chmod 0600 "$owner_configure_evidence"
+      set +e
+      owner_configured_preflight_output=$(compose run --rm --no-deps \
+        -e PHOENIX_RELEASE_SHA="$release_sha" \
+        --entrypoint /usr/local/bin/autonomous-live-control \
+        live-executor owner-configured-preflight 2>&1)
+      owner_configured_preflight_code=$?
+      set -e
+      printf '%s\n' "$owner_configured_preflight_output"
+      [ "$owner_configured_preflight_code" -eq 0 ] ||
+        fail "configured executor preflight failed"
+      printf '%s\n' "$owner_configured_preflight_output" \
+        >"$owner_configured_preflight_evidence"
+      chmod 0600 "$owner_configured_preflight_evidence"
       ;;
     *) fail "read-only autonomous preflight failed" ;;
   esac
@@ -196,9 +340,9 @@ fi
 if [ -s "$current_file" ]; then
   cp "$current_file" "$previous_file"
 fi
+mutation_started=1
 python3 "$deploy_dir/production_mode.py" live --env-file "$env_file" ||
   fail "autonomous production mode could not be installed"
-mutation_started=1
 "$deploy_dir/validate-production-env.sh" "$env_file"
 "$deploy_dir/render-production-compose.sh" \
   --compose-file "$compose_file" \
@@ -221,6 +365,27 @@ compose run --rm --no-deps \
   -e PHOENIX_AUTONOMOUS_ACTIVATION_ACK=ACTIVATE_AUTONOMOUS_LIVE_42161 \
   --entrypoint /usr/local/bin/autonomous-live-control \
   live-executor activate
+set +e
+owner_unpause_output=$(compose run --rm --no-deps \
+  -e PHOENIX_RELEASE_SHA="$release_sha" \
+  -e PHOENIX_EXECUTOR_OWNER_UNPAUSE_ACK=UNPAUSE_CONFIGURED_EXECUTOR_42161 \
+  --entrypoint /usr/local/bin/autonomous-live-control \
+  live-executor owner-unpause 2>&1)
+owner_unpause_code=$?
+set -e
+printf '%s\n' "$owner_unpause_output"
+if [ "$owner_bootstrap_started" -eq 1 ] &&
+  printf '%s\n' "$owner_unpause_output" |
+    grep -F '"status": "applied"' >/dev/null
+then
+  owner_unpaused=1
+fi
+[ "$owner_unpause_code" -eq 0 ] || fail "executor owner unpause failed"
+printf '%s\n' "$owner_unpause_output" >"$owner_unpause_evidence"
+chmod 0600 "$owner_unpause_evidence"
+compose run --rm --no-deps \
+  --entrypoint /usr/local/bin/autonomous-live-control \
+  live-executor preflight
 compose up -d --no-deps live-executor
 wait_service_healthy live-executor ||
   fail "autonomous LIVE executor did not become healthy"

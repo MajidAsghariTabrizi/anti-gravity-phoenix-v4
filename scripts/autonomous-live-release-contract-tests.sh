@@ -12,6 +12,8 @@ dockerfile=$repo_root/deploy/rust.Dockerfile
 runtime_verifier=$repo_root/scripts/verify-image-runtime.sh
 compose_contract=$repo_root/compose.live-autonomous.yml
 control_source=$repo_root/live-executor/src/autonomous_live_control_main.rs
+owner_bootstrap_source=$repo_root/live-executor/src/owner_bootstrap.rs
+deploy_release=$repo_root/scripts/deploy-release.sh
 
 fail() {
   echo "AUTONOMOUS_LIVE_RELEASE_CONTRACT_TEST_FAILED: $1" >&2
@@ -26,7 +28,9 @@ for required in \
   "$dockerfile" \
   "$runtime_verifier" \
   "$compose_contract" \
-  "$control_source"
+  "$control_source" \
+  "$owner_bootstrap_source" \
+  "$deploy_release"
 do
   [ -f "$required" ] && [ ! -L "$required" ] ||
     fail "required_file_missing:$required"
@@ -71,7 +75,8 @@ grep -F 'autonomous-live-control __image_runtime_probe__' "$dockerfile" >/dev/nu
   fail dockerfile_runtime_probe_missing
 
 PYTHONDONTWRITEBYTECODE=1 python3 -I -B - \
-  "$compose_contract" "$control_source" "$dockerfile" "$runtime_verifier" <<'PY' ||
+  "$compose_contract" "$control_source" "$owner_bootstrap_source" \
+  "$deploy_release" "$dockerfile" "$runtime_verifier" <<'PY' ||
 import re
 import sys
 from pathlib import Path
@@ -86,9 +91,19 @@ def require(condition: bool, message: str) -> None:
         fail(message)
 
 
-compose_path, control_path, dockerfile_path, verifier_path = map(Path, sys.argv[1:])
+(
+    compose_path,
+    control_path,
+    owner_bootstrap_path,
+    deploy_release_path,
+    dockerfile_path,
+    verifier_path,
+) = map(Path, sys.argv[1:])
 compose = compose_path.read_text(encoding="utf-8")
 control = control_path.read_text(encoding="utf-8")
+owner_bootstrap = owner_bootstrap_path.read_text(encoding="utf-8")
+owner_runtime = owner_bootstrap.split("#[cfg(test)]", 1)[0]
+deploy_release = deploy_release_path.read_text(encoding="utf-8")
 dockerfile = dockerfile_path.read_text(encoding="utf-8")
 verifier = verifier_path.read_text(encoding="utf-8")
 
@@ -130,8 +145,18 @@ require(
     "control_deprecated_executor_lookup_present",
 )
 require(
-    control.count("control_address_environment_with(") == 2,
-    "control_canonical_address_helper_usage_invalid",
+    control.count("control_address_environment_with(") == 1,
+    "control_preflight_canonical_address_helper_usage_invalid",
+)
+require(
+    '"WALLET_ADDRESS"' in owner_runtime
+    and '"EXECUTOR_ADDRESS"' in owner_runtime,
+    "owner_bootstrap_canonical_address_names_missing",
+)
+require(
+    '"LIVE_EXECUTOR_WALLET_ADDRESS"' not in owner_runtime
+    and '"LIVE_EXECUTOR_EXECUTOR_ADDRESS"' not in owner_runtime,
+    "owner_bootstrap_deprecated_address_names_present",
 )
 
 run_start = control.find("async fn run()")
@@ -146,6 +171,10 @@ for command in (
     "IMAGE_RUNTIME_PROBE_COMMAND",
     '"preflight"',
     '"owner-plan"',
+    '"owner-configure"',
+    '"owner-configured-preflight"',
+    '"owner-unpause"',
+    '"owner-pause"',
     '"migrate"',
     '"activate"',
     '"disarm"',
@@ -160,6 +189,141 @@ require(
 require(
     control.find('required("POSTGRES_DSN")') > pool_start,
     "control_dsn_lookup_not_isolated",
+)
+for forbidden in ("POSTGRES_DSN", "DATABASE_URL"):
+    require(
+        forbidden not in owner_runtime,
+        f"owner_bootstrap_database_dependency_present:{forbidden}",
+    )
+
+for required_owner_contract in (
+    "BOOTSTRAP_EXECUTOR_OWNER_42161",
+    "UNPAUSE_CONFIGURED_EXECUTOR_42161",
+    "PAUSE_EXECUTOR_AFTER_FAILED_DEPLOY_42161",
+    "EXECUTOR_OWNER_CONFIGURE_OK",
+    "EXECUTOR_OWNER_CONFIGURED_PREFLIGHT_OK",
+    "EXECUTOR_OWNER_UNPAUSE_OK",
+    "EXECUTOR_OWNER_PAUSE_OK",
+    "transaction_signer_from_file",
+    "quote_transaction",
+    "pending_nonce",
+    "send_raw_transaction",
+    "transaction_receipt",
+    "transaction_known",
+    '"receipt_status"',
+):
+    require(
+        required_owner_contract in owner_runtime or required_owner_contract in control,
+        f"owner_bootstrap_contract_missing:{required_owner_contract}",
+    )
+
+for forbidden_input in (
+    '"TARGET"',
+    '"CALLDATA"',
+    '"RAW_TRANSACTION"',
+    '"TRANSACTION_NONCE"',
+):
+    require(
+        forbidden_input not in owner_runtime,
+        f"owner_bootstrap_arbitrary_input_present:{forbidden_input}",
+    )
+
+authorization_absent = deploy_release.find('if [ ! -e "$owner_authorization" ]')
+authorization = deploy_release.find(
+    "validate_owner_authorization", authorization_absent
+)
+consume = deploy_release.find("consume_owner_authorization", authorization)
+configure = deploy_release.find("live-executor owner-configure")
+configured_preflight = deploy_release.find("live-executor owner-configured-preflight")
+production_mode = deploy_release.find("production_mode.py")
+activation = deploy_release.find("live-executor activate")
+unpause = deploy_release.find("live-executor owner-unpause")
+normal_preflight = deploy_release.rfind("live-executor preflight")
+executor_start = deploy_release.find("compose up -d --no-deps live-executor")
+require(
+    min(
+        authorization,
+        authorization_absent,
+        consume,
+        configure,
+        configured_preflight,
+        production_mode,
+        activation,
+        unpause,
+        normal_preflight,
+        executor_start,
+    )
+    >= 0,
+    "owner_bootstrap_deployment_sequence_missing",
+)
+require(
+    authorization_absent
+    < authorization
+    < consume
+    < configure
+    < configured_preflight
+    < production_mode
+    < activation
+    < unpause
+    < normal_preflight
+    < executor_start,
+    "owner_bootstrap_deployment_sequence_invalid",
+)
+require(
+    "owner_authorization=/etc/phoenix/authorizations/executor-owner-bootstrap.json"
+    in deploy_release,
+    "owner_authorization_path_not_exact",
+)
+require(
+    "PHOENIX_EXECUTOR_OWNER_BOOTSTRAP_AUTHORIZATION_FILE" not in deploy_release,
+    "owner_authorization_path_is_operator_overridable",
+)
+require(
+    'mv -n "$owner_authorization" "$consumed_owner_authorization"'
+    in deploy_release
+    and '[ ! -e "$owner_authorization" ] && [ -f "$consumed_owner_authorization" ]'
+    in deploy_release,
+    "owner_authorization_not_consumed_exactly_once",
+)
+require(
+    deploy_release.find("owner_bootstrap_started=1", consume)
+    < configure,
+    "owner_bootstrap_not_marked_before_first_mutation",
+)
+owner_unpause_code = deploy_release.find("owner_unpause_code=$?")
+owner_unpause_applied = deploy_release.find("owner_unpaused=1", owner_unpause_code)
+owner_unpause_failure = deploy_release.find(
+    '[ "$owner_unpause_code" -eq 0 ] || fail "executor owner unpause failed"',
+    owner_unpause_code,
+)
+require(
+    owner_unpause_code < owner_unpause_applied < owner_unpause_failure,
+    "owner_unpause_compensation_state_not_captured_before_failure",
+)
+require(
+    deploy_release.find("live-executor owner-pause")
+    < deploy_release.find("invoking rollback"),
+    "owner_pause_not_before_rollback",
+)
+for authorization_contract in (
+    "phoenix.executor-owner-bootstrap-authorization.v1",
+    '{"schema", "release_sha", "chain_id", "acknowledgement"}',
+    "0:0:600:1",
+    "cannot be consumed atomically",
+    "EXTERNAL_OWNER_AUTHORIZATION_REQUIRED",
+):
+    require(
+        authorization_contract in deploy_release,
+        f"owner_authorization_contract_missing:{authorization_contract}",
+    )
+
+owner_mutation = control[control.find("async fn owner_mutation") :]
+require(
+    owner_mutation.find("execute_from_environment(mutation).await?")
+    < owner_mutation.find("mutation == OwnerMutation::Unpause")
+    < owner_mutation.find("preflight().await?")
+    < owner_mutation.find('println!("{marker}")'),
+    "owner_unpause_normal_preflight_sequence_invalid",
 )
 
 for label, gate in (("dockerfile", dockerfile), ("verifier", verifier)):
