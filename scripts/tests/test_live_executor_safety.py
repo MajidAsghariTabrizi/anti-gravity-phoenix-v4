@@ -268,6 +268,13 @@ class LiveExecutorSafetyTests(unittest.TestCase):
         self.assertLess(mode_live, migration)
         self.assertLess(migration, activation)
         self.assertLess(activation, executor_start)
+        configured_preflight = deployment.index(
+            "live-executor owner-configured-preflight"
+        )
+        owner_plan = deployment.index("live-executor owner-plan")
+        authorization = deployment.index("EXTERNAL_OWNER_AUTHORIZATION_REQUIRED")
+        self.assertLess(configured_preflight, owner_plan)
+        self.assertLess(owner_plan, authorization)
         self.assertIn("EXTERNAL_OWNER_AUTHORIZATION_REQUIRED", deployment)
         self.assertIn("EXTERNAL_GAS_FUNDING_REQUIRED", deployment)
         self.assertIn(

@@ -372,11 +372,12 @@ def rollback_phase(
 ) -> dict[str, Any]:
     validate_state(value)
     allowed = {
-        "FAILED_POST_MUTATION": "ROLLBACK_STARTED",
-        "ROLLBACK_STARTED": phase,
+        "FAILED_POST_MUTATION": {"ROLLBACK_STARTED"},
+        "ROLLBACK_STARTED": {"ROLLED_BACK", "ROLLBACK_FAILED"},
+        "ROLLBACK_FAILED": {"ROLLED_BACK"},
     }
-    expected = allowed.get(value["current_phase"])
-    if expected != phase or phase not in {"ROLLBACK_STARTED", "ROLLED_BACK", "ROLLBACK_FAILED"}:
+    expected = allowed.get(value["current_phase"], set())
+    if phase not in expected:
         raise StateError("rollback phase transition is invalid")
     value["current_phase"] = phase
     value["completed_phases"].append(phase)

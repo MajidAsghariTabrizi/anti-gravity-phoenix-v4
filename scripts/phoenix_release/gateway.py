@@ -722,13 +722,21 @@ def _write_state(paths: HostPaths, state: dict[str, Any]) -> None:
     atomic_write(state_file(paths, state["release_sha"]), state)
 
 
+def _runtime_may_have_changed(state: dict[str, Any]) -> bool:
+    failure_phase = state.get("failure_phase")
+    return (
+        failure_phase in PHASES
+        and PHASES.index(failure_phase) >= PHASES.index("MIGRATIONS_APPLIED")
+    )
+
+
 def _rollback_failed_state(
     paths: HostPaths, state: dict[str, Any]
 ) -> dict[str, Any]:
     if state["current_phase"] == "FAILED_POST_MUTATION":
         state = rollback_phase(state, "ROLLBACK_STARTED")
         _write_state(paths, state)
-    if state["current_phase"] != "ROLLBACK_STARTED":
+    if state["current_phase"] not in {"ROLLBACK_STARTED", "ROLLBACK_FAILED"}:
         return state
     rollback_sha = state["rollback_sha"]
     rollback_root = paths.releases / rollback_sha
@@ -736,12 +744,7 @@ def _rollback_failed_state(
         rollback_root / "scripts" / "install-production-release-context.sh"
     )
     try:
-        failure_phase = state.get("failure_phase")
-        runtime_may_have_changed = (
-            failure_phase in PHASES
-            and PHASES.index(failure_phase)
-            >= PHASES.index("CANDIDATE_LIVE_RENDER_VERIFIED")
-        )
+        runtime_may_have_changed = _runtime_may_have_changed(state)
         if runtime_may_have_changed:
             emergency_pause(paths)
         _require_success(
@@ -785,14 +788,19 @@ def _rollback_failed_state(
             }
         )
     except (GatewayError, OSError) as exc:
-        state = rollback_phase(
-            state,
-            "ROLLBACK_FAILED",
-            {
-                "status": "failed",
-                "code": exc.code if isinstance(exc, GatewayError) else "OS_ERROR",
-            },
-        )
+        result = {
+            "status": "failed",
+            "code": exc.code if isinstance(exc, GatewayError) else "OS_ERROR",
+            "evidence": (
+                exc.evidence
+                if isinstance(exc, GatewayError)
+                else {"message": _bounded_output(str(exc))}
+            ),
+        }
+        if state["current_phase"] == "ROLLBACK_FAILED":
+            state["rollback_result"] = result
+        else:
+            state = rollback_phase(state, "ROLLBACK_FAILED", result)
     _write_state(paths, state)
     return state
 
@@ -806,10 +814,13 @@ def resume(paths: HostPaths, release_sha: str) -> dict[str, Any]:
     if state["current_phase"] in {
         "FAILED_PRE_MUTATION",
         "ROLLED_BACK",
-        "ROLLBACK_FAILED",
     }:
         return state
-    if state["current_phase"] in {"FAILED_POST_MUTATION", "ROLLBACK_STARTED"}:
+    if state["current_phase"] in {
+        "FAILED_POST_MUTATION",
+        "ROLLBACK_STARTED",
+        "ROLLBACK_FAILED",
+    }:
         return _rollback_failed_state(paths, state)
     if state["mutation_started"] and state["current_phase"] not in {
         "CANDIDATE_INSTALLED",
