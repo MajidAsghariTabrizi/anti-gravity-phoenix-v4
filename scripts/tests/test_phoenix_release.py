@@ -411,9 +411,12 @@ class BoundedTransportTests(unittest.TestCase):
             '{"service":"phoenix-engine"}}'
         )
         output = _bounded_output(
-            f"{diagnostic}\n" + ("rollback-noise\n" * 500) + "ROLLBACK_OK\n"
+            f"{diagnostic}\nHEALTH_FAIL: shadow-mode\n"
+            + ("rollback-noise\n" * 500)
+            + "ROLLBACK_OK\n"
         )
         self.assertIn(diagnostic, output)
+        self.assertIn("HEALTH_FAIL: shadow-mode", output)
         self.assertIn("ROLLBACK_OK", output)
         self.assertLessEqual(len(output), 4096)
 
