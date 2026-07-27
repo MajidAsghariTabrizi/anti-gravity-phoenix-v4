@@ -284,6 +284,18 @@ class LiveExecutorSafetyTests(unittest.TestCase):
         self.assertLess(shadow_mode, immutable_verify)
         self.assertNotIn("TRUNCATE", rollback)
 
+    def test_jetstream_ci_proves_postgres_through_the_published_port(self) -> None:
+        workflow = (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
+        job = workflow.split("\n  jetstream-integration:\n", 1)[1]
+        host_probe = job.index("docker run --rm --network host")
+        migration_test = job.index(
+            "TestFreshV5DatabaseInitializesFromZeroAndIsIdempotent"
+        )
+        self.assertLess(host_probe, migration_test)
+        self.assertIn("-h 127.0.0.1 -U phoenix_test -d phoenix_test", job)
+        self.assertIn("-c 'SELECT 1'", job)
+        self.assertNotIn("docker exec phoenix-ci-postgres pg_isready", job)
+
     def test_config_failures_are_logged_by_sanitized_code_only(self) -> None:
         runtime = (ROOT / "live-executor/src/main.rs").read_text(encoding="utf-8")
         self.assertIn("error_code = error.code()", runtime)
