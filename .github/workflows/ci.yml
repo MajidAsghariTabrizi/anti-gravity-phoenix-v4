@@ -728,7 +728,14 @@ jobs:
             sleep 1
           done
           for attempt in $(seq 1 30); do
-            if docker exec phoenix-ci-postgres pg_isready -U phoenix_test -d phoenix_test >/dev/null; then
+            if docker run --rm --network host \
+              --env PGPASSWORD=phoenix_test_password \
+              postgres@sha256:57c72fd2a128e416c7fcc499958864df5301e940bca0a56f58fddf30ffc07777 \
+              psql -X -qAt -v ON_ERROR_STOP=1 \
+                -h 127.0.0.1 -U phoenix_test -d phoenix_test \
+                -c 'SELECT 1' |
+              grep -Fx 1 >/dev/null
+            then
               break
             fi
             if [ "$attempt" -eq 30 ]; then
