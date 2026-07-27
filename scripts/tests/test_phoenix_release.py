@@ -23,6 +23,8 @@ from scripts.phoenix_release.controller import (
 )
 from scripts.phoenix_release.gateway import (
     _bounded_output,
+    _rollback_failed_state,
+    _runtime_may_have_changed,
     _service_absence_allowed,
     GatewayError,
     HostPaths,
@@ -195,6 +197,15 @@ class ReleaseStateTests(unittest.TestCase):
         value = set_mutation_started(state())
         value = fail_state(value, code="DEPLOYMENT_FAILED", evidence={})
         value = rollback_phase(value, "ROLLBACK_STARTED")
+        value = rollback_phase(value, "ROLLED_BACK", {"status": "ok"})
+        self.assertEqual(value["current_phase"], "ROLLED_BACK")
+        self.assertEqual(value["rollback_result"], {"status": "ok"})
+
+    def test_failed_rollback_can_be_reconciled_to_rolled_back(self) -> None:
+        value = set_mutation_started(state())
+        value = fail_state(value, code="DEPLOYMENT_FAILED", evidence={})
+        value = rollback_phase(value, "ROLLBACK_STARTED")
+        value = rollback_phase(value, "ROLLBACK_FAILED", {"status": "failed"})
         value = rollback_phase(value, "ROLLED_BACK", {"status": "ok"})
         self.assertEqual(value["current_phase"], "ROLLED_BACK")
         self.assertEqual(value["rollback_result"], {"status": "ok"})
@@ -454,6 +465,115 @@ class BoundedTransportTests(unittest.TestCase):
             self.assertEqual(rollback_state["current_phase"], "FAILED_POST_MUTATION")
             self.assertTrue(rollback_state["mutation_started"])
 
+    def test_candidate_render_failure_needs_context_only_reconciliation(self) -> None:
+        value = state()
+        value = set_mutation_started(value)
+        value = fail_state(
+            value,
+            code="DEPLOYMENT_FAILED",
+            evidence={},
+        )
+        value["failure_phase"] = "CANDIDATE_LIVE_RENDER_VERIFIED"
+        self.assertFalse(_runtime_may_have_changed(value))
+        value["failure_phase"] = "MIGRATIONS_APPLIED"
+        self.assertTrue(_runtime_may_have_changed(value))
+
+    def test_failed_context_reconciliation_preserves_bounded_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            paths = self.paths(Path(temporary))
+            value = set_mutation_started(state())
+            value = fail_state(value, code="DEPLOYMENT_FAILED", evidence={})
+            value = rollback_phase(value, "ROLLBACK_STARTED")
+            with patch(
+                "scripts.phoenix_release.gateway._require_success",
+                side_effect=GatewayError(
+                    "ROLLBACK_CONTEXT_INSTALL_FAILED",
+                    {"exit_code": 17, "output": "expected context evidence"},
+                ),
+            ):
+                recovered = _rollback_failed_state(paths, value)
+            self.assertEqual(recovered["current_phase"], "ROLLBACK_FAILED")
+            self.assertEqual(
+                recovered["rollback_result"],
+                {
+                    "status": "failed",
+                    "code": "ROLLBACK_CONTEXT_INSTALL_FAILED",
+                    "evidence": {
+                        "exit_code": 17,
+                        "output": "expected context evidence",
+                    },
+                },
+            )
+
+    def test_resume_reconciles_context_only_rollback_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            paths = self.paths(Path(temporary))
+            value = state()
+            for phase in PHASES[1 : PHASES.index("MIGRATIONS_APPLIED")]:
+                value = advance(value, phase)
+            value = set_mutation_started(value)
+            value = fail_state(value, code="DEPLOYMENT_FAILED", evidence={})
+            value = rollback_phase(value, "ROLLBACK_STARTED")
+            value = rollback_phase(
+                value,
+                "ROLLBACK_FAILED",
+                {"status": "failed", "code": "ROLLBACK_FAILED"},
+            )
+            atomic_write(state_file(paths, RELEASE_SHA), value)
+            request_path = request_file(paths, RELEASE_SHA)
+            request_path.parent.mkdir(parents=True)
+            request_path.write_text(json.dumps(request()), encoding="utf-8")
+
+            with (
+                patch(
+                    "scripts.phoenix_release.gateway._require_success",
+                    return_value="",
+                ) as require_success,
+                patch(
+                    "scripts.phoenix_release.gateway.emergency_pause"
+                ) as emergency_pause,
+            ):
+                recovered = resume(paths, RELEASE_SHA)
+
+            require_success.assert_called_once()
+            emergency_pause.assert_not_called()
+            self.assertEqual(recovered["current_phase"], "ROLLED_BACK")
+            self.assertIsNone(recovered["candidate_pointer"])
+            self.assertEqual(
+                recovered["rollback_result"]["runtime_reconciled"],
+                False,
+            )
+
+    def test_failed_rollback_retry_keeps_terminal_state_and_new_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            paths = self.paths(Path(temporary))
+            value = set_mutation_started(state())
+            value = fail_state(value, code="DEPLOYMENT_FAILED", evidence={})
+            value = rollback_phase(value, "ROLLBACK_STARTED")
+            value = rollback_phase(
+                value,
+                "ROLLBACK_FAILED",
+                {"status": "failed", "code": "FIRST_FAILURE"},
+            )
+            with patch(
+                "scripts.phoenix_release.gateway._require_success",
+                side_effect=GatewayError(
+                    "ROLLBACK_CONTEXT_INSTALL_FAILED",
+                    {"exit_code": 23},
+                ),
+            ):
+                recovered = _rollback_failed_state(paths, value)
+
+            self.assertEqual(recovered["current_phase"], "ROLLBACK_FAILED")
+            self.assertEqual(
+                recovered["completed_phases"].count("ROLLBACK_FAILED"),
+                1,
+            )
+            self.assertEqual(
+                recovered["rollback_result"]["evidence"],
+                {"exit_code": 23},
+            )
+
     def test_state_updater_uses_installed_package_layout(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             paths = self.paths(Path(temporary))
@@ -573,6 +693,23 @@ class WorkflowAndDeploymentContractTests(unittest.TestCase):
         self.assertIn("engine_process_fatal_integrity_total", self.deploy)
         self.assertIn("run_post_live_stabilization", self.deploy)
         self.assertIn("PHOENIX_POST_LIVE_STABILIZATION_SECONDS:-60", self.deploy)
+
+    def test_configured_paused_executor_bypasses_owner_bootstrap(self) -> None:
+        configured = self.deploy.index(
+            "live-executor owner-configured-preflight"
+        )
+        fallback = self.deploy.index(
+            'if [ "$owner_configured_preflight_code" -ne 0 ]; then'
+        )
+        owner_plan = self.deploy.index("live-executor owner-plan")
+        authorization = self.deploy.index("EXTERNAL_OWNER_AUTHORIZATION_REQUIRED")
+        self.assertLess(configured, fallback)
+        self.assertLess(fallback, owner_plan)
+        self.assertLess(owner_plan, authorization)
+        self.assertNotIn(
+            '[ "$owner_bootstrap_started" -eq 1 ]',
+            self.deploy,
+        )
 
     def test_post_live_verification_precedes_pointer_promotion(self) -> None:
         verify = self.deploy.index("mark_phase POST_LIVE_VERIFIED")

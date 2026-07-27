@@ -228,13 +228,22 @@ for forbidden_input in (
         f"owner_bootstrap_arbitrary_input_present:{forbidden_input}",
     )
 
-authorization_absent = deploy_release.find('if [ ! -e "$owner_authorization" ]')
+configured_preflight = deploy_release.find("live-executor owner-configured-preflight")
+owner_bootstrap_fallback = deploy_release.find(
+    'if [ "$owner_configured_preflight_code" -ne 0 ]; then',
+    configured_preflight,
+)
+authorization_absent = deploy_release.find(
+    'if [ ! -e "$owner_authorization" ]', owner_bootstrap_fallback
+)
 authorization = deploy_release.find(
     "validate_owner_authorization", authorization_absent
 )
 consume = deploy_release.find("consume_owner_authorization", authorization)
-configure = deploy_release.find("live-executor owner-configure")
-configured_preflight = deploy_release.find("live-executor owner-configured-preflight")
+configure = deploy_release.find("live-executor owner-configure", consume)
+configured_preflight_after_configure = deploy_release.find(
+    "live-executor owner-configured-preflight", configure
+)
 production_mode = deploy_release.find(
     'python3 "$deploy_dir/production_mode.py" live --env-file "$env_file"'
 )
@@ -248,9 +257,11 @@ require(
     min(
         authorization,
         authorization_absent,
+        owner_bootstrap_fallback,
         consume,
         configure,
         configured_preflight,
+        configured_preflight_after_configure,
         production_mode,
         live_reload,
         burn_in,
@@ -263,11 +274,13 @@ require(
     "owner_bootstrap_deployment_sequence_missing",
 )
 require(
-    authorization_absent
+    configured_preflight
+    < owner_bootstrap_fallback
+    < authorization_absent
     < authorization
     < consume
     < configure
-    < configured_preflight
+    < configured_preflight_after_configure
     < production_mode
     < live_reload
     < burn_in

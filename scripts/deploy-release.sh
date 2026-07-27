@@ -616,7 +616,6 @@ rollback_on_failure() {
 }
 mutation_started=0
 owner_unpaused=0
-owner_bootstrap_started=0
 trap rollback_on_failure EXIT
 
 compose pull
@@ -634,33 +633,6 @@ if [ "$preflight_code" -ne 0 ]; then
       exit 1
       ;;
     *"executor configuration is not LIVE-ready"*)
-      compose run --rm --no-deps \
-        -e PHOENIX_RELEASE_SHA="$release_sha" \
-        --entrypoint /usr/local/bin/autonomous-live-control \
-        live-executor owner-plan >"$owner_plan" ||
-        fail "executor owner plan could not be materialized"
-      chmod 0640 "$owner_plan"
-      cat "$owner_plan"
-      if [ ! -e "$owner_authorization" ]; then
-        echo "EXTERNAL_OWNER_AUTHORIZATION_REQUIRED: $owner_plan"
-        exit 1
-      fi
-      validate_owner_authorization
-      consume_owner_authorization
-      owner_bootstrap_started=1
-      set +e
-      owner_configure_output=$(compose run --rm --no-deps \
-        -e PHOENIX_RELEASE_SHA="$release_sha" \
-        -e PHOENIX_EXECUTOR_OWNER_BOOTSTRAP_ACK=BOOTSTRAP_EXECUTOR_OWNER_42161 \
-        --entrypoint /usr/local/bin/autonomous-live-control \
-        live-executor owner-configure 2>&1)
-      owner_configure_code=$?
-      set -e
-      printf '%s\n' "$owner_configure_output"
-      [ "$owner_configure_code" -eq 0 ] ||
-        fail "executor owner configuration failed"
-      printf '%s\n' "$owner_configure_output" >"$owner_configure_evidence"
-      chmod 0600 "$owner_configure_evidence"
       set +e
       owner_configured_preflight_output=$(compose run --rm --no-deps \
         -e PHOENIX_RELEASE_SHA="$release_sha" \
@@ -669,8 +641,44 @@ if [ "$preflight_code" -ne 0 ]; then
       owner_configured_preflight_code=$?
       set -e
       printf '%s\n' "$owner_configured_preflight_output"
-      [ "$owner_configured_preflight_code" -eq 0 ] ||
-        fail "configured executor preflight failed"
+      if [ "$owner_configured_preflight_code" -ne 0 ]; then
+        compose run --rm --no-deps \
+          -e PHOENIX_RELEASE_SHA="$release_sha" \
+          --entrypoint /usr/local/bin/autonomous-live-control \
+          live-executor owner-plan >"$owner_plan" ||
+          fail "executor owner plan could not be materialized"
+        chmod 0640 "$owner_plan"
+        cat "$owner_plan"
+        if [ ! -e "$owner_authorization" ]; then
+          echo "EXTERNAL_OWNER_AUTHORIZATION_REQUIRED: $owner_plan"
+          exit 1
+        fi
+        validate_owner_authorization
+        consume_owner_authorization
+        set +e
+        owner_configure_output=$(compose run --rm --no-deps \
+          -e PHOENIX_RELEASE_SHA="$release_sha" \
+          -e PHOENIX_EXECUTOR_OWNER_BOOTSTRAP_ACK=BOOTSTRAP_EXECUTOR_OWNER_42161 \
+          --entrypoint /usr/local/bin/autonomous-live-control \
+          live-executor owner-configure 2>&1)
+        owner_configure_code=$?
+        set -e
+        printf '%s\n' "$owner_configure_output"
+        [ "$owner_configure_code" -eq 0 ] ||
+          fail "executor owner configuration failed"
+        printf '%s\n' "$owner_configure_output" >"$owner_configure_evidence"
+        chmod 0600 "$owner_configure_evidence"
+        set +e
+        owner_configured_preflight_output=$(compose run --rm --no-deps \
+          -e PHOENIX_RELEASE_SHA="$release_sha" \
+          --entrypoint /usr/local/bin/autonomous-live-control \
+          live-executor owner-configured-preflight 2>&1)
+        owner_configured_preflight_code=$?
+        set -e
+        printf '%s\n' "$owner_configured_preflight_output"
+        [ "$owner_configured_preflight_code" -eq 0 ] ||
+          fail "configured executor preflight failed"
+      fi
       printf '%s\n' "$owner_configured_preflight_output" \
         >"$owner_configured_preflight_evidence"
       chmod 0600 "$owner_configured_preflight_evidence"
@@ -740,9 +748,8 @@ owner_unpause_output=$(compose run --rm --no-deps \
 owner_unpause_code=$?
 set -e
 printf '%s\n' "$owner_unpause_output"
-if [ "$owner_bootstrap_started" -eq 1 ] &&
-  printf '%s\n' "$owner_unpause_output" |
-    grep -F '"status": "applied"' >/dev/null
+if printf '%s\n' "$owner_unpause_output" |
+  grep -F '"status": "applied"' >/dev/null
 then
   owner_unpaused=1
 fi
