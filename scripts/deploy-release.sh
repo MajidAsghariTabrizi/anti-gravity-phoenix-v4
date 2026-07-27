@@ -25,10 +25,40 @@ protected_services='nitro-feed-relay feed-ingestor nats postgres recorder'
 optional_services='prometheus rpc-gateway shadow-dispatcher phoenix-engine dashboard'
 service_wait_seconds=${PHOENIX_DEPLOY_SERVICE_WAIT_SECONDS:-300}
 engine_burn_in_seconds=${PHOENIX_ENGINE_BURN_IN_SECONDS:-120}
+post_live_stabilization_seconds=${PHOENIX_POST_LIVE_STABILIZATION_SECONDS:-60}
+release_state_updater=${PHOENIX_RELEASE_STATE_UPDATER:-}
 
 fail() {
   echo "DEPLOY_FAILED: $1"
   exit 1
+}
+
+state_update() {
+  operation=$1
+  value=$2
+  [ -n "$release_state_updater" ] || return 0
+  [ -f "$release_state_updater" ] && [ ! -L "$release_state_updater" ] ||
+    fail "release state updater is missing or unsafe"
+  /usr/bin/python3 -I -B "$release_state_updater" \
+    "$release_sha" "$operation" "$value" >/dev/null ||
+    fail "durable release state update failed"
+}
+
+mark_phase() {
+  state_update phase "$1"
+}
+
+mark_owner_unpaused() {
+  transaction_hash=$1
+  [ -n "$release_state_updater" ] || return 0
+  if [ -n "$transaction_hash" ]; then
+    /usr/bin/python3 -I -B "$release_state_updater" \
+      "$release_sha" phase EXECUTOR_UNPAUSED \
+      --transaction-hash "$transaction_hash" >/dev/null ||
+      fail "durable owner transaction state update failed"
+  else
+    mark_phase EXECUTOR_UNPAUSED
+  fi
 }
 
 case "$release_sha" in
@@ -68,6 +98,12 @@ case "$engine_burn_in_seconds" in
 esac
 [ "$engine_burn_in_seconds" -ge 120 ] && [ "$engine_burn_in_seconds" -le 900 ] ||
   fail "Engine burn-in seconds must be from 120 through 900"
+case "$post_live_stabilization_seconds" in
+  ''|*[!0-9]*) fail "post-LIVE stabilization seconds must be an integer" ;;
+esac
+[ "$post_live_stabilization_seconds" -ge 30 ] &&
+  [ "$post_live_stabilization_seconds" -le 300 ] ||
+  fail "post-LIVE stabilization seconds must be from 30 through 300"
 
 command -v python3 >/dev/null 2>&1 || fail "python3 is unavailable"
 command -v cmp >/dev/null 2>&1 || fail "cmp is unavailable"
@@ -285,6 +321,35 @@ engine_terminal_integrity_total() {
   printf '%s\n' "$metric_value"
 }
 
+engine_process_fatal_integrity_total() {
+  metrics_output=$(
+    compose exec -T phoenix-engine wget -q -O - http://127.0.0.1:9200/metrics
+  ) || return 1
+  metric_value=$(
+    printf '%s\n' "$metrics_output" |
+      awk '$1 == "phoenix_engine_runtime_exits_total{class=\"integrity_failure\"}" { print $2; found=1 } END { if (!found) exit 1 }'
+  ) || return 1
+  case "$metric_value" in
+    ''|*[!0-9]*) return 1 ;;
+  esac
+  printf '%s\n' "$metric_value"
+}
+
+mark_engine_burn_in_started() {
+  container_id=$1
+  restart_count=$2
+  terminal_integrity=$3
+  process_fatal_integrity=$4
+  [ -n "$release_state_updater" ] || return 0
+  /usr/bin/python3 -I -B "$release_state_updater" \
+    "$release_sha" engine-baseline ENGINE_BURN_IN_STARTED \
+    --container-id "$container_id" \
+    --restart-count "$restart_count" \
+    --terminal-integrity "$terminal_integrity" \
+    --process-fatal-integrity "$process_fatal_integrity" >/dev/null ||
+    fail "durable Engine burn-in baseline update failed"
+}
+
 run_live_engine_burn_in() {
   engine_id=$(compose ps -a -q phoenix-engine | awk 'NF { print; exit }')
   rpc_id=$(compose ps -a -q rpc-gateway | awk 'NF { print; exit }')
@@ -293,6 +358,12 @@ run_live_engine_burn_in() {
     docker inspect --format '{{.RestartCount}}' "$engine_id"
   ) || return 1
   terminal_integrity_baseline=$(engine_terminal_integrity_total) || return 1
+  process_fatal_integrity_baseline=$(
+    engine_process_fatal_integrity_total
+  ) || return 1
+  mark_engine_burn_in_started \
+    "$engine_id" "$engine_restart_count" "$terminal_integrity_baseline" \
+    "$process_fatal_integrity_baseline"
   burn_in_deadline=$(( $(date +%s) + engine_burn_in_seconds ))
   while [ "$(date +%s)" -lt "$burn_in_deadline" ]; do
     sleep 5
@@ -319,8 +390,40 @@ run_live_engine_burn_in() {
       http://127.0.0.1:9300/readyz >/dev/null || return 1
     [ "$(engine_terminal_integrity_total)" = "$terminal_integrity_baseline" ] ||
       return 1
+    [ "$(engine_process_fatal_integrity_total)" = \
+      "$process_fatal_integrity_baseline" ] || return 1
   done
   echo "LIVE_ENGINE_BURN_IN_OK: ${engine_burn_in_seconds}s"
+}
+
+run_post_live_stabilization() {
+  live_id=$(compose ps -a -q live-executor | awk 'NF { print; exit }')
+  engine_id=$(compose ps -a -q phoenix-engine | awk 'NF { print; exit }')
+  rpc_id=$(compose ps -a -q rpc-gateway | awk 'NF { print; exit }')
+  [ -n "$live_id" ] && [ -n "$engine_id" ] && [ -n "$rpc_id" ] || return 1
+  live_restarts=$(docker inspect --format '{{.RestartCount}}' "$live_id") || return 1
+  engine_restarts=$(docker inspect --format '{{.RestartCount}}' "$engine_id") || return 1
+  rpc_restarts=$(docker inspect --format '{{.RestartCount}}' "$rpc_id") || return 1
+  process_fatal_baseline=$(engine_process_fatal_integrity_total) || return 1
+  deadline=$(( $(date +%s) + post_live_stabilization_seconds ))
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    sleep 5
+    for identity in \
+      "$live_id:$live_restarts" \
+      "$engine_id:$engine_restarts" \
+      "$rpc_id:$rpc_restarts"
+    do
+      container_id=${identity%%:*}
+      restart_count=${identity##*:}
+      state=$(docker inspect --format \
+        '{{.State.Status}}|{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}|{{.RestartCount}}' \
+        "$container_id") || return 1
+      [ "$state" = "running|healthy|$restart_count" ] || return 1
+    done
+    [ "$(engine_process_fatal_integrity_total)" = "$process_fatal_baseline" ] ||
+      return 1
+  done
+  echo "POST_LIVE_STABILIZATION_OK: ${post_live_stabilization_seconds}s"
 }
 
 install_active_file() {
@@ -437,11 +540,16 @@ active_environment_identity_after=$(production_environment_identity "$env_file")
 [ "$active_environment_identity_after" = "$active_environment_identity_before" ] ||
   fail "active production environment changed during candidate preflight"
 capture_protected_ids "$protected_before" || fail "protected services are not ready before deployment"
+mark_phase CANDIDATE_LIVE_RENDER_VERIFIED
 
 rollback_on_failure() {
   code=$?
   trap - EXIT
+  if [ "$code" -ne 0 ]; then
+    state_update failure deployment_failed >/dev/null 2>&1 || true
+  fi
   if [ "$code" -ne 0 ] && [ "$mutation_started" -eq 1 ]; then
+    state_update rollback ROLLBACK_STARTED >/dev/null 2>&1 || true
     repause_ok=1
     compose stop -t 30 live-executor >/dev/null 2>&1 || true
     if [ "$owner_unpause_attempted" -eq 1 ]; then
@@ -489,14 +597,18 @@ rollback_on_failure() {
     if [ "$rollback_code" -eq 0 ]; then
       if ! verify_active_release_coherence "$rollback_sha" "$rollback_sha"; then
         echo "ROLLBACK_INCOMPLETE: active release pointers are incoherent"
+        state_update rollback ROLLBACK_FAILED >/dev/null 2>&1 || true
       elif [ "$repause_ok" -eq 1 ]; then
         printf '%s\n' "$rollback_output"
+        state_update rollback ROLLED_BACK >/dev/null 2>&1 || true
       else
         echo "ROLLBACK_INCOMPLETE: executor re-pause was not proven"
+        state_update rollback ROLLBACK_FAILED >/dev/null 2>&1 || true
       fi
     else
       printf '%s\n' "$rollback_output"
       echo "ROLLBACK_FAILED"
+      state_update rollback ROLLBACK_FAILED >/dev/null 2>&1 || true
     fi
   fi
   rm -rf "$state_dir"
@@ -566,10 +678,11 @@ if [ "$preflight_code" -ne 0 ]; then
     *) fail "read-only autonomous preflight failed" ;;
   esac
 fi
+state_update mutation mutation_started
+mutation_started=1
 if [ -s "$current_file" ]; then
   cp "$current_file" "$previous_file"
 fi
-mutation_started=1
 python3 "$deploy_dir/production_mode.py" live --env-file "$env_file" ||
   fail "autonomous production mode could not be installed"
 reload_environment
@@ -591,6 +704,8 @@ compose run --rm --no-deps \
   --entrypoint /usr/local/bin/autonomous-live-control \
   live-executor migrate
 compose run --rm --no-deps migration-runner
+mark_phase MIGRATIONS_APPLIED
+mark_phase LIVE_MODE_INSTALLED
 for service in $optional_services; do
   case "$service" in
     rpc-gateway|phoenix-engine) continue ;;
@@ -601,17 +716,22 @@ done
 compose up -d --no-deps rpc-gateway
 wait_service_healthy rpc-gateway ||
   fail "rpc-gateway did not become healthy before Engine burn-in"
+mark_phase RPC_GATEWAY_HEALTHY
 compose up -d --no-deps phoenix-engine
 wait_service_healthy phoenix-engine ||
   fail "phoenix-engine did not become healthy before Engine burn-in"
+mark_phase ENGINE_HEALTHY
 run_live_engine_burn_in ||
   fail "autonomous LIVE Engine burn-in failed"
+mark_phase ENGINE_BURN_IN_PASSED
 compose run --rm --no-deps \
   -e PHOENIX_AUTONOMOUS_ACTIVATION_ACK=ACTIVATE_AUTONOMOUS_LIVE_42161 \
   --entrypoint /usr/local/bin/autonomous-live-control \
   live-executor activate
-set +e
+mark_phase AUTONOMOUS_ACTIVATED
 owner_unpause_attempted=1
+mark_phase EXECUTOR_UNPAUSE_STARTED
+set +e
 owner_unpause_output=$(compose run --rm --no-deps \
   -e PHOENIX_RELEASE_SHA="$release_sha" \
   -e PHOENIX_EXECUTOR_OWNER_UNPAUSE_ACK=UNPAUSE_CONFIGURED_EXECUTOR_42161 \
@@ -627,6 +747,12 @@ then
   owner_unpaused=1
 fi
 [ "$owner_unpause_code" -eq 0 ] || fail "executor owner unpause failed"
+owner_unpause_transaction_hash=$(
+  printf '%s\n' "$owner_unpause_output" |
+    sed -n 's/.*"transaction_hash":[[:space:]]*"\(0x[0-9a-f]\{64\}\)".*/\1/p' |
+    tail -n 1
+)
+mark_owner_unpaused "$owner_unpause_transaction_hash"
 printf '%s\n' "$owner_unpause_output" >"$owner_unpause_evidence"
 chmod 0600 "$owner_unpause_evidence"
 compose run --rm --no-deps \
@@ -635,6 +761,8 @@ compose run --rm --no-deps \
 compose up -d --no-deps live-executor
 wait_service_healthy live-executor ||
   fail "autonomous LIVE executor did not become healthy"
+mark_phase LIVE_EXECUTOR_STARTED
+mark_phase POST_LIVE_VERIFYING
 compose run --rm --no-deps \
   --entrypoint /usr/local/bin/autonomous-live-control \
   live-executor status
@@ -646,6 +774,8 @@ assert_live_environment
   unset PHOENIX_MODE LIVE_EXECUTION AUTONOMOUS_EXECUTION
   PHOENIX_RELEASE_ENV="$release_env" "$deploy_dir/production-healthcheck.sh"
 )
+run_post_live_stabilization ||
+  fail "post-LIVE stabilization failed"
 
 printf '%s\n' "$release_sha" >"$pointer_candidate"
 printf '%s\n' "$release_sha" >"$assets_pointer_candidate"
@@ -668,6 +798,7 @@ python3 "$deploy_dir/production_context.py" write-state \
   --rendered-output "$context_rendered" \
   --metadata-output "$context_metadata" \
   --output "$context_candidate" >/dev/null
+mark_phase POST_LIVE_VERIFIED
 
 install_active_file "$metadata_candidate" "$release_metadata" 0640
 install_active_file "$state_candidate" "$release_state" 0640
@@ -678,6 +809,7 @@ install_active_file "$assets_pointer_candidate" "$release_assets_file" 0640
 install_active_file "$pointer_candidate" "$current_file" 0640
 verify_active_release_coherence "$release_sha" "$rollback_sha" ||
   fail "candidate release pointers are incoherent after promotion"
+mark_phase COMPLETED
 rm -f "$candidate_release_assets_file"
 
 trap - EXIT HUP INT TERM

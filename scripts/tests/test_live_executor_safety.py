@@ -214,32 +214,37 @@ class LiveExecutorSafetyTests(unittest.TestCase):
         self.assertIn('if "SIGNER_PRIVATE_KEY" in environment:', workflow)
 
     def test_autonomous_deployment_is_exact_release_gated_and_preflight_first(self) -> None:
-        workflow = (
+        legacy = (
             ROOT / ".github/workflows/deploy-autonomous-live.yml"
+        ).read_text(encoding="utf-8")
+        self.assertIn("deprecated and disabled", legacy)
+        self.assertNotIn("scp ", legacy)
+        workflow = (
+            ROOT / ".github/workflows/phoenix-release-controller.yml"
         ).read_text(encoding="utf-8")
         for required in (
             "environment: production-live",
-            '[ "$(git rev-parse FETCH_HEAD)" = "$RELEASE_SHA" ]',
-            "validate-source-ci-api",
+            "verify-source-ci",
             "validate-deploy-pair",
-            "phoenix-release-assets-${{ inputs.release_sha }}",
-            "$remote:$stage/rollback-manifest.json",
-            "$remote:$stage/rollback-provenance.json",
-            "/usr/local/sbin/phoenix-autonomous-live-deploy-gateway",
+            "phoenix-release-assets-${{ needs.prepare.outputs.release_sha }}",
+            "rollback-manifest.json",
+            "rollback-provenance.json",
+            '"receive ${RELEASE_SHA}"',
+            '"resume ${RELEASE_SHA}"',
         ):
             self.assertIn(required, workflow)
 
-        gateway = (
-            ROOT / "scripts/phoenix-autonomous-live-deploy-gateway.sh"
-        ).read_text(encoding="utf-8")
-        active_context = gateway.index('"$current_validator"')
-        immutable_install = gateway.index('"$libexec/install-release-assets.sh"')
-        live_deploy = gateway.index('"$deploy_dir/deploy-release.sh"')
+        gateway = (ROOT / "scripts/phoenix_release/gateway.py").read_text(
+            encoding="utf-8"
+        )
+        active_context = gateway.index("_host_preflight(paths, request)")
+        immutable_install = gateway.index("_install_candidate(paths, request)")
+        live_deploy = gateway.index('"deploy-release.sh"')
         self.assertLess(active_context, immutable_install)
         self.assertLess(immutable_install, live_deploy)
         self.assertIn("validate-deploy-pair", gateway)
         self.assertIn("verify-tree", gateway)
-        self.assertIn("current_release_mismatch", gateway)
+        self.assertIn("ACTIVE_RELEASE_CHANGED", gateway)
 
         deployment = (ROOT / "scripts/deploy-release.sh").read_text(encoding="utf-8")
         candidate_mode_live = deployment.index(

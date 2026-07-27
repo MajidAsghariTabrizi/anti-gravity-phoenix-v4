@@ -48,12 +48,16 @@ STATIC_PATHS = (
     "prometheus/prometheus.yml",
     "scripts/bootstrap-production.sh",
     "scripts/deploy-release.sh",
+    "scripts/finalize-phoenix-deploy-bootstrap.sh",
     "scripts/install-production-release-context.sh",
     "scripts/install-release-assets.sh",
     "scripts/install-autonomous-live-deploy-gateway.sh",
+    "scripts/install-phoenix-release-platform.sh",
     "scripts/install-shadow-deploy-gateway.sh",
     "scripts/phoenix-shadow-deploy-gateway.sh",
     "scripts/phoenix-autonomous-live-deploy-gateway.sh",
+    "scripts/phoenix-release-gateway.sh",
+    "scripts/phoenix-release-transport.sh",
     "scripts/phoenix_shadow_deploy.py",
     "scripts/hunter_contracts.py",
     "scripts/prelive-money-path-report.sh",
@@ -94,6 +98,7 @@ GLOB_PATHS = (
     "migrations/*.sql",
     "schemas/*.json",
     "scripts/sql/*.sql",
+    "scripts/phoenix_release/*.py",
 )
 CONTRACT_TARGET = "contracts/PhoenixExecutor.compiled.json"
 MANIFEST_NAME = "release-assets-manifest.json"

@@ -1,0 +1,555 @@
+name: Phoenix Release Controller
+
+on:
+  workflow_run:
+    workflows: ["Phoenix CI"]
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      release_sha:
+        description: Exact current main SHA to resume or release
+        required: true
+        type: string
+      source_ci_run_id:
+        description: Exact successful Phoenix CI main-push run
+        required: true
+        type: string
+      source_ci_run_attempt:
+        description: Exact successful Phoenix CI attempt
+        required: true
+        default: "1"
+        type: string
+  schedule:
+    - cron: "*/10 * * * *"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: phoenix-production-release
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    name: verify-release-eligibility
+    if: ${{ vars.PHOENIX_AUTORELEASE_ENABLED == 'true' && (github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success') }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      actions: read
+      contents: read
+    outputs:
+      release_sha: ${{ steps.request.outputs.release_sha }}
+      source_ci_run_id: ${{ steps.request.outputs.source_ci_run_id }}
+      source_ci_run_attempt: ${{ steps.request.outputs.source_ci_run_attempt }}
+      should_release: ${{ steps.impact.outputs.should_release }}
+      build_required: ${{ steps.existing.outputs.build_required }}
+      build_run_id: ${{ steps.existing.outputs.build_run_id }}
+    steps:
+      - name: Checkout protected main
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          ref: main
+          fetch-depth: 2
+          persist-credentials: false
+
+      - name: Resolve exact source CI request
+        id: request
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          EVENT_NAME: ${{ github.event_name }}
+          EVENT_PATH: ${{ github.event_path }}
+          DISPATCH_SHA: ${{ inputs.release_sha }}
+          DISPATCH_CI_RUN_ID: ${{ inputs.source_ci_run_id }}
+          DISPATCH_CI_ATTEMPT: ${{ inputs.source_ci_run_attempt }}
+        run: |
+          set -euo pipefail
+          case "$EVENT_NAME" in
+            workflow_run)
+              release_sha="$(jq -er '.workflow_run.head_sha' "$EVENT_PATH")"
+              source_ci_run_id="$(jq -er '.workflow_run.id' "$EVENT_PATH")"
+              source_ci_run_attempt="$(jq -er '.workflow_run.run_attempt' "$EVENT_PATH")"
+              [ "$(jq -er '.workflow_run.conclusion' "$EVENT_PATH")" = success ]
+              [ "$(jq -er '.workflow_run.head_branch' "$EVENT_PATH")" = main ]
+              [ "$(jq -er '.workflow_run.repository.full_name' "$EVENT_PATH")" = "$GITHUB_REPOSITORY" ]
+              ;;
+            workflow_dispatch)
+              release_sha="$DISPATCH_SHA"
+              source_ci_run_id="$DISPATCH_CI_RUN_ID"
+              source_ci_run_attempt="$DISPATCH_CI_ATTEMPT"
+              ;;
+            schedule)
+              release_sha="$(git rev-parse origin/main)"
+              runs="$(
+                gh api \
+                  "repos/${GITHUB_REPOSITORY}/actions/workflows/ci.yml/runs?branch=main&event=push&status=success&per_page=20"
+              )"
+              source_ci_run_id="$(
+                jq -er --arg sha "$release_sha" \
+                  '[.workflow_runs[] | select(.head_sha == $sha)][0].id' <<<"$runs"
+              )"
+              source_ci_run_attempt="$(
+                jq -er --arg sha "$release_sha" \
+                  '[.workflow_runs[] | select(.head_sha == $sha)][0].run_attempt' <<<"$runs"
+              )"
+              ;;
+            *)
+              echo "unsupported trigger"
+              exit 1
+              ;;
+          esac
+          [[ "$release_sha" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$source_ci_run_id" =~ ^[1-9][0-9]*$ ]]
+          [[ "$source_ci_run_attempt" =~ ^[1-9][0-9]*$ ]]
+          current_main="$(git rev-parse origin/main)"
+          [ "$release_sha" = "$current_main" ] || {
+            echo "release SHA is not the exact protected main tip"
+            exit 1
+          }
+          printf 'release_sha=%s\n' "$release_sha" >>"$GITHUB_OUTPUT"
+          printf 'source_ci_run_id=%s\n' "$source_ci_run_id" >>"$GITHUB_OUTPUT"
+          printf 'source_ci_run_attempt=%s\n' "$source_ci_run_attempt" >>"$GITHUB_OUTPUT"
+
+      - name: Verify every required source CI job
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_SHA: ${{ steps.request.outputs.release_sha }}
+          SOURCE_CI_RUN_ID: ${{ steps.request.outputs.source_ci_run_id }}
+          SOURCE_CI_RUN_ATTEMPT: ${{ steps.request.outputs.source_ci_run_attempt }}
+        run: |
+          set -euo pipefail
+          mkdir -p source-ci
+          gh api \
+            "repos/${GITHUB_REPOSITORY}/actions/runs/${SOURCE_CI_RUN_ID}/attempts/${SOURCE_CI_RUN_ATTEMPT}" \
+            >source-ci/run.json
+          gh api \
+            "repos/${GITHUB_REPOSITORY}/actions/runs/${SOURCE_CI_RUN_ID}/attempts/${SOURCE_CI_RUN_ATTEMPT}/jobs?per_page=100" \
+            >source-ci/jobs.json
+          python3 -m scripts.phoenix_release.controller verify-source-ci \
+            --run source-ci/run.json \
+            --jobs source-ci/jobs.json \
+            --repository "$GITHUB_REPOSITORY" \
+            --expected-sha "$RELEASE_SHA" \
+            --run-id "$SOURCE_CI_RUN_ID" \
+            --run-attempt "$SOURCE_CI_RUN_ATTEMPT" \
+            --current-main-sha "$(git rev-parse origin/main)" \
+            >source-ci/controller-evidence.json
+
+      - name: Classify release impact
+        id: impact
+        shell: bash
+        env:
+          RELEASE_SHA: ${{ steps.request.outputs.release_sha }}
+        run: |
+          set -euo pipefail
+          git diff --name-only "${RELEASE_SHA}^1" "$RELEASE_SHA" >changed-paths.txt
+          impact="$(
+            python3 -m scripts.phoenix_release.controller classify-impact \
+              --paths changed-paths.txt
+          )"
+          if [ "$impact" = docs-only ]; then
+            echo "should_release=false" >>"$GITHUB_OUTPUT"
+            echo "Documentation-only change: no production release created." >>"$GITHUB_STEP_SUMMARY"
+          else
+            echo "should_release=true" >>"$GITHUB_OUTPUT"
+          fi
+
+      - name: Locate an existing exact-SHA immutable build
+        id: existing
+        if: ${{ steps.impact.outputs.should_release == 'true' }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_SHA: ${{ steps.request.outputs.release_sha }}
+        run: |
+          set -euo pipefail
+          artifacts="$(
+            gh api \
+              "repos/${GITHUB_REPOSITORY}/actions/artifacts?name=phoenix-release-manifest-${RELEASE_SHA}&per_page=100"
+          )"
+          build_run_id="$(
+            jq -r \
+              '[.artifacts[] | select(.expired == false)] | sort_by(.created_at) | reverse | .[0].workflow_run.id // empty' \
+              <<<"$artifacts"
+          )"
+          if [ -n "$build_run_id" ]; then
+            run="$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${build_run_id}")"
+            if [ "$(jq -r '.head_sha' <<<"$run")" = "$RELEASE_SHA" ]; then
+              printf 'build_required=false\nbuild_run_id=%s\n' "$build_run_id" >>"$GITHUB_OUTPUT"
+              exit 0
+            fi
+          fi
+          printf 'build_required=true\nbuild_run_id=%s\n' "$GITHUB_RUN_ID" >>"$GITHUB_OUTPUT"
+
+  build:
+    name: immutable-build
+    needs: [prepare, host-plan]
+    if: ${{ needs.prepare.outputs.should_release == 'true' && needs.prepare.outputs.build_required == 'true' && needs.host-plan.outputs.already_active != 'true' }}
+    permissions:
+      actions: read
+      contents: read
+      packages: write
+    uses: ./.github/workflows/build-images.yml
+    with:
+      release_sha: ${{ needs.prepare.outputs.release_sha }}
+      release_intent: PHOENIX_PRELIVE_SHADOW_V5
+      confirm_publish: PUBLISH_IMMUTABLE_PHOENIX_IMAGES
+      ci_run_id: ${{ needs.prepare.outputs.source_ci_run_id }}
+      ci_run_attempt: ${{ needs.prepare.outputs.source_ci_run_attempt }}
+      protected_base_sha: ${{ needs.host-plan.outputs.rollback_sha }}
+      protected_base_build_run_id: ${{ needs.host-plan.outputs.rollback_build_run_id }}
+    secrets: inherit
+
+  host-plan:
+    name: read-active-release-plan
+    needs: prepare
+    if: ${{ needs.prepare.outputs.should_release == 'true' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    environment: production-live
+    permissions:
+      contents: read
+    outputs:
+      rollback_sha: ${{ steps.active.outputs.rollback_sha }}
+      rollback_build_run_id: ${{ steps.active.outputs.rollback_build_run_id }}
+      already_active: ${{ steps.active.outputs.already_active }}
+    steps:
+      - name: Install restricted SSH identity
+        shell: bash
+        env:
+          PROD_SSH_PRIVATE_KEY: ${{ secrets.PROD_SSH_PRIVATE_KEY }}
+          PROD_KNOWN_HOSTS: ${{ secrets.PROD_KNOWN_HOSTS }}
+        run: |
+          set -euo pipefail
+          [ -n "$PROD_SSH_PRIVATE_KEY" ] && [ -n "$PROD_KNOWN_HOSTS" ]
+          install -d -m 0700 "$HOME/.ssh"
+          printf '%s\n' "$PROD_SSH_PRIVATE_KEY" >"$HOME/.ssh/id_ed25519"
+          printf '%s\n' "$PROD_KNOWN_HOSTS" >"$HOME/.ssh/known_hosts"
+          chmod 0600 "$HOME/.ssh/id_ed25519" "$HOME/.ssh/known_hosts"
+
+      - name: Read active immutable release
+        id: active
+        shell: bash
+        env:
+          PROD_HOST: ${{ secrets.PROD_HOST }}
+          PROD_PORT: ${{ secrets.PROD_PORT }}
+          PROD_USER: ${{ secrets.PROD_USER }}
+          RELEASE_SHA: ${{ needs.prepare.outputs.release_sha }}
+        run: |
+          set -euo pipefail
+          [ "$PROD_USER" = phoenix-deploy ]
+          [[ "$PROD_HOST" =~ ^[A-Za-z0-9._-]+$ ]]
+          [[ "$PROD_PORT" =~ ^[1-9][0-9]{0,4}$ ]]
+          ssh_opts=(
+            -i "$HOME/.ssh/id_ed25519"
+            -p "$PROD_PORT"
+            -o BatchMode=yes
+            -o IdentitiesOnly=yes
+            -o StrictHostKeyChecking=yes
+            -o UserKnownHostsFile="$HOME/.ssh/known_hosts"
+            -o ConnectTimeout=20
+          )
+          ssh "${ssh_opts[@]}" "${PROD_USER}@${PROD_HOST}" status >active.json
+          rollback_sha="$(jq -er '.active_release' active.json)"
+          rollback_build_run_id="$(jq -er '.active_build_run_id' active.json)"
+          [[ "$rollback_sha" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$rollback_build_run_id" =~ ^[1-9][0-9]*$ ]]
+          [ "$rollback_sha" != 8f6a1c362773ba9e764954883402b0d6c7375349 ]
+          printf 'rollback_sha=%s\n' "$rollback_sha" >>"$GITHUB_OUTPUT"
+          printf 'rollback_build_run_id=%s\n' "$rollback_build_run_id" >>"$GITHUB_OUTPUT"
+          if [ "$rollback_sha" = "$RELEASE_SHA" ]; then
+            echo "already_active=true" >>"$GITHUB_OUTPUT"
+          else
+            echo "already_active=false" >>"$GITHUB_OUTPUT"
+          fi
+
+  deploy:
+    name: deploy-through-release-gateway
+    needs: [prepare, host-plan, build]
+    if: ${{ always() && needs.prepare.result == 'success' && needs.host-plan.result == 'success' && needs.prepare.outputs.should_release == 'true' && (needs.build.result == 'success' || needs.build.result == 'skipped') }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 75
+    environment: production-live
+    permissions:
+      actions: read
+      contents: read
+      deployments: write
+    steps:
+      - name: Checkout exact protected main release
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          ref: ${{ needs.prepare.outputs.release_sha }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Install restricted SSH identity
+        shell: bash
+        env:
+          PROD_SSH_PRIVATE_KEY: ${{ secrets.PROD_SSH_PRIVATE_KEY }}
+          PROD_KNOWN_HOSTS: ${{ secrets.PROD_KNOWN_HOSTS }}
+        run: |
+          set -euo pipefail
+          [ -n "$PROD_SSH_PRIVATE_KEY" ] && [ -n "$PROD_KNOWN_HOSTS" ]
+          install -d -m 0700 "$HOME/.ssh"
+          printf '%s\n' "$PROD_SSH_PRIVATE_KEY" >"$HOME/.ssh/id_ed25519"
+          printf '%s\n' "$PROD_KNOWN_HOSTS" >"$HOME/.ssh/known_hosts"
+          chmod 0600 "$HOME/.ssh/id_ed25519" "$HOME/.ssh/known_hosts"
+
+      - name: Read active rollback identity through the gateway
+        id: active
+        shell: bash
+        env:
+          PROD_HOST: ${{ secrets.PROD_HOST }}
+          PROD_PORT: ${{ secrets.PROD_PORT }}
+          PROD_USER: ${{ secrets.PROD_USER }}
+          RELEASE_SHA: ${{ needs.prepare.outputs.release_sha }}
+        run: |
+          set -euo pipefail
+          [ "$PROD_USER" = phoenix-deploy ]
+          [[ "$PROD_HOST" =~ ^[A-Za-z0-9._-]+$ ]]
+          [[ "$PROD_PORT" =~ ^[1-9][0-9]{0,4}$ ]]
+          ssh_opts=(
+            -i "$HOME/.ssh/id_ed25519"
+            -p "$PROD_PORT"
+            -o BatchMode=yes
+            -o IdentitiesOnly=yes
+            -o StrictHostKeyChecking=yes
+            -o UserKnownHostsFile="$HOME/.ssh/known_hosts"
+            -o ConnectTimeout=20
+          )
+          ssh "${ssh_opts[@]}" "${PROD_USER}@${PROD_HOST}" status >active.json
+          rollback_sha="$(jq -er '.active_release' active.json)"
+          rollback_build_run_id="$(jq -er '.active_build_run_id' active.json)"
+          [[ "$rollback_sha" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$rollback_build_run_id" =~ ^[1-9][0-9]*$ ]]
+          [ "$rollback_sha" = "${{ needs.host-plan.outputs.rollback_sha }}" ]
+          [ "$rollback_build_run_id" = "${{ needs.host-plan.outputs.rollback_build_run_id }}" ]
+          if [ "$rollback_sha" = "$RELEASE_SHA" ]; then
+            echo "already_active=true" >>"$GITHUB_OUTPUT"
+            echo "Exact release is already active; deployment is idempotently complete." \
+              >>"$GITHUB_STEP_SUMMARY"
+          else
+            echo "already_active=false" >>"$GITHUB_OUTPUT"
+          fi
+          printf 'rollback_sha=%s\n' "$rollback_sha" >>"$GITHUB_OUTPUT"
+          printf 'rollback_build_run_id=%s\n' "$rollback_build_run_id" >>"$GITHUB_OUTPUT"
+
+      - name: Download exact release manifest
+        if: ${{ steps.active.outputs.already_active != 'true' }}
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: phoenix-release-manifest-${{ needs.prepare.outputs.release_sha }}
+          run-id: ${{ needs.prepare.outputs.build_run_id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          path: package
+
+      - name: Download exact release assets
+        if: ${{ steps.active.outputs.already_active != 'true' }}
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: phoenix-release-assets-${{ needs.prepare.outputs.release_sha }}
+          run-id: ${{ needs.prepare.outputs.build_run_id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          path: package
+
+      - name: Download immutable rollback evidence
+        if: ${{ steps.active.outputs.already_active != 'true' }}
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: phoenix-release-manifest-${{ steps.active.outputs.rollback_sha }}
+          run-id: ${{ steps.active.outputs.rollback_build_run_id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          path: rollback
+
+      - name: Create GitHub deployment
+        id: deployment
+        if: ${{ steps.active.outputs.already_active != 'true' }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_SHA: ${{ needs.prepare.outputs.release_sha }}
+        run: |
+          set -euo pipefail
+          deployment_id="$(
+            gh api --method POST \
+              "repos/${GITHUB_REPOSITORY}/deployments" \
+              -f ref="$RELEASE_SHA" \
+              -f environment=production-live \
+              -f description="Phoenix automated production release" \
+              -F auto_merge=false \
+              --jq '.id'
+          )"
+          printf 'id=%s\n' "$deployment_id" >>"$GITHUB_OUTPUT"
+          gh api --method POST \
+            "repos/${GITHUB_REPOSITORY}/deployments/${deployment_id}/statuses" \
+            -f state=in_progress \
+            -f environment=production-live \
+            -f description="Immutable build verified; host release started" >/dev/null
+
+      - name: Verify, package, receive, and resume
+        id: release
+        if: ${{ steps.active.outputs.already_active != 'true' }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PROD_HOST: ${{ secrets.PROD_HOST }}
+          PROD_PORT: ${{ secrets.PROD_PORT }}
+          PROD_USER: ${{ secrets.PROD_USER }}
+          RELEASE_SHA: ${{ needs.prepare.outputs.release_sha }}
+          SOURCE_CI_RUN_ID: ${{ needs.prepare.outputs.source_ci_run_id }}
+          SOURCE_CI_RUN_ATTEMPT: ${{ needs.prepare.outputs.source_ci_run_attempt }}
+          BUILD_RUN_ID: ${{ needs.prepare.outputs.build_run_id }}
+          ROLLBACK_SHA: ${{ steps.active.outputs.rollback_sha }}
+          ROLLBACK_BUILD_RUN_ID: ${{ steps.active.outputs.rollback_build_run_id }}
+        run: |
+          set -euo pipefail
+          cp rollback/release-manifest.json package/rollback-manifest.json
+          cp rollback/release-provenance.json package/rollback-provenance.json
+          python3 -m scripts.phoenix_release.controller verify-source-ci \
+            --run <(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${SOURCE_CI_RUN_ID}/attempts/${SOURCE_CI_RUN_ATTEMPT}") \
+            --jobs <(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${SOURCE_CI_RUN_ID}/attempts/${SOURCE_CI_RUN_ATTEMPT}/jobs?per_page=100") \
+            --repository "$GITHUB_REPOSITORY" \
+            --expected-sha "$RELEASE_SHA" \
+            --run-id "$SOURCE_CI_RUN_ID" \
+            --run-attempt "$SOURCE_CI_RUN_ATTEMPT" \
+            --current-main-sha "$RELEASE_SHA" >/dev/null
+          python3 scripts/release_assets.py verify \
+            --archive "package/phoenix-release-assets-${RELEASE_SHA}.tar.gz" \
+            --manifest package/release-assets-manifest.json \
+            --checksums package/release-assets-checksums.txt \
+            --expected-sha "$RELEASE_SHA"
+          python3 scripts/release_provenance.py validate-deploy-pair \
+            --release-manifest package/release-manifest.json \
+            --release-provenance package/release-provenance.json \
+            --release-sha "$RELEASE_SHA" \
+            --build-run-id "$BUILD_RUN_ID" \
+            --rollback-manifest package/rollback-manifest.json \
+            --rollback-provenance package/rollback-provenance.json \
+            --rollback-sha "$ROLLBACK_SHA" \
+            --rollback-build-run-id "$ROLLBACK_BUILD_RUN_ID"
+          python3 - "$RELEASE_SHA" "$ROLLBACK_SHA" "$SOURCE_CI_RUN_ID" \
+            "$SOURCE_CI_RUN_ATTEMPT" "$BUILD_RUN_ID" "$ROLLBACK_BUILD_RUN_ID" \
+            "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" >package/request.json <<'PY'
+          import json
+          import sys
+          from scripts.phoenix_release import PROTOCOL_VERSION
+
+          keys = (
+              "release_sha",
+              "rollback_sha",
+              "source_ci_run_id",
+              "source_ci_run_attempt",
+              "build_run_id",
+              "rollback_build_run_id",
+              "deploy_run_id",
+              "deploy_run_attempt",
+          )
+          values = sys.argv[1:]
+          request = dict(zip(keys, values, strict=True))
+          for key in keys[2:]:
+              request[key] = int(request[key])
+          request.update(
+              schema="phoenix.release-request.v1",
+              protocol_version=PROTOCOL_VERSION,
+          )
+          print(json.dumps(request, indent=2, sort_keys=True))
+          PY
+          (
+            cd package
+            tar --create --gzip --file ../release-package.tar.gz \
+              --sort=name --mtime='@0' --owner=0 --group=0 --numeric-owner \
+              "phoenix-release-assets-${RELEASE_SHA}.tar.gz" \
+              release-assets-checksums.txt release-assets-manifest.json \
+              release-manifest.json release-provenance.json request.json \
+              rollback-manifest.json rollback-provenance.json
+          )
+          ssh_opts=(
+            -i "$HOME/.ssh/id_ed25519"
+            -p "$PROD_PORT"
+            -o BatchMode=yes
+            -o IdentitiesOnly=yes
+            -o StrictHostKeyChecking=yes
+            -o UserKnownHostsFile="$HOME/.ssh/known_hosts"
+            -o ConnectTimeout=20
+            -o ServerAliveInterval=15
+            -o ServerAliveCountMax=8
+          )
+          if ssh "${ssh_opts[@]}" "${PROD_USER}@${PROD_HOST}" \
+            "evidence ${RELEASE_SHA}" >existing-evidence.json 2>/dev/null
+          then
+            jq -e --arg sha "$RELEASE_SHA" --argjson build "$BUILD_RUN_ID" \
+              '.release_sha == $sha and .build_run_id == $build' \
+              existing-evidence.json >/dev/null
+            cp existing-evidence.json receive-evidence.json
+          else
+            cat release-package.tar.gz |
+              ssh "${ssh_opts[@]}" "${PROD_USER}@${PROD_HOST}" \
+                "receive ${RELEASE_SHA}" >receive-evidence.json
+          fi
+          ssh "${ssh_opts[@]}" "${PROD_USER}@${PROD_HOST}" "resume ${RELEASE_SHA}" \
+            >release-evidence.json
+          jq -e --arg sha "$RELEASE_SHA" \
+            '.release_sha == $sha and .current_phase == "COMPLETED"' \
+            release-evidence.json >/dev/null
+
+      - name: Publish successful deployment status
+        if: ${{ success() && steps.deployment.outputs.id != '' }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          DEPLOYMENT_ID: ${{ steps.deployment.outputs.id }}
+        run: |
+          set -euo pipefail
+          gh api --method POST \
+            "repos/${GITHUB_REPOSITORY}/deployments/${DEPLOYMENT_ID}/statuses" \
+            -f state=success \
+            -f environment=production-live \
+            -f description="Phoenix release completed and verified" >/dev/null
+
+      - name: Publish failed deployment status
+        if: ${{ failure() && steps.deployment.outputs.id != '' }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          DEPLOYMENT_ID: ${{ steps.deployment.outputs.id }}
+        run: |
+          set -euo pipefail
+          gh api --method POST \
+            "repos/${GITHUB_REPOSITORY}/deployments/${DEPLOYMENT_ID}/statuses" \
+            -f state=failure \
+            -f environment=production-live \
+            -f description="Phoenix release failed closed; inspect bounded evidence" >/dev/null
+
+      - name: Upload bounded release evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: phoenix-release-evidence-${{ needs.prepare.outputs.release_sha }}
+          path: |
+            active.json
+            receive-evidence.json
+            release-evidence.json
+          if-no-files-found: warn
+          retention-days: 90
+
+      - name: Write release summary
+        if: ${{ always() }}
+        shell: bash
+        env:
+          RELEASE_SHA: ${{ needs.prepare.outputs.release_sha }}
+          BUILD_RUN_ID: ${{ needs.prepare.outputs.build_run_id }}
+          ROLLBACK_SHA: ${{ steps.active.outputs.rollback_sha }}
+        run: |
+          {
+            echo "## Phoenix automated release"
+            echo
+            echo "- Release SHA: \`$RELEASE_SHA\`"
+            echo "- Immutable build run: \`$BUILD_RUN_ID\`"
+            echo "- Rollback SHA: \`$ROLLBACK_SHA\`"
+            echo "- Gateway protocol: \`phoenix-release.v1\`"
+            if [ -f release-evidence.json ]; then
+              echo "- Final phase: \`$(jq -r '.current_phase // "unknown"' release-evidence.json)\`"
+            fi
+          } >>"$GITHUB_STEP_SUMMARY"

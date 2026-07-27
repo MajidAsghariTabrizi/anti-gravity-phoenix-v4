@@ -54,11 +54,16 @@ jobs:
           sh -n scripts/*.sh
           shellcheck --severity=warning \
             scripts/deploy-release.sh \
+            scripts/finalize-phoenix-deploy-bootstrap.sh \
             scripts/install-autonomous-live-deploy-gateway.sh \
+            scripts/install-phoenix-release-platform.sh \
             scripts/install-production-release-context.sh \
             scripts/autonomous-live-release-contract-tests.sh \
             scripts/live-executor-isolated-fork-tests.sh \
             scripts/phoenix-autonomous-live-deploy-gateway.sh \
+            scripts/phoenix-release-gateway.sh \
+            scripts/phoenix-release-platform-tests.sh \
+            scripts/phoenix-release-transport.sh \
             scripts/production-healthcheck.sh \
             scripts/render-production-compose.sh \
             scripts/verify-image-runtime.sh \
@@ -87,6 +92,9 @@ jobs:
           sh ./scripts/prelive-shadow-control-tests.sh
           python3 -m py_compile scripts/release_assets.py
           python3 -m unittest scripts.tests.test_release_assets
+          python3 -m py_compile scripts/phoenix_release/*.py
+          python3 -m unittest scripts.tests.test_phoenix_release -v
+          sh ./scripts/phoenix-release-platform-tests.sh
           python3 -m py_compile scripts/hunter_contracts.py
           python3 scripts/hunter_contracts.py validate-fixtures
           python3 -m unittest scripts.tests.test_hunter_contracts

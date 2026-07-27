@@ -1,6 +1,38 @@
 name: Build Phoenix Images
 
 on:
+  workflow_call:
+    inputs:
+      release_sha:
+        description: Exact lowercase 40-character current main SHA
+        required: true
+        type: string
+      release_intent:
+        description: Bounded immutable release intent
+        required: true
+        type: string
+      confirm_publish:
+        description: Exact immutable publication acknowledgement
+        required: true
+        type: string
+      ci_run_id:
+        description: Exact successful Phoenix CI main-push run
+        required: true
+        type: string
+      ci_run_attempt:
+        description: Exact successful Phoenix CI attempt
+        required: true
+        type: string
+      protected_base_sha:
+        description: Optional exact protected-image base SHA
+        required: false
+        default: ""
+        type: string
+      protected_base_build_run_id:
+        description: Optional protected-image base build run
+        required: false
+        default: ""
+        type: string
   workflow_dispatch:
     inputs:
       release_sha:
