@@ -235,7 +235,9 @@ authorization = deploy_release.find(
 consume = deploy_release.find("consume_owner_authorization", authorization)
 configure = deploy_release.find("live-executor owner-configure")
 configured_preflight = deploy_release.find("live-executor owner-configured-preflight")
-production_mode = deploy_release.find("production_mode.py")
+production_mode = deploy_release.find(
+    'python3 "$deploy_dir/production_mode.py" live --env-file "$env_file"'
+)
 live_reload = deploy_release.find("reload_environment", production_mode)
 burn_in = deploy_release.find("run_live_engine_burn_in", live_reload)
 activation = deploy_release.find("live-executor activate")
@@ -339,10 +341,30 @@ preflight_render_body = (
 )
 require(
     preflight_render_body
-    and '--overlay-file "$overlay_file"' not in preflight_render_body
     and "validate_live_rpc_inputs" in preflight_render_body
     and "validate_live_rpc_inputs()" in deploy_release,
-    "prelive_shadow_render_uses_live_overlay",
+    "prelive_rpc_inputs_not_validated",
+)
+require(
+    'candidate_live_env="$state_dir/candidate-live.env"' in deploy_release
+    and 'cp "$env_file" "$candidate_live_env"' in preflight_render_body
+    and 'production_mode.py" live --env-file "$candidate_live_env"' in preflight_render_body
+    and 'validate-production-env.sh" "$candidate_live_env"' in preflight_render_body
+    and '--overlay-file "$overlay_file"' in preflight_render_body
+    and '--env-file "$candidate_live_env"' in preflight_render_body
+    and "validate_live_rpc_rendering" in preflight_render_body,
+    "candidate_live_overlay_preflight_missing",
+)
+require(
+    "production_environment_identity()" in deploy_release
+    and "active_environment_identity_before" in preflight_render_body
+    and "active_environment_identity_after" in preflight_render_body
+    and (
+        '[ "$active_environment_identity_after" = '
+        '"$active_environment_identity_before" ]'
+    )
+    in preflight_render_body,
+    "candidate_preflight_does_not_prove_active_environment_unchanged",
 )
 preflight_rpc_gate = deploy_release.find(
     'fail "preflight LIVE RPC provider and priority configuration is invalid"'

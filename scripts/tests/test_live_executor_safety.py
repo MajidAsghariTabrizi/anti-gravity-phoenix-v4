@@ -242,12 +242,22 @@ class LiveExecutorSafetyTests(unittest.TestCase):
         self.assertIn("current_release_mismatch", gateway)
 
         deployment = (ROOT / "scripts/deploy-release.sh").read_text(encoding="utf-8")
+        candidate_mode_live = deployment.index(
+            'production_mode.py" live --env-file "$candidate_live_env"'
+        )
+        candidate_overlay = deployment.index(
+            '--overlay-file "$overlay_file"', candidate_mode_live
+        )
         preflight = deployment.index("live-executor preflight")
         previous_release = deployment.index('cp "$current_file" "$previous_file"')
-        mode_live = deployment.index("production_mode.py\" live")
+        mode_live = deployment.index(
+            'production_mode.py" live --env-file "$env_file"'
+        )
         migration = deployment.index("live-executor migrate")
         activation = deployment.index("live-executor activate")
         executor_start = deployment.index("compose up -d --no-deps live-executor")
+        self.assertLess(candidate_mode_live, candidate_overlay)
+        self.assertLess(candidate_overlay, preflight)
         self.assertLess(preflight, previous_release)
         self.assertLess(previous_release, mode_live)
         self.assertLess(mode_live, migration)
@@ -255,6 +265,11 @@ class LiveExecutorSafetyTests(unittest.TestCase):
         self.assertLess(activation, executor_start)
         self.assertIn("EXTERNAL_OWNER_AUTHORIZATION_REQUIRED", deployment)
         self.assertIn("EXTERNAL_GAS_FUNDING_REQUIRED", deployment)
+        self.assertIn(
+            '"$active_environment_identity_after" = '
+            '"$active_environment_identity_before"',
+            deployment,
+        )
 
     def test_autonomous_rollback_disarms_reconciles_then_restores(self) -> None:
         rollback = (ROOT / "scripts/rollback-release.sh").read_text(encoding="utf-8")

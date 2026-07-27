@@ -135,6 +135,7 @@ trap cleanup_candidate EXIT
 trap 'exit 1' HUP INT TERM
 rendered_candidate="$state_dir/compose.rendered.json"
 metadata_candidate="$state_dir/render.metadata.json"
+candidate_live_env="$state_dir/candidate-live.env"
 state_candidate="$state_dir/release-state.json"
 pointer_candidate="$state_dir/current-release"
 assets_pointer_candidate="$state_dir/release-assets.sha"
@@ -232,6 +233,21 @@ if len(priorities) != 2 or any(
     raise SystemExit(1)
 PY
 }
+
+production_environment_identity() {
+  identity_path=$1
+  [ -f "$identity_path" ] && [ ! -L "$identity_path" ] || return 1
+  identity_metadata=$(stat -c '%d:%i:%u:%g:%a:%h:%s' "$identity_path") ||
+    return 1
+  identity_digest=$(sha256sum "$identity_path" | awk 'NR == 1 { print $1 }') ||
+    return 1
+  case "$identity_digest" in
+    *[!0-9a-f]*|"") return 1 ;;
+  esac
+  [ "${#identity_digest}" -eq 64 ] || return 1
+  printf '%s:%s\n' "$identity_metadata" "$identity_digest"
+}
+
 validate_live_rpc_rendering() {
   python3 -I -B - \
     "$rendered_candidate" "$PRODUCTION_RPC_URL" "$SECONDARY_RPC_URL" <<'PY'
@@ -384,6 +400,8 @@ consume_owner_authorization() {
 
 verify_active_release_coherence "$rollback_sha" "" ||
   fail "active release pointers are incoherent before deployment"
+active_environment_identity_before=$(production_environment_identity "$env_file") ||
+  fail "active production environment identity is unavailable before preflight"
 "$deploy_dir/render-production-compose.sh" \
   --compose-file "$compose_file" \
   --env-file "$env_file" \
@@ -394,6 +412,30 @@ verify_active_release_coherence "$rollback_sha" "" ||
   fail "preflight production rendering failed"
 validate_live_rpc_inputs ||
   fail "preflight LIVE RPC provider and priority configuration is invalid"
+cp "$env_file" "$candidate_live_env" ||
+  fail "candidate LIVE environment could not be copied"
+chmod 0600 "$candidate_live_env"
+[ "$(stat -c '%u:%g:%a:%h' "$candidate_live_env")" = 0:0:600:1 ] ||
+  fail "candidate LIVE environment metadata is unsafe"
+python3 "$deploy_dir/production_mode.py" live --env-file "$candidate_live_env" ||
+  fail "candidate LIVE environment could not be materialized"
+"$deploy_dir/validate-production-env.sh" "$candidate_live_env"
+"$deploy_dir/render-production-compose.sh" \
+  --compose-file "$compose_file" \
+  --overlay-file "$overlay_file" \
+  --env-file "$candidate_live_env" \
+  --release-env "$release_env" \
+  --release-manifest "$manifest" \
+  --output "$rendered_candidate" \
+  --metadata-output "$metadata_candidate" >/dev/null ||
+  fail "candidate LIVE overlay rendering failed"
+validate_live_rpc_rendering ||
+  fail "candidate LIVE RPC provider and priority rendering is invalid"
+rm -f "$candidate_live_env"
+active_environment_identity_after=$(production_environment_identity "$env_file") ||
+  fail "active production environment identity is unavailable after preflight"
+[ "$active_environment_identity_after" = "$active_environment_identity_before" ] ||
+  fail "active production environment changed during candidate preflight"
 capture_protected_ids "$protected_before" || fail "protected services are not ready before deployment"
 
 rollback_on_failure() {
