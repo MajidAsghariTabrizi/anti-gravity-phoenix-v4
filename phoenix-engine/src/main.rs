@@ -1,5 +1,6 @@
 use phoenix_engine::autonomous::{
-    AutonomousHunterProcessor, PostgresAutonomousCandidateStore, RpcHunterStateClient,
+    AutonomousError, AutonomousHunterProcessor, PostgresAutonomousCandidateStore,
+    RpcHunterStateClient,
 };
 use phoenix_engine::config::EngineConfig;
 use phoenix_engine::domain::Address;
@@ -19,11 +20,12 @@ use phoenix_engine::runtime::{
 use phoenix_engine::runtime_state::RuntimeReadiness;
 use phoenix_engine::shadow_processor::{RouteRegistry, ShadowProcessor};
 use phoenix_recorder::engine_stream::{
-    ensure_engine_pipeline, ENGINE_DURABLE_NAME, ENGINE_STREAM_NAME,
+    ensure_engine_pipeline, EngineStreamError, ENGINE_DURABLE_NAME, ENGINE_STREAM_NAME,
 };
 use phoenix_recorder::logging::LogSampler;
 use std::collections::HashSet;
 use std::error::Error;
+use std::fmt;
 use std::io;
 use std::sync::Arc;
 use std::time::Duration;
@@ -54,6 +56,53 @@ struct DaemonConfig {
     executor_address: Option<String>,
     executor_code_hash: Option<String>,
     hunter_maximum_input: u128,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct DaemonFailure {
+    runtime_exit_class: &'static str,
+    stage: String,
+    error_class: String,
+    failure_scope: &'static str,
+    suppressed_count: u64,
+}
+
+impl From<&'static str> for DaemonFailure {
+    fn from(error_class: &'static str) -> Self {
+        Self {
+            runtime_exit_class: "startup_failure",
+            stage: "startup_configuration".to_string(),
+            error_class: error_class.to_string(),
+            failure_scope: "process",
+            suppressed_count: 0,
+        }
+    }
+}
+
+impl DaemonFailure {
+    fn process(stage: &'static str, error_class: &'static str) -> Self {
+        Self {
+            runtime_exit_class: "integrity_failure",
+            stage: stage.to_string(),
+            error_class: error_class.to_string(),
+            failure_scope: "process",
+            suppressed_count: 0,
+        }
+    }
+}
+
+fn pipeline_integrity_failure(error: &EngineStreamError) -> DaemonFailure {
+    DaemonFailure::process("jetstream_contract_validation", error.class())
+}
+
+impl fmt::Display for DaemonFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "{} at {} ({})",
+            self.runtime_exit_class, self.stage, self.error_class
+        )
+    }
 }
 
 impl DaemonConfig {
@@ -118,8 +167,15 @@ impl DaemonConfig {
 async fn main() -> Result<(), Box<dyn Error>> {
     init_logging();
     if let Err(error) = run_daemon().await {
-        tracing::error!(event = "phoenix_engine_stopped", error_class = error);
-        return Err(io::Error::other(error).into());
+        tracing::error!(
+            event = "phoenix_engine_stopped",
+            runtime_exit_class = error.runtime_exit_class,
+            stage = %error.stage,
+            error_class = %error.error_class,
+            failure_scope = error.failure_scope,
+            suppressed_count = error.suppressed_count
+        );
+        return Err(io::Error::other(error.to_string()).into());
     }
     Ok(())
 }
@@ -135,7 +191,7 @@ fn init_logging() {
         .init();
 }
 
-async fn run_daemon() -> Result<(), &'static str> {
+async fn run_daemon() -> Result<(), DaemonFailure> {
     let config = DaemonConfig::from_env()?;
     let readiness = RuntimeReadiness::new();
     let metrics = RuntimeMetrics::default();
@@ -219,7 +275,7 @@ async fn run_daemon() -> Result<(), &'static str> {
             &[include_str!("../../config/phoenix-route-policy-v1.json")],
             bounds,
         )
-        .map_err(|_| "invalid autonomous Hunter contracts")?;
+        .map_err(|error| DaemonFailure::process("hunter_route_selection", error.code()))?;
         let core = HunterCore::new(
             HunterMode::Live,
             graph.clone(),
@@ -233,14 +289,28 @@ async fn run_daemon() -> Result<(), &'static str> {
                 shadow_maximum_input: config.hunter_maximum_input,
             },
         )
-        .map_err(|_| "invalid autonomous Hunter economics")?;
-        let state_provider = Arc::new(
-            RpcHunterStateClient::new(&config.rpc_gateway_url)
-                .map_err(|_| "invalid Hunter state client")?,
-        );
+        .map_err(|error| DaemonFailure::process("hunter_route_simulation", error.code()))?;
+        let state_provider = Arc::new(RpcHunterStateClient::new(&config.rpc_gateway_url).map_err(
+            |_| DaemonFailure::process("hunter_state_request", "hunter_state_client_configuration"),
+        )?);
         let candidate_store = PostgresAutonomousCandidateStore::connect(&config.postgres_dsn)
             .await
-            .map_err(|_| "autonomous candidate store unavailable")?;
+            .map_err(|error| match error {
+                AutonomousError::ProcessIntegrity(context) => {
+                    DaemonFailure::process(context.stage, context.error_class)
+                }
+                AutonomousError::Dependency => DaemonFailure {
+                    runtime_exit_class: "startup_dependency_failure",
+                    stage: "autonomous_candidate_persistence".to_string(),
+                    error_class: "autonomous_database_unavailable".to_string(),
+                    failure_scope: "process",
+                    suppressed_count: 0,
+                },
+                _ => DaemonFailure::process(
+                    "autonomous_schema_validation",
+                    "autonomous_candidate_store_initialization",
+                ),
+            })?;
         let autonomous = Arc::new(AutonomousHunterProcessor::new(
             graph,
             core,
@@ -273,7 +343,7 @@ async fn run_daemon() -> Result<(), &'static str> {
         shutdown.clone(),
     ));
 
-    let mut integrity_failure = false;
+    let mut integrity_failure = None;
     let mut connection_attempt = 0_u64;
     loop {
         if shutdown.is_cancelled() {
@@ -323,9 +393,11 @@ async fn run_daemon() -> Result<(), &'static str> {
                     readiness.mark_integrity_loss();
                     tracing::error!(
                         event = "phoenix_engine_pipeline_incompatible",
-                        error_class = %error
+                        stage = "jetstream_contract_validation",
+                        error_class = error.class(),
+                        failure_scope = "process"
                     );
-                    integrity_failure = true;
+                    integrity_failure = Some(pipeline_integrity_failure(&error));
                     break;
                 }
                 sampled_warning(
@@ -353,17 +425,23 @@ async fn run_daemon() -> Result<(), &'static str> {
         )
         .await;
         readiness.set_nats_connected(false);
-        metrics.runtime_exit(match exit {
+        metrics.runtime_exit(match &exit {
             RuntimeExit::Shutdown => RuntimeExitMetric::Shutdown,
             RuntimeExit::FetchFailed => RuntimeExitMetric::FetchFailed,
             RuntimeExit::StoreFailed => RuntimeExitMetric::StoreFailed,
             RuntimeExit::AcknowledgementFailed => RuntimeExitMetric::AcknowledgementFailed,
-            RuntimeExit::IntegrityFailure => RuntimeExitMetric::IntegrityFailure,
+            RuntimeExit::IntegrityFailure(_) => RuntimeExitMetric::IntegrityFailure,
         });
         match exit {
             RuntimeExit::Shutdown => break,
-            RuntimeExit::IntegrityFailure => {
-                integrity_failure = true;
+            RuntimeExit::IntegrityFailure(failure) => {
+                integrity_failure = Some(DaemonFailure {
+                    runtime_exit_class: "integrity_failure",
+                    stage: failure.stage,
+                    error_class: failure.error_class,
+                    failure_scope: failure.failure_scope,
+                    suppressed_count: failure.suppressed_count,
+                });
                 break;
             }
             RuntimeExit::StoreFailed => {
@@ -383,11 +461,7 @@ async fn run_daemon() -> Result<(), &'static str> {
     readiness.stop_event_loop();
     let _ = health_task.await;
     tracing::info!(event = "phoenix_engine_graceful_shutdown_complete");
-    if integrity_failure {
-        Err("Engine stopped on a terminal integrity condition")
-    } else {
-        Ok(())
-    }
+    integrity_failure.map_or(Ok(()), Err)
 }
 
 async fn monitor_rpc_gateway(
@@ -725,6 +799,21 @@ mod tests {
             ["SIGN", "ER"].concat(),
         ] {
             assert!(!source.contains(&forbidden));
+        }
+    }
+
+    #[test]
+    fn incompatible_jetstream_contract_is_process_fatal_with_exact_evidence() {
+        for error in [
+            EngineStreamError::StreamIncompatible,
+            EngineStreamError::ConsumerIncompatible,
+        ] {
+            let failure = pipeline_integrity_failure(&error);
+            assert_eq!(failure.runtime_exit_class, "integrity_failure");
+            assert_eq!(failure.stage, "jetstream_contract_validation");
+            assert_eq!(failure.error_class, error.class());
+            assert_eq!(failure.failure_scope, "process");
+            assert_eq!(failure.suppressed_count, 0);
         }
     }
 }

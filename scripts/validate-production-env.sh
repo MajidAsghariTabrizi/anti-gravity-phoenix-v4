@@ -316,10 +316,16 @@ if [ "${PHOENIX_MODE:-}" = LIVE ]; then
     fail "LIVE_EXECUTION must be true for autonomous LIVE production"
   [ "${AUTONOMOUS_EXECUTION:-}" = true ] ||
     fail "AUTONOMOUS_EXECUTION must be true for autonomous LIVE production"
-  [ "$(csv_count "${RPC_PROVIDER_URLS:-}")" -ge 2 ] ||
-    fail "autonomous LIVE requires at least two RPC providers"
+  [ "$(csv_count "${RPC_PROVIDER_URLS:-}")" -eq 2 ] ||
+    fail "autonomous LIVE requires exactly two RPC providers"
+  [ "$(csv_count "${RPC_PROVIDER_WEIGHTS:-}")" -eq 2 ] ||
+    fail "autonomous LIVE requires exactly two RPC provider priorities"
   [ "${PRODUCTION_RPC_URL:-}" != "${SECONDARY_RPC_URL:-}" ] ||
     fail "primary and secondary RPC URLs must be independent"
+  csv_contains_exact "$PRODUCTION_RPC_URL" "$RPC_PROVIDER_URLS" ||
+    fail "RPC_PROVIDER_URLS must contain PRODUCTION_RPC_URL exactly"
+  csv_contains_exact "$SECONDARY_RPC_URL" "$RPC_PROVIDER_URLS" ||
+    fail "RPC_PROVIDER_URLS must contain SECONDARY_RPC_URL exactly"
   csv_contains_exact "$PRODUCTION_RPC_URL" "$LIVE_EXECUTOR_RPC_ALLOWLIST" ||
     fail "LIVE_EXECUTOR_RPC_ALLOWLIST must contain PRODUCTION_RPC_URL exactly"
   csv_contains_exact "$SECONDARY_RPC_URL" "$LIVE_EXECUTOR_RPC_ALLOWLIST" ||

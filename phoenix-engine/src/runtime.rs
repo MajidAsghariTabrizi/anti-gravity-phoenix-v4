@@ -63,21 +63,29 @@ impl ConsumerRuntimeConfig {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RuntimeIntegrityFailure {
+    pub stage: String,
+    pub error_class: String,
+    pub failure_scope: &'static str,
+    pub suppressed_count: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RuntimeExit {
     Shutdown,
     FetchFailed,
     StoreFailed,
     AcknowledgementFailed,
-    IntegrityFailure,
+    IntegrityFailure(RuntimeIntegrityFailure),
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DeliveryDisposition {
     Continue,
     StoreFailed,
     AcknowledgementFailed,
-    IntegrityFailure,
+    IntegrityFailure(RuntimeIntegrityFailure),
 }
 
 pub async fn consume_engine_messages(
@@ -150,7 +158,9 @@ pub async fn consume_engine_messages(
                 DeliveryDisposition::AcknowledgementFailed => {
                     return RuntimeExit::AcknowledgementFailed;
                 }
-                DeliveryDisposition::IntegrityFailure => return RuntimeExit::IntegrityFailure,
+                DeliveryDisposition::IntegrityFailure(failure) => {
+                    return RuntimeExit::IntegrityFailure(failure);
+                }
             }
         }
     }
@@ -186,7 +196,7 @@ pub async fn process_delivery(
     {
         Ok(Some(_)) => {
             metrics.duplicate_skip();
-            return acknowledge(delivery, ProcessingAction::Ack, readiness, sampler, false).await;
+            return acknowledge(delivery, ProcessingAction::Ack, readiness, sampler, None).await;
         }
         Ok(None) => {}
         Err(error) => {
@@ -261,9 +271,31 @@ pub async fn process_delivery(
                     "prior_evidence": result.evidence
                 }),
                 evaluations: Vec::new(),
-                action: ProcessingAction::Terminate,
+                action: ProcessingAction::Quarantine,
                 origin_metric: result.origin_metric,
             };
+        }
+    }
+
+    if matches!(
+        result.action,
+        ProcessingAction::Quarantine | ProcessingAction::ProcessFatal
+    ) {
+        if let Err(error) = attach_integrity_evidence(
+            &mut result,
+            &identity,
+            delivery.delivery_count,
+            processor.execution_mode(),
+        ) {
+            return handle_store_failure(
+                delivery,
+                readiness,
+                metrics,
+                sampler,
+                "engine_integrity_evidence_failure",
+                error,
+            )
+            .await;
         }
     }
 
@@ -302,7 +334,7 @@ pub async fn process_delivery(
     readiness.set_persistence_healthy(true);
     if outcome == PersistOutcome::AlreadyFinal {
         metrics.duplicate_skip();
-        return acknowledge(delivery, ProcessingAction::Ack, readiness, sampler, false).await;
+        return acknowledge(delivery, ProcessingAction::Ack, readiness, sampler, None).await;
     }
 
     metrics.input_processed(elapsed);
@@ -313,8 +345,29 @@ pub async fn process_delivery(
         metrics.retry_recovered();
     }
     record_result_metrics(metrics, &result);
-    let terminal = result.action == ProcessingAction::Terminate;
-    acknowledge(delivery, result.action, readiness, sampler, terminal).await
+    if result.action == ProcessingAction::Quarantine {
+        let stage = bounded_evidence_text(&result.evidence, "stage", "event_processing");
+        let error_class =
+            bounded_evidence_text(&result.evidence, "error_class", result.detail_class);
+        tracing::warn!(
+            event = "phoenix_engine_delivery_quarantined",
+            stage,
+            error_class,
+            source_event_identity = %record.identity.source_event_identity,
+            source_sequence = record.identity.source_sequence,
+            delivery_attempt = record.delivery_attempt,
+            execution_mode = bounded_evidence_text(
+                &result.evidence,
+                "execution_mode",
+                "SHADOW"
+            ),
+            execution_eligible = false,
+            execution_request_created = false
+        );
+    }
+    let fatal = (result.action == ProcessingAction::ProcessFatal)
+        .then(|| runtime_integrity_from_evidence(&result.evidence, result.detail_class));
+    acknowledge(delivery, result.action, readiness, sampler, fatal).await
 }
 
 fn decode_failure_result(kind: InputFailureKind, evidence: serde_json::Value) -> ProcessResult {
@@ -326,7 +379,7 @@ fn decode_failure_result(kind: InputFailureKind, evidence: serde_json::Value) ->
             decision_count: 0,
             evidence,
             evaluations: Vec::new(),
-            action: ProcessingAction::Terminate,
+            action: ProcessingAction::Quarantine,
             origin_metric: None,
         },
         InputFailureKind::Malformed => ProcessResult {
@@ -342,7 +395,91 @@ fn decode_failure_result(kind: InputFailureKind, evidence: serde_json::Value) ->
     }
 }
 
+fn attach_integrity_evidence(
+    result: &mut ProcessResult,
+    identity: &crate::engine_input::InputIdentity,
+    delivery_attempt: u64,
+    execution_mode: &'static str,
+) -> Result<(), StoreError> {
+    result.candidate_count = 0;
+    result.decision_count = 0;
+    result.evaluations.clear();
+    let scope = if result.action == ProcessingAction::ProcessFatal {
+        "process"
+    } else {
+        "event"
+    };
+    let object = result
+        .evidence
+        .as_object_mut()
+        .ok_or(StoreError::Integrity)?;
+    object
+        .entry("stage")
+        .or_insert_with(|| json!("event_input_validation"));
+    object
+        .entry("error_class")
+        .or_insert_with(|| json!(result.detail_class));
+    object.insert(
+        "source_event_identity".to_string(),
+        json!(&identity.source_event_identity),
+    );
+    object.insert(
+        "source_sequence".to_string(),
+        json!(identity.source_sequence),
+    );
+    object.insert("delivery_attempt".to_string(), json!(delivery_attempt));
+    object.insert("failure_scope".to_string(), json!(scope));
+    object.insert("execution_mode".to_string(), json!(execution_mode));
+    object.insert("execution_eligible".to_string(), json!(false));
+    object.insert("execution_request_created".to_string(), json!(false));
+    if serde_json::to_vec(&result.evidence)
+        .map_err(|_| StoreError::Integrity)?
+        .len()
+        > MAX_EVIDENCE_BYTES
+    {
+        return Err(StoreError::Integrity);
+    }
+    Ok(())
+}
+
+fn bounded_evidence_text<'a>(
+    evidence: &'a serde_json::Value,
+    field: &str,
+    fallback: &'a str,
+) -> &'a str {
+    evidence
+        .get(field)
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| {
+            !value.is_empty()
+                && value.len() <= 128
+                && value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
+        })
+        .unwrap_or(fallback)
+}
+
+fn runtime_integrity_from_evidence(
+    evidence: &serde_json::Value,
+    fallback_error_class: &'static str,
+) -> RuntimeIntegrityFailure {
+    RuntimeIntegrityFailure {
+        stage: bounded_evidence_text(evidence, "stage", "event_processing").to_string(),
+        error_class: bounded_evidence_text(evidence, "error_class", fallback_error_class)
+            .to_string(),
+        failure_scope: "process",
+        suppressed_count: 0,
+    }
+}
+
 fn record_result_metrics(metrics: &RuntimeMetrics, result: &ProcessResult) {
+    if matches!(
+        result.action,
+        ProcessingAction::Quarantine | ProcessingAction::ProcessFatal
+    ) {
+        metrics.terminal_integrity();
+    }
     if let Some(kind) = result.origin_metric {
         metrics.origin_classified(kind);
     }
@@ -401,7 +538,6 @@ fn record_result_metrics(metrics: &RuntimeMetrics, result: &ProcessResult) {
         }
         EngineClassification::TerminalIntegrityFailure => {
             metrics.processing_failure();
-            metrics.terminal_integrity();
             metrics.route_ranking_exclusion(RouteExclusionMetric::IntegrityFailure);
         }
     }
@@ -514,33 +650,33 @@ async fn acknowledge(
     action: ProcessingAction,
     readiness: &RuntimeReadiness,
     sampler: &LogSampler,
-    terminal: bool,
+    fatal: Option<RuntimeIntegrityFailure>,
 ) -> DeliveryDisposition {
     let result = match action {
         ProcessingAction::Ack => delivery.acker.ack_confirmed().await,
         ProcessingAction::Retry => delivery.acker.nak(RETRY_DELAY).await,
-        ProcessingAction::Terminate => delivery.acker.term().await,
+        ProcessingAction::Quarantine | ProcessingAction::ProcessFatal => {
+            delivery.acker.term().await
+        }
     };
-    if terminal {
+    if fatal.is_some() {
         readiness.mark_integrity_loss();
     }
     match result {
         Ok(()) => {
             readiness.set_acknowledgements_healthy(true);
-            if terminal {
-                DeliveryDisposition::IntegrityFailure
-            } else {
-                DeliveryDisposition::Continue
-            }
+            fatal.map_or(
+                DeliveryDisposition::Continue,
+                DeliveryDisposition::IntegrityFailure,
+            )
         }
         Err(error) => {
             readiness.set_acknowledgements_healthy(false);
             sampled_pipeline_failure(sampler, "engine_ack_failure", error);
-            if terminal {
-                DeliveryDisposition::IntegrityFailure
-            } else {
-                DeliveryDisposition::AcknowledgementFailed
-            }
+            fatal.map_or(
+                DeliveryDisposition::AcknowledgementFailed,
+                DeliveryDisposition::IntegrityFailure,
+            )
         }
     }
 }
@@ -571,14 +707,20 @@ async fn handle_store_failure(
         error,
         StoreError::Configuration | StoreError::Schema | StoreError::Integrity
     );
-    sampled_store_failure(sampler, failure_class, error);
+    sampled_store_failure(sampler, failure_class, &error);
     if terminal {
+        let failure = RuntimeIntegrityFailure {
+            stage: "postgres_persistence".to_string(),
+            error_class: error.class().to_string(),
+            failure_scope: "process",
+            suppressed_count: 0,
+        };
         acknowledge(
             delivery,
-            ProcessingAction::Terminate,
+            ProcessingAction::ProcessFatal,
             readiness,
             sampler,
-            true,
+            Some(failure),
         )
         .await
     } else {
@@ -597,7 +739,7 @@ fn sampled_pipeline_failure(sampler: &LogSampler, class: &'static str, error: Pi
     }
 }
 
-fn sampled_store_failure(sampler: &LogSampler, class: &'static str, error: StoreError) {
+fn sampled_store_failure(sampler: &LogSampler, class: &'static str, error: &StoreError) {
     if let Some(suppressed) = sampler.sample(class) {
         tracing::warn!(
             event = "phoenix_engine_postgres_failure",
@@ -611,6 +753,7 @@ fn sampled_store_failure(sampler: &LogSampler, class: &'static str, error: Store
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::autonomous::AutonomousEventProcessor;
     use crate::domain::Address;
     use crate::engine_jetstream::{ConsumerState, DeliveryAcker};
     use crate::persistence::{validate_record, ClassificationRecord};
@@ -618,6 +761,7 @@ mod tests {
         CandidateBatch, CandidateEvaluator, EvaluationError, RouteRegistry, RuntimeRoute,
         UnavailableEvaluator,
     };
+    use crate::{engine_input::EngineInput, origin::OriginEvent};
     use async_trait::async_trait;
     use phoenix_recorder::model::{
         decode_message, engine_event_identity, ARBITRUM_ONE_CHAIN_ID, ENGINE_INPUT_SCHEMA_VERSION,
@@ -667,6 +811,22 @@ mod tests {
                         evidence: json!({"evaluation": "complete"}),
                     })
                 })
+        }
+    }
+
+    #[derive(Debug)]
+    struct ScriptedAutonomousProcessor {
+        outcomes: Mutex<VecDeque<ProcessResult>>,
+    }
+
+    #[async_trait]
+    impl AutonomousEventProcessor for ScriptedAutonomousProcessor {
+        async fn process(&self, _input: &EngineInput, _origin: &OriginEvent) -> ProcessResult {
+            self.outcomes
+                .lock()
+                .unwrap()
+                .pop_front()
+                .expect("scripted autonomous outcome")
         }
     }
 
@@ -1013,7 +1173,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn malformed_input_is_persisted_before_nak_and_terminated_at_delivery_limit() {
+    async fn malformed_input_is_persisted_before_nak_and_quarantined_at_delivery_limit() {
         let events = Arc::new(Mutex::new(Vec::new()));
         let store = store(events.clone(), None, false);
         assert_eq!(
@@ -1038,13 +1198,61 @@ mod tests {
                 &store,
             )
             .await,
-            DeliveryDisposition::IntegrityFailure
+            DeliveryDisposition::Continue
         );
         assert_eq!(*events.lock().unwrap(), vec!["persist", "term"]);
+        let records = store.records.lock().unwrap();
         assert_eq!(
-            store.records.lock().unwrap()[1].classification,
+            records[1].classification,
             EngineClassification::TerminalIntegrityFailure
         );
+        assert_eq!(records[1].candidate_count, 0);
+        assert_eq!(records[1].decision_count, 0);
+        assert!(records[1].evaluations.is_empty());
+        assert_eq!(records[1].evidence["stage"], "event_input_validation");
+        assert_eq!(
+            records[1].evidence["delivery_attempt"],
+            ENGINE_MAX_DELIVERIES
+        );
+        assert_eq!(records[1].evidence["execution_eligible"], false);
+        assert_eq!(records[1].evidence["execution_request_created"], false);
+    }
+
+    #[tokio::test]
+    async fn unsupported_schema_is_terminally_quarantined_without_runtime_integrity_loss() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let store = store(events.clone(), None, false);
+        let readiness = ready_state();
+        let metrics = RuntimeMetrics::default();
+        let mut unsupported = delivery(events.clone(), payload(), 1, false);
+        unsupported.schema_header = Some("phoenix.engine-input.v999".to_string());
+
+        assert_eq!(
+            run_with(
+                unsupported,
+                &store,
+                &processor(),
+                &readiness,
+                &metrics,
+                DependencyRetryPolicy::engine_default().unwrap(),
+            )
+            .await,
+            DeliveryDisposition::Continue
+        );
+        assert_eq!(*events.lock().unwrap(), vec!["persist", "term"]);
+        assert_eq!(readiness.ready(), Ok(()));
+        let records = store.records.lock().unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(
+            records[0].classification,
+            EngineClassification::UnsupportedSchema
+        );
+        assert_eq!(records[0].candidate_count, 0);
+        assert_eq!(records[0].decision_count, 0);
+        assert!(records[0].evaluations.is_empty());
+        assert!(metrics
+            .render(&readiness)
+            .contains("phoenix_engine_terminal_integrity_total 1"));
     }
 
     #[tokio::test]
@@ -1501,6 +1709,41 @@ mod tests {
         }
     }
 
+    #[derive(Debug)]
+    struct FatalLookupStore(StoreError);
+
+    #[async_trait]
+    impl ShadowStore for FatalLookupStore {
+        async fn ping(&self) -> Result<(), StoreError> {
+            Err(self.0.clone())
+        }
+
+        async fn verify_schema(&self) -> Result<(), StoreError> {
+            Err(self.0.clone())
+        }
+
+        async fn final_classification(
+            &self,
+            _source_event_identity: &str,
+        ) -> Result<Option<EngineClassification>, StoreError> {
+            Err(self.0.clone())
+        }
+
+        async fn dependency_failure_context(
+            &self,
+            _source_event_identity: &str,
+        ) -> Result<Option<DependencyFailureContext>, StoreError> {
+            Err(self.0.clone())
+        }
+
+        async fn persist_classification(
+            &self,
+            _record: &ClassificationRecord,
+        ) -> Result<PersistOutcome, StoreError> {
+            Err(self.0.clone())
+        }
+    }
+
     #[tokio::test]
     async fn exhausted_message_does_not_restart_consumer_and_later_message_is_processed() {
         let events = Arc::new(Mutex::new(Vec::new()));
@@ -1571,39 +1814,140 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn true_internal_contract_failure_still_returns_integrity_exit() {
+    async fn autonomous_integrity_event_is_quarantined_and_next_valid_event_is_processed() {
         let events = Arc::new(Mutex::new(Vec::new()));
         let store = Arc::new(store(events.clone(), None, false));
+        let autonomous = Arc::new(ScriptedAutonomousProcessor {
+            outcomes: Mutex::new(
+                vec![
+                    ProcessResult::terminal(
+                        "autonomous_event_integrity_quarantined",
+                        0,
+                        json!({
+                            "stage": "hunter_route_simulation",
+                            "error_class": "hunter_arithmetic",
+                            "hunter_error_code": "hunter_arithmetic"
+                        }),
+                    ),
+                    ProcessResult::no_route(
+                        "no_affected_hunter_route",
+                        json!({"origin_classification": "supported_swap_origin"}),
+                    ),
+                ]
+                .into(),
+            ),
+        });
+        let processor = Arc::new(
+            route_processor(Arc::new(UnavailableEvaluator)).with_test_autonomous(autonomous),
+        );
         let readiness = ready_state();
+        let metrics = RuntimeMetrics::default();
         let shutdown = CancellationToken::new();
         let fetcher = Arc::new(OneBatchFetcher {
-            batch: Mutex::new(Some(vec![delivery(
-                events.clone(),
-                b"bad".to_vec(),
-                2,
-                false,
-            )])),
+            batch: Mutex::new(Some(vec![
+                delivery(events.clone(), route_payload(501), 1, false),
+                delivery(events.clone(), route_payload(502), 1, false),
+            ])),
             shutdown: shutdown.clone(),
         });
+
         let exit = consume_engine_messages(
             fetcher,
-            store,
-            Arc::new(processor()),
+            store.clone(),
+            processor,
             readiness.clone(),
-            RuntimeMetrics::default(),
+            metrics.clone(),
             ConsumerRuntimeConfig::new(
                 LogSampler::new(Duration::ZERO),
-                DependencyRetryPolicy::bounded(2).unwrap(),
+                DependencyRetryPolicy::engine_default().unwrap(),
             ),
             shutdown,
         )
         .await;
-        assert_eq!(exit, RuntimeExit::IntegrityFailure);
-        assert_eq!(*events.lock().unwrap(), vec!["persist", "term"]);
+
+        assert_eq!(exit, RuntimeExit::Shutdown);
         assert_eq!(
-            readiness.ready(),
-            Err("terminal Engine integrity condition detected")
+            *events.lock().unwrap(),
+            vec!["persist", "term", "persist", "ack"]
         );
+        let records = store.records.lock().unwrap();
+        assert_eq!(records.len(), 2);
+        let quarantined = &records[0];
+        assert_eq!(
+            quarantined.classification,
+            EngineClassification::TerminalIntegrityFailure
+        );
+        assert_eq!(quarantined.candidate_count, 0);
+        assert_eq!(quarantined.decision_count, 0);
+        assert!(quarantined.evaluations.is_empty());
+        assert_eq!(quarantined.evidence["stage"], "hunter_route_simulation");
+        assert_eq!(quarantined.evidence["error_class"], "hunter_arithmetic");
+        assert_eq!(
+            quarantined.evidence["hunter_error_code"],
+            "hunter_arithmetic"
+        );
+        assert_eq!(quarantined.evidence["source_sequence"], 501);
+        assert_eq!(quarantined.evidence["delivery_attempt"], 1);
+        assert_eq!(quarantined.evidence["execution_mode"], "LIVE");
+        assert_eq!(quarantined.evidence["execution_eligible"], false);
+        assert_eq!(quarantined.evidence["execution_request_created"], false);
+        assert_eq!(
+            records[1].classification,
+            EngineClassification::NoRelevantRoute
+        );
+        assert_eq!(records[1].identity.source_sequence, 502);
+        assert_eq!(readiness.ready(), Ok(()));
+        let rendered = metrics.render(&readiness);
+        assert!(rendered.contains("phoenix_engine_terminal_integrity_total 1"));
+        assert!(rendered.contains("phoenix_engine_later_message_progress_after_quarantine_total 1"));
+        assert!(!quarantined.evidence.to_string().contains("http"));
+        assert!(!quarantined.evidence.to_string().contains("private"));
+    }
+
+    #[tokio::test]
+    async fn true_internal_contract_failure_still_returns_integrity_exit() {
+        for (store_error, expected_class) in [
+            (StoreError::Configuration, "postgres_configuration"),
+            (StoreError::Schema, "postgres_schema"),
+            (StoreError::Integrity, "postgres_integrity"),
+        ] {
+            let events = Arc::new(Mutex::new(Vec::new()));
+            let readiness = ready_state();
+            let shutdown = CancellationToken::new();
+            let fetcher = Arc::new(OneBatchFetcher {
+                batch: Mutex::new(Some(vec![delivery(events.clone(), payload(), 1, false)])),
+                shutdown: shutdown.clone(),
+            });
+            let exit = consume_engine_messages(
+                fetcher,
+                Arc::new(FatalLookupStore(store_error)),
+                Arc::new(processor()),
+                readiness.clone(),
+                RuntimeMetrics::default(),
+                ConsumerRuntimeConfig::new(
+                    LogSampler::new(Duration::ZERO),
+                    DependencyRetryPolicy::bounded(2).unwrap(),
+                ),
+                shutdown,
+            )
+            .await;
+            assert_eq!(
+                exit,
+                RuntimeExit::IntegrityFailure(RuntimeIntegrityFailure {
+                    stage: "postgres_persistence".to_string(),
+                    error_class: expected_class.to_string(),
+                    failure_scope: "process",
+                    suppressed_count: 0,
+                })
+            );
+            assert_eq!(*events.lock().unwrap(), vec!["term"]);
+            assert_eq!(readiness.ready(), Err("Engine persistence unavailable"));
+            readiness.set_persistence_healthy(true);
+            assert_eq!(
+                readiness.ready(),
+                Err("terminal Engine integrity condition detected")
+            );
+        }
     }
 
     #[tokio::test]

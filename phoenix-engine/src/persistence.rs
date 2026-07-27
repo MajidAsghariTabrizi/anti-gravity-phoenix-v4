@@ -66,6 +66,18 @@ pub enum StoreError {
     Integrity,
 }
 
+impl StoreError {
+    pub const fn class(&self) -> &'static str {
+        match self {
+            Self::Configuration => "postgres_configuration",
+            Self::Connection => "postgres_connection",
+            Self::Schema => "postgres_schema",
+            Self::Transaction => "postgres_transaction",
+            Self::Integrity => "postgres_integrity",
+        }
+    }
+}
+
 #[async_trait]
 pub trait ShadowStore: Send + Sync {
     async fn ping(&self) -> Result<(), StoreError>;

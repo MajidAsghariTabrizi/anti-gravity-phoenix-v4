@@ -155,7 +155,7 @@ grep -F 'validate_existing_postgres' "$provisioner" >/dev/null ||
   fail 'first-host provisioning lacks fail-closed PostgreSQL ownership validation'
 
 validation_line=$(grep -n 'validate-production-env.sh" "$env_file"' "$context_installer" | tail -n 1 | cut -d: -f1)
-marker_line=$(grep -n 'mv "$marker" "$deploy_dir/release-assets.sha"' "$context_installer" | cut -d: -f1)
+marker_line=$(grep -n 'mv "$marker" "$deploy_dir/candidate-release-assets.sha"' "$context_installer" | cut -d: -f1)
 [ -n "$validation_line" ] && [ -n "$marker_line" ] && [ "$marker_line" -gt "$validation_line" ] ||
   fail 'release-assets marker is not promoted after production validation'
 

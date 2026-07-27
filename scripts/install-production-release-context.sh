@@ -251,7 +251,7 @@ if [ -n "$release_sha" ]; then
   printf '%s\n' "$release_sha" >"$marker"
   chown "root:$owner_group" "$marker"
   chmod 0640 "$marker"
-  mv "$marker" "$deploy_dir/release-assets.sha"
+  mv "$marker" "$deploy_dir/candidate-release-assets.sha"
 fi
 
 echo "RELEASE_CONTEXT_INSTALL_OK: canonical deploy context updated without persistent-data mutation"

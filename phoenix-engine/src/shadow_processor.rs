@@ -1,4 +1,4 @@
-use crate::autonomous::AutonomousHunterProcessor;
+use crate::autonomous::{AutonomousEventProcessor, AutonomousHunterProcessor};
 use crate::domain::{Address, Amount, Direction, PoolId, RouteId, TokenAddress};
 use crate::engine_input::{EngineClassification, EngineInput};
 use crate::graph::{PoolEdge, PoolGraph, Route};
@@ -23,7 +23,8 @@ pub const MAX_CANDIDATE_SIZES_PER_ROUTE: usize = 32;
 pub enum ProcessingAction {
     Ack,
     Retry,
-    Terminate,
+    Quarantine,
+    ProcessFatal,
 }
 
 #[derive(Clone, Debug)]
@@ -65,15 +66,32 @@ impl ProcessResult {
         }
     }
 
-    pub fn terminal(detail_class: &'static str, candidate_count: usize, evidence: Value) -> Self {
+    pub fn terminal(detail_class: &'static str, _candidate_count: usize, evidence: Value) -> Self {
         Self {
             classification: EngineClassification::TerminalIntegrityFailure,
             detail_class,
-            candidate_count,
+            candidate_count: 0,
             decision_count: 0,
             evidence,
             evaluations: Vec::new(),
-            action: ProcessingAction::Terminate,
+            action: ProcessingAction::Quarantine,
+            origin_metric: None,
+        }
+    }
+
+    pub fn process_fatal(
+        detail_class: &'static str,
+        _candidate_count: usize,
+        evidence: Value,
+    ) -> Self {
+        Self {
+            classification: EngineClassification::TerminalIntegrityFailure,
+            detail_class,
+            candidate_count: 0,
+            decision_count: 0,
+            evidence,
+            evaluations: Vec::new(),
+            action: ProcessingAction::ProcessFatal,
             origin_metric: None,
         }
     }
@@ -254,7 +272,7 @@ pub struct ShadowProcessor {
     detector: OriginDetector,
     routes: RouteRegistry,
     evaluator: Arc<dyn CandidateEvaluator>,
-    autonomous: Option<Arc<AutonomousHunterProcessor>>,
+    autonomous: Option<Arc<dyn AutonomousEventProcessor>>,
 }
 
 impl std::fmt::Debug for ShadowProcessor {
@@ -286,8 +304,25 @@ impl ShadowProcessor {
         self
     }
 
+    #[cfg(test)]
+    pub(crate) fn with_test_autonomous(
+        mut self,
+        autonomous: Arc<dyn AutonomousEventProcessor>,
+    ) -> Self {
+        self.autonomous = Some(autonomous);
+        self
+    }
+
     pub fn strategy_configured(&self) -> bool {
         !self.routes.is_empty() || self.autonomous.is_some()
+    }
+
+    pub const fn execution_mode(&self) -> &'static str {
+        if self.autonomous.is_some() {
+            "LIVE"
+        } else {
+            "SHADOW"
+        }
     }
 
     pub async fn process(&self, input: &EngineInput) -> ProcessResult {

@@ -67,6 +67,11 @@ pub trait HunterStateProvider: Send + Sync {
 }
 
 #[async_trait]
+pub trait AutonomousEventProcessor: Send + Sync {
+    async fn process(&self, input: &EngineInput, origin: &OriginEvent) -> ProcessResult;
+}
+
+#[async_trait]
 impl HunterStateProvider for RpcHunterStateClient {
     async fn state(
         &self,
@@ -87,21 +92,36 @@ impl HunterStateProvider for RpcHunterStateClient {
             return Err(match body.error_class.as_str() {
                 "provider_disagreement" => AutonomousError::ProviderDisagreement,
                 "state_incomplete" => AutonomousError::StateIncomplete,
-                "provider_integrity_failure" => AutonomousError::Integrity,
+                "provider_integrity_failure" => event_integrity(
+                    "hunter_state_response_validation",
+                    "provider_integrity_failure",
+                    None,
+                ),
                 _ if body.retryable => AutonomousError::Dependency,
-                _ => AutonomousError::Integrity,
+                _ => event_integrity(
+                    "hunter_state_request",
+                    "hunter_state_request_rejected",
+                    None,
+                ),
             });
         }
         if response
             .content_length()
             .is_some_and(|length| length > MAX_GATEWAY_RESPONSE_BYTES as u64)
         {
-            return Err(AutonomousError::Integrity);
+            return Err(event_integrity(
+                "hunter_state_response_validation",
+                "hunter_state_response_too_large",
+                None,
+            ));
         }
-        response
-            .json::<HunterStateResponse>()
-            .await
-            .map_err(|_| AutonomousError::Integrity)
+        response.json::<HunterStateResponse>().await.map_err(|_| {
+            event_integrity(
+                "hunter_state_response_validation",
+                "hunter_state_response_invalid_json",
+                None,
+            )
+        })
     }
 }
 
@@ -117,7 +137,7 @@ impl PostgresAutonomousCandidateStore {
             .acquire_timeout(Duration::from_secs(5))
             .connect(dsn)
             .await
-            .map_err(classify_database)?;
+            .map_err(|error| classify_database(error, "autonomous_candidate_persistence"))?;
         let store = Self { pool };
         store.validate_schema().await?;
         Ok(store)
@@ -130,9 +150,13 @@ impl PostgresAutonomousCandidateStore {
         .bind(AUTONOMOUS_SCHEMA_VERSION)
         .fetch_one(&self.pool)
         .await
-        .map_err(classify_database)?;
+        .map_err(|error| classify_database(error, "autonomous_schema_validation"))?;
         if version != AUTONOMOUS_SCHEMA_VERSION {
-            return Err(AutonomousError::Integrity);
+            return Err(process_integrity(
+                "autonomous_schema_validation",
+                "autonomous_schema_incompatible",
+                None,
+            ));
         }
         Ok(())
     }
@@ -174,10 +198,13 @@ impl PostgresAutonomousCandidateStore {
         .bind(opportunity_id)
         .bind(text(contract, "origin_event_id")?)
         .bind(text(contract, "schema_version")?)
-        .bind(
-            i64::try_from(unsigned(contract, "chain_id")?)
-                .map_err(|_| AutonomousError::Integrity)?,
-        )
+        .bind(i64::try_from(unsigned(contract, "chain_id")?).map_err(|_| {
+            event_integrity(
+                "autonomous_candidate_validation",
+                "candidate_chain_id_out_of_range",
+                None,
+            )
+        })?)
         .bind(text(contract, "route_fingerprint")?)
         .bind(text(contract, "route_universe_hash")?)
         .bind(text(contract, "route_policy_hash")?)
@@ -203,7 +230,7 @@ impl PostgresAutonomousCandidateStore {
         .bind(Json(state_contract))
         .execute(&self.pool)
         .await
-        .map_err(classify_database)?;
+        .map_err(|error| classify_database(error, "autonomous_candidate_persistence"))?;
         if result.rows_affected() == 1 {
             return Ok(true);
         }
@@ -215,15 +242,34 @@ impl PostgresAutonomousCandidateStore {
         .bind(candidate_hash)
         .fetch_optional(&self.pool)
         .await
-        .map_err(classify_database)?;
+        .map_err(|error| classify_database(error, "autonomous_candidate_persistence"))?;
         let Some((existing_id, existing_contract)) = existing else {
-            return Err(AutonomousError::Integrity);
+            return Err(process_integrity(
+                "autonomous_candidate_persistence",
+                "candidate_conflict_row_missing",
+                None,
+            ));
         };
-        let expected = serde_json::to_value(contract).map_err(|_| AutonomousError::Integrity)?;
-        let actual: Value =
-            serde_json::from_str(&existing_contract).map_err(|_| AutonomousError::Integrity)?;
+        let expected = serde_json::to_value(contract).map_err(|_| {
+            event_integrity(
+                "autonomous_candidate_validation",
+                "candidate_contract_serialization",
+                None,
+            )
+        })?;
+        let actual: Value = serde_json::from_str(&existing_contract).map_err(|_| {
+            process_integrity(
+                "autonomous_candidate_persistence",
+                "persisted_candidate_contract_invalid",
+                None,
+            )
+        })?;
         if existing_id != candidate_id || actual != expected {
-            return Err(AutonomousError::Integrity);
+            return Err(process_integrity(
+                "autonomous_candidate_persistence",
+                "candidate_hash_conflict",
+                None,
+            ));
         }
         Ok(false)
     }
@@ -257,7 +303,7 @@ impl AutonomousHunterProcessor {
         }
     }
 
-    pub async fn process(&self, input: &EngineInput, origin: &OriginEvent) -> ProcessResult {
+    async fn process_event(&self, input: &EngineInput, origin: &OriginEvent) -> ProcessResult {
         match self.process_inner(input, origin).await {
             Ok(result) => result,
             Err(AutonomousError::Dependency) => ProcessResult::transient(
@@ -268,13 +314,26 @@ impl AutonomousHunterProcessor {
             Err(AutonomousError::ProviderDisagreement) => rejected("provider_disagreement"),
             Err(AutonomousError::StateIncomplete) => rejected("state_incomplete"),
             Err(AutonomousError::Economic) => rejected("no_profitable_candidate"),
-            Err(AutonomousError::Configuration | AutonomousError::Integrity) => {
-                ProcessResult::terminal(
-                    "autonomous_integrity_failure",
-                    0,
-                    json!({"integrity_failure_class": "autonomous_contract_integrity"}),
-                )
-            }
+            Err(AutonomousError::EventIntegrity(context)) => ProcessResult::terminal(
+                "autonomous_event_integrity_quarantined",
+                0,
+                context.evidence("event"),
+            ),
+            Err(AutonomousError::Configuration) => ProcessResult::process_fatal(
+                "autonomous_configuration_integrity_failure",
+                0,
+                AutonomousIntegrityContext {
+                    stage: "autonomous_configuration",
+                    error_class: "autonomous_configuration_invalid",
+                    hunter_error_code: None,
+                }
+                .evidence("process"),
+            ),
+            Err(AutonomousError::ProcessIntegrity(context)) => ProcessResult::process_fatal(
+                "autonomous_integrity_failure",
+                0,
+                context.evidence("process"),
+            ),
         }
     }
 
@@ -332,9 +391,13 @@ impl AutonomousHunterProcessor {
             maximum_initialized_ticks: self.bounds.maximum_initialized_ticks,
         };
         let response = self.state_provider.state(request.clone()).await?;
-        response
-            .validate(&request)
-            .map_err(|_| AutonomousError::Integrity)?;
+        response.validate(&request).map_err(|_| {
+            event_integrity(
+                "hunter_state_response_validation",
+                "hunter_state_response_invalid",
+                None,
+            )
+        })?;
         let states = response
             .agreements
             .iter()
@@ -357,8 +420,13 @@ impl AutonomousHunterProcessor {
             block_number: response.block_number,
             block_hash: response.block_hash.clone(),
             observed_at_unix_ms: input.observed_at_unix_ms,
-            evaluated_at_unix_ms: u64::try_from(evaluated_at)
-                .map_err(|_| AutonomousError::Integrity)?,
+            evaluated_at_unix_ms: u64::try_from(evaluated_at).map_err(|_| {
+                event_integrity(
+                    "hunter_event_validation",
+                    "hunter_evaluation_clock_invalid",
+                    None,
+                )
+            })?,
             touched_pool_addresses: touched,
         };
         let mut collector = ArtifactCollector::default();
@@ -371,8 +439,16 @@ impl AutonomousHunterProcessor {
         if result.candidates.is_empty() {
             return Err(AutonomousError::Economic);
         }
-        let state_contract =
-            serde_json::to_value(&response).map_err(|_| AutonomousError::Integrity)?;
+        let state_contract = serde_json::to_value(&response).map_err(|_| {
+            event_integrity(
+                "hunter_state_response_validation",
+                "hunter_state_response_serialization",
+                None,
+            )
+        })?;
+        for artifact in &collector.artifacts {
+            validate_artifact(artifact)?;
+        }
         let mut materialized = 0_usize;
         for artifact in &collector.artifacts {
             if self.store.materialize(artifact, &state_contract).await? {
@@ -380,6 +456,13 @@ impl AutonomousHunterProcessor {
             }
         }
         Ok(candidate_result(result, materialized))
+    }
+}
+
+#[async_trait]
+impl AutonomousEventProcessor for AutonomousHunterProcessor {
+    async fn process(&self, input: &EngineInput, origin: &OriginEvent) -> ProcessResult {
+        self.process_event(input, origin).await
     }
 }
 
@@ -456,23 +539,33 @@ fn validate_artifact(artifact: &MaterializedCandidate) -> Result<(), AutonomousE
             != Some(true)
         || artifact.plan.get("shadow_only").and_then(Value::as_bool) != Some(false)
     {
-        return Err(AutonomousError::Integrity);
+        return Err(event_integrity(
+            "autonomous_candidate_validation",
+            "autonomous_candidate_contract_invalid",
+            None,
+        ));
     }
     Ok(())
 }
 
 fn text<'a>(value: &'a Value, field: &str) -> Result<&'a str, AutonomousError> {
-    value
-        .get(field)
-        .and_then(Value::as_str)
-        .ok_or(AutonomousError::Integrity)
+    value.get(field).and_then(Value::as_str).ok_or_else(|| {
+        event_integrity(
+            "autonomous_candidate_validation",
+            "autonomous_candidate_field_invalid",
+            None,
+        )
+    })
 }
 
 fn unsigned(value: &Value, field: &str) -> Result<u64, AutonomousError> {
-    value
-        .get(field)
-        .and_then(Value::as_u64)
-        .ok_or(AutonomousError::Integrity)
+    value.get(field).and_then(Value::as_u64).ok_or_else(|| {
+        event_integrity(
+            "autonomous_candidate_validation",
+            "autonomous_candidate_field_invalid",
+            None,
+        )
+    })
 }
 
 fn unsigned_text(value: &Value, field: &str) -> Result<String, AutonomousError> {
@@ -480,34 +573,150 @@ fn unsigned_text(value: &Value, field: &str) -> Result<String, AutonomousError> 
 }
 
 fn parse_uuid(value: &Value, field: &str) -> Result<Uuid, AutonomousError> {
-    Uuid::parse_str(text(value, field)?).map_err(|_| AutonomousError::Integrity)
+    Uuid::parse_str(text(value, field)?).map_err(|_| {
+        event_integrity(
+            "autonomous_candidate_validation",
+            "autonomous_candidate_uuid_invalid",
+            None,
+        )
+    })
 }
 
 fn timestamp(value: &Value, field: &str) -> Result<DateTime<Utc>, AutonomousError> {
     DateTime::parse_from_rfc3339(text(value, field)?)
         .map(|value| value.with_timezone(&Utc))
-        .map_err(|_| AutonomousError::Integrity)
+        .map_err(|_| {
+            event_integrity(
+                "autonomous_candidate_validation",
+                "autonomous_candidate_timestamp_invalid",
+                None,
+            )
+        })
 }
 
 fn map_hunter_error(error: HunterError) -> AutonomousError {
+    let error_code = error.code();
     match error {
-        HunterError::StateIncomplete | HunterError::EconomicInfeasible => {
-            AutonomousError::StateIncomplete
-        }
+        HunterError::InvalidBounds => process_integrity(
+            "hunter_route_selection",
+            "hunter_invalid_bounds",
+            Some(error_code),
+        ),
+        HunterError::InvalidUniverse => process_integrity(
+            "hunter_route_selection",
+            "hunter_invalid_universe",
+            Some(error_code),
+        ),
+        HunterError::InvalidPolicy => process_integrity(
+            "hunter_route_selection",
+            "hunter_invalid_policy",
+            Some(error_code),
+        ),
+        HunterError::PolicyRouteMismatch => process_integrity(
+            "hunter_route_selection",
+            "hunter_policy_route_mismatch",
+            Some(error_code),
+        ),
+        HunterError::InvalidRoute => process_integrity(
+            "hunter_route_selection",
+            "hunter_invalid_route",
+            Some(error_code),
+        ),
+        HunterError::DuplicateRoute => process_integrity(
+            "hunter_route_selection",
+            "hunter_duplicate_route",
+            Some(error_code),
+        ),
+        HunterError::RouteLimit => process_integrity(
+            "hunter_route_selection",
+            "hunter_route_limit",
+            Some(error_code),
+        ),
+        HunterError::AffectedRouteLimit => event_integrity(
+            "hunter_route_selection",
+            "hunter_affected_route_limit",
+            Some(error_code),
+        ),
+        HunterError::InvalidEvent => event_integrity(
+            "hunter_event_validation",
+            "hunter_invalid_event",
+            Some(error_code),
+        ),
+        HunterError::StateIncomplete => AutonomousError::StateIncomplete,
         HunterError::StateIntegrity => AutonomousError::ProviderDisagreement,
-        _ => AutonomousError::Integrity,
+        HunterError::EconomicInfeasible => AutonomousError::Economic,
+        HunterError::Arithmetic => event_integrity(
+            "hunter_route_simulation",
+            "hunter_arithmetic",
+            Some(error_code),
+        ),
+        HunterError::CandidateIntegrity => event_integrity(
+            "hunter_candidate_materialization",
+            "hunter_candidate_integrity",
+            Some(error_code),
+        ),
+        HunterError::PlanIntegrity => event_integrity(
+            "hunter_candidate_materialization",
+            "hunter_plan_integrity",
+            Some(error_code),
+        ),
     }
 }
 
-fn classify_database(error: sqlx::Error) -> AutonomousError {
+fn classify_database(error: sqlx::Error, stage: &'static str) -> AutonomousError {
     match error {
         sqlx::Error::Io(_)
         | sqlx::Error::Tls(_)
         | sqlx::Error::PoolTimedOut
         | sqlx::Error::PoolClosed
         | sqlx::Error::WorkerCrashed => AutonomousError::Dependency,
-        _ => AutonomousError::Integrity,
+        _ => process_integrity(stage, "autonomous_database_integrity", None),
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AutonomousIntegrityContext {
+    pub stage: &'static str,
+    pub error_class: &'static str,
+    pub hunter_error_code: Option<&'static str>,
+}
+
+impl AutonomousIntegrityContext {
+    fn evidence(self, failure_scope: &'static str) -> Value {
+        json!({
+            "stage": self.stage,
+            "error_class": self.error_class,
+            "hunter_error_code": self.hunter_error_code,
+            "failure_scope": failure_scope,
+            "execution_mode": "LIVE",
+            "execution_eligible": false,
+            "execution_request_created": false
+        })
+    }
+}
+
+fn event_integrity(
+    stage: &'static str,
+    error_class: &'static str,
+    hunter_error_code: Option<&'static str>,
+) -> AutonomousError {
+    AutonomousError::EventIntegrity(AutonomousIntegrityContext {
+        stage,
+        error_class,
+        hunter_error_code,
+    })
+}
+
+fn process_integrity(
+    stage: &'static str,
+    error_class: &'static str,
+    hunter_error_code: Option<&'static str>,
+) -> AutonomousError {
+    AutonomousError::ProcessIntegrity(AutonomousIntegrityContext {
+        stage,
+        error_class,
+        hunter_error_code,
+    })
 }
 
 #[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
@@ -522,6 +731,139 @@ pub enum AutonomousError {
     StateIncomplete,
     #[error("autonomous Hunter economics rejected the route")]
     Economic,
-    #[error("autonomous Hunter integrity check failed")]
-    Integrity,
+    #[error("autonomous Hunter event integrity check failed")]
+    EventIntegrity(AutonomousIntegrityContext),
+    #[error("autonomous Hunter process integrity check failed")]
+    ProcessIntegrity(AutonomousIntegrityContext),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn event_context(error: HunterError) -> AutonomousIntegrityContext {
+        match map_hunter_error(error) {
+            AutonomousError::EventIntegrity(context) => context,
+            other => panic!("expected event integrity, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn every_hunter_error_has_an_explicit_safe_classification() {
+        for error in [
+            HunterError::InvalidBounds,
+            HunterError::InvalidUniverse,
+            HunterError::InvalidPolicy,
+            HunterError::PolicyRouteMismatch,
+            HunterError::InvalidRoute,
+            HunterError::DuplicateRoute,
+            HunterError::RouteLimit,
+            HunterError::AffectedRouteLimit,
+            HunterError::InvalidEvent,
+            HunterError::StateIncomplete,
+            HunterError::StateIntegrity,
+            HunterError::EconomicInfeasible,
+            HunterError::Arithmetic,
+            HunterError::CandidateIntegrity,
+            HunterError::PlanIntegrity,
+        ] {
+            let code = error.code();
+            let mapped = map_hunter_error(error);
+            match mapped {
+                AutonomousError::EventIntegrity(context)
+                | AutonomousError::ProcessIntegrity(context) => {
+                    assert_eq!(context.hunter_error_code, Some(code));
+                }
+                AutonomousError::StateIncomplete
+                | AutonomousError::ProviderDisagreement
+                | AutonomousError::Economic => {}
+                other => panic!("unexpected Hunter classification: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn event_integrity_stages_and_hunter_codes_are_preserved() {
+        for (error, stage, code) in [
+            (
+                HunterError::AffectedRouteLimit,
+                "hunter_route_selection",
+                "hunter_affected_route_limit",
+            ),
+            (
+                HunterError::InvalidEvent,
+                "hunter_event_validation",
+                "hunter_invalid_event",
+            ),
+            (
+                HunterError::Arithmetic,
+                "hunter_route_simulation",
+                "hunter_arithmetic",
+            ),
+            (
+                HunterError::CandidateIntegrity,
+                "hunter_candidate_materialization",
+                "hunter_candidate_integrity",
+            ),
+            (
+                HunterError::PlanIntegrity,
+                "hunter_candidate_materialization",
+                "hunter_plan_integrity",
+            ),
+        ] {
+            let context = event_context(error);
+            assert_eq!(context.stage, stage);
+            assert_eq!(context.error_class, code);
+            assert_eq!(context.hunter_error_code, Some(code));
+            let result = ProcessResult::terminal(
+                "autonomous_event_integrity_quarantined",
+                99,
+                context.evidence("event"),
+            );
+            assert_eq!(result.candidate_count, 0);
+            assert_eq!(result.decision_count, 0);
+            assert!(result.evaluations.is_empty());
+            assert_eq!(result.action, ProcessingAction::Quarantine);
+        }
+    }
+
+    #[test]
+    fn invalid_state_response_and_candidate_validation_use_exact_bounded_evidence() {
+        let state = event_integrity(
+            "hunter_state_response_validation",
+            "hunter_state_response_invalid",
+            None,
+        );
+        let candidate = event_integrity(
+            "autonomous_candidate_validation",
+            "autonomous_candidate_contract_invalid",
+            None,
+        );
+        for error in [state, candidate] {
+            let AutonomousError::EventIntegrity(context) = error else {
+                panic!("expected event integrity");
+            };
+            let evidence = context.evidence("event");
+            assert_eq!(evidence["failure_scope"], "event");
+            assert_eq!(evidence["execution_mode"], "LIVE");
+            assert_eq!(evidence["execution_eligible"], false);
+            assert_eq!(evidence["execution_request_created"], false);
+            let rendered = evidence.to_string();
+            assert!(rendered.len() < 1024);
+            assert!(!rendered.contains("http://"));
+            assert!(!rendered.contains("private_key"));
+        }
+    }
+
+    #[test]
+    fn autonomous_database_integrity_is_process_scoped() {
+        assert_eq!(
+            classify_database(sqlx::Error::RowNotFound, "autonomous_candidate_persistence"),
+            process_integrity(
+                "autonomous_candidate_persistence",
+                "autonomous_database_integrity",
+                None,
+            )
+        );
+    }
 }
