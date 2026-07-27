@@ -17,7 +17,20 @@ metadata_output=
 result_output=
 
 fail() {
-  printf '{"code":"%s","status":"error"}\n' "$1" >&2
+  code=$1
+  stage=${2:-}
+  service=${3:-}
+  if [ -n "$stage" ] && [ -n "$service" ]; then
+    printf \
+      '{"code":"%s","evidence":{"service":"%s","stage":"%s"},"status":"error"}\n' \
+      "$code" "$service" "$stage" >&2
+  elif [ -n "$stage" ]; then
+    printf \
+      '{"code":"%s","evidence":{"stage":"%s"},"status":"error"}\n' \
+      "$code" "$stage" >&2
+  else
+    printf '{"code":"%s","status":"error"}\n' "$code" >&2
+  fi
   exit 1
 }
 
@@ -128,17 +141,23 @@ if [ "$inspect_running" -eq 1 ]; then
         --env-file "$env_file" \
         --env-file "$release_env" \
         "$@" ps -q "$service" 2>/dev/null) ||
-      fail RUNNING_IMAGE_MISMATCH
-    [ -n "$container_id" ] || fail RUNNING_IMAGE_MISMATCH
+      fail RUNNING_IMAGE_MISMATCH compose-ps "$service"
+    [ -n "$container_id" ] ||
+      fail RUNNING_IMAGE_MISMATCH container-missing "$service"
+    container_count=$(printf '%s\n' "$container_id" | awk 'NF { count += 1 } END { print count + 0 }')
+    [ "$container_count" -eq 1 ] ||
+      fail RUNNING_IMAGE_MISMATCH container-count "$service"
     image_pair=$(
       "$inspect_command" inspect \
         --format '{{.Config.Image}}{{printf "\t"}}{{.Image}}' \
         "$container_id" 2>/dev/null
-    ) || fail RUNNING_IMAGE_MISMATCH
+    ) || fail RUNNING_IMAGE_MISMATCH docker-inspect "$service"
     configured_image=${image_pair%%	*}
     image_id=${image_pair#*	}
-    [ "$configured_image" != "$image_pair" ] || fail RUNNING_IMAGE_MISMATCH
-    printf '%s\t%s\t%s\n' "$service" "$configured_image" "$image_id" >>"$running_tsv"
+    [ "$configured_image" != "$image_pair" ] ||
+      fail RUNNING_IMAGE_MISMATCH inspect-format "$service"
+    printf '%s\t%s\t%s\t%s\n' \
+      "$service" "$configured_image" "$image_id" "$container_id" >>"$running_tsv"
   done
   python3 "$script_dir/production_context.py" running-from-tsv \
     --input "$running_tsv" \

@@ -42,6 +42,7 @@ from scripts.phoenix_release.model import (
     StateError,
     advance,
     atomic_write,
+    complete_failure_evidence,
     fail_state,
     load_state,
     new_state,
@@ -200,6 +201,29 @@ class ReleaseStateTests(unittest.TestCase):
         value = rollback_phase(value, "ROLLED_BACK", {"status": "ok"})
         self.assertEqual(value["current_phase"], "ROLLED_BACK")
         self.assertEqual(value["rollback_result"], {"status": "ok"})
+
+    def test_deploy_failure_evidence_can_be_completed_after_rollback(self) -> None:
+        value = set_mutation_started(state())
+        value = fail_state(
+            value,
+            code="DEPLOYMENT_FAILED",
+            evidence={"source": "deploy-release", "detail": "deployment_failed"},
+        )
+        value = rollback_phase(value, "ROLLBACK_STARTED")
+        value = rollback_phase(value, "ROLLED_BACK", {"status": "ok"})
+        evidence = {
+            "source": "deploy-release",
+            "exit_code": 1,
+            "output": '{"code":"RUNNING_IMAGE_MISMATCH"}',
+        }
+        value = complete_failure_evidence(value, evidence)
+        self.assertEqual(value["failure_evidence"], evidence)
+        self.assertIs(complete_failure_evidence(value, evidence), value)
+        with self.assertRaisesRegex(StateError, "cannot be replaced"):
+            complete_failure_evidence(
+                value,
+                {**evidence, "output": '{"code":"DIFFERENT_FAILURE"}'},
+            )
 
     def test_failed_rollback_can_be_reconciled_to_rolled_back(self) -> None:
         value = set_mutation_started(state())
@@ -380,6 +404,18 @@ class BoundedTransportTests(unittest.TestCase):
         self.assertNotIn("token", output)
         self.assertNotIn("password", output)
         self.assertEqual(output.count("[REDACTED_URL]"), 2)
+
+    def test_failure_output_preserves_early_structured_diagnostic(self) -> None:
+        diagnostic = (
+            '{"code":"RUNNING_IMAGE_MISMATCH","evidence":'
+            '{"service":"phoenix-engine"}}'
+        )
+        output = _bounded_output(
+            f"{diagnostic}\n" + ("rollback-noise\n" * 500) + "ROLLBACK_OK\n"
+        )
+        self.assertIn(diagnostic, output)
+        self.assertIn("ROLLBACK_OK", output)
+        self.assertLessEqual(len(output), 4096)
 
     def test_transport_has_no_eval_or_general_shell(self) -> None:
         transport = (ROOT / "scripts/phoenix-release-transport.sh").read_text()
@@ -671,6 +707,10 @@ class WorkflowAndDeploymentContractTests(unittest.TestCase):
         self.assertIn("state=failure", self.workflow)
         self.assertIn("phoenix-release-evidence-", self.workflow)
         self.assertIn("GITHUB_STEP_SUMMARY", self.workflow)
+        self.assertIn('"evidence ${RELEASE_SHA}" >failed-release-evidence.json', self.workflow)
+        self.assertIn(
+            "mv failed-release-evidence.json release-evidence.json", self.workflow
+        )
 
     def test_candidate_render_precedes_any_runtime_mutation(self) -> None:
         candidate = self.deploy.index("mark_phase CANDIDATE_LIVE_RENDER_VERIFIED")
@@ -719,6 +759,8 @@ class WorkflowAndDeploymentContractTests(unittest.TestCase):
         complete = self.deploy.index("mark_phase COMPLETED")
         self.assertLess(verify, promote)
         self.assertLess(promote, complete)
+        self.assertIn("context_validation_output=$(", self.deploy)
+        self.assertIn("production release context validation failed", self.deploy)
 
     def test_failure_path_persists_rollback_phases(self) -> None:
         self.assertIn("state_update failure deployment_failed", self.deploy)

@@ -793,18 +793,35 @@ python3 "$deploy_dir/production_context.py" write-state \
   --compose-config "$rendered_candidate" \
   --output "$state_candidate"
 
-"$deploy_dir/validate-production-release-context.sh" \
-  --compose-file "$compose_file" \
-  --overlay-file "$overlay_file" \
-  --env-file "$env_file" \
-  --release-env "$release_env" \
-  --release-manifest "$manifest" \
-  --current-release "$pointer_candidate" \
-  --release-state "$state_candidate" \
-  --inspect-running \
-  --rendered-output "$context_rendered" \
-  --metadata-output "$context_metadata" \
-  --output "$context_candidate" >/dev/null
+set +e
+context_validation_output=$(
+  "$deploy_dir/validate-production-release-context.sh" \
+    --compose-file "$compose_file" \
+    --overlay-file "$overlay_file" \
+    --env-file "$env_file" \
+    --release-env "$release_env" \
+    --release-manifest "$manifest" \
+    --current-release "$pointer_candidate" \
+    --release-state "$state_candidate" \
+    --inspect-running \
+    --rendered-output "$context_rendered" \
+    --metadata-output "$context_metadata" \
+    --output "$context_candidate" 2>&1
+)
+context_validation_code=$?
+set -e
+if [ "$context_validation_code" -ne 0 ]; then
+  context_validation_evidence=$(
+    printf '%s\n' "$context_validation_output" |
+      grep -E '^\{"code":"[A-Z][A-Z0-9_]{2,63}",.*"status":"error"\}$' |
+      tail -n 1 || true
+  )
+  if [ -z "$context_validation_evidence" ]; then
+    context_validation_evidence='{"code":"PRODUCTION_CONTEXT_VALIDATION_FAILED","status":"error"}'
+  fi
+  printf '%s\n' "$context_validation_evidence"
+  fail "production release context validation failed"
+fi
 mark_phase POST_LIVE_VERIFIED
 
 install_active_file "$metadata_candidate" "$release_metadata" 0640
