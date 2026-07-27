@@ -214,6 +214,24 @@ wait_service_healthy() {
   return 1
 }
 
+validate_live_rpc_inputs() {
+  python3 -I -B - \
+    "$RPC_PROVIDER_URLS" "$RPC_PROVIDER_WEIGHTS" \
+    "$PRODUCTION_RPC_URL" "$SECONDARY_RPC_URL" <<'PY'
+import sys
+
+urls = [item.strip() for item in sys.argv[1].split(",")]
+priorities = [item.strip() for item in sys.argv[2].split(",")]
+
+if urls != [sys.argv[3], sys.argv[4]] or len(set(urls)) != 2:
+    raise SystemExit(1)
+if len(priorities) != 2 or any(
+    not value.isdigit() or int(value) <= 0
+    for value in priorities
+):
+    raise SystemExit(1)
+PY
+}
 validate_live_rpc_rendering() {
   python3 -I -B - \
     "$rendered_candidate" "$PRODUCTION_RPC_URL" "$SECONDARY_RPC_URL" <<'PY'
@@ -368,14 +386,13 @@ verify_active_release_coherence "$rollback_sha" "" ||
   fail "active release pointers are incoherent before deployment"
 "$deploy_dir/render-production-compose.sh" \
   --compose-file "$compose_file" \
-  --overlay-file "$overlay_file" \
   --env-file "$env_file" \
   --release-env "$release_env" \
   --release-manifest "$manifest" \
   --output "$rendered_candidate" \
   --metadata-output "$metadata_candidate" >/dev/null ||
   fail "preflight production rendering failed"
-validate_live_rpc_rendering ||
+validate_live_rpc_inputs ||
   fail "preflight LIVE RPC provider and priority configuration is invalid"
 capture_protected_ids "$protected_before" || fail "protected services are not ready before deployment"
 
