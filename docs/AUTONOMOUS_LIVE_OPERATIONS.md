@@ -6,22 +6,24 @@ existing `live-executor` release image. It does not reuse the bounded
 
 ## Release and deployment authority
 
-Only `.github/workflows/deploy-autonomous-live.yml` may start the final
-deployment. Its inputs bind the current merged `main` SHA, the successful
+Only `.github/workflows/phoenix-release-controller.yml` may start the final
+deployment. Successful exact-main Phoenix CI invokes it automatically. Its
+inputs and evidence bind the current merged `main` SHA, the successful
 seven-image build run, and the active immutable rollback release and build
 run. It revalidates source CI, release provenance, release assets, strict SSH
 host identity, and the active rollback identity before invoking the
-root-owned, digest-constrained gateway.
+root-owned, digest-constrained gateway through a bounded forced command.
 
 After merged-main CI and the immutable release build succeed, an authorized
 administrator may install the gateway once from that verified release tree:
 
 ```text
-sudo /bin/sh scripts/install-autonomous-live-deploy-gateway.sh
+sudo /bin/sh scripts/install-phoenix-release-platform.sh /root/phoenix-deploy.pub
 ```
 
-The `phoenix` account receives permission to invoke only that exact gateway
-digest. It does not receive a general root shell. Missing gateway
+The `phoenix-deploy` account receives permission to invoke only that exact gateway
+digest. It does not receive a general root shell, SCP, PTY, forwarding, or arbitrary
+SSH command. Missing gateway
 installation or SSH access is `EXTERNAL_VPS_ACCESS_REQUIRED`; missing signer,
 RPC, owner, or gas prerequisites use their corresponding exact external
 blocker class.

@@ -1,0 +1,22 @@
+#!/usr/bin/env sh
+set -eu
+umask 077
+
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+export PATH PYTHONDONTWRITEBYTECODE=1
+
+fail() {
+  printf '%s\n' \
+    '{"status":"error","phase":"GATEWAY","code":"GATEWAY_WRAPPER_FAILED","evidence":{}}' >&2
+  exit 1
+}
+
+[ "$(id -u)" -eq 0 ] || fail
+[ "$(uname -s)" = Linux ] || fail
+[ "$#" -ge 1 ] && [ "$#" -le 3 ] || fail
+command -v flock >/dev/null 2>&1 || fail
+[ -f /usr/local/libexec/phoenix-release/phoenix_release/cli.py ] || fail
+
+exec /usr/bin/flock -w 30 /run/lock/phoenix-release.lock \
+  /usr/bin/python3 -I -B \
+  /usr/local/libexec/phoenix-release/phoenix_release/cli.py "$@"
