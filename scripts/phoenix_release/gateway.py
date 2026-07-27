@@ -108,6 +108,10 @@ class HostPaths:
     def release_states(self) -> Path:
         return self.state_root / "releases"
 
+    @property
+    def state_updater(self) -> Path:
+        return self.libexec / "phoenix_release" / "phase_update.py"
+
 
 def host_paths() -> HostPaths:
     return HostPaths(
@@ -897,9 +901,7 @@ def resume(paths: HostPaths, release_sha: str) -> dict[str, Any]:
                 "PHOENIX_RELEASE_ROOT": str(paths.releases),
                 "PHOENIX_ENV_FILE": str(paths.env_file),
                 "PHOENIX_RELEASE_STATE_ROOT": str(paths.state_root),
-                "PHOENIX_RELEASE_STATE_UPDATER": str(
-                    paths.libexec / "phase_update.py"
-                ),
+                "PHOENIX_RELEASE_STATE_UPDATER": str(paths.state_updater),
             }
             result = _run(
                 [

@@ -454,6 +454,14 @@ class BoundedTransportTests(unittest.TestCase):
             self.assertEqual(rollback_state["current_phase"], "FAILED_POST_MUTATION")
             self.assertTrue(rollback_state["mutation_started"])
 
+    def test_state_updater_uses_installed_package_layout(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            paths = self.paths(Path(temporary))
+            self.assertEqual(
+                paths.state_updater,
+                paths.libexec / "phoenix_release" / "phase_update.py",
+            )
+
 
 class ReconciliationTests(unittest.TestCase):
     def snapshot(self) -> dict[str, object]:
@@ -588,14 +596,21 @@ class WorkflowAndDeploymentContractTests(unittest.TestCase):
             shutil.copytree(ROOT / "scripts/phoenix_release", destination)
             for path in destination.glob("*.py"):
                 path.chmod(0o644)
-            result = subprocess.run(
-                [sys.executable, "-I", str(destination / "cli.py"), "--help"],
-                check=False,
-                capture_output=True,
-                text=True,
-                cwd=root,
-            )
-            self.assertEqual(result.returncode, 0, result.stderr)
+            for entrypoint in ("cli.py", "phase_update.py"):
+                with self.subTest(entrypoint=entrypoint):
+                    result = subprocess.run(
+                        [
+                            sys.executable,
+                            "-I",
+                            str(destination / entrypoint),
+                            "--help",
+                        ],
+                        check=False,
+                        capture_output=True,
+                        text=True,
+                        cwd=root,
+                    )
+                    self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_no_secret_or_raw_transaction_is_written_to_evidence(self) -> None:
         gateway = (ROOT / "scripts/phoenix_release/gateway.py").read_text()
