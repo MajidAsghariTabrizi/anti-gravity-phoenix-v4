@@ -951,6 +951,8 @@ def resume(paths: HostPaths, release_sha: str) -> dict[str, Any]:
         }:
             current = fail_state(current, code=exc.code, evidence=exc.evidence)
             _write_state(paths, current)
+        if current["current_phase"] in {"FAILED_POST_MUTATION", "ROLLBACK_STARTED"}:
+            _rollback_failed_state(paths, current)
         raise
     except (OSError, StateError) as exc:
         current = load_state(state_path)
@@ -966,6 +968,8 @@ def resume(paths: HostPaths, release_sha: str) -> dict[str, Any]:
                 evidence={"message": str(exc)[:1024]},
             )
             _write_state(paths, current)
+        if current["current_phase"] in {"FAILED_POST_MUTATION", "ROLLBACK_STARTED"}:
+            _rollback_failed_state(paths, current)
         raise GatewayError("RELEASE_STATE_ERROR") from exc
 
 

@@ -4,6 +4,7 @@ import copy
 import io
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -11,6 +12,7 @@ import tarfile
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from scripts.phoenix_release import PROTOCOL_VERSION
 from scripts.phoenix_release.controller import (
@@ -27,6 +29,9 @@ from scripts.phoenix_release.gateway import (
     expected_members,
     receive_package,
     reconcile_snapshot,
+    request_file,
+    resume,
+    state_file,
     validate_request,
 )
 from scripts.phoenix_release.model import (
@@ -392,6 +397,62 @@ class BoundedTransportTests(unittest.TestCase):
         self.assertIn("PermitTunnel no", installer)
         self.assertIn("PermitUserRC no", installer)
         self.assertNotIn("NOPASSWD: ALL", installer)
+
+    def test_platform_installs_every_context_safety_dependency(self) -> None:
+        context_installer = (
+            ROOT / "scripts/install-production-release-context.sh"
+        ).read_text()
+        dependency_block = re.search(
+            r"for safety_script in \\\n(?P<body>.*?)\ndo\n",
+            context_installer,
+            re.DOTALL,
+        )
+        self.assertIsNotNone(dependency_block)
+        dependencies = set(
+            re.findall(
+                r"^\s{2}([A-Za-z0-9_.-]+)(?: \\)?$",
+                dependency_block.group("body"),
+                re.MULTILINE,
+            )
+        )
+        self.assertTrue(dependencies)
+        platform_installer = (
+            ROOT / "scripts/install-phoenix-release-platform.sh"
+        ).read_text()
+        installed = set(
+            re.findall(r"'([A-Za-z0-9_.-]+):[0-7]{4}'", platform_installer)
+        )
+        self.assertEqual(dependencies - installed, set())
+
+    def test_candidate_install_failure_rolls_back_in_same_resume(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            paths = self.paths(Path(temporary))
+            value = state()
+            for phase in PHASES[1 : PHASES.index("CANDIDATE_INSTALLED")]:
+                value = advance(value, phase)
+            atomic_write(state_file(paths, RELEASE_SHA), value)
+            request_path = request_file(paths, RELEASE_SHA)
+            request_path.parent.mkdir(parents=True)
+            request_path.write_text(json.dumps(request()), encoding="utf-8")
+
+            with (
+                patch(
+                    "scripts.phoenix_release.gateway._install_candidate",
+                    side_effect=GatewayError("CANDIDATE_INSTALL_FAILED"),
+                ),
+                patch(
+                    "scripts.phoenix_release.gateway._rollback_failed_state"
+                ) as rollback,
+            ):
+                with self.assertRaisesRegex(
+                    GatewayError, "CANDIDATE_INSTALL_FAILED"
+                ):
+                    resume(paths, RELEASE_SHA)
+
+            rollback.assert_called_once()
+            rollback_state = rollback.call_args.args[1]
+            self.assertEqual(rollback_state["current_phase"], "FAILED_POST_MUTATION")
+            self.assertTrue(rollback_state["mutation_started"])
 
 
 class ReconciliationTests(unittest.TestCase):
