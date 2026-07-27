@@ -128,6 +128,18 @@ output=$("$validator" "$live_env" 2>&1)
 assert_redacted "$output"
 printf '%s' "$output" | grep -q 'required autonomous LIVE variables'
 
+too_many_live_providers="$tmp_dir/live-too-many-providers.env"
+sed \
+  -e 's#^RPC_PROVIDER_URLS=.*#RPC_PROVIDER_URLS=https://credential-bearing-rpc.example/private-token,https://secondary.invalid,https://third.invalid#' \
+  -e 's/^RPC_PROVIDER_WEIGHTS=4,3$/RPC_PROVIDER_WEIGHTS=4,3,1/' \
+  "$live_env" >"$too_many_live_providers"
+if output=$("$validator" "$too_many_live_providers" 2>&1); then
+  echo "expected more than two autonomous LIVE RPC providers to fail"
+  exit 1
+fi
+assert_redacted "$output"
+printf '%s' "$output" | grep -q 'autonomous LIVE requires exactly two RPC providers'
+
 bad_allowlist="$tmp_dir/live-bad-allowlist.env"
 sed \
   's#LIVE_EXECUTOR_RPC_ALLOWLIST=.*#LIVE_EXECUTOR_RPC_ALLOWLIST=https://credential-bearing-rpc.example/private-token#' \

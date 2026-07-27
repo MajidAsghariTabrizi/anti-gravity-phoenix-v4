@@ -236,6 +236,8 @@ consume = deploy_release.find("consume_owner_authorization", authorization)
 configure = deploy_release.find("live-executor owner-configure")
 configured_preflight = deploy_release.find("live-executor owner-configured-preflight")
 production_mode = deploy_release.find("production_mode.py")
+live_reload = deploy_release.find("reload_environment", production_mode)
+burn_in = deploy_release.find("run_live_engine_burn_in", live_reload)
 activation = deploy_release.find("live-executor activate")
 unpause = deploy_release.find("live-executor owner-unpause")
 normal_preflight = deploy_release.rfind("live-executor preflight")
@@ -248,6 +250,8 @@ require(
         configure,
         configured_preflight,
         production_mode,
+        live_reload,
+        burn_in,
         activation,
         unpause,
         normal_preflight,
@@ -263,11 +267,77 @@ require(
     < configure
     < configured_preflight
     < production_mode
+    < live_reload
+    < burn_in
     < activation
     < unpause
     < normal_preflight
     < executor_start,
     "owner_bootstrap_deployment_sequence_invalid",
+)
+require(
+    "engine_burn_in_seconds=${PHOENIX_ENGINE_BURN_IN_SECONDS:-120}"
+    in deploy_release
+    and '[ "$engine_burn_in_seconds" -ge 120 ]' in deploy_release,
+    "engine_burn_in_minimum_missing",
+)
+burn_in_body = deploy_release[
+    deploy_release.find("run_live_engine_burn_in()") : deploy_release.find(
+        "install_active_file()", deploy_release.find("run_live_engine_burn_in()")
+    )
+]
+for burn_in_contract in (
+    "{{.RestartCount}}",
+    "http://127.0.0.1:9200/readyz",
+    "http://127.0.0.1:9300/readyz",
+    "compose ps -q live-executor",
+):
+    require(
+        burn_in_contract in burn_in_body,
+        f"engine_burn_in_contract_missing:{burn_in_contract}",
+    )
+require(
+    "engine_terminal_integrity_total" in burn_in_body
+    and "phoenix_engine_terminal_integrity_total" in deploy_release,
+    "engine_burn_in_terminal_integrity_gate_missing",
+)
+require(
+    deploy_release.find("compose stop -t 30 live-executor", production_mode)
+    < burn_in
+    < activation
+    < unpause
+    < executor_start,
+    "executor_not_stopped_through_engine_burn_in",
+)
+require(
+    deploy_release.count("reload_environment") >= 3
+    and deploy_release.count("assert_live_environment") >= 3,
+    "live_environment_reload_contract_missing",
+)
+require(
+    'unset PHOENIX_MODE LIVE_EXECUTION AUTONOMOUS_EXECUTION' in deploy_release,
+    "stale_mode_environment_not_cleared",
+)
+require(
+    "validate_live_rpc_rendering" in deploy_release
+    and 'urls != [sys.argv[2], sys.argv[3]]' in deploy_release
+    and "len(priorities) != 2" in deploy_release,
+    "rendered_live_rpc_parity_gate_missing",
+)
+preflight_rpc_gate = deploy_release.find(
+    'fail "preflight LIVE RPC provider and priority configuration is invalid"'
+)
+first_container_creation = deploy_release.find("compose pull")
+require(
+    0 <= preflight_rpc_gate < first_container_creation,
+    "live_rpc_parity_not_validated_before_container_creation",
+)
+require(
+    "candidate-release-assets.sha" in deploy_release
+    and "verify_active_release_coherence" in deploy_release
+    and 'rollback_release_root="$release_root/$rollback_sha"' in deploy_release
+    and 'PHOENIX_CONTEXT_INSTALLER="$rollback_context_installer"' in deploy_release,
+    "coherent_version_matched_rollback_contract_missing",
 )
 require(
     "owner_authorization=/etc/phoenix/authorizations/executor-owner-bootstrap.json"
@@ -290,6 +360,9 @@ require(
     < configure,
     "owner_bootstrap_not_marked_before_first_mutation",
 )
+owner_unpause_attempt = deploy_release.find(
+    "owner_unpause_attempted=1", configured_preflight
+)
 owner_unpause_code = deploy_release.find("owner_unpause_code=$?")
 owner_unpause_applied = deploy_release.find("owner_unpaused=1", owner_unpause_code)
 owner_unpause_failure = deploy_release.find(
@@ -297,7 +370,11 @@ owner_unpause_failure = deploy_release.find(
     owner_unpause_code,
 )
 require(
-    owner_unpause_code < owner_unpause_applied < owner_unpause_failure,
+    configured_preflight
+    < owner_unpause_attempt
+    < owner_unpause_code
+    < owner_unpause_applied
+    < owner_unpause_failure,
     "owner_unpause_compensation_state_not_captured_before_failure",
 )
 require(

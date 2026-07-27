@@ -192,6 +192,9 @@ impl RuntimeMetrics {
         self.inner
             .terminal_integrity
             .fetch_add(1, Ordering::Relaxed);
+        self.inner
+            .quarantine_pending_progress
+            .store(true, Ordering::Release);
     }
 
     pub fn duplicate_skip(&self) {

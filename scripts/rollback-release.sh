@@ -12,6 +12,8 @@ current_env="$deploy_dir/current-release.env"
 live_release_env="${PHOENIX_CURRENT_LIVE_RELEASE_ENV:-$current_env}"
 current_state="$deploy_dir/current-release.json"
 current_context="$deploy_dir/current-release-context.json"
+release_assets_file="$deploy_dir/release-assets.sha"
+candidate_release_assets_file="$deploy_dir/candidate-release-assets.sha"
 previous_file="$deploy_dir/previous-release"
 runtime_dir="${PHOENIX_DEPLOY_RUNTIME_DIR:-$deploy_dir/.deploy-runtime}"
 protected_services='nitro-feed-relay feed-ingestor nats postgres recorder'
@@ -111,8 +113,8 @@ PHOENIX_DEPLOY_ROOT="$deploy_root" \
 PHOENIX_ENV_FILE="$env_file" \
   /bin/sh "$context_installer" "$release_sha" "$release_assets_root" ||
   fail "rollback release assets could not be restored"
-[ -s "$deploy_dir/release-assets.sha" ] || fail "rollback release-assets marker is missing"
-installed_assets_sha=$(tr -d '\r\n' <"$deploy_dir/release-assets.sha")
+[ -s "$candidate_release_assets_file" ] || fail "rollback release-assets marker is missing"
+installed_assets_sha=$(tr -d '\r\n' <"$candidate_release_assets_file")
 [ "$installed_assets_sha" = "$release_sha" ] || fail "rollback release-assets marker is invalid"
 python3 "$deploy_dir/production_context.py" manifest-env \
   --manifest "$manifest" \
@@ -133,6 +135,7 @@ rendered_candidate="$state_dir/compose.rendered.json"
 metadata_candidate="$state_dir/render.metadata.json"
 state_candidate="$state_dir/release-state.json"
 pointer_candidate="$state_dir/current-release"
+assets_pointer_candidate="$state_dir/release-assets.sha"
 context_candidate="$state_dir/release-context.json"
 context_rendered="$state_dir/context.compose.json"
 context_metadata="$state_dir/context.metadata.json"
@@ -196,6 +199,31 @@ install_active_file() {
   fi
 }
 
+verify_active_release_coherence() {
+  expected_sha=$1
+  expected_previous_sha=$2
+  [ "$(tr -d '\r\n' <"$current_file")" = "$expected_sha" ] || return 1
+  [ "$(tr -d '\r\n' <"$release_assets_file")" = "$expected_sha" ] || return 1
+  [ "$(tr -d '\r\n' <"$previous_file")" = "$expected_previous_sha" ] ||
+    return 1
+  grep -F -x "PHOENIX_RELEASE_SHA=$expected_sha" "$current_env" >/dev/null ||
+    return 1
+  python3 -I -B - "$expected_sha" "$current_state" "$current_context" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+expected = sys.argv[1]
+for name in sys.argv[2:]:
+    try:
+        value = json.loads(Path(name).read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        raise SystemExit(1)
+    if not isinstance(value, dict) or value.get("release_sha") != expected:
+        raise SystemExit(1)
+PY
+}
+
 rollback_from=
 if [ -s "$current_file" ]; then
   rollback_from=$(tr -d '\r\n' <"$current_file")
@@ -212,6 +240,7 @@ cmp "$protected_before" "$protected_after" >/dev/null || fail "protected service
 PHOENIX_RELEASE_ENV="$release_env" "$deploy_dir/production-healthcheck.sh"
 
 printf '%s\n' "$release_sha" >"$pointer_candidate"
+printf '%s\n' "$release_sha" >"$assets_pointer_candidate"
 python3 "$deploy_dir/production_context.py" write-state \
   --manifest "$manifest" \
   --release-env "$release_env" \
@@ -236,10 +265,16 @@ install_active_file "$state_candidate" "$release_state" 0640
 install_active_file "$release_env" "$current_env" 0640
 install_active_file "$state_candidate" "$current_state" 0640
 install_active_file "$context_candidate" "$current_context" 0640
+install_active_file "$assets_pointer_candidate" "$release_assets_file" 0640
 install_active_file "$pointer_candidate" "$current_file" 0640
+expected_previous_sha=$release_sha
 if [ -n "$rollback_from" ] && [ "$rollback_from" != "$release_sha" ]; then
   printf '%s\n' "$rollback_from" >"$previous_file"
+  expected_previous_sha=$rollback_from
 fi
+verify_active_release_coherence "$release_sha" "$expected_previous_sha" ||
+  fail "rollback release pointers are incoherent after promotion"
+rm -f "$candidate_release_assets_file"
 
 trap - EXIT HUP INT TERM
 rm -rf "$state_dir"
