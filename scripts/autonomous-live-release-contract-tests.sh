@@ -324,6 +324,26 @@ require(
     and "len(priorities) != 2" in deploy_release,
     "rendered_live_rpc_parity_gate_missing",
 )
+preflight_render_start = deploy_release.find(
+    '"$deploy_dir/render-production-compose.sh"',
+    deploy_release.find('verify_active_release_coherence "$rollback_sha" ""'),
+)
+preflight_render_end = deploy_release.find(
+    'capture_protected_ids "$protected_before"',
+    preflight_render_start,
+)
+preflight_render_body = (
+    deploy_release[preflight_render_start:preflight_render_end]
+    if 0 <= preflight_render_start < preflight_render_end
+    else ""
+)
+require(
+    preflight_render_body
+    and '--overlay-file "$overlay_file"' not in preflight_render_body
+    and "validate_live_rpc_inputs" in preflight_render_body
+    and "validate_live_rpc_inputs()" in deploy_release,
+    "prelive_shadow_render_uses_live_overlay",
+)
 preflight_rpc_gate = deploy_release.find(
     'fail "preflight LIVE RPC provider and priority configuration is invalid"'
 )
