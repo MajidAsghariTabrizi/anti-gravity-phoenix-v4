@@ -96,4 +96,42 @@ do
     fail "existing health contract changed: $unchanged_contract"
 done
 
+cat >"$release_env" <<'EOF'
+PHOENIX_MODE=LIVE
+LIVE_EXECUTION=true
+AUTONOMOUS_EXECUTION=true
+EOF
+: >"$docker_log"
+PHOENIX_MODE=SHADOW \
+LIVE_EXECUTION=false \
+AUTONOMOUS_EXECUTION=false \
+PATH="$fake_bin:$PATH" \
+PHOENIX_DEPLOY_ROOT="$deploy_root" \
+PHOENIX_ENV_FILE="$env_file" \
+PHOENIX_RELEASE_ENV="$release_env" \
+PHOENIX_HEALTH_RETRIES=2 \
+PHOENIX_HEALTH_SLEEP_SECONDS=0 \
+PHOENIX_HEALTHCHECK_DOCKER_LOG="$docker_log" \
+  /bin/sh "$healthcheck" >"$output"
+
+for live_contract in \
+  'HEALTH_OK: live-executor' \
+  'HEALTH_OK: autonomous-live-mode' \
+  'HEALTH_OK: autonomous-controls' \
+  'HEALTH_OK: event-metrics'
+do
+  grep -Fx "$live_contract" "$output" >/dev/null ||
+    fail "release environment did not select LIVE health contract: $live_contract"
+done
+if grep -F 'HEALTH_OK: shadow-mode' "$output" >/dev/null; then
+  fail 'inherited SHADOW mode overrode the installed release environment'
+fi
+grep -F '/compose.live-autonomous.yml>' "$docker_log" >/dev/null ||
+  fail 'LIVE healthcheck did not use the autonomous Compose overlay'
+grep -F '<--profile><live-autonomous>' "$docker_log" >/dev/null ||
+  fail 'LIVE healthcheck did not select the autonomous Compose profile'
+grep -F '<live-executor></usr/local/bin/autonomous-live-control><status>' \
+  "$docker_log" >/dev/null ||
+  fail 'LIVE healthcheck did not inspect autonomous controls'
+
 echo 'production-healthcheck-tests: ok'

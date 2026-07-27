@@ -10,9 +10,14 @@ overlay_file="$deploy_dir/compose.live-autonomous.yml"
 retries="${PHOENIX_HEALTH_RETRIES:-20}"
 sleep_seconds="${PHOENIX_HEALTH_SLEEP_SECONDS:-3}"
 
+[ -f "$release_env" ] ||
+  { echo "HEALTH_FAIL: missing release env $release_env"; exit 1; }
+
 set -a
 # shellcheck disable=SC1090
 . "$env_file"
+# shellcheck disable=SC1090
+. "$release_env"
 set +a
 
 compose() {
@@ -39,8 +44,6 @@ check() {
   echo "HEALTH_FAIL: $name"
   return 1
 }
-
-[ -f "$release_env" ] || { echo "HEALTH_FAIL: missing release env $release_env"; exit 1; }
 
 check postgres compose exec -T postgres /bin/sh -c 'pg_isready -U "$POSTGRES_USER" -d "$POSTGRES_DB"'
 check nats compose exec -T nats wget -q -O - http://127.0.0.1:8222/healthz

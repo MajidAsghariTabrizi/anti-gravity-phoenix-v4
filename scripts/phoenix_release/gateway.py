@@ -92,6 +92,7 @@ def _bounded_output(value: str | None) -> str:
             '"code":"' in line
             or line.startswith("DEPLOY_FAILED:")
             or line.startswith("DEPLOY_COMPENSATION_")
+            or line.startswith("HEALTH_FAIL:")
             or line.startswith("ROLLBACK_")
         )
     ]
