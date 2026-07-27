@@ -14,6 +14,7 @@ compose_contract=$repo_root/compose.live-autonomous.yml
 control_source=$repo_root/live-executor/src/autonomous_live_control_main.rs
 owner_bootstrap_source=$repo_root/live-executor/src/owner_bootstrap.rs
 deploy_release=$repo_root/scripts/deploy-release.sh
+rollback_release=$repo_root/scripts/rollback-release.sh
 
 fail() {
   echo "AUTONOMOUS_LIVE_RELEASE_CONTRACT_TEST_FAILED: $1" >&2
@@ -30,7 +31,8 @@ for required in \
   "$compose_contract" \
   "$control_source" \
   "$owner_bootstrap_source" \
-  "$deploy_release"
+  "$deploy_release" \
+  "$rollback_release"
 do
   [ -f "$required" ] && [ ! -L "$required" ] ||
     fail "required_file_missing:$required"
@@ -76,7 +78,7 @@ grep -F 'autonomous-live-control __image_runtime_probe__' "$dockerfile" >/dev/nu
 
 PYTHONDONTWRITEBYTECODE=1 python3 -I -B - \
   "$compose_contract" "$control_source" "$owner_bootstrap_source" \
-  "$deploy_release" "$dockerfile" "$runtime_verifier" <<'PY' ||
+  "$deploy_release" "$rollback_release" "$dockerfile" "$runtime_verifier" <<'PY' ||
 import re
 import sys
 from pathlib import Path
@@ -96,6 +98,7 @@ def require(condition: bool, message: str) -> None:
     control_path,
     owner_bootstrap_path,
     deploy_release_path,
+    rollback_release_path,
     dockerfile_path,
     verifier_path,
 ) = map(Path, sys.argv[1:])
@@ -104,6 +107,7 @@ control = control_path.read_text(encoding="utf-8")
 owner_bootstrap = owner_bootstrap_path.read_text(encoding="utf-8")
 owner_runtime = owner_bootstrap.split("#[cfg(test)]", 1)[0]
 deploy_release = deploy_release_path.read_text(encoding="utf-8")
+rollback_release = rollback_release_path.read_text(encoding="utf-8")
 dockerfile = dockerfile_path.read_text(encoding="utf-8")
 verifier = verifier_path.read_text(encoding="utf-8")
 
@@ -332,6 +336,11 @@ require(
 require(
     'unset PHOENIX_MODE LIVE_EXECUTION AUTONOMOUS_EXECUTION' in deploy_release,
     "stale_mode_environment_not_cleared",
+)
+require(
+    "PHOENIX_HEALTH_EXPECTED_MODE=LIVE" in deploy_release
+    and "PHOENIX_HEALTH_EXPECTED_MODE=SHADOW" in rollback_release,
+    "release_phase_health_mode_not_explicit",
 )
 require(
     "validate_live_rpc_rendering" in deploy_release

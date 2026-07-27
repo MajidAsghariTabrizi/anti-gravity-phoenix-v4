@@ -237,7 +237,10 @@ for service in $optional_services; do
 done
 capture_protected_ids "$protected_after" || fail "protected services are not ready after rollback"
 cmp "$protected_before" "$protected_after" >/dev/null || fail "protected service identity changed during rollback"
-PHOENIX_RELEASE_ENV="$release_env" "$deploy_dir/production-healthcheck.sh"
+PHOENIX_ENV_FILE="$env_file" \
+PHOENIX_RELEASE_ENV="$release_env" \
+PHOENIX_HEALTH_EXPECTED_MODE=SHADOW \
+  "$deploy_dir/production-healthcheck.sh"
 
 printf '%s\n' "$release_sha" >"$pointer_candidate"
 printf '%s\n' "$release_sha" >"$assets_pointer_candidate"

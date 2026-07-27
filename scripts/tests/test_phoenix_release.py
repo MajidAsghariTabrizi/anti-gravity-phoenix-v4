@@ -683,6 +683,7 @@ class WorkflowAndDeploymentContractTests(unittest.TestCase):
             ROOT / ".github/workflows/phoenix-release-controller.yml"
         ).read_text()
         self.deploy = (ROOT / "scripts/deploy-release.sh").read_text()
+        self.rollback = (ROOT / "scripts/rollback-release.sh").read_text()
 
     def test_controller_is_automatic_resumable_and_serialized(self) -> None:
         self.assertIn('workflows: ["Phoenix CI"]', self.workflow)
@@ -764,6 +765,22 @@ class WorkflowAndDeploymentContractTests(unittest.TestCase):
         self.assertLess(promote, complete)
         self.assertIn("context_validation_output=$(", self.deploy)
         self.assertIn("production release context validation failed", self.deploy)
+
+    def test_health_checks_receive_explicit_release_phase_mode(self) -> None:
+        self.assertIn("PHOENIX_HEALTH_EXPECTED_MODE=LIVE", self.deploy)
+        self.assertIn('PHOENIX_ENV_FILE="$env_file"', self.deploy)
+        self.assertIn("PHOENIX_HEALTH_EXPECTED_MODE=SHADOW", self.rollback)
+        self.assertIn('PHOENIX_ENV_FILE="$env_file"', self.rollback)
+        live_health = self.deploy.index("PHOENIX_HEALTH_EXPECTED_MODE=LIVE")
+        live_reload = self.deploy.rfind("reload_environment", 0, live_health)
+        live_assertion = self.deploy.find(
+            "assert_live_environment", live_reload, live_health
+        )
+        self.assertGreaterEqual(live_reload, 0)
+        self.assertGreaterEqual(live_assertion, 0)
+        shadow_install = self.rollback.index('production_mode.py" shadow')
+        shadow_health = self.rollback.index("PHOENIX_HEALTH_EXPECTED_MODE=SHADOW")
+        self.assertLess(shadow_install, shadow_health)
 
     def test_failure_path_persists_rollback_phases(self) -> None:
         self.assertIn("state_update failure deployment_failed", self.deploy)

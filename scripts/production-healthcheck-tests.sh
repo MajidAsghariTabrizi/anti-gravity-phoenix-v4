@@ -96,10 +96,13 @@ do
     fail "existing health contract changed: $unchanged_contract"
 done
 
-cat >"$release_env" <<'EOF'
+cat >"$env_file" <<'EOF'
 PHOENIX_MODE=LIVE
 LIVE_EXECUTION=true
 AUTONOMOUS_EXECUTION=true
+EOF
+cat >"$release_env" <<'EOF'
+PHOENIX_RELEASE_SHA=1111111111111111111111111111111111111111
 EOF
 : >"$docker_log"
 PHOENIX_MODE=SHADOW \
@@ -109,6 +112,7 @@ PATH="$fake_bin:$PATH" \
 PHOENIX_DEPLOY_ROOT="$deploy_root" \
 PHOENIX_ENV_FILE="$env_file" \
 PHOENIX_RELEASE_ENV="$release_env" \
+PHOENIX_HEALTH_EXPECTED_MODE=LIVE \
 PHOENIX_HEALTH_RETRIES=2 \
 PHOENIX_HEALTH_SLEEP_SECONDS=0 \
 PHOENIX_HEALTHCHECK_DOCKER_LOG="$docker_log" \
@@ -121,10 +125,10 @@ for live_contract in \
   'HEALTH_OK: event-metrics'
 do
   grep -Fx "$live_contract" "$output" >/dev/null ||
-    fail "release environment did not select LIVE health contract: $live_contract"
+    fail "explicit LIVE expectation did not select health contract: $live_contract"
 done
 if grep -F 'HEALTH_OK: shadow-mode' "$output" >/dev/null; then
-  fail 'inherited SHADOW mode overrode the installed release environment'
+  fail 'inherited SHADOW mode overrode the explicit LIVE expectation'
 fi
 grep -F '/compose.live-autonomous.yml>' "$docker_log" >/dev/null ||
   fail 'LIVE healthcheck did not use the autonomous Compose overlay'
@@ -133,5 +137,18 @@ grep -F '<--profile><live-autonomous>' "$docker_log" >/dev/null ||
 grep -F '<live-executor></usr/local/bin/autonomous-live-control><status>' \
   "$docker_log" >/dev/null ||
   fail 'LIVE healthcheck did not inspect autonomous controls'
+
+if PATH="$fake_bin:$PATH" \
+  PHOENIX_DEPLOY_ROOT="$deploy_root" \
+  PHOENIX_ENV_FILE="$env_file" \
+  PHOENIX_RELEASE_ENV="$release_env" \
+  PHOENIX_HEALTH_EXPECTED_MODE=INVALID \
+  PHOENIX_HEALTHCHECK_DOCKER_LOG="$docker_log" \
+    /bin/sh "$healthcheck" >"$output" 2>&1
+then
+  fail 'invalid explicit health mode passed'
+fi
+grep -Fx 'HEALTH_FAIL: invalid expected mode' "$output" >/dev/null ||
+  fail 'invalid explicit health mode did not fail explicitly'
 
 echo 'production-healthcheck-tests: ok'

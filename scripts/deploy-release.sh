@@ -779,7 +779,10 @@ reload_environment
 assert_live_environment
 (
   unset PHOENIX_MODE LIVE_EXECUTION AUTONOMOUS_EXECUTION
-  PHOENIX_RELEASE_ENV="$release_env" "$deploy_dir/production-healthcheck.sh"
+  PHOENIX_ENV_FILE="$env_file" \
+  PHOENIX_RELEASE_ENV="$release_env" \
+  PHOENIX_HEALTH_EXPECTED_MODE=LIVE \
+    "$deploy_dir/production-healthcheck.sh"
 )
 run_post_live_stabilization ||
   fail "post-LIVE stabilization failed"

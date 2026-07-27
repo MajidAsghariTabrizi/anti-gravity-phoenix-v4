@@ -9,6 +9,12 @@ compose_file="$deploy_dir/compose.prod.yml"
 overlay_file="$deploy_dir/compose.live-autonomous.yml"
 retries="${PHOENIX_HEALTH_RETRIES:-20}"
 sleep_seconds="${PHOENIX_HEALTH_SLEEP_SECONDS:-3}"
+expected_mode="${PHOENIX_HEALTH_EXPECTED_MODE:-}"
+
+case "$expected_mode" in
+  ""|LIVE|SHADOW) ;;
+  *) echo "HEALTH_FAIL: invalid expected mode"; exit 1 ;;
+esac
 
 [ -f "$release_env" ] ||
   { echo "HEALTH_FAIL: missing release env $release_env"; exit 1; }
@@ -20,9 +26,11 @@ set -a
 . "$release_env"
 set +a
 
+health_mode=${expected_mode:-${PHOENIX_MODE:-SHADOW}}
+
 compose() {
   set -- --env-file "$env_file" --env-file "$release_env" -f "$compose_file" "$@"
-  if [ "${PHOENIX_MODE:-SHADOW}" = LIVE ]; then
+  if [ "$health_mode" = LIVE ]; then
     set -- --env-file "$env_file" --env-file "$release_env" \
       -f "$compose_file" -f "$overlay_file" --profile live-autonomous "$@"
   fi
@@ -55,10 +63,13 @@ check phoenix-engine compose exec -T phoenix-engine wget -q -O - http://127.0.0.
 check recorder compose exec -T recorder wget -q -O - http://127.0.0.1:9400/readyz
 check prometheus compose exec -T prometheus wget -q -O - http://127.0.0.1:9090/-/ready
 check dashboard compose exec -T dashboard python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8501/_stcore/health', timeout=2)"
-if [ "${PHOENIX_MODE:-}" = LIVE ]; then
-  [ "${LIVE_EXECUTION:-}" = true ] &&
-    [ "${AUTONOMOUS_EXECUTION:-}" = true ] ||
-    { echo "HEALTH_FAIL: autonomous-live-mode"; exit 1; }
+if [ "$health_mode" = LIVE ]; then
+  if [ -z "$expected_mode" ]; then
+    [ "${PHOENIX_MODE:-}" = LIVE ] &&
+      [ "${LIVE_EXECUTION:-}" = true ] &&
+      [ "${AUTONOMOUS_EXECUTION:-}" = true ] ||
+      { echo "HEALTH_FAIL: autonomous-live-mode"; exit 1; }
+  fi
   check live-executor compose exec -T live-executor /bin/sh -c 'kill -0 1'
   check autonomous-live-mode compose exec -T phoenix-engine /bin/sh -c \
     '[ "$PHOENIX_MODE" = LIVE ] && [ "$LIVE_EXECUTION" = true ] && [ "$AUTONOMOUS_EXECUTION" = true ]'
