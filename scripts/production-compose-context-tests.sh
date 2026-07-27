@@ -337,7 +337,11 @@ running = {}
 for service, image in metadata["images"].items():
     if service == "migration-runner":
         continue
-    running[service] = {"configured_image": image, "image_id": "sha256:" + "a" * 64}
+    running[service] = {
+        "configured_image": image,
+        "container_id": "b" * 64,
+        "image_id": "sha256:" + "a" * 64,
+    }
 with open(sys.argv[2], "w", encoding="utf-8", newline="\n") as handle:
     json.dump({"schema": "phoenix.running-images.v1", "services": running}, handle, indent=2, sort_keys=True)
     handle.write("\n")
@@ -353,6 +357,39 @@ PHOENIX_COMPOSE_BIN="$fake_compose" "$context_validator" \
   --rendered-output "$context_rendered" \
   --metadata-output "$context_metadata" \
   --output "$context_result" >/dev/null || fail "valid active release context failed"
+
+fake_runtime_compose=$test_root/fake-runtime-compose
+cat >"$fake_runtime_compose" <<'SH'
+#!/usr/bin/env sh
+set -eu
+fake_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+case " $* " in
+  *" ps -q nitro-feed-relay "*) exit 1 ;;
+  *) cat "$fake_dir/compose-output.json" ;;
+esac
+SH
+chmod +x "$fake_runtime_compose"
+if output=$(
+  PHOENIX_COMPOSE_BIN="$fake_runtime_compose" \
+  PHOENIX_DOCKER_BIN=/bin/false \
+    "$context_validator" \
+      --compose-file "$compose_file" \
+      --env-file "$operator_env" \
+      --release-env "$release_env" \
+      --release-manifest "$manifest" \
+      --current-release "$current_release" \
+      --release-state "$release_state" \
+      --inspect-running \
+      --rendered-output "$context_rendered" \
+      --metadata-output "$context_metadata" \
+      --output "$context_result" 2>&1
+); then
+  fail "failed runtime inspection passed active release validation"
+fi
+printf '%s' "$output" | grep -F '"service":"nitro-feed-relay"' >/dev/null ||
+  fail "runtime inspection failure omitted the service"
+printf '%s' "$output" | grep -F '"stage":"compose-ps"' >/dev/null ||
+  fail "runtime inspection failure omitted the stage"
 
 bad_release_state=$test_root/bad-release-state.json
 python3 - "$release_state" "$bad_release_state" <<'PY'
@@ -405,6 +442,32 @@ if output=$(PHOENIX_COMPOSE_BIN="$fake_compose" "$context_validator" \
 fi
 printf '%s' "$output" | grep -F '"code":"RUNNING_IMAGE_MISMATCH"' >/dev/null ||
   fail "running image mismatch was not explicit"
+printf '%s' "$output" | grep -F '"service":"phoenix-engine"' >/dev/null ||
+  fail "running image mismatch omitted the service"
+printf '%s' "$output" | grep -F \
+  '"configured_image":"ghcr.io/majidasgharitabrizi/phoenix-engine@sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"' \
+  >/dev/null ||
+  fail "running image mismatch omitted the actual configured image"
+printf '%s' "$output" | grep -F \
+  '"expected_image":"ghcr.io/majidasgharitabrizi/phoenix-engine@sha256:2222222222222222222222222222222222222222222222222222222222222222"' \
+  >/dev/null ||
+  fail "running image mismatch omitted the expected image"
+
+running_tsv=$test_root/running-images.tsv
+running_from_tsv=$test_root/running-from-tsv.json
+printf '%s\t%s\t%s\t%s\n' \
+  phoenix-engine \
+  ghcr.io/majidasgharitabrizi/phoenix-engine@sha256:2222222222222222222222222222222222222222222222222222222222222222 \
+  sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
+  bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb \
+  >"$running_tsv"
+python3 "$helper" running-from-tsv \
+  --input "$running_tsv" \
+  --output "$running_from_tsv"
+grep -F \
+  '"container_id": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"' \
+  "$running_from_tsv" >/dev/null ||
+  fail "running image snapshot omitted the container identity"
 
 for generated in \
   deploy/current-release \

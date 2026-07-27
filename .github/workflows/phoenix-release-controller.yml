@@ -488,8 +488,19 @@ jobs:
               ssh "${ssh_opts[@]}" "${PROD_USER}@${PROD_HOST}" \
                 "receive ${RELEASE_SHA}" >receive-evidence.json
           fi
+          set +e
           ssh "${ssh_opts[@]}" "${PROD_USER}@${PROD_HOST}" "resume ${RELEASE_SHA}" \
             >release-evidence.json
+          resume_code=$?
+          set -e
+          if (( resume_code != 0 )); then
+            if ssh "${ssh_opts[@]}" "${PROD_USER}@${PROD_HOST}" \
+              "evidence ${RELEASE_SHA}" >failed-release-evidence.json
+            then
+              mv failed-release-evidence.json release-evidence.json
+            fi
+            exit "$resume_code"
+          fi
           jq -e --arg sha "$RELEASE_SHA" \
             '.release_sha == $sha and .current_phase == "COMPLETED"' \
             release-evidence.json >/dev/null

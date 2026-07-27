@@ -24,6 +24,7 @@ from .model import (
     StateError,
     advance,
     atomic_write,
+    complete_failure_evidence,
     fail_state,
     load_state,
     new_state,
@@ -82,6 +83,23 @@ class GatewayError(ValueError):
 
 def _bounded_output(value: str | None) -> str:
     redacted = SENSITIVE_OUTPUT_RE.sub("[REDACTED_URL]", value or "")
+    if len(redacted) <= 4096:
+        return redacted
+    diagnostic_lines = [
+        line
+        for line in redacted.splitlines()
+        if (
+            '"code":"' in line
+            or line.startswith("DEPLOY_FAILED:")
+            or line.startswith("DEPLOY_COMPENSATION_")
+            or line.startswith("ROLLBACK_")
+        )
+    ]
+    diagnostics = "\n".join(dict.fromkeys(diagnostic_lines))
+    if diagnostics:
+        diagnostics = diagnostics[:2048]
+        tail_budget = 4096 - len(diagnostics) - 1
+        return f"{diagnostics}\n{redacted[-tail_budget:]}"
     return redacted[-4096:]
 
 
@@ -924,6 +942,11 @@ def resume(paths: HostPaths, release_sha: str) -> dict[str, Any]:
             )
             state = load_state(state_path)
             if result.returncode != 0:
+                failure_evidence = {
+                    "exit_code": result.returncode,
+                    "output": _bounded_output(result.stdout),
+                    "source": "deploy-release",
+                }
                 if state["current_phase"] not in {
                     "FAILED_PRE_MUTATION",
                     "FAILED_POST_MUTATION",
@@ -933,11 +956,15 @@ def resume(paths: HostPaths, release_sha: str) -> dict[str, Any]:
                     state = fail_state(
                         state,
                         code="DEPLOYMENT_FAILED",
-                        evidence={
-                            "exit_code": result.returncode,
-                            "output": _bounded_output(result.stdout),
-                        },
+                        evidence=failure_evidence,
                     )
+                    _write_state(paths, state)
+                elif (
+                    state["failure_code"] == "DEPLOYMENT_FAILED"
+                    and state["failure_evidence"]
+                    == {"source": "deploy-release", "detail": "deployment_failed"}
+                ):
+                    state = complete_failure_evidence(state, failure_evidence)
                     _write_state(paths, state)
                 raise GatewayError(
                     "DEPLOYMENT_FAILED",

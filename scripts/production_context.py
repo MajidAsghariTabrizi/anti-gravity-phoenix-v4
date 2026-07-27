@@ -79,13 +79,16 @@ MAX_ROUTES = 256
 
 
 class ContextError(Exception):
-    def __init__(self, code: str):
+    def __init__(self, code: str, evidence: dict[str, str | None] | None = None):
         super().__init__(code)
         self.code = code
+        self.evidence = evidence or {}
 
 
-def fail(code: str) -> None:
+def fail(code: str, evidence: dict[str, str | None] | None = None) -> None:
     payload = {"code": code, "status": "error"}
+    if evidence:
+        payload["evidence"] = evidence
     print(json.dumps(payload, sort_keys=True, separators=(",", ":")), file=sys.stderr)
     raise SystemExit(1)
 
@@ -644,15 +647,17 @@ def running_from_tsv(args: argparse.Namespace) -> None:
         raise ContextError("RUNNING_IMAGE_MISMATCH") from None
     for line in lines:
         fields = line.split("\t")
-        if len(fields) != 3:
+        if len(fields) not in (3, 4):
             raise ContextError("RUNNING_IMAGE_MISMATCH")
-        service, configured_image, image_id = fields
+        service, configured_image, image_id = fields[:3]
         if service in services:
             raise ContextError("RUNNING_IMAGE_MISMATCH")
         services[service] = {
             "configured_image": configured_image,
             "image_id": image_id,
         }
+        if len(fields) == 4:
+            services[service]["container_id"] = fields[3]
     atomic_write(
         Path(args.output),
         json.dumps({"schema": "phoenix.running-images.v1", "services": services}, indent=2, sort_keys=True)
@@ -700,15 +705,51 @@ def validate_active(args: argparse.Namespace) -> None:
         item = running_services.get(service)
         expected_image = expected_state["images"].get(service)
         if not isinstance(item, dict) or not isinstance(expected_image, str):
-            raise ContextError("RUNNING_IMAGE_MISMATCH")
+            raise ContextError(
+                "RUNNING_IMAGE_MISMATCH",
+                {
+                    "configured_image": None,
+                    "container_id": None,
+                    "expected_image": expected_image
+                    if isinstance(expected_image, str)
+                    else None,
+                    "image_id": None,
+                    "service": service,
+                },
+            )
         configured_image = item.get("configured_image")
         image_id = item.get("image_id")
+        container_id = item.get("container_id")
+        safe_configured_image = (
+            configured_image
+            if isinstance(configured_image, str)
+            and IMAGE_PATTERN.fullmatch(configured_image)
+            else None
+        )
+        safe_image_id = (
+            image_id
+            if isinstance(image_id, str) and DIGEST_PATTERN.fullmatch(image_id)
+            else None
+        )
+        safe_container_id = (
+            container_id
+            if isinstance(container_id, str)
+            and re.fullmatch(r"[0-9a-f]{12,64}", container_id)
+            else None
+        )
+        evidence = {
+            "configured_image": safe_configured_image,
+            "container_id": safe_container_id,
+            "expected_image": expected_image,
+            "image_id": safe_image_id,
+            "service": service,
+        }
         if isinstance(configured_image, str) and (
             configured_image.startswith("app-") or "/app-" in configured_image
         ):
-            raise ContextError("LOCAL_IMAGE_FALLBACK")
-        if configured_image != expected_image or not DIGEST_PATTERN.fullmatch(str(image_id)):
-            raise ContextError("RUNNING_IMAGE_MISMATCH")
+            raise ContextError("LOCAL_IMAGE_FALLBACK", evidence)
+        if configured_image != expected_image or safe_image_id is None:
+            raise ContextError("RUNNING_IMAGE_MISMATCH", evidence)
 
     result = {
         "autonomous_execution": expected_state["autonomous_execution"],
@@ -779,7 +820,7 @@ def main() -> None:
     try:
         args.handler(args)
     except ContextError as error:
-        fail(error.code)
+        fail(error.code, error.evidence)
 
 
 if __name__ == "__main__":

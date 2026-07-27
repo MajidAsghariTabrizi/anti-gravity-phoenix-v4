@@ -321,6 +321,25 @@ def fail_state(
     return validate_state(value)
 
 
+def complete_failure_evidence(
+    value: dict[str, Any], evidence: dict[str, Any]
+) -> dict[str, Any]:
+    validate_state(value)
+    if value["current_phase"] not in FAILURE_PHASES:
+        raise StateError("failure evidence requires a failed release")
+    if value["failure_code"] != "DEPLOYMENT_FAILED":
+        raise StateError("failure evidence code cannot be replaced")
+    existing = value["failure_evidence"]
+    if not isinstance(existing, dict) or existing.get("source") != "deploy-release":
+        raise StateError("failure evidence source cannot be replaced")
+    if existing.get("detail") != "deployment_failed":
+        if existing == evidence:
+            return value
+        raise StateError("completed failure evidence cannot be replaced")
+    value["failure_evidence"] = evidence
+    return validate_state(value)
+
+
 def set_mutation_started(value: dict[str, Any]) -> dict[str, Any]:
     validate_state(value)
     if value["current_phase"] in TERMINAL_PHASES:
