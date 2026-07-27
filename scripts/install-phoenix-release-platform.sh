@@ -69,7 +69,14 @@ for specification in \
   'release_components.py:0644' \
   'release_provenance.py:0644' \
   'install-release-assets.sh:0644' \
-  'install-production-release-context.sh:0644'
+  'install-production-release-context.sh:0644' \
+  'production_mode.py:0644' \
+  'production-healthcheck.sh:0644' \
+  'prelive-protected-maintenance.sh:0644' \
+  'prelive_protected_maintenance.py:0644' \
+  'prelive-protected-maintenance-launch.sh:0644' \
+  'prelive-protected-maintenance-unit.sh:0644' \
+  'rollback-release.sh:0644'
 do
   name=${specification%%:*}
   mode=${specification##*:}
