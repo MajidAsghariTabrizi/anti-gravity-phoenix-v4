@@ -452,6 +452,12 @@ def reconcile_snapshot(snapshot: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _service_absence_allowed(
+    component: dict[str, Any], phoenix_mode: str
+) -> bool:
+    return phoenix_mode == "SHADOW" and component.get("live_canary_only") is True
+
+
 def reconcile_active_context(paths: HostPaths) -> dict[str, Any]:
     active = status(paths)
     release_sha = active["active_release"]
@@ -504,6 +510,8 @@ def reconcile_active_context(paths: HostPaths) -> dict[str, Any]:
         expected_image = f"{image_value.get('repository')}@{image_value.get('digest')}"
         for service in production_services:
             if service not in services:
+                if _service_absence_allowed(component, active["phoenix_mode"]):
+                    continue
                 raise GatewayError(
                     "ACTIVE_SERVICE_MISSING",
                     {"service": service, "expected_image": expected_image},

@@ -21,6 +21,7 @@ from scripts.phoenix_release.controller import (
 )
 from scripts.phoenix_release.gateway import (
     _bounded_output,
+    _service_absence_allowed,
     GatewayError,
     HostPaths,
     expected_members,
@@ -431,6 +432,20 @@ class ReconciliationTests(unittest.TestCase):
         result = reconcile_snapshot(snapshot)
         self.assertEqual(
             result["stale_fields"], ["state_sha", "context_sha"]
+        )
+
+    def test_shadow_allows_explicit_live_only_service_to_be_absent(self) -> None:
+        component = {"live_canary_only": True}
+        self.assertTrue(_service_absence_allowed(component, "SHADOW"))
+
+    def test_live_requires_explicit_live_only_service_to_exist(self) -> None:
+        component = {"live_canary_only": True}
+        self.assertFalse(_service_absence_allowed(component, "LIVE"))
+
+    def test_shadow_still_requires_every_non_live_only_service(self) -> None:
+        self.assertFalse(_service_absence_allowed({}, "SHADOW"))
+        self.assertFalse(
+            _service_absence_allowed({"live_canary_only": False}, "SHADOW")
         )
 
 
