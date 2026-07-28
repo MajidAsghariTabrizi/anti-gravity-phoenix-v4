@@ -1028,6 +1028,16 @@ class WorkflowAndDeploymentContractTests(unittest.TestCase):
         )
 
     def test_candidate_render_precedes_any_runtime_mutation(self) -> None:
+        preflight_render = self.deploy.index(
+            '"$deploy_dir/render-production-compose.sh"'
+        )
+        preflight_failure = self.deploy.index(
+            'fail "preflight production rendering failed"', preflight_render
+        )
+        self.assertIn(
+            '--overlay-file "$overlay_file"',
+            self.deploy[preflight_render:preflight_failure],
+        )
         candidate = self.deploy.index("mark_phase CANDIDATE_LIVE_RENDER_VERIFIED")
         mutation = self.deploy.index("state_update mutation mutation_started")
         live_mode = self.deploy.index(
