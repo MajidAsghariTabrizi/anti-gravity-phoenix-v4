@@ -1107,16 +1107,20 @@ async fn activate(pool: &PgPool) -> ControlResult<()> {
     .execute(&mut *transaction)
     .await
     .map_err(|_| "economic canary activation failed")?;
-    sqlx::query(
+    let authorization_consumed = sqlx::query(
         "UPDATE live_canary.automation_authorizations
-         SET consumed_at = $2::timestamptz
-         WHERE authorization_id = $1 AND consumed_at IS NULL",
+         SET consumed_at = now()
+         WHERE authorization_id = $1
+           AND consumed_at IS NULL
+           AND expires_at > now()",
     )
     .bind(authorization_id)
-    .bind(&updated_at)
     .execute(&mut *transaction)
     .await
     .map_err(|_| "automation authorization consumption failed")?;
+    if authorization_consumed.rows_affected() != 1 {
+        return Err("automation authorization is already consumed or expired".into());
+    }
     insert_transition(
         &mut transaction,
         &previous,
