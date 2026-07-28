@@ -401,6 +401,7 @@ active_environment_identity_before=$(production_environment_identity "$env_file"
   fail "active production environment identity is unavailable before preflight"
 "$deploy_dir/render-production-compose.sh" \
   --compose-file "$compose_file" \
+  --overlay-file "$overlay_file" \
   --env-file "$env_file" \
   --release-env "$release_env" \
   --release-manifest "$manifest" \
