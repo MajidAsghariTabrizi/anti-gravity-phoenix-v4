@@ -656,8 +656,8 @@ class ReleaseProvenanceTests(unittest.TestCase):
                         BASE_RUN_ID,
                     )
 
-    def test_github_base_run_must_be_exact_and_successful(self) -> None:
-        run = {
+    def _github_build_run(self) -> dict:
+        return {
             "id": int(BASE_RUN_ID),
             "name": release_provenance.WORKFLOW,
             "path": release_provenance.WORKFLOW_PATH,
@@ -667,14 +667,59 @@ class ReleaseProvenanceTests(unittest.TestCase):
             "conclusion": "success",
             "repository": {"full_name": release_provenance.REPOSITORY},
         }
+
+    def test_github_base_run_accepts_direct_build(self) -> None:
+        run = self._github_build_run()
         release_provenance.validate_github_run(run, BASE_SHA, BASE_RUN_ID)
+
+    def test_github_base_run_accepts_release_controller_caller(self) -> None:
+        for event in release_provenance.CONTROLLER_EVENTS:
+            run = self._github_build_run()
+            run.update(
+                name=release_provenance.CONTROLLER_WORKFLOW,
+                path=release_provenance.CONTROLLER_WORKFLOW_PATH,
+                event=event,
+            )
+            with self.subTest(event=event):
+                release_provenance.validate_github_run(run, BASE_SHA, BASE_RUN_ID)
+
+    def test_github_base_run_rejects_wrong_workflow_name_or_path(self) -> None:
         for field, value in (
-            ("head_sha", "c" * 40),
-            ("conclusion", "failure"),
-            ("event", "push"),
+            ("name", "Other Workflow"),
             ("path", ".github/workflows/other.yml"),
         ):
-            changed = copy.deepcopy(run)
+            changed = self._github_build_run()
+            changed[field] = value
+            with self.subTest(field=field):
+                with self.assertRaises(release_provenance.ReleaseProvenanceError):
+                    release_provenance.validate_github_run(
+                        changed, BASE_SHA, BASE_RUN_ID
+                    )
+
+    def test_github_base_run_rejects_failed_or_incomplete_controller(self) -> None:
+        for field, value in (
+            ("conclusion", "failure"),
+            ("status", "in_progress"),
+        ):
+            changed = self._github_build_run()
+            changed.update(
+                name=release_provenance.CONTROLLER_WORKFLOW,
+                path=release_provenance.CONTROLLER_WORKFLOW_PATH,
+                event="workflow_run",
+            )
+            changed[field] = value
+            with self.subTest(field=field):
+                with self.assertRaises(release_provenance.ReleaseProvenanceError):
+                    release_provenance.validate_github_run(
+                        changed, BASE_SHA, BASE_RUN_ID
+                    )
+
+    def test_github_base_run_rejects_wrong_sha_or_run_id(self) -> None:
+        for field, value in (
+            ("head_sha", "c" * 40),
+            ("id", int(BASE_RUN_ID) + 1),
+        ):
+            changed = self._github_build_run()
             changed[field] = value
             with self.subTest(field=field):
                 with self.assertRaises(release_provenance.ReleaseProvenanceError):

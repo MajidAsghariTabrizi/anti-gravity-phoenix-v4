@@ -36,6 +36,9 @@ INHERITED_RELEASE_SCHEMA = "phoenix.release.v2"
 REPOSITORY = "MajidAsghariTabrizi/anti-gravity-phoenix-v4"
 WORKFLOW = "Build Phoenix Images"
 WORKFLOW_PATH = ".github/workflows/build-images.yml"
+CONTROLLER_WORKFLOW = "Phoenix Release Controller"
+CONTROLLER_WORKFLOW_PATH = ".github/workflows/phoenix-release-controller.yml"
+CONTROLLER_EVENTS = ("workflow_run", "workflow_dispatch", "schedule")
 RELEASE_INTENT = "PHOENIX_PRELIVE_SHADOW_V5"
 PUBLISH_CONFIRMATION = "PUBLISH_IMMUTABLE_PHOENIX_IMAGES"
 QUARANTINED_RUNS = {
@@ -1148,11 +1151,19 @@ def validate_github_run(
     if not isinstance(value, dict):
         raise ReleaseProvenanceError("GitHub build run evidence is invalid")
     repository = value.get("repository")
+    direct_build = (
+        value.get("name") == WORKFLOW
+        and value.get("path") == WORKFLOW_PATH
+        and value.get("event") == "workflow_dispatch"
+    )
+    controller_build = (
+        value.get("name") == CONTROLLER_WORKFLOW
+        and value.get("path") == CONTROLLER_WORKFLOW_PATH
+        and value.get("event") in CONTROLLER_EVENTS
+    )
     if (
         str(value.get("id")) != expected_run_id
-        or value.get("name") != WORKFLOW
-        or value.get("path") != WORKFLOW_PATH
-        or value.get("event") != "workflow_dispatch"
+        or not (direct_build or controller_build)
         or value.get("head_sha") != expected_sha
         or value.get("status") != "completed"
         or value.get("conclusion") != "success"
