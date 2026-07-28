@@ -338,6 +338,35 @@ def complete_failure_evidence(
     return validate_state(value)
 
 
+def retry_failed_pre_mutation(value: dict[str, Any]) -> dict[str, Any]:
+    validate_state(value)
+    if value["current_phase"] != "FAILED_PRE_MUTATION":
+        raise StateError("retry requires FAILED_PRE_MUTATION")
+    if value["mutation_started"]:
+        raise StateError("pre-mutation retry cannot follow mutation")
+    if value["owner_transaction_hash"] is not None:
+        raise StateError("pre-mutation retry cannot follow an owner transaction")
+    failure_phase = value["failure_phase"]
+    if (
+        failure_phase not in PHASES
+        or PHASES.index(failure_phase) >= PHASES.index("CANDIDATE_INSTALLED")
+    ):
+        raise StateError("failure phase is not before the mutation boundary")
+    if "BUILD_VERIFIED" not in value["completed_phases"]:
+        raise StateError("pre-mutation retry requires verified build evidence")
+
+    retained_phases = list(PHASES[: PHASES.index("BUILD_VERIFIED") + 1])
+    value["current_phase"] = "BUILD_VERIFIED"
+    value["completed_phases"] = retained_phases
+    value["phase_timestamps"] = {
+        phase: value["phase_timestamps"][phase] for phase in retained_phases
+    }
+    value["failure_phase"] = None
+    value["failure_code"] = None
+    value["failure_evidence"] = None
+    return validate_state(value)
+
+
 def set_mutation_started(value: dict[str, Any]) -> dict[str, Any]:
     validate_state(value)
     if value["current_phase"] in TERMINAL_PHASES:

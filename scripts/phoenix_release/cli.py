@@ -23,6 +23,7 @@ from phoenix_release.gateway import (  # noqa: E402
     json_result,
     receive_package,
     reconcile_active_context,
+    retry_pre_mutation,
     rollback_release,
     resume,
     status,
@@ -48,6 +49,8 @@ def parser() -> argparse.ArgumentParser:
     plan.add_argument("release_sha", type=_sha)
     resume_parser = subparsers.add_parser("resume")
     resume_parser.add_argument("release_sha", type=_sha)
+    retry_parser = subparsers.add_parser("retry-pre-mutation")
+    retry_parser.add_argument("release_sha", type=_sha)
     rollback = subparsers.add_parser("rollback")
     rollback.add_argument("release_sha", type=_sha)
     subparsers.add_parser("emergency-pause")
@@ -89,6 +92,8 @@ def main(argv: list[str] | None = None) -> int:
             result = evidence(paths, arguments.release_sha)
         elif arguments.command == "resume":
             result = resume(paths, arguments.release_sha)
+        elif arguments.command == "retry-pre-mutation":
+            result = retry_pre_mutation(paths, arguments.release_sha)
         elif arguments.command == "evidence":
             result = evidence(paths, arguments.release_sha)
         elif arguments.command == "reconcile-active-context":

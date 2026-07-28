@@ -31,6 +31,7 @@ from .model import (
     rollback_phase,
     record_owner_transaction,
     record_engine_baseline,
+    retry_failed_pre_mutation,
     set_mutation_started,
     sha256_file,
 )
@@ -163,6 +164,39 @@ def _atomic_bytes(path: Path, payload: bytes, mode: int = 0o600) -> None:
             os.fsync(handle.fileno())
         os.chmod(temporary, mode)
         os.replace(temporary, path)
+    finally:
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+
+
+def _atomic_archive(path: Path, payload: bytes) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if path.parent.is_symlink():
+        raise GatewayError("RETRY_ARCHIVE_DESTINATION_UNSAFE")
+    if path.exists():
+        metadata = path.lstat()
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_nlink != 1
+            or path.read_bytes() != payload
+        ):
+            raise GatewayError("RETRY_ARCHIVE_CONFLICT")
+        return
+    descriptor, temporary = tempfile.mkstemp(
+        prefix=f".{path.name}.", dir=path.parent
+    )
+    try:
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(temporary, 0o600)
+        try:
+            os.link(temporary, path)
+        except FileExistsError as exc:
+            raise GatewayError("RETRY_ARCHIVE_CONFLICT") from exc
     finally:
         try:
             os.unlink(temporary)
@@ -1093,6 +1127,88 @@ def resume(paths: HostPaths, release_sha: str) -> dict[str, Any]:
         if current["current_phase"] in {"FAILED_POST_MUTATION", "ROLLBACK_STARTED"}:
             _rollback_failed_state(paths, current)
         raise GatewayError("RELEASE_STATE_ERROR") from exc
+
+
+def retry_pre_mutation(paths: HostPaths, release_sha: str) -> dict[str, Any]:
+    state_path = state_file(paths, release_sha)
+    state = load_state(state_path)
+    if state["current_phase"] != "FAILED_PRE_MUTATION":
+        raise GatewayError("PRE_MUTATION_RETRY_PHASE_INVALID")
+    if state["mutation_started"]:
+        raise GatewayError("PRE_MUTATION_RETRY_AFTER_MUTATION")
+    if state["owner_transaction_hash"] is not None:
+        raise GatewayError("PRE_MUTATION_RETRY_OWNER_TRANSACTION_RECORDED")
+
+    request = validate_request(_read_json(request_file(paths, release_sha), 64 * 1024))
+    identity_fields = (
+        "release_sha",
+        "rollback_sha",
+        "source_ci_run_id",
+        "source_ci_run_attempt",
+        "build_run_id",
+        "deploy_run_id",
+        "deploy_run_attempt",
+    )
+    if any(state[field] != request[field] for field in identity_fields):
+        raise GatewayError("PRE_MUTATION_RETRY_REQUEST_MISMATCH")
+    if (
+        state["candidate_pointer"] != release_sha
+        or state["active_release_pointer"] != state["rollback_sha"]
+    ):
+        raise GatewayError("PRE_MUTATION_RETRY_POINTER_MISMATCH")
+
+    active = status(paths)
+    if active["active_release"] != state["rollback_sha"]:
+        raise GatewayError(
+            "PRE_MUTATION_RETRY_ACTIVE_RELEASE_CHANGED",
+            {
+                "expected": state["rollback_sha"],
+                "actual": active["active_release"],
+            },
+        )
+
+    root = paths.incoming / release_sha
+    expected_images = _verify_evidence(paths, request)
+    if expected_images != state["expected_images"]:
+        raise GatewayError("PRE_MUTATION_RETRY_IMAGE_EVIDENCE_MISMATCH")
+    if (
+        sha256_file(root / "release-manifest.json")
+        != state["release_manifest_digest"]
+        or sha256_file(root / f"phoenix-release-assets-{release_sha}.tar.gz")
+        != state["release_assets_digest"]
+    ):
+        raise GatewayError("PRE_MUTATION_RETRY_BUILD_EVIDENCE_MISMATCH")
+
+    failed_state = json.loads(json.dumps(state))
+    try:
+        retried = retry_failed_pre_mutation(json.loads(json.dumps(state)))
+    except StateError as exc:
+        raise GatewayError("PRE_MUTATION_RETRY_STATE_INVALID") from exc
+    failed_at = state["phase_timestamps"]["FAILED_PRE_MUTATION"]
+    archive_payload = _canonical(
+        {
+            "schema": "phoenix.release-pre-mutation-retry-archive.v1",
+            "failed_at": failed_at,
+            "failed_state": failed_state,
+            "failure_evidence": failed_state["failure_evidence"],
+        }
+    )
+    archive_digest = hashlib.sha256(archive_payload).hexdigest()
+    archive_name = (
+        f"failed-pre-mutation-{failed_at.replace(':', '').replace('-', '')}-"
+        f"{archive_digest}.json"
+    )
+    archive_path = state_path.parent / "retry-archives" / archive_name
+    _atomic_archive(archive_path, archive_payload)
+
+    atomic_write(state_path, retried)
+    return {
+        "schema": "phoenix.release-pre-mutation-retry.v1",
+        "status": "reset",
+        "release_sha": release_sha,
+        "current_phase": retried["current_phase"],
+        "archive": f"retry-archives/{archive_name}",
+    }
 
 
 def history(paths: HostPaths) -> list[dict[str, Any]]:

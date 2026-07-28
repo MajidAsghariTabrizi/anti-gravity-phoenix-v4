@@ -21,6 +21,7 @@ from scripts.phoenix_release.controller import (
     is_docs_only,
     validate_source_ci,
 )
+from scripts.phoenix_release.cli import parser as release_parser
 from scripts.phoenix_release.gateway import (
     _bounded_output,
     _live_executor_absence_is_fail_closed,
@@ -33,6 +34,7 @@ from scripts.phoenix_release.gateway import (
     receive_package,
     reconcile_snapshot,
     request_file,
+    retry_pre_mutation,
     resume,
     state_file,
     validate_request,
@@ -51,6 +53,7 @@ from scripts.phoenix_release.model import (
     record_owner_transaction,
     record_engine_baseline,
     set_mutation_started,
+    sha256_file,
 )
 
 
@@ -339,6 +342,251 @@ class BoundedTransportTests(unittest.TestCase):
             env_file=root / "phoenix.env",
             libexec=root / "libexec",
         )
+
+    def failed_pre_mutation_fixture(
+        self, paths: HostPaths
+    ) -> dict[str, object]:
+        incoming = paths.incoming / RELEASE_SHA
+        incoming.mkdir(parents=True)
+        request_file(paths, RELEASE_SHA).write_text(
+            json.dumps(request()), encoding="utf-8"
+        )
+        images = {
+            f"service-{index}": {
+                "repository": f"ghcr.io/example/service-{index}",
+                "digest": f"sha256:{index}" + "0" * 63,
+            }
+            for index in range(1, 8)
+        }
+        (incoming / "release-provenance.json").write_text(
+            json.dumps(
+                {
+                    "release_sha": RELEASE_SHA,
+                    "build_run_id": 202,
+                    "source_ci": {"run_id": 101, "run_attempt": 1},
+                }
+            ),
+            encoding="utf-8",
+        )
+        manifest = incoming / "release-manifest.json"
+        manifest.write_text(
+            json.dumps({"release_sha": RELEASE_SHA, "images": images}),
+            encoding="utf-8",
+        )
+        assets = incoming / f"phoenix-release-assets-{RELEASE_SHA}.tar.gz"
+        assets.write_bytes(b"verified release assets")
+
+        value = state()
+        value = advance(
+            value,
+            "SOURCE_CI_VERIFIED",
+            updates={
+                "expected_images": {
+                    name: f"{image['repository']}@{image['digest']}"
+                    for name, image in images.items()
+                }
+            },
+        )
+        value = advance(
+            value,
+            "BUILD_VERIFIED",
+            updates={
+                "release_manifest_digest": sha256_file(manifest),
+                "release_assets_digest": sha256_file(assets),
+            },
+        )
+        value = advance(value, "HOST_PREFLIGHT_STARTED")
+        value = advance(
+            value,
+            "HOST_PREFLIGHT_OK",
+            updates={
+                "contract_paused": True,
+                "autonomous_armed": False,
+                "kill_switch": True,
+            },
+        )
+        value = fail_state(
+            value,
+            code="ACTIVE_SERVICE_MISSING",
+            evidence={"service": "live-executor"},
+        )
+        atomic_write(state_file(paths, RELEASE_SHA), value)
+        return value
+
+    def test_failed_pre_mutation_retry_archives_and_resets_to_build(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            paths = self.paths(Path(temporary))
+            failed = self.failed_pre_mutation_fixture(paths)
+            with patch(
+                "scripts.phoenix_release.gateway.status",
+                return_value={"active_release": ROLLBACK_SHA},
+            ):
+                result = retry_pre_mutation(paths, RELEASE_SHA)
+
+            retried = load_state(state_file(paths, RELEASE_SHA))
+            self.assertEqual(result["status"], "reset")
+            self.assertEqual(retried["current_phase"], "BUILD_VERIFIED")
+            self.assertEqual(
+                retried["completed_phases"],
+                ["REQUESTED", "SOURCE_CI_VERIFIED", "BUILD_VERIFIED"],
+            )
+            self.assertIsNone(retried["failure_phase"])
+            self.assertIsNone(retried["failure_code"])
+            self.assertIsNone(retried["failure_evidence"])
+            for field in (
+                "release_sha",
+                "rollback_sha",
+                "source_ci_run_id",
+                "source_ci_run_attempt",
+                "build_run_id",
+                "deploy_run_id",
+                "deploy_run_attempt",
+                "release_manifest_digest",
+                "release_assets_digest",
+                "expected_images",
+                "contract_paused",
+                "autonomous_armed",
+                "kill_switch",
+            ):
+                self.assertEqual(retried[field], failed[field], field)
+
+            archive = json.loads(
+                (state_file(paths, RELEASE_SHA).parent / result["archive"]).read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertEqual(archive["failed_state"], failed)
+            self.assertEqual(archive["failure_evidence"], failed["failure_evidence"])
+
+    def test_failed_pre_mutation_retry_rejects_mutation_started(self) -> None:
+        value = fail_state(
+            state(),
+            code="ACTIVE_SERVICE_MISSING",
+            evidence={"service": "live-executor"},
+        )
+        value["mutation_started"] = True
+        with (
+            tempfile.TemporaryDirectory() as temporary,
+            patch(
+                "scripts.phoenix_release.gateway.load_state",
+                return_value=value,
+            ),
+        ):
+            with self.assertRaisesRegex(
+                GatewayError, "PRE_MUTATION_RETRY_AFTER_MUTATION"
+            ):
+                retry_pre_mutation(self.paths(Path(temporary)), RELEASE_SHA)
+
+    def test_failed_pre_mutation_retry_rejects_changed_active_release(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            paths = self.paths(Path(temporary))
+            self.failed_pre_mutation_fixture(paths)
+            with patch(
+                "scripts.phoenix_release.gateway.status",
+                return_value={"active_release": "c" * 40},
+            ):
+                with self.assertRaisesRegex(
+                    GatewayError, "PRE_MUTATION_RETRY_ACTIVE_RELEASE_CHANGED"
+                ):
+                    retry_pre_mutation(paths, RELEASE_SHA)
+            self.assertEqual(
+                load_state(state_file(paths, RELEASE_SHA))["current_phase"],
+                "FAILED_PRE_MUTATION",
+            )
+
+    def test_failed_pre_mutation_retry_rejects_terminal_nonretry_states(self) -> None:
+        post_mutation = set_mutation_started(state())
+        post_mutation = fail_state(
+            post_mutation, code="DEPLOYMENT_FAILED", evidence={}
+        )
+        rolled_back = rollback_phase(
+            rollback_phase(copy.deepcopy(post_mutation), "ROLLBACK_STARTED"),
+            "ROLLED_BACK",
+            {"status": "ok"},
+        )
+        rollback_failed = rollback_phase(
+            rollback_phase(copy.deepcopy(post_mutation), "ROLLBACK_STARTED"),
+            "ROLLBACK_FAILED",
+            {"status": "failed"},
+        )
+        for value in (post_mutation, rolled_back, rollback_failed):
+            with (
+                self.subTest(phase=value["current_phase"]),
+                tempfile.TemporaryDirectory() as temporary,
+                patch(
+                    "scripts.phoenix_release.gateway.load_state",
+                    return_value=value,
+                ),
+            ):
+                with self.assertRaisesRegex(
+                    GatewayError, "PRE_MUTATION_RETRY_PHASE_INVALID"
+                ):
+                    retry_pre_mutation(self.paths(Path(temporary)), RELEASE_SHA)
+
+    def test_failed_pre_mutation_retry_rejects_evidence_mismatch(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            paths = self.paths(Path(temporary))
+            self.failed_pre_mutation_fixture(paths)
+            mismatched = request()
+            mismatched["build_run_id"] = 999
+            request_file(paths, RELEASE_SHA).write_text(
+                json.dumps(mismatched), encoding="utf-8"
+            )
+            with self.assertRaisesRegex(
+                GatewayError, "PRE_MUTATION_RETRY_REQUEST_MISMATCH"
+            ):
+                retry_pre_mutation(paths, RELEASE_SHA)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            paths = self.paths(Path(temporary))
+            self.failed_pre_mutation_fixture(paths)
+            (paths.incoming / RELEASE_SHA / "release-manifest.json").write_text(
+                json.dumps(
+                    {
+                        "release_sha": RELEASE_SHA,
+                        "images": {
+                            f"service-{index}": {
+                                "repository": f"ghcr.io/example/service-{index}",
+                                "digest": f"sha256:{index}" + "0" * 63,
+                            }
+                            for index in range(1, 8)
+                        },
+                        "tampered": True,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with (
+                patch(
+                    "scripts.phoenix_release.gateway.status",
+                    return_value={"active_release": ROLLBACK_SHA},
+                ),
+                self.assertRaisesRegex(
+                    GatewayError, "PRE_MUTATION_RETRY_BUILD_EVIDENCE_MISMATCH"
+                ),
+            ):
+                retry_pre_mutation(paths, RELEASE_SHA)
+
+    def test_failed_pre_mutation_retry_refuses_after_reset(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            paths = self.paths(Path(temporary))
+            self.failed_pre_mutation_fixture(paths)
+            with patch(
+                "scripts.phoenix_release.gateway.status",
+                return_value={"active_release": ROLLBACK_SHA},
+            ):
+                retry_pre_mutation(paths, RELEASE_SHA)
+            with self.assertRaisesRegex(
+                GatewayError, "PRE_MUTATION_RETRY_PHASE_INVALID"
+            ):
+                retry_pre_mutation(paths, RELEASE_SHA)
+
+    def test_retry_pre_mutation_cli_requires_a_release_sha(self) -> None:
+        arguments = release_parser().parse_args(
+            ["retry-pre-mutation", RELEASE_SHA]
+        )
+        self.assertEqual(arguments.command, "retry-pre-mutation")
+        self.assertEqual(arguments.release_sha, RELEASE_SHA)
 
     def test_valid_package_is_received_once_with_durable_state(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
