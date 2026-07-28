@@ -99,7 +99,15 @@ grep -F 'matrix.protected == false' "$build_workflow" >/dev/null ||
 for release_script in "$deploy_script" "$rollback_script"; do
   grep -F "protected_services='nitro-feed-relay feed-ingestor nats postgres recorder'" "$release_script" >/dev/null ||
     fail "protected service set is incomplete: $release_script"
-  grep -F "optional_services='prometheus rpc-gateway shadow-dispatcher phoenix-engine dashboard'" "$release_script" >/dev/null ||
+  case "$release_script" in
+    "$deploy_script")
+      expected_optional_services='prometheus rpc-gateway shadow-dispatcher phoenix-engine dashboard economic-monitor economic-supervisor'
+      ;;
+    "$rollback_script")
+      expected_optional_services='prometheus rpc-gateway shadow-dispatcher phoenix-engine dashboard'
+      ;;
+  esac
+  grep -F "optional_services='$expected_optional_services'" "$release_script" >/dev/null ||
     fail "optional service set is incomplete: $release_script"
   grep -F 'compose up -d --no-deps "$service"' "$release_script" >/dev/null ||
     fail "optional services are not started individually: $release_script"
