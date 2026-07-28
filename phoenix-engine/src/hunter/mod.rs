@@ -236,6 +236,7 @@ pub struct HunterRouteGraph {
     routes: Vec<EnumerableRoute>,
     bound_routes: Vec<BoundRoute>,
     affected: BTreeMap<String, Vec<usize>>,
+    origin_pool_addresses: BTreeMap<String, Vec<String>>,
     summary: RouteGraphSummary,
 }
 
@@ -275,6 +276,17 @@ impl HunterRouteGraph {
         }
 
         let routes = enumerate_routes(&universe, bounds)?;
+        let mut origin_pool_addresses: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        for pool in &universe.pools {
+            origin_pool_addresses
+                .entry(origin_pool_identity(&pool.token0, &pool.token1, pool.fee))
+                .or_default()
+                .push(pool.address.clone());
+        }
+        for addresses in origin_pool_addresses.values_mut() {
+            addresses.sort();
+            addresses.dedup();
+        }
         let asset_limits = universe
             .settlement_assets
             .iter()
@@ -339,6 +351,7 @@ impl HunterRouteGraph {
             routes,
             bound_routes,
             affected,
+            origin_pool_addresses,
             summary,
         })
     }
@@ -364,6 +377,29 @@ impl HunterRouteGraph {
                     .map(|route| route.route.clone())
                     .collect()
             })
+    }
+
+    pub fn pool_addresses_for_origin_pool_ids(
+        &self,
+        origin_pool_ids: &[String],
+        maximum: usize,
+    ) -> Result<Vec<String>, HunterError> {
+        if origin_pool_ids.is_empty() || origin_pool_ids.len() > maximum {
+            return Err(HunterError::InvalidOriginPoolIdentity);
+        }
+        let mut addresses = BTreeSet::new();
+        for pool_id in origin_pool_ids {
+            if !canonical_origin_pool_identity(pool_id) {
+                return Err(HunterError::InvalidOriginPoolIdentity);
+            }
+            if let Some(configured) = self.origin_pool_addresses.get(pool_id) {
+                addresses.extend(configured.iter().cloned());
+            }
+            if addresses.len() > maximum {
+                return Err(HunterError::AffectedRouteLimit);
+            }
+        }
+        Ok(addresses.into_iter().collect())
     }
 
     fn affected_route_indices(
@@ -687,6 +723,8 @@ pub enum HunterError {
     AffectedRouteLimit,
     #[error("hunter event is invalid")]
     InvalidEvent,
+    #[error("hunter origin pool identity is invalid")]
+    InvalidOriginPoolIdentity,
     #[error("hunter pinned state is incomplete")]
     StateIncomplete,
     #[error("hunter pinned state failed integrity")]
@@ -713,6 +751,7 @@ impl HunterError {
             Self::RouteLimit => "hunter_route_limit",
             Self::AffectedRouteLimit => "hunter_affected_route_limit",
             Self::InvalidEvent => "hunter_invalid_event",
+            Self::InvalidOriginPoolIdentity => "hunter_origin_pool_identity_invalid",
             Self::StateIncomplete => "hunter_state_incomplete",
             Self::StateIntegrity => "hunter_state_integrity",
             Self::EconomicInfeasible => "hunter_economic_infeasible",
@@ -996,6 +1035,38 @@ fn build_affected_index(
         }
     }
     Ok(affected)
+}
+
+fn origin_pool_identity(token_a: &str, token_b: &str, fee: u32) -> String {
+    if token_a < token_b {
+        format!("{token_a}:{token_b}:{fee}")
+    } else {
+        format!("{token_b}:{token_a}:{fee}")
+    }
+}
+
+fn canonical_origin_pool_identity(value: &str) -> bool {
+    let mut fields = value.split(':');
+    let Some(token0) = fields.next() else {
+        return false;
+    };
+    let Some(token1) = fields.next() else {
+        return false;
+    };
+    let Some(fee_text) = fields.next() else {
+        return false;
+    };
+    if fields.next().is_some()
+        || !canonical_address(token0)
+        || !canonical_address(token1)
+        || token0 >= token1
+    {
+        return false;
+    }
+    let Ok(fee) = fee_text.parse::<u32>() else {
+        return false;
+    };
+    fee > 0 && fee < 1_000_000 && fee_text == fee.to_string()
 }
 
 fn policy_matches_route(policy: &RoutePolicy, route: &EnumerableRoute) -> bool {
@@ -2128,6 +2199,34 @@ mod tests {
             )
             .unwrap()
             .is_empty());
+    }
+
+    #[test]
+    fn production_origin_pool_ids_resolve_to_reviewed_pool_addresses() {
+        let graph = graph();
+        let pool_500 = format!("{WETH}:{USDC}:500");
+        let pool_3000 = format!("{WETH}:{USDC}:3000");
+        assert_eq!(
+            graph
+                .pool_addresses_for_origin_pool_ids(
+                    &[pool_3000.clone(), pool_500.clone(), pool_500],
+                    16,
+                )
+                .unwrap(),
+            vec![POOL_3000.to_string(), POOL_500.to_string()]
+        );
+        assert!(graph
+            .pool_addresses_for_origin_pool_ids(&[format!("{WETH}:{USDC}:10000")], 16)
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            graph.pool_addresses_for_origin_pool_ids(&[POOL_500.to_string()], 16),
+            Err(HunterError::InvalidOriginPoolIdentity)
+        );
+        assert_eq!(
+            graph.pool_addresses_for_origin_pool_ids(&[format!("{USDC}:{WETH}:500")], 16),
+            Err(HunterError::InvalidOriginPoolIdentity)
+        );
     }
 
     #[test]
