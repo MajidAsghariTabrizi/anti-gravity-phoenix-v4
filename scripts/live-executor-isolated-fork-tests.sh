@@ -161,18 +161,115 @@ PHOENIX_DISARMED_DEPLOY_ACK=INSTALL_DISARMED_EVIDENCE_RELEASE_42161 \
   cargo run --locked --quiet --manifest-path live-executor/Cargo.toml \
     --bin autonomous-live-control -- disarmed-deploy
 
-read -r global_epoch route_epoch <<EOF
+if POSTGRES_DSN="$test_dsn" \
+  PHOENIX_RELEASE_SHA=cccccccccccccccccccccccccccccccccccccccc \
+  PHOENIX_ENGINE_IMAGE=sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb \
+  PHOENIX_EVIDENCE_START_ACK=START_DISARMED_EVIDENCE_42161 \
+  cargo run --locked --quiet --manifest-path live-executor/Cargo.toml \
+    --bin autonomous-live-control -- evidence-start >/dev/null 2>&1
+then
+  printf 'evidence-start accepted the wrong release SHA\n' >&2
+  exit 1
+fi
+if POSTGRES_DSN="$test_dsn" \
+  PHOENIX_RELEASE_SHA=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
+  PHOENIX_ENGINE_IMAGE=sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc \
+  PHOENIX_EVIDENCE_START_ACK=START_DISARMED_EVIDENCE_42161 \
+  cargo run --locked --quiet --manifest-path live-executor/Cargo.toml \
+    --bin autonomous-live-control -- evidence-start >/dev/null 2>&1
+then
+  printf 'evidence-start accepted the wrong Engine digest\n' >&2
+  exit 1
+fi
+
+POSTGRES_DSN="$test_dsn" \
+PHOENIX_RELEASE_SHA=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
+PHOENIX_ENGINE_IMAGE=sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb \
+PHOENIX_EVIDENCE_START_ACK=START_DISARMED_EVIDENCE_42161 \
+  cargo run --locked --quiet --manifest-path live-executor/Cargo.toml \
+    --bin autonomous-live-control -- evidence-start
+if POSTGRES_DSN="$test_dsn" \
+  PHOENIX_RELEASE_SHA=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
+  PHOENIX_ENGINE_IMAGE=sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb \
+  PHOENIX_EVIDENCE_START_ACK=START_DISARMED_EVIDENCE_42161 \
+  cargo run --locked --quiet --manifest-path live-executor/Cargo.toml \
+    --bin autonomous-live-control -- evidence-start >/dev/null 2>&1
+then
+  printf 'repeated evidence-start was not safely rejected\n' >&2
+  exit 1
+fi
+
+evidence_atomic="$(
+  psql -X -qAt "$test_dsn" -c "
+    SELECT (
+      economic.phase = 'DISARMED_EVIDENCE'
+      AND NOT legacy.armed AND legacy.kill_switch
+      AND NOT global.armed AND global.kill_switch
+      AND global.execution_mode = 'disarmed'
+      AND NOT route.enabled AND route.kill_switch
+      AND transition.from_phase = 'DISARMED_DEPLOY'
+      AND transition.to_phase = 'DISARMED_EVIDENCE'
+      AND transition.control_epoch = economic.control_epoch
+      AND transition.transitioned_at = economic.updated_at
+    )::text
+    FROM live_canary.economic_control economic
+    CROSS JOIN live_canary.control legacy
+    CROSS JOIN live_canary.autonomous_global_control global
+    JOIN live_canary.autonomous_route_controls route
+      ON route.route_fingerprint = economic.route_fingerprint
+    JOIN live_canary.economic_transitions transition
+      ON transition.control_epoch = economic.control_epoch
+     AND transition.to_phase = 'DISARMED_EVIDENCE'
+    WHERE economic.singleton AND legacy.singleton AND global.singleton"
+)"
+[ "$evidence_atomic" = true ] || {
+  printf 'DISARMED_EVIDENCE transition and ledger were not atomic and fail-closed\n' >&2
+  exit 1
+}
+
+POSTGRES_DSN="$test_dsn" \
+PHOENIX_AUTONOMOUS_DISARM_ACK=DISARM_AUTONOMOUS_LIVE_42161 \
+PHOENIX_AUTONOMOUS_DISARM_REASON=isolated_evidence_rollback \
+  cargo run --locked --quiet --manifest-path live-executor/Cargo.toml \
+    --bin autonomous-live-control -- disarm
+[ "$(psql -X -qAt "$test_dsn" -c \
+  "SELECT phase FROM live_canary.economic_control WHERE singleton")" = DISARMED_FAILURE ] || {
+  printf 'rollback from DISARMED_EVIDENCE did not end in DISARMED_FAILURE\n' >&2
+  exit 1
+}
+
+POSTGRES_DSN="$test_dsn" \
+PHOENIX_RELEASE_SHA=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
+PHOENIX_ENGINE_IMAGE=sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb \
+LIVE_EXECUTOR_EXECUTOR_CODE_HASH="$executor_code_hash" \
+LIVE_EXECUTOR_MAX_DAILY_LOSS_WEI=10000000000000000 \
+PHOENIX_DISARMED_DEPLOY_ACK=INSTALL_DISARMED_EVIDENCE_RELEASE_42161 \
+  cargo run --locked --quiet --manifest-path live-executor/Cargo.toml \
+    --bin autonomous-live-control -- disarmed-deploy
+POSTGRES_DSN="$test_dsn" \
+PHOENIX_RELEASE_SHA=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
+PHOENIX_ENGINE_IMAGE=sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb \
+PHOENIX_EVIDENCE_START_ACK=START_DISARMED_EVIDENCE_42161 \
+  cargo run --locked --quiet --manifest-path live-executor/Cargo.toml \
+    --bin autonomous-live-control -- evidence-start
+sleep 2
+
+read -r economic_epoch global_epoch route_epoch evidence_started_at <<EOF
 $(psql -X -qAt "$test_dsn" -F ' ' -c \
-  "SELECT global.control_epoch, route.control_epoch
-   FROM live_canary.autonomous_global_control global
+  "SELECT economic.control_epoch, global.control_epoch, route.control_epoch,
+          to_char(economic.updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"')
+   FROM live_canary.economic_control economic
+   CROSS JOIN live_canary.autonomous_global_control global
    JOIN live_canary.autonomous_route_controls route
      ON route.route_fingerprint = 'arbitrum-weth-usdc-uniswap-v3-500-3000-v1'
-   WHERE global.singleton")
+   WHERE economic.singleton AND global.singleton
+     AND economic.phase = 'DISARMED_EVIDENCE'")
 EOF
 readiness_file="$tmp_dir/canary-readiness.json"
 authorization_file="$tmp_dir/automation-authorization.json"
 python3 - "$readiness_file" "$authorization_file" \
-  "$global_epoch" "$route_epoch" "$executor_code_hash" <<'PY'
+  "$economic_epoch" "$global_epoch" "$route_epoch" "$executor_code_hash" \
+  "$evidence_started_at" <<'PY'
 import datetime
 import hashlib
 import json
@@ -192,6 +289,7 @@ def bind_hash(value, field, domain, schema):
 
 
 now = datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0)
+evidence_started_at = datetime.datetime.fromisoformat(sys.argv[7].replace("Z", "+00:00"))
 binding = {
     "release_sha": "a" * 40,
     "engine_image_digest": "sha256:" + "b" * 64,
@@ -199,15 +297,16 @@ binding = {
     "route_universe_hash": "84adac686635535486e06e44fcaf90c812dc27273affc5bffc4eebd6c164928c",
     "route_policy_hash": "d7aff21eb025696208c646631772a45c241fc2971ef0c9866646d12dca12d476",
     "risk_policy_hash": "d7aff21eb025696208c646631772a45c241fc2971ef0c9866646d12dca12d476",
-    "global_control_epoch": int(sys.argv[3]),
-    "route_control_epoch": int(sys.argv[4]),
-    "executor_code_hash": sys.argv[5],
+    "economic_control_epoch": int(sys.argv[3]),
+    "global_control_epoch": int(sys.argv[4]),
+    "route_control_epoch": int(sys.argv[5]),
+    "executor_code_hash": sys.argv[6],
     "contract_identity_hash": "c" * 64,
     "wallet_gas_reserve_wei": 2,
     "gas_reserve_floor_wei": 1,
     "current_daily_loss_wei": 0,
     "daily_loss_limit_wei": 10000000000000000,
-    "observed_from": timestamp(now - datetime.timedelta(minutes=5)),
+    "observed_from": evidence_started_at.isoformat(timespec="microseconds").replace("+00:00", "Z"),
     "observed_until": timestamp(now - datetime.timedelta(seconds=1)),
     "created_at": timestamp(now),
     "expires_at": timestamp(now + datetime.timedelta(minutes=10)),
@@ -257,7 +356,7 @@ authorization = {
         "route_fingerprint": binding["route_fingerprint"],
         "route_policy_hash": binding["route_policy_hash"],
         "maximum_reviewed_input_wei": 10000000000000000,
-        "executor_code_hash": sys.argv[5],
+        "executor_code_hash": sys.argv[6],
         "release_family": "isolated-test",
         "one_transaction_at_a_time": True,
         "reviewed_ladder_only": True,

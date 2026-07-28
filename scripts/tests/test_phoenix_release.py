@@ -163,9 +163,9 @@ class ReleaseStateTests(unittest.TestCase):
                 "ENGINE_HEALTHY",
                 "ENGINE_BURN_IN_STARTED",
                 "ENGINE_BURN_IN_PASSED",
-                "DISARMED_EVIDENCE_STARTED",
                 "POST_DISARMED_VERIFYING",
                 "POST_DISARMED_VERIFIED",
+                "DISARMED_EVIDENCE_STARTED",
                 "COMPLETED",
             ),
         )
@@ -726,9 +726,24 @@ class WorkflowAndDeploymentContractTests(unittest.TestCase):
     def test_burn_in_preserves_the_disarmed_owner_boundary(self) -> None:
         burn_start = self.deploy.index("mark_engine_burn_in_started \\")
         burn_pass = self.deploy.index("mark_phase ENGINE_BURN_IN_PASSED")
+        health = self.deploy.index('"$deploy_dir/production-healthcheck.sh"')
+        fail_closed = self.deploy.index(
+            "runtime controls are not fail-closed before evidence-start"
+        )
+        runtime_transition = self.deploy.index("autonomous-control evidence-start")
+        runtime_verified = self.deploy.index(
+            "runtime did not enter fail-closed DISARMED_EVIDENCE"
+        )
         evidence = self.deploy.index("mark_phase DISARMED_EVIDENCE_STARTED")
         self.assertLess(burn_start, burn_pass)
-        self.assertLess(burn_pass, evidence)
+        self.assertLess(burn_pass, health)
+        self.assertLess(health, fail_closed)
+        self.assertLess(fail_closed, runtime_transition)
+        self.assertLess(runtime_transition, runtime_verified)
+        self.assertLess(runtime_verified, evidence)
+        self.assertIn("PHOENIX_EVIDENCE_START_ACK=START_DISARMED_EVIDENCE_42161", self.deploy)
+        self.assertIn("verify_runtime_control_phase DISARMED_DEPLOY", self.deploy)
+        self.assertIn("verify_runtime_control_phase DISARMED_EVIDENCE", self.deploy)
         self.assertIn("[ -z \"$(compose ps -q live-executor", self.deploy)
         self.assertIn("engine_process_fatal_integrity_total", self.deploy)
         self.assertNotIn("live-executor activate", self.deploy)

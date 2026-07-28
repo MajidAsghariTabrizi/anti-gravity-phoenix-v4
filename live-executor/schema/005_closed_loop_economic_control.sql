@@ -261,6 +261,7 @@ CREATE TABLE IF NOT EXISTS live_canary.canary_readiness_records (
         CHECK (route_policy_hash ~ '^[0-9a-f]{64}$'),
     risk_policy_hash TEXT NOT NULL
         CHECK (risk_policy_hash ~ '^[0-9a-f]{64}$'),
+    economic_control_epoch BIGINT NOT NULL CHECK (economic_control_epoch >= 0),
     global_control_epoch BIGINT NOT NULL CHECK (global_control_epoch >= 0),
     route_control_epoch BIGINT NOT NULL CHECK (route_control_epoch >= 0),
     executor_code_hash TEXT NOT NULL

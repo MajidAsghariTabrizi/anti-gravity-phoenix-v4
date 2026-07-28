@@ -21,10 +21,32 @@ The only phases are:
 11. `COOLDOWN`
 12. `DISARMED_FAILURE`
 
-Normal release deployment enters `DISARMED_EVIDENCE`. It never activates the
-executor, calls owner-unpause, mounts signer material into an active executor,
+Normal release deployment first persists `DISARMED_DEPLOY`. After the immutable
+install, migrations, disarmed Engine/RPC startup, Engine burn-in, post-release
+health checks, and fail-closed global and route verification, the signerless
+control service invokes `evidence-start`. That command is the only normal path
+to durable `DISARMED_EVIDENCE`; it is safely rejected from every other phase.
+It never activates the executor, calls owner-unpause, mounts signer material,
 or creates a temporary armed interval. Rollback and every terminal integrity
 failure enter `DISARMED_FAILURE`; neither path can automatically rearm.
+
+```mermaid
+stateDiagram-v2
+    DISARMED_DEPLOY --> DISARMED_EVIDENCE: evidence-start
+    DISARMED_EVIDENCE --> CANARY_READY: bound readiness evidence
+    CANARY_READY --> LIVE_CANARY_MIN: separate owner authorization
+    DISARMED_EVIDENCE --> DISARMED_FAILURE: rollback or integrity failure
+    CANARY_READY --> DISARMED_FAILURE: rollback or integrity failure
+    LIVE_CANARY_MIN --> DISARMED_FAILURE: rollback or integrity failure
+```
+
+A direct `DISARMED_DEPLOY` to `CANARY_READY` transition is invalid and fails
+closed. `evidence-start` locks the economic, global, legacy, and route controls
+in one PostgreSQL transaction; verifies release and image identity, route and
+policy hashes, zero active attempts, and zero unresolved receipt
+reconciliation; then advances the economic epoch and writes the immutable
+transition ledger at the same database-clock timestamp. Global and route
+authority remain closed throughout.
 
 `CANARY_READY` is created only from complete hash-bound evidence. A separate,
 expiring owner authorization may then permit exactly the reviewed route,
@@ -54,9 +76,11 @@ The ten-minute readiness record requires all of the following:
   strictly below its limit.
 
 Readiness binds the release SHA, Engine image digest, route universe, route and
-risk policies, global and route epochs, observation window, candidate evidence,
-executor code, contract identity, gas reserve, and daily loss. Expired or
-mismatched evidence cannot activate.
+risk policies, the durable Evidence-phase economic epoch, global and route
+epochs, observation window, candidate evidence, executor code, contract
+identity, gas reserve, and daily loss. Its observation window must begin at or
+after the database-clock `DISARMED_EVIDENCE` transition and end later than it.
+Pre-deployment, stale, expired, or mismatched evidence cannot activate.
 
 ## Reviewed capital ladder
 

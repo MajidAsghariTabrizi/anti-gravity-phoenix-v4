@@ -90,14 +90,15 @@ async fn nonce_allocation_and_pending_state_survive_restart() {
         "INSERT INTO live_canary.canary_readiness_records(
             readiness_id, schema_version, release_sha, engine_image_digest,
             route_fingerprint, route_universe_hash, route_policy_hash,
-            risk_policy_hash, global_control_epoch, route_control_epoch,
+            risk_policy_hash, economic_control_epoch,
+            global_control_epoch, route_control_epoch,
             executor_code_hash, contract_identity_hash, wallet_gas_reserve_wei,
             gas_reserve_floor_wei, current_daily_loss_wei, daily_loss_limit_wei,
             observed_from, observed_until, candidate_evidence_hashes,
             evidence_metrics, readiness_contract, readiness_hash, created_at, expires_at
          ) VALUES (
             $1, 'phoenix.canary-readiness.v1', $2, $3, $4, $5, $6, $6,
-            0, 0, $7, $8, 2, 1, 0, 1, now() - interval '2 minutes',
+            0, 0, 0, $7, $8, 2, 1, 0, 1, now() - interval '2 minutes',
             now() - interval '1 minute', $9, '{}'::jsonb, '{}'::jsonb,
             $10, now(), now() + interval '5 minutes'
          )",

@@ -87,7 +87,9 @@ require(
 for required in (
     "autonomous-control migrate",
     "autonomous-control disarmed-deploy",
+    "autonomous-control evidence-start",
     "INSTALL_DISARMED_EVIDENCE_RELEASE_42161",
+    "START_DISARMED_EVIDENCE_42161",
     "mark_phase DISARMED_CONTROL_INSTALLED",
     "mark_phase DISARMED_EVIDENCE_STARTED",
     "PHOENIX_HEALTH_EXPECTED_MODE=DISARMED_EVIDENCE",
@@ -110,9 +112,25 @@ migrate = deploy.index("autonomous-control migrate", operation)
 disarmed = deploy.index("autonomous-control disarmed-deploy", operation)
 engine = deploy.index("compose up -d --no-deps phoenix-engine", operation)
 burn = deploy.index("run_live_engine_burn_in", operation)
-status = deploy.index("autonomous-control status", burn)
+healthcheck = deploy.index('"$deploy_dir/production-healthcheck.sh"', burn)
+fail_closed = deploy.index(
+    "runtime controls are not fail-closed before evidence-start", healthcheck
+)
+evidence_start = deploy.index("autonomous-control evidence-start", fail_closed)
+evidence_verified = deploy.index(
+    "runtime did not enter fail-closed DISARMED_EVIDENCE", evidence_start
+)
+external_evidence = deploy.index("mark_phase DISARMED_EVIDENCE_STARTED", evidence_verified)
 require(
-    migrate < disarmed < engine < burn < status,
+    migrate
+    < disarmed
+    < engine
+    < burn
+    < healthcheck
+    < fail_closed
+    < evidence_start
+    < evidence_verified
+    < external_evidence,
     "disarmed_release_sequence_invalid",
 )
 
@@ -132,6 +150,7 @@ require(
 
 for command in (
     '"disarmed-deploy"',
+    '"evidence-start"',
     '"create-readiness"',
     '"install-authorization"',
     '"activate-ready-canary"',
@@ -144,6 +163,29 @@ require(
     "legacy_direct_activation_not_disabled",
 )
 require("phoenix.live-canary-schema.v5" in control, "schema_v5_not_required")
+require(
+    "previous.phase != EconomicPhase::DisarmedEvidence" in control,
+    "readiness_does_not_require_durable_evidence_phase",
+)
+require(
+    "input.binding.observed_from < previous.updated_at" not in control
+    and "binding.observed_from < previous.updated_at" in control,
+    "readiness_observation_not_bound_to_evidence_transition",
+)
+require(
+    "economic_control_epoch" in state
+    and "economic_control_epoch" in schema
+    and "economic_control_epoch" in control,
+    "readiness_economic_epoch_binding_missing",
+)
+for required in (
+    "active execution attempt",
+    "unresolved receipt reconciliation",
+    "evidence-start requires fail-closed global and route controls",
+    "clock_timestamp()",
+    "disarmed_evidence_started",
+):
+    require(required in control, f"evidence_start_gate_missing:{required}")
 
 phases = (
     "DISARMED_DEPLOY",

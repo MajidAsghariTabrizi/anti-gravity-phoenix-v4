@@ -1,4 +1,4 @@
-use chrono::{SecondsFormat, Utc};
+use chrono::{DateTime, SecondsFormat, Utc};
 use phoenix_live_executor::control_environment::{
     control_address_environment_with, required_environment_with, MissingEnvironment,
 };
@@ -58,6 +58,7 @@ const MIGRATIONS: [(&str, &str); 5] = [
 const ACTIVATE_ACK: &str = "ACTIVATE_READY_MIN_CANARY_42161";
 const DISARM_ACK: &str = "DISARM_AUTONOMOUS_LIVE_42161";
 const DISARMED_DEPLOY_ACK: &str = "INSTALL_DISARMED_EVIDENCE_RELEASE_42161";
+const EVIDENCE_START_ACK: &str = "START_DISARMED_EVIDENCE_42161";
 const READINESS_ACK: &str = "CREATE_HASH_BOUND_CANARY_READINESS_42161";
 const AUTHORIZATION_ACK: &str = "INSTALL_BOUNDED_AUTOMATION_AUTHORIZATION_42161";
 const MAX_CONTROL_FILE_BYTES: u64 = 256 * 1024;
@@ -124,6 +125,7 @@ async fn run() -> ControlResult<()> {
         "owner-pause" => owner_mutation(OwnerMutation::Pause).await?,
         "migrate" => migrate(&database_pool().await?).await?,
         "disarmed-deploy" => disarmed_deploy(&database_pool().await?).await?,
+        "evidence-start" => start_evidence().await?,
         "create-readiness" => create_readiness(&database_pool().await?).await?,
         "install-authorization" => install_authorization(&database_pool().await?).await?,
         "activate-ready-canary" => activate(&database_pool().await?).await?,
@@ -431,6 +433,19 @@ struct AuthorizationFile {
     authorization_hash: String,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct EvidenceAuthorityState {
+    legacy_armed: bool,
+    legacy_kill_switch: bool,
+    global_armed: bool,
+    global_kill_switch: bool,
+    global_disarmed: bool,
+    route_enabled: bool,
+    route_kill_switch: bool,
+    active_attempts: i64,
+    unresolved_receipts: i64,
+}
+
 async fn disarmed_deploy(pool: &PgPool) -> ControlResult<()> {
     if required("PHOENIX_DISARMED_DEPLOY_ACK")? != DISARMED_DEPLOY_ACK {
         return Err("disarmed deployment acknowledgement is invalid".into());
@@ -602,6 +617,158 @@ async fn disarmed_deploy(pool: &PgPool) -> ControlResult<()> {
     Ok(())
 }
 
+async fn start_evidence() -> ControlResult<()> {
+    if required("PHOENIX_EVIDENCE_START_ACK")? != EVIDENCE_START_ACK {
+        return Err("evidence-start acknowledgement is invalid".into());
+    }
+    require_signerless_control()?;
+    evidence_start(&database_pool().await?).await
+}
+
+async fn evidence_start(pool: &PgPool) -> ControlResult<()> {
+    require_schema(pool).await?;
+    let release_sha = required("PHOENIX_RELEASE_SHA")?;
+    if !canonical_hex(&release_sha, 40) {
+        return Err("release SHA is invalid".into());
+    }
+    let engine_image_digest = image_digest(&required("PHOENIX_ENGINE_IMAGE")?)?;
+    let policy: Value = serde_json::from_str(POLICY).map_err(|_| "route policy is invalid")?;
+    let universe: Value =
+        serde_json::from_str(UNIVERSE).map_err(|_| "route universe is invalid")?;
+    verify_hash(
+        &policy,
+        "policy_hash",
+        "route-policy",
+        "phoenix.route-policy.v1",
+    )?;
+    verify_hash(
+        &universe,
+        "universe_hash",
+        "route-universe",
+        "phoenix.route-universe.v1",
+    )?;
+    let route_fingerprint = value_text(&policy, "route_fingerprint")?;
+    let route_policy_hash = value_text(&policy, "policy_hash")?;
+    let route_universe_hash = value_text(&universe, "universe_hash")?;
+
+    let mut transaction = pool
+        .begin()
+        .await
+        .map_err(|_| "database transaction failed")?;
+    let previous = economic_state_for_update(&mut transaction).await?;
+    let controls = sqlx::query(
+        "SELECT c.armed AS legacy_armed, c.kill_switch AS legacy_kill_switch,
+                g.armed AS global_armed, g.kill_switch AS global_kill_switch,
+                g.execution_mode = 'disarmed' AS global_disarmed,
+                r.enabled AS route_enabled, r.kill_switch AS route_kill_switch
+         FROM live_canary.control c
+         CROSS JOIN live_canary.autonomous_global_control g
+         JOIN live_canary.autonomous_route_controls r
+           ON r.route_fingerprint = $1
+         WHERE c.singleton AND g.singleton
+         FOR UPDATE OF c, g, r",
+    )
+    .bind(route_fingerprint)
+    .fetch_one(&mut *transaction)
+    .await
+    .map_err(|_| "disarmed controls are unavailable")?;
+    let active_attempts: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM live_canary.execution_attempts
+         WHERE status IN (
+            'claimed', 'nonce_allocated', 'submission_unknown', 'pending', 'timed_out'
+         )",
+    )
+    .fetch_one(&mut *transaction)
+    .await
+    .map_err(|_| "active-attempt inspection failed")?;
+    let unresolved_receipts: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM live_canary.execution_attempts
+         WHERE status IN ('submission_unknown', 'pending', 'timed_out')",
+    )
+    .fetch_one(&mut *transaction)
+    .await
+    .map_err(|_| "receipt-reconciliation inspection failed")?;
+    let authority = EvidenceAuthorityState {
+        legacy_armed: controls
+            .try_get("legacy_armed")
+            .map_err(|_| "disarmed controls are invalid")?,
+        legacy_kill_switch: controls
+            .try_get("legacy_kill_switch")
+            .map_err(|_| "disarmed controls are invalid")?,
+        global_armed: controls
+            .try_get("global_armed")
+            .map_err(|_| "disarmed controls are invalid")?,
+        global_kill_switch: controls
+            .try_get("global_kill_switch")
+            .map_err(|_| "disarmed controls are invalid")?,
+        global_disarmed: controls
+            .try_get("global_disarmed")
+            .map_err(|_| "disarmed controls are invalid")?,
+        route_enabled: controls
+            .try_get("route_enabled")
+            .map_err(|_| "disarmed controls are invalid")?,
+        route_kill_switch: controls
+            .try_get("route_kill_switch")
+            .map_err(|_| "disarmed controls are invalid")?,
+        active_attempts,
+        unresolved_receipts,
+    };
+    validate_evidence_start(
+        &previous,
+        &release_sha,
+        &engine_image_digest,
+        route_fingerprint,
+        route_universe_hash,
+        route_policy_hash,
+        &authority,
+    )?;
+
+    let transitioned_at: DateTime<Utc> = sqlx::query_scalar("SELECT clock_timestamp()")
+        .fetch_one(&mut *transaction)
+        .await
+        .map_err(|_| "database clock is unavailable")?;
+    let next_epoch = previous.control_epoch + 1;
+    let updated = sqlx::query(
+        "UPDATE live_canary.economic_control
+         SET phase = 'DISARMED_EVIDENCE', control_epoch = $1,
+             last_transition_reason = 'disarmed_evidence_started',
+             updated_at = $2
+         WHERE singleton AND phase = 'DISARMED_DEPLOY'",
+    )
+    .bind(next_epoch)
+    .bind(transitioned_at)
+    .execute(&mut *transaction)
+    .await
+    .map_err(|_| "disarmed evidence transition failed")?;
+    if updated.rows_affected() != 1 {
+        return Err("economic control is not in DISARMED_DEPLOY".into());
+    }
+    insert_transition_at(
+        &mut transaction,
+        &previous,
+        EconomicPhase::DisarmedEvidence,
+        SizeLevel::Min,
+        "disarmed_evidence_started",
+        None,
+        Some(&release_sha),
+        next_epoch,
+        transitioned_at,
+    )
+    .await?;
+    transaction
+        .commit()
+        .await
+        .map_err(|_| "disarmed evidence commit failed")?;
+    println!(
+        "DISARMED_EVIDENCE_OK: release={} route={} control_epoch={} armed=false kill_switch=true transitioned_at={}",
+        release_sha,
+        route_fingerprint,
+        next_epoch,
+        transitioned_at.to_rfc3339_opts(SecondsFormat::Micros, true)
+    );
+    Ok(())
+}
+
 async fn create_readiness(pool: &PgPool) -> ControlResult<()> {
     if required("PHOENIX_CANARY_READINESS_ACK")? != READINESS_ACK {
         return Err("readiness acknowledgement is invalid".into());
@@ -635,46 +802,67 @@ async fn create_readiness(pool: &PgPool) -> ControlResult<()> {
         .await
         .map_err(|_| "database transaction failed")?;
     let previous = economic_state_for_update(&mut transaction).await?;
-    if !matches!(
-        previous.phase,
-        EconomicPhase::DisarmedDeploy | EconomicPhase::DisarmedEvidence
-    ) || previous.release_sha.as_deref() != Some(input.binding.release_sha.as_str())
-        || previous.route_fingerprint.as_deref() != Some(input.binding.route_fingerprint.as_str())
-        || previous.route_policy_hash.as_deref() != Some(input.binding.route_policy_hash.as_str())
-        || previous.executor_code_hash.as_deref() != Some(input.binding.executor_code_hash.as_str())
-    {
-        return Err("readiness does not bind the current disarmed release".into());
-    }
-    let closed: bool = sqlx::query_scalar(
+    validate_readiness_against_evidence(&previous, &input.binding)?;
+    let controls = sqlx::query(
         "SELECT NOT c.armed AND c.kill_switch
-                AND NOT g.armed AND g.kill_switch AND g.execution_mode = 'disarmed'
-                AND NOT r.enabled AND r.kill_switch
+                    AND NOT g.armed AND g.kill_switch AND g.execution_mode = 'disarmed'
+                    AND NOT r.enabled AND r.kill_switch AS closed,
+                g.control_epoch AS global_control_epoch,
+                r.control_epoch AS route_control_epoch
          FROM live_canary.control c
          CROSS JOIN live_canary.autonomous_global_control g
          JOIN live_canary.autonomous_route_controls r
            ON r.route_fingerprint = $1
-         WHERE c.singleton AND g.singleton",
+         WHERE c.singleton AND g.singleton
+         FOR UPDATE OF c, g, r",
     )
     .bind(&input.binding.route_fingerprint)
     .fetch_one(&mut *transaction)
     .await
     .map_err(|_| "disarmed controls are unavailable")?;
-    if !closed {
+    if !controls
+        .try_get::<bool, _>("closed")
+        .map_err(|_| "disarmed controls are invalid")?
+    {
         return Err("readiness cannot be created while execution authority is open".into());
+    }
+    let global_epoch: i64 = controls
+        .try_get("global_control_epoch")
+        .map_err(|_| "disarmed controls are invalid")?;
+    let route_epoch: i64 = controls
+        .try_get("route_control_epoch")
+        .map_err(|_| "disarmed controls are invalid")?;
+    if u64::try_from(global_epoch).ok() != Some(input.binding.global_control_epoch)
+        || u64::try_from(route_epoch).ok() != Some(input.binding.route_control_epoch)
+    {
+        return Err("readiness does not bind the current fail-closed control epochs".into());
+    }
+    let active_attempts: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM live_canary.execution_attempts
+         WHERE status IN (
+            'claimed', 'nonce_allocated', 'submission_unknown', 'pending', 'timed_out'
+         )",
+    )
+    .fetch_one(&mut *transaction)
+    .await
+    .map_err(|_| "active-attempt inspection failed")?;
+    if active_attempts != 0 {
+        return Err("readiness is blocked by an active execution attempt".into());
     }
     sqlx::query(
         "INSERT INTO live_canary.canary_readiness_records(
             readiness_id, schema_version, release_sha, engine_image_digest,
             route_fingerprint, route_universe_hash, route_policy_hash,
-            risk_policy_hash, global_control_epoch, route_control_epoch,
+            risk_policy_hash, economic_control_epoch,
+            global_control_epoch, route_control_epoch,
             executor_code_hash, contract_identity_hash, wallet_gas_reserve_wei,
             gas_reserve_floor_wei, current_daily_loss_wei, daily_loss_limit_wei,
             observed_from, observed_until, candidate_evidence_hashes,
             evidence_metrics, readiness_contract, readiness_hash, created_at, expires_at
          ) VALUES (
             $1, 'phoenix.canary-readiness.v1', $2, $3, $4, $5, $6, $7,
-            $8, $9, $10, $11, $12::numeric, $13::numeric, $14::numeric,
-            $15::numeric, $16, $17, $18, $19, $20, $21, $22, $23
+            $8, $9, $10, $11, $12, $13::numeric, $14::numeric, $15::numeric,
+            $16::numeric, $17, $18, $19, $20, $21, $22, $23, $24
          )",
     )
     .bind(input.readiness_id)
@@ -684,6 +872,10 @@ async fn create_readiness(pool: &PgPool) -> ControlResult<()> {
     .bind(&input.binding.route_universe_hash)
     .bind(&input.binding.route_policy_hash)
     .bind(&input.binding.risk_policy_hash)
+    .bind(
+        i64::try_from(input.binding.economic_control_epoch)
+            .map_err(|_| "control epoch is invalid")?,
+    )
     .bind(
         i64::try_from(input.binding.global_control_epoch)
             .map_err(|_| "control epoch is invalid")?,
@@ -917,10 +1109,16 @@ async fn activate(pool: &PgPool) -> ControlResult<()> {
         || readiness.binding.release_sha != previous.release_sha.as_deref().unwrap_or_default()
         || readiness.binding.engine_image_digest
             != previous.engine_image_digest.as_deref().unwrap_or_default()
+        || readiness.binding.route_universe_hash
+            != previous.route_universe_hash.as_deref().unwrap_or_default()
         || readiness.binding.route_policy_hash
             != previous.route_policy_hash.as_deref().unwrap_or_default()
+        || readiness.binding.risk_policy_hash
+            != previous.risk_policy_hash.as_deref().unwrap_or_default()
         || readiness.binding.executor_code_hash
             != previous.executor_code_hash.as_deref().unwrap_or_default()
+        || u64::try_from(previous.control_epoch - 1).ok()
+            != Some(readiness.binding.economic_control_epoch)
     {
         return Err("ready canary binding does not match economic control".into());
     }
@@ -1862,7 +2060,7 @@ async fn status(pool: &PgPool) -> Result<(), &'static str> {
                 release_sha, readiness_id, authorization_id, cooldown_until,
                 gas_reserve_wei::text AS gas_reserve_wei,
                 gas_reserve_floor_wei::text AS gas_reserve_floor_wei,
-                control_epoch, last_transition_reason
+                control_epoch, last_transition_reason, updated_at
          FROM live_canary.economic_control WHERE singleton",
     )
     .fetch_one(pool)
@@ -1897,7 +2095,8 @@ async fn status(pool: &PgPool) -> Result<(), &'static str> {
             "gas_reserve_wei": economic.try_get::<String, _>("gas_reserve_wei").map_err(|_| "economic control is invalid")?,
             "gas_reserve_floor_wei": economic.try_get::<String, _>("gas_reserve_floor_wei").map_err(|_| "economic control is invalid")?,
             "control_epoch": economic.try_get::<i64, _>("control_epoch").map_err(|_| "economic control is invalid")?,
-            "last_transition_reason": economic.try_get::<String, _>("last_transition_reason").map_err(|_| "economic control is invalid")?
+            "last_transition_reason": economic.try_get::<String, _>("last_transition_reason").map_err(|_| "economic control is invalid")?,
+            "updated_at": economic.try_get::<chrono::DateTime<Utc>, _>("updated_at").map_err(|_| "economic control is invalid")?
         }
     });
     println!(
@@ -1949,12 +2148,82 @@ struct EconomicState {
     route_fingerprint: Option<String>,
     release_sha: Option<String>,
     engine_image_digest: Option<String>,
+    route_universe_hash: Option<String>,
     route_policy_hash: Option<String>,
+    risk_policy_hash: Option<String>,
     executor_code_hash: Option<String>,
     readiness_id: Option<Uuid>,
     authorization_id: Option<Uuid>,
     gas_reserve_floor_wei: u128,
     control_epoch: i64,
+    updated_at: DateTime<Utc>,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_evidence_start(
+    previous: &EconomicState,
+    release_sha: &str,
+    engine_image_digest: &str,
+    route_fingerprint: &str,
+    route_universe_hash: &str,
+    route_policy_hash: &str,
+    authority: &EvidenceAuthorityState,
+) -> ControlResult<()> {
+    if previous.phase != EconomicPhase::DisarmedDeploy {
+        return Err("economic control is not in DISARMED_DEPLOY".into());
+    }
+    if previous.release_sha.as_deref() != Some(release_sha)
+        || previous.engine_image_digest.as_deref() != Some(engine_image_digest)
+        || previous.route_fingerprint.as_deref() != Some(route_fingerprint)
+        || previous.route_universe_hash.as_deref() != Some(route_universe_hash)
+        || previous.route_policy_hash.as_deref() != Some(route_policy_hash)
+        || previous.risk_policy_hash.as_deref() != Some(route_policy_hash)
+    {
+        return Err("evidence-start does not bind the current release".into());
+    }
+    if authority.legacy_armed
+        || !authority.legacy_kill_switch
+        || authority.global_armed
+        || !authority.global_kill_switch
+        || !authority.global_disarmed
+        || authority.route_enabled
+        || !authority.route_kill_switch
+    {
+        return Err("evidence-start requires fail-closed global and route controls".into());
+    }
+    if authority.active_attempts != 0 {
+        return Err("evidence-start is blocked by an active execution attempt".into());
+    }
+    if authority.unresolved_receipts != 0 {
+        return Err("evidence-start is blocked by unresolved receipt reconciliation".into());
+    }
+    Ok(())
+}
+
+fn validate_readiness_against_evidence(
+    previous: &EconomicState,
+    binding: &ReadinessBinding,
+) -> ControlResult<()> {
+    if previous.phase != EconomicPhase::DisarmedEvidence {
+        return Err("readiness requires the durable DISARMED_EVIDENCE phase".into());
+    }
+    if previous.release_sha.as_deref() != Some(binding.release_sha.as_str())
+        || previous.engine_image_digest.as_deref() != Some(binding.engine_image_digest.as_str())
+        || previous.route_fingerprint.as_deref() != Some(binding.route_fingerprint.as_str())
+        || previous.route_universe_hash.as_deref() != Some(binding.route_universe_hash.as_str())
+        || previous.route_policy_hash.as_deref() != Some(binding.route_policy_hash.as_str())
+        || previous.risk_policy_hash.as_deref() != Some(binding.risk_policy_hash.as_str())
+        || previous.executor_code_hash.as_deref() != Some(binding.executor_code_hash.as_str())
+    {
+        return Err("readiness does not bind the current disarmed release".into());
+    }
+    if u64::try_from(previous.control_epoch).ok() != Some(binding.economic_control_epoch) {
+        return Err("readiness does not bind the current economic control epoch".into());
+    }
+    if binding.observed_from < previous.updated_at {
+        return Err("readiness observation predates DISARMED_EVIDENCE".into());
+    }
+    Ok(())
 }
 
 async fn economic_state_for_update(
@@ -1962,10 +2231,11 @@ async fn economic_state_for_update(
 ) -> ControlResult<EconomicState> {
     let row = sqlx::query(
         "SELECT phase, current_size_level, route_fingerprint, release_sha,
-                engine_image_digest, route_policy_hash, executor_code_hash,
+                engine_image_digest, route_universe_hash, route_policy_hash,
+                risk_policy_hash, executor_code_hash,
                 readiness_id, authorization_id,
                 gas_reserve_floor_wei::text AS gas_reserve_floor_wei,
-                control_epoch
+                control_epoch, updated_at
          FROM live_canary.economic_control
          WHERE singleton
          FOR UPDATE",
@@ -1994,8 +2264,14 @@ async fn economic_state_for_update(
         engine_image_digest: row
             .try_get("engine_image_digest")
             .map_err(|_| "economic control is invalid")?,
+        route_universe_hash: row
+            .try_get("route_universe_hash")
+            .map_err(|_| "economic control is invalid")?,
         route_policy_hash: row
             .try_get("route_policy_hash")
+            .map_err(|_| "economic control is invalid")?,
+        risk_policy_hash: row
+            .try_get("risk_policy_hash")
             .map_err(|_| "economic control is invalid")?,
         executor_code_hash: row
             .try_get("executor_code_hash")
@@ -2014,6 +2290,9 @@ async fn economic_state_for_update(
         control_epoch: row
             .try_get("control_epoch")
             .map_err(|_| "economic control is invalid")?,
+        updated_at: row
+            .try_get("updated_at")
+            .map_err(|_| "economic control is invalid")?,
     })
 }
 
@@ -2028,6 +2307,32 @@ async fn insert_transition(
     release_sha: Option<&str>,
     control_epoch: i64,
 ) -> ControlResult<()> {
+    insert_transition_at(
+        transaction,
+        previous,
+        next_phase,
+        next_level,
+        reason,
+        evidence_hash,
+        release_sha,
+        control_epoch,
+        Utc::now(),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn insert_transition_at(
+    transaction: &mut Transaction<'_, Postgres>,
+    previous: &EconomicState,
+    next_phase: EconomicPhase,
+    next_level: SizeLevel,
+    reason: &str,
+    evidence_hash: Option<&str>,
+    release_sha: Option<&str>,
+    control_epoch: i64,
+    transitioned_at: DateTime<Utc>,
+) -> ControlResult<()> {
     if reason.is_empty()
         || reason.len() > 128
         || evidence_hash.is_some_and(|value| !canonical_hex(value, 64))
@@ -2035,7 +2340,7 @@ async fn insert_transition(
         return Err("economic transition evidence is invalid".into());
     }
     let transition_id = Uuid::new_v4();
-    let transitioned_at = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
+    let transitioned_at = transitioned_at.to_rfc3339_opts(SecondsFormat::Micros, true);
     let mut contract = json!({
         "schema_version": "phoenix.economic-transition.v1",
         "transition_id": transition_id,
@@ -2140,6 +2445,19 @@ fn canonical_hex(value: &str, length: usize) -> bool {
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
+fn require_signerless_control() -> ControlResult<()> {
+    for name in [
+        "SIGNER_PRIVATE_KEY",
+        "SIGNER_PRIVATE_KEY_FILE",
+        "LIVE_EXECUTOR_SIGNER_FILE",
+    ] {
+        if env::var_os(name).is_some() {
+            return Err("evidence-start requires a signerless control process".into());
+        }
+    }
+    Ok(())
+}
+
 fn required(name: &'static str) -> ControlResult<String> {
     required_environment_with(name, &mut |name| env::var(name).ok()).map_err(Into::into)
 }
@@ -2235,6 +2553,222 @@ fn canonical_json(value: &Value) -> Result<Vec<u8>, &'static str> {
             }
             output.push(b'}');
             Ok(output)
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::{Duration as ChronoDuration, TimeZone};
+
+    fn evidence_time() -> DateTime<Utc> {
+        Utc.timestamp_opt(1_720_000_000, 0)
+            .single()
+            .expect("valid timestamp")
+    }
+
+    fn state(phase: EconomicPhase) -> EconomicState {
+        EconomicState {
+            phase,
+            level: SizeLevel::Min,
+            route_fingerprint: Some("route".to_string()),
+            release_sha: Some("a".repeat(40)),
+            engine_image_digest: Some(format!("sha256:{}", "b".repeat(64))),
+            route_universe_hash: Some("c".repeat(64)),
+            route_policy_hash: Some("d".repeat(64)),
+            risk_policy_hash: Some("d".repeat(64)),
+            executor_code_hash: Some("e".repeat(64)),
+            readiness_id: None,
+            authorization_id: None,
+            gas_reserve_floor_wei: 1,
+            control_epoch: 7,
+            updated_at: evidence_time(),
+        }
+    }
+
+    fn closed_authority() -> EvidenceAuthorityState {
+        EvidenceAuthorityState {
+            legacy_armed: false,
+            legacy_kill_switch: true,
+            global_armed: false,
+            global_kill_switch: true,
+            global_disarmed: true,
+            route_enabled: false,
+            route_kill_switch: true,
+            active_attempts: 0,
+            unresolved_receipts: 0,
+        }
+    }
+
+    fn readiness() -> ReadinessBinding {
+        let start = evidence_time();
+        ReadinessBinding {
+            release_sha: "a".repeat(40),
+            engine_image_digest: format!("sha256:{}", "b".repeat(64)),
+            route_fingerprint: "route".to_string(),
+            route_universe_hash: "c".repeat(64),
+            route_policy_hash: "d".repeat(64),
+            risk_policy_hash: "d".repeat(64),
+            economic_control_epoch: 7,
+            global_control_epoch: 8,
+            route_control_epoch: 9,
+            executor_code_hash: "e".repeat(64),
+            contract_identity_hash: "f".repeat(64),
+            wallet_gas_reserve_wei: 2,
+            gas_reserve_floor_wei: 1,
+            current_daily_loss_wei: 0,
+            daily_loss_limit_wei: 1,
+            observed_from: start,
+            observed_until: start + ChronoDuration::seconds(1),
+            created_at: start + ChronoDuration::seconds(2),
+            expires_at: start + ChronoDuration::minutes(5),
+            candidate_evidence_hashes: vec!["1".repeat(64)],
+        }
+    }
+
+    #[test]
+    fn evidence_start_accepts_only_the_exact_fail_closed_deploy() {
+        let current = state(EconomicPhase::DisarmedDeploy);
+        let authority = closed_authority();
+        assert!(validate_evidence_start(
+            &current,
+            &"a".repeat(40),
+            &format!("sha256:{}", "b".repeat(64)),
+            "route",
+            &"c".repeat(64),
+            &"d".repeat(64),
+            &authority,
+        )
+        .is_ok());
+
+        let repeated = state(EconomicPhase::DisarmedEvidence);
+        assert!(validate_evidence_start(
+            &repeated,
+            &"a".repeat(40),
+            &format!("sha256:{}", "b".repeat(64)),
+            "route",
+            &"c".repeat(64),
+            &"d".repeat(64),
+            &authority,
+        )
+        .is_err());
+
+        for (release, digest, route, universe, policy) in [
+            (
+                "0".repeat(40),
+                format!("sha256:{}", "b".repeat(64)),
+                "route".to_string(),
+                "c".repeat(64),
+                "d".repeat(64),
+            ),
+            (
+                "a".repeat(40),
+                format!("sha256:{}", "0".repeat(64)),
+                "route".to_string(),
+                "c".repeat(64),
+                "d".repeat(64),
+            ),
+            (
+                "a".repeat(40),
+                format!("sha256:{}", "b".repeat(64)),
+                "other-route".to_string(),
+                "c".repeat(64),
+                "d".repeat(64),
+            ),
+            (
+                "a".repeat(40),
+                format!("sha256:{}", "b".repeat(64)),
+                "route".to_string(),
+                "0".repeat(64),
+                "d".repeat(64),
+            ),
+            (
+                "a".repeat(40),
+                format!("sha256:{}", "b".repeat(64)),
+                "route".to_string(),
+                "c".repeat(64),
+                "0".repeat(64),
+            ),
+        ] {
+            assert!(validate_evidence_start(
+                &current, &release, &digest, &route, &universe, &policy, &authority,
+            )
+            .is_err());
+        }
+    }
+
+    #[test]
+    fn evidence_start_rejects_every_open_or_active_authority() {
+        let current = state(EconomicPhase::DisarmedDeploy);
+        let validate = |authority: &EvidenceAuthorityState| {
+            validate_evidence_start(
+                &current,
+                &"a".repeat(40),
+                &format!("sha256:{}", "b".repeat(64)),
+                "route",
+                &"c".repeat(64),
+                &"d".repeat(64),
+                authority,
+            )
+        };
+        let mut variants = Vec::new();
+        for index in 0..7 {
+            let mut authority = closed_authority();
+            match index {
+                0 => authority.legacy_armed = true,
+                1 => authority.legacy_kill_switch = false,
+                2 => authority.global_armed = true,
+                3 => authority.global_kill_switch = false,
+                4 => authority.global_disarmed = false,
+                5 => authority.route_enabled = true,
+                6 => authority.route_kill_switch = false,
+                _ => unreachable!(),
+            }
+            variants.push(authority);
+        }
+        assert!(variants
+            .iter()
+            .all(|authority| validate(authority).is_err()));
+
+        let mut active = closed_authority();
+        active.active_attempts = 1;
+        assert!(validate(&active).is_err());
+        let mut unresolved = closed_authority();
+        unresolved.unresolved_receipts = 1;
+        assert!(validate(&unresolved).is_err());
+    }
+
+    #[test]
+    fn readiness_requires_evidence_phase_current_bindings_and_post_transition_window() {
+        let evidence = state(EconomicPhase::DisarmedEvidence);
+        let binding = readiness();
+        assert!(validate_readiness_against_evidence(&evidence, &binding).is_ok());
+
+        let deploy = state(EconomicPhase::DisarmedDeploy);
+        assert!(validate_readiness_against_evidence(&deploy, &binding).is_err());
+
+        let mut stale = binding.clone();
+        stale.observed_from = evidence.updated_at - ChronoDuration::seconds(1);
+        assert!(validate_readiness_against_evidence(&evidence, &stale).is_err());
+
+        let mut wrong_epoch = binding.clone();
+        wrong_epoch.economic_control_epoch += 1;
+        assert!(validate_readiness_against_evidence(&evidence, &wrong_epoch).is_err());
+
+        for field in 0..7 {
+            let mut wrong = binding.clone();
+            match field {
+                0 => wrong.release_sha = "0".repeat(40),
+                1 => wrong.engine_image_digest = format!("sha256:{}", "0".repeat(64)),
+                2 => wrong.route_fingerprint = "other-route".to_string(),
+                3 => wrong.route_universe_hash = "0".repeat(64),
+                4 => wrong.route_policy_hash = "0".repeat(64),
+                5 => wrong.risk_policy_hash = "0".repeat(64),
+                6 => wrong.executor_code_hash = "0".repeat(64),
+                _ => unreachable!(),
+            }
+            assert!(validate_readiness_against_evidence(&evidence, &wrong).is_err());
         }
     }
 }

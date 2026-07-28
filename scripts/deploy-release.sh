@@ -46,6 +46,31 @@ mark_phase() {
   state_update phase "$1"
 }
 
+verify_runtime_control_phase() {
+  expected_phase=$1
+  python3 -c '
+import json
+import sys
+
+expected_phase, expected_release = sys.argv[1:]
+status = json.load(sys.stdin)
+global_control = status["global"]
+route_control = status["route"]
+economic = status["economic"]
+valid = (
+    global_control["armed"] is False
+    and global_control["kill_switch"] is True
+    and global_control["execution_mode"] == "disarmed"
+    and route_control is not None
+    and route_control["enabled"] is False
+    and route_control["kill_switch"] is True
+    and economic["phase"] == expected_phase
+    and economic["release_sha"] == expected_release
+)
+raise SystemExit(0 if valid else 1)
+' "$expected_phase" "$release_sha"
+}
+
 case "$release_sha" in
   *[!0-9a-f]*|"") fail "release SHA must be 40 lowercase hex characters" ;;
 esac
@@ -524,11 +549,9 @@ mark_phase ENGINE_HEALTHY
 run_live_engine_burn_in ||
   fail "disarmed evidence Engine burn-in failed"
 mark_phase ENGINE_BURN_IN_PASSED
-mark_phase DISARMED_EVIDENCE_STARTED
 mark_phase POST_DISARMED_VERIFYING
 [ -z "$(compose ps -q live-executor | awk 'NF { print; exit }')" ] ||
   fail "live-executor started during disarmed deployment"
-compose run --rm --no-deps autonomous-control status
 capture_protected_ids "$protected_after" || fail "protected services are not ready after deployment"
 cmp "$protected_before" "$protected_after" >/dev/null || fail "protected service identity changed during deployment"
 reload_environment
@@ -541,6 +564,23 @@ assert_live_environment
     "$deploy_dir/production-healthcheck.sh"
 )
 mark_phase POST_DISARMED_VERIFIED
+control_status=$(compose run --rm --no-deps autonomous-control status)
+printf '%s\n' "$control_status" |
+  verify_runtime_control_phase DISARMED_DEPLOY ||
+  fail "runtime controls are not fail-closed before evidence-start"
+[ -z "$(compose ps -q live-executor | awk 'NF { print; exit }')" ] ||
+  fail "live-executor started before evidence-start"
+compose run --rm --no-deps \
+  -e PHOENIX_RELEASE_SHA="$release_sha" \
+  -e PHOENIX_EVIDENCE_START_ACK=START_DISARMED_EVIDENCE_42161 \
+  autonomous-control evidence-start
+evidence_status=$(compose run --rm --no-deps autonomous-control status)
+printf '%s\n' "$evidence_status" |
+  verify_runtime_control_phase DISARMED_EVIDENCE ||
+  fail "runtime did not enter fail-closed DISARMED_EVIDENCE"
+[ -z "$(compose ps -q live-executor | awk 'NF { print; exit }')" ] ||
+  fail "live-executor started during evidence-start"
+mark_phase DISARMED_EVIDENCE_STARTED
 
 printf '%s\n' "$release_sha" >"$pointer_candidate"
 printf '%s\n' "$release_sha" >"$assets_pointer_candidate"
