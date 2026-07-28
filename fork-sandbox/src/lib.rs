@@ -5,7 +5,9 @@ pub mod rpc;
 pub mod runner;
 pub mod store;
 
-pub use model::{CounterfactualResult, PersistedOpportunity, UnsignedTransactionPlan};
+pub use model::{
+    CounterfactualResult, PersistedOpportunity, SimulationStatus, UnsignedTransactionPlan,
+};
 pub use planner::{PlanPolicy, PlannerError, UnsignedPlanner};
 pub use rpc::{ForkRpc, HttpForkRpc, RpcError};
 pub use runner::{ForkRunner, RunnerError};

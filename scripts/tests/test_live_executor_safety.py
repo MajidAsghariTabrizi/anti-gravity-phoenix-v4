@@ -253,30 +253,24 @@ class LiveExecutorSafetyTests(unittest.TestCase):
         candidate_overlay = deployment.index(
             '--overlay-file "$overlay_file"', candidate_mode_live
         )
-        preflight = deployment.index("live-executor preflight")
+        disarmed_control = deployment.index("autonomous-control disarmed-deploy")
         previous_release = deployment.index('cp "$current_file" "$previous_file"')
         mode_live = deployment.index(
             'production_mode.py" live --env-file "$env_file"'
         )
-        migration = deployment.index("live-executor migrate")
-        activation = deployment.index("live-executor activate")
-        executor_start = deployment.index("compose up -d --no-deps live-executor")
+        migration = deployment.index("autonomous-control migrate")
+        burn_in = deployment.index("run_live_engine_burn_in ||")
         self.assertLess(candidate_mode_live, candidate_overlay)
-        self.assertLess(candidate_overlay, preflight)
-        self.assertLess(preflight, previous_release)
+        self.assertLess(candidate_overlay, previous_release)
         self.assertLess(previous_release, mode_live)
         self.assertLess(mode_live, migration)
-        self.assertLess(migration, activation)
-        self.assertLess(activation, executor_start)
-        configured_preflight = deployment.index(
-            "live-executor owner-configured-preflight"
-        )
-        owner_plan = deployment.index("live-executor owner-plan")
-        authorization = deployment.index("EXTERNAL_OWNER_AUTHORIZATION_REQUIRED")
-        self.assertLess(configured_preflight, owner_plan)
-        self.assertLess(owner_plan, authorization)
-        self.assertIn("EXTERNAL_OWNER_AUTHORIZATION_REQUIRED", deployment)
-        self.assertIn("EXTERNAL_GAS_FUNDING_REQUIRED", deployment)
+        self.assertLess(migration, disarmed_control)
+        self.assertLess(disarmed_control, burn_in)
+        self.assertNotIn("live-executor activate", deployment)
+        self.assertNotIn("live-executor owner-unpause", deployment)
+        self.assertNotIn("compose up -d --no-deps live-executor", deployment)
+        self.assertNotIn("LIVE_EXECUTOR_SIGNER_FILE", deployment)
+        self.assertIn("PHOENIX_HEALTH_EXPECTED_MODE=DISARMED_EVIDENCE", deployment)
         self.assertIn(
             '"$active_environment_identity_after" = '
             '"$active_environment_identity_before"',
@@ -285,8 +279,8 @@ class LiveExecutorSafetyTests(unittest.TestCase):
 
     def test_autonomous_rollback_disarms_reconciles_then_restores(self) -> None:
         rollback = (ROOT / "scripts/rollback-release.sh").read_text(encoding="utf-8")
-        disarm = rollback.index("live-executor disarm")
-        reconciliation = rollback.index("live-executor reconciliation-status")
+        disarm = rollback.index("autonomous-control disarm")
+        reconciliation = rollback.index("autonomous-control reconciliation-status")
         executor_stop = rollback.index("stop -t 30 live-executor")
         shadow_mode = rollback.index("production_mode.py\" shadow")
         immutable_verify = rollback.index("verify-tree")

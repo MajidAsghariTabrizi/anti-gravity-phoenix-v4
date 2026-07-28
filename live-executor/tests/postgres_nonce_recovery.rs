@@ -7,6 +7,7 @@ use phoenix_fork_sandbox::{ForkEvidenceStore, PlanPolicy, UnsignedPlanner};
 use phoenix_live_executor::abi::encode_execute_opportunity;
 use phoenix_live_executor::approval::{ApprovalInput, ApprovalMaterializer};
 use phoenix_live_executor::config::{ExecutorConfig, SafetyLimits};
+use phoenix_live_executor::economic_control::SizeLevel;
 use phoenix_live_executor::model::{
     AttemptStatus, CanonicalAddress, ExecutionRequest, ReceiptOutcome, Settlement, TransactionHash,
     ValidatedLeg,
@@ -71,12 +72,71 @@ async fn nonce_allocation_and_pending_state_survive_restart() {
         .execute(&pool)
         .await
         .expect("apply autonomous LIVE runtime schema");
+    sqlx::raw_sql(include_str!(
+        "../schema/005_closed_loop_economic_control.sql"
+    ))
+    .execute(&pool)
+    .await
+    .expect("apply closed-loop economic control schema");
 
     let signer = TransactionSigner::from_secret(&hex::encode([13_u8; 32]), ARBITRUM_ONE_CHAIN_ID)
         .expect("signer");
     let config = test_config(&dsn, signer.address());
     let store = PostgresExecutorStore::from_pool(pool.clone());
     store.validate_schema().await.expect("schema");
+    let readiness_id = Uuid::from_u128(50);
+    let authorization_id = Uuid::from_u128(51);
+    sqlx::query(
+        "INSERT INTO live_canary.canary_readiness_records(
+            readiness_id, schema_version, release_sha, engine_image_digest,
+            route_fingerprint, route_universe_hash, route_policy_hash,
+            risk_policy_hash, economic_control_epoch,
+            global_control_epoch, route_control_epoch,
+            executor_code_hash, contract_identity_hash, wallet_gas_reserve_wei,
+            gas_reserve_floor_wei, current_daily_loss_wei, daily_loss_limit_wei,
+            observed_from, observed_until, candidate_evidence_hashes,
+            evidence_metrics, readiness_contract, readiness_hash, created_at, expires_at
+         ) VALUES (
+            $1, 'phoenix.canary-readiness.v1', $2, $3, $4, $5, $6, $6,
+            0, 0, 0, $7, $8, 2, 1, 0, 1, now() - interval '2 minutes',
+            now() - interval '1 minute', $9, '{}'::jsonb, '{}'::jsonb,
+            $10, now(), now() + interval '5 minutes'
+         )",
+    )
+    .bind(readiness_id)
+    .bind("a".repeat(40))
+    .bind(format!("sha256:{}", "b".repeat(64)))
+    .bind(CURRENT_ROUTE_FINGERPRINT)
+    .bind("c".repeat(64))
+    .bind("d".repeat(64))
+    .bind("a".repeat(64))
+    .bind("e".repeat(64))
+    .bind(sqlx::types::Json(vec!["f".repeat(64)]))
+    .bind("1".repeat(64))
+    .execute(&pool)
+    .await
+    .expect("seed readiness");
+    sqlx::query(
+        "INSERT INTO live_canary.automation_authorizations(
+            authorization_id, schema_version, route_fingerprint,
+            route_policy_hash, maximum_reviewed_input_wei, executor_code_hash,
+            release_family, one_transaction_at_a_time, reviewed_ladder_only,
+            automatic_disarm_required, authorization_contract,
+            authorization_hash, authorized_at, expires_at, consumed_at
+         ) VALUES (
+            $1, 'phoenix.automation-authorization.v1', $2, $3,
+            10000000000000000, $4, 'test', true, true, true,
+            '{}'::jsonb, $5, now(), now() + interval '5 minutes', now()
+         )",
+    )
+    .bind(authorization_id)
+    .bind(CURRENT_ROUTE_FINGERPRINT)
+    .bind("d".repeat(64))
+    .bind("a".repeat(64))
+    .bind("2".repeat(64))
+    .execute(&pool)
+    .await
+    .expect("seed authorization");
     sqlx::query(
         "UPDATE live_canary.control
          SET armed = true, kill_switch = false, disarm_reason = 'test_armed'
@@ -95,6 +155,36 @@ async fn nonce_allocation_and_pending_state_survive_restart() {
     .execute(&pool)
     .await
     .expect("arm isolated autonomous control");
+    sqlx::query(
+        "UPDATE live_canary.autonomous_global_control
+         SET maximum_input_amount = $1::numeric
+         WHERE singleton",
+    )
+    .bind(SizeLevel::Min.amount_wei().to_string())
+    .execute(&pool)
+    .await
+    .expect("set isolated global size");
+    sqlx::query(
+        "UPDATE live_canary.economic_control
+         SET phase = 'LIVE_CANARY_MIN', current_size_level = 'MIN',
+             current_input_wei = $1::numeric, route_fingerprint = $2,
+             release_sha = $3, engine_image_digest = $4,
+             route_policy_hash = $5, executor_code_hash = $6,
+             readiness_id = $7, authorization_id = $8,
+             gas_reserve_wei = 2, gas_reserve_floor_wei = 1
+         WHERE singleton",
+    )
+    .bind(SizeLevel::Min.amount_wei().to_string())
+    .bind(CURRENT_ROUTE_FINGERPRINT)
+    .bind("a".repeat(40))
+    .bind(format!("sha256:{}", "b".repeat(64)))
+    .bind("d".repeat(64))
+    .bind("a".repeat(64))
+    .bind(readiness_id)
+    .bind(authorization_id)
+    .execute(&pool)
+    .await
+    .expect("arm isolated economic control");
 
     let now = Utc::now();
     let first = request(Uuid::from_u128(10), now, config.pnl_asset_address);
@@ -289,6 +379,44 @@ async fn nonce_allocation_and_pending_state_survive_restart() {
         .await
         .expect("reconcile late receipt");
 
+    let fourth = request(Uuid::from_u128(13), now, config.pnl_asset_address);
+    insert_approved(&pool, &fourth).await;
+    second_restart
+        .claim_approved(&config, now)
+        .await
+        .expect("claim fourth")
+        .expect("fourth request");
+    assert_eq!(
+        second_restart
+            .allocate_nonce(fourth.id, &config, 7)
+            .await
+            .expect("allocate fourth nonce"),
+        7
+    );
+    second_restart
+        .fail_unsubmitted(fourth.id, "isolated_pre_submit_cancel", now)
+        .await
+        .expect("release unsubmitted nonce");
+
+    let fifth = request(Uuid::from_u128(14), now, config.pnl_asset_address);
+    insert_approved(&pool, &fifth).await;
+    second_restart
+        .claim_approved(&config, now)
+        .await
+        .expect("claim fifth")
+        .expect("fifth request");
+    assert_eq!(
+        second_restart
+            .allocate_nonce(fifth.id, &config, 7)
+            .await
+            .expect("reuse released nonce"),
+        7
+    );
+    second_restart
+        .fail_unsubmitted(fifth.id, "isolated_cleanup", now)
+        .await
+        .expect("close final fixture attempt");
+
     let third = request(Uuid::from_u128(12), now, config.pnl_asset_address);
     insert_approved(&pool, &third).await;
     second_restart
@@ -338,44 +466,6 @@ async fn nonce_allocation_and_pending_state_survive_restart() {
             .expect("daily loss"),
         100
     );
-
-    let fourth = request(Uuid::from_u128(13), now, config.pnl_asset_address);
-    insert_approved(&pool, &fourth).await;
-    second_restart
-        .claim_approved(&config, now)
-        .await
-        .expect("claim fourth")
-        .expect("fourth request");
-    assert_eq!(
-        second_restart
-            .allocate_nonce(fourth.id, &config, 8)
-            .await
-            .expect("allocate fourth nonce"),
-        8
-    );
-    second_restart
-        .fail_unsubmitted(fourth.id, "isolated_pre_submit_cancel", now)
-        .await
-        .expect("release unsubmitted nonce");
-
-    let fifth = request(Uuid::from_u128(14), now, config.pnl_asset_address);
-    insert_approved(&pool, &fifth).await;
-    second_restart
-        .claim_approved(&config, now)
-        .await
-        .expect("claim fifth")
-        .expect("fifth request");
-    assert_eq!(
-        second_restart
-            .allocate_nonce(fifth.id, &config, 8)
-            .await
-            .expect("reuse released nonce"),
-        8
-    );
-    second_restart
-        .fail_unsubmitted(fifth.id, "isolated_cleanup", now)
-        .await
-        .expect("close final fixture attempt");
 
     prepare_fork_approval_fixture(&pool).await;
     sqlx::query(
@@ -710,7 +800,7 @@ fn test_config(dsn: &str, wallet_address: CanonicalAddress) -> ExecutorConfig {
             maximum_gas_limit: 500_000,
             maximum_max_fee_per_gas: 1_000,
             maximum_priority_fee_per_gas: 100,
-            maximum_input_amount: 1_000_000,
+            maximum_input_amount: SizeLevel::Min.amount_wei(),
             minimum_expected_profit: 100,
             maximum_daily_loss_wei: 1_000_000_000,
         },
@@ -733,7 +823,7 @@ fn request(
         chain_id: ARBITRUM_ONE_CHAIN_ID,
         route_id: [17_u8; 32],
         route_fingerprint: CURRENT_ROUTE_FINGERPRINT.to_string(),
-        selected_size: 1_000,
+        selected_size: SizeLevel::Min.amount_wei(),
         token_path: vec![flash_asset, token_b, flash_asset],
         origin_router: CanonicalAddress::parse("0x4444444444444444444444444444444444444444")
             .expect("router"),
@@ -746,8 +836,8 @@ fn request(
         pinned_block_number: 123_456,
         pinned_block_hash: format!("0x{}", "d".repeat(64)),
         flash_asset,
-        flash_amount: 1_000,
-        maximum_input_amount: 1_000,
+        flash_amount: SizeLevel::Min.amount_wei(),
+        maximum_input_amount: SizeLevel::Min.amount_wei(),
         minimum_profit: 100,
         expected_profit: 500,
         deadline: now + ChronoDuration::minutes(2),

@@ -18,14 +18,12 @@ current_state="$deploy_dir/current-release.json"
 current_context="$deploy_dir/current-release-context.json"
 previous_file="$deploy_dir/previous-release"
 runtime_dir="${PHOENIX_DEPLOY_RUNTIME_DIR:-$deploy_dir/.deploy-runtime}"
-owner_authorization=/etc/phoenix/authorizations/executor-owner-bootstrap.json
 candidate_release_assets_file="$deploy_dir/candidate-release-assets.sha"
 release_assets_file="$deploy_dir/release-assets.sha"
 protected_services='nitro-feed-relay feed-ingestor nats postgres recorder'
-optional_services='prometheus rpc-gateway shadow-dispatcher phoenix-engine dashboard'
+optional_services='prometheus rpc-gateway shadow-dispatcher phoenix-engine dashboard economic-monitor economic-supervisor'
 service_wait_seconds=${PHOENIX_DEPLOY_SERVICE_WAIT_SECONDS:-300}
 engine_burn_in_seconds=${PHOENIX_ENGINE_BURN_IN_SECONDS:-120}
-post_live_stabilization_seconds=${PHOENIX_POST_LIVE_STABILIZATION_SECONDS:-60}
 release_state_updater=${PHOENIX_RELEASE_STATE_UPDATER:-}
 
 fail() {
@@ -48,17 +46,29 @@ mark_phase() {
   state_update phase "$1"
 }
 
-mark_owner_unpaused() {
-  transaction_hash=$1
-  [ -n "$release_state_updater" ] || return 0
-  if [ -n "$transaction_hash" ]; then
-    /usr/bin/python3 -I -B "$release_state_updater" \
-      "$release_sha" phase EXECUTOR_UNPAUSED \
-      --transaction-hash "$transaction_hash" >/dev/null ||
-      fail "durable owner transaction state update failed"
-  else
-    mark_phase EXECUTOR_UNPAUSED
-  fi
+verify_runtime_control_phase() {
+  expected_phase=$1
+  python3 -c '
+import json
+import sys
+
+expected_phase, expected_release = sys.argv[1:]
+status = json.load(sys.stdin)
+global_control = status["global"]
+route_control = status["route"]
+economic = status["economic"]
+valid = (
+    global_control["armed"] is False
+    and global_control["kill_switch"] is True
+    and global_control["execution_mode"] == "disarmed"
+    and route_control is not None
+    and route_control["enabled"] is False
+    and route_control["kill_switch"] is True
+    and economic["phase"] == expected_phase
+    and economic["release_sha"] == expected_release
+)
+raise SystemExit(0 if valid else 1)
+' "$expected_phase" "$release_sha"
 }
 
 case "$release_sha" in
@@ -98,12 +108,6 @@ case "$engine_burn_in_seconds" in
 esac
 [ "$engine_burn_in_seconds" -ge 120 ] && [ "$engine_burn_in_seconds" -le 900 ] ||
   fail "Engine burn-in seconds must be from 120 through 900"
-case "$post_live_stabilization_seconds" in
-  ''|*[!0-9]*) fail "post-LIVE stabilization seconds must be an integer" ;;
-esac
-[ "$post_live_stabilization_seconds" -ge 30 ] &&
-  [ "$post_live_stabilization_seconds" -le 300 ] ||
-  fail "post-LIVE stabilization seconds must be from 30 through 300"
 
 command -v python3 >/dev/null 2>&1 || fail "python3 is unavailable"
 command -v cmp >/dev/null 2>&1 || fail "cmp is unavailable"
@@ -143,18 +147,6 @@ assert_live_environment() {
 
 "$deploy_dir/validate-production-env.sh" "$env_file"
 reload_environment
-[ -n "${LIVE_EXECUTOR_SIGNER_FILE:-}" ] &&
-  [ -f "$LIVE_EXECUTOR_SIGNER_FILE" ] &&
-  [ ! -L "$LIVE_EXECUTOR_SIGNER_FILE" ] || {
-    echo EXTERNAL_SIGNER_FILE_REQUIRED
-    exit 1
-  }
-signer_metadata=$(stat -c '%u:%g:%a:%h' "$LIVE_EXECUTOR_SIGNER_FILE") ||
-  fail "signer file metadata is unavailable"
-case "$signer_metadata" in
-  65532:65532:400:1|65532:65532:440:1) ;;
-  *) fail "signer file ownership, mode, or link count is unsafe" ;;
-esac
 if [ -z "${PRODUCTION_RPC_URL:-}" ] || [ -z "${SECONDARY_RPC_URL:-}" ] ||
   [ -z "${LIVE_EXECUTOR_RPC_ALLOWLIST:-}" ]
 then
@@ -180,13 +172,6 @@ context_rendered="$state_dir/context.compose.json"
 context_metadata="$state_dir/context.metadata.json"
 protected_before="$state_dir/protected.before.tsv"
 protected_after="$state_dir/protected.after.tsv"
-owner_plan="$runtime_dir/owner-plan-$release_sha.json"
-owner_configure_evidence="$runtime_dir/owner-configure-$release_sha.json"
-owner_configured_preflight_evidence="$runtime_dir/owner-configured-preflight-$release_sha.json"
-owner_unpause_evidence="$runtime_dir/owner-unpause-$release_sha.json"
-owner_pause_evidence="$runtime_dir/owner-pause-$release_sha.json"
-consumed_owner_authorization=
-owner_unpause_attempted=0
 
 verify_active_release_coherence() {
   expected_sha=$1
@@ -396,36 +381,6 @@ run_live_engine_burn_in() {
   echo "LIVE_ENGINE_BURN_IN_OK: ${engine_burn_in_seconds}s"
 }
 
-run_post_live_stabilization() {
-  live_id=$(compose ps -a -q live-executor | awk 'NF { print; exit }')
-  engine_id=$(compose ps -a -q phoenix-engine | awk 'NF { print; exit }')
-  rpc_id=$(compose ps -a -q rpc-gateway | awk 'NF { print; exit }')
-  [ -n "$live_id" ] && [ -n "$engine_id" ] && [ -n "$rpc_id" ] || return 1
-  live_restarts=$(docker inspect --format '{{.RestartCount}}' "$live_id") || return 1
-  engine_restarts=$(docker inspect --format '{{.RestartCount}}' "$engine_id") || return 1
-  rpc_restarts=$(docker inspect --format '{{.RestartCount}}' "$rpc_id") || return 1
-  process_fatal_baseline=$(engine_process_fatal_integrity_total) || return 1
-  deadline=$(( $(date +%s) + post_live_stabilization_seconds ))
-  while [ "$(date +%s)" -lt "$deadline" ]; do
-    sleep 5
-    for identity in \
-      "$live_id:$live_restarts" \
-      "$engine_id:$engine_restarts" \
-      "$rpc_id:$rpc_restarts"
-    do
-      container_id=${identity%%:*}
-      restart_count=${identity##*:}
-      state=$(docker inspect --format \
-        '{{.State.Status}}|{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}|{{.RestartCount}}' \
-        "$container_id") || return 1
-      [ "$state" = "running|healthy|$restart_count" ] || return 1
-    done
-    [ "$(engine_process_fatal_integrity_total)" = "$process_fatal_baseline" ] ||
-      return 1
-  done
-  echo "POST_LIVE_STABILIZATION_OK: ${post_live_stabilization_seconds}s"
-}
-
 install_active_file() {
   source_file=$1
   target_file=$2
@@ -438,67 +393,6 @@ install_active_file() {
     rm -f "$active_tmp"
     return 1
   fi
-}
-
-validate_owner_authorization() {
-  [ -f "$owner_authorization" ] && [ ! -L "$owner_authorization" ] ||
-    fail "executor owner authorization is missing or unsafe"
-  authorization_size=$(stat -c '%s' "$owner_authorization") ||
-    fail "executor owner authorization size is unavailable"
-  [ "$authorization_size" -gt 0 ] && [ "$authorization_size" -le 2048 ] ||
-    fail "executor owner authorization size is invalid"
-  authorization_metadata=$(stat -c '%u:%g:%a:%h' "$owner_authorization") ||
-    fail "executor owner authorization metadata is unavailable"
-  [ "$authorization_metadata" = 0:0:600:1 ] ||
-    fail "executor owner authorization metadata is unsafe"
-  python3 -I -B - "$owner_authorization" "$release_sha" <<'PY' ||
-import json
-import sys
-from pathlib import Path
-
-path = Path(sys.argv[1])
-release_sha = sys.argv[2]
-try:
-    raw = path.read_bytes()
-    text = raw.decode("utf-8")
-    value = json.loads(text)
-except (OSError, UnicodeDecodeError, json.JSONDecodeError):
-    raise SystemExit(1)
-if not isinstance(value, dict):
-    raise SystemExit(1)
-if set(value) != {"schema", "release_sha", "chain_id", "acknowledgement"}:
-    raise SystemExit(1)
-if value != {
-    "schema": "phoenix.executor-owner-bootstrap-authorization.v1",
-    "release_sha": release_sha,
-    "chain_id": 42161,
-    "acknowledgement": "BOOTSTRAP_EXECUTOR_OWNER_42161",
-}:
-    raise SystemExit(1)
-PY
-    fail "executor owner authorization content is invalid"
-}
-
-consume_owner_authorization() {
-  authorization_device=$(stat -c '%d' "$owner_authorization") ||
-    fail "executor owner authorization filesystem is unavailable"
-  runtime_device=$(stat -c '%d' "$runtime_dir") ||
-    fail "deployment runtime filesystem is unavailable"
-  [ "$authorization_device" = "$runtime_device" ] ||
-    fail "executor owner authorization cannot be consumed atomically"
-  consumed_authorization_dir=$(mktemp -d \
-    "$runtime_dir/owner-authorization-consumed-$release_sha.XXXXXX") ||
-    fail "consumed executor owner authorization directory could not be created"
-  chmod 0700 "$consumed_authorization_dir"
-  consumed_owner_authorization="$consumed_authorization_dir/authorization.json"
-  mv -n "$owner_authorization" "$consumed_owner_authorization" ||
-    fail "executor owner authorization could not be consumed"
-  [ ! -e "$owner_authorization" ] && [ -f "$consumed_owner_authorization" ] ||
-    fail "executor owner authorization was not consumed exactly once"
-  consumed_metadata=$(stat -c '%u:%g:%a:%h' "$consumed_owner_authorization") ||
-    fail "consumed executor owner authorization metadata is unavailable"
-  [ "$consumed_metadata" = 0:0:600:1 ] ||
-    fail "consumed executor owner authorization metadata is unsafe"
 }
 
 verify_active_release_coherence "$rollback_sha" "" ||
@@ -552,29 +446,17 @@ rollback_on_failure() {
     state_update rollback ROLLBACK_STARTED >/dev/null 2>&1 || true
     repause_ok=1
     compose stop -t 30 live-executor >/dev/null 2>&1 || true
-    if [ "$owner_unpause_attempted" -eq 1 ]; then
-      if [ "$owner_unpaused" -eq 1 ]; then
-        echo "DEPLOY_FAILED: compensating applied owner-unpause"
-      else
-        echo "DEPLOY_FAILED: compensating attempted owner-unpause"
-      fi
-      set +e
-      pause_output=$(compose run --rm --no-deps \
-        -e PHOENIX_RELEASE_SHA="$release_sha" \
-        -e PHOENIX_EXECUTOR_OWNER_PAUSE_ACK=PAUSE_EXECUTOR_AFTER_FAILED_DEPLOY_42161 \
-        --entrypoint /usr/local/bin/autonomous-live-control \
-        live-executor owner-pause 2>&1)
-      pause_code=$?
-      set -e
-      printf '%s\n' "$pause_output"
-      if [ "$pause_code" -eq 0 ]; then
-        printf '%s\n' "$pause_output" >"$owner_pause_evidence"
-        chmod 0600 "$owner_pause_evidence"
-        echo "DEPLOY_COMPENSATION_OK: executor paused before rollback"
-      else
-        repause_ok=0
-        echo "DEPLOY_COMPENSATION_FAILED: executor re-pause failed"
-      fi
+    set +e
+    disarm_output=$(compose run --rm --no-deps \
+      -e PHOENIX_AUTONOMOUS_DISARM_ACK=DISARM_AUTONOMOUS_LIVE_42161 \
+      -e PHOENIX_AUTONOMOUS_DISARM_REASON=deployment_rollback \
+      autonomous-control disarm 2>&1)
+    disarm_code=$?
+    set -e
+    printf '%s\n' "$disarm_output"
+    if [ "$disarm_code" -ne 0 ]; then
+      repause_ok=0
+      echo "DEPLOY_COMPENSATION_FAILED: disarmed-failure state was not proven"
     fi
     echo "DEPLOY_FAILED: invoking rollback"
     set +e
@@ -615,77 +497,9 @@ rollback_on_failure() {
   exit "$code"
 }
 mutation_started=0
-owner_unpaused=0
 trap rollback_on_failure EXIT
 
 compose pull
-set +e
-preflight_output=$(compose run --rm --no-deps \
-  --entrypoint /usr/local/bin/autonomous-live-control \
-  live-executor preflight 2>&1)
-preflight_code=$?
-set -e
-printf '%s\n' "$preflight_output"
-if [ "$preflight_code" -ne 0 ]; then
-  case "$preflight_output" in
-    *"wallet has no native gas balance"*)
-      echo EXTERNAL_GAS_FUNDING_REQUIRED
-      exit 1
-      ;;
-    *"executor configuration is not LIVE-ready"*)
-      set +e
-      owner_configured_preflight_output=$(compose run --rm --no-deps \
-        -e PHOENIX_RELEASE_SHA="$release_sha" \
-        --entrypoint /usr/local/bin/autonomous-live-control \
-        live-executor owner-configured-preflight 2>&1)
-      owner_configured_preflight_code=$?
-      set -e
-      printf '%s\n' "$owner_configured_preflight_output"
-      if [ "$owner_configured_preflight_code" -ne 0 ]; then
-        compose run --rm --no-deps \
-          -e PHOENIX_RELEASE_SHA="$release_sha" \
-          --entrypoint /usr/local/bin/autonomous-live-control \
-          live-executor owner-plan >"$owner_plan" ||
-          fail "executor owner plan could not be materialized"
-        chmod 0640 "$owner_plan"
-        cat "$owner_plan"
-        if [ ! -e "$owner_authorization" ]; then
-          echo "EXTERNAL_OWNER_AUTHORIZATION_REQUIRED: $owner_plan"
-          exit 1
-        fi
-        validate_owner_authorization
-        consume_owner_authorization
-        set +e
-        owner_configure_output=$(compose run --rm --no-deps \
-          -e PHOENIX_RELEASE_SHA="$release_sha" \
-          -e PHOENIX_EXECUTOR_OWNER_BOOTSTRAP_ACK=BOOTSTRAP_EXECUTOR_OWNER_42161 \
-          --entrypoint /usr/local/bin/autonomous-live-control \
-          live-executor owner-configure 2>&1)
-        owner_configure_code=$?
-        set -e
-        printf '%s\n' "$owner_configure_output"
-        [ "$owner_configure_code" -eq 0 ] ||
-          fail "executor owner configuration failed"
-        printf '%s\n' "$owner_configure_output" >"$owner_configure_evidence"
-        chmod 0600 "$owner_configure_evidence"
-        set +e
-        owner_configured_preflight_output=$(compose run --rm --no-deps \
-          -e PHOENIX_RELEASE_SHA="$release_sha" \
-          --entrypoint /usr/local/bin/autonomous-live-control \
-          live-executor owner-configured-preflight 2>&1)
-        owner_configured_preflight_code=$?
-        set -e
-        printf '%s\n' "$owner_configured_preflight_output"
-        [ "$owner_configured_preflight_code" -eq 0 ] ||
-          fail "configured executor preflight failed"
-      fi
-      printf '%s\n' "$owner_configured_preflight_output" \
-        >"$owner_configured_preflight_evidence"
-      chmod 0600 "$owner_configured_preflight_evidence"
-      ;;
-    *) fail "read-only autonomous preflight failed" ;;
-  esac
-fi
 state_update mutation mutation_started
 mutation_started=1
 if [ -s "$current_file" ]; then
@@ -708,12 +522,15 @@ assert_live_environment
 validate_live_rpc_rendering ||
   fail "rendered LIVE RPC provider and priority configuration is invalid"
 compose stop -t 30 live-executor >/dev/null 2>&1 || true
-compose run --rm --no-deps \
-  --entrypoint /usr/local/bin/autonomous-live-control \
-  live-executor migrate
+compose run --rm --no-deps autonomous-control migrate
 compose run --rm --no-deps migration-runner
 mark_phase MIGRATIONS_APPLIED
-mark_phase LIVE_MODE_INSTALLED
+mark_phase EVIDENCE_MODE_INSTALLED
+compose run --rm --no-deps \
+  -e PHOENIX_RELEASE_SHA="$release_sha" \
+  -e PHOENIX_DISARMED_DEPLOY_ACK=INSTALL_DISARMED_EVIDENCE_RELEASE_42161 \
+  autonomous-control disarmed-deploy
+mark_phase DISARMED_CONTROL_INSTALLED
 for service in $optional_services; do
   case "$service" in
     rpc-gateway|phoenix-engine) continue ;;
@@ -730,49 +547,11 @@ wait_service_healthy phoenix-engine ||
   fail "phoenix-engine did not become healthy before Engine burn-in"
 mark_phase ENGINE_HEALTHY
 run_live_engine_burn_in ||
-  fail "autonomous LIVE Engine burn-in failed"
+  fail "disarmed evidence Engine burn-in failed"
 mark_phase ENGINE_BURN_IN_PASSED
-compose run --rm --no-deps \
-  -e PHOENIX_AUTONOMOUS_ACTIVATION_ACK=ACTIVATE_AUTONOMOUS_LIVE_42161 \
-  --entrypoint /usr/local/bin/autonomous-live-control \
-  live-executor activate
-mark_phase AUTONOMOUS_ACTIVATED
-owner_unpause_attempted=1
-mark_phase EXECUTOR_UNPAUSE_STARTED
-set +e
-owner_unpause_output=$(compose run --rm --no-deps \
-  -e PHOENIX_RELEASE_SHA="$release_sha" \
-  -e PHOENIX_EXECUTOR_OWNER_UNPAUSE_ACK=UNPAUSE_CONFIGURED_EXECUTOR_42161 \
-  --entrypoint /usr/local/bin/autonomous-live-control \
-  live-executor owner-unpause 2>&1)
-owner_unpause_code=$?
-set -e
-printf '%s\n' "$owner_unpause_output"
-if printf '%s\n' "$owner_unpause_output" |
-  grep -F '"status": "applied"' >/dev/null
-then
-  owner_unpaused=1
-fi
-[ "$owner_unpause_code" -eq 0 ] || fail "executor owner unpause failed"
-owner_unpause_transaction_hash=$(
-  printf '%s\n' "$owner_unpause_output" |
-    sed -n 's/.*"transaction_hash":[[:space:]]*"\(0x[0-9a-f]\{64\}\)".*/\1/p' |
-    tail -n 1
-)
-mark_owner_unpaused "$owner_unpause_transaction_hash"
-printf '%s\n' "$owner_unpause_output" >"$owner_unpause_evidence"
-chmod 0600 "$owner_unpause_evidence"
-compose run --rm --no-deps \
-  --entrypoint /usr/local/bin/autonomous-live-control \
-  live-executor preflight
-compose up -d --no-deps live-executor
-wait_service_healthy live-executor ||
-  fail "autonomous LIVE executor did not become healthy"
-mark_phase LIVE_EXECUTOR_STARTED
-mark_phase POST_LIVE_VERIFYING
-compose run --rm --no-deps \
-  --entrypoint /usr/local/bin/autonomous-live-control \
-  live-executor status
+mark_phase POST_DISARMED_VERIFYING
+[ -z "$(compose ps -q live-executor | awk 'NF { print; exit }')" ] ||
+  fail "live-executor started during disarmed deployment"
 capture_protected_ids "$protected_after" || fail "protected services are not ready after deployment"
 cmp "$protected_before" "$protected_after" >/dev/null || fail "protected service identity changed during deployment"
 reload_environment
@@ -781,11 +560,27 @@ assert_live_environment
   unset PHOENIX_MODE LIVE_EXECUTION AUTONOMOUS_EXECUTION
   PHOENIX_ENV_FILE="$env_file" \
   PHOENIX_RELEASE_ENV="$release_env" \
-  PHOENIX_HEALTH_EXPECTED_MODE=LIVE \
+  PHOENIX_HEALTH_EXPECTED_MODE=DISARMED_EVIDENCE \
     "$deploy_dir/production-healthcheck.sh"
 )
-run_post_live_stabilization ||
-  fail "post-LIVE stabilization failed"
+mark_phase POST_DISARMED_VERIFIED
+control_status=$(compose run --rm --no-deps autonomous-control status)
+printf '%s\n' "$control_status" |
+  verify_runtime_control_phase DISARMED_DEPLOY ||
+  fail "runtime controls are not fail-closed before evidence-start"
+[ -z "$(compose ps -q live-executor | awk 'NF { print; exit }')" ] ||
+  fail "live-executor started before evidence-start"
+compose run --rm --no-deps \
+  -e PHOENIX_RELEASE_SHA="$release_sha" \
+  -e PHOENIX_EVIDENCE_START_ACK=START_DISARMED_EVIDENCE_42161 \
+  autonomous-control evidence-start
+evidence_status=$(compose run --rm --no-deps autonomous-control status)
+printf '%s\n' "$evidence_status" |
+  verify_runtime_control_phase DISARMED_EVIDENCE ||
+  fail "runtime did not enter fail-closed DISARMED_EVIDENCE"
+[ -z "$(compose ps -q live-executor | awk 'NF { print; exit }')" ] ||
+  fail "live-executor started during evidence-start"
+mark_phase DISARMED_EVIDENCE_STARTED
 
 printf '%s\n' "$release_sha" >"$pointer_candidate"
 printf '%s\n' "$release_sha" >"$assets_pointer_candidate"

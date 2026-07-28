@@ -13,11 +13,16 @@ from scripts import release_assets
 RELEASE_SHA = "1" * 40
 LIVE_CANARY_ASSETS = (
     "compose.live-canary.yml",
+    "docs/AUTOMATED_ECONOMIC_CONTROL.md",
     "live-executor/schema/001_live_canary.sql",
     "live-executor/schema/002_approval_evidence.sql",
     "live-executor/schema/003_autonomous_hunter_contracts.sql",
     "live-executor/schema/004_autonomous_live_runtime.sql",
+    "live-executor/schema/005_closed_loop_economic_control.sql",
     "compose.live-autonomous.yml",
+    "scripts/activate-economic-canary.sh",
+    "scripts/economic-dashboard-loop.sh",
+    "scripts/sql/economic-dashboard-snapshot.sql",
 )
 
 
@@ -130,13 +135,19 @@ class ReleaseAssetsTests(unittest.TestCase):
                 for relative in LIVE_CANARY_ASSETS:
                     source_bytes = (self.repo_root / relative).read_bytes()
                     entry = entries[relative]
-                    self.assertEqual(entry["mode"], "0644")
+                    expected_mode = (
+                        "0755"
+                        if relative.startswith("scripts/")
+                        and relative.endswith(".sh")
+                        else "0644"
+                    )
+                    self.assertEqual(entry["mode"], expected_mode)
                     self.assertEqual(entry["size_bytes"], len(source_bytes))
                     self.assertEqual(entry["sha256"], release_assets._sha256(source_bytes))
                     archive_path = f"{root_name}/{relative}"
                     member = members[archive_path]
                     self.assertTrue(member.isfile())
-                    self.assertEqual(member.mode, 0o644)
+                    self.assertEqual(member.mode, int(expected_mode, 8))
                     extracted = bundle.extractfile(member)
                     self.assertIsNotNone(extracted)
                     self.assertEqual(extracted.read(), source_bytes)

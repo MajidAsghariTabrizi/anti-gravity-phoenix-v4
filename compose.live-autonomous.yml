@@ -19,6 +19,110 @@ services:
       LIVE_EXECUTOR_EXPECTED_FLASH_PROVIDER: ${LIVE_EXECUTOR_EXPECTED_FLASH_PROVIDER:?LIVE_EXECUTOR_EXPECTED_FLASH_PROVIDER is required}
       LIVE_EXECUTOR_MAX_INPUT_AMOUNT: ${LIVE_EXECUTOR_MAX_INPUT_AMOUNT:?LIVE_EXECUTOR_MAX_INPUT_AMOUNT is required}
 
+  autonomous-control:
+    profiles: ["live-autonomous"]
+    image: ${LIVE_EXECUTOR_IMAGE:?LIVE_EXECUTOR_IMAGE is required}
+    build:
+      context: .
+      dockerfile: deploy/rust.Dockerfile
+      args:
+        CRATE: live-executor
+    entrypoint: ["/usr/local/bin/autonomous-live-control"]
+    environment:
+      POSTGRES_DSN: ${POSTGRES_DSN:?POSTGRES_DSN is required}
+      PHOENIX_ENGINE_IMAGE: ${PHOENIX_ENGINE_IMAGE:?PHOENIX_ENGINE_IMAGE is required}
+      PRODUCTION_RPC_URL: ${PRODUCTION_RPC_URL:?PRODUCTION_RPC_URL is required}
+      SECONDARY_RPC_URL: ${SECONDARY_RPC_URL:?SECONDARY_RPC_URL is required}
+      ENGINE_ROUTER_ADDRESSES: ${ENGINE_ROUTER_ADDRESSES:?ENGINE_ROUTER_ADDRESSES is required}
+      WALLET_ADDRESS: ${LIVE_EXECUTOR_WALLET_ADDRESS:?LIVE_EXECUTOR_WALLET_ADDRESS is required}
+      EXECUTOR_ADDRESS: ${LIVE_EXECUTOR_EXECUTOR_ADDRESS:?LIVE_EXECUTOR_EXECUTOR_ADDRESS is required}
+      LIVE_EXECUTOR_EXECUTOR_CODE_HASH: ${LIVE_EXECUTOR_EXECUTOR_CODE_HASH:?LIVE_EXECUTOR_EXECUTOR_CODE_HASH is required}
+      LIVE_EXECUTOR_EXPECTED_OWNER: ${LIVE_EXECUTOR_EXPECTED_OWNER:?LIVE_EXECUTOR_EXPECTED_OWNER is required}
+      LIVE_EXECUTOR_EXPECTED_FLASH_PROVIDER: ${LIVE_EXECUTOR_EXPECTED_FLASH_PROVIDER:?LIVE_EXECUTOR_EXPECTED_FLASH_PROVIDER is required}
+      LIVE_EXECUTOR_RPC_ALLOWLIST: ${LIVE_EXECUTOR_RPC_ALLOWLIST:?LIVE_EXECUTOR_RPC_ALLOWLIST is required}
+      LIVE_EXECUTOR_MAX_INPUT_AMOUNT: ${LIVE_EXECUTOR_MAX_INPUT_AMOUNT:?LIVE_EXECUTOR_MAX_INPUT_AMOUNT is required}
+      LIVE_EXECUTOR_MAX_DAILY_LOSS_WEI: ${LIVE_EXECUTOR_MAX_DAILY_LOSS_WEI:?LIVE_EXECUTOR_MAX_DAILY_LOSS_WEI is required}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks: [phoenix-internal]
+    init: true
+    user: "65532:65532"
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1777,noexec,nosuid,nodev
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    restart: "no"
+
+  economic-monitor:
+    profiles: ["live-autonomous"]
+    image: postgres@sha256:57c72fd2a128e416c7fcc499958864df5301e940bca0a56f58fddf30ffc07777
+    entrypoint: ["/bin/sh", "/opt/phoenix/economic-dashboard-loop.sh"]
+    environment:
+      POSTGRES_DSN: ${POSTGRES_DSN:?POSTGRES_DSN is required}
+      PHOENIX_ECONOMIC_DASHBOARD_INTERVAL_SECONDS: "45"
+      PHOENIX_ECONOMIC_DASHBOARD_SQL: /opt/phoenix/economic-dashboard-snapshot.sql
+      PHOENIX_ECONOMIC_DASHBOARD_OUTPUT: /evidence/latest-dashboard.json
+    volumes:
+      - /opt/phoenix/deploy/economic-dashboard-loop.sh:/opt/phoenix/economic-dashboard-loop.sh:ro
+      - /opt/phoenix/deploy/sql/economic-dashboard-snapshot.sql:/opt/phoenix/economic-dashboard-snapshot.sql:ro
+      - /opt/phoenix/evidence/dashboard:/evidence
+    depends_on:
+      postgres:
+        condition: service_healthy
+      migration-runner:
+        condition: service_completed_successfully
+    networks: [phoenix-internal]
+    user: "0:0"
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1777,noexec,nosuid,nodev
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "test -s /evidence/latest-dashboard.json"]
+      interval: 45s
+      timeout: 3s
+      retries: 3
+
+  economic-supervisor:
+    profiles: ["live-autonomous"]
+    image: ${LIVE_EXECUTOR_IMAGE:?LIVE_EXECUTOR_IMAGE is required}
+    entrypoint: ["/usr/local/bin/autonomous-live-control"]
+    command: ["supervise-economic-control"]
+    environment:
+      POSTGRES_DSN: ${POSTGRES_DSN:?POSTGRES_DSN is required}
+      PRODUCTION_RPC_URL: ${PRODUCTION_RPC_URL:?PRODUCTION_RPC_URL is required}
+      LIVE_EXECUTOR_RPC_ALLOWLIST: ${LIVE_EXECUTOR_RPC_ALLOWLIST:?LIVE_EXECUTOR_RPC_ALLOWLIST is required}
+      WALLET_ADDRESS: ${LIVE_EXECUTOR_WALLET_ADDRESS:?LIVE_EXECUTOR_WALLET_ADDRESS is required}
+      PHOENIX_ECONOMIC_SUPERVISOR_INTERVAL_SECONDS: "45"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rpc-gateway:
+        condition: service_healthy
+      migration-runner:
+        condition: service_completed_successfully
+    networks: [phoenix-internal]
+    init: true
+    user: "65532:65532"
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1777,noexec,nosuid,nodev
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "kill -0 1"]
+      interval: 15s
+      timeout: 3s
+      retries: 5
+
   live-executor:
     profiles: ["live-autonomous"]
     image: ${LIVE_EXECUTOR_IMAGE:?LIVE_EXECUTOR_IMAGE is required}

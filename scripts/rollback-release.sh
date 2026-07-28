@@ -75,19 +75,20 @@ current_live_compose() {
 
 if [ -f "$overlay_file" ] && [ -s "$live_release_env" ]; then
   live_executor_id=$(current_live_compose ps -a -q live-executor | awk 'NF { print; exit }')
+  current_live_compose config --services |
+    grep -F -x autonomous-control >/dev/null ||
+    fail "signerless autonomous control service is unavailable"
+  current_live_compose run --rm --no-deps \
+    -e PHOENIX_AUTONOMOUS_DISARM_ACK=DISARM_AUTONOMOUS_LIVE_42161 \
+    -e PHOENIX_AUTONOMOUS_DISARM_REASON=operator_rollback \
+    autonomous-control disarm ||
+    fail "autonomous controls could not enter DISARMED_FAILURE"
   if [ -n "$live_executor_id" ]; then
-    current_live_compose run --rm --no-deps \
-      -e PHOENIX_AUTONOMOUS_DISARM_ACK=DISARM_AUTONOMOUS_LIVE_42161 \
-      -e PHOENIX_AUTONOMOUS_DISARM_REASON=operator_rollback \
-      --entrypoint /usr/local/bin/autonomous-live-control \
-      live-executor disarm ||
-      fail "autonomous LIVE controls could not be disarmed"
     reconciliation_deadline=$(( $(date +%s) + reconciliation_seconds ))
     reconciled=0
     while [ "$(date +%s)" -lt "$reconciliation_deadline" ]; do
       if current_live_compose run --rm --no-deps \
-        --entrypoint /usr/local/bin/autonomous-live-control \
-        live-executor reconciliation-status >/dev/null 2>&1
+        autonomous-control reconciliation-status >/dev/null 2>&1
       then
         reconciled=1
         break
@@ -100,6 +101,8 @@ if [ -f "$overlay_file" ] && [ -s "$live_release_env" ]; then
     current_live_compose stop -t 30 live-executor ||
       fail "autonomous LIVE executor could not be stopped"
   fi
+  current_live_compose stop -t 30 economic-monitor >/dev/null 2>&1 || true
+  current_live_compose stop -t 30 economic-supervisor >/dev/null 2>&1 || true
 fi
 python3 "$deploy_dir/production_mode.py" shadow --env-file "$env_file" ||
   fail "SHADOW production mode could not be restored"

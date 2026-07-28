@@ -1,10 +1,12 @@
+use crate::autonomous::set_hash;
 use crate::config::ExecutorConfig;
+use crate::economic_control::{SizeLevel, COOLDOWN_SECONDS};
 use crate::model::{
     ActiveAttempt, AttemptStatus, ExecutionLeg, ExecutionRequest, RawExecutionRequest,
     ReceiptOutcome, TransactionHash,
 };
 use async_trait::async_trait;
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, SecondsFormat, Utc};
 use serde_json::{json, Value};
 use sqlx::postgres::PgPoolOptions;
 use sqlx::types::Json;
@@ -12,7 +14,7 @@ use sqlx::{PgPool, Postgres, Row, Transaction};
 use thiserror::Error;
 use uuid::Uuid;
 
-const SCHEMA_VERSION: &str = "phoenix.live-canary-schema.v4";
+const SCHEMA_VERSION: &str = "phoenix.live-canary-schema.v5";
 const ACTIVE_STATUSES: &str =
     "'claimed', 'nonce_allocated', 'submission_unknown', 'pending', 'timed_out'";
 
@@ -117,12 +119,13 @@ impl ExecutorStore for PostgresExecutorStore {
         let controls: i64 = sqlx::query_scalar(
             "SELECT
                 (SELECT count(*) FROM live_canary.control WHERE singleton)
-                + (SELECT count(*) FROM live_canary.autonomous_global_control WHERE singleton)",
+                + (SELECT count(*) FROM live_canary.autonomous_global_control WHERE singleton)
+                + (SELECT count(*) FROM live_canary.economic_control WHERE singleton)",
         )
         .fetch_one(&self.pool)
         .await
         .map_err(StoreError::from)?;
-        if controls != 2 {
+        if controls != 3 {
             return Err(StoreError::Schema);
         }
         Ok(())
@@ -130,11 +133,14 @@ impl ExecutorStore for PostgresExecutorStore {
 
     async fn control_state(&self) -> Result<ControlState, StoreError> {
         let row = sqlx::query(
-            "SELECT c.armed AND a.armed AND a.execution_mode = 'live' AS armed,
-                    c.kill_switch OR a.kill_switch AS kill_switch
+            "SELECT c.armed AND a.armed AND a.execution_mode = 'live'
+                    AND e.phase LIKE 'LIVE_%' AS armed,
+                    c.kill_switch OR a.kill_switch
+                    OR e.phase NOT LIKE 'LIVE_%' AS kill_switch
              FROM live_canary.control c
              CROSS JOIN live_canary.autonomous_global_control a
-             WHERE c.singleton AND a.singleton",
+             CROSS JOIN live_canary.economic_control e
+             WHERE c.singleton AND a.singleton AND e.singleton",
         )
         .fetch_one(&self.pool)
         .await
@@ -168,18 +174,25 @@ impl ExecutorStore for PostgresExecutorStore {
     ) -> Result<Option<ExecutionRequest>, StoreError> {
         let mut transaction = self.pool.begin().await.map_err(StoreError::from)?;
         let control = sqlx::query(
-            "SELECT c.armed AND a.armed AND a.execution_mode = 'live' AS armed,
-                    c.kill_switch OR a.kill_switch AS kill_switch
+            "SELECT c.armed AND a.armed AND a.execution_mode = 'live'
+                    AND e.phase LIKE 'LIVE_%' AS armed,
+                    c.kill_switch OR a.kill_switch
+                    OR e.phase NOT LIKE 'LIVE_%' AS kill_switch,
+                    e.current_input_wei::text AS current_input_wei
              FROM live_canary.control c
              CROSS JOIN live_canary.autonomous_global_control a
-             WHERE c.singleton AND a.singleton
-             FOR UPDATE OF c, a",
+             CROSS JOIN live_canary.economic_control e
+             WHERE c.singleton AND a.singleton AND e.singleton
+             FOR UPDATE OF c, a, e",
         )
         .fetch_one(&mut *transaction)
         .await
         .map_err(StoreError::from)?;
         let armed: bool = control.try_get("armed").map_err(StoreError::from)?;
         let kill_switch: bool = control.try_get("kill_switch").map_err(StoreError::from)?;
+        let current_input_wei: String = control
+            .try_get("current_input_wei")
+            .map_err(StoreError::from)?;
         if !armed || kill_switch {
             transaction.commit().await.map_err(StoreError::from)?;
             return Ok(None);
@@ -206,6 +219,7 @@ impl ExecutorStore for PostgresExecutorStore {
                  AND r.approval_digest IS NOT NULL
                  AND r.deadline > $1
                  AND r.approval_deadline > $1
+                 AND r.selected_size = $3::numeric
              ORDER BY r.approved_at, r.id
              FOR UPDATE OF r SKIP LOCKED
              LIMIT 1",
@@ -213,6 +227,7 @@ impl ExecutorStore for PostgresExecutorStore {
         ))
         .bind(now)
         .bind(crate::REQUEST_SCHEMA_VERSION)
+        .bind(&current_input_wei)
         .fetch_optional(&mut *transaction)
         .await
         .map_err(StoreError::from)?;
@@ -763,6 +778,24 @@ impl ExecutorStore for PostgresExecutorStore {
             return Err(StoreError::Invariant);
         }
         let mut transaction = self.pool.begin().await.map_err(StoreError::from)?;
+        let economic = sqlx::query(
+            "SELECT phase, current_size_level, release_sha, control_epoch
+             FROM live_canary.economic_control
+             WHERE singleton
+             FOR UPDATE",
+        )
+        .fetch_one(&mut *transaction)
+        .await
+        .map_err(StoreError::from)?;
+        let previous_phase: String = economic.try_get("phase").map_err(StoreError::from)?;
+        let previous_level: String = economic
+            .try_get("current_size_level")
+            .map_err(StoreError::from)?;
+        let release_sha: Option<String> =
+            economic.try_get("release_sha").map_err(StoreError::from)?;
+        let previous_epoch: i64 = economic
+            .try_get("control_epoch")
+            .map_err(StoreError::from)?;
         let updated = sqlx::query(
             "UPDATE live_canary.control
              SET armed = false, kill_switch = true, disarm_reason = $1, updated_at = now()
@@ -790,6 +823,29 @@ impl ExecutorStore for PostgresExecutorStore {
             return Err(StoreError::Invariant);
         }
         sqlx::query(
+            "UPDATE live_canary.autonomous_route_controls
+             SET enabled = false, kill_switch = true, disarm_reason = $1,
+                 cooldown_until = NULL, control_hash = NULL,
+                 control_contract = NULL, control_epoch = control_epoch + 1,
+                 updated_at = now()",
+        )
+        .bind(reason)
+        .execute(&mut *transaction)
+        .await
+        .map_err(StoreError::from)?;
+        sqlx::query(
+            "UPDATE live_canary.economic_control
+             SET phase = 'DISARMED_FAILURE', cooldown_until = NULL,
+                 control_epoch = $2,
+                 last_transition_reason = $1, updated_at = now()
+             WHERE singleton",
+        )
+        .bind(reason)
+        .bind(previous_epoch + 1)
+        .execute(&mut *transaction)
+        .await
+        .map_err(StoreError::from)?;
+        sqlx::query(
             "UPDATE live_canary.autonomous_candidates
              SET status = 'disarmed', updated_at = now()
              WHERE status IN ('materialized', 'approval_pending', 'approved', 'request_materialized',
@@ -798,8 +854,88 @@ impl ExecutorStore for PostgresExecutorStore {
         .execute(&mut *transaction)
         .await
         .map_err(StoreError::from)?;
+        insert_runtime_transition(
+            &mut transaction,
+            &previous_phase,
+            &previous_level,
+            "DISARMED_FAILURE",
+            &previous_level,
+            reason,
+            release_sha.as_deref(),
+            previous_epoch + 1,
+            Utc::now(),
+        )
+        .await?;
         transaction.commit().await.map_err(StoreError::from)
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn insert_runtime_transition(
+    transaction: &mut Transaction<'_, Postgres>,
+    from_phase: &str,
+    from_level: &str,
+    to_phase: &str,
+    to_level: &str,
+    reason: &str,
+    release_sha: Option<&str>,
+    control_epoch: i64,
+    transitioned_at: DateTime<Utc>,
+) -> Result<(), StoreError> {
+    if reason.is_empty() || reason.len() > 128 || control_epoch < 0 {
+        return Err(StoreError::Invariant);
+    }
+    let transition_id = Uuid::new_v4();
+    let transitioned_at = transitioned_at.to_rfc3339_opts(SecondsFormat::Secs, true);
+    let mut contract = json!({
+        "schema_version": "phoenix.economic-transition.v1",
+        "transition_id": transition_id,
+        "from_phase": from_phase,
+        "to_phase": to_phase,
+        "from_size_level": from_level,
+        "to_size_level": to_level,
+        "reason": reason,
+        "evidence_hash": Value::Null,
+        "release_sha": release_sha,
+        "control_epoch": control_epoch,
+        "transitioned_at": transitioned_at,
+        "transition_hash": "0".repeat(64)
+    });
+    set_hash(
+        &mut contract,
+        "transition_hash",
+        "economic-transition",
+        "phoenix.economic-transition.v1",
+    )
+    .map_err(|_| StoreError::Invariant)?;
+    let transition_hash = contract
+        .get("transition_hash")
+        .and_then(Value::as_str)
+        .ok_or(StoreError::Invariant)?;
+    sqlx::query(
+        "INSERT INTO live_canary.economic_transitions(
+            transition_id, schema_version, from_phase, to_phase,
+            from_size_level, to_size_level, reason, evidence_hash,
+            release_sha, control_epoch, transition_hash, transitioned_at
+         ) VALUES (
+            $1, 'phoenix.economic-transition.v1', $2, $3, $4, $5, $6,
+            NULL, $7, $8, $9, $10::timestamptz
+         )",
+    )
+    .bind(transition_id)
+    .bind(from_phase)
+    .bind(to_phase)
+    .bind(from_level)
+    .bind(to_level)
+    .bind(reason)
+    .bind(release_sha)
+    .bind(control_epoch)
+    .bind(transition_hash)
+    .bind(&transitioned_at)
+    .execute(&mut **transaction)
+    .await
+    .map_err(StoreError::from)?;
+    Ok(())
 }
 
 async fn update_request_status(
@@ -841,7 +977,8 @@ async fn insert_autonomous_outcome(
                 c.route_universe_hash, c.route_policy_hash,
                 c.risk_snapshot_hash, c.submission_quote_hash,
                 c.candidate_hash, c.state_hash, c.plan_hash, c.calldata_hash,
-                c.executor_code_hash,
+                c.executor_code_hash, c.selected_size::text AS selected_size,
+                c.candidate_created_at,
                 c.predicted_gross_profit::text AS predicted_gross_profit,
                 (
                     c.predicted_gross_profit
@@ -862,6 +999,19 @@ async fn insert_autonomous_outcome(
     let Some(row) = row else {
         return Ok(());
     };
+    let plan_hash: String = row.try_get("plan_hash").map_err(StoreError::from)?;
+    let fork_simulated_net_pnl: Option<String> = sqlx::query_scalar(
+        "SELECT simulated_net_pnl::text
+         FROM public.fork_simulation_results
+         WHERE plan_hash = $1
+           AND status = 'passed'
+         ORDER BY simulated_at DESC, result_hash
+         LIMIT 1",
+    )
+    .bind(&plan_hash)
+    .fetch_optional(&mut **transaction)
+    .await
+    .map_err(StoreError::from)?;
     let nonce = nonce
         .ok_or(StoreError::Invariant)?
         .parse::<u64>()
@@ -879,6 +1029,26 @@ async fn insert_autonomous_outcome(
     let conservative = conservative_predicted_net_pnl
         .parse::<i128>()
         .map_err(|_| StoreError::Data)?;
+    let selected_size = row
+        .try_get::<String, _>("selected_size")
+        .map_err(StoreError::from)?
+        .parse::<u128>()
+        .map_err(|_| StoreError::Data)?;
+    let input_size_level = [
+        SizeLevel::Min,
+        SizeLevel::L1,
+        SizeLevel::L2,
+        SizeLevel::L3,
+        SizeLevel::L4,
+        SizeLevel::L5,
+        SizeLevel::MaxReviewed,
+    ]
+    .into_iter()
+    .find(|level| level.amount_wei() == selected_size)
+    .ok_or(StoreError::Data)?;
+    let candidate_created_at: DateTime<Utc> = row
+        .try_get("candidate_created_at")
+        .map_err(StoreError::from)?;
     let realized_gross_profit =
         i128::try_from(outcome.settlement.realized_profit).map_err(|_| StoreError::Data)?;
     let actual_l1_cost = outcome.actual_l1_cost_wei.min(outcome.actual_fee_wei);
@@ -890,6 +1060,20 @@ async fn insert_autonomous_outcome(
         .net_pnl_wei
         .checked_sub(conservative)
         .ok_or(StoreError::Data)?;
+    let actual_output = outcome
+        .settlement
+        .flash_amount
+        .checked_add(outcome.settlement.premium)
+        .and_then(|value| value.checked_add(outcome.settlement.realized_profit))
+        .ok_or(StoreError::Data)?;
+    let detection_to_submission_latency_ms = submitted_at
+        .signed_duration_since(candidate_created_at)
+        .num_milliseconds()
+        .max(0);
+    let receipt_latency_ms = terminal_at
+        .signed_duration_since(submitted_at)
+        .num_milliseconds()
+        .max(0);
     let outcome_class = match status {
         AttemptStatus::Confirmed if outcome.net_pnl_wei > 0 => "confirmed_profitable",
         AttemptStatus::Confirmed => "confirmed_negative",
@@ -914,7 +1098,6 @@ async fn insert_autonomous_outcome(
         .map_err(StoreError::from)?;
     let candidate_hash: String = row.try_get("candidate_hash").map_err(StoreError::from)?;
     let state_hash: String = row.try_get("state_hash").map_err(StoreError::from)?;
-    let plan_hash: String = row.try_get("plan_hash").map_err(StoreError::from)?;
     let calldata_hash: String = row.try_get("calldata_hash").map_err(StoreError::from)?;
     let executor_code_hash: String = row
         .try_get("executor_code_hash")
@@ -964,6 +1147,37 @@ async fn insert_autonomous_outcome(
         "attributed_at": terminal_at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
         "outcome_hash": "0".repeat(64)
     });
+    let contract_fields = contract.as_object_mut().ok_or(StoreError::Data)?;
+    contract_fields.insert(
+        "input_size_level".to_string(),
+        Value::String(input_size_level.as_str().to_string()),
+    );
+    contract_fields.insert(
+        "actual_output".to_string(),
+        Value::String(actual_output.to_string()),
+    );
+    contract_fields.insert(
+        "actual_balance_delta".to_string(),
+        Value::String(realized_gross_profit.to_string()),
+    );
+    contract_fields.insert(
+        "predicted_net_pnl".to_string(),
+        Value::String(conservative_predicted_net_pnl.clone()),
+    );
+    contract_fields.insert(
+        "fork_simulated_net_pnl".to_string(),
+        fork_simulated_net_pnl
+            .as_ref()
+            .map_or(Value::Null, |value| Value::String(value.clone())),
+    );
+    contract_fields.insert(
+        "detection_to_submission_latency_ms".to_string(),
+        Value::from(detection_to_submission_latency_ms),
+    );
+    contract_fields.insert(
+        "receipt_latency_ms".to_string(),
+        Value::from(receipt_latency_ms),
+    );
     crate::autonomous::set_hash(
         &mut contract,
         "outcome_hash",
@@ -985,13 +1199,18 @@ async fn insert_autonomous_outcome(
             realized_business_net_pnl, terminal_at, attributed_at,
             outcome_hash, outcome_contract, nonce, submission_channel,
             submitted_at, gas_used, effective_gas_price, actual_l1_cost,
-            actual_flash_premium, prediction_error, failure_reason
+            actual_flash_premium, prediction_error, failure_reason,
+            input_size_level, actual_output, actual_balance_delta,
+            fork_simulated_net_pnl, predicted_net_pnl,
+            detection_to_submission_latency_ms, receipt_latency_ms
          ) VALUES (
             $1, 'phoenix.outcome.v1', $2, $3, $4::numeric, $5,
             $6::numeric, $7::numeric, $8::numeric, $9::numeric,
             $10::numeric, 0, $11::numeric, 0, $12::numeric, $13, $13,
             $14, $15, $16::numeric, 'standard_rpc', $17, $18::numeric,
-            $19::numeric, $20::numeric, $21::numeric, $22::numeric, $23
+            $19::numeric, $20::numeric, $21::numeric, $22::numeric, $23,
+            $24, $25::numeric, $26::numeric, $27::numeric, $28::numeric,
+            $29, $30
          )",
     )
     .bind(candidate_id)
@@ -1021,6 +1240,13 @@ async fn insert_autonomous_outcome(
     } else {
         None
     })
+    .bind(input_size_level.as_str())
+    .bind(actual_output.to_string())
+    .bind(realized_gross_profit.to_string())
+    .bind(&fork_simulated_net_pnl)
+    .bind(&conservative_predicted_net_pnl)
+    .bind(detection_to_submission_latency_ms)
+    .bind(receipt_latency_ms)
     .execute(&mut **transaction)
     .await
     .map_err(StoreError::from)?;
@@ -1120,6 +1346,26 @@ async fn apply_autonomous_risk_feedback(
         .iter()
         .take_while(|value| value.starts_with('-'))
         .count() as u64;
+    let economic = sqlx::query(
+        "SELECT phase, current_size_level, release_sha, control_epoch
+         FROM live_canary.economic_control
+         WHERE singleton
+         FOR UPDATE",
+    )
+    .fetch_one(&mut **transaction)
+    .await
+    .map_err(StoreError::from)?;
+    let current_level_text: String = economic
+        .try_get("current_size_level")
+        .map_err(StoreError::from)?;
+    let current_level =
+        SizeLevel::try_from(current_level_text.as_str()).map_err(|_| StoreError::Data)?;
+    let current_phase: String = economic.try_get("phase").map_err(StoreError::from)?;
+    let release_sha: Option<String> = economic.try_get("release_sha").map_err(StoreError::from)?;
+    let economic_epoch: i64 = economic
+        .try_get("control_epoch")
+        .map_err(StoreError::from)?;
+    let mut transition: Option<(&'static str, SizeLevel, &'static str, i64)> = None;
 
     if route_loss >= route_limit || consecutive_losses >= consecutive_limit {
         let reason = if route_loss >= route_limit {
@@ -1139,6 +1385,70 @@ async fn apply_autonomous_risk_feedback(
         .execute(&mut **transaction)
         .await
         .map_err(StoreError::from)?;
+        sqlx::query(
+            "UPDATE live_canary.economic_control
+             SET phase = 'DISARMED_FAILURE', cooldown_until = NULL,
+                 control_epoch = $1, last_transition_reason = $2,
+                 updated_at = $3
+             WHERE singleton",
+        )
+        .bind(economic_epoch + 1)
+        .bind(reason)
+        .bind(terminal_at)
+        .execute(&mut **transaction)
+        .await
+        .map_err(StoreError::from)?;
+        transition = Some((
+            "DISARMED_FAILURE",
+            current_level,
+            reason,
+            economic_epoch + 1,
+        ));
+    } else if recent.first().is_some_and(|value| value.starts_with('-')) {
+        let next_level = current_level.previous();
+        let cooldown_until = terminal_at + chrono::Duration::seconds(COOLDOWN_SECONDS);
+        sqlx::query(
+            "UPDATE live_canary.autonomous_route_controls
+             SET enabled = false, kill_switch = true,
+                 current_size_level = $2,
+                 maximum_permitted_size = $3::numeric,
+                 cooldown_until = $4,
+                 disarm_reason = 'realized_negative_cooldown',
+                 control_hash = NULL, control_contract = NULL,
+                 control_epoch = control_epoch + 1, updated_at = $5
+             WHERE route_fingerprint = $1",
+        )
+        .bind(&route_fingerprint)
+        .bind(next_level.as_str())
+        .bind(next_level.amount_wei().to_string())
+        .bind(cooldown_until)
+        .bind(terminal_at)
+        .execute(&mut **transaction)
+        .await
+        .map_err(StoreError::from)?;
+        sqlx::query(
+            "UPDATE live_canary.economic_control
+             SET phase = 'COOLDOWN', current_size_level = $1,
+                 current_input_wei = $2::numeric, cooldown_until = $3,
+                 control_epoch = $4,
+                 last_transition_reason = 'realized_negative_cooldown',
+                 updated_at = $5
+             WHERE singleton",
+        )
+        .bind(next_level.as_str())
+        .bind(next_level.amount_wei().to_string())
+        .bind(cooldown_until)
+        .bind(economic_epoch + 1)
+        .bind(terminal_at)
+        .execute(&mut **transaction)
+        .await
+        .map_err(StoreError::from)?;
+        transition = Some((
+            "COOLDOWN",
+            next_level,
+            "realized_negative_cooldown",
+            economic_epoch + 1,
+        ));
     }
     if global_loss >= global_limit {
         sqlx::query(
@@ -1148,6 +1458,29 @@ async fn apply_autonomous_risk_feedback(
              WHERE singleton",
         )
         .bind(terminal_at)
+        .execute(&mut **transaction)
+        .await
+        .map_err(StoreError::from)?;
+        sqlx::query(
+            "UPDATE live_canary.autonomous_route_controls
+             SET enabled = false, kill_switch = true,
+                 disarm_reason = 'daily_loss_budget', cooldown_until = NULL,
+                 control_hash = NULL, control_contract = NULL,
+                 control_epoch = control_epoch + 1, updated_at = $1",
+        )
+        .bind(terminal_at)
+        .execute(&mut **transaction)
+        .await
+        .map_err(StoreError::from)?;
+        sqlx::query(
+            "UPDATE live_canary.economic_control
+             SET phase = 'DISARMED_FAILURE', cooldown_until = NULL,
+                 control_epoch = $2,
+                 last_transition_reason = 'daily_loss_budget', updated_at = $1
+             WHERE singleton",
+        )
+        .bind(terminal_at)
+        .bind(economic_epoch + 1)
         .execute(&mut **transaction)
         .await
         .map_err(StoreError::from)?;
@@ -1174,6 +1507,26 @@ async fn apply_autonomous_risk_feedback(
         .execute(&mut **transaction)
         .await
         .map_err(StoreError::from)?;
+        transition = Some((
+            "DISARMED_FAILURE",
+            current_level,
+            "daily_loss_budget",
+            economic_epoch + 1,
+        ));
+    }
+    if let Some((next_phase, next_level, reason, next_epoch)) = transition {
+        insert_runtime_transition(
+            transaction,
+            &current_phase,
+            &current_level_text,
+            next_phase,
+            next_level.as_str(),
+            reason,
+            release_sha.as_deref(),
+            next_epoch,
+            terminal_at,
+        )
+        .await?;
     }
     Ok(())
 }

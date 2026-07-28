@@ -53,6 +53,8 @@ jobs:
           set -euo pipefail
           sh -n scripts/*.sh
           shellcheck --severity=warning \
+            scripts/activate-economic-canary.sh \
+            scripts/economic-dashboard-loop.sh \
             scripts/deploy-release.sh \
             scripts/finalize-phoenix-deploy-bootstrap.sh \
             scripts/install-autonomous-live-deploy-gateway.sh \
@@ -101,6 +103,7 @@ jobs:
           python3 scripts/hunter_contracts.py validate fixtures/hunter-a1/v1/autonomous-candidate.json
           python3 -m unittest scripts.tests.test_hunter_a1
           python3 -m py_compile scripts/release_components.py scripts/release_provenance.py scripts/prelive_v5_release.py scripts/production_mode.py scripts/anvil_quote_proxy.py
+          python3 -m unittest scripts.tests.test_anvil_quote_proxy
           python3 -m unittest scripts.tests.test_production_mode
           python3 -m unittest scripts.tests.test_release_components scripts.tests.test_release_provenance scripts.tests.test_prelive_v5_release
           python3 -m py_compile scripts/phoenix_shadow_deploy.py

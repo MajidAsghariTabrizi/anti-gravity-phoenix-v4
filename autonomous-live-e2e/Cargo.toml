@@ -11,6 +11,7 @@ chrono = "=0.4.38"
 futures-util = "=0.3.31"
 hex = "=0.4.3"
 phoenix-engine = { path = "../phoenix-engine" }
+phoenix-fork-sandbox = { path = "../fork-sandbox" }
 phoenix-live-executor = { path = "../live-executor" }
 rpc-gateway = { path = "../rpc-gateway" }
 serde_json = "=1.0.128"

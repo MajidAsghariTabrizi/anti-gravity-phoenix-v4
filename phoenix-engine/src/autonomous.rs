@@ -342,11 +342,8 @@ impl AutonomousHunterProcessor {
         input: &EngineInput,
         origin: &OriginEvent,
     ) -> Result<ProcessResult, AutonomousError> {
-        let touched = origin
-            .candidate_touched_pools
-            .iter()
-            .map(|pool| pool.0.clone())
-            .collect::<Vec<_>>();
+        let touched =
+            resolve_origin_pool_addresses(&self.graph, origin, self.bounds.maximum_pools)?;
         let routes = self
             .graph
             .affected_routes_for_pools(&touched, self.bounds.maximum_affected_routes_per_event)
@@ -642,6 +639,11 @@ fn map_hunter_error(error: HunterError) -> AutonomousError {
             "hunter_invalid_event",
             Some(error_code),
         ),
+        HunterError::InvalidOriginPoolIdentity => event_integrity(
+            "hunter_origin_pool_resolution",
+            "hunter_origin_pool_identity_invalid",
+            Some(error_code),
+        ),
         HunterError::StateIncomplete => AutonomousError::StateIncomplete,
         HunterError::StateIntegrity => AutonomousError::ProviderDisagreement,
         HunterError::EconomicInfeasible => AutonomousError::Economic,
@@ -661,6 +663,21 @@ fn map_hunter_error(error: HunterError) -> AutonomousError {
             Some(error_code),
         ),
     }
+}
+
+fn resolve_origin_pool_addresses(
+    graph: &HunterRouteGraph,
+    origin: &OriginEvent,
+    maximum: usize,
+) -> Result<Vec<String>, AutonomousError> {
+    let origin_pool_ids = origin
+        .candidate_touched_pools
+        .iter()
+        .map(|pool| pool.0.clone())
+        .collect::<Vec<_>>();
+    graph
+        .pool_addresses_for_origin_pool_ids(&origin_pool_ids, maximum)
+        .map_err(map_hunter_error)
 }
 
 fn classify_database(error: sqlx::Error, stage: &'static str) -> AutonomousError {
@@ -740,12 +757,148 @@ pub enum AutonomousError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::{Address, PoolId};
+    use crate::engine_input::decode_engine_input;
+    use crate::hunter::{HunterEconomicConfig, HunterMode, InMemoryCandidateSink};
+    use crate::origin::{OriginClassification, OriginDetector};
+    use phoenix_recorder::model::ENGINE_INPUT_SCHEMA_VERSION;
+
+    const WETH: &str = "0x82af49447d8a07e3bd95bd0d56f35241523fbab1";
+    const USDC: &str = "0xaf88d065e77c8cc2239327c5edb3a432268e5831";
+    const ROUTER: &str = "0x68b3465833fb72a70ecdf485e0e4c7bd8665fc45";
+    const POOL_500: &str = "0xc6962004f452be9203591991d15f6b388e09e8d0";
+
+    fn slot_address(value: &str) -> String {
+        format!("000000000000000000000000{}", value.trim_start_matches("0x"))
+    }
+
+    fn slot_u128(value: u128) -> String {
+        format!("{value:064x}")
+    }
+
+    fn production_shaped_input() -> EngineInput {
+        let sequence = 466_289_816_u64;
+        let tx_hash = format!("0x{}", "a".repeat(64));
+        let calldata = format!(
+            "0x04e45aaf{}{}{}{}{}{}{}",
+            slot_address(WETH),
+            slot_address(USDC),
+            slot_u128(500),
+            slot_address("0x1111111111111111111111111111111111111111"),
+            slot_u128(100_000_000_000_000),
+            slot_u128(0),
+            slot_u128(0),
+        );
+        let payload = serde_json::to_vec(&json!({
+            "schema_version": "phoenix.v4.normalized_tx.v1",
+            "sequence": sequence,
+            "timestamp_unix_ms": 1_785_215_949_000_u64,
+            "tx_hash": tx_hash,
+            "tx_type": "0x02",
+            "chain_id": 42161,
+            "from": "0x1111111111111111111111111111111111111111",
+            "to": ROUTER,
+            "nonce": 7,
+            "value": "0",
+            "calldata": calldata,
+            "gas_limit": "300000",
+            "max_fee_per_gas": "100000000",
+            "max_priority_fee_per_gas": "1000000",
+            "raw_tx": "AQID",
+            "ingested_at_unix_ns": 1_785_215_949_123_456_789_i64
+        }))
+        .unwrap();
+        let identity = format!("{ENGINE_INPUT_SCHEMA_VERSION}:{sequence}:{tx_hash}");
+        decode_engine_input(
+            &payload,
+            Some(ENGINE_INPUT_SCHEMA_VERSION),
+            Some(&identity),
+            281,
+        )
+        .unwrap()
+    }
 
     fn event_context(error: HunterError) -> AutonomousIntegrityContext {
         match map_hunter_error(error) {
             AutonomousError::EventIntegrity(context) => context,
             other => panic!("expected event integrity, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn production_shaped_dispatcher_input_passes_hunter_event_validation() {
+        let input = production_shaped_input();
+        let detector = OriginDetector::new(vec![Address::parse(ROUTER).unwrap()]).unwrap();
+        let mut origin = match detector.classify(&input.normalized) {
+            OriginClassification::SupportedSwapOrigin(event) => event,
+            other => panic!("production-shaped input was not supported: {other:?}"),
+        };
+        assert_eq!(
+            origin.candidate_touched_pools,
+            vec![PoolId(format!("{WETH}:{USDC}:500"))]
+        );
+
+        let bounds = HunterBounds::default();
+        let graph = HunterRouteGraph::from_contracts(
+            include_str!("../../config/phoenix-route-universe-v1.json"),
+            &[include_str!("../../config/phoenix-route-policy-v1.json")],
+            bounds,
+        )
+        .unwrap();
+        let touched = resolve_origin_pool_addresses(&graph, &origin, bounds.maximum_pools).unwrap();
+        assert_eq!(touched, vec![POOL_500.to_string()]);
+        let invalid_graph = graph.clone();
+
+        let mut core = HunterCore::new(
+            HunterMode::Live,
+            graph,
+            bounds,
+            HunterEconomicConfig {
+                flash_premium_bps: 5,
+                gas_cost: 0,
+                tick_crossing_gas_cost: 0,
+                ordering_cost_reserve: 0,
+                model_error_reserve_bps: 100,
+                shadow_maximum_input: 10_000_000_000_000_000,
+            },
+        )
+        .unwrap();
+        let event = HunterEvent {
+            origin_event_id: input.identity.source_event_identity,
+            origin_router: origin.router.0.clone(),
+            chain_id: input.identity.chain_id,
+            block_number: 48_379_269,
+            block_hash: format!("0x{}", "b".repeat(64)),
+            observed_at_unix_ms: input.observed_at_unix_ms,
+            evaluated_at_unix_ms: input.observed_at_unix_ms,
+            touched_pool_addresses: touched,
+        };
+        let bindings = CandidateBindings {
+            risk_snapshot_hash: "0".repeat(64),
+            submission_quote_hash: "0".repeat(64),
+            executor_address: "0x1111111111111111111111111111111111111111".to_string(),
+            executor_code_hash: "c".repeat(64),
+            submission_channel: "standard_rpc".to_string(),
+        };
+        let mut sink = InMemoryCandidateSink::default();
+        let result = core
+            .process_event(&event, &BTreeMap::new(), &bindings, &mut sink)
+            .unwrap();
+        assert_eq!(result.affected_route_fingerprints.len(), 1);
+        assert_eq!(result.metrics.events_observed, 1);
+        assert_eq!(result.metrics.pools_matched, 1);
+        assert_eq!(result.metrics.routes_affected, 1);
+        assert_eq!(result.metrics.state_incomplete, 1);
+        assert!(result.candidates.is_empty());
+
+        origin.candidate_touched_pools = vec![PoolId(POOL_500.to_string())];
+        let invalid = resolve_origin_pool_addresses(&invalid_graph, &origin, bounds.maximum_pools)
+            .unwrap_err();
+        let AutonomousError::EventIntegrity(context) = invalid else {
+            panic!("malformed origin pool identity did not quarantine");
+        };
+        assert_eq!(context.stage, "hunter_origin_pool_resolution");
+        assert_eq!(context.error_class, "hunter_origin_pool_identity_invalid");
     }
 
     #[test]
@@ -760,6 +913,7 @@ mod tests {
             HunterError::RouteLimit,
             HunterError::AffectedRouteLimit,
             HunterError::InvalidEvent,
+            HunterError::InvalidOriginPoolIdentity,
             HunterError::StateIncomplete,
             HunterError::StateIntegrity,
             HunterError::EconomicInfeasible,
@@ -794,6 +948,11 @@ mod tests {
                 HunterError::InvalidEvent,
                 "hunter_event_validation",
                 "hunter_invalid_event",
+            ),
+            (
+                HunterError::InvalidOriginPoolIdentity,
+                "hunter_origin_pool_resolution",
+                "hunter_origin_pool_identity_invalid",
             ),
             (
                 HunterError::Arithmetic,

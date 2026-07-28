@@ -123,6 +123,22 @@ fn mutating_owner_commands_reject_missing_acknowledgement_before_environment_acc
 }
 
 #[test]
+fn evidence_start_rejects_missing_acknowledgement_before_database_access() {
+    let output = control_command("evidence-start")
+        .output()
+        .expect("run evidence-start without acknowledgement");
+    let error = stderr(&output);
+
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    assert!(error.contains(
+        "AUTONOMOUS_CONTROL_FAILED: required environment is missing: PHOENIX_EVIDENCE_START_ACK"
+    ));
+    assert!(!error.contains("POSTGRES_DSN"));
+    assert!(!error.contains("SIGNER_PRIVATE_KEY"));
+}
+
+#[test]
 fn missing_environment_diagnostic_names_variable_without_value() {
     let sensitive_value = "sensitive-wallet-value-must-not-appear";
     let error = control_address_environment_with(|name| match name {

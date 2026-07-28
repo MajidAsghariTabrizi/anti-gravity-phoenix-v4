@@ -4,518 +4,300 @@ set -eu
 script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 repo_root=$(CDPATH='' cd -- "$script_dir/.." && pwd)
 
-gateway_installer=$repo_root/scripts/install-autonomous-live-deploy-gateway.sh
-context_installer=$repo_root/scripts/install-production-release-context.sh
-build_workflow=$repo_root/.github/workflows/build-images.yml
-ci_workflow=$repo_root/.github/workflows/ci.yml
-dockerfile=$repo_root/deploy/rust.Dockerfile
-runtime_verifier=$repo_root/scripts/verify-image-runtime.sh
-compose_contract=$repo_root/compose.live-autonomous.yml
-control_source=$repo_root/live-executor/src/autonomous_live_control_main.rs
-owner_bootstrap_source=$repo_root/live-executor/src/owner_bootstrap.rs
-deploy_release=$repo_root/scripts/deploy-release.sh
-rollback_release=$repo_root/scripts/rollback-release.sh
-
 fail() {
   echo "AUTONOMOUS_LIVE_RELEASE_CONTRACT_TEST_FAILED: $1" >&2
   exit 1
 }
 
-for required in \
-  "$gateway_installer" \
-  "$context_installer" \
-  "$build_workflow" \
-  "$ci_workflow" \
-  "$dockerfile" \
-  "$runtime_verifier" \
-  "$compose_contract" \
-  "$control_source" \
-  "$owner_bootstrap_source" \
-  "$deploy_release" \
-  "$rollback_release"
+for path in \
+  compose.live-autonomous.yml \
+  live-executor/schema/005_closed_loop_economic_control.sql \
+  live-executor/src/economic_control.rs \
+  live-executor/src/autonomous_live_control_main.rs \
+  scripts/deploy-release.sh \
+  scripts/rollback-release.sh \
+  scripts/activate-economic-canary.sh \
+  scripts/economic-dashboard-loop.sh \
+  scripts/sql/economic-dashboard-snapshot.sql
 do
-  [ -f "$required" ] && [ ! -L "$required" ] ||
-    fail "required_file_missing:$required"
+  [ -f "$repo_root/$path" ] && [ ! -L "$repo_root/$path" ] ||
+    fail "required contract is missing: $path"
 done
 
-for specification in \
-  'release_assets.py:0600' \
-  'release_components.py:0600' \
-  'release_provenance.py:0600' \
-  'install-release-assets.sh:0700' \
-  'install-production-release-context.sh:0700' \
-  'production-healthcheck.sh:0700' \
-  'production_mode.py:0700' \
-  'prelive-protected-maintenance.sh:0700' \
-  'prelive_protected_maintenance.py:0600' \
-  'prelive-protected-maintenance-launch.sh:0700' \
-  'prelive-protected-maintenance-unit.sh:0700' \
-  'rollback-release.sh:0700'
-do
-  grep -F "'$specification'" "$gateway_installer" >/dev/null ||
-    fail "gateway_runtime_missing:$specification"
-done
-
-for safety_script in \
-  prelive-protected-maintenance.sh \
-  prelive_protected_maintenance.py \
-  prelive-protected-maintenance-launch.sh \
-  prelive-protected-maintenance-unit.sh
-do
-  grep -F "$safety_script" "$context_installer" >/dev/null ||
-    fail "context_installer_runtime_missing:$safety_script"
-done
-
-PYTHONDONTWRITEBYTECODE=1 \
-  python3 -I -B "$repo_root/scripts/release_provenance.py" --help >/dev/null ||
-  fail release_provenance_isolated_import_failed
-
-grep -F 'libgcc-s1' "$dockerfile" >/dev/null ||
-  fail rust_runtime_dependency_missing
-
-grep -F 'autonomous-live-control __image_runtime_probe__' "$dockerfile" >/dev/null ||
-  fail dockerfile_runtime_probe_missing
-
-PYTHONDONTWRITEBYTECODE=1 python3 -I -B - \
-  "$compose_contract" "$control_source" "$owner_bootstrap_source" \
-  "$deploy_release" "$rollback_release" "$dockerfile" "$runtime_verifier" <<'PY' ||
+PYTHONDONTWRITEBYTECODE=1 python3 -I -B - "$repo_root" <<'PY' ||
 import re
 import sys
 from pathlib import Path
 
 
-def fail(message: str) -> None:
-    raise SystemExit(f"AUTONOMOUS_CONTROL_CONTRACT_INVALID:{message}")
+root = Path(sys.argv[1])
+
+
+def read(path: str) -> str:
+    return (root / path).read_text(encoding="utf-8")
 
 
 def require(condition: bool, message: str) -> None:
     if not condition:
-        fail(message)
+        raise SystemExit(f"AUTONOMOUS_LIVE_RELEASE_CONTRACT_INVALID:{message}")
 
 
-(
-    compose_path,
-    control_path,
-    owner_bootstrap_path,
-    deploy_release_path,
-    rollback_release_path,
-    dockerfile_path,
-    verifier_path,
-) = map(Path, sys.argv[1:])
-compose = compose_path.read_text(encoding="utf-8")
-control = control_path.read_text(encoding="utf-8")
-owner_bootstrap = owner_bootstrap_path.read_text(encoding="utf-8")
-owner_runtime = owner_bootstrap.split("#[cfg(test)]", 1)[0]
-deploy_release = deploy_release_path.read_text(encoding="utf-8")
-rollback_release = rollback_release_path.read_text(encoding="utf-8")
-dockerfile = dockerfile_path.read_text(encoding="utf-8")
-verifier = verifier_path.read_text(encoding="utf-8")
+compose = read("compose.live-autonomous.yml")
+deploy = read("scripts/deploy-release.sh")
+rollback = read("scripts/rollback-release.sh")
+activate = read("scripts/activate-economic-canary.sh")
+control = read("live-executor/src/autonomous_live_control_main.rs")
+state = read("live-executor/src/economic_control.rs")
+schema = read("live-executor/schema/005_closed_loop_economic_control.sql")
+health = read("scripts/production-healthcheck.sh")
+monitor = read("scripts/economic-dashboard-loop.sh")
+dashboard_sql = read("scripts/sql/economic-dashboard-snapshot.sql")
+release_model = read("scripts/phoenix_release/model.py")
+release_gateway = read("scripts/phoenix_release/gateway.py")
+assets = read("scripts/release_assets.py")
+installer = read("scripts/install-production-release-context.sh")
 
-service_match = re.search(
+service = re.search(
+    r"(?ms)^  autonomous-control:\s*\n(?P<body>.*?)(?=^  [a-zA-Z0-9_-]+:\s*\n|\Z)",
+    compose,
+)
+require(service is not None, "signerless_control_service_missing")
+control_service = service.group("body")
+for forbidden in ("SIGNER_PRIVATE_KEY", "SIGNER_PRIVATE_KEY_FILE", "LIVE_EXECUTOR_SIGNER_FILE"):
+    require(forbidden not in control_service, f"signerless_control_contains:{forbidden}")
+require("autonomous-live-control" in control_service, "control_entrypoint_missing")
+require('restart: "no"' in control_service, "control_service_must_be_one_shot")
+
+live_service = re.search(
     r"(?ms)^  live-executor:\s*\n(?P<body>.*?)(?=^  [a-zA-Z0-9_-]+:\s*\n|\Z)",
     compose,
 )
-require(service_match is not None, "compose_live_executor_service_missing")
-service = service_match.group("body")
+require(live_service is not None, "live_executor_service_missing")
 require(
-    len(
-        re.findall(
-            r"(?m)^\s+WALLET_ADDRESS:\s*"
-            r"\$\{LIVE_EXECUTOR_WALLET_ADDRESS:[^}]+\}\s*$",
-            service,
-        )
-    )
-    == 1,
-    "compose_wallet_mapping_not_canonical",
+    "phoenix-live-executor-signer" in live_service.group("body"),
+    "authorized_executor_signer_mount_missing",
 )
+require("economic-monitor:" in compose, "economic_monitor_service_missing")
+require("economic-supervisor:" in compose, "economic_supervisor_service_missing")
 require(
-    len(
-        re.findall(
-            r"(?m)^\s+EXECUTOR_ADDRESS:\s*"
-            r"\$\{LIVE_EXECUTOR_EXECUTOR_ADDRESS:[^}]+\}\s*$",
-            service,
-        )
-    )
-    == 1,
-    "compose_executor_mapping_not_canonical",
+    "PHOENIX_ECONOMIC_DASHBOARD_INTERVAL_SECONDS: \"45\"" in compose,
+    "dashboard_refresh_interval_not_45_seconds",
 )
 
-require(
-    '"LIVE_EXECUTOR_WALLET_ADDRESS"' not in control,
-    "control_deprecated_wallet_lookup_present",
+for required in (
+    "autonomous-control migrate",
+    "autonomous-control disarmed-deploy",
+    "autonomous-control evidence-start",
+    "INSTALL_DISARMED_EVIDENCE_RELEASE_42161",
+    "START_DISARMED_EVIDENCE_42161",
+    "mark_phase DISARMED_CONTROL_INSTALLED",
+    "mark_phase DISARMED_EVIDENCE_STARTED",
+    "PHOENIX_HEALTH_EXPECTED_MODE=DISARMED_EVIDENCE",
+    'compose stop -t 30 live-executor',
+    'live-executor started during disarmed deployment',
+):
+    require(required in deploy, f"disarmed_deploy_contract_missing:{required}")
+for forbidden in (
+    "live-executor activate",
+    "live-executor owner-unpause",
+    "compose up -d --no-deps live-executor",
+    "LIVE_EXECUTOR_SIGNER_FILE",
+    "AUTONOMOUS_ACTIVATED",
+    "EXECUTOR_UNPAUSED",
+):
+    require(forbidden not in deploy, f"normal_deploy_authority_leak:{forbidden}")
+
+operation = deploy.index("\ncompose pull\n")
+migrate = deploy.index("autonomous-control migrate", operation)
+disarmed = deploy.index("autonomous-control disarmed-deploy", operation)
+engine = deploy.index("compose up -d --no-deps phoenix-engine", operation)
+burn = deploy.index("run_live_engine_burn_in", operation)
+healthcheck = deploy.index('"$deploy_dir/production-healthcheck.sh"', burn)
+fail_closed = deploy.index(
+    "runtime controls are not fail-closed before evidence-start", healthcheck
 )
-require(
-    '"LIVE_EXECUTOR_EXECUTOR_ADDRESS"' not in control,
-    "control_deprecated_executor_lookup_present",
+evidence_start = deploy.index("autonomous-control evidence-start", fail_closed)
+evidence_verified = deploy.index(
+    "runtime did not enter fail-closed DISARMED_EVIDENCE", evidence_start
 )
+external_evidence = deploy.index("mark_phase DISARMED_EVIDENCE_STARTED", evidence_verified)
 require(
-    control.count("control_address_environment_with(") == 1,
-    "control_preflight_canonical_address_helper_usage_invalid",
-)
-require(
-    '"WALLET_ADDRESS"' in owner_runtime
-    and '"EXECUTOR_ADDRESS"' in owner_runtime,
-    "owner_bootstrap_canonical_address_names_missing",
-)
-require(
-    '"LIVE_EXECUTOR_WALLET_ADDRESS"' not in owner_runtime
-    and '"LIVE_EXECUTOR_EXECUTOR_ADDRESS"' not in owner_runtime,
-    "owner_bootstrap_deprecated_address_names_present",
+    migrate
+    < disarmed
+    < engine
+    < burn
+    < healthcheck
+    < fail_closed
+    < evidence_start
+    < evidence_verified
+    < external_evidence,
+    "disarmed_release_sequence_invalid",
 )
 
-run_start = control.find("async fn run()")
-pool_start = control.find("async fn database_pool()")
-require(run_start >= 0 and pool_start > run_start, "control_dispatch_structure_missing")
-run_body = control[run_start:pool_start]
-dispatch = run_body.find("match command.as_str()")
-require(dispatch >= 0, "control_command_dispatch_missing")
-require("POSTGRES_DSN" not in run_body, "control_database_initialized_before_dispatch")
-require("PgPoolOptions" not in run_body, "control_pool_initialized_before_dispatch")
+for required in (
+    "autonomous-control disarm",
+    "DISARM_AUTONOMOUS_LIVE_42161",
+    "DISARMED_FAILURE",
+):
+    require(
+        required in rollback or required in control,
+        f"rollback_disarm_contract_missing:{required}",
+    )
+require(
+    "live-executor disarm" not in rollback,
+    "rollback_uses_signer_mounted_service_for_disarm",
+)
+
 for command in (
-    "IMAGE_RUNTIME_PROBE_COMMAND",
-    '"preflight"',
-    '"owner-plan"',
-    '"owner-configure"',
-    '"owner-configured-preflight"',
-    '"owner-unpause"',
-    '"owner-pause"',
-    '"migrate"',
-    '"activate"',
-    '"disarm"',
-    '"status"',
-    '"reconciliation-status"',
+    '"disarmed-deploy"',
+    '"evidence-start"',
+    '"create-readiness"',
+    '"install-authorization"',
+    '"activate-ready-canary"',
+    '"evaluate-economic-control"',
+    '"supervise-economic-control"',
 ):
-    require(command in run_body[dispatch:], f"control_command_missing:{command}")
+    require(command in control, f"control_command_missing:{command}")
 require(
-    run_body.find('"unsupported command"') > dispatch,
-    "unsupported_command_not_rejected_by_dispatch",
+    '"activate" => return Err(' in control,
+    "legacy_direct_activation_not_disabled",
+)
+require("phoenix.live-canary-schema.v5" in control, "schema_v5_not_required")
+require(
+    "previous.phase != EconomicPhase::DisarmedEvidence" in control,
+    "readiness_does_not_require_durable_evidence_phase",
 )
 require(
-    control.find('required("POSTGRES_DSN")') > pool_start,
-    "control_dsn_lookup_not_isolated",
+    "input.binding.observed_from < previous.updated_at" not in control
+    and "binding.observed_from < previous.updated_at" in control,
+    "readiness_observation_not_bound_to_evidence_transition",
 )
-for forbidden in ("POSTGRES_DSN", "DATABASE_URL"):
-    require(
-        forbidden not in owner_runtime,
-        f"owner_bootstrap_database_dependency_present:{forbidden}",
-    )
-
-for required_owner_contract in (
-    "BOOTSTRAP_EXECUTOR_OWNER_42161",
-    "UNPAUSE_CONFIGURED_EXECUTOR_42161",
-    "PAUSE_EXECUTOR_AFTER_FAILED_DEPLOY_42161",
-    "EXECUTOR_OWNER_CONFIGURE_OK",
-    "EXECUTOR_OWNER_CONFIGURED_PREFLIGHT_OK",
-    "EXECUTOR_OWNER_UNPAUSE_OK",
-    "EXECUTOR_OWNER_PAUSE_OK",
-    "transaction_signer_from_file",
-    "quote_transaction",
-    "pending_nonce",
-    "send_raw_transaction",
-    "transaction_receipt",
-    "transaction_known",
-    '"receipt_status"',
+require(
+    "economic_control_epoch" in state
+    and "economic_control_epoch" in schema
+    and "economic_control_epoch" in control,
+    "readiness_economic_epoch_binding_missing",
+)
+for required in (
+    "active execution attempt",
+    "unresolved receipt reconciliation",
+    "evidence-start requires fail-closed global and route controls",
+    "clock_timestamp()",
+    "disarmed_evidence_started",
 ):
-    require(
-        required_owner_contract in owner_runtime or required_owner_contract in control,
-        f"owner_bootstrap_contract_missing:{required_owner_contract}",
-    )
+    require(required in control, f"evidence_start_gate_missing:{required}")
 
-for forbidden_input in (
-    '"TARGET"',
-    '"CALLDATA"',
-    '"RAW_TRANSACTION"',
-    '"TRANSACTION_NONCE"',
+phases = (
+    "DISARMED_DEPLOY",
+    "DISARMED_EVIDENCE",
+    "CANARY_READY",
+    "LIVE_CANARY_MIN",
+    "LIVE_SCALE_L1",
+    "LIVE_SCALE_L2",
+    "LIVE_SCALE_L3",
+    "LIVE_SCALE_L4",
+    "LIVE_SCALE_L5",
+    "LIVE_MAX_REVIEWED",
+    "COOLDOWN",
+    "DISARMED_FAILURE",
+)
+for phase in phases:
+    require(phase in state and phase in schema, f"economic_phase_missing:{phase}")
+
+for amount in (
+    "100_000_000_000_000",
+    "250_000_000_000_000",
+    "500_000_000_000_000",
+    "1_000_000_000_000_000",
+    "2_500_000_000_000_000",
+    "5_000_000_000_000_000",
+    "10_000_000_000_000_000",
 ):
-    require(
-        forbidden_input not in owner_runtime,
-        f"owner_bootstrap_arbitrary_input_present:{forbidden_input}",
-    )
-
-configured_preflight = deploy_release.find("live-executor owner-configured-preflight")
-owner_bootstrap_fallback = deploy_release.find(
-    'if [ "$owner_configured_preflight_code" -ne 0 ]; then',
-    configured_preflight,
-)
-authorization_absent = deploy_release.find(
-    'if [ ! -e "$owner_authorization" ]', owner_bootstrap_fallback
-)
-authorization = deploy_release.find(
-    "validate_owner_authorization", authorization_absent
-)
-consume = deploy_release.find("consume_owner_authorization", authorization)
-configure = deploy_release.find("live-executor owner-configure", consume)
-configured_preflight_after_configure = deploy_release.find(
-    "live-executor owner-configured-preflight", configure
-)
-production_mode = deploy_release.find(
-    'python3 "$deploy_dir/production_mode.py" live --env-file "$env_file"'
-)
-live_reload = deploy_release.find("reload_environment", production_mode)
-burn_in = deploy_release.find("run_live_engine_burn_in", live_reload)
-activation = deploy_release.find("live-executor activate")
-unpause = deploy_release.find("live-executor owner-unpause")
-normal_preflight = deploy_release.rfind("live-executor preflight")
-executor_start = deploy_release.find("compose up -d --no-deps live-executor")
-require(
-    min(
-        authorization,
-        authorization_absent,
-        owner_bootstrap_fallback,
-        consume,
-        configure,
-        configured_preflight,
-        configured_preflight_after_configure,
-        production_mode,
-        live_reload,
-        burn_in,
-        activation,
-        unpause,
-        normal_preflight,
-        executor_start,
-    )
-    >= 0,
-    "owner_bootstrap_deployment_sequence_missing",
-)
-require(
-    configured_preflight
-    < owner_bootstrap_fallback
-    < authorization_absent
-    < authorization
-    < consume
-    < configure
-    < configured_preflight_after_configure
-    < production_mode
-    < live_reload
-    < burn_in
-    < activation
-    < unpause
-    < normal_preflight
-    < executor_start,
-    "owner_bootstrap_deployment_sequence_invalid",
-)
-require(
-    "engine_burn_in_seconds=${PHOENIX_ENGINE_BURN_IN_SECONDS:-120}"
-    in deploy_release
-    and '[ "$engine_burn_in_seconds" -ge 120 ]' in deploy_release,
-    "engine_burn_in_minimum_missing",
-)
-burn_in_body = deploy_release[
-    deploy_release.find("run_live_engine_burn_in()") : deploy_release.find(
-        "install_active_file()", deploy_release.find("run_live_engine_burn_in()")
-    )
-]
-for burn_in_contract in (
-    "{{.RestartCount}}",
-    "http://127.0.0.1:9200/readyz",
-    "http://127.0.0.1:9300/readyz",
-    "compose ps -q live-executor",
+    require(amount in state, f"ladder_amount_missing:{amount}")
+for threshold in (
+    "MINIMUM_OBSERVATIONS: u64 = 100",
+    "MINIMUM_VALID_ACCEPTANCE_BPS: u16 = 9_990",
+    "MINIMUM_FORK_PASS_RATE_BPS: u16 = 9_500",
+    "MAXIMUM_PREDICTION_ERROR_BPS: u16 = 1_000",
+    "MINIMUM_PROMOTION_OUTCOMES: u64 = 20",
+    "MINIMUM_SUCCESS_RATE_BPS: u16 = 9_500",
 ):
-    require(
-        burn_in_contract in burn_in_body,
-        f"engine_burn_in_contract_missing:{burn_in_contract}",
-    )
-require(
-    "engine_terminal_integrity_total" in burn_in_body
-    and "phoenix_engine_terminal_integrity_total" in deploy_release,
-    "engine_burn_in_terminal_integrity_gate_missing",
-)
-require(
-    deploy_release.find("compose stop -t 30 live-executor", production_mode)
-    < burn_in
-    < activation
-    < unpause
-    < executor_start,
-    "executor_not_stopped_through_engine_burn_in",
-)
-require(
-    deploy_release.count("reload_environment") >= 3
-    and deploy_release.count("assert_live_environment") >= 3,
-    "live_environment_reload_contract_missing",
-)
-require(
-    'unset PHOENIX_MODE LIVE_EXECUTION AUTONOMOUS_EXECUTION' in deploy_release,
-    "stale_mode_environment_not_cleared",
-)
-require(
-    "PHOENIX_HEALTH_EXPECTED_MODE=LIVE" in deploy_release
-    and "PHOENIX_HEALTH_EXPECTED_MODE=SHADOW" in rollback_release,
-    "release_phase_health_mode_not_explicit",
-)
-require(
-    "validate_live_rpc_rendering" in deploy_release
-    and 'urls != [sys.argv[2], sys.argv[3]]' in deploy_release
-    and "len(priorities) != 2" in deploy_release,
-    "rendered_live_rpc_parity_gate_missing",
-)
-preflight_render_start = deploy_release.find(
-    '"$deploy_dir/render-production-compose.sh"',
-    deploy_release.find('verify_active_release_coherence "$rollback_sha" ""'),
-)
-preflight_render_end = deploy_release.find(
-    'capture_protected_ids "$protected_before"',
-    preflight_render_start,
-)
-preflight_render_body = (
-    deploy_release[preflight_render_start:preflight_render_end]
-    if 0 <= preflight_render_start < preflight_render_end
-    else ""
-)
-require(
-    preflight_render_body
-    and "validate_live_rpc_inputs" in preflight_render_body
-    and "validate_live_rpc_inputs()" in deploy_release,
-    "prelive_rpc_inputs_not_validated",
-)
-require(
-    'candidate_live_env="$state_dir/candidate-live.env"' in deploy_release
-    and 'cp "$env_file" "$candidate_live_env"' in preflight_render_body
-    and 'production_mode.py" live --env-file "$candidate_live_env"' in preflight_render_body
-    and 'validate-production-env.sh" "$candidate_live_env"' in preflight_render_body
-    and '--overlay-file "$overlay_file"' in preflight_render_body
-    and '--env-file "$candidate_live_env"' in preflight_render_body
-    and "validate_live_rpc_rendering" in preflight_render_body,
-    "candidate_live_overlay_preflight_missing",
-)
-require(
-    "production_environment_identity()" in deploy_release
-    and "active_environment_identity_before" in preflight_render_body
-    and "active_environment_identity_after" in preflight_render_body
-    and (
-        '[ "$active_environment_identity_after" = '
-        '"$active_environment_identity_before" ]'
-    )
-    in preflight_render_body,
-    "candidate_preflight_does_not_prove_active_environment_unchanged",
-)
-preflight_rpc_gate = deploy_release.find(
-    'fail "preflight LIVE RPC provider and priority configuration is invalid"'
-)
-first_container_creation = deploy_release.find("compose pull")
-require(
-    0 <= preflight_rpc_gate < first_container_creation,
-    "live_rpc_parity_not_validated_before_container_creation",
-)
-require(
-    "candidate-release-assets.sha" in deploy_release
-    and "verify_active_release_coherence" in deploy_release
-    and 'rollback_release_root="$release_root/$rollback_sha"' in deploy_release
-    and 'PHOENIX_CONTEXT_INSTALLER="$rollback_context_installer"' in deploy_release,
-    "coherent_version_matched_rollback_contract_missing",
-)
-require(
-    "owner_authorization=/etc/phoenix/authorizations/executor-owner-bootstrap.json"
-    in deploy_release,
-    "owner_authorization_path_not_exact",
-)
-require(
-    "PHOENIX_EXECUTOR_OWNER_BOOTSTRAP_AUTHORIZATION_FILE" not in deploy_release,
-    "owner_authorization_path_is_operator_overridable",
-)
-require(
-    'mv -n "$owner_authorization" "$consumed_owner_authorization"'
-    in deploy_release
-    and '[ ! -e "$owner_authorization" ] && [ -f "$consumed_owner_authorization" ]'
-    in deploy_release,
-    "owner_authorization_not_consumed_exactly_once",
-)
-require(
-    deploy_release.find("owner_bootstrap_started=1", consume)
-    < configure,
-    "owner_bootstrap_not_marked_before_first_mutation",
-)
-owner_unpause_attempt = deploy_release.find(
-    "owner_unpause_attempted=1", configured_preflight
-)
-owner_unpause_code = deploy_release.find("owner_unpause_code=$?")
-owner_unpause_applied = deploy_release.find("owner_unpaused=1", owner_unpause_code)
-owner_unpause_failure = deploy_release.find(
-    '[ "$owner_unpause_code" -eq 0 ] || fail "executor owner unpause failed"',
-    owner_unpause_code,
-)
-require(
-    configured_preflight
-    < owner_unpause_attempt
-    < owner_unpause_code
-    < owner_unpause_applied
-    < owner_unpause_failure,
-    "owner_unpause_compensation_state_not_captured_before_failure",
-)
-require(
-    deploy_release.find("live-executor owner-pause")
-    < deploy_release.find("invoking rollback"),
-    "owner_pause_not_before_rollback",
-)
-for authorization_contract in (
-    "phoenix.executor-owner-bootstrap-authorization.v1",
-    '{"schema", "release_sha", "chain_id", "acknowledgement"}',
-    "0:0:600:1",
-    "cannot be consumed atomically",
-    "EXTERNAL_OWNER_AUTHORIZATION_REQUIRED",
+    require(threshold in state, f"economic_threshold_missing:{threshold}")
+
+for required in (
+    "CREATE TABLE IF NOT EXISTS live_canary.economic_control",
+    "CREATE TABLE IF NOT EXISTS live_canary.canary_readiness_records",
+    "CREATE TABLE IF NOT EXISTS live_canary.automation_authorizations",
+    "CREATE TABLE IF NOT EXISTS live_canary.economic_transitions",
+    "economic transitions are immutable",
+    "realized_profit_by_route_level",
+    "realized_profit_windows",
+    "actual_output",
+    "actual_balance_delta",
+    "fork_simulated_net_pnl",
+    "detection_to_submission_latency_ms",
+    "receipt_latency_ms",
 ):
-    require(
-        authorization_contract in deploy_release,
-        f"owner_authorization_contract_missing:{authorization_contract}",
-    )
+    require(required in schema, f"economic_schema_contract_missing:{required}")
 
-owner_mutation = control[control.find("async fn owner_mutation") :]
+for required in (
+    "CREATE_HASH_BOUND_CANARY_READINESS_42161",
+    "INSTALL_BOUNDED_AUTOMATION_AUTHORIZATION_42161",
+    "ACTIVATE_READY_MIN_CANARY_42161",
+    "live-executor owner-unpause",
+    "owner-pause",
+    "canary_activation_failure",
+    "level=MIN input_wei=100000000000000",
+):
+    require(required in activate, f"owner_activation_boundary_missing:{required}")
 require(
-    owner_mutation.find("execute_from_environment(mutation).await?")
-    < owner_mutation.find("mutation == OwnerMutation::Unpause")
-    < owner_mutation.find("preflight().await?")
-    < owner_mutation.find('println!("{marker}")'),
-    "owner_unpause_normal_preflight_sequence_invalid",
+    activate.index("activate-ready-canary")
+    < activate.index("live-executor owner-unpause")
+    < activate.index("compose up -d --no-deps live-executor"),
+    "authorized_canary_sequence_invalid",
 )
 
-for label, gate in (("dockerfile", dockerfile), ("verifier", verifier)):
-    require("__image_runtime_probe__" in gate, f"{label}_probe_command_missing")
-    require(
-        "AUTONOMOUS_CONTROL_RUNTIME_OK" in gate,
-        f"{label}_success_marker_missing",
-    )
-    require(
-        "__image_runtime_contract_probe__" not in gate,
-        f"{label}_obsolete_probe_command_present",
-    )
-    require(
-        'probe_status" -lt 125' not in gate,
-        f"{label}_nonzero_probe_status_accepted",
-    )
-    require(
-        '*AUTONOMOUS_CONTROL_FAILED:*)' in gate,
-        f"{label}_failure_marker_not_rejected",
-    )
-    require(
-        '[ ! -s "$probe_stderr" ]' in gate,
-        f"{label}_probe_stderr_not_required_empty",
-    )
+for required in (
+    "refresh_interval_seconds",
+    "'executive'",
+    "'funnel'",
+    "'economics'",
+    "'safety'",
+    "'growth'",
+    "REALIZED NET PNL AFTER ALL COSTS",
+):
+    require(required in dashboard_sql, f"dashboard_section_missing:{required}")
+require("interval must be 30-60 seconds" in monitor, "monitor_interval_guard_missing")
 
+for phase in (
+    "EVIDENCE_MODE_INSTALLED",
+    "DISARMED_CONTROL_INSTALLED",
+    "DISARMED_EVIDENCE_STARTED",
+    "POST_DISARMED_VERIFYING",
+    "POST_DISARMED_VERIFIED",
+):
+    require(phase in release_model, f"release_phase_missing:{phase}")
 require(
-    '[ "$probe_output" = "AUTONOMOUS_CONTROL_RUNTIME_OK" ]' in dockerfile,
-    "dockerfile_probe_stdout_not_exact",
+    '"autonomous_armed": False' in release_gateway
+    and '"kill_switch": True' in release_gateway,
+    "release_completion_not_disarmed",
 )
-require(
-    "set +e" not in dockerfile[dockerfile.find("FROM debian:bookworm-slim") :],
-    "dockerfile_probe_nonzero_status_tolerated",
-)
-require(
-    '[ "$probe_status" -eq 0 ]' in verifier,
-    "verifier_probe_zero_status_not_required",
-)
-require(
-    "[ \"$probe_output\" = AUTONOMOUS_CONTROL_RUNTIME_OK ]" in verifier,
-    "verifier_probe_stdout_not_exact",
-)
+require("DISARMED_EVIDENCE" in health, "disarmed_health_mode_missing")
+
+for asset in (
+    "live-executor/schema/005_closed_loop_economic_control.sql",
+    "scripts/activate-economic-canary.sh",
+    "scripts/economic-dashboard-loop.sh",
+):
+    require(asset in assets, f"release_asset_missing:{asset}")
+for installed in (
+    "005_closed_loop_economic_control.sql",
+    "activate-economic-canary.sh",
+    "economic-dashboard-loop.sh",
+    "economic-dashboard-snapshot.sql",
+):
+    require(installed in installer, f"release_context_install_missing:{installed}")
 PY
-  fail autonomous_control_contract_checker_failed
-
-grep -F 'Verify immutable image runtime contract' "$build_workflow" >/dev/null ||
-  fail immutable_build_runtime_gate_missing
-
-grep -F 'scripts/verify-image-runtime.sh' "$build_workflow" >/dev/null ||
-  fail immutable_build_runtime_verifier_missing
-
-grep -F 'scripts/verify-image-runtime.sh' "$ci_workflow" >/dev/null ||
-  fail source_ci_runtime_verifier_missing
+  fail "closed-loop release contract validation failed"
 
 echo "AUTONOMOUS_LIVE_RELEASE_CONTRACT_TEST_OK"

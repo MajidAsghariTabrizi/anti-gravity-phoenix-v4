@@ -11,6 +11,21 @@ def encoded_gas_components(gas: int = 100_000, l1_gas: int = 0) -> str:
     return "0x" + "".join(f"{value:064x}" for value in (gas, l1_gas, 0, 0))
 
 
+def deterministic_response(request: dict) -> dict | None:
+    method = request.get("method")
+    if method == "eth_estimateGas":
+        result = "0x186a0"
+    elif method == "eth_maxPriorityFeePerGas":
+        result = "0x1"
+    elif method == "eth_call" and request.get("params", [{}])[0].get("to", "").lower() == (
+        "0x00000000000000000000000000000000000000c8"
+    ):
+        result = encoded_gas_components()
+    else:
+        return None
+    return {"jsonrpc": "2.0", "id": request.get("id"), "result": result}
+
+
 class Handler(BaseHTTPRequestHandler):
     upstream = ""
 
@@ -23,18 +38,8 @@ class Handler(BaseHTTPRequestHandler):
             self.send_error(400)
             return
         request = json.loads(self.rfile.read(length))
-        method = request.get("method")
-        if method == "eth_estimateGas":
-            response = {"jsonrpc": "2.0", "id": request.get("id"), "result": "0x186a0"}
-        elif method == "eth_call" and request.get("params", [{}])[0].get("to", "").lower() == (
-            "0x00000000000000000000000000000000000000c8"
-        ):
-            response = {
-                "jsonrpc": "2.0",
-                "id": request.get("id"),
-                "result": encoded_gas_components(),
-            }
-        else:
+        response = deterministic_response(request)
+        if response is None:
             forwarded = urllib.request.Request(
                 self.upstream,
                 data=json.dumps(request, separators=(",", ":")).encode(),

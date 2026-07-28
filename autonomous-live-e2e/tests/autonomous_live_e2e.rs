@@ -7,6 +7,11 @@ use phoenix_engine::hunter::{
     CandidateBindings, HunterBounds, HunterCore, HunterEconomicConfig, HunterEvent, HunterMode,
     HunterRouteGraph, InMemoryCandidateSink, MaterializedCandidate,
 };
+use phoenix_fork_sandbox::model::{
+    CounterfactualResult, CounterfactualResultBody, ForkIdentity, PinnedBlockEvidence,
+    PredictedEconomics, RoutePlan, SimulationEvidence, SimulationStatus, UnsignedTransactionPlan,
+    VerificationEvidence, PLAN_SCHEMA_VERSION, RESULT_SCHEMA_VERSION,
+};
 use phoenix_live_executor::abi::encode_execute_opportunity;
 use phoenix_live_executor::autonomous::{AutonomousMaterializer, MaterializationState};
 use phoenix_live_executor::config::{ExecutorConfig, SafetyLimits};
@@ -161,6 +166,7 @@ struct ControlSnapshot {
     route_reason: Option<String>,
     route_hash: Option<String>,
     route_contract: Option<Json<Value>>,
+    economic_control: Json<Value>,
 }
 
 impl ControlSnapshot {
@@ -186,6 +192,13 @@ impl ControlSnapshot {
         .bind(CURRENT_ROUTE_FINGERPRINT)
         .fetch_one(pool)
         .await?;
+        let economic_control: Json<Value> = sqlx::query_scalar(
+            "SELECT to_jsonb(economic)
+             FROM live_canary.economic_control economic
+             WHERE singleton",
+        )
+        .fetch_one(pool)
+        .await?;
         Ok(Self {
             legacy_armed: legacy.try_get("armed")?,
             legacy_kill_switch: legacy.try_get("kill_switch")?,
@@ -201,6 +214,7 @@ impl ControlSnapshot {
             route_reason: route.try_get("disarm_reason")?,
             route_hash: route.try_get("control_hash")?,
             route_contract: route.try_get("control_contract")?,
+            economic_control,
         })
     }
 
@@ -245,6 +259,42 @@ impl ControlSnapshot {
         .bind(&self.route_hash)
         .bind(&self.route_contract)
         .bind(restored_at)
+        .execute(pool)
+        .await?;
+        sqlx::query(
+            "WITH snapshot AS (
+                SELECT *
+                FROM jsonb_populate_record(
+                    NULL::live_canary.economic_control,
+                    $1::jsonb
+                )
+             )
+             UPDATE live_canary.economic_control economic
+             SET schema_version = snapshot.schema_version,
+                 phase = snapshot.phase,
+                 route_fingerprint = snapshot.route_fingerprint,
+                 current_size_level = snapshot.current_size_level,
+                 current_input_wei = snapshot.current_input_wei,
+                 maximum_reviewed_input_wei = snapshot.maximum_reviewed_input_wei,
+                 release_sha = snapshot.release_sha,
+                 engine_image_digest = snapshot.engine_image_digest,
+                 route_universe_hash = snapshot.route_universe_hash,
+                 route_policy_hash = snapshot.route_policy_hash,
+                 risk_policy_hash = snapshot.risk_policy_hash,
+                 executor_code_hash = snapshot.executor_code_hash,
+                 readiness_id = snapshot.readiness_id,
+                 authorization_id = snapshot.authorization_id,
+                 cooldown_until = snapshot.cooldown_until,
+                 gas_reserve_wei = snapshot.gas_reserve_wei,
+                 gas_reserve_floor_wei = snapshot.gas_reserve_floor_wei,
+                 control_epoch = snapshot.control_epoch,
+                 last_transition_reason = snapshot.last_transition_reason,
+                 state_hash = snapshot.state_hash,
+                 updated_at = snapshot.updated_at
+             FROM snapshot
+             WHERE economic.singleton",
+        )
+        .bind(&self.economic_control)
         .execute(pool)
         .await?;
         Ok(())
@@ -488,6 +538,7 @@ impl Fixture {
         let bundle = self.candidate(variant).await?;
         self.store_candidate(&bundle).await?;
         let approval_time = at_whole_second(&bundle.event)? + ChronoDuration::seconds(1);
+        persist_candidate_fork_pass(&self.pool, &self.config, &bundle, approval_time).await?;
         let materializer = AutonomousMaterializer::connect(self.config.clone(), self.rpc.clone())
             .await
             .map_err(boxed)?;
@@ -603,8 +654,20 @@ impl Fixture {
         .await
         .ok()
         .flatten();
+        let economic =
+            sqlx::query_as::<_, (String, String, String, Option<String>, String, String)>(
+                "SELECT phase, current_size_level, current_input_wei::text,
+                        cooldown_until::text, last_transition_reason,
+                        updated_at::text
+                 FROM live_canary.economic_control
+                 WHERE singleton",
+            )
+            .fetch_optional(&self.pool)
+            .await
+            .ok()
+            .flatten();
         eprintln!(
-            "SCENARIO_DIAGNOSTIC scenario={} canonical_base={} expected={} actual={} retained_profit={} candidate={candidate:?} request={request:?} attempt={attempt:?} controls={controls:?}",
+            "SCENARIO_DIAGNOSTIC scenario={} canonical_base={} expected={} actual={} retained_profit={} candidate={candidate:?} request={request:?} attempt={attempt:?} controls={controls:?} economic={economic:?}",
             self.scenario,
             timestamp(self.base),
             expected,
@@ -1027,6 +1090,25 @@ async fn scenario_08_outcome_v1_and_realized_pnl() -> TestResult {
             && contract.0["candidate_hash"]
                 == text(&prepared.bundle.artifact.contract, "candidate_hash")?,
         "OutcomeV1 binding or realized PnL is invalid",
+    )?;
+    let cooldown: (bool, bool, Option<String>, String) = sqlx::query_as(
+        "SELECT route.enabled, route.kill_switch, route.disarm_reason, economic.phase
+         FROM live_canary.autonomous_route_controls route
+         CROSS JOIN live_canary.economic_control economic
+         WHERE route.route_fingerprint = $1 AND economic.singleton",
+    )
+    .bind(CURRENT_ROUTE_FINGERPRINT)
+    .fetch_one(&fixture.pool)
+    .await?;
+    require(
+        cooldown
+            == (
+                false,
+                true,
+                Some("realized_negative_cooldown".to_string()),
+                "COOLDOWN".to_string(),
+            ),
+        "one realized loss did not immediately enter route cooldown",
     )
 }
 
@@ -1180,73 +1262,79 @@ async fn scenario_11_route_risk_feedback_at_threshold() -> TestResult {
     let Some(fixture) = Fixture::new("route_risk_feedback_at_threshold", 11).await? else {
         return Ok(());
     };
+    let mut losses = Vec::new();
     for loss_number in 1_u64..=3 {
-        let prepared = fixture.approved(loss_number).await?;
-        let executor = LiveExecutor::new(
-            fixture.config.clone(),
-            isolated_signer()?,
-            PostgresExecutorStore::from_pool(fixture.pool.clone()),
-            ReadyAnvilRpc(fixture.rpc.clone()),
-        );
-        fixture
-            .diagnose(
-                "submit route-risk observation",
-                &format!("route loss {loss_number} approved"),
-            )
-            .await;
-        require(
-            matches!(
-                executor.step(prepared.approval_time).await.map_err(boxed)?,
-                ExecutionState::Pending { .. }
-            ),
-            format!("route loss {loss_number} did not submit"),
-        )?;
-        fixture
-            .diagnose(
-                "reconcile route loss and update feedback",
-                &format!("route loss {loss_number} pending"),
-            )
-            .await;
-        require(
-            matches!(
-                executor
-                    .step(prepared.approval_time + ChronoDuration::seconds(1))
-                    .await
-                    .map_err(boxed)?,
-                ExecutionState::Reverted { .. }
-            ),
-            format!("route loss {loss_number} did not reconcile"),
-        )?;
-        let route: (bool, bool, Option<String>) = sqlx::query_as(
-            "SELECT enabled, kill_switch, disarm_reason
-             FROM live_canary.autonomous_route_controls
-             WHERE route_fingerprint = $1",
+        losses.push(fixture.approved(loss_number).await?);
+    }
+    for (index, prepared) in losses.iter().enumerate() {
+        let loss_number = u64::try_from(index + 1).map_err(boxed)?;
+        insert_synthetic_loss(
+            &fixture.pool,
+            prepared,
+            1,
+            fixture
+                .seed
+                .checked_mul(100)
+                .and_then(|value| value.checked_add(loss_number))
+                .ok_or_else(|| failure("route loss hash seed overflow"))?,
         )
-        .bind(CURRENT_ROUTE_FINGERPRINT)
-        .fetch_one(&fixture.pool)
         .await?;
         fixture
             .diagnose(
-                if loss_number < 3 {
-                    "route remains enabled below three consecutive losses"
-                } else {
-                    "route disarmed at three consecutive losses"
-                },
-                &format!("{route:?}"),
+                "three independent reconciled route losses",
+                &format!("route loss {loss_number} persisted"),
             )
             .await;
-        if loss_number < 3 {
-            require(
-                route == (true, false, None),
-                "route disarmed below threshold",
-            )?;
-        } else {
-            require(
-                route == (false, true, Some("maximum_consecutive_losses".to_string())),
-                "route did not disarm at the consecutive-loss threshold",
-            )?;
-        }
     }
+    let threshold_bundle = fixture.candidate(4).await?;
+    fixture.store_candidate(&threshold_bundle).await?;
+    let threshold_time = at_whole_second(&threshold_bundle.event)? + ChronoDuration::seconds(1);
+    persist_candidate_fork_pass(
+        &fixture.pool,
+        &fixture.config,
+        &threshold_bundle,
+        threshold_time,
+    )
+    .await?;
+    let materializer = AutonomousMaterializer::connect(fixture.config.clone(), fixture.rpc.clone())
+        .await
+        .map_err(boxed)?;
+    let actual = materializer.step(threshold_time).await.map_err(boxed)?;
+    fixture
+        .diagnose(
+            "route disarmed at exactly three consecutive losses",
+            &format!("{actual:?}"),
+        )
+        .await;
+    require(
+        matches!(
+            actual,
+            MaterializationState::Rejected {
+                reason: "rejected_policy",
+                ..
+            }
+        ),
+        "three consecutive losses did not reject the next candidate",
+    )?;
+    let route: (bool, bool, Option<String>, String) = sqlx::query_as(
+        "SELECT route.enabled, route.kill_switch, route.disarm_reason, economic.phase
+         FROM live_canary.autonomous_route_controls route
+         CROSS JOIN live_canary.economic_control economic
+         WHERE route.route_fingerprint = $1 AND economic.singleton",
+    )
+    .bind(CURRENT_ROUTE_FINGERPRINT)
+    .fetch_one(&fixture.pool)
+    .await?;
+    require(
+        route
+            == (
+                false,
+                true,
+                Some("maximum_consecutive_losses".to_string()),
+                "DISARMED_FAILURE".to_string(),
+            ),
+        "route and economic state did not fail closed at the consecutive-loss threshold",
+    )?;
     let global: (bool, bool) = sqlx::query_as(
         "SELECT armed, kill_switch
          FROM live_canary.autonomous_global_control WHERE singleton",
@@ -1266,25 +1354,7 @@ async fn scenario_12_global_risk_feedback_at_threshold() -> TestResult {
         return Ok(());
     };
     let prepared = fixture.approved(0).await?;
-    let synthetic_hash = format!("0x{:064x}", fixture.seed);
-    sqlx::query(
-        "INSERT INTO live_canary.execution_outcomes(
-            request_id, tx_hash, outcome_status, receipt_status,
-            settled_event_found, block_number, gas_used, effective_gas_price,
-            actual_fee_wei, asset, flash_amount, premium, realized_profit,
-            net_pnl_wei, recorded_at
-         )
-         SELECT id, $2, 'reverted', 0, false, 1, 1, $3::numeric,
-                $3::numeric, flash_asset, flash_amount, 0, 0,
-                -($3::numeric), $4
-         FROM live_canary.execution_requests WHERE id = $1",
-    )
-    .bind(prepared.request_id)
-    .bind(synthetic_hash)
-    .bind(GLOBAL_LOSS_LIMIT.to_string())
-    .bind(prepared.approval_time)
-    .execute(&fixture.pool)
-    .await?;
+    insert_synthetic_loss(&fixture.pool, &prepared, GLOBAL_LOSS_LIMIT, fixture.seed).await?;
     let executor = LiveExecutor::new(
         fixture.config.clone(),
         isolated_signer()?,
@@ -1344,6 +1414,400 @@ async fn reset_history(pool: &PgPool) -> TestResult {
             live_canary.nonce_state
          RESTART IDENTITY CASCADE",
     )
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+async fn insert_synthetic_loss(
+    pool: &PgPool,
+    prepared: &Prepared,
+    amount: u128,
+    hash_seed: u64,
+) -> TestResult {
+    let synthetic_hash = format!("0x{hash_seed:064x}");
+    sqlx::query(
+        "INSERT INTO live_canary.execution_outcomes(
+            request_id, tx_hash, outcome_status, receipt_status,
+            settled_event_found, block_number, gas_used, effective_gas_price,
+            actual_fee_wei, asset, flash_amount, premium, realized_profit,
+            net_pnl_wei, recorded_at
+         )
+         SELECT id, $2, 'reverted', 0, false, 1, 1, $3::numeric,
+                $3::numeric, flash_asset, flash_amount, 0, 0,
+                -($3::numeric), $4
+         FROM live_canary.execution_requests WHERE id = $1",
+    )
+    .bind(prepared.request_id)
+    .bind(synthetic_hash)
+    .bind(amount.to_string())
+    .bind(prepared.approval_time)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+async fn persist_candidate_fork_pass(
+    pool: &PgPool,
+    config: &ExecutorConfig,
+    bundle: &CandidateBundle,
+    simulated_at: DateTime<Utc>,
+) -> TestResult {
+    let candidate = &bundle.artifact.contract;
+    let hunter_plan = &bundle.artifact.plan;
+    let route = hunter_plan
+        .get("route")
+        .and_then(Value::as_object)
+        .ok_or_else(|| failure("fork fixture route is missing"))?;
+    let route_legs = route
+        .get("legs")
+        .and_then(Value::as_array)
+        .ok_or_else(|| failure("fork fixture route legs are missing"))?;
+    let simulations = hunter_plan
+        .get("legs")
+        .and_then(Value::as_array)
+        .ok_or_else(|| failure("fork fixture simulations are missing"))?;
+    require(
+        !route_legs.is_empty() && route_legs.len() == simulations.len(),
+        "fork fixture route and simulation legs differ",
+    )?;
+    let pool_ids = route_legs
+        .iter()
+        .map(|leg| text(leg, "pool_id"))
+        .collect::<Result<Vec<_>, _>>()?;
+    let pool_addresses = route_legs
+        .iter()
+        .map(|leg| text(leg, "pool_address"))
+        .collect::<Result<Vec<_>, _>>()?;
+    let protocols = route_legs
+        .iter()
+        .map(|leg| text(leg, "protocol_id"))
+        .collect::<Result<Vec<_>, _>>()?;
+    let directions = route_legs
+        .iter()
+        .map(|leg| text(leg, "direction"))
+        .collect::<Result<Vec<_>, _>>()?;
+    let fees = route_legs
+        .iter()
+        .map(|leg| {
+            leg.get("fee")
+                .and_then(Value::as_u64)
+                .and_then(|value| u32::try_from(value).ok())
+                .ok_or_else(|| failure("fork fixture fee is invalid"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let expected_leg_outputs = simulations
+        .iter()
+        .map(|leg| text(leg, "amount_out"))
+        .collect::<Result<Vec<_>, _>>()?;
+    let minimum_leg_outputs = simulations
+        .iter()
+        .map(|leg| text(leg, "minimum_output"))
+        .collect::<Result<Vec<_>, _>>()?;
+    let pool_state_hash_path = simulations
+        .iter()
+        .map(|leg| text(leg, "pool_state_hash"))
+        .collect::<Result<Vec<_>, _>>()?;
+    let token_path = std::iter::once(text(&route_legs[0], "token_in")?)
+        .chain(
+            route_legs
+                .iter()
+                .map(|leg| text(leg, "token_out"))
+                .collect::<Result<Vec<_>, _>>()?,
+        )
+        .collect::<Vec<_>>();
+    let decision_id = text(candidate, "opportunity_id")?;
+    let route_fingerprint = text(candidate, "route_fingerprint")?;
+    let state_block_number = candidate
+        .get("state_block_number")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| failure("fork fixture block number is invalid"))?;
+    let selected_size = text(candidate, "selected_size")?;
+    let predicted_gross = text(candidate, "predicted_gross_profit")?;
+    let predicted_total_cost = text(candidate, "predicted_total_cost")?;
+    let predicted_net = text(candidate, "conservative_predicted_net_pnl")?;
+    let predicted_net_value = predicted_net.parse::<i128>()?;
+    require(
+        predicted_net_value > i128::try_from(RETAINED_PROFIT)?,
+        "fork fixture predicted net is not positive",
+    )?;
+    let deadline = DateTime::parse_from_rfc3339(&text(candidate, "candidate_expires_at")?)?
+        .timestamp()
+        .try_into()?;
+    let route_semantic_hash = route
+        .get("semantic_hash")
+        .and_then(Value::as_str)
+        .ok_or_else(|| failure("fork fixture route semantic hash is missing"))?;
+    let plan = UnsignedTransactionPlan {
+        schema_version: PLAN_SCHEMA_VERSION.to_string(),
+        shadow_decision_id: decision_id.to_string(),
+        source_event_identity: bundle.event.origin_event_id.clone(),
+        chain_id: ARBITRUM_ONE_CHAIN_ID,
+        route: RoutePlan {
+            route_id: route_semantic_hash.to_string(),
+            route_fingerprint: route_fingerprint.to_string(),
+            pool_ids: pool_ids.clone(),
+            pool_addresses: pool_addresses.clone(),
+            protocols: protocols.clone(),
+            directions: directions.clone(),
+            fees: fees.clone(),
+        },
+        token_path: token_path.clone(),
+        origin_router: bundle.event.origin_router.clone(),
+        input_amount: selected_size.to_string(),
+        maximum_input_amount: text(hunter_plan, "maximum_input_amount")?.to_string(),
+        expected_output: text(hunter_plan, "final_output")?.to_string(),
+        expected_leg_outputs: expected_leg_outputs.clone(),
+        minimum_output: minimum_leg_outputs
+            .last()
+            .cloned()
+            .ok_or_else(|| failure("fork fixture minimum output is missing"))?,
+        minimum_leg_outputs: minimum_leg_outputs.clone(),
+        minimum_profit: RETAINED_PROFIT
+            .checked_add(profitable_economics().gas_cost)
+            .ok_or_else(|| failure("fork fixture minimum profit overflow"))?
+            .to_string(),
+        calldata: format!("0x{}", hex::encode(&bundle.artifact.calldata)),
+        calldata_hash: text(candidate, "calldata_hash")?.to_string(),
+        value: "0".to_string(),
+        gas_estimate: 400_000,
+        gas_price_wei: "1".to_string(),
+        deadline,
+        target_contract: config.executor_address.to_string(),
+        target_code_hash: config.executor_code_hash.clone(),
+        simulation_from: config.wallet_address.to_string(),
+        pinned_block: PinnedBlockEvidence {
+            number: state_block_number,
+            hash: text(candidate, "state_block_hash")?.to_string(),
+        },
+        route_hash: route_semantic_hash.to_string(),
+        primary_state_hash: text(candidate, "state_hash")?.to_string(),
+        pool_state_hash_path: pool_state_hash_path.clone(),
+        verification: VerificationEvidence {
+            verification_status: "agreed".to_string(),
+            independent_verification_status: "agreed".to_string(),
+            agreement_state: "agreed".to_string(),
+            primary_provider_id: "isolated-primary".to_string(),
+            secondary_provider_id: "isolated-secondary".to_string(),
+        },
+        predicted: PredictedEconomics {
+            gross_profit: predicted_gross.to_string(),
+            total_cost: predicted_total_cost.to_string(),
+            net_pnl: predicted_net.to_string(),
+            minimum_required_net_pnl: RETAINED_PROFIT.to_string(),
+        },
+        model_version: "autonomous-live-e2e".to_string(),
+        policy_version: text(candidate, "route_policy_hash")?.to_string(),
+        unsigned: true,
+        fork_only: true,
+        shadow_only: true,
+        live_execution: false,
+        execution_eligible: false,
+        execution_request_created: false,
+        public_broadcast: false,
+        signer_used: false,
+    };
+    let simulated_gross = predicted_net_value
+        .checked_add(1)
+        .ok_or_else(|| failure("fork fixture simulated gross overflow"))?;
+    let result = CounterfactualResult::from_body(CounterfactualResultBody {
+        schema_version: RESULT_SCHEMA_VERSION.to_string(),
+        plan_hash: plan.canonical_hash()?,
+        shadow_decision_id: decision_id.to_string(),
+        status: SimulationStatus::Passed,
+        predicted_gross_profit: plan.predicted.gross_profit.clone(),
+        predicted_total_cost: plan.predicted.total_cost.clone(),
+        predicted_net_pnl: plan.predicted.net_pnl.clone(),
+        simulated_gross_profit: Some(simulated_gross.to_string()),
+        simulated_gas_cost: Some("1".to_string()),
+        simulated_balance_delta: Some(simulated_gross.to_string()),
+        simulated_net_pnl: Some(predicted_net.to_string()),
+        prediction_error: Some("0".to_string()),
+        gas_estimate: Some(plan.gas_estimate),
+        gas_used: Some(1),
+        model_version: plan.model_version.clone(),
+        policy_version: plan.policy_version.clone(),
+        fork: ForkIdentity {
+            chain_id: ARBITRUM_ONE_CHAIN_ID,
+            fork_block: plan.pinned_block.clone(),
+            fork_instance_hash: hex::encode(Sha256::digest(format!("fork-instance-{decision_id}"))),
+            local_block: plan.pinned_block.clone(),
+        },
+        simulated_at,
+        revert_reason: None,
+        evidence: SimulationEvidence {
+            rpc_methods: vec![
+                "eth_call".to_string(),
+                "eth_estimateGas".to_string(),
+                "debug_traceCall".to_string(),
+            ],
+            target_code_hash: plan.target_code_hash.clone(),
+            observed_pool_state_hashes: plan.pool_state_hash_path.clone(),
+            observed_aggregate_state_hash: plan.primary_state_hash.clone(),
+            call_output_hash: Some("1".repeat(64)),
+            trace_hash: Some("2".repeat(64)),
+            settled_route_hash: Some(plan.route_hash.clone()),
+        },
+        fork_only: true,
+        shadow_only: true,
+        live_execution: false,
+        execution_eligible: false,
+        execution_request_created: false,
+        public_broadcast: false,
+        signer_used: false,
+    })?;
+    result.validate_plan_binding(&plan).map_err(boxed)?;
+
+    sqlx::query(
+        r#"
+INSERT INTO shadow_decisions (
+    id, strategy, strategy_version, detector_version, code_version,
+    config_version, policy_version, chain_id, source_sequence,
+    observed_block, state_block, quote_block, route_fingerprint,
+    disposition, primary_rejection_reason, confidence_bps, execution_eligible,
+    base_net_pnl, conservative_net_pnl, severe_net_pnl, identity_evidence,
+    route_evidence, market_evidence, economics_evidence, simulation_evidence,
+    decision_evidence, outcome_evidence, observed_at, detected_at, decided_at,
+    source_event_identity, secondary_rejection_reasons, risk_flags,
+    processing_latency_ns
+) VALUES (
+    CAST($1 AS uuid), 'two_pool_v3_arbitrage', 'autonomous-live-e2e',
+    'autonomous-live-e2e', 'autonomous-live-e2e', 'autonomous-live-e2e',
+    $2, 42161, 1, $3::numeric, $3::numeric, $3::numeric, $4,
+    'rejected', 'contract_path_unavailable', 10000, false,
+    $5::numeric, $5::numeric, $5::numeric, '{}'::jsonb, '{}'::jsonb,
+    '{}'::jsonb, '{}'::jsonb, '{}'::jsonb, '{}'::jsonb, '{}'::jsonb,
+    $6, $6, $6, $7, '[]'::jsonb, '[]'::jsonb, 1
+)
+ON CONFLICT (id) DO NOTHING
+"#,
+    )
+    .bind(&decision_id)
+    .bind(&plan.policy_version)
+    .bind(state_block_number.to_string())
+    .bind(route_fingerprint)
+    .bind(predicted_net)
+    .bind(simulated_at)
+    .bind(&bundle.event.origin_event_id)
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        r#"
+INSERT INTO shadow_profitability_facts (
+    shadow_decision_id, source_event_identity, source_sequence,
+    transaction_hash, origin_router, chain_id, route_id, route_fingerprint,
+    detected_at, evaluated_at, pinned_block_number, pinned_block_hash,
+    primary_state_hash, token_path, pool_path, fee_path, pool_address_path,
+    protocol_path, direction_path, expected_leg_outputs, pool_state_hash_path,
+    opportunity_expires_at, fork_evidence_schema_version, input_amount,
+    expected_output, gross_spread, gross_profit, dex_fees, price_impact,
+    execution_gas, gas_price, arbitrum_execution_fee, l1_data_fee,
+    flash_loan_premium, protocol_fees, failed_attempt_reserve,
+    ordering_reserve, slippage_reserve, stale_state_reserve,
+    state_drift_reserve, latency_reserve, uncertainty_reserve,
+    contract_overhead, total_cost, expected_net_pnl, conservative_net_pnl,
+    severe_net_pnl, minimum_required_net_pnl, primary_profitability_status,
+    disposition, final_rejection_reason, secondary_rejection_reasons,
+    model_version, policy_version, detector_version, code_version,
+    primary_provider_id, primary_response_hash, route_config_hash,
+    secondary_provider_id, secondary_state_hash, secondary_block_number,
+    secondary_block_hash, secondary_route_config_hash, verification_status,
+    independent_verification_status, independent_verification_lifecycle,
+    agreement_state, shadow_only, execution_eligible,
+    execution_request_created, evidence_completeness_status
+) VALUES (
+    CAST($1 AS uuid), $2, 1, $3, $4, 42161, $5, $6, $7, $7,
+    $8::numeric, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18,
+    to_timestamp($19::double precision), 'phoenix.fork-evidence.v1', $20::numeric,
+    $21::numeric, $22::numeric, $22::numeric, 0, 0, 1, $23::numeric, $23::numeric, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, $23::numeric, $24::numeric,
+    $24::numeric, $24::numeric, $25::numeric, 'meets_minimum', 'rejected',
+    'contract_path_unavailable', '[]'::jsonb, $26, $27,
+    'autonomous-live-e2e', 'autonomous-live-e2e', 'isolated-primary',
+    $28, $29, 'isolated-secondary', $10, $8::numeric, $9, $29, 'agreed',
+    'agreed', '["requested","agreed"]'::jsonb, 'agreed', true, false,
+    false, 'complete'
+)
+ON CONFLICT (shadow_decision_id) DO NOTHING
+"#,
+    )
+    .bind(&decision_id)
+    .bind(&plan.source_event_identity)
+    .bind(&plan.pinned_block.hash)
+    .bind(&plan.origin_router)
+    .bind(&plan.route.route_id)
+    .bind(&plan.route.route_fingerprint)
+    .bind(simulated_at)
+    .bind(plan.pinned_block.number.to_string())
+    .bind(&plan.pinned_block.hash)
+    .bind(&plan.primary_state_hash)
+    .bind(Json(&plan.token_path))
+    .bind(Json(&plan.route.pool_ids))
+    .bind(Json(&plan.route.fees))
+    .bind(Json(&plan.route.pool_addresses))
+    .bind(Json(&plan.route.protocols))
+    .bind(Json(&plan.route.directions))
+    .bind(Json(&plan.expected_leg_outputs))
+    .bind(Json(&plan.pool_state_hash_path))
+    .bind(plan.deadline.to_string())
+    .bind(&plan.input_amount)
+    .bind(&plan.expected_output)
+    .bind(&plan.predicted.gross_profit)
+    .bind(&plan.predicted.total_cost)
+    .bind(&plan.predicted.net_pnl)
+    .bind(&plan.predicted.minimum_required_net_pnl)
+    .bind(&plan.model_version)
+    .bind(&plan.policy_version)
+    .bind("3".repeat(64))
+    .bind(&plan.route_hash)
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        r#"
+INSERT INTO fork_simulation_results (
+    result_hash, plan_hash, shadow_decision_id, plan_schema_version,
+    result_schema_version, plan, evidence, status, predicted_gross_profit,
+    predicted_total_cost, predicted_net_pnl, simulated_gross_profit,
+    simulated_gas_cost, simulated_balance_delta, simulated_net_pnl,
+    prediction_error, gas_estimate, gas_used, model_version, policy_version,
+    fork_chain_id, fork_block_number, fork_block_hash, fork_instance_hash,
+    local_block_number, local_block_hash, simulated_at, revert_reason,
+    fork_only, shadow_only, live_execution, execution_eligible,
+    execution_request_created, public_broadcast, signer_used
+) VALUES (
+    $1, $2, CAST($3 AS uuid), $4, $5, $6, $7, 'passed',
+    $8::numeric, $9::numeric, $10::numeric, $11::numeric, 1, $11::numeric,
+    $10::numeric, 0, $12::numeric, 1, $13, $14, 42161, $15::numeric,
+    $16, $17, $15::numeric, $16, $18, NULL,
+    true, true, false, false, false, false, false
+)
+ON CONFLICT (result_hash) DO NOTHING
+"#,
+    )
+    .bind(&result.result_hash)
+    .bind(&result.body.plan_hash)
+    .bind(&decision_id)
+    .bind(&plan.schema_version)
+    .bind(&result.body.schema_version)
+    .bind(Json(&plan))
+    .bind(Json(&result.body.evidence))
+    .bind(&result.body.predicted_gross_profit)
+    .bind(&result.body.predicted_total_cost)
+    .bind(&result.body.predicted_net_pnl)
+    .bind(
+        result
+            .body
+            .simulated_gross_profit
+            .as_deref()
+            .ok_or_else(|| failure("fork fixture gross result is missing"))?,
+    )
+    .bind(result.body.gas_estimate.unwrap_or_default().to_string())
+    .bind(&result.body.model_version)
+    .bind(&result.body.policy_version)
+    .bind(result.body.fork.fork_block.number.to_string())
+    .bind(&result.body.fork.fork_block.hash)
+    .bind(&result.body.fork.fork_instance_hash)
+    .bind(result.body.simulated_at)
     .execute(pool)
     .await?;
     Ok(())
@@ -1488,7 +1952,7 @@ fn profitable_economics() -> HunterEconomicConfig {
         tick_crossing_gas_cost: 1,
         ordering_cost_reserve: 0,
         model_error_reserve_bps: 10,
-        shadow_maximum_input: 10_000_000_000_000_000,
+        shadow_maximum_input: 100_000_000_000_000,
     }
 }
 
