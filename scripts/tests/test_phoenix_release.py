@@ -23,6 +23,7 @@ from scripts.phoenix_release.controller import (
 )
 from scripts.phoenix_release.gateway import (
     _bounded_output,
+    _live_executor_absence_is_fail_closed,
     _rollback_failed_state,
     _runtime_may_have_changed,
     _service_absence_allowed,
@@ -672,6 +673,70 @@ class ReconciliationTests(unittest.TestCase):
         self.assertFalse(_service_absence_allowed({}, "SHADOW"))
         self.assertFalse(
             _service_absence_allowed({"live_canary_only": False}, "SHADOW")
+        )
+
+    def test_stopped_live_executor_requires_complete_fail_closed_evidence(
+        self,
+    ) -> None:
+        release_evidence = {
+            "contract_paused": True,
+            "autonomous_armed": False,
+            "kill_switch": True,
+        }
+        runtime_evidence = {
+            "armed": False,
+            "kill_switch": True,
+            "active_attempts": 0,
+        }
+        self.assertTrue(
+            _live_executor_absence_is_fail_closed(
+                release_evidence, runtime_evidence
+            )
+        )
+
+        unsafe_values = (
+            ("contract_paused", False, "release"),
+            ("autonomous_armed", True, "release"),
+            ("kill_switch", False, "release"),
+            ("armed", True, "runtime"),
+            ("kill_switch", False, "runtime"),
+            ("active_attempts", 1, "runtime"),
+            ("active_attempts", False, "runtime"),
+        )
+        for field, value, source in unsafe_values:
+            with self.subTest(field=field, source=source):
+                candidate_release = dict(release_evidence)
+                candidate_runtime = dict(runtime_evidence)
+                target = (
+                    candidate_release
+                    if source == "release"
+                    else candidate_runtime
+                )
+                target[field] = value
+                self.assertFalse(
+                    _live_executor_absence_is_fail_closed(
+                        candidate_release, candidate_runtime
+                    )
+                )
+
+    def test_stopped_live_executor_rejects_unbounded_runtime_evidence(
+        self,
+    ) -> None:
+        release_evidence = {
+            "contract_paused": True,
+            "autonomous_armed": False,
+            "kill_switch": True,
+        }
+        runtime_evidence = {
+            "armed": False,
+            "kill_switch": True,
+            "active_attempts": 0,
+            "unreviewed": True,
+        }
+        self.assertFalse(
+            _live_executor_absence_is_fail_closed(
+                release_evidence, runtime_evidence
+            )
         )
 
 

@@ -481,6 +481,74 @@ def _service_absence_allowed(
     return phoenix_mode == "SHADOW" and component.get("live_canary_only") is True
 
 
+def _live_executor_absence_is_fail_closed(
+    release_evidence: dict[str, Any], runtime_evidence: object
+) -> bool:
+    return (
+        release_evidence.get("contract_paused") is True
+        and release_evidence.get("autonomous_armed") is False
+        and release_evidence.get("kill_switch") is True
+        and isinstance(runtime_evidence, dict)
+        and set(runtime_evidence) == {"armed", "kill_switch", "active_attempts"}
+        and runtime_evidence["armed"] is False
+        and runtime_evidence["kill_switch"] is True
+        and type(runtime_evidence["active_attempts"]) is int
+        and runtime_evidence["active_attempts"] == 0
+    )
+
+
+def _require_fail_closed_live_executor_absence(
+    paths: HostPaths, compose_arguments: list[str], release_sha: str
+) -> None:
+    release_evidence = load_state(state_file(paths, release_sha))
+    output = _require_success(
+        compose_arguments
+        + [
+            "exec",
+            "-T",
+            "postgres",
+            "/bin/sh",
+            "-c",
+            (
+                "exec psql -X -qAt -v ON_ERROR_STOP=1 "
+                '-U "$POSTGRES_USER" -d "$POSTGRES_DB" -c '
+                "\"SELECT json_build_object("
+                "'armed', global_control.armed, "
+                "'kill_switch', global_control.kill_switch, "
+                "'active_attempts', (SELECT count(*) "
+                "FROM live_canary.execution_attempts "
+                "WHERE status IN ("
+                "'claimed', 'nonce_allocated', 'submission_unknown', "
+                "'pending', 'timed_out'))"
+                ")::text "
+                "FROM live_canary.autonomous_global_control AS global_control "
+                "WHERE global_control.singleton\""
+            ),
+        ],
+        "ACTIVE_SERVICE_EVIDENCE_FAILED",
+    )
+    try:
+        runtime_evidence = json.loads(output)
+    except json.JSONDecodeError as exc:
+        raise GatewayError("ACTIVE_SERVICE_EVIDENCE_INVALID") from exc
+    if not _live_executor_absence_is_fail_closed(
+        release_evidence, runtime_evidence
+    ):
+        bounded_runtime = (
+            runtime_evidence if isinstance(runtime_evidence, dict) else {}
+        )
+        raise GatewayError(
+            "ACTIVE_SERVICE_ABSENCE_UNSAFE",
+            {
+                "service": "live-executor",
+                "contract_paused": release_evidence.get("contract_paused"),
+                "armed": bounded_runtime.get("armed"),
+                "kill_switch": bounded_runtime.get("kill_switch"),
+                "active_attempts": bounded_runtime.get("active_attempts"),
+            },
+        )
+
+
 def reconcile_active_context(paths: HostPaths) -> dict[str, Any]:
     active = status(paths)
     release_sha = active["active_release"]
@@ -507,7 +575,12 @@ def reconcile_active_context(paths: HostPaths) -> dict[str, Any]:
     ]
     if active["phoenix_mode"] == "LIVE":
         compose_arguments.extend(
-            ["-f", str(paths.deploy_dir / "compose.live-autonomous.yml")]
+            [
+                "-f",
+                str(paths.deploy_dir / "compose.live-autonomous.yml"),
+                "--profile",
+                "live-autonomous",
+            ]
         )
     rendered = _require_success(
         compose_arguments + ["config", "--format", "json"],
@@ -556,6 +629,14 @@ def reconcile_active_context(paths: HostPaths) -> dict[str, Any]:
                 "ACTIVE_CONTAINER_LOOKUP_FAILED",
             ).strip()
             if not container_id:
+                if (
+                    name == "live-executor"
+                    and component.get("live_canary_only") is True
+                    and active["phoenix_mode"] == "LIVE"
+                ):
+                    _require_fail_closed_live_executor_absence(
+                        paths, compose_arguments, release_sha
+                    )
                 # Services deliberately absent in the current mode do not prove a
                 # mismatch and are left untouched.
                 continue
