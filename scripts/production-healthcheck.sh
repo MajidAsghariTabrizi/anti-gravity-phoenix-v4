@@ -12,7 +12,7 @@ sleep_seconds="${PHOENIX_HEALTH_SLEEP_SECONDS:-3}"
 expected_mode="${PHOENIX_HEALTH_EXPECTED_MODE:-}"
 
 case "$expected_mode" in
-  ""|LIVE|SHADOW) ;;
+  ""|LIVE|SHADOW|DISARMED_EVIDENCE) ;;
   *) echo "HEALTH_FAIL: invalid expected mode"; exit 1 ;;
 esac
 
@@ -30,7 +30,7 @@ health_mode=${expected_mode:-${PHOENIX_MODE:-SHADOW}}
 
 compose() {
   set -- --env-file "$env_file" --env-file "$release_env" -f "$compose_file" "$@"
-  if [ "$health_mode" = LIVE ]; then
+  if [ "$health_mode" = LIVE ] || [ "$health_mode" = DISARMED_EVIDENCE ]; then
     set -- --env-file "$env_file" --env-file "$release_env" \
       -f "$compose_file" -f "$overlay_file" --profile live-autonomous "$@"
   fi
@@ -75,6 +75,14 @@ if [ "$health_mode" = LIVE ]; then
     '[ "$PHOENIX_MODE" = LIVE ] && [ "$LIVE_EXECUTION" = true ] && [ "$AUTONOMOUS_EXECUTION" = true ]'
   check autonomous-controls compose exec -T live-executor \
     /usr/local/bin/autonomous-live-control status
+  check event-metrics compose exec -T phoenix-engine wget -q -O - \
+    http://127.0.0.1:9200/metrics
+elif [ "$health_mode" = DISARMED_EVIDENCE ]; then
+  [ -z "$(compose ps -q live-executor | awk 'NF { print; exit }')" ] ||
+    { echo "HEALTH_FAIL: live-executor-running-while-disarmed"; exit 1; }
+  check disarmed-evidence-mode compose exec -T phoenix-engine /bin/sh -c \
+    '[ "$PHOENIX_MODE" = LIVE ] && [ "$LIVE_EXECUTION" = true ] && [ "$AUTONOMOUS_EXECUTION" = true ]'
+  check disarmed-controls compose run --rm --no-deps autonomous-control status
   check event-metrics compose exec -T phoenix-engine wget -q -O - \
     http://127.0.0.1:9200/metrics
 else

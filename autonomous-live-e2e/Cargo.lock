@@ -2114,6 +2114,7 @@ dependencies = [
  "futures-util",
  "hex",
  "phoenix-engine",
+ "phoenix-fork-sandbox",
  "phoenix-live-executor",
  "rpc-gateway",
  "serde_json",

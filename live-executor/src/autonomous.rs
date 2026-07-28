@@ -1,9 +1,12 @@
-use crate::approval::insert_approved_request;
+use crate::approval::{insert_approved_request, load_simulation, StoredSimulation};
 use crate::config::ExecutorConfig;
+use crate::economic_control::SizeLevel;
 use crate::model::{canonical_digest, CanonicalAddress, ExecutionRequest, ValidatedLeg};
 use crate::rpc::{HttpExecutionRpc, RpcErrorKind, TransactionQuote};
+use crate::store::insert_runtime_transition;
 use crate::{APPROVAL_POLICY_VERSION, REQUEST_SCHEMA_VERSION};
 use chrono::{DateTime, SecondsFormat, TimeZone, Utc};
+use phoenix_fork_sandbox::SimulationStatus;
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 use sqlx::postgres::PgPoolOptions;
@@ -14,7 +17,7 @@ use std::time::Duration;
 use thiserror::Error;
 use uuid::Uuid;
 
-const SCHEMA_VERSION: &str = "phoenix.live-canary-schema.v4";
+const SCHEMA_VERSION: &str = "phoenix.live-canary-schema.v5";
 const QUOTE_SCHEMA: &str = "phoenix.submission-quote.v1";
 const RISK_SCHEMA: &str = "phoenix.risk-snapshot.v1";
 const APPROVAL_SCHEMA: &str = "phoenix.automatic-approval.v1";
@@ -339,6 +342,46 @@ impl AutonomousMaterializer {
             transaction.rollback().await.map_err(database_error)?;
             return Ok(MaterializationState::Idle);
         }
+        let fork =
+            load_bound_fork_evidence(&mut transaction, &candidate, now, minimum_retained_profit)
+                .await?;
+        let simulation_result_hash = match fork {
+            ForkDisposition::Pending => {
+                sqlx::query(
+                    "UPDATE live_canary.autonomous_candidates
+                     SET status = 'materialized', rejection_reason = NULL,
+                         updated_at = $2
+                     WHERE candidate_id = $1 AND status = 'approval_pending'",
+                )
+                .bind(candidate.candidate_id)
+                .bind(now)
+                .execute(&mut *transaction)
+                .await
+                .map_err(database_error)?;
+                transaction.commit().await.map_err(database_error)?;
+                return Ok(MaterializationState::Idle);
+            }
+            ForkDisposition::Rejected(reason) => {
+                sqlx::query(
+                    "UPDATE live_canary.autonomous_candidates
+                     SET status = 'simulation_mismatch', rejection_reason = $2,
+                         updated_at = $3
+                     WHERE candidate_id = $1 AND status = 'approval_pending'",
+                )
+                .bind(candidate.candidate_id)
+                .bind(reason)
+                .bind(now)
+                .execute(&mut *transaction)
+                .await
+                .map_err(database_error)?;
+                transaction.commit().await.map_err(database_error)?;
+                return Ok(MaterializationState::Rejected {
+                    candidate_id: candidate.candidate_id,
+                    reason: "simulation_mismatch",
+                });
+            }
+            ForkDisposition::Passed(result_hash) => result_hash,
+        };
         let controls = load_controls(
             &mut transaction,
             &candidate.route_fingerprint,
@@ -352,23 +395,55 @@ impl AutonomousMaterializer {
         if risk_facts.route_daily_loss >= route_loss_limit
             || u64::from(risk_facts.consecutive_losses) >= consecutive_limit
         {
+            let reason = if risk_facts.route_daily_loss >= route_loss_limit {
+                "route_daily_loss_budget"
+            } else {
+                "maximum_consecutive_losses"
+            };
             sqlx::query(
                 "UPDATE live_canary.autonomous_route_controls
                  SET enabled = false, kill_switch = true,
-                     disarm_reason = $2, control_hash = NULL,
+                     disarm_reason = $2, control_epoch = control_epoch + 1,
+                     control_hash = NULL,
                      control_contract = NULL, updated_at = $3
                  WHERE route_fingerprint = $1",
             )
             .bind(&candidate.route_fingerprint)
-            .bind(if risk_facts.route_daily_loss >= route_loss_limit {
-                "route_daily_loss_budget"
-            } else {
-                "maximum_consecutive_losses"
-            })
+            .bind(reason)
             .bind(now)
             .execute(&mut *transaction)
             .await
             .map_err(database_error)?;
+            let next_epoch = controls
+                .economic_epoch
+                .checked_add(1)
+                .ok_or(AutonomousMaterializerError::Arithmetic)?;
+            sqlx::query(
+                "UPDATE live_canary.economic_control
+                 SET phase = 'DISARMED_FAILURE', cooldown_until = NULL,
+                     control_epoch = $1, last_transition_reason = $2,
+                     updated_at = $3
+                 WHERE singleton",
+            )
+            .bind(next_epoch)
+            .bind(reason)
+            .bind(now)
+            .execute(&mut *transaction)
+            .await
+            .map_err(database_error)?;
+            insert_runtime_transition(
+                &mut transaction,
+                &controls.economic_phase,
+                controls.current_level.as_str(),
+                "DISARMED_FAILURE",
+                controls.current_level.as_str(),
+                reason,
+                controls.release_sha.as_deref(),
+                next_epoch,
+                now,
+            )
+            .await
+            .map_err(|_| AutonomousMaterializerError::Integrity)?;
             transaction.commit().await.map_err(database_error)?;
             return self
                 .reject(candidate.candidate_id, "rejected_policy", "route_disarmed")
@@ -418,7 +493,7 @@ impl AutonomousMaterializer {
             "submission_quote_hash": quote_hash,
             "state_hash": candidate.state_hash,
             "plan_hash": candidate.plan_hash,
-            "simulation_result_hash": candidate.state_hash,
+            "simulation_result_hash": simulation_result_hash,
             "calldata_hash": candidate.calldata_hash,
             "executor_address": candidate.executor_address.to_string(),
             "executor_code_hash": candidate.executor_code_hash,
@@ -436,7 +511,7 @@ impl AutonomousMaterializer {
         let automatic_digest = policy_text(&approval, "automatic_approval_digest")?.to_string();
         let request = build_execution_request(
             &candidate,
-            &submission_quote,
+            &approval,
             executable_net,
             minimum_retained_profit,
             quote,
@@ -450,6 +525,7 @@ impl AutonomousMaterializer {
             &risk_snapshot,
             &submission_quote,
             &approval,
+            &simulation_result_hash,
         )
         .await?;
         sqlx::query(
@@ -512,16 +588,17 @@ impl AutonomousMaterializer {
         &self,
         candidate_id: Uuid,
         status: &'static str,
-        _reason: &'static str,
+        reason: &'static str,
     ) -> Result<MaterializationState, AutonomousMaterializerError> {
         let result = sqlx::query(
             "UPDATE live_canary.autonomous_candidates
-             SET status = $2, updated_at = now()
+             SET status = $2, rejection_reason = $3, updated_at = now()
              WHERE candidate_id = $1
                AND status IN ('materialized', 'approval_pending')",
         )
         .bind(candidate_id)
         .bind(status)
+        .bind(reason)
         .execute(&self.pool)
         .await
         .map_err(database_error)?;
@@ -569,6 +646,11 @@ struct Controls {
     global_maximum_input: u128,
     global_daily_loss_limit: u128,
     route_maximum_input: u128,
+    current_input: u128,
+    current_level: SizeLevel,
+    economic_phase: String,
+    economic_epoch: i64,
+    release_sha: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -578,6 +660,133 @@ struct RiskFacts {
     consecutive_losses: u32,
     active_attempts: u64,
     next_nonce: Option<u64>,
+}
+
+enum ForkDisposition {
+    Pending,
+    Rejected(&'static str),
+    Passed(String),
+}
+
+async fn load_bound_fork_evidence(
+    transaction: &mut Transaction<'_, Postgres>,
+    candidate: &AutonomousCandidate,
+    now: DateTime<Utc>,
+    minimum_retained_profit: u128,
+) -> Result<ForkDisposition, AutonomousMaterializerError> {
+    let result_hash: Option<String> = sqlx::query_scalar(
+        "SELECT result.result_hash
+         FROM public.fork_simulation_results result
+         WHERE result.plan->>'source_event_identity' = $1
+           AND result.plan->'route'->>'route_fingerprint' = $2
+           AND result.plan->>'input_amount' = $3
+           AND result.plan->'pinned_block'->>'number' = $4
+         ORDER BY result.simulated_at DESC, result.result_hash
+         LIMIT 1
+         FOR SHARE",
+    )
+    .bind(&candidate.origin_event_id)
+    .bind(&candidate.route_fingerprint)
+    .bind(candidate.selected_size.to_string())
+    .bind(candidate.state_block_number.to_string())
+    .fetch_optional(&mut **transaction)
+    .await
+    .map_err(database_error)?;
+    let Some(result_hash) = result_hash else {
+        return Ok(ForkDisposition::Pending);
+    };
+    let simulation = load_simulation(transaction, &result_hash)
+        .await
+        .map_err(|_| AutonomousMaterializerError::Integrity)?;
+    validate_bound_fork_evidence(candidate, &simulation, now, minimum_retained_profit)
+}
+
+fn validate_bound_fork_evidence(
+    candidate: &AutonomousCandidate,
+    simulation: &StoredSimulation,
+    now: DateTime<Utc>,
+    minimum_retained_profit: u128,
+) -> Result<ForkDisposition, AutonomousMaterializerError> {
+    simulation
+        .result
+        .validate_plan_binding(&simulation.plan)
+        .map_err(|_| AutonomousMaterializerError::Integrity)?;
+    let plan = &simulation.plan;
+    let result = &simulation.result;
+    let calldata = plan
+        .calldata
+        .strip_prefix("0x")
+        .and_then(|encoded| hex::decode(encoded).ok())
+        .ok_or(AutonomousMaterializerError::Integrity)?;
+    let candidate_deadline = u64::try_from(candidate.expires_at.timestamp())
+        .map_err(|_| AutonomousMaterializerError::Arithmetic)?;
+    let simulated_net = result
+        .body
+        .simulated_net_pnl
+        .as_deref()
+        .and_then(|value| value.parse::<i128>().ok());
+    let predicted_net = result
+        .body
+        .predicted_net_pnl
+        .parse::<i128>()
+        .map_err(|_| AutonomousMaterializerError::Integrity)?;
+    let prediction_error = result
+        .body
+        .prediction_error
+        .as_deref()
+        .and_then(|value| value.parse::<i128>().ok());
+    let maximum_prediction_error = predicted_net
+        .unsigned_abs()
+        .checked_mul(1_000)
+        .and_then(|value| value.checked_div(10_000))
+        .ok_or(AutonomousMaterializerError::Arithmetic)?;
+    let binding_matches = plan.source_event_identity == candidate.origin_event_id
+        && plan.chain_id == candidate.chain_id
+        && plan.route.route_fingerprint == candidate.route_fingerprint
+        && plan.input_amount == candidate.selected_size.to_string()
+        && plan.calldata_hash == candidate.calldata_hash
+        && calldata == candidate.calldata
+        && plan.target_contract == candidate.executor_address.to_string()
+        && plan.target_code_hash == candidate.executor_code_hash
+        && plan.pinned_block.number == candidate.state_block_number
+        && plan.pinned_block.hash == candidate.state_block_hash
+        && plan.primary_state_hash == candidate.state_hash
+        && plan.deadline == candidate_deadline
+        && plan.verification.verification_status == "agreed"
+        && plan.verification.independent_verification_status == "agreed"
+        && plan.verification.agreement_state == "agreed"
+        && !plan.verification.primary_provider_id.trim().is_empty()
+        && !plan.verification.secondary_provider_id.trim().is_empty()
+        && plan.verification.primary_provider_id != plan.verification.secondary_provider_id
+        && result.body.fork.chain_id == candidate.chain_id
+        && result.body.fork.fork_block.number == candidate.state_block_number
+        && result.body.fork.fork_block.hash == candidate.state_block_hash
+        && result.body.evidence.target_code_hash == candidate.executor_code_hash
+        && result.body.evidence.observed_aggregate_state_hash == candidate.state_hash
+        && result.body.simulated_at <= now
+        && result.body.simulated_at >= candidate.created_at - chrono::Duration::seconds(5);
+    if !binding_matches {
+        return Ok(ForkDisposition::Rejected("fork_evidence_binding"));
+    }
+    if result.body.status != SimulationStatus::Passed {
+        return Ok(ForkDisposition::Rejected("fork_reverted"));
+    }
+    let Some(simulated_net) = simulated_net else {
+        return Err(AutonomousMaterializerError::Integrity);
+    };
+    let Some(prediction_error) = prediction_error else {
+        return Err(AutonomousMaterializerError::Integrity);
+    };
+    if simulated_net
+        <= i128::try_from(minimum_retained_profit)
+            .map_err(|_| AutonomousMaterializerError::Arithmetic)?
+    {
+        return Ok(ForkDisposition::Rejected("fork_net_below_floor"));
+    }
+    if prediction_error.unsigned_abs() > maximum_prediction_error {
+        return Ok(ForkDisposition::Rejected("fork_prediction_error"));
+    }
+    Ok(ForkDisposition::Passed(result.result_hash.clone()))
 }
 
 fn decode_candidate(
@@ -838,6 +1047,23 @@ async fn load_controls(
     .fetch_one(&mut **transaction)
     .await
     .map_err(database_error)?;
+    let economic = sqlx::query(
+        "SELECT phase, current_size_level,
+                current_input_wei::text AS current_input_wei,
+                route_fingerprint, route_policy_hash, control_epoch, release_sha
+         FROM live_canary.economic_control
+         WHERE singleton
+         FOR UPDATE",
+    )
+    .fetch_one(&mut **transaction)
+    .await
+    .map_err(database_error)?;
+    let level_text: String = economic
+        .try_get("current_size_level")
+        .map_err(database_error)?;
+    let current_level = SizeLevel::try_from(level_text.as_str())
+        .map_err(|_| AutonomousMaterializerError::Integrity)?;
+    let economic_phase: String = economic.try_get("phase").map_err(database_error)?;
     if !global.try_get::<bool, _>("armed").map_err(database_error)?
         || global
             .try_get::<bool, _>("kill_switch")
@@ -856,6 +1082,17 @@ async fn load_controls(
             .try_get::<String, _>("route_policy_hash")
             .map_err(database_error)?
             != route_policy_hash
+        || economic_phase != current_level.phase().as_str()
+        || economic
+            .try_get::<Option<String>, _>("route_fingerprint")
+            .map_err(database_error)?
+            .as_deref()
+            != Some(route_fingerprint)
+        || economic
+            .try_get::<Option<String>, _>("route_policy_hash")
+            .map_err(database_error)?
+            .as_deref()
+            != Some(route_policy_hash)
     {
         return Err(AutonomousMaterializerError::Policy);
     }
@@ -903,6 +1140,15 @@ async fn load_controls(
                 .try_get::<String, _>("maximum_permitted_size")
                 .map_err(database_error)?,
         )?,
+        current_input: decimal_u128(
+            &economic
+                .try_get::<String, _>("current_input_wei")
+                .map_err(database_error)?,
+        )?,
+        current_level,
+        economic_phase,
+        economic_epoch: economic.try_get("control_epoch").map_err(database_error)?,
+        release_sha: economic.try_get("release_sha").map_err(database_error)?,
     })
 }
 
@@ -989,8 +1235,10 @@ fn validate_controls(
     let route_loss_limit = policy_u128(route_policy, "per_route_daily_loss")?;
     let maximum_consecutive = policy_u64(route_policy, "maximum_consecutive_losses")?;
     let cooldown = controls.route.get("cooldown_until");
-    if candidate.selected_size > controls.global_maximum_input
-        || candidate.selected_size > controls.route_maximum_input
+    if candidate.selected_size != controls.current_input
+        || candidate.selected_size != controls.current_level.amount_wei()
+        || controls.global_maximum_input != controls.current_input
+        || controls.route_maximum_input != controls.current_input
         || candidate.selected_size > config.limits.maximum_input_amount
         || facts.global_daily_loss >= controls.global_daily_loss_limit
         || facts.route_daily_loss >= route_loss_limit
@@ -1053,7 +1301,7 @@ fn build_risk_snapshot(
 
 fn build_execution_request(
     candidate: &AutonomousCandidate,
-    _submission_quote: &Value,
+    approval: &Value,
     executable_net: i128,
     minimum_retained_profit: u128,
     quote: TransactionQuote,
@@ -1152,7 +1400,7 @@ fn build_execution_request(
         executor_address: candidate.executor_address,
         executor_code_hash: candidate.executor_code_hash.clone(),
         calldata_hash: candidate.calldata_hash.clone(),
-        simulation_result_hash: candidate.state_hash.clone(),
+        simulation_result_hash: policy_text(approval, "simulation_result_hash")?.to_string(),
         plan_hash: candidate.plan_hash.clone(),
         pinned_block_number: candidate.state_block_number,
         pinned_block_hash: candidate.state_block_hash.clone(),
@@ -1188,6 +1436,7 @@ async fn insert_approval(
     risk: &Value,
     quote: &Value,
     approval: &Value,
+    simulation_result_hash: &str,
 ) -> Result<(), AutonomousMaterializerError> {
     sqlx::query(
         "INSERT INTO live_canary.autonomous_approvals(
@@ -1212,7 +1461,7 @@ async fn insert_approval(
     .bind(policy_text(quote, "quote_evidence_hash")?)
     .bind(&candidate.state_hash)
     .bind(&candidate.plan_hash)
-    .bind(&candidate.state_hash)
+    .bind(simulation_result_hash)
     .bind(&candidate.calldata_hash)
     .bind(candidate.executor_address.to_string())
     .bind(&candidate.executor_code_hash)
@@ -1503,7 +1752,7 @@ mod tests {
         let quote = quote();
         let initial = build_execution_request(
             &candidate,
-            &json!({}),
+            &json!({"simulation_result_hash": "8".repeat(64)}),
             2_000_000_000_000,
             RETAINED_PROFIT,
             quote.clone(),
@@ -1518,7 +1767,7 @@ mod tests {
 
         let rebuilt = build_execution_request(
             &candidate,
-            &json!({}),
+            &json!({"simulation_result_hash": "8".repeat(64)}),
             2_000_000_000_000,
             RETAINED_PROFIT,
             quote,

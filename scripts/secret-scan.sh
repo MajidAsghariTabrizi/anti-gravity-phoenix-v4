@@ -22,7 +22,7 @@ scan_rule() {
 
 find . -type f \
   ! -path './.git/*' \
-  ! -path './target/*' \
+  ! -path '*/target/*' \
   ! -path './node_modules/*' \
   ! -path './contracts/out/*' \
   ! -path './contracts/cache/*' \

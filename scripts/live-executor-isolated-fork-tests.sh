@@ -1,7 +1,7 @@
 #!/usr/bin/env sh
 set -eu
 
-for command in forge cast anvil cargo python3; do
+for command in forge cast anvil cargo python3 psql; do
   if ! command -v "$command" >/dev/null 2>&1; then
     printf 'required isolated-fork command is unavailable: %s\n' "$command" >&2
     exit 1
@@ -153,11 +153,149 @@ POSTGRES_DSN="$test_dsn" \
   cargo run --locked --quiet --manifest-path live-executor/Cargo.toml \
     --bin autonomous-live-control -- migrate
 POSTGRES_DSN="$test_dsn" \
+PHOENIX_RELEASE_SHA=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
+PHOENIX_ENGINE_IMAGE=sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb \
+LIVE_EXECUTOR_EXECUTOR_CODE_HASH="$executor_code_hash" \
+LIVE_EXECUTOR_MAX_DAILY_LOSS_WEI=10000000000000000 \
+PHOENIX_DISARMED_DEPLOY_ACK=INSTALL_DISARMED_EVIDENCE_RELEASE_42161 \
+  cargo run --locked --quiet --manifest-path live-executor/Cargo.toml \
+    --bin autonomous-live-control -- disarmed-deploy
+
+read -r global_epoch route_epoch <<EOF
+$(psql -X -qAt "$test_dsn" -F ' ' -c \
+  "SELECT global.control_epoch, route.control_epoch
+   FROM live_canary.autonomous_global_control global
+   JOIN live_canary.autonomous_route_controls route
+     ON route.route_fingerprint = 'arbitrum-weth-usdc-uniswap-v3-500-3000-v1'
+   WHERE global.singleton")
+EOF
+readiness_file="$tmp_dir/canary-readiness.json"
+authorization_file="$tmp_dir/automation-authorization.json"
+python3 - "$readiness_file" "$authorization_file" \
+  "$global_epoch" "$route_epoch" "$executor_code_hash" <<'PY'
+import datetime
+import hashlib
+import json
+import sys
+
+
+def timestamp(value):
+    return value.replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def bind_hash(value, field, domain, schema):
+    body = dict(value)
+    body.pop(field)
+    canonical = json.dumps(body, sort_keys=True, separators=(",", ":"))
+    prefix = f"phoenix.canonical-json.v1:{domain}:{schema}\n"
+    return hashlib.sha256((prefix + canonical).encode()).hexdigest()
+
+
+now = datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0)
+binding = {
+    "release_sha": "a" * 40,
+    "engine_image_digest": "sha256:" + "b" * 64,
+    "route_fingerprint": "arbitrum-weth-usdc-uniswap-v3-500-3000-v1",
+    "route_universe_hash": "84adac686635535486e06e44fcaf90c812dc27273affc5bffc4eebd6c164928c",
+    "route_policy_hash": "d7aff21eb025696208c646631772a45c241fc2971ef0c9866646d12dca12d476",
+    "risk_policy_hash": "d7aff21eb025696208c646631772a45c241fc2971ef0c9866646d12dca12d476",
+    "global_control_epoch": int(sys.argv[3]),
+    "route_control_epoch": int(sys.argv[4]),
+    "executor_code_hash": sys.argv[5],
+    "contract_identity_hash": "c" * 64,
+    "wallet_gas_reserve_wei": 2,
+    "gas_reserve_floor_wei": 1,
+    "current_daily_loss_wei": 0,
+    "daily_loss_limit_wei": 10000000000000000,
+    "observed_from": timestamp(now - datetime.timedelta(minutes=5)),
+    "observed_until": timestamp(now - datetime.timedelta(seconds=1)),
+    "created_at": timestamp(now),
+    "expires_at": timestamp(now + datetime.timedelta(minutes=10)),
+    "candidate_evidence_hashes": ["d" * 64],
+}
+evidence = {
+    "supported_observations": 100,
+    "valid_acceptance_bps": 9990,
+    "process_fatal_integrity_exits": 0,
+    "quarantine_progress_proven": True,
+    "consumer_pending_bounded": True,
+    "ack_pending_bounded": True,
+    "stale_outbox_rows": 0,
+    "primary_rpc_healthy": True,
+    "secondary_rpc_healthy": True,
+    "rpc_providers_independent": True,
+    "eligible_rpc_disagreements": 0,
+    "maximum_state_age_blocks": 1,
+    "maximum_quote_age_ms": 2000,
+    "maximum_candidate_age_ms": 3000,
+    "fork_attempts": 100,
+    "fork_passes": 95,
+    "prediction_error_bps": 1000,
+    "secondary_skips": 0,
+    "fork_skips": 0,
+    "execution_requests": 0,
+    "active_attempts": 0,
+    "positive_independent_fork_candidates": 1,
+}
+readiness = {
+    "schema_version": "phoenix.canary-readiness.v1",
+    "readiness_id": "11111111-1111-4111-8111-111111111111",
+    "binding": binding,
+    "evidence": evidence,
+    "readiness_hash": "0" * 64,
+}
+readiness["readiness_hash"] = bind_hash(
+    readiness,
+    "readiness_hash",
+    "canary-readiness",
+    "phoenix.canary-readiness.v1",
+)
+authorization = {
+    "schema_version": "phoenix.automation-authorization.v1",
+    "authorization_id": "22222222-2222-4222-8222-222222222222",
+    "authorization": {
+        "route_fingerprint": binding["route_fingerprint"],
+        "route_policy_hash": binding["route_policy_hash"],
+        "maximum_reviewed_input_wei": 10000000000000000,
+        "executor_code_hash": sys.argv[5],
+        "release_family": "isolated-test",
+        "one_transaction_at_a_time": True,
+        "reviewed_ladder_only": True,
+        "automatic_disarm_required": True,
+        "expires_at": timestamp(now + datetime.timedelta(minutes=10)),
+    },
+    "authorization_hash": "0" * 64,
+}
+authorization["authorization_hash"] = bind_hash(
+    authorization,
+    "authorization_hash",
+    "automation-authorization",
+    "phoenix.automation-authorization.v1",
+)
+for path, value in ((sys.argv[1], readiness), (sys.argv[2], authorization)):
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump(value, handle, sort_keys=True, separators=(",", ":"))
+        handle.write("\n")
+PY
+chmod 600 "$readiness_file" "$authorization_file"
+POSTGRES_DSN="$test_dsn" \
+PHOENIX_CANARY_READINESS_FILE="$readiness_file" \
+PHOENIX_CANARY_READINESS_ACK=CREATE_HASH_BOUND_CANARY_READINESS_42161 \
+  cargo run --locked --quiet --manifest-path live-executor/Cargo.toml \
+    --bin autonomous-live-control -- create-readiness
+POSTGRES_DSN="$test_dsn" \
+PHOENIX_AUTOMATION_AUTHORIZATION_FILE="$authorization_file" \
+PHOENIX_AUTOMATION_AUTHORIZATION_ACK=INSTALL_BOUNDED_AUTOMATION_AUTHORIZATION_42161 \
+  cargo run --locked --quiet --manifest-path live-executor/Cargo.toml \
+    --bin autonomous-live-control -- install-authorization
+POSTGRES_DSN="$test_dsn" \
 LIVE_EXECUTOR_MAX_INPUT_AMOUNT=10000000000000000 \
 LIVE_EXECUTOR_MAX_DAILY_LOSS_WEI=10000000000000000 \
-PHOENIX_AUTONOMOUS_ACTIVATION_ACK=ACTIVATE_AUTONOMOUS_LIVE_42161 \
+PHOENIX_CANARY_READINESS_ID=11111111-1111-4111-8111-111111111111 \
+PHOENIX_AUTOMATION_AUTHORIZATION_ID=22222222-2222-4222-8222-222222222222 \
+PHOENIX_AUTONOMOUS_ACTIVATION_ACK=ACTIVATE_READY_MIN_CANARY_42161 \
   cargo run --locked --quiet --manifest-path live-executor/Cargo.toml \
-    --bin autonomous-live-control -- activate
+    --bin autonomous-live-control -- activate-ready-canary
 
 PHOENIX_TEST_POSTGRES_DSN="$test_dsn" \
 PHOENIX_TEST_NATS_URL="${PHOENIX_TEST_NATS_URL:-nats://127.0.0.1:4222}" \

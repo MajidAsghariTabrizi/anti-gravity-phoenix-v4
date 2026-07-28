@@ -129,12 +129,12 @@ impl ApprovalMaterializer {
     }
 }
 
-struct StoredSimulation {
-    plan: UnsignedTransactionPlan,
-    result: CounterfactualResult,
+pub(crate) struct StoredSimulation {
+    pub(crate) plan: UnsignedTransactionPlan,
+    pub(crate) result: CounterfactualResult,
 }
 
-async fn load_simulation(
+pub(crate) async fn load_simulation(
     transaction: &mut Transaction<'_, Postgres>,
     result_hash: &str,
 ) -> Result<StoredSimulation, ApprovalError> {

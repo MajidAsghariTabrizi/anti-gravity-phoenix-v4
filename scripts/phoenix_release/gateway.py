@@ -1151,28 +1151,22 @@ def rollback_release(paths: HostPaths, target_sha: str) -> dict[str, Any]:
 
 def mark_release_phase(paths: HostPaths, release_sha: str, phase: str) -> dict[str, Any]:
     state = load_state(state_file(paths, release_sha))
-    mutation = True if phase == "LIVE_MODE_INSTALLED" else None
+    mutation = True if phase == "EVIDENCE_MODE_INSTALLED" else None
     updates: dict[str, Any] = {}
-    if phase == "AUTONOMOUS_ACTIVATED":
+    if phase == "DISARMED_CONTROL_INSTALLED":
         updates = {
             "contract_paused": True,
-            "autonomous_armed": True,
-            "kill_switch": False,
-        }
-    elif phase == "EXECUTOR_UNPAUSED":
-        updates = {
-            "contract_paused": False,
-            "autonomous_armed": True,
-            "kill_switch": False,
+            "autonomous_armed": False,
+            "kill_switch": True,
         }
     elif phase == "COMPLETED":
         updates = {
             "active_release_pointer": release_sha,
             "candidate_pointer": None,
             "actual_images": dict(state["expected_images"]),
-            "contract_paused": False,
-            "autonomous_armed": True,
-            "kill_switch": False,
+            "contract_paused": True,
+            "autonomous_armed": False,
+            "kill_switch": True,
         }
     state = advance(
         state,

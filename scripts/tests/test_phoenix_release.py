@@ -157,17 +157,15 @@ class ReleaseStateTests(unittest.TestCase):
                 "CANDIDATE_INSTALLED",
                 "CANDIDATE_LIVE_RENDER_VERIFIED",
                 "MIGRATIONS_APPLIED",
-                "LIVE_MODE_INSTALLED",
+                "EVIDENCE_MODE_INSTALLED",
+                "DISARMED_CONTROL_INSTALLED",
                 "RPC_GATEWAY_HEALTHY",
                 "ENGINE_HEALTHY",
                 "ENGINE_BURN_IN_STARTED",
                 "ENGINE_BURN_IN_PASSED",
-                "AUTONOMOUS_ACTIVATED",
-                "EXECUTOR_UNPAUSE_STARTED",
-                "EXECUTOR_UNPAUSED",
-                "LIVE_EXECUTOR_STARTED",
-                "POST_LIVE_VERIFYING",
-                "POST_LIVE_VERIFIED",
+                "DISARMED_EVIDENCE_STARTED",
+                "POST_DISARMED_VERIFYING",
+                "POST_DISARMED_VERIFIED",
                 "COMPLETED",
             ),
         )
@@ -725,38 +723,32 @@ class WorkflowAndDeploymentContractTests(unittest.TestCase):
         self.assertLess(candidate, mutation)
         self.assertLess(mutation, live_mode)
 
-    def test_burn_in_precedes_activation_and_owner_unpause(self) -> None:
+    def test_burn_in_preserves_the_disarmed_owner_boundary(self) -> None:
         burn_start = self.deploy.index("mark_engine_burn_in_started \\")
         burn_pass = self.deploy.index("mark_phase ENGINE_BURN_IN_PASSED")
-        activate = self.deploy.index("mark_phase AUTONOMOUS_ACTIVATED")
-        unpause = self.deploy.index("mark_phase EXECUTOR_UNPAUSE_STARTED")
+        evidence = self.deploy.index("mark_phase DISARMED_EVIDENCE_STARTED")
         self.assertLess(burn_start, burn_pass)
-        self.assertLess(burn_pass, activate)
-        self.assertLess(activate, unpause)
+        self.assertLess(burn_pass, evidence)
         self.assertIn("[ -z \"$(compose ps -q live-executor", self.deploy)
         self.assertIn("engine_process_fatal_integrity_total", self.deploy)
-        self.assertIn("run_post_live_stabilization", self.deploy)
-        self.assertIn("PHOENIX_POST_LIVE_STABILIZATION_SECONDS:-60", self.deploy)
+        self.assertNotIn("live-executor activate", self.deploy)
+        self.assertNotIn("live-executor owner-unpause", self.deploy)
+        self.assertNotIn("compose up -d --no-deps live-executor", self.deploy)
+        self.assertNotIn("LIVE_EXECUTOR_SIGNER_FILE", self.deploy)
 
-    def test_configured_paused_executor_bypasses_owner_bootstrap(self) -> None:
-        configured = self.deploy.index(
-            "live-executor owner-configured-preflight"
+    def test_owner_bootstrap_is_separate_from_normal_deployment(self) -> None:
+        activation = (ROOT / "scripts/activate-economic-canary.sh").read_text(
+            encoding="utf-8"
         )
-        fallback = self.deploy.index(
-            'if [ "$owner_configured_preflight_code" -ne 0 ]; then'
-        )
-        owner_plan = self.deploy.index("live-executor owner-plan")
-        authorization = self.deploy.index("EXTERNAL_OWNER_AUTHORIZATION_REQUIRED")
-        self.assertLess(configured, fallback)
-        self.assertLess(fallback, owner_plan)
-        self.assertLess(owner_plan, authorization)
-        self.assertNotIn(
-            '[ "$owner_bootstrap_started" -eq 1 ]',
-            self.deploy,
-        )
+        self.assertNotIn("activate-economic-canary.sh", self.deploy)
+        self.assertIn("activate-ready-canary", activation)
+        self.assertIn("live-executor owner-unpause", activation)
+        self.assertIn("compose up -d --no-deps live-executor", activation)
+        self.assertIn("PHOENIX_CANARY_READINESS_FILE", activation)
+        self.assertIn("PHOENIX_AUTOMATION_AUTHORIZATION_FILE", activation)
 
     def test_post_live_verification_precedes_pointer_promotion(self) -> None:
-        verify = self.deploy.index("mark_phase POST_LIVE_VERIFIED")
+        verify = self.deploy.index("mark_phase POST_DISARMED_VERIFIED")
         promote = self.deploy.index(
             'install_active_file "$pointer_candidate" "$current_file"'
         )
@@ -767,11 +759,13 @@ class WorkflowAndDeploymentContractTests(unittest.TestCase):
         self.assertIn("production release context validation failed", self.deploy)
 
     def test_health_checks_receive_explicit_release_phase_mode(self) -> None:
-        self.assertIn("PHOENIX_HEALTH_EXPECTED_MODE=LIVE", self.deploy)
+        self.assertIn("PHOENIX_HEALTH_EXPECTED_MODE=DISARMED_EVIDENCE", self.deploy)
         self.assertIn('PHOENIX_ENV_FILE="$env_file"', self.deploy)
         self.assertIn("PHOENIX_HEALTH_EXPECTED_MODE=SHADOW", self.rollback)
         self.assertIn('PHOENIX_ENV_FILE="$env_file"', self.rollback)
-        live_health = self.deploy.index("PHOENIX_HEALTH_EXPECTED_MODE=LIVE")
+        live_health = self.deploy.index(
+            "PHOENIX_HEALTH_EXPECTED_MODE=DISARMED_EVIDENCE"
+        )
         live_reload = self.deploy.rfind("reload_environment", 0, live_health)
         live_assertion = self.deploy.find(
             "assert_live_environment", live_reload, live_health

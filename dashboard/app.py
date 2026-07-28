@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import json
 from datetime import timedelta
 from decimal import Decimal
 from pathlib import Path
@@ -71,6 +72,60 @@ def _load_current_snapshot() -> DashboardSnapshot:
     configured = os.getenv(SNAPSHOT_PATH_VARIABLE)
     path = Path(configured) if configured else DEFAULT_SNAPSHOT_PATH
     return load_snapshot(path)
+
+
+def _load_economic_snapshot() -> dict[str, Any] | None:
+    configured = os.getenv(SNAPSHOT_PATH_VARIABLE)
+    path = Path(configured) if configured else DEFAULT_SNAPSHOT_PATH
+    if not path.is_file() or path.is_symlink() or path.stat().st_size > 2 * 1024 * 1024:
+        return None
+    value = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(value, dict) or value.get("schema") != "phoenix.economic-dashboard.v1":
+        return None
+    required = {"executive", "funnel", "economics", "safety", "growth"}
+    if not required.issubset(value):
+        raise SnapshotError("economic_snapshot_shape_invalid")
+    return value
+
+
+def _render_economic_snapshot(snapshot: dict[str, Any]) -> None:
+    executive = snapshot["executive"]
+    st.title("Phoenix LIVE Economic Control")
+    if executive["armed"]:
+        st.warning("Execution authority is open under the bounded economic control.")
+    else:
+        st.success("Execution authority is closed.")
+    _metric_grid(
+        [
+            ("Release", executive["current_release"]),
+            ("Phase", executive["phase"]),
+            ("Armed", str(executive["armed"]).lower()),
+            ("Kill switch", str(executive["kill_switch"]).lower()),
+            ("Size level", executive["current_size_level"]),
+            ("Input (wei)", executive["current_input_wei"]),
+            ("Net PnL today (wei)", executive["realized_net_pnl_today_wei"]),
+            ("Net PnL 7d (wei)", executive["realized_net_pnl_7d_wei"]),
+            ("Net PnL 30d (wei)", executive["realized_net_pnl_30d_wei"]),
+            ("Active route", executive["active_route"]),
+        ],
+        width=5,
+    )
+    tabs = st.tabs(["Funnel", "Economics", "Safety", "Growth"])
+    for tab, section in zip(
+        tabs,
+        (
+            snapshot["funnel"],
+            snapshot["economics"],
+            snapshot["safety"],
+            snapshot["growth"],
+        ),
+    ):
+        with tab:
+            rows = [
+                {"metric": key, "value": json.dumps(value, sort_keys=True) if isinstance(value, dict) else value}
+                for key, value in section.items()
+            ]
+            st.dataframe(_rows(rows), width="stretch", hide_index=True)
 
 
 def _render_alerts(snapshot: DashboardSnapshot) -> None:
@@ -583,9 +638,12 @@ def _render_logs(snapshot: DashboardSnapshot) -> None:
 
 
 def main() -> None:
-    st.set_page_config(page_title="Phoenix PRE-LIVE SHADOW", layout="wide")
-    st.title("Phoenix PRE-LIVE SHADOW")
+    st.set_page_config(page_title="Phoenix Economic Control", layout="wide")
     try:
+        economic = _load_economic_snapshot()
+        if economic is not None:
+            _render_economic_snapshot(economic)
+            return
         snapshot = _load_current_snapshot()
     except SnapshotError as exc:
         st.error(f"Dashboard evidence unavailable: {exc.code}")
@@ -598,6 +656,7 @@ def main() -> None:
         st.metric("Pre-LIVE gate", "blocked")
         st.stop()
 
+    st.title("Phoenix PRE-LIVE SHADOW")
     safety = snapshot.data["safety"]
     st.warning(SHADOW_FINANCIAL_LABEL)
     _metric_grid(

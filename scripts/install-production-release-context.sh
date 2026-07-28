@@ -121,6 +121,7 @@ for context_directory in \
   "$deploy_dir/schemas" \
   "$deploy_dir/routes" \
   "$deploy_dir/contracts" \
+  "$deploy_dir/docs" \
   "$deploy_dir/live-executor" \
   "$deploy_dir/live-executor/schema"
 do
@@ -147,6 +148,9 @@ install_source \
 install_source \
   "$source_root/dashboard/snapshot_model.py" "$deploy_dir/snapshot_model.py" 0640
 install_source \
+  "$source_root/docs/AUTOMATED_ECONOMIC_CONTROL.md" \
+  "$deploy_dir/docs/AUTOMATED_ECONOMIC_CONTROL.md" 0640
+install_source \
   "$source_root/fixtures/routes/arbitrum_uniswap_v3_pool_proofs.json" \
   "$deploy_dir/routes/arbitrum_uniswap_v3_pool_proofs.json" 0640
 install_source \
@@ -169,12 +173,18 @@ if [ -f "$source_root/live-executor/schema/004_autonomous_live_runtime.sql" ]; t
     "$source_root/live-executor/schema/004_autonomous_live_runtime.sql" \
     "$deploy_dir/live-executor/schema/004_autonomous_live_runtime.sql" 0640
 fi
+if [ -f "$source_root/live-executor/schema/005_closed_loop_economic_control.sql" ]; then
+  install_source \
+    "$source_root/live-executor/schema/005_closed_loop_economic_control.sql" \
+    "$deploy_dir/live-executor/schema/005_closed_loop_economic_control.sql" 0640
+fi
 
 for sql_name in \
   shadow-profitability-report.sql \
   shadow-route-discovery-enrichment.sql \
   prelive-money-path-report.sql \
-  prelive-dashboard-source.sql
+  prelive-dashboard-source.sql \
+  economic-dashboard-snapshot.sql
 do
   install_source \
     "$source_root/scripts/sql/$sql_name" "$deploy_dir/sql/$sql_name" 0640
@@ -192,6 +202,7 @@ done
 
 for script_name in \
   production_context.py \
+  activate-economic-canary.sh \
   release_components.py \
   render-production-compose.sh \
   verify-compose-route-registry.py \
@@ -211,7 +222,8 @@ for script_name in \
   prelive-shadow-control.sh \
   release_assets.py \
   verify_dashboard_compose.py \
-  deploy-release.sh
+  deploy-release.sh \
+  economic-dashboard-loop.sh
 do
   install_source \
     "$source_root/scripts/$script_name" "$deploy_dir/$script_name" 0750

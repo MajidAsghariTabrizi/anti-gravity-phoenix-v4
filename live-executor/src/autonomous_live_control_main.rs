@@ -2,6 +2,10 @@ use chrono::{SecondsFormat, Utc};
 use phoenix_live_executor::control_environment::{
     control_address_environment_with, required_environment_with, MissingEnvironment,
 };
+use phoenix_live_executor::economic_control::{
+    activate_canary, evaluate_promotion, AutomationAuthorization, EconomicPhase, EvidenceGate,
+    PromotionEvidence, ReadinessBinding, SizeLevel, Transition, MAXIMUM_REVIEWED_INPUT_WEI,
+};
 use phoenix_live_executor::model::{CanonicalAddress, ExecutionRequest, ValidatedLeg};
 use phoenix_live_executor::owner_bootstrap::{
     configured_preflight_from_environment, execute_from_environment, owner_plan_from_environment,
@@ -11,21 +15,25 @@ use phoenix_live_executor::rpc::{ExecutionRpc, HttpExecutionRpc};
 use phoenix_live_executor::{
     APPROVAL_POLICY_VERSION, CURRENT_ROUTE_FINGERPRINT, REQUEST_SCHEMA_VERSION,
 };
+use serde::Deserialize;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use sqlx::postgres::PgPoolOptions;
-use sqlx::{PgPool, Row};
+use sqlx::{PgPool, Postgres, Row, Transaction};
 use std::collections::BTreeMap;
 use std::env;
 use std::error::Error;
 use std::fmt::{Display, Formatter};
+use std::fs;
 use std::io;
+use std::path::PathBuf;
 use std::time::Duration;
 use url::Url;
 use uuid::Uuid;
 
 const POLICY: &str = include_str!("../../config/phoenix-route-policy-v1.json");
-const MIGRATIONS: [(&str, &str); 4] = [
+const UNIVERSE: &str = include_str!("../../config/phoenix-route-universe-v1.json");
+const MIGRATIONS: [(&str, &str); 5] = [
     (
         "phoenix.live-canary-schema.v1",
         include_str!("../schema/001_live_canary.sql"),
@@ -42,9 +50,17 @@ const MIGRATIONS: [(&str, &str); 4] = [
         "phoenix.live-canary-schema.v4",
         include_str!("../schema/004_autonomous_live_runtime.sql"),
     ),
+    (
+        "phoenix.live-canary-schema.v5",
+        include_str!("../schema/005_closed_loop_economic_control.sql"),
+    ),
 ];
-const ACTIVATE_ACK: &str = "ACTIVATE_AUTONOMOUS_LIVE_42161";
+const ACTIVATE_ACK: &str = "ACTIVATE_READY_MIN_CANARY_42161";
 const DISARM_ACK: &str = "DISARM_AUTONOMOUS_LIVE_42161";
+const DISARMED_DEPLOY_ACK: &str = "INSTALL_DISARMED_EVIDENCE_RELEASE_42161";
+const READINESS_ACK: &str = "CREATE_HASH_BOUND_CANARY_READINESS_42161";
+const AUTHORIZATION_ACK: &str = "INSTALL_BOUNDED_AUTOMATION_AUTHORIZATION_42161";
+const MAX_CONTROL_FILE_BYTES: u64 = 256 * 1024;
 const IMAGE_RUNTIME_PROBE_COMMAND: &str = "__image_runtime_probe__";
 const IMAGE_RUNTIME_OK: &str = "AUTONOMOUS_CONTROL_RUNTIME_OK";
 
@@ -107,7 +123,13 @@ async fn run() -> ControlResult<()> {
         "owner-unpause" => owner_mutation(OwnerMutation::Unpause).await?,
         "owner-pause" => owner_mutation(OwnerMutation::Pause).await?,
         "migrate" => migrate(&database_pool().await?).await?,
-        "activate" => activate(&database_pool().await?).await?,
+        "disarmed-deploy" => disarmed_deploy(&database_pool().await?).await?,
+        "create-readiness" => create_readiness(&database_pool().await?).await?,
+        "install-authorization" => install_authorization(&database_pool().await?).await?,
+        "activate-ready-canary" => activate(&database_pool().await?).await?,
+        "activate" => return Err("direct activation is disabled; use activate-ready-canary".into()),
+        "evaluate-economic-control" => evaluate_economic_control(&database_pool().await?).await?,
+        "supervise-economic-control" => supervise_economic_control().await?,
         "disarm" => disarm(&database_pool().await?).await?,
         "status" => status(&database_pool().await?).await?,
         "reconciliation-status" => reconciliation_status(&database_pool().await?).await?,
@@ -390,7 +412,416 @@ async fn migrate(pool: &PgPool) -> Result<(), &'static str> {
         }
     }
     require_schema(pool).await?;
-    println!("AUTONOMOUS_MIGRATION_OK: phoenix.live-canary-schema.v4");
+    println!("AUTONOMOUS_MIGRATION_OK: phoenix.live-canary-schema.v5");
+    Ok(())
+}
+
+#[derive(Debug, Deserialize)]
+struct ReadinessFile {
+    readiness_id: Uuid,
+    binding: ReadinessBinding,
+    evidence: EvidenceGate,
+    readiness_hash: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct AuthorizationFile {
+    authorization_id: Uuid,
+    authorization: AutomationAuthorization,
+    authorization_hash: String,
+}
+
+async fn disarmed_deploy(pool: &PgPool) -> ControlResult<()> {
+    if required("PHOENIX_DISARMED_DEPLOY_ACK")? != DISARMED_DEPLOY_ACK {
+        return Err("disarmed deployment acknowledgement is invalid".into());
+    }
+    require_schema(pool).await?;
+    let release_sha = required("PHOENIX_RELEASE_SHA")?;
+    if !canonical_hex(&release_sha, 40) {
+        return Err("release SHA is invalid".into());
+    }
+    let engine_image_digest = image_digest(&required("PHOENIX_ENGINE_IMAGE")?)?;
+    let executor_code_hash = required("LIVE_EXECUTOR_EXECUTOR_CODE_HASH")?;
+    if !canonical_hex(&executor_code_hash, 64) {
+        return Err("executor code hash is invalid".into());
+    }
+    let daily_loss_limit = required_u128("LIVE_EXECUTOR_MAX_DAILY_LOSS_WEI")?;
+    let policy: Value = serde_json::from_str(POLICY).map_err(|_| "route policy is invalid")?;
+    let universe: Value =
+        serde_json::from_str(UNIVERSE).map_err(|_| "route universe is invalid")?;
+    verify_hash(
+        &policy,
+        "policy_hash",
+        "route-policy",
+        "phoenix.route-policy.v1",
+    )?;
+    verify_hash(
+        &universe,
+        "universe_hash",
+        "route-universe",
+        "phoenix.route-universe.v1",
+    )?;
+    let route_fingerprint = value_text(&policy, "route_fingerprint")?;
+    let route_policy_hash = value_text(&policy, "policy_hash")?;
+    let route_universe_hash = value_text(&universe, "universe_hash")?;
+    if value_text(&policy, "route_universe_hash")? != route_universe_hash
+        || value_u128(&policy, "maximum_input_amount")? != MAXIMUM_REVIEWED_INPUT_WEI
+        || value_u128(&policy, "minimum_input_amount")? != SizeLevel::Min.amount_wei()
+    {
+        return Err("reviewed route policy does not match the economic ladder".into());
+    }
+
+    let mut transaction = pool
+        .begin()
+        .await
+        .map_err(|_| "database transaction failed")?;
+    let previous = economic_state_for_update(&mut transaction).await?;
+    let global_epoch: i64 = sqlx::query_scalar(
+        "UPDATE live_canary.autonomous_global_control
+         SET armed = false, kill_switch = true, execution_mode = 'disarmed',
+             maximum_input_amount = $1::numeric, daily_loss_limit = $2::numeric,
+             daily_ordering_budget = 0, maximum_concurrent_candidates = 1,
+             control_epoch = control_epoch + 1,
+             disarm_reason = 'disarmed_deploy', control_hash = NULL,
+             control_contract = NULL, updated_at = now()
+         WHERE singleton
+         RETURNING control_epoch",
+    )
+    .bind(MAXIMUM_REVIEWED_INPUT_WEI.to_string())
+    .bind(daily_loss_limit.to_string())
+    .fetch_one(&mut *transaction)
+    .await
+    .map_err(|_| "global disarmed deployment failed")?;
+    sqlx::query(
+        "UPDATE live_canary.control
+         SET armed = false, kill_switch = true,
+             disarm_reason = 'disarmed_deploy', updated_at = now()
+         WHERE singleton",
+    )
+    .execute(&mut *transaction)
+    .await
+    .map_err(|_| "legacy disarmed deployment failed")?;
+    let route_epoch: i64 = sqlx::query_scalar(
+        "INSERT INTO live_canary.autonomous_route_controls(
+            route_fingerprint, route_policy_hash, enabled, kill_switch,
+            current_size_level, maximum_permitted_size, cooldown_until,
+            control_epoch, disarm_reason, control_hash, control_contract, updated_at
+         ) VALUES (
+            $1, $2, false, true, 'MIN', $3::numeric, NULL,
+            0, 'disarmed_deploy', NULL, NULL, now()
+         )
+         ON CONFLICT (route_fingerprint) DO UPDATE SET
+            route_policy_hash = EXCLUDED.route_policy_hash,
+            enabled = false,
+            kill_switch = true,
+            current_size_level = 'MIN',
+            maximum_permitted_size = EXCLUDED.maximum_permitted_size,
+            cooldown_until = NULL,
+            control_epoch = live_canary.autonomous_route_controls.control_epoch + 1,
+            disarm_reason = 'disarmed_deploy',
+            control_hash = NULL,
+            control_contract = NULL,
+            updated_at = now()
+         RETURNING control_epoch",
+    )
+    .bind(route_fingerprint)
+    .bind(route_policy_hash)
+    .bind(MAXIMUM_REVIEWED_INPUT_WEI.to_string())
+    .fetch_one(&mut *transaction)
+    .await
+    .map_err(|_| "route disarmed deployment failed")?;
+    sqlx::query(
+        "UPDATE live_canary.autonomous_candidates
+         SET status = 'disarmed', updated_at = now()
+         WHERE status IN (
+             'materialized', 'approval_pending', 'approved',
+             'request_materialized', 'claimed', 'signed'
+         )",
+    )
+    .execute(&mut *transaction)
+    .await
+    .map_err(|_| "candidate disarm failed")?;
+    let next_epoch = previous.control_epoch + 1;
+    sqlx::query(
+        "UPDATE live_canary.economic_control
+         SET phase = 'DISARMED_DEPLOY', route_fingerprint = $1,
+             current_size_level = 'MIN', current_input_wei = $2::numeric,
+             maximum_reviewed_input_wei = $3::numeric, release_sha = $4,
+             engine_image_digest = $5, route_universe_hash = $6,
+             route_policy_hash = $7, risk_policy_hash = $7,
+             executor_code_hash = $8, readiness_id = NULL,
+             authorization_id = NULL, cooldown_until = NULL,
+             gas_reserve_wei = 0, gas_reserve_floor_wei = 0,
+             control_epoch = $9, last_transition_reason = 'disarmed_deploy',
+             state_hash = NULL, updated_at = now()
+         WHERE singleton",
+    )
+    .bind(route_fingerprint)
+    .bind(SizeLevel::Min.amount_wei().to_string())
+    .bind(MAXIMUM_REVIEWED_INPUT_WEI.to_string())
+    .bind(&release_sha)
+    .bind(&engine_image_digest)
+    .bind(route_universe_hash)
+    .bind(route_policy_hash)
+    .bind(&executor_code_hash)
+    .bind(next_epoch)
+    .execute(&mut *transaction)
+    .await
+    .map_err(|_| "economic disarmed deployment failed")?;
+    insert_transition(
+        &mut transaction,
+        &previous,
+        EconomicPhase::DisarmedDeploy,
+        SizeLevel::Min,
+        "disarmed_deploy",
+        None,
+        Some(&release_sha),
+        next_epoch,
+    )
+    .await?;
+    let active_attempts: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM live_canary.execution_attempts
+         WHERE status IN (
+            'claimed', 'nonce_allocated', 'submission_unknown', 'pending', 'timed_out'
+         )",
+    )
+    .fetch_one(&mut *transaction)
+    .await
+    .map_err(|_| "active-attempt inspection failed")?;
+    if active_attempts != 0 {
+        return Err("disarmed deployment is blocked by an active attempt".into());
+    }
+    transaction
+        .commit()
+        .await
+        .map_err(|_| "disarmed deployment commit failed")?;
+    println!(
+        "DISARMED_DEPLOY_OK: release={} route={} global_epoch={} route_epoch={} armed=false kill_switch=true",
+        release_sha, route_fingerprint, global_epoch, route_epoch
+    );
+    Ok(())
+}
+
+async fn create_readiness(pool: &PgPool) -> ControlResult<()> {
+    if required("PHOENIX_CANARY_READINESS_ACK")? != READINESS_ACK {
+        return Err("readiness acknowledgement is invalid".into());
+    }
+    require_schema(pool).await?;
+    let (contract, source) =
+        read_control_contract("PHOENIX_CANARY_READINESS_FILE", "readiness file is invalid")?;
+    verify_hash(
+        &contract,
+        "readiness_hash",
+        "canary-readiness",
+        "phoenix.canary-readiness.v1",
+    )?;
+    let input: ReadinessFile =
+        serde_json::from_value(contract.clone()).map_err(|_| "readiness file is invalid")?;
+    if input.readiness_hash != value_text(&contract, "readiness_hash")? {
+        return Err("readiness hash is invalid".into());
+    }
+    let now = Utc::now();
+    input
+        .evidence
+        .validate()
+        .map_err(|_| "readiness evidence gate failed")?;
+    input
+        .binding
+        .validate(now)
+        .map_err(|_| "readiness binding failed")?;
+
+    let mut transaction = pool
+        .begin()
+        .await
+        .map_err(|_| "database transaction failed")?;
+    let previous = economic_state_for_update(&mut transaction).await?;
+    if !matches!(
+        previous.phase,
+        EconomicPhase::DisarmedDeploy | EconomicPhase::DisarmedEvidence
+    ) || previous.release_sha.as_deref() != Some(input.binding.release_sha.as_str())
+        || previous.route_fingerprint.as_deref() != Some(input.binding.route_fingerprint.as_str())
+        || previous.route_policy_hash.as_deref() != Some(input.binding.route_policy_hash.as_str())
+        || previous.executor_code_hash.as_deref() != Some(input.binding.executor_code_hash.as_str())
+    {
+        return Err("readiness does not bind the current disarmed release".into());
+    }
+    let closed: bool = sqlx::query_scalar(
+        "SELECT NOT c.armed AND c.kill_switch
+                AND NOT g.armed AND g.kill_switch AND g.execution_mode = 'disarmed'
+                AND NOT r.enabled AND r.kill_switch
+         FROM live_canary.control c
+         CROSS JOIN live_canary.autonomous_global_control g
+         JOIN live_canary.autonomous_route_controls r
+           ON r.route_fingerprint = $1
+         WHERE c.singleton AND g.singleton",
+    )
+    .bind(&input.binding.route_fingerprint)
+    .fetch_one(&mut *transaction)
+    .await
+    .map_err(|_| "disarmed controls are unavailable")?;
+    if !closed {
+        return Err("readiness cannot be created while execution authority is open".into());
+    }
+    sqlx::query(
+        "INSERT INTO live_canary.canary_readiness_records(
+            readiness_id, schema_version, release_sha, engine_image_digest,
+            route_fingerprint, route_universe_hash, route_policy_hash,
+            risk_policy_hash, global_control_epoch, route_control_epoch,
+            executor_code_hash, contract_identity_hash, wallet_gas_reserve_wei,
+            gas_reserve_floor_wei, current_daily_loss_wei, daily_loss_limit_wei,
+            observed_from, observed_until, candidate_evidence_hashes,
+            evidence_metrics, readiness_contract, readiness_hash, created_at, expires_at
+         ) VALUES (
+            $1, 'phoenix.canary-readiness.v1', $2, $3, $4, $5, $6, $7,
+            $8, $9, $10, $11, $12::numeric, $13::numeric, $14::numeric,
+            $15::numeric, $16, $17, $18, $19, $20, $21, $22, $23
+         )",
+    )
+    .bind(input.readiness_id)
+    .bind(&input.binding.release_sha)
+    .bind(&input.binding.engine_image_digest)
+    .bind(&input.binding.route_fingerprint)
+    .bind(&input.binding.route_universe_hash)
+    .bind(&input.binding.route_policy_hash)
+    .bind(&input.binding.risk_policy_hash)
+    .bind(
+        i64::try_from(input.binding.global_control_epoch)
+            .map_err(|_| "control epoch is invalid")?,
+    )
+    .bind(i64::try_from(input.binding.route_control_epoch).map_err(|_| "control epoch is invalid")?)
+    .bind(&input.binding.executor_code_hash)
+    .bind(&input.binding.contract_identity_hash)
+    .bind(input.binding.wallet_gas_reserve_wei.to_string())
+    .bind(input.binding.gas_reserve_floor_wei.to_string())
+    .bind(input.binding.current_daily_loss_wei.to_string())
+    .bind(input.binding.daily_loss_limit_wei.to_string())
+    .bind(input.binding.observed_from)
+    .bind(input.binding.observed_until)
+    .bind(sqlx::types::Json(&input.binding.candidate_evidence_hashes))
+    .bind(sqlx::types::Json(&input.evidence))
+    .bind(sqlx::types::Json(&contract))
+    .bind(&input.readiness_hash)
+    .bind(input.binding.created_at)
+    .bind(input.binding.expires_at)
+    .execute(&mut *transaction)
+    .await
+    .map_err(|_| "readiness persistence failed")?;
+    let next_epoch = previous.control_epoch + 1;
+    sqlx::query(
+        "UPDATE live_canary.economic_control
+         SET phase = 'CANARY_READY', readiness_id = $1,
+             gas_reserve_wei = $2::numeric, gas_reserve_floor_wei = $3::numeric,
+             control_epoch = $4, last_transition_reason = 'evidence_gate_passed',
+             updated_at = now()
+         WHERE singleton",
+    )
+    .bind(input.readiness_id)
+    .bind(input.binding.wallet_gas_reserve_wei.to_string())
+    .bind(input.binding.gas_reserve_floor_wei.to_string())
+    .bind(next_epoch)
+    .execute(&mut *transaction)
+    .await
+    .map_err(|_| "readiness transition failed")?;
+    insert_transition(
+        &mut transaction,
+        &previous,
+        EconomicPhase::CanaryReady,
+        SizeLevel::Min,
+        "evidence_gate_passed",
+        Some(&input.readiness_hash),
+        Some(&input.binding.release_sha),
+        next_epoch,
+    )
+    .await?;
+    transaction
+        .commit()
+        .await
+        .map_err(|_| "readiness commit failed")?;
+    println!(
+        "CANARY_READY_OK: readiness_id={} expires_at={} source={}",
+        input.readiness_id,
+        input
+            .binding
+            .expires_at
+            .to_rfc3339_opts(SecondsFormat::Secs, true),
+        source.display()
+    );
+    Ok(())
+}
+
+async fn install_authorization(pool: &PgPool) -> ControlResult<()> {
+    if required("PHOENIX_AUTOMATION_AUTHORIZATION_ACK")? != AUTHORIZATION_ACK {
+        return Err("automation authorization acknowledgement is invalid".into());
+    }
+    require_schema(pool).await?;
+    let (contract, source) = read_control_contract(
+        "PHOENIX_AUTOMATION_AUTHORIZATION_FILE",
+        "automation authorization file is invalid",
+    )?;
+    verify_hash(
+        &contract,
+        "authorization_hash",
+        "automation-authorization",
+        "phoenix.automation-authorization.v1",
+    )?;
+    let input: AuthorizationFile = serde_json::from_value(contract.clone())
+        .map_err(|_| "automation authorization file is invalid")?;
+    if input.authorization_hash != value_text(&contract, "authorization_hash")? {
+        return Err("automation authorization hash is invalid".into());
+    }
+    let current: (String, String, String) = sqlx::query_as(
+        "SELECT phase, route_fingerprint, route_policy_hash
+         FROM live_canary.economic_control WHERE singleton",
+    )
+    .fetch_one(pool)
+    .await
+    .map_err(|_| "economic control is unavailable")?;
+    if current.0 != EconomicPhase::CanaryReady.as_str()
+        || current.1 != input.authorization.route_fingerprint
+        || current.2 != input.authorization.route_policy_hash
+    {
+        return Err("authorization does not bind the current ready canary".into());
+    }
+    if input.authorization.maximum_reviewed_input_wei != MAXIMUM_REVIEWED_INPUT_WEI
+        || !input.authorization.one_transaction_at_a_time
+        || !input.authorization.reviewed_ladder_only
+        || !input.authorization.automatic_disarm_required
+        || Utc::now() >= input.authorization.expires_at
+    {
+        return Err("automation authorization is outside the reviewed bounds".into());
+    }
+    sqlx::query(
+        "INSERT INTO live_canary.automation_authorizations(
+            authorization_id, schema_version, route_fingerprint,
+            route_policy_hash, maximum_reviewed_input_wei,
+            executor_code_hash, release_family, one_transaction_at_a_time,
+            reviewed_ladder_only, automatic_disarm_required,
+            authorization_contract, authorization_hash, authorized_at, expires_at
+         ) VALUES (
+            $1, 'phoenix.automation-authorization.v1', $2, $3, $4::numeric,
+            $5, $6, $7, $8, $9, $10, $11, now(), $12
+         )",
+    )
+    .bind(input.authorization_id)
+    .bind(&input.authorization.route_fingerprint)
+    .bind(&input.authorization.route_policy_hash)
+    .bind(input.authorization.maximum_reviewed_input_wei.to_string())
+    .bind(&input.authorization.executor_code_hash)
+    .bind(&input.authorization.release_family)
+    .bind(input.authorization.one_transaction_at_a_time)
+    .bind(input.authorization.reviewed_ladder_only)
+    .bind(input.authorization.automatic_disarm_required)
+    .bind(sqlx::types::Json(&contract))
+    .bind(&input.authorization_hash)
+    .bind(input.authorization.expires_at)
+    .execute(pool)
+    .await
+    .map_err(|_| "automation authorization persistence failed")?;
+    println!(
+        "AUTOMATION_AUTHORIZATION_OK: authorization_id={} source={}",
+        input.authorization_id,
+        source.display()
+    );
     Ok(())
 }
 
@@ -399,6 +830,10 @@ async fn activate(pool: &PgPool) -> ControlResult<()> {
         return Err("activation acknowledgement is invalid".into());
     }
     require_schema(pool).await?;
+    let readiness_id = Uuid::parse_str(&required("PHOENIX_CANARY_READINESS_ID")?)
+        .map_err(|_| "readiness ID is invalid")?;
+    let authorization_id = Uuid::parse_str(&required("PHOENIX_AUTOMATION_AUTHORIZATION_ID")?)
+        .map_err(|_| "authorization ID is invalid")?;
     let policy: Value = serde_json::from_str(POLICY).map_err(|_| "route policy is invalid")?;
     verify_hash(
         &policy,
@@ -416,10 +851,13 @@ async fn activate(pool: &PgPool) -> ControlResult<()> {
     let configured_maximum = required_u128("LIVE_EXECUTOR_MAX_INPUT_AMOUNT")?;
     let policy_minimum = value_u128(&policy, "minimum_input_amount")?;
     let policy_maximum = value_u128(&policy, "maximum_input_amount")?;
-    let maximum_input = configured_maximum.min(policy_maximum);
-    if maximum_input < policy_minimum {
-        return Err("configured maximum input is economically inert".into());
+    if configured_maximum != MAXIMUM_REVIEWED_INPUT_WEI
+        || policy_maximum != MAXIMUM_REVIEWED_INPUT_WEI
+        || policy_minimum != SizeLevel::Min.amount_wei()
+    {
+        return Err("configured maximum does not match the reviewed ladder".into());
     }
+    let maximum_input = SizeLevel::Min.amount_wei();
     let daily_loss_limit = required_u128("LIVE_EXECUTOR_MAX_DAILY_LOSS_WEI")?;
     if daily_loss_limit == 0 {
         return Err("global daily loss limit is economically inert".into());
@@ -429,6 +867,80 @@ async fn activate(pool: &PgPool) -> ControlResult<()> {
         .begin()
         .await
         .map_err(|_| "database transaction failed")?;
+    let previous = economic_state_for_update(&mut transaction).await?;
+    if previous.phase != EconomicPhase::CanaryReady
+        || previous.readiness_id != Some(readiness_id)
+        || previous.route_fingerprint.as_deref()
+            != policy.get("route_fingerprint").and_then(Value::as_str)
+    {
+        return Err("economic control is not ready for this canary".into());
+    }
+    let record = sqlx::query(
+        "SELECT readiness_record.readiness_contract,
+                automation_authorization.authorization_contract
+         FROM live_canary.canary_readiness_records readiness_record
+         JOIN live_canary.automation_authorizations automation_authorization
+           ON automation_authorization.authorization_id = $2
+         WHERE readiness_record.readiness_id = $1
+           AND automation_authorization.consumed_at IS NULL
+         FOR UPDATE OF readiness_record, automation_authorization",
+    )
+    .bind(readiness_id)
+    .bind(authorization_id)
+    .fetch_one(&mut *transaction)
+    .await
+    .map_err(|_| "readiness or authorization is unavailable")?;
+    let readiness_contract: sqlx::types::Json<Value> = record
+        .try_get("readiness_contract")
+        .map_err(|_| "readiness contract is invalid")?;
+    let authorization_contract: sqlx::types::Json<Value> = record
+        .try_get("authorization_contract")
+        .map_err(|_| "authorization contract is invalid")?;
+    verify_hash(
+        &readiness_contract.0,
+        "readiness_hash",
+        "canary-readiness",
+        "phoenix.canary-readiness.v1",
+    )?;
+    verify_hash(
+        &authorization_contract.0,
+        "authorization_hash",
+        "automation-authorization",
+        "phoenix.automation-authorization.v1",
+    )?;
+    let readiness: ReadinessFile = serde_json::from_value(readiness_contract.0)
+        .map_err(|_| "readiness contract is invalid")?;
+    let authorization: AuthorizationFile = serde_json::from_value(authorization_contract.0)
+        .map_err(|_| "authorization contract is invalid")?;
+    if readiness.readiness_id != readiness_id
+        || authorization.authorization_id != authorization_id
+        || readiness.binding.release_sha != previous.release_sha.as_deref().unwrap_or_default()
+        || readiness.binding.engine_image_digest
+            != previous.engine_image_digest.as_deref().unwrap_or_default()
+        || readiness.binding.route_policy_hash
+            != previous.route_policy_hash.as_deref().unwrap_or_default()
+        || readiness.binding.executor_code_hash
+            != previous.executor_code_hash.as_deref().unwrap_or_default()
+    {
+        return Err("ready canary binding does not match economic control".into());
+    }
+    let now = Utc::now();
+    let decision = activate_canary(
+        previous.phase,
+        &readiness.binding,
+        &readiness.evidence,
+        &authorization.authorization,
+        now,
+    )
+    .map_err(|_| "ready canary activation gate failed")?;
+    if decision
+        != (Transition::Promote {
+            phase: EconomicPhase::LiveCanaryMin,
+            level: SizeLevel::Min,
+        })
+    {
+        return Err("first canary decision is not the minimum level".into());
+    }
     let active_count: i64 = sqlx::query_scalar(
         "SELECT count(*)
          FROM live_canary.execution_attempts
@@ -463,7 +975,12 @@ async fn activate(pool: &PgPool) -> ControlResult<()> {
     .await
     .map_err(|_| "route control inspection failed")?
     .unwrap_or(0);
-    let updated_at = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
+    if u64::try_from(global_epoch - 1).ok() != Some(readiness.binding.global_control_epoch)
+        || u64::try_from(route_epoch - 1).ok() != Some(readiness.binding.route_control_epoch)
+    {
+        return Err("control epoch changed after readiness was created".into());
+    }
+    let updated_at = now.to_rfc3339_opts(SecondsFormat::Secs, true);
     let mut global = json!({
         "schema_version": "phoenix.autonomous-global-control.v1",
         "chain_id": 42161,
@@ -492,7 +1009,7 @@ async fn activate(pool: &PgPool) -> ControlResult<()> {
         "route_policy_hash": value_text(&policy, "policy_hash")?,
         "enabled": true,
         "kill_switch": false,
-        "current_size_level": "0.25x",
+        "current_size_level": "MIN",
         "maximum_permitted_size": maximum_input.to_string(),
         "daily_loss_limit": value_text(&policy, "per_route_daily_loss")?,
         "maximum_consecutive_losses": policy.get("maximum_consecutive_losses")
@@ -546,7 +1063,7 @@ async fn activate(pool: &PgPool) -> ControlResult<()> {
             current_size_level, maximum_permitted_size, cooldown_until,
             control_epoch, disarm_reason, control_hash, control_contract, updated_at
          ) VALUES (
-            $1, $2, true, false, '0.25x', $3::numeric, NULL,
+            $1, $2, true, false, 'MIN', $3::numeric, NULL,
             $4, NULL, $5, $6, $7::timestamptz
          )
          ON CONFLICT (route_fingerprint) DO UPDATE SET
@@ -572,15 +1089,659 @@ async fn activate(pool: &PgPool) -> ControlResult<()> {
     .execute(&mut *transaction)
     .await
     .map_err(|_| "route autonomous control activation failed")?;
+    let economic_epoch = previous.control_epoch + 1;
+    sqlx::query(
+        "UPDATE live_canary.economic_control
+         SET phase = 'LIVE_CANARY_MIN', current_size_level = 'MIN',
+             current_input_wei = $1::numeric, authorization_id = $2,
+             cooldown_until = NULL, control_epoch = $3,
+             last_transition_reason = 'owner_authorized_min_canary',
+             updated_at = $4::timestamptz
+         WHERE singleton AND phase = 'CANARY_READY' AND readiness_id = $5",
+    )
+    .bind(maximum_input.to_string())
+    .bind(authorization_id)
+    .bind(economic_epoch)
+    .bind(&updated_at)
+    .bind(readiness_id)
+    .execute(&mut *transaction)
+    .await
+    .map_err(|_| "economic canary activation failed")?;
+    sqlx::query(
+        "UPDATE live_canary.automation_authorizations
+         SET consumed_at = $2::timestamptz
+         WHERE authorization_id = $1 AND consumed_at IS NULL",
+    )
+    .bind(authorization_id)
+    .bind(&updated_at)
+    .execute(&mut *transaction)
+    .await
+    .map_err(|_| "automation authorization consumption failed")?;
+    insert_transition(
+        &mut transaction,
+        &previous,
+        EconomicPhase::LiveCanaryMin,
+        SizeLevel::Min,
+        "owner_authorized_min_canary",
+        Some(&readiness.readiness_hash),
+        previous.release_sha.as_deref(),
+        economic_epoch,
+    )
+    .await?;
     transaction
         .commit()
         .await
         .map_err(|_| "activation commit failed")?;
     println!(
-        "AUTONOMOUS_ACTIVATION_OK: chain=42161 route={} global_epoch={} route_epoch={}",
-        route_fingerprint, global_epoch, route_epoch
+        "AUTONOMOUS_ACTIVATION_OK: chain=42161 route={} level=MIN input_wei={} global_epoch={} route_epoch={}",
+        route_fingerprint, maximum_input, global_epoch, route_epoch
     );
     Ok(())
+}
+
+async fn supervise_economic_control() -> ControlResult<()> {
+    let interval = env::var("PHOENIX_ECONOMIC_SUPERVISOR_INTERVAL_SECONDS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| (30..=60).contains(value))
+        .unwrap_or(45);
+    let pool = database_pool().await?;
+    loop {
+        if let Err(error) = evaluate_economic_control(&pool).await {
+            eprintln!("ECONOMIC_SUPERVISION_STEP_FAILED: {error}");
+        }
+        tokio::time::sleep(Duration::from_secs(interval)).await;
+    }
+}
+
+async fn evaluate_economic_control(pool: &PgPool) -> ControlResult<()> {
+    require_schema(pool).await?;
+    let reserve = wallet_gas_reserve().await?;
+    let mut transaction = pool
+        .begin()
+        .await
+        .map_err(|_| "database transaction failed")?;
+    let previous = economic_state_for_update(&mut transaction).await?;
+    if !previous.phase.is_live() {
+        transaction
+            .commit()
+            .await
+            .map_err(|_| "economic supervision commit failed")?;
+        println!(
+            "ECONOMIC_SUPERVISION_IDLE: phase={}",
+            previous.phase.as_str()
+        );
+        return Ok(());
+    }
+    let authorization_valid: bool = sqlx::query_scalar(
+        "SELECT EXISTS(
+            SELECT 1
+            FROM live_canary.automation_authorizations authorization
+            WHERE authorization.authorization_id = $1
+              AND authorization.consumed_at IS NOT NULL
+              AND authorization.expires_at > now()
+              AND authorization.one_transaction_at_a_time
+              AND authorization.reviewed_ladder_only
+              AND authorization.automatic_disarm_required
+              AND authorization.maximum_reviewed_input_wei = $2::numeric
+         )",
+    )
+    .bind(previous.authorization_id)
+    .bind(MAXIMUM_REVIEWED_INPUT_WEI.to_string())
+    .fetch_one(&mut *transaction)
+    .await
+    .map_err(|_| "automation authorization inspection failed")?;
+    if !authorization_valid {
+        route_failure(
+            &mut transaction,
+            &previous,
+            "automation_authorization_expired",
+        )
+        .await?;
+        transaction
+            .commit()
+            .await
+            .map_err(|_| "authorization disarm commit failed")?;
+        println!("ECONOMIC_ROUTE_DISARMED: reason=automation_authorization_expired");
+        return Ok(());
+    }
+
+    let rows = sqlx::query(
+        "SELECT outcome.realized_business_net_pnl::text AS net_pnl,
+                outcome.receipt_status,
+                outcome.prediction_error::text AS prediction_error,
+                outcome.predicted_net_pnl::text AS predicted_net_pnl,
+                candidate.candidate_created_at,
+                outcome.submitted_at,
+                (candidate.submission_quote_contract->>'quote_created_at')::timestamptz
+                    AS quote_created_at,
+                outcome.nonce::text AS nonce
+         FROM live_canary.autonomous_outcome_attributions outcome
+         JOIN live_canary.autonomous_candidates candidate
+           ON candidate.candidate_id = outcome.candidate_id
+         WHERE outcome.input_size_level = $1
+           AND candidate.route_fingerprint = $2
+         ORDER BY outcome.attributed_at, outcome.candidate_id",
+    )
+    .bind(previous.level.as_str())
+    .bind(
+        previous
+            .route_fingerprint
+            .as_deref()
+            .ok_or("economic route is unavailable")?,
+    )
+    .fetch_all(&mut *transaction)
+    .await
+    .map_err(|_| "promotion outcome evidence is unavailable")?;
+    let reconciled_outcomes =
+        u64::try_from(rows.len()).map_err(|_| "promotion evidence is invalid")?;
+    let mut realized_net = 0_i128;
+    let mut successful = 0_u64;
+    let mut absolute_prediction_error = 0_u128;
+    let mut absolute_predicted_net = 0_u128;
+    let mut maximum_quote_age_ms = 0_u64;
+    let mut maximum_candidate_age_ms = 0_u64;
+    let mut nonces = Vec::new();
+    for row in &rows {
+        let net = row
+            .try_get::<String, _>("net_pnl")
+            .map_err(|_| "promotion evidence is invalid")?
+            .parse::<i128>()
+            .map_err(|_| "promotion evidence is invalid")?;
+        realized_net = realized_net
+            .checked_add(net)
+            .ok_or("promotion evidence overflow")?;
+        if row
+            .try_get::<Option<i16>, _>("receipt_status")
+            .map_err(|_| "promotion evidence is invalid")?
+            == Some(1)
+        {
+            successful += 1;
+        }
+        let error = row
+            .try_get::<Option<String>, _>("prediction_error")
+            .map_err(|_| "promotion evidence is invalid")?
+            .and_then(|value| value.parse::<i128>().ok())
+            .ok_or("prediction evidence is incomplete")?;
+        let predicted = row
+            .try_get::<Option<String>, _>("predicted_net_pnl")
+            .map_err(|_| "promotion evidence is invalid")?
+            .and_then(|value| value.parse::<i128>().ok())
+            .ok_or("prediction evidence is incomplete")?;
+        absolute_prediction_error = absolute_prediction_error
+            .checked_add(error.unsigned_abs())
+            .ok_or("promotion evidence overflow")?;
+        absolute_predicted_net = absolute_predicted_net
+            .checked_add(predicted.unsigned_abs())
+            .ok_or("promotion evidence overflow")?;
+        let candidate_created_at: chrono::DateTime<Utc> = row
+            .try_get("candidate_created_at")
+            .map_err(|_| "promotion evidence is invalid")?;
+        let submitted_at: chrono::DateTime<Utc> = row
+            .try_get::<Option<chrono::DateTime<Utc>>, _>("submitted_at")
+            .map_err(|_| "promotion evidence is invalid")?
+            .ok_or("submitted outcome timestamp is missing")?;
+        let quote_created_at: chrono::DateTime<Utc> = row
+            .try_get("quote_created_at")
+            .map_err(|_| "promotion evidence is invalid")?;
+        maximum_quote_age_ms = maximum_quote_age_ms.max(nonnegative_milliseconds(
+            submitted_at.signed_duration_since(quote_created_at),
+        )?);
+        maximum_candidate_age_ms = maximum_candidate_age_ms.max(nonnegative_milliseconds(
+            submitted_at.signed_duration_since(candidate_created_at),
+        )?);
+        nonces.push(
+            row.try_get::<Option<String>, _>("nonce")
+                .map_err(|_| "promotion evidence is invalid")?
+                .and_then(|value| value.parse::<u64>().ok())
+                .ok_or("nonce evidence is incomplete")?,
+        );
+    }
+    nonces.sort_unstable();
+    nonces.dedup();
+    let nonce_gaps = nonces
+        .windows(2)
+        .map(|pair| pair[1].saturating_sub(pair[0]).saturating_sub(1))
+        .sum();
+    let prediction_error_bps = if absolute_predicted_net == 0 {
+        u16::MAX
+    } else {
+        u16::try_from(
+            absolute_prediction_error
+                .saturating_mul(10_000)
+                .checked_div(absolute_predicted_net)
+                .unwrap_or(u128::MAX)
+                .min(u128::from(u16::MAX)),
+        )
+        .map_err(|_| "prediction evidence is invalid")?
+    };
+    let (fork_attempts, fork_passes): (i64, i64) = sqlx::query_as(
+        "SELECT count(result.result_hash),
+                count(result.result_hash) FILTER (WHERE result.status = 'passed')
+         FROM live_canary.autonomous_candidates candidate
+         LEFT JOIN public.fork_simulation_results result
+           ON result.plan_hash = candidate.plan_hash
+         WHERE candidate.route_fingerprint = $1
+           AND candidate.selected_size = $2::numeric",
+    )
+    .bind(
+        previous
+            .route_fingerprint
+            .as_deref()
+            .ok_or("economic route is unavailable")?,
+    )
+    .bind(previous.level.amount_wei().to_string())
+    .fetch_one(&mut *transaction)
+    .await
+    .map_err(|_| "fork promotion evidence is unavailable")?;
+    let rpc_disagreements: i64 = sqlx::query_scalar(
+        "SELECT count(*)
+         FROM live_canary.autonomous_candidates candidate
+         WHERE candidate.route_fingerprint = $1
+           AND candidate.selected_size = $2::numeric
+           AND candidate.status IN (
+               'submitted', 'confirmed_profitable', 'confirmed_unprofitable', 'reverted'
+           )
+           AND (
+               candidate.plan_contract #>> '{verification,agreement_state}' IS DISTINCT FROM 'agreed'
+               OR candidate.plan_contract #>> '{verification,independent_verification_status}'
+                  IS DISTINCT FROM 'agreed'
+           )",
+    )
+    .bind(
+        previous
+            .route_fingerprint
+            .as_deref()
+            .ok_or("economic route is unavailable")?,
+    )
+    .bind(previous.level.amount_wei().to_string())
+    .fetch_one(&mut *transaction)
+    .await
+    .map_err(|_| "RPC promotion evidence is unavailable")?;
+    let unknown_submissions: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM live_canary.autonomous_candidates
+         WHERE route_fingerprint = $1 AND status = 'submission_unknown'",
+    )
+    .bind(
+        previous
+            .route_fingerprint
+            .as_deref()
+            .ok_or("economic route is unavailable")?,
+    )
+    .fetch_one(&mut *transaction)
+    .await
+    .map_err(|_| "unknown-submission evidence is unavailable")?;
+    let control_violations: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM live_canary.autonomous_candidates
+         WHERE route_fingerprint = $1
+           AND status IN (
+               'request_materialized', 'claimed', 'signed', 'submitted',
+               'confirmed_profitable', 'confirmed_unprofitable'
+           )
+           AND selected_size <> $2::numeric",
+    )
+    .bind(
+        previous
+            .route_fingerprint
+            .as_deref()
+            .ok_or("economic route is unavailable")?,
+    )
+    .bind(previous.level.amount_wei().to_string())
+    .fetch_one(&mut *transaction)
+    .await
+    .map_err(|_| "control evidence is unavailable")?;
+    let unreconciled_receipts: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM live_canary.execution_attempts
+         WHERE status IN ('pending', 'timed_out', 'submission_unknown')
+           AND coalesce(submitted_at, claimed_at) < now() - interval '180 seconds'",
+    )
+    .fetch_one(&mut *transaction)
+    .await
+    .map_err(|_| "receipt evidence is unavailable")?;
+    let fatal_integrity: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM live_canary.autonomous_candidates
+         WHERE route_fingerprint = $1 AND status = 'integrity_failure'",
+    )
+    .bind(
+        previous
+            .route_fingerprint
+            .as_deref()
+            .ok_or("economic route is unavailable")?,
+    )
+    .fetch_one(&mut *transaction)
+    .await
+    .map_err(|_| "integrity evidence is unavailable")?;
+    let global: (String, String) = sqlx::query_as(
+        "SELECT COALESCE(sum(
+                    CASE WHEN outcome.net_pnl_wei < 0 THEN -outcome.net_pnl_wei ELSE 0 END
+                ) FILTER (
+                    WHERE outcome.recorded_at >= date_trunc(
+                        'day', now() AT TIME ZONE 'UTC'
+                    ) AT TIME ZONE 'UTC'
+                ), 0)::text,
+                control.daily_loss_limit::text
+         FROM live_canary.autonomous_global_control control
+         LEFT JOIN live_canary.execution_outcomes outcome ON true
+         WHERE control.singleton
+         GROUP BY control.daily_loss_limit",
+    )
+    .fetch_one(&mut *transaction)
+    .await
+    .map_err(|_| "daily-loss evidence is unavailable")?;
+    let daily_loss = global
+        .0
+        .parse::<u128>()
+        .map_err(|_| "daily-loss evidence is invalid")?;
+    let daily_limit = global
+        .1
+        .parse::<u128>()
+        .map_err(|_| "daily-loss evidence is invalid")?;
+    let consecutive_losses = rows
+        .iter()
+        .rev()
+        .map(|row| row.try_get::<String, _>("net_pnl"))
+        .take_while(|value| {
+            value
+                .as_ref()
+                .ok()
+                .and_then(|value| value.parse::<i128>().ok())
+                .is_some_and(|value| value < 0)
+        })
+        .count();
+    let evidence = PromotionEvidence {
+        reconciled_outcomes,
+        aggregate_realized_net_pnl_wei: realized_net,
+        successful_outcomes: successful,
+        fork_attempts: u64::try_from(fork_attempts)
+            .map_err(|_| "fork promotion evidence is invalid")?,
+        fork_passes: u64::try_from(fork_passes)
+            .map_err(|_| "fork promotion evidence is invalid")?,
+        rpc_disagreements: u64::try_from(rpc_disagreements)
+            .map_err(|_| "RPC promotion evidence is invalid")?,
+        unknown_submissions: u64::try_from(unknown_submissions)
+            .map_err(|_| "unknown-submission evidence is invalid")?,
+        duplicate_submissions: 0,
+        nonce_gaps,
+        control_violations: u64::try_from(control_violations)
+            .map_err(|_| "control evidence is invalid")?,
+        unreconciled_receipts: u64::try_from(unreconciled_receipts)
+            .map_err(|_| "receipt evidence is invalid")?,
+        process_fatal_integrity_events: u64::try_from(fatal_integrity)
+            .map_err(|_| "integrity evidence is invalid")?,
+        identity_mismatches: 0,
+        prediction_error_bps,
+        daily_loss_wei: daily_loss,
+        daily_loss_limit_wei: daily_limit,
+        consecutive_losses: u64::try_from(consecutive_losses)
+            .map_err(|_| "loss evidence is invalid")?,
+        wallet_gas_reserve_wei: reserve,
+        gas_reserve_floor_wei: previous.gas_reserve_floor_wei,
+        maximum_quote_age_ms,
+        maximum_candidate_age_ms,
+    };
+    sqlx::query(
+        "UPDATE live_canary.economic_control
+         SET gas_reserve_wei = $1::numeric, updated_at = now()
+         WHERE singleton",
+    )
+    .bind(reserve.to_string())
+    .execute(&mut *transaction)
+    .await
+    .map_err(|_| "gas reserve update failed")?;
+
+    if evidence.fork_attempts > 0
+        && evidence.fork_passes.saturating_mul(10_000)
+            < evidence.fork_attempts.saturating_mul(9_500)
+    {
+        route_failure(&mut transaction, &previous, "fork_pass_rate").await?;
+    } else if evidence.reconciled_outcomes > 0 && evidence.prediction_error_bps > 1_000 {
+        route_failure(&mut transaction, &previous, "prediction_error").await?;
+    } else if evidence.rpc_disagreements >= 2 {
+        route_failure(&mut transaction, &previous, "rpc_disagreement").await?;
+    } else if evidence.wallet_gas_reserve_wei <= evidence.gas_reserve_floor_wei {
+        route_failure(&mut transaction, &previous, "gas_reserve_floor").await?;
+    } else if let Ok(Transition::Promote { level, .. }) =
+        evaluate_promotion(previous.phase, previous.level, &evidence)
+    {
+        apply_promotion(&mut transaction, &previous, level).await?;
+    }
+    transaction
+        .commit()
+        .await
+        .map_err(|_| "economic supervision commit failed")?;
+    println!(
+        "ECONOMIC_SUPERVISION_OK: phase={} level={} outcomes={} net_pnl_wei={}",
+        previous.phase.as_str(),
+        previous.level.as_str(),
+        evidence.reconciled_outcomes,
+        evidence.aggregate_realized_net_pnl_wei
+    );
+    Ok(())
+}
+
+async fn wallet_gas_reserve() -> ControlResult<u128> {
+    let wallet = CanonicalAddress::parse(&required("WALLET_ADDRESS")?)
+        .map_err(|_| "wallet address is invalid")?;
+    let url =
+        Url::parse(&required("PRODUCTION_RPC_URL")?).map_err(|_| "primary RPC URL is invalid")?;
+    let allowlist = required("LIVE_EXECUTOR_RPC_ALLOWLIST")?
+        .split(',')
+        .map(|value| Url::parse(value).map_err(|_| "RPC allowlist is invalid"))
+        .collect::<Result<Vec<_>, _>>()?;
+    HttpExecutionRpc::new_production(url, &allowlist)
+        .map_err(|_| "primary RPC is not allowlisted")?
+        .wallet_balance(wallet)
+        .await
+        .map_err(|_| "wallet gas reserve is unavailable".into())
+}
+
+fn nonnegative_milliseconds(duration: chrono::Duration) -> ControlResult<u64> {
+    u64::try_from(duration.num_milliseconds().max(0))
+        .map_err(|_| "latency evidence is invalid".into())
+}
+
+async fn route_failure(
+    transaction: &mut Transaction<'_, Postgres>,
+    previous: &EconomicState,
+    reason: &'static str,
+) -> ControlResult<()> {
+    sqlx::query(
+        "UPDATE live_canary.autonomous_route_controls
+         SET enabled = false, kill_switch = true, disarm_reason = $2,
+             cooldown_until = NULL, control_hash = NULL, control_contract = NULL,
+             control_epoch = control_epoch + 1, updated_at = now()
+         WHERE route_fingerprint = $1",
+    )
+    .bind(
+        previous
+            .route_fingerprint
+            .as_deref()
+            .ok_or("economic route is unavailable")?,
+    )
+    .bind(reason)
+    .execute(&mut **transaction)
+    .await
+    .map_err(|_| "route disarm failed")?;
+    let next_epoch = previous.control_epoch + 1;
+    sqlx::query(
+        "UPDATE live_canary.economic_control
+         SET phase = 'DISARMED_FAILURE', cooldown_until = NULL,
+             control_epoch = $1, last_transition_reason = $2,
+             updated_at = now()
+         WHERE singleton",
+    )
+    .bind(next_epoch)
+    .bind(reason)
+    .execute(&mut **transaction)
+    .await
+    .map_err(|_| "economic route disarm failed")?;
+    insert_transition(
+        transaction,
+        previous,
+        EconomicPhase::DisarmedFailure,
+        previous.level,
+        reason,
+        None,
+        previous.release_sha.as_deref(),
+        next_epoch,
+    )
+    .await
+}
+
+async fn apply_promotion(
+    transaction: &mut Transaction<'_, Postgres>,
+    previous: &EconomicState,
+    next_level: SizeLevel,
+) -> ControlResult<()> {
+    let global = sqlx::query(
+        "SELECT daily_loss_limit::text AS daily_loss_limit, control_epoch
+         FROM live_canary.autonomous_global_control
+         WHERE singleton FOR UPDATE",
+    )
+    .fetch_one(&mut **transaction)
+    .await
+    .map_err(|_| "global promotion control is unavailable")?;
+    let route = sqlx::query(
+        "SELECT route_policy_hash, control_epoch
+         FROM live_canary.autonomous_route_controls
+         WHERE route_fingerprint = $1 FOR UPDATE",
+    )
+    .bind(
+        previous
+            .route_fingerprint
+            .as_deref()
+            .ok_or("economic route is unavailable")?,
+    )
+    .fetch_one(&mut **transaction)
+    .await
+    .map_err(|_| "route promotion control is unavailable")?;
+    let global_epoch = global
+        .try_get::<i64, _>("control_epoch")
+        .map_err(|_| "global promotion control is invalid")?
+        + 1;
+    let route_epoch = route
+        .try_get::<i64, _>("control_epoch")
+        .map_err(|_| "route promotion control is invalid")?
+        + 1;
+    let updated_at = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
+    let daily_loss_limit: String = global
+        .try_get("daily_loss_limit")
+        .map_err(|_| "global promotion control is invalid")?;
+    let route_policy_hash: String = route
+        .try_get("route_policy_hash")
+        .map_err(|_| "route promotion control is invalid")?;
+    let route_fingerprint = previous
+        .route_fingerprint
+        .as_deref()
+        .ok_or("economic route is unavailable")?;
+    let mut global_contract = json!({
+        "schema_version": "phoenix.autonomous-global-control.v1",
+        "chain_id": 42161,
+        "armed": true,
+        "kill_switch": false,
+        "execution_mode": "live",
+        "maximum_input_amount": next_level.amount_wei().to_string(),
+        "daily_loss_limit": daily_loss_limit,
+        "daily_ordering_budget": "0",
+        "maximum_concurrent_candidates": 1,
+        "control_epoch": global_epoch,
+        "updated_at": updated_at,
+        "disarm_reason": Value::Null,
+        "control_hash": "0".repeat(64)
+    });
+    set_hash(
+        &mut global_contract,
+        "control_hash",
+        "global-control",
+        "phoenix.autonomous-global-control.v1",
+    )?;
+    let mut route_contract = json!({
+        "schema_version": "phoenix.autonomous-route-control.v1",
+        "chain_id": 42161,
+        "route_fingerprint": route_fingerprint,
+        "route_policy_hash": route_policy_hash,
+        "enabled": true,
+        "kill_switch": false,
+        "current_size_level": next_level.as_str(),
+        "maximum_permitted_size": next_level.amount_wei().to_string(),
+        "daily_loss_limit": value_text(
+            &serde_json::from_str(POLICY).map_err(|_| "route policy is invalid")?,
+            "per_route_daily_loss"
+        )?,
+        "maximum_consecutive_losses": 3,
+        "submission_unknown_disarms": true,
+        "integrity_failure_disarms": true,
+        "cooldown_until": Value::Null,
+        "control_epoch": route_epoch,
+        "updated_at": updated_at,
+        "disarm_reason": Value::Null,
+        "control_hash": "0".repeat(64)
+    });
+    set_hash(
+        &mut route_contract,
+        "control_hash",
+        "route-control",
+        "phoenix.autonomous-route-control.v1",
+    )?;
+    sqlx::query(
+        "UPDATE live_canary.autonomous_global_control
+         SET maximum_input_amount = $1::numeric, control_epoch = $2,
+             control_hash = $3, control_contract = $4, updated_at = $5::timestamptz
+         WHERE singleton AND armed AND NOT kill_switch AND execution_mode = 'live'",
+    )
+    .bind(next_level.amount_wei().to_string())
+    .bind(global_epoch)
+    .bind(value_text(&global_contract, "control_hash")?)
+    .bind(sqlx::types::Json(&global_contract))
+    .bind(&updated_at)
+    .execute(&mut **transaction)
+    .await
+    .map_err(|_| "global promotion failed")?;
+    sqlx::query(
+        "UPDATE live_canary.autonomous_route_controls
+         SET current_size_level = $2, maximum_permitted_size = $3::numeric,
+             control_epoch = $4, control_hash = $5, control_contract = $6,
+             updated_at = $7::timestamptz
+         WHERE route_fingerprint = $1 AND enabled AND NOT kill_switch",
+    )
+    .bind(route_fingerprint)
+    .bind(next_level.as_str())
+    .bind(next_level.amount_wei().to_string())
+    .bind(route_epoch)
+    .bind(value_text(&route_contract, "control_hash")?)
+    .bind(sqlx::types::Json(&route_contract))
+    .bind(&updated_at)
+    .execute(&mut **transaction)
+    .await
+    .map_err(|_| "route promotion failed")?;
+    let next_epoch = previous.control_epoch + 1;
+    sqlx::query(
+        "UPDATE live_canary.economic_control
+         SET phase = $1, current_size_level = $2,
+             current_input_wei = $3::numeric, control_epoch = $4,
+             last_transition_reason = 'promotion_gate_passed',
+             updated_at = $5::timestamptz
+         WHERE singleton",
+    )
+    .bind(next_level.phase().as_str())
+    .bind(next_level.as_str())
+    .bind(next_level.amount_wei().to_string())
+    .bind(next_epoch)
+    .bind(&updated_at)
+    .execute(&mut **transaction)
+    .await
+    .map_err(|_| "economic promotion failed")?;
+    insert_transition(
+        transaction,
+        previous,
+        next_level.phase(),
+        next_level,
+        "promotion_gate_passed",
+        None,
+        previous.release_sha.as_deref(),
+        next_epoch,
+    )
+    .await
 }
 
 async fn disarm(pool: &PgPool) -> ControlResult<()> {
@@ -596,6 +1757,7 @@ async fn disarm(pool: &PgPool) -> ControlResult<()> {
         .begin()
         .await
         .map_err(|_| "database transaction failed")?;
+    let previous = economic_state_for_update(&mut transaction).await?;
     sqlx::query(
         "UPDATE live_canary.control
          SET armed = false, kill_switch = true, disarm_reason = $1, updated_at = now()
@@ -617,6 +1779,16 @@ async fn disarm(pool: &PgPool) -> ControlResult<()> {
     .await
     .map_err(|_| "global autonomous control disarm failed")?;
     sqlx::query(
+        "UPDATE live_canary.autonomous_route_controls
+         SET enabled = false, kill_switch = true, disarm_reason = $1,
+             cooldown_until = NULL, control_hash = NULL, control_contract = NULL,
+             control_epoch = control_epoch + 1, updated_at = now()",
+    )
+    .bind(&reason)
+    .execute(&mut *transaction)
+    .await
+    .map_err(|_| "route autonomous control disarm failed")?;
+    sqlx::query(
         "UPDATE live_canary.autonomous_candidates
          SET status = 'disarmed', updated_at = now()
          WHERE status IN (
@@ -627,6 +1799,30 @@ async fn disarm(pool: &PgPool) -> ControlResult<()> {
     .execute(&mut *transaction)
     .await
     .map_err(|_| "candidate disarm failed")?;
+    let next_epoch = previous.control_epoch + 1;
+    sqlx::query(
+        "UPDATE live_canary.economic_control
+         SET phase = 'DISARMED_FAILURE', cooldown_until = NULL,
+             control_epoch = $1, last_transition_reason = $2,
+             updated_at = now()
+         WHERE singleton",
+    )
+    .bind(next_epoch)
+    .bind(&reason)
+    .execute(&mut *transaction)
+    .await
+    .map_err(|_| "economic control disarm failed")?;
+    insert_transition(
+        &mut transaction,
+        &previous,
+        EconomicPhase::DisarmedFailure,
+        previous.level,
+        &reason,
+        None,
+        previous.release_sha.as_deref(),
+        next_epoch,
+    )
+    .await?;
     transaction
         .commit()
         .await
@@ -656,8 +1852,20 @@ async fn status(pool: &PgPool) -> Result<(), &'static str> {
     .fetch_optional(pool)
     .await
     .map_err(|_| "route control is unavailable")?;
+    let economic = sqlx::query(
+        "SELECT phase, current_size_level, current_input_wei::text AS current_input_wei,
+                maximum_reviewed_input_wei::text AS maximum_reviewed_input_wei,
+                release_sha, readiness_id, authorization_id, cooldown_until,
+                gas_reserve_wei::text AS gas_reserve_wei,
+                gas_reserve_floor_wei::text AS gas_reserve_floor_wei,
+                control_epoch, last_transition_reason
+         FROM live_canary.economic_control WHERE singleton",
+    )
+    .fetch_one(pool)
+    .await
+    .map_err(|_| "economic control is unavailable")?;
     let payload = json!({
-        "schema": "phoenix.autonomous-live-status.v1",
+        "schema": "phoenix.autonomous-live-status.v2",
         "chain_id": 42161,
         "global": {
             "armed": row.try_get::<bool, _>("armed").map_err(|_| "global control is invalid")?,
@@ -672,7 +1880,21 @@ async fn status(pool: &PgPool) -> Result<(), &'static str> {
             "kill_switch": route.try_get::<bool, _>("kill_switch").ok(),
             "control_epoch": route.try_get::<i64, _>("control_epoch").ok(),
             "hash_present": route.try_get::<bool, _>("hash_present").ok()
-        }))
+        })),
+        "economic": {
+            "phase": economic.try_get::<String, _>("phase").map_err(|_| "economic control is invalid")?,
+            "current_size_level": economic.try_get::<String, _>("current_size_level").map_err(|_| "economic control is invalid")?,
+            "current_input_wei": economic.try_get::<String, _>("current_input_wei").map_err(|_| "economic control is invalid")?,
+            "maximum_reviewed_input_wei": economic.try_get::<String, _>("maximum_reviewed_input_wei").map_err(|_| "economic control is invalid")?,
+            "release_sha": economic.try_get::<Option<String>, _>("release_sha").map_err(|_| "economic control is invalid")?,
+            "readiness_id": economic.try_get::<Option<Uuid>, _>("readiness_id").map_err(|_| "economic control is invalid")?,
+            "authorization_id": economic.try_get::<Option<Uuid>, _>("authorization_id").map_err(|_| "economic control is invalid")?,
+            "cooldown_until": economic.try_get::<Option<chrono::DateTime<Utc>>, _>("cooldown_until").map_err(|_| "economic control is invalid")?,
+            "gas_reserve_wei": economic.try_get::<String, _>("gas_reserve_wei").map_err(|_| "economic control is invalid")?,
+            "gas_reserve_floor_wei": economic.try_get::<String, _>("gas_reserve_floor_wei").map_err(|_| "economic control is invalid")?,
+            "control_epoch": economic.try_get::<i64, _>("control_epoch").map_err(|_| "economic control is invalid")?,
+            "last_transition_reason": economic.try_get::<String, _>("last_transition_reason").map_err(|_| "economic control is invalid")?
+        }
     });
     println!(
         "{}",
@@ -704,16 +1926,214 @@ async fn require_schema(pool: &PgPool) -> Result<(), &'static str> {
     let installed: bool = sqlx::query_scalar(
         "SELECT EXISTS(
              SELECT 1 FROM live_canary.schema_contract
-             WHERE version = 'phoenix.live-canary-schema.v4'
+             WHERE version = 'phoenix.live-canary-schema.v5'
          )",
     )
     .fetch_one(pool)
     .await
     .map_err(|_| "schema inspection failed")?;
     if !installed {
-        return Err("phoenix.live-canary-schema.v4 is not installed");
+        return Err("phoenix.live-canary-schema.v5 is not installed");
     }
     Ok(())
+}
+
+#[derive(Clone, Debug)]
+struct EconomicState {
+    phase: EconomicPhase,
+    level: SizeLevel,
+    route_fingerprint: Option<String>,
+    release_sha: Option<String>,
+    engine_image_digest: Option<String>,
+    route_policy_hash: Option<String>,
+    executor_code_hash: Option<String>,
+    readiness_id: Option<Uuid>,
+    authorization_id: Option<Uuid>,
+    gas_reserve_floor_wei: u128,
+    control_epoch: i64,
+}
+
+async fn economic_state_for_update(
+    transaction: &mut Transaction<'_, Postgres>,
+) -> ControlResult<EconomicState> {
+    let row = sqlx::query(
+        "SELECT phase, current_size_level, route_fingerprint, release_sha,
+                engine_image_digest, route_policy_hash, executor_code_hash,
+                readiness_id, authorization_id,
+                gas_reserve_floor_wei::text AS gas_reserve_floor_wei,
+                control_epoch
+         FROM live_canary.economic_control
+         WHERE singleton
+         FOR UPDATE",
+    )
+    .fetch_one(&mut **transaction)
+    .await
+    .map_err(|_| "economic control is unavailable")?;
+    let phase = parse_phase(
+        &row.try_get::<String, _>("phase")
+            .map_err(|_| "economic control is invalid")?,
+    )?;
+    let level_text: String = row
+        .try_get("current_size_level")
+        .map_err(|_| "economic control is invalid")?;
+    let level =
+        SizeLevel::try_from(level_text.as_str()).map_err(|_| "economic size level is invalid")?;
+    Ok(EconomicState {
+        phase,
+        level,
+        route_fingerprint: row
+            .try_get("route_fingerprint")
+            .map_err(|_| "economic control is invalid")?,
+        release_sha: row
+            .try_get("release_sha")
+            .map_err(|_| "economic control is invalid")?,
+        engine_image_digest: row
+            .try_get("engine_image_digest")
+            .map_err(|_| "economic control is invalid")?,
+        route_policy_hash: row
+            .try_get("route_policy_hash")
+            .map_err(|_| "economic control is invalid")?,
+        executor_code_hash: row
+            .try_get("executor_code_hash")
+            .map_err(|_| "economic control is invalid")?,
+        readiness_id: row
+            .try_get("readiness_id")
+            .map_err(|_| "economic control is invalid")?,
+        authorization_id: row
+            .try_get("authorization_id")
+            .map_err(|_| "economic control is invalid")?,
+        gas_reserve_floor_wei: row
+            .try_get::<String, _>("gas_reserve_floor_wei")
+            .map_err(|_| "economic control is invalid")?
+            .parse()
+            .map_err(|_| "economic gas reserve floor is invalid")?,
+        control_epoch: row
+            .try_get("control_epoch")
+            .map_err(|_| "economic control is invalid")?,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn insert_transition(
+    transaction: &mut Transaction<'_, Postgres>,
+    previous: &EconomicState,
+    next_phase: EconomicPhase,
+    next_level: SizeLevel,
+    reason: &str,
+    evidence_hash: Option<&str>,
+    release_sha: Option<&str>,
+    control_epoch: i64,
+) -> ControlResult<()> {
+    if reason.is_empty()
+        || reason.len() > 128
+        || evidence_hash.is_some_and(|value| !canonical_hex(value, 64))
+    {
+        return Err("economic transition evidence is invalid".into());
+    }
+    let transition_id = Uuid::new_v4();
+    let transitioned_at = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
+    let mut contract = json!({
+        "schema_version": "phoenix.economic-transition.v1",
+        "transition_id": transition_id,
+        "from_phase": previous.phase.as_str(),
+        "to_phase": next_phase.as_str(),
+        "from_size_level": previous.level.as_str(),
+        "to_size_level": next_level.as_str(),
+        "reason": reason,
+        "evidence_hash": evidence_hash,
+        "release_sha": release_sha,
+        "control_epoch": control_epoch,
+        "transitioned_at": transitioned_at,
+        "transition_hash": "0".repeat(64)
+    });
+    set_hash(
+        &mut contract,
+        "transition_hash",
+        "economic-transition",
+        "phoenix.economic-transition.v1",
+    )?;
+    sqlx::query(
+        "INSERT INTO live_canary.economic_transitions(
+            transition_id, schema_version, from_phase, to_phase,
+            from_size_level, to_size_level, reason, evidence_hash,
+            release_sha, control_epoch, transition_hash, transitioned_at
+         ) VALUES (
+            $1, 'phoenix.economic-transition.v1', $2, $3, $4, $5, $6,
+            $7, $8, $9, $10, $11::timestamptz
+         )",
+    )
+    .bind(transition_id)
+    .bind(previous.phase.as_str())
+    .bind(next_phase.as_str())
+    .bind(previous.level.as_str())
+    .bind(next_level.as_str())
+    .bind(reason)
+    .bind(evidence_hash)
+    .bind(release_sha)
+    .bind(control_epoch)
+    .bind(value_text(&contract, "transition_hash")?)
+    .bind(&transitioned_at)
+    .execute(&mut **transaction)
+    .await
+    .map_err(|_| "economic transition persistence failed")?;
+    Ok(())
+}
+
+fn parse_phase(value: &str) -> ControlResult<EconomicPhase> {
+    match value {
+        "DISARMED_DEPLOY" => Ok(EconomicPhase::DisarmedDeploy),
+        "DISARMED_EVIDENCE" => Ok(EconomicPhase::DisarmedEvidence),
+        "CANARY_READY" => Ok(EconomicPhase::CanaryReady),
+        "LIVE_CANARY_MIN" => Ok(EconomicPhase::LiveCanaryMin),
+        "LIVE_SCALE_L1" => Ok(EconomicPhase::LiveScaleL1),
+        "LIVE_SCALE_L2" => Ok(EconomicPhase::LiveScaleL2),
+        "LIVE_SCALE_L3" => Ok(EconomicPhase::LiveScaleL3),
+        "LIVE_SCALE_L4" => Ok(EconomicPhase::LiveScaleL4),
+        "LIVE_SCALE_L5" => Ok(EconomicPhase::LiveScaleL5),
+        "LIVE_MAX_REVIEWED" => Ok(EconomicPhase::LiveMaxReviewed),
+        "COOLDOWN" => Ok(EconomicPhase::Cooldown),
+        "DISARMED_FAILURE" => Ok(EconomicPhase::DisarmedFailure),
+        _ => Err("economic phase is invalid".into()),
+    }
+}
+
+fn read_control_contract(
+    environment_name: &'static str,
+    error: &'static str,
+) -> ControlResult<(Value, PathBuf)> {
+    let path = PathBuf::from(required(environment_name)?);
+    let metadata = fs::symlink_metadata(&path).map_err(|_| error)?;
+    if !metadata.file_type().is_file()
+        || metadata.file_type().is_symlink()
+        || metadata.len() == 0
+        || metadata.len() > MAX_CONTROL_FILE_BYTES
+    {
+        return Err(error.into());
+    }
+    let raw = fs::read(&path).map_err(|_| error)?;
+    let value = serde_json::from_slice(&raw).map_err(|_| error)?;
+    Ok((value, path))
+}
+
+fn image_digest(value: &str) -> ControlResult<String> {
+    let digest = value
+        .rsplit_once('@')
+        .map(|(_, digest)| digest)
+        .unwrap_or(value);
+    let Some(hex_digest) = digest.strip_prefix("sha256:") else {
+        return Err("Engine image digest is invalid".into());
+    };
+    if !canonical_hex(hex_digest, 64) {
+        return Err("Engine image digest is invalid".into());
+    }
+    Ok(digest.to_string())
+}
+
+fn canonical_hex(value: &str, length: usize) -> bool {
+    value.len() == length
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 fn required(name: &'static str) -> ControlResult<String> {
