@@ -1232,6 +1232,13 @@ class BoundedTransportTests(unittest.TestCase):
             self.assertEqual(require_success.call_count, 2)
             emergency_pause.assert_called_once()
             self.assertEqual(
+                require_success.call_args_list[0].args[0][2:],
+                [
+                    RELEASE_SHA,
+                    str(paths.releases / RELEASE_SHA),
+                ],
+            )
+            self.assertEqual(
                 require_success.call_args_list[1].args[0][1],
                 str(paths.libexec / "rollback-release.sh"),
             )
