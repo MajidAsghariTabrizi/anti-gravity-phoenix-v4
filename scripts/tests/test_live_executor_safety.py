@@ -54,6 +54,10 @@ class LiveExecutorSafetyTests(unittest.TestCase):
 
     def test_autonomous_live_profile_is_explicit_continuous_and_file_signed(self) -> None:
         overlay = (ROOT / "compose.live-autonomous.yml").read_text(encoding="utf-8")
+        self.assertRegex(
+            overlay,
+            r'(?ms)^  economic-monitor:\n(?:(?!^  \S).)*^    user: "1000:1000"$',
+        )
         for required in (
             'profiles: ["live-autonomous"]',
             "PHOENIX_MODE: LIVE",
