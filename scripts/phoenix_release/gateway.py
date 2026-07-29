@@ -832,7 +832,11 @@ def _readiness_chain_reconciliation(
     }
     try:
         value = read_chain_reconciliation_evidence(
-            chain_reconciliation_path(paths.state_root, active_release),
+            chain_reconciliation_path(
+                paths.state_root,
+                active_release,
+                candidate_sha,
+            ),
             expected=expected,
         )
     except ReconciliationError as exc:
@@ -1271,7 +1275,11 @@ def reconcile_chain_evidence(
                 "expected_release_assets": release_assets_sha,
             },
         )
-    path = chain_reconciliation_path(paths.state_root, active_release)
+    path = chain_reconciliation_path(
+        paths.state_root,
+        active_release,
+        protected_main_sha,
+    )
     try:
         created = write_chain_reconciliation_evidence(path, evidence_value)
     except ReconciliationError as exc:

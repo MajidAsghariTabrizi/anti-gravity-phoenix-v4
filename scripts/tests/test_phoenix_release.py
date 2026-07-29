@@ -1458,6 +1458,13 @@ class WorkflowAndDeploymentContractTests(unittest.TestCase):
         self.assertNotIn("GITHUB_RUN_ATTEMPT", self.workflow)
         self.assertIn("Probe durable exact-package evidence", self.workflow)
 
+    def test_deploy_checkout_preserves_rollback_history(self) -> None:
+        checkout = self.workflow.split(
+            "- name: Checkout exact protected main release",
+            maxsplit=1,
+        )[1].split("- name:", maxsplit=1)[0]
+        self.assertIn("fetch-depth: 0", checkout)
+
     def test_ci_preserves_jobs_and_runs_expensive_suites_only_on_main(
         self,
     ) -> None:
