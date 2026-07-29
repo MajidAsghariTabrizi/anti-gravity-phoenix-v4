@@ -281,14 +281,13 @@ def load_manifest(path: Path) -> tuple[dict, str, dict[str, str]]:
             ):
                 raise ContextError("RELEASE_IMAGE_MISMATCH")
             expected_tag = f"sha-{source_sha}"
-            if image_name in PROTECTED_IMAGES:
-                if image.get("origin") != "inherited":
+            if image.get("origin") == "built":
+                if source_sha != release_sha or source_run_id != build_run_id:
                     raise ContextError("RELEASE_IMAGE_MISMATCH")
-            elif (
-                image.get("origin") != "built"
-                or source_sha != release_sha
-                or source_run_id != build_run_id
-            ):
+            elif image.get("origin") == "inherited":
+                if source_sha == release_sha and source_run_id == build_run_id:
+                    raise ContextError("RELEASE_IMAGE_MISMATCH")
+            else:
                 raise ContextError("RELEASE_IMAGE_MISMATCH")
         if (
             repository != expected_repository

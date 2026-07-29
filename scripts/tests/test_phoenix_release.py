@@ -1505,6 +1505,35 @@ class WorkflowAndDeploymentContractTests(unittest.TestCase):
         self.assertIn("1000:1000", self.rehearsal)
         self.assertIn("candidate_monitor_unhealthy", self.rehearsal)
         self.assertIn("candidate_health_contract_failed", self.rehearsal)
+        self.assertIn(
+            'docker rm -f -v "$monitor_container"',
+            self.rehearsal,
+        )
+        self.assertIn(
+            "PHOENIX_HEALTH_EXPECTED_MODE=SHADOW",
+            self.rehearsal,
+        )
+        self.assertNotIn(
+            "PHOENIX_HEALTH_EXPECTED_MODE=DISARMED_EVIDENCE",
+            self.rehearsal,
+        )
+        self.assertIn(
+            'image_volume = "/var/lib/postgresql/data"',
+            self.rehearsal,
+        )
+        self.assertIn(
+            'r"/var/lib/docker/volumes/[0-9a-f]{64}/_data"',
+            self.rehearsal,
+        )
+
+    def test_rehearsal_renders_disarmed_candidate_without_live_overlay(
+        self,
+    ) -> None:
+        render = self.rehearsal.split(
+            '"$candidate_root/scripts/render-production-compose.sh"',
+            maxsplit=1,
+        )[1].split("postgres_image=", maxsplit=1)[0]
+        self.assertNotIn("--overlay-file", render)
 
     def test_candidate_render_precedes_any_runtime_mutation(self) -> None:
         preflight_render = self.deploy.index(

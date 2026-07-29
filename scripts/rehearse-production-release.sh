@@ -60,7 +60,7 @@ database_container=
 database_network=
 cleanup_monitor() {
   [ -z "$monitor_container" ] ||
-    /usr/bin/docker rm -f "$monitor_container" >/dev/null 2>&1 || true
+    /usr/bin/docker rm -f -v "$monitor_container" >/dev/null 2>&1 || true
 }
 cleanup_database() {
   [ -z "$database_container" ] ||
@@ -83,7 +83,6 @@ python3 "$candidate_root/scripts/production_context.py" manifest-env \
 
 "$candidate_root/scripts/render-production-compose.sh" \
   --compose-file "$compose_file" \
-  --overlay-file "$overlay_file" \
   --env-file "$env_file" \
   --release-env "$release_env" \
   --release-manifest "$release_manifest" \
@@ -211,21 +210,51 @@ python3 -I -B - \
   "$candidate_root/scripts/sql/economic-dashboard-snapshot.sql" \
   "$monitor_output" <<'PY' ||
 import json
+import re
 import sys
 from pathlib import Path
 
 mounts = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
 observed = {
-    item["Destination"]: Path(item["Source"]).resolve()
+    item["Destination"]: item
     for item in mounts
     if isinstance(item, dict)
 }
 expected = {
-    "/opt/phoenix/economic-dashboard-loop.sh": Path(sys.argv[2]).resolve(),
-    "/opt/phoenix/economic-dashboard-snapshot.sql": Path(sys.argv[3]).resolve(),
-    "/evidence": Path(sys.argv[4]).resolve(),
+    "/opt/phoenix/economic-dashboard-loop.sh": (
+        Path(sys.argv[2]).resolve(),
+        False,
+    ),
+    "/opt/phoenix/economic-dashboard-snapshot.sql": (
+        Path(sys.argv[3]).resolve(),
+        False,
+    ),
+    "/evidence": (Path(sys.argv[4]).resolve(), True),
 }
-if observed != expected:
+image_volume = "/var/lib/postgresql/data"
+if (
+    len(observed) != len(mounts)
+    or set(observed) != set(expected) | {image_volume}
+):
+    raise SystemExit(1)
+for destination, (source, writable) in expected.items():
+    item = observed[destination]
+    if (
+        item.get("Type") != "bind"
+        or Path(item.get("Source", "")).resolve() != source
+        or item.get("RW") is not writable
+    ):
+        raise SystemExit(1)
+volume = observed[image_volume]
+if (
+    volume.get("Type") != "volume"
+    or volume.get("RW") is not True
+    or re.fullmatch(
+        r"/var/lib/docker/volumes/[0-9a-f]{64}/_data",
+        str(volume.get("Source", "")),
+    )
+    is None
+):
     raise SystemExit(1)
 PY
   fail candidate_monitor_mount_mismatch
@@ -274,7 +303,7 @@ PHOENIX_COMPOSE_FILE="$compose_file" \
 PHOENIX_COMPOSE_OVERLAY_FILE="$overlay_file" \
 PHOENIX_COMPOSE_PROJECT_DIRECTORY="$deploy_dir" \
 PHOENIX_COMPOSE_RUNNER="$compose_runner" \
-PHOENIX_HEALTH_EXPECTED_MODE=DISARMED_EVIDENCE \
+PHOENIX_HEALTH_EXPECTED_MODE=SHADOW \
   "$candidate_root/scripts/production-healthcheck.sh" >/dev/null ||
   fail candidate_health_contract_failed
 
