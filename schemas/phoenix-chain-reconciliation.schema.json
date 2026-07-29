@@ -121,6 +121,7 @@
         "input_selector",
         "paused",
         "provider_identity",
+        "receipt_source",
         "receipt_status",
         "set_paused_value",
         "transaction_hash"
@@ -151,6 +152,12 @@
         "provider_identity": {
           "type": "string",
           "pattern": "^rpc-[0-9a-f]{16}$"
+        },
+        "receipt_source": {
+          "enum": [
+            "eth_getBlockReceipts",
+            "eth_getTransactionReceipt"
+          ]
         },
         "receipt_status": {
           "const": 1

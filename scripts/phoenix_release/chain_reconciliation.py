@@ -133,6 +133,45 @@ def _hex_integer(value: object, code: str) -> int:
     return int(value, 16)
 
 
+def _receipt_evidence(
+    url: str,
+    transaction_hash: str,
+    block_tag: str,
+    call: Callable[[str, str, list[object]], object],
+) -> tuple[dict[str, Any], str]:
+    try:
+        receipt = call(
+            url,
+            "eth_getTransactionReceipt",
+            [transaction_hash],
+        )
+    except ReconciliationError as exc:
+        if exc.code not in {
+            "CHAIN_EVIDENCE_RPC_ERROR",
+            "CHAIN_EVIDENCE_RPC_UNAVAILABLE",
+        }:
+            raise
+        receipt = None
+    if isinstance(receipt, dict):
+        return receipt, "eth_getTransactionReceipt"
+
+    block_receipts = call(url, "eth_getBlockReceipts", [block_tag])
+    if not isinstance(block_receipts, list):
+        raise ReconciliationError("CHAIN_EVIDENCE_RECEIPT_INVALID")
+    matching = [
+        value
+        for value in block_receipts
+        if (
+            isinstance(value, dict)
+            and isinstance(value.get("transactionHash"), str)
+            and value["transactionHash"].lower() == transaction_hash
+        )
+    ]
+    if len(matching) != 1:
+        raise ReconciliationError("CHAIN_EVIDENCE_RECEIPT_INVALID")
+    return matching[0], "eth_getBlockReceipts"
+
+
 def _provider_observation(
     url: str,
     executor_address: str,
@@ -145,7 +184,6 @@ def _provider_observation(
         "eth_call",
         [{"to": executor_address, "data": PAUSED_SELECTOR}, "latest"],
     )
-    receipt = call(url, "eth_getTransactionReceipt", [transaction_hash])
     transaction = call(url, "eth_getTransactionByHash", [transaction_hash])
     if chain_id != ARBITRUM_CHAIN_ID:
         raise ReconciliationError("CHAIN_EVIDENCE_CHAIN_ID_INVALID")
@@ -155,17 +193,31 @@ def _provider_observation(
         or int(paused_raw, 16) != 1
     ):
         raise ReconciliationError("CHAIN_EVIDENCE_CONTRACT_NOT_PAUSED")
-    if not isinstance(receipt, dict) or not isinstance(transaction, dict):
+    if not isinstance(transaction, dict):
         raise ReconciliationError("CHAIN_EVIDENCE_TRANSACTION_MISSING")
-    receipt_hash = receipt.get("transactionHash")
     transaction_value = transaction.get("hash")
     if (
-        not isinstance(receipt_hash, str)
-        or not isinstance(transaction_value, str)
-        or receipt_hash.lower() != transaction_hash
+        not isinstance(transaction_value, str)
         or transaction_value.lower() != transaction_hash
     ):
         raise ReconciliationError("CHAIN_EVIDENCE_TRANSACTION_INVALID")
+    transaction_block_tag = transaction.get("blockNumber")
+    _hex_integer(
+        transaction_block_tag,
+        "CHAIN_EVIDENCE_TRANSACTION_INVALID",
+    )
+    receipt, receipt_source = _receipt_evidence(
+        url,
+        transaction_hash,
+        transaction_block_tag,
+        call,
+    )
+    receipt_hash = receipt.get("transactionHash")
+    if (
+        not isinstance(receipt_hash, str)
+        or receipt_hash.lower() != transaction_hash
+    ):
+        raise ReconciliationError("CHAIN_EVIDENCE_RECEIPT_INVALID")
     receipt_status = _hex_integer(
         receipt.get("status"),
         "CHAIN_EVIDENCE_RECEIPT_INVALID",
@@ -211,6 +263,7 @@ def _provider_observation(
         "input_selector": SET_PAUSED_SELECTOR,
         "paused": True,
         "provider_identity": provider_identity(url),
+        "receipt_source": receipt_source,
         "receipt_status": receipt_status,
         "set_paused_value": False,
         "transaction_hash": transaction_hash,
@@ -249,12 +302,12 @@ def collect_provider_evidence(
     comparable = {
         key: value
         for key, value in observations[0].items()
-        if key != "provider_identity"
+        if key not in {"provider_identity", "receipt_source"}
     }
     second = {
         key: value
         for key, value in observations[1].items()
-        if key != "provider_identity"
+        if key not in {"provider_identity", "receipt_source"}
     }
     if comparable != second:
         raise ReconciliationError("CHAIN_EVIDENCE_PROVIDER_DISAGREEMENT")
@@ -362,6 +415,7 @@ def validate_evidence(
         "input_selector",
         "paused",
         "provider_identity",
+        "receipt_source",
         "receipt_status",
         "set_paused_value",
         "transaction_hash",
@@ -378,6 +432,11 @@ def validate_evidence(
             or provider["transaction_hash"]
             != value["owner_transaction_hash"]
             or provider["paused"] is not True
+            or provider["receipt_source"]
+            not in {
+                "eth_getBlockReceipts",
+                "eth_getTransactionReceipt",
+            }
             or provider["receipt_status"] != 1
             or type(provider["block_number"]) is not int
             or provider["block_number"] <= 0
@@ -392,12 +451,12 @@ def validate_evidence(
     comparable = {
         key: value
         for key, value in providers[0].items()
-        if key != "provider_identity"
+        if key not in {"provider_identity", "receipt_source"}
     }
     second = {
         key: value
         for key, value in providers[1].items()
-        if key != "provider_identity"
+        if key not in {"provider_identity", "receipt_source"}
     }
     if comparable != second:
         raise ReconciliationError("CHAIN_EVIDENCE_PROVIDER_DISAGREEMENT")
