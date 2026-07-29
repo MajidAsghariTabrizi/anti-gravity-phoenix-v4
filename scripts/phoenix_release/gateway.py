@@ -1911,18 +1911,23 @@ def _rollback_failed_state(
     if state["current_phase"] not in {"ROLLBACK_STARTED", "ROLLBACK_FAILED"}:
         return state
     rollback_sha = state["rollback_sha"]
-    rollback_root = paths.releases / rollback_sha
     context_installer = paths.libexec / "install-production-release-context.sh"
     try:
         runtime_may_have_changed = _runtime_may_have_changed(state)
         if runtime_may_have_changed:
             emergency_pause(paths)
+        context_sha = (
+            state["release_sha"]
+            if runtime_may_have_changed
+            else rollback_sha
+        )
+        context_root = paths.releases / context_sha
         _require_success(
             [
                 "/bin/sh",
                 str(context_installer),
-                rollback_sha,
-                str(rollback_root),
+                context_sha,
+                str(context_root),
             ],
             "ROLLBACK_CONTEXT_INSTALL_FAILED",
             env={"PHOENIX_DEPLOY_ROOT": str(paths.deploy_root)},
