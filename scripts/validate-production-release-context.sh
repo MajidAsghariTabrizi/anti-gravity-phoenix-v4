@@ -12,6 +12,7 @@ current_release=
 release_state=
 running_images=
 inspect_running=0
+allow_stopped_live_executor=0
 rendered_output=
 metadata_output=
 result_output=
@@ -49,6 +50,7 @@ while [ "$#" -gt 0 ]; do
     --release-state) [ "$#" -ge 2 ] || usage; release_state=$2; shift 2 ;;
     --running-images-file) [ "$#" -ge 2 ] || usage; running_images=$2; shift 2 ;;
     --inspect-running) inspect_running=1; shift ;;
+    --allow-stopped-live-executor) allow_stopped_live_executor=1; shift ;;
     --rendered-output) [ "$#" -ge 2 ] || usage; rendered_output=$2; shift 2 ;;
     --metadata-output) [ "$#" -ge 2 ] || usage; metadata_output=$2; shift 2 ;;
     --output) [ "$#" -ge 2 ] || usage; result_output=$2; shift 2 ;;
@@ -74,6 +76,11 @@ if [ "$inspect_running" -eq 1 ] && [ -n "$running_images" ]; then
 fi
 if [ "$inspect_running" -eq 0 ] && [ -z "$running_images" ]; then
   fail RUNNING_IMAGE_MISMATCH
+fi
+if [ "$allow_stopped_live_executor" -eq 1 ] &&
+  { [ "$inspect_running" -ne 1 ] || [ -z "$overlay_file" ]; }
+then
+  usage
 fi
 
 if ! command -v python3 >/dev/null 2>&1 && command -v python >/dev/null 2>&1; then
@@ -142,6 +149,12 @@ if [ "$inspect_running" -eq 1 ]; then
         --env-file "$release_env" \
         "$@" ps -q "$service" 2>/dev/null) ||
       fail RUNNING_IMAGE_MISMATCH compose-ps "$service"
+    if [ -z "$container_id" ] &&
+      [ "$service" = live-executor ] &&
+      [ "$allow_stopped_live_executor" -eq 1 ]
+    then
+      continue
+    fi
     [ -n "$container_id" ] ||
       fail RUNNING_IMAGE_MISMATCH container-missing "$service"
     container_count=$(printf '%s\n' "$container_id" | awk 'NF { count += 1 } END { print count + 0 }')
@@ -167,7 +180,7 @@ else
 fi
 
 result_tmp=$state_dir/release-context.json
-python3 "$script_dir/production_context.py" validate-active \
+set -- \
   --manifest "$release_manifest" \
   --release-env "$release_env" \
   --render-metadata "$metadata_output" \
@@ -175,7 +188,11 @@ python3 "$script_dir/production_context.py" validate-active \
   --current-release "$current_release" \
   --release-state "$release_state" \
   --running-images "$running_images" \
-  --output "$result_tmp" || exit 1
+  --output "$result_tmp"
+if [ "$allow_stopped_live_executor" -eq 1 ]; then
+  set -- "$@" --allow-stopped-live-executor
+fi
+python3 "$script_dir/production_context.py" validate-active "$@" || exit 1
 
 result_dir=$(dirname -- "$result_output")
 mkdir -p "$result_dir" || fail PRODUCTION_COMPOSE_CONTEXT_MISSING

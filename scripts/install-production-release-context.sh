@@ -31,7 +31,7 @@ case "$deploy_root:$env_file" in
   *) fail 'deployment root and environment file must be absolute' ;;
 esac
 id "$owner_user" >/dev/null 2>&1 || fail 'production owner user is unavailable'
-for command_name in chown chmod docker install mktemp readlink stat; do
+for command_name in chown chmod docker install mktemp python3 readlink stat; do
   command -v "$command_name" >/dev/null 2>&1 ||
     fail "required command is unavailable: $command_name"
 done
@@ -97,6 +97,51 @@ install_source() {
     "$source_path" "$target_path"
 }
 
+release_manifest_omits() {
+  relative_path=$1
+  manifest_path=$source_root/release-assets-manifest.json
+  [ -n "$release_sha" ] &&
+    [ -f "$manifest_path" ] &&
+    [ ! -L "$manifest_path" ] ||
+    return 1
+  python3 -I -B - "$manifest_path" "$release_sha" "$relative_path" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+manifest_path, release_sha, relative_path = sys.argv[1:]
+try:
+    value = json.loads(Path(manifest_path).read_text(encoding="utf-8"))
+except (OSError, UnicodeError, json.JSONDecodeError):
+    raise SystemExit(1)
+if (
+    not isinstance(value, dict)
+    or value.get("schema") != "phoenix.release-assets.v1"
+    or value.get("release_sha") != release_sha
+    or not isinstance(value.get("files"), list)
+):
+    raise SystemExit(1)
+paths = [
+    item.get("path")
+    for item in value["files"]
+    if isinstance(item, dict)
+]
+raise SystemExit(0 if relative_path not in paths else 1)
+PY
+}
+
+install_versioned_source() {
+  relative_path=$1
+  target_path=$2
+  target_mode=$3
+  if [ -f "$source_root/$relative_path" ]; then
+    install_source "$source_root/$relative_path" "$target_path" "$target_mode"
+    return
+  fi
+  release_manifest_omits "$relative_path" ||
+    fail "release context source is missing or unsafe: $source_root/$relative_path"
+}
+
 ensure_deploy_directory() {
   context_path=$1
   context_owner=$2
@@ -147,8 +192,8 @@ install_source \
   "$deploy_dir/prometheus/prometheus.yml" 0644
 install_source \
   "$source_root/dashboard/snapshot_model.py" "$deploy_dir/snapshot_model.py" 0640
-install_source \
-  "$source_root/docs/AUTOMATED_ECONOMIC_CONTROL.md" \
+install_versioned_source \
+  "docs/AUTOMATED_ECONOMIC_CONTROL.md" \
   "$deploy_dir/docs/AUTOMATED_ECONOMIC_CONTROL.md" 0640
 install_source \
   "$source_root/fixtures/routes/arbitrum_uniswap_v3_pool_proofs.json" \
@@ -183,12 +228,14 @@ for sql_name in \
   shadow-profitability-report.sql \
   shadow-route-discovery-enrichment.sql \
   prelive-money-path-report.sql \
-  prelive-dashboard-source.sql \
-  economic-dashboard-snapshot.sql
+  prelive-dashboard-source.sql
 do
   install_source \
     "$source_root/scripts/sql/$sql_name" "$deploy_dir/sql/$sql_name" 0640
 done
+install_versioned_source \
+  "scripts/sql/economic-dashboard-snapshot.sql" \
+  "$deploy_dir/sql/economic-dashboard-snapshot.sql" 0640
 
 for schema_name in \
   prelive-money-path-summary.schema.json \
@@ -202,7 +249,6 @@ done
 
 for script_name in \
   production_context.py \
-  activate-economic-canary.sh \
   release_components.py \
   render-production-compose.sh \
   verify-compose-route-registry.py \
@@ -222,11 +268,14 @@ for script_name in \
   prelive-shadow-control.sh \
   release_assets.py \
   verify_dashboard_compose.py \
-  deploy-release.sh \
-  economic-dashboard-loop.sh
+  deploy-release.sh
 do
   install_source \
     "$source_root/scripts/$script_name" "$deploy_dir/$script_name" 0750
+done
+for script_name in activate-economic-canary.sh economic-dashboard-loop.sh; do
+  install_versioned_source \
+    "scripts/$script_name" "$deploy_dir/$script_name" 0750
 done
 
 # These reviewed safety scripts may be newer than an immutable rollback tree.

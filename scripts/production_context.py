@@ -703,6 +703,12 @@ def validate_active(args: argparse.Namespace) -> None:
     ):
         item = running_services.get(service)
         expected_image = expected_state["images"].get(service)
+        if (
+            service == "live-executor"
+            and args.allow_stopped_live_executor
+            and item is None
+        ):
+            continue
         if not isinstance(item, dict) or not isinstance(expected_image, str):
             raise ContextError(
                 "RUNNING_IMAGE_MISMATCH",
@@ -809,6 +815,7 @@ def parser() -> argparse.ArgumentParser:
     active.add_argument("--current-release", required=True)
     active.add_argument("--release-state", required=True)
     active.add_argument("--running-images", required=True)
+    active.add_argument("--allow-stopped-live-executor", action="store_true")
     active.add_argument("--output", required=True)
     active.set_defaults(handler=validate_active)
     return root

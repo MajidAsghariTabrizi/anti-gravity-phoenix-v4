@@ -12,6 +12,7 @@ import sys
 import tarfile
 import tempfile
 import unittest
+from argparse import Namespace
 from pathlib import Path
 from unittest.mock import patch
 
@@ -25,6 +26,7 @@ from scripts.phoenix_release.controller import (
 from scripts.phoenix_release.cli import parser as release_parser
 from scripts.phoenix_release.gateway import (
     _bounded_output,
+    _is_stopped_live_executor,
     _live_executor_absence_is_fail_closed,
     _require_success,
     _rollback_failed_state,
@@ -42,6 +44,10 @@ from scripts.phoenix_release.gateway import (
     resume,
     state_file,
     validate_request,
+)
+from scripts.production_context import (
+    ContextError,
+    validate_active as validate_active_context,
 )
 from scripts.phoenix_release.model import (
     PHASES,
@@ -1271,6 +1277,107 @@ class BoundedTransportTests(unittest.TestCase):
             )
 
 
+class ActiveReleaseContextTests(unittest.TestCase):
+    def _validate(
+        self,
+        root: Path,
+        *,
+        allow_stopped_live_executor: bool,
+        missing_service: str,
+    ) -> None:
+        engine_image = (
+            "ghcr.io/example/phoenix-engine@sha256:" + "1" * 64
+        )
+        executor_image = (
+            "ghcr.io/example/live-executor@sha256:" + "2" * 64
+        )
+        expected = {
+            "autonomous_execution": True,
+            "images": {
+                "phoenix-engine": engine_image,
+                "live-executor": executor_image,
+            },
+            "live_execution": True,
+            "mode": "LIVE",
+            "release_sha": RELEASE_SHA,
+            "route_registry_hash": "sha256:" + "3" * 64,
+        }
+        release_state = root / "release-state.json"
+        current_release = root / "current-release"
+        running_images = root / "running-images.json"
+        output = root / "result.json"
+        release_state.write_text(
+            json.dumps(expected), encoding="utf-8"
+        )
+        current_release.write_text(RELEASE_SHA + "\n", encoding="utf-8")
+        services = {
+            "phoenix-engine": {
+                "configured_image": engine_image,
+                "container_id": "a" * 64,
+                "image_id": "sha256:" + "4" * 64,
+            },
+            "live-executor": {
+                "configured_image": executor_image,
+                "container_id": "b" * 64,
+                "image_id": "sha256:" + "5" * 64,
+            },
+        }
+        services.pop(missing_service)
+        running_images.write_text(
+            json.dumps(
+                {
+                    "schema": "phoenix.running-images.v1",
+                    "services": services,
+                }
+            ),
+            encoding="utf-8",
+        )
+        arguments = Namespace(
+            allow_stopped_live_executor=allow_stopped_live_executor,
+            current_release=str(current_release),
+            output=str(output),
+            release_state=str(release_state),
+            running_images=str(running_images),
+        )
+        with patch(
+            "scripts.production_context.state_payload",
+            return_value=expected,
+        ):
+            validate_active_context(arguments)
+
+    def test_stopped_live_executor_requires_the_explicit_disarmed_flag(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            with self.assertRaisesRegex(
+                ContextError, "RUNNING_IMAGE_MISMATCH"
+            ):
+                self._validate(
+                    Path(temporary),
+                    allow_stopped_live_executor=False,
+                    missing_service="live-executor",
+                )
+        with tempfile.TemporaryDirectory() as temporary:
+            self._validate(
+                Path(temporary),
+                allow_stopped_live_executor=True,
+                missing_service="live-executor",
+            )
+
+    def test_disarmed_flag_never_allows_another_service_to_be_missing(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            with self.assertRaisesRegex(
+                ContextError, "RUNNING_IMAGE_MISMATCH"
+            ):
+                self._validate(
+                    Path(temporary),
+                    allow_stopped_live_executor=True,
+                    missing_service="phoenix-engine",
+                )
+
+
 class ReconciliationTests(unittest.TestCase):
     def snapshot(self) -> dict[str, object]:
         return {
@@ -1374,6 +1481,30 @@ class ReconciliationTests(unittest.TestCase):
                         candidate_release, candidate_runtime
                     )
                 )
+
+    def test_readiness_treats_only_a_nonrunning_live_executor_as_stopped(
+        self,
+    ) -> None:
+        self.assertTrue(
+            _is_stopped_live_executor(
+                "live-executor", {"running": False}
+            )
+        )
+        self.assertTrue(
+            _is_stopped_live_executor(
+                "live-executor", {"running": None}
+            )
+        )
+        self.assertFalse(
+            _is_stopped_live_executor(
+                "live-executor", {"running": True}
+            )
+        )
+        self.assertFalse(
+            _is_stopped_live_executor(
+                "phoenix-engine", {"running": False}
+            )
+        )
 
     def test_stopped_live_executor_rejects_unbounded_runtime_evidence(
         self,
@@ -1620,6 +1751,21 @@ class WorkflowAndDeploymentContractTests(unittest.TestCase):
         self.assertLess(promote, complete)
         self.assertIn("context_validation_output=$(", self.deploy)
         self.assertIn("production release context validation failed", self.deploy)
+        context_validation = self.deploy.index(
+            '"$deploy_dir/validate-production-release-context.sh"'
+        )
+        evidence_phase = self.deploy.index(
+            "mark_phase DISARMED_EVIDENCE_STARTED"
+        )
+        stopped_executor = self.deploy.rfind(
+            'compose ps -q live-executor', 0, context_validation
+        )
+        self.assertLess(evidence_phase, context_validation)
+        self.assertLess(stopped_executor, evidence_phase)
+        self.assertIn(
+            "--allow-stopped-live-executor",
+            self.deploy[evidence_phase:context_validation + 500],
+        )
 
     def test_health_checks_receive_explicit_release_phase_mode(self) -> None:
         health = (ROOT / "scripts/production-healthcheck.sh").read_text()
