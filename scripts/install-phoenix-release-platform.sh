@@ -114,7 +114,7 @@ install -d -m 0700 -o root -g root /var/lib/phoenix-release/releases
 
 install -m 0755 -o root -g root "$script_dir/phoenix-release-gateway.sh" "$gateway"
 install -m 0755 -o root -g root "$script_dir/phoenix-release-transport.sh" "$transport"
-for name in __init__.py model.py controller.py gateway.py cli.py phase_update.py; do
+for name in __init__.py chain_reconciliation.py model.py controller.py gateway.py cli.py phase_update.py; do
   install -m 0644 -o root -g root \
     "$script_dir/phoenix_release/$name" "$libexec/phoenix_release/$name"
 done

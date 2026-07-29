@@ -24,6 +24,7 @@ from phoenix_release.gateway import (  # noqa: E402
     production_readiness,
     receive_package,
     reconcile_active_context,
+    reconcile_chain_evidence,
     retry_pre_mutation,
     retry_rolled_back,
     rollback_release,
@@ -63,6 +64,8 @@ def parser() -> argparse.ArgumentParser:
     evidence_parser = subparsers.add_parser("evidence")
     evidence_parser.add_argument("release_sha", type=_sha)
     subparsers.add_parser("reconcile-active-context")
+    chain_evidence = subparsers.add_parser("reconcile-chain-evidence")
+    chain_evidence.add_argument("protected_main_sha", type=_sha)
     return value
 
 
@@ -108,6 +111,11 @@ def main(argv: list[str] | None = None) -> int:
             result = evidence(paths, arguments.release_sha)
         elif arguments.command == "reconcile-active-context":
             result = reconcile_active_context(paths)
+        elif arguments.command == "reconcile-chain-evidence":
+            result = reconcile_chain_evidence(
+                paths,
+                arguments.protected_main_sha,
+            )
         elif arguments.command == "rollback":
             result = rollback_release(paths, arguments.release_sha)
         elif arguments.command == "emergency-pause":

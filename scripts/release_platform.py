@@ -45,6 +45,7 @@ PLATFORM_FILES = (
     ("scripts/validate-production-env.sh", "/usr/local/libexec/phoenix-release/validate-production-env.sh", 0o644),
     ("scripts/validate-production-release-context.sh", "/usr/local/libexec/phoenix-release/validate-production-release-context.sh", 0o644),
     ("scripts/phoenix_release/__init__.py", "/usr/local/libexec/phoenix-release/phoenix_release/__init__.py", 0o644),
+    ("scripts/phoenix_release/chain_reconciliation.py", "/usr/local/libexec/phoenix-release/phoenix_release/chain_reconciliation.py", 0o644),
     ("scripts/phoenix_release/cli.py", "/usr/local/libexec/phoenix-release/phoenix_release/cli.py", 0o644),
     ("scripts/phoenix_release/controller.py", "/usr/local/libexec/phoenix-release/phoenix_release/controller.py", 0o644),
     ("scripts/phoenix_release/gateway.py", "/usr/local/libexec/phoenix-release/phoenix_release/gateway.py", 0o644),

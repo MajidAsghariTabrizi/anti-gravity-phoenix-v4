@@ -18,6 +18,15 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, BinaryIO, Iterable
 
+from .chain_reconciliation import (
+    ReconciliationError,
+    build_evidence as build_chain_reconciliation_evidence,
+    collect_provider_evidence,
+    evidence_digest as chain_reconciliation_digest,
+    evidence_path as chain_reconciliation_path,
+    read_evidence as read_chain_reconciliation_evidence,
+    write_evidence as write_chain_reconciliation_evidence,
+)
 from .model import (
     PHASES,
     PROTOCOL_VERSION,
@@ -48,6 +57,25 @@ SAFE_CODE_RE = re.compile(r"^[A-Z][A-Z0-9_]{2,63}$")
 SENSITIVE_OUTPUT_RE = re.compile(
     r"(?i)\b(?:https?|wss?|postgres(?:ql)?|nats)://[^\s\"']+"
 )
+CONTROL_EVIDENCE_KEYS = {
+    "active_attempts",
+    "armed",
+    "execution_mode",
+    "kill_switch",
+    "open_routes",
+    "outbox_ack_pending",
+    "outbox_claimable",
+    "outbox_pending",
+    "unresolved_submissions",
+}
+FAIL_CLOSED_CONTROL_EVIDENCE = {
+    "active_attempts": 0,
+    "armed": False,
+    "execution_mode": "disarmed",
+    "kill_switch": True,
+    "open_routes": 0,
+    "unresolved_submissions": 0,
+}
 
 FIXED_MEMBERS = {
     "request.json",
@@ -535,6 +563,217 @@ def _path_evidence(path: Path) -> dict[str, Any]:
     }
 
 
+def _selected_environment(path: Path, names: set[str]) -> dict[str, str]:
+    try:
+        metadata = path.lstat()
+        raw = path.read_bytes()
+    except OSError as exc:
+        raise GatewayError("PRODUCTION_ENV_INVALID") from exc
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or path.is_symlink()
+        or metadata.st_nlink != 1
+        or len(raw) > 1024 * 1024
+    ):
+        raise GatewayError("PRODUCTION_ENV_INVALID")
+    try:
+        lines = raw.decode("utf-8-sig").splitlines()
+    except UnicodeError as exc:
+        raise GatewayError("PRODUCTION_ENV_INVALID") from exc
+    selected: dict[str, str] = {}
+    for raw_line in lines:
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        name, candidate = line.split("=", 1)
+        name = name.strip()
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name):
+            raise GatewayError("PRODUCTION_ENV_INVALID")
+        if name not in names:
+            continue
+        candidate = candidate.strip()
+        if len(candidate) >= 2 and candidate[0] == candidate[-1] == "'":
+            candidate = candidate[1:-1]
+        elif (
+            len(candidate) >= 2
+            and candidate[0] == candidate[-1] == '"'
+        ):
+            try:
+                decoded = json.loads(candidate)
+            except json.JSONDecodeError as exc:
+                raise GatewayError("PRODUCTION_ENV_INVALID") from exc
+            if not isinstance(decoded, str):
+                raise GatewayError("PRODUCTION_ENV_INVALID")
+            candidate = decoded
+        selected[name] = candidate
+    if set(selected) != names or any(not value for value in selected.values()):
+        raise GatewayError("PRODUCTION_ENV_INCOMPLETE")
+    return selected
+
+
+def _control_evidence(
+    paths: HostPaths,
+    active: dict[str, Any],
+) -> dict[str, Any]:
+    release_env = paths.deploy_dir / "current-release.env"
+    mode = "LIVE" if active["phoenix_mode"] == "LIVE" else "SHADOW"
+    compose = production_compose_command(
+        paths,
+        mode=mode,
+        release_env=release_env,
+    )
+    control_sql = (
+        "SELECT json_build_object("
+        "'armed', global_control.armed,"
+        "'kill_switch', global_control.kill_switch,"
+        "'execution_mode', global_control.execution_mode,"
+        "'open_routes', (SELECT count(*) FROM "
+        "live_canary.autonomous_route_controls "
+        "WHERE enabled OR NOT kill_switch),"
+        "'active_attempts', (SELECT count(*) FROM "
+        "live_canary.execution_attempts WHERE status IN "
+        "('claimed','nonce_allocated','submission_unknown','pending','timed_out')),"
+        "'unresolved_submissions', (SELECT count(*) FROM "
+        "live_canary.execution_attempts WHERE status IN "
+        "('submission_unknown','pending','timed_out')),"
+        "'outbox_pending', (SELECT count(*) FROM engine_outbox "
+        "WHERE published_at IS NULL),"
+        "'outbox_ack_pending', (SELECT count(*) FROM engine_outbox "
+        "WHERE published_at IS NOT NULL AND jetstream_ack_sequence IS NULL),"
+        "'outbox_claimable', (SELECT count(*) FROM engine_outbox "
+        "WHERE published_at IS NULL AND available_at <= now() "
+        "AND (claim_expires_at IS NULL OR claim_expires_at <= now())))::text "
+        "FROM live_canary.autonomous_global_control AS global_control "
+        "WHERE global_control.singleton"
+    )
+    output = _require_success(
+        compose
+        + [
+            "exec",
+            "-T",
+            "postgres",
+            "/bin/sh",
+            "-c",
+            (
+                "exec psql -X -qAt -v ON_ERROR_STOP=1 "
+                '-U "$POSTGRES_USER" -d "$POSTGRES_DB" -c '
+                + shlex.quote(control_sql)
+            ),
+        ],
+        "READINESS_CONTROL_QUERY_FAILED",
+    )
+    try:
+        controls = json.loads(output)
+    except (json.JSONDecodeError, TypeError) as exc:
+        raise GatewayError("READINESS_CONTROL_EVIDENCE_INVALID") from exc
+    if (
+        not isinstance(controls, dict)
+        or set(controls) != CONTROL_EVIDENCE_KEYS
+    ):
+        raise GatewayError("READINESS_CONTROL_EVIDENCE_INVALID")
+    return controls
+
+
+def _require_fail_closed_controls(controls: dict[str, Any]) -> None:
+    for field, expected in FAIL_CLOSED_CONTROL_EVIDENCE.items():
+        if controls.get(field) != expected:
+            raise GatewayError(
+                "READINESS_CONTROL_OPEN",
+                {
+                    "actual": controls.get(field),
+                    "expected": expected,
+                    "field": field,
+                },
+            )
+
+
+def _live_executor_stopped() -> dict[str, Any]:
+    output = _require_success(
+        [
+            "/usr/bin/docker",
+            "ps",
+            "-q",
+            "--filter",
+            "label=com.docker.compose.service=live-executor",
+        ],
+        "READINESS_LIVE_EXECUTOR_LOOKUP_FAILED",
+    )
+    containers = [line for line in output.splitlines() if line]
+    evidence_value = {
+        "running_container_ids": containers[:8],
+        "stopped": not containers,
+    }
+    if containers:
+        raise GatewayError(
+            "READINESS_LIVE_EXECUTOR_ACTIVE",
+            evidence_value,
+        )
+    return evidence_value
+
+
+def _reconciliation_runtime(
+    controls: dict[str, Any],
+) -> dict[str, object]:
+    return {
+        "active_attempts": controls["active_attempts"],
+        "armed": controls["armed"],
+        "execution_mode": controls["execution_mode"],
+        "kill_switch": controls["kill_switch"],
+        "live_executor_stopped": True,
+        "open_routes": controls["open_routes"],
+        "unresolved_submissions": controls["unresolved_submissions"],
+    }
+
+
+def _readiness_chain_reconciliation(
+    paths: HostPaths,
+    *,
+    active_release: str,
+    release_assets_sha: str,
+    candidate_sha: str,
+    platform_manifest_sha256: str,
+    controls: dict[str, Any],
+    historical_contract_paused: bool,
+    owner_transaction_hash: str,
+) -> dict[str, Any]:
+    environment = _selected_environment(
+        paths.env_file,
+        {"LIVE_EXECUTOR_EXECUTOR_ADDRESS"},
+    )
+    expected = {
+        "active_release_sha": active_release,
+        "executor_address": environment[
+            "LIVE_EXECUTOR_EXECUTOR_ADDRESS"
+        ].lower(),
+        "historical_release_evidence": {
+            "contract_paused": historical_contract_paused,
+            "owner_transaction_hash": owner_transaction_hash,
+        },
+        "owner_transaction_hash": owner_transaction_hash,
+        "protected_main_sha": candidate_sha,
+        "release_assets_sha": release_assets_sha,
+        "release_platform_manifest_sha256": platform_manifest_sha256,
+        "runtime": _reconciliation_runtime(controls),
+    }
+    try:
+        value = read_chain_reconciliation_evidence(
+            chain_reconciliation_path(paths.state_root, active_release),
+            expected=expected,
+        )
+    except ReconciliationError as exc:
+        raise GatewayError(
+            "READINESS_CHAIN_RECONCILIATION_INVALID",
+            {"code": exc.code},
+        ) from exc
+    return {
+        "evidence_sha256": chain_reconciliation_digest(value),
+        "historical_contract_paused": historical_contract_paused,
+        "historical_owner_transaction_hash": owner_transaction_hash,
+        "provider_agreement": value["provider_agreement"],
+        "status": "accepted",
+    }
+
+
 def production_readiness(
     paths: HostPaths, candidate_sha: str
 ) -> dict[str, Any]:
@@ -543,6 +782,9 @@ def production_readiness(
         raise GatewayError("RELEASE_SHA_INVALID")
     failures: list[dict[str, Any]] = []
     checks: dict[str, Any] = {}
+    controls: dict[str, Any] | None = None
+    installed_sha: str | None = None
+    platform_manifest_digest: str | None = None
 
     def failed(code: str, evidence_value: dict[str, Any] | None = None) -> None:
         failures.append({"code": code, "evidence": evidence_value or {}})
@@ -591,9 +833,13 @@ def production_readiness(
             if isinstance(platform_manifest, dict)
             else None
         )
+        platform_manifest_digest = sha256_file(
+            paths.libexec / "platform-manifest.json"
+        )
         checks["release_platform"] = {
             "candidate_sha": candidate_sha,
             "installed_sha": installed_sha,
+            "manifest_sha256": platform_manifest_digest,
             "upgrade_required": installed_sha != candidate_sha,
         }
         if not isinstance(installed_sha, str) or not SHA_RE.fullmatch(
@@ -748,75 +994,12 @@ def production_readiness(
                     )
         checks["services"] = service_evidence
 
-        control_sql = (
-            "SELECT json_build_object("
-            "'armed', global_control.armed,"
-            "'kill_switch', global_control.kill_switch,"
-            "'execution_mode', global_control.execution_mode,"
-            "'open_routes', (SELECT count(*) FROM "
-            "live_canary.autonomous_route_controls "
-            "WHERE enabled OR NOT kill_switch),"
-            "'active_attempts', (SELECT count(*) FROM "
-            "live_canary.execution_attempts WHERE status IN "
-            "('claimed','nonce_allocated','submission_unknown','pending','timed_out')),"
-            "'unresolved_submissions', (SELECT count(*) FROM "
-            "live_canary.execution_attempts WHERE status IN "
-            "('submission_unknown','pending','timed_out')),"
-            "'outbox_pending', (SELECT count(*) FROM engine_outbox "
-            "WHERE published_at IS NULL),"
-            "'outbox_ack_pending', (SELECT count(*) FROM engine_outbox "
-            "WHERE published_at IS NOT NULL AND jetstream_ack_sequence IS NULL),"
-            "'outbox_claimable', (SELECT count(*) FROM engine_outbox "
-            "WHERE published_at IS NULL AND available_at <= now() "
-            "AND (claim_expires_at IS NULL OR claim_expires_at <= now())))::text "
-            "FROM live_canary.autonomous_global_control AS global_control "
-            "WHERE global_control.singleton"
-        )
         try:
-            control_output = _require_success(
-                compose
-                + [
-                    "exec",
-                    "-T",
-                    "postgres",
-                    "/bin/sh",
-                    "-c",
-                    (
-                        "exec psql -X -qAt -v ON_ERROR_STOP=1 "
-                        '-U "$POSTGRES_USER" -d "$POSTGRES_DB" -c '
-                        + shlex.quote(control_sql)
-                    ),
-                ],
-                "READINESS_CONTROL_QUERY_FAILED",
-            )
-            controls = json.loads(control_output)
+            controls = _control_evidence(paths, active)
             checks["controls"] = controls
-            expected_controls = {
-                "active_attempts": 0,
-                "armed": False,
-                "kill_switch": True,
-                "open_routes": 0,
-                "unresolved_submissions": 0,
-            }
-            for field, expected in expected_controls.items():
-                if controls.get(field) != expected:
-                    failed(
-                        "READINESS_CONTROL_OPEN",
-                        {
-                            "actual": controls.get(field),
-                            "expected": expected,
-                            "field": field,
-                        },
-                    )
-            if controls.get("execution_mode") == "live":
-                failed(
-                    "READINESS_EXECUTION_MODE_LIVE",
-                    {"execution_mode": controls.get("execution_mode")},
-                )
+            _require_fail_closed_controls(controls)
         except GatewayError as exc:
             failed(exc.code, exc.evidence)
-        except (json.JSONDecodeError, TypeError):
-            failed("READINESS_CONTROL_EVIDENCE_INVALID")
 
         try:
             active_state = load_state(
@@ -829,10 +1012,49 @@ def production_readiness(
                 ],
             }
             checks["contract"] = contract
-            if contract["contract_paused"] is not True:
-                failed("READINESS_CONTRACT_NOT_PAUSED", contract)
-            if contract["owner_transaction_hash"] is not None:
-                failed("READINESS_OWNER_TRANSACTION_RECORDED", contract)
+            historical_safe = (
+                contract["contract_paused"] is True
+                and contract["owner_transaction_hash"] is None
+            )
+            if not historical_safe:
+                try:
+                    checks["live_executor"] = _live_executor_stopped()
+                except GatewayError as exc:
+                    failed(exc.code, exc.evidence)
+                if (
+                    not isinstance(contract["owner_transaction_hash"], str)
+                    or controls is None
+                    or platform_manifest_digest is None
+                    or installed_sha != candidate_sha
+                ):
+                    failed(
+                        "READINESS_CHAIN_RECONCILIATION_INVALID",
+                        {"code": "CHAIN_EVIDENCE_PREREQUISITE_INVALID"},
+                    )
+                else:
+                    try:
+                        checks["chain_reconciliation"] = (
+                            _readiness_chain_reconciliation(
+                                paths,
+                                active_release=active["active_release"],
+                                release_assets_sha=active[
+                                    "release_assets_sha"
+                                ],
+                                candidate_sha=candidate_sha,
+                                platform_manifest_sha256=(
+                                    platform_manifest_digest
+                                ),
+                                controls=controls,
+                                historical_contract_paused=contract[
+                                    "contract_paused"
+                                ],
+                                owner_transaction_hash=contract[
+                                    "owner_transaction_hash"
+                                ],
+                            )
+                        )
+                    except GatewayError as exc:
+                        failed(exc.code, exc.evidence)
         except (OSError, StateError, GatewayError) as exc:
             failed(
                 "READINESS_ACTIVE_STATE_INVALID",
@@ -850,6 +1072,143 @@ def production_readiness(
     if failures:
         raise GatewayError("PRODUCTION_READINESS_FAILED", result)
     return result
+
+
+def reconcile_chain_evidence(
+    paths: HostPaths,
+    protected_main_sha: str,
+) -> dict[str, Any]:
+    if os.environ.get("PHOENIX_RELEASE_LOCK_HELD") != "1":
+        raise GatewayError("CHAIN_EVIDENCE_RELEASE_LOCK_REQUIRED")
+    if not SHA_RE.fullmatch(protected_main_sha):
+        raise GatewayError("RELEASE_SHA_INVALID")
+    initial = status(paths)
+    if (
+        initial["phoenix_mode"] != "SHADOW"
+        or initial["live_execution"] is not False
+        or initial["autonomous_execution"] is not False
+    ):
+        raise GatewayError(
+            "CHAIN_EVIDENCE_RUNTIME_MODE_UNSAFE",
+            {
+                "autonomous_execution": initial["autonomous_execution"],
+                "live_execution": initial["live_execution"],
+                "phoenix_mode": initial["phoenix_mode"],
+            },
+        )
+    active_release = initial["active_release"]
+    release_assets_sha = initial["release_assets_sha"]
+    if active_release != release_assets_sha:
+        raise GatewayError(
+            "ACTIVE_POINTER_MISMATCH",
+            {
+                "current_release": active_release,
+                "release_assets": release_assets_sha,
+            },
+        )
+    active_state = load_state(state_file(paths, active_release))
+    owner_transaction_hash = active_state["owner_transaction_hash"]
+    historical_contract_paused = active_state["contract_paused"]
+    if not isinstance(owner_transaction_hash, str):
+        raise GatewayError("CHAIN_EVIDENCE_HISTORICAL_TRANSACTION_MISSING")
+
+    controls = _control_evidence(paths, initial)
+    _require_fail_closed_controls(controls)
+    _live_executor_stopped()
+
+    platform_manifest_path = paths.libexec / "platform-manifest.json"
+    platform_manifest = _read_json(platform_manifest_path, 256 * 1024)
+    if (
+        not isinstance(platform_manifest, dict)
+        or platform_manifest.get("release_sha") != protected_main_sha
+    ):
+        raise GatewayError("CHAIN_EVIDENCE_PLATFORM_IDENTITY_INVALID")
+    _require_success(
+        [
+            "/usr/bin/python3",
+            "-I",
+            "-B",
+            str(paths.libexec / "release_platform.py"),
+            "verify",
+            "--installed-root",
+            "/",
+            "--expected-sha",
+            protected_main_sha,
+        ],
+        "CHAIN_EVIDENCE_PLATFORM_DRIFT",
+    )
+    platform_manifest_sha256 = sha256_file(platform_manifest_path)
+
+    environment = _selected_environment(
+        paths.env_file,
+        {
+            "LIVE_EXECUTOR_EXECUTOR_ADDRESS",
+            "PRODUCTION_RPC_URL",
+            "RPC_PROVIDER_URLS",
+            "SECONDARY_RPC_URL",
+        },
+    )
+    providers = [
+        value.strip()
+        for value in environment["RPC_PROVIDER_URLS"].split(",")
+        if value.strip()
+    ]
+    if providers != [
+        environment["PRODUCTION_RPC_URL"],
+        environment["SECONDARY_RPC_URL"],
+    ]:
+        raise GatewayError("CHAIN_EVIDENCE_PROVIDER_IDENTITY_INVALID")
+    try:
+        provider_evidence = collect_provider_evidence(
+            providers,
+            environment["LIVE_EXECUTOR_EXECUTOR_ADDRESS"],
+            owner_transaction_hash,
+        )
+        evidence_value = build_chain_reconciliation_evidence(
+            active_release_sha=active_release,
+            release_assets_sha=release_assets_sha,
+            protected_main_sha=protected_main_sha,
+            release_platform_manifest_sha256=platform_manifest_sha256,
+            executor_address=environment[
+                "LIVE_EXECUTOR_EXECUTOR_ADDRESS"
+            ],
+            owner_transaction_hash=owner_transaction_hash,
+            historical_contract_paused=historical_contract_paused,
+            runtime=_reconciliation_runtime(controls),
+            providers=provider_evidence,
+        )
+    except ReconciliationError as exc:
+        raise GatewayError(exc.code) from exc
+
+    final = status(paths)
+    if (
+        final["active_release"] != active_release
+        or final["release_assets_sha"] != release_assets_sha
+        or final["active_release"] != final["release_assets_sha"]
+    ):
+        raise GatewayError(
+            "CHAIN_EVIDENCE_ACTIVE_POINTER_CHANGED",
+            {
+                "actual_active_release": final["active_release"],
+                "actual_release_assets": final["release_assets_sha"],
+                "expected_active_release": active_release,
+                "expected_release_assets": release_assets_sha,
+            },
+        )
+    path = chain_reconciliation_path(paths.state_root, active_release)
+    try:
+        created = write_chain_reconciliation_evidence(path, evidence_value)
+    except ReconciliationError as exc:
+        raise GatewayError(exc.code) from exc
+    return {
+        "active_release": active_release,
+        "evidence_sha256": chain_reconciliation_digest(evidence_value),
+        "idempotent": not created,
+        "protected_main_sha": protected_main_sha,
+        "release_assets_sha": release_assets_sha,
+        "schema": "phoenix.chain-reconciliation-result.v1",
+        "status": "reconciled",
+    }
 
 
 def _deployment_diagnostics(

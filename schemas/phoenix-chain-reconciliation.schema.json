@@ -1,0 +1,175 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://phoenix.invalid/schemas/phoenix-chain-reconciliation.schema.json",
+  "title": "Phoenix append-only chain reconciliation evidence",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "active_release_sha",
+    "executor_address",
+    "historical_release_evidence",
+    "owner_transaction_hash",
+    "protected_main_sha",
+    "provider_agreement",
+    "providers",
+    "release_assets_sha",
+    "release_platform_manifest_sha256",
+    "runtime",
+    "schema"
+  ],
+  "properties": {
+    "active_release_sha": {
+      "$ref": "#/$defs/sha"
+    },
+    "executor_address": {
+      "$ref": "#/$defs/address"
+    },
+    "historical_release_evidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "contract_paused",
+        "owner_transaction_hash"
+      ],
+      "properties": {
+        "contract_paused": {
+          "type": "boolean"
+        },
+        "owner_transaction_hash": {
+          "$ref": "#/$defs/transaction"
+        }
+      }
+    },
+    "owner_transaction_hash": {
+      "$ref": "#/$defs/transaction"
+    },
+    "protected_main_sha": {
+      "$ref": "#/$defs/sha"
+    },
+    "provider_agreement": {
+      "const": true
+    },
+    "providers": {
+      "type": "array",
+      "minItems": 2,
+      "maxItems": 2,
+      "items": {
+        "$ref": "#/$defs/provider"
+      }
+    },
+    "release_assets_sha": {
+      "$ref": "#/$defs/sha"
+    },
+    "release_platform_manifest_sha256": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "runtime": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "active_attempts",
+        "armed",
+        "execution_mode",
+        "kill_switch",
+        "live_executor_stopped",
+        "open_routes",
+        "unresolved_submissions"
+      ],
+      "properties": {
+        "active_attempts": {
+          "const": 0
+        },
+        "armed": {
+          "const": false
+        },
+        "execution_mode": {
+          "const": "disarmed"
+        },
+        "kill_switch": {
+          "const": true
+        },
+        "live_executor_stopped": {
+          "const": true
+        },
+        "open_routes": {
+          "const": 0
+        },
+        "unresolved_submissions": {
+          "const": 0
+        }
+      }
+    },
+    "schema": {
+      "const": "phoenix.chain-reconciliation.v1"
+    }
+  },
+  "$defs": {
+    "address": {
+      "type": "string",
+      "pattern": "^0x[0-9a-f]{40}$"
+    },
+    "provider": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "block_hash",
+        "block_number",
+        "chain_id",
+        "classification",
+        "executor_address",
+        "input_selector",
+        "paused",
+        "provider_identity",
+        "receipt_status",
+        "set_paused_value",
+        "transaction_hash"
+      ],
+      "properties": {
+        "block_hash": {
+          "$ref": "#/$defs/transaction"
+        },
+        "block_number": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "chain_id": {
+          "const": "0xa4b1"
+        },
+        "classification": {
+          "const": "unpause"
+        },
+        "executor_address": {
+          "$ref": "#/$defs/address"
+        },
+        "input_selector": {
+          "const": "0x16c38b3c"
+        },
+        "paused": {
+          "const": true
+        },
+        "provider_identity": {
+          "type": "string",
+          "pattern": "^rpc-[0-9a-f]{16}$"
+        },
+        "receipt_status": {
+          "const": 1
+        },
+        "set_paused_value": {
+          "const": false
+        },
+        "transaction_hash": {
+          "$ref": "#/$defs/transaction"
+        }
+      }
+    },
+    "sha": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{40}$"
+    },
+    "transaction": {
+      "type": "string",
+      "pattern": "^0x[0-9a-f]{64}$"
+    }
+  }
+}
