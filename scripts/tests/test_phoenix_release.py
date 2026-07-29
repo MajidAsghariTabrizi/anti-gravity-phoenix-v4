@@ -425,17 +425,29 @@ class CanonicalComposeAndPlatformTests(unittest.TestCase):
                 encoding="utf-8",
             )
 
-            verified = verify_installed(installed_root, RELEASE_SHA)
-            self.assertEqual(verified["release_sha"], RELEASE_SHA)
-            tampered = (
-                installed_root
-                / PLATFORM_FILES[0][1].removeprefix("/")
-            )
-            tampered.write_text("stale\n", encoding="utf-8")
-            with self.assertRaisesRegex(
-                PlatformError, "does not match manifest"
-            ):
-                verify_installed(installed_root, RELEASE_SHA)
+            real_lstat = Path.lstat
+
+            def root_owned_lstat(path: Path) -> os.stat_result:
+                metadata = list(real_lstat(path))
+                metadata[4] = 0
+                metadata[5] = 0
+                return os.stat_result(metadata)
+
+            # This manifest/hash fixture runs unprivileged in CI. Preserve the
+            # real file metadata while modeling the root ownership enforced by
+            # the production installer and verifier.
+            with patch.object(Path, "lstat", root_owned_lstat):
+                verified = verify_installed(installed_root, RELEASE_SHA)
+                self.assertEqual(verified["release_sha"], RELEASE_SHA)
+                tampered = (
+                    installed_root
+                    / PLATFORM_FILES[0][1].removeprefix("/")
+                )
+                tampered.write_text("stale\n", encoding="utf-8")
+                with self.assertRaisesRegex(
+                    PlatformError, "does not match manifest"
+                ):
+                    verify_installed(installed_root, RELEASE_SHA)
 
 
 class ControllerEligibilityTests(unittest.TestCase):
