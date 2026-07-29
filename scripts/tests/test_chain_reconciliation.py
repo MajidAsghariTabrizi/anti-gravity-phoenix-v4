@@ -21,6 +21,7 @@ from scripts.phoenix_release.chain_reconciliation import (
 from scripts.phoenix_release.gateway import (
     GatewayError,
     HostPaths,
+    _historical_contract_evidence,
     _readiness_chain_reconciliation,
     reconcile_chain_evidence,
 )
@@ -335,6 +336,95 @@ class GatewayReconciliationTests(unittest.TestCase):
                 reconcile_chain_evidence(paths, MAIN_SHA)
             status_mock.assert_not_called()
 
+    @unittest.skipUnless(os.name == "posix", "POSIX metadata contract")
+    def test_completed_legacy_state_exposes_only_historical_contract(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            paths = self.host_paths(Path(directory))
+            path = (
+                paths.state_root
+                / "releases"
+                / ACTIVE_SHA
+                / "state.json"
+            )
+            path.parent.mkdir(parents=True, mode=0o700)
+            legacy = {
+                "active_release_pointer": ACTIVE_SHA,
+                "completed_phases": [
+                    "REQUESTED",
+                    "LEGACY_LIVE_MODE_INSTALLED",
+                    "COMPLETED",
+                ],
+                "contract_paused": False,
+                "controller_protocol_version": "phoenix-release.v1",
+                "current_phase": "COMPLETED",
+                "owner_transaction_hash": OWNER_TRANSACTION,
+                "phase_timestamps": {
+                    "REQUESTED": "2026-01-01T00:00:00Z",
+                    "LEGACY_LIVE_MODE_INSTALLED": "2026-01-01T00:01:00Z",
+                    "COMPLETED": "2026-01-01T00:02:00Z",
+                },
+                "release_sha": ACTIVE_SHA,
+                "schema_version": "phoenix.release-state.v1",
+            }
+            path.write_text(
+                json.dumps(legacy, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+            os.chmod(path, 0o600)
+            observed = _historical_contract_evidence(
+                paths,
+                ACTIVE_SHA,
+                expected_uid=os.getuid(),
+                expected_gid=os.getgid(),
+            )
+            self.assertEqual(
+                observed,
+                {
+                    "contract_paused": False,
+                    "owner_transaction_hash": OWNER_TRANSACTION,
+                },
+            )
+
+    @unittest.skipUnless(os.name == "posix", "POSIX metadata contract")
+    def test_nonterminal_legacy_state_rejects(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            paths = self.host_paths(Path(directory))
+            path = (
+                paths.state_root
+                / "releases"
+                / ACTIVE_SHA
+                / "state.json"
+            )
+            path.parent.mkdir(parents=True, mode=0o700)
+            value = {
+                "active_release_pointer": ACTIVE_SHA,
+                "completed_phases": ["REQUESTED"],
+                "contract_paused": False,
+                "controller_protocol_version": "phoenix-release.v1",
+                "current_phase": "REQUESTED",
+                "owner_transaction_hash": OWNER_TRANSACTION,
+                "phase_timestamps": {
+                    "REQUESTED": "2026-01-01T00:00:00Z",
+                },
+                "release_sha": ACTIVE_SHA,
+                "schema_version": "phoenix.release-state.v1",
+            }
+            path.write_text(
+                json.dumps(value, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+            os.chmod(path, 0o600)
+            with self.assertRaisesRegex(
+                GatewayError,
+                "ACTIVE_RELEASE_HISTORICAL_STATE_INVALID",
+            ):
+                _historical_contract_evidence(
+                    paths,
+                    ACTIVE_SHA,
+                    expected_uid=os.getuid(),
+                    expected_gid=os.getgid(),
+                )
+
     def test_cli_and_root_gateway_use_nonblocking_release_lock(self) -> None:
         arguments = release_parser().parse_args(
             ["reconcile-chain-evidence", MAIN_SHA]
@@ -379,7 +469,8 @@ class GatewayReconciliationTests(unittest.TestCase):
                             return_value=self.active_status(),
                         ),
                         patch(
-                            "scripts.phoenix_release.gateway.load_state",
+                            "scripts.phoenix_release.gateway."
+                            "_historical_contract_evidence",
                             return_value={
                                 "contract_paused": False,
                                 "owner_transaction_hash": OWNER_TRANSACTION,
@@ -412,7 +503,8 @@ class GatewayReconciliationTests(unittest.TestCase):
                     side_effect=[self.active_status(), final],
                 ),
                 patch(
-                    "scripts.phoenix_release.gateway.load_state",
+                    "scripts.phoenix_release.gateway."
+                    "_historical_contract_evidence",
                     return_value={
                         "contract_paused": False,
                         "owner_transaction_hash": OWNER_TRANSACTION,
