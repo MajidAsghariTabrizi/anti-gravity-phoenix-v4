@@ -57,13 +57,19 @@ def evidence_digest(value: object) -> str:
     return f"sha256:{hashlib.sha256(canonical_json(value)).hexdigest()}"
 
 
-def evidence_path(state_root: Path, active_release: str) -> Path:
+def evidence_path(
+    state_root: Path,
+    active_release: str,
+    protected_main_sha: str,
+) -> Path:
     if not SHA_RE.fullmatch(active_release):
         raise ReconciliationError("CHAIN_EVIDENCE_RELEASE_SHA_INVALID")
+    if not SHA_RE.fullmatch(protected_main_sha):
+        raise ReconciliationError("CHAIN_EVIDENCE_PROTECTED_MAIN_SHA_INVALID")
     return (
         state_root
         / "chain-reconciliation"
-        / f"{active_release}.json"
+        / f"{active_release}.{protected_main_sha}.json"
     )
 
 

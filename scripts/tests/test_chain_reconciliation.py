@@ -284,7 +284,7 @@ class AppendOnlyEvidenceTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
         self.root = Path(self.temporary.name)
-        self.path = evidence_path(self.root, ACTIVE_SHA)
+        self.path = evidence_path(self.root, ACTIVE_SHA, MAIN_SHA)
         self.uid = os.getuid()
         self.gid = os.getgid()
 
@@ -309,6 +309,37 @@ class AppendOnlyEvidenceTests(unittest.TestCase):
             expected_gid=self.gid,
         )
         self.assertEqual(observed, valid_evidence())
+
+    def test_successive_protected_main_evidence_is_append_only(self) -> None:
+        self.assertTrue(self.write())
+        next_main = "d" * 40
+        next_value = copy.deepcopy(valid_evidence())
+        next_value["protected_main_sha"] = next_main
+        next_path = evidence_path(self.root, ACTIVE_SHA, next_main)
+        self.assertTrue(
+            write_evidence(
+                next_path,
+                next_value,
+                expected_uid=self.uid,
+                expected_gid=self.gid,
+            )
+        )
+        self.assertEqual(
+            read_evidence(
+                self.path,
+                expected_uid=self.uid,
+                expected_gid=self.gid,
+            ),
+            valid_evidence(),
+        )
+        self.assertEqual(
+            read_evidence(
+                next_path,
+                expected_uid=self.uid,
+                expected_gid=self.gid,
+            ),
+            next_value,
+        )
 
     def test_tampered_existing_evidence_rejects(self) -> None:
         self.write()
