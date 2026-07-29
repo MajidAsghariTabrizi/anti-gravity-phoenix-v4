@@ -57,6 +57,10 @@ grep -F '"production-healthcheck.sh": 0o700' "$helper" >/dev/null ||
   fail 'production healthcheck is not a verified trusted helper'
 grep -F "'production-healthcheck.sh:0700'" "$installer" >/dev/null ||
   fail 'gateway installer does not install the trusted production healthcheck'
+grep -F "'production_compose.py:0600'" "$installer" >/dev/null ||
+  fail 'gateway installer does not install the canonical Compose runner'
+grep -F "'rehearse-production-release.sh:0700'" "$installer" >/dev/null ||
+  fail 'gateway installer does not install the candidate rehearsal'
 grep -F "'production-healthcheck.sh:700'" "$gateway" >/dev/null ||
   fail 'privileged gateway does not verify the trusted production healthcheck'
 grep -F '"--no-block"' "$helper" >/dev/null ||
@@ -135,6 +139,8 @@ installed_gateway=$fixture/usr/local/sbin/phoenix-shadow-deploy-gateway
 installed_libexec=$fixture/usr/local/libexec/phoenix-shadow-deploy
 installed_sudoers=$fixture/etc/sudoers.d/phoenix-shadow-deploy
 installed_healthcheck=$installed_libexec/production-healthcheck.sh
+installed_compose_runner=$installed_libexec/production_compose.py
+installed_rehearsal=$installed_libexec/rehearse-production-release.sh
 [ "$(sudo stat -c '%U:%G:%a:%h' "$installed_gateway")" = root:root:755:1 ] ||
   fail 'installed gateway ownership, mode, or link count is invalid'
 [ "$(sudo stat -c '%U:%G:%a' "$installed_libexec")" = root:root:750 ] ||
@@ -143,6 +149,14 @@ installed_healthcheck=$installed_libexec/production-healthcheck.sh
   fail 'trusted production healthcheck ownership, mode, or link count is invalid'
 sudo cmp "$script_dir/production-healthcheck.sh" "$installed_healthcheck" >/dev/null ||
   fail 'trusted production healthcheck bytes differ'
+[ "$(sudo stat -c '%U:%G:%a:%h' "$installed_compose_runner")" = root:root:600:1 ] ||
+  fail 'canonical Compose runner ownership, mode, or link count is invalid'
+sudo cmp "$script_dir/production_compose.py" "$installed_compose_runner" >/dev/null ||
+  fail 'canonical Compose runner bytes differ'
+[ "$(sudo stat -c '%U:%G:%a:%h' "$installed_rehearsal")" = root:root:700:1 ] ||
+  fail 'candidate rehearsal ownership, mode, or link count is invalid'
+sudo cmp "$script_dir/rehearse-production-release.sh" "$installed_rehearsal" >/dev/null ||
+  fail 'candidate rehearsal bytes differ'
 [ "$(sudo stat -c '%U:%G:%a:%h' "$installed_sudoers")" = root:root:440:1 ] ||
   fail 'installed sudoers ownership, mode, or link count is invalid'
 gateway_digest=$(sudo sha256sum "$installed_gateway" | awk '{print $1}')

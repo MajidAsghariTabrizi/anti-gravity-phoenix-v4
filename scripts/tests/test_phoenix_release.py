@@ -25,15 +25,18 @@ from scripts.phoenix_release.cli import parser as release_parser
 from scripts.phoenix_release.gateway import (
     _bounded_output,
     _live_executor_absence_is_fail_closed,
+    _require_success,
     _rollback_failed_state,
     _runtime_may_have_changed,
     _service_absence_allowed,
     GatewayError,
     HostPaths,
     expected_members,
+    production_readiness,
     receive_package,
     reconcile_snapshot,
     request_file,
+    retry_rolled_back,
     retry_pre_mutation,
     resume,
     state_file,
@@ -54,6 +57,18 @@ from scripts.phoenix_release.model import (
     record_engine_baseline,
     set_mutation_started,
     sha256_file,
+    retry_rolled_back_release,
+)
+from scripts.production_compose import (
+    ProductionComposeError,
+    build_compose_command,
+)
+from scripts.release_platform import (
+    MANIFEST_PATH,
+    PLATFORM_FILES,
+    PlatformError,
+    create_manifest,
+    verify_installed,
 )
 
 
@@ -158,6 +173,7 @@ class ReleaseStateTests(unittest.TestCase):
                 "HOST_PREFLIGHT_OK",
                 "ACTIVE_CONTEXT_RECONCILED",
                 "ROLLBACK_VERIFIED",
+                "CANDIDATE_REHEARSED",
                 "CANDIDATE_INSTALLED",
                 "CANDIDATE_LIVE_RENDER_VERIFIED",
                 "MIGRATIONS_APPLIED",
@@ -182,6 +198,58 @@ class ReleaseStateTests(unittest.TestCase):
         self.assertFalse(value["mutation_started"])
         self.assertIn("owner_transaction_hash", value)
         self.assertIn("process_fatal_integrity_baseline", value)
+        self.assertEqual(value["release_attempt"], 1)
+
+    def test_successful_rollback_can_start_one_new_exact_package_attempt(self) -> None:
+        value = state()
+        for phase in PHASES[1 : PHASES.index("CANDIDATE_REHEARSED") + 1]:
+            value = advance(value, phase)
+        value = set_mutation_started(value)
+        value = fail_state(value, code="DEPLOYMENT_FAILED", evidence={})
+        value = rollback_phase(value, "ROLLBACK_STARTED")
+        value = rollback_phase(value, "ROLLED_BACK", {"status": "ok"})
+        value.update(
+            {
+                "active_release_pointer": ROLLBACK_SHA,
+                "autonomous_armed": False,
+                "candidate_pointer": None,
+                "contract_paused": True,
+                "kill_switch": True,
+            }
+        )
+
+        retried = retry_rolled_back_release(value)
+
+        self.assertEqual(retried["current_phase"], "BUILD_VERIFIED")
+        self.assertEqual(retried["release_attempt"], 2)
+        self.assertFalse(retried["mutation_started"])
+        self.assertEqual(retried["candidate_pointer"], RELEASE_SHA)
+        self.assertIsNone(retried["rollback_result"])
+
+    def test_rolled_back_retry_rejects_owner_transaction_or_open_control(self) -> None:
+        value = state()
+        for phase in PHASES[1 : PHASES.index("CANDIDATE_REHEARSED") + 1]:
+            value = advance(value, phase)
+        value = set_mutation_started(value)
+        value = fail_state(value, code="DEPLOYMENT_FAILED", evidence={})
+        value = rollback_phase(value, "ROLLBACK_STARTED")
+        value = rollback_phase(value, "ROLLED_BACK", {"status": "ok"})
+        value.update(
+            {
+                "active_release_pointer": ROLLBACK_SHA,
+                "autonomous_armed": False,
+                "candidate_pointer": None,
+                "contract_paused": True,
+                "kill_switch": True,
+            }
+        )
+        owner_transaction = copy.deepcopy(value)
+        owner_transaction["owner_transaction_hash"] = "0x" + "1" * 64
+        with self.assertRaisesRegex(StateError, "owner transaction"):
+            retry_rolled_back_release(owner_transaction)
+        value["autonomous_armed"] = True
+        with self.assertRaisesRegex(StateError, "fail-closed"):
+            retry_rolled_back_release(value)
 
     def test_successful_transitions_cannot_skip_a_postcondition(self) -> None:
         with self.assertRaisesRegex(StateError, "expected next phase"):
@@ -275,6 +343,111 @@ class ReleaseStateTests(unittest.TestCase):
                 self.skipTest("symlink creation is unavailable")
             with self.assertRaises(StateError):
                 load_state(link)
+
+
+class CanonicalComposeAndPlatformTests(unittest.TestCase):
+    def test_one_builder_preserves_exact_live_overlay_without_duplicates(self) -> None:
+        command = build_compose_command(
+            mode="LIVE",
+            env_file=Path("/etc/phoenix/phoenix.env"),
+            release_env=Path("/opt/phoenix/deploy/current-release.env"),
+            compose_file=Path("/opt/phoenix/deploy/compose.prod.yml"),
+            overlay_file=Path(
+                "/opt/phoenix/deploy/compose.live-autonomous.yml"
+            ),
+            arguments=["config", "--format", "json"],
+        )
+        self.assertEqual(command.count("--env-file"), 2)
+        self.assertEqual(command.count("-f"), 2)
+        self.assertEqual(command.count("--profile"), 1)
+        self.assertEqual(
+            command,
+            [
+                "/usr/bin/docker",
+                "compose",
+                "--env-file",
+                "/etc/phoenix/phoenix.env",
+                "--env-file",
+                "/opt/phoenix/deploy/current-release.env",
+                "-f",
+                "/opt/phoenix/deploy/compose.prod.yml",
+                "-f",
+                "/opt/phoenix/deploy/compose.live-autonomous.yml",
+                "--profile",
+                "live-autonomous",
+                "--project-directory",
+                "/opt/phoenix/deploy",
+                "config",
+                "--format",
+                "json",
+            ],
+        )
+
+    def test_shadow_context_rejects_a_wrong_overlay(self) -> None:
+        with self.assertRaisesRegex(
+            ProductionComposeError, "must not include an overlay"
+        ):
+            build_compose_command(
+                mode="SHADOW",
+                env_file=Path("/etc/phoenix/phoenix.env"),
+                release_env=Path(
+                    "/opt/phoenix/deploy/current-release.env"
+                ),
+                compose_file=Path("/opt/phoenix/deploy/compose.prod.yml"),
+                overlay_file=Path(
+                    "/opt/phoenix/deploy/compose.live-autonomous.yml"
+                ),
+                arguments=["config"],
+            )
+
+    def test_platform_manifest_binds_every_installed_file_to_exact_sha(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source_root = root / "source"
+            installed_root = root / "installed"
+            for index, (source, installed, mode) in enumerate(
+                PLATFORM_FILES
+            ):
+                source_path = source_root / source
+                source_path.parent.mkdir(parents=True, exist_ok=True)
+                source_path.write_text(f"platform-{index}\n", encoding="utf-8")
+                destination = installed_root / installed.removeprefix("/")
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(source_path, destination)
+                destination.chmod(mode)
+            manifest = create_manifest(source_root, RELEASE_SHA)
+            manifest_path = installed_root / MANIFEST_PATH.removeprefix("/")
+            manifest_path.parent.mkdir(parents=True, exist_ok=True)
+            manifest_path.write_text(
+                json.dumps(manifest, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+
+            real_lstat = Path.lstat
+
+            def root_owned_lstat(path: Path) -> os.stat_result:
+                metadata = list(real_lstat(path))
+                metadata[4] = 0
+                metadata[5] = 0
+                return os.stat_result(metadata)
+
+            # This manifest/hash fixture runs unprivileged in CI. Preserve the
+            # real file metadata while modeling the root ownership enforced by
+            # the production installer and verifier.
+            with patch.object(Path, "lstat", root_owned_lstat):
+                verified = verify_installed(installed_root, RELEASE_SHA)
+                self.assertEqual(verified["release_sha"], RELEASE_SHA)
+                tampered = (
+                    installed_root
+                    / PLATFORM_FILES[0][1].removeprefix("/")
+                )
+                tampered.write_text("stale\n", encoding="utf-8")
+                with self.assertRaisesRegex(
+                    PlatformError, "does not match manifest"
+                ):
+                    verify_installed(installed_root, RELEASE_SHA)
 
 
 class ControllerEligibilityTests(unittest.TestCase):
@@ -412,6 +585,20 @@ class BoundedTransportTests(unittest.TestCase):
         )
         atomic_write(state_file(paths, RELEASE_SHA), value)
         return value
+
+    def test_production_readiness_aggregates_every_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            paths = self.paths(Path(temporary))
+            with self.assertRaisesRegex(
+                GatewayError, "PRODUCTION_READINESS_FAILED"
+            ) as raised:
+                production_readiness(paths, RELEASE_SHA)
+            evidence = raised.exception.evidence
+            self.assertEqual(evidence["status"], "failed")
+            self.assertGreater(evidence["failure_count"], 1)
+            self.assertEqual(
+                evidence["failure_count"], len(evidence["failures"])
+            )
 
     def test_failed_pre_mutation_retry_archives_and_resets_to_build(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -588,6 +775,93 @@ class BoundedTransportTests(unittest.TestCase):
         self.assertEqual(arguments.command, "retry-pre-mutation")
         self.assertEqual(arguments.release_sha, RELEASE_SHA)
 
+    def test_rolled_back_gateway_retry_reuses_unchanged_package(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            paths = self.paths(Path(temporary))
+            failed = self.failed_pre_mutation_fixture(paths)
+            value = state()
+            value = advance(
+                value,
+                "SOURCE_CI_VERIFIED",
+                updates={"expected_images": failed["expected_images"]},
+            )
+            value = advance(
+                value,
+                "BUILD_VERIFIED",
+                updates={
+                    "release_assets_digest": failed[
+                        "release_assets_digest"
+                    ],
+                    "release_manifest_digest": failed[
+                        "release_manifest_digest"
+                    ],
+                },
+            )
+            for phase in PHASES[
+                PHASES.index("HOST_PREFLIGHT_STARTED") :
+                PHASES.index("CANDIDATE_REHEARSED") + 1
+            ]:
+                updates = (
+                    {
+                        "autonomous_armed": False,
+                        "contract_paused": True,
+                        "kill_switch": True,
+                    }
+                    if phase == "HOST_PREFLIGHT_OK"
+                    else None
+                )
+                value = advance(value, phase, updates=updates)
+            value = set_mutation_started(value)
+            value = fail_state(
+                value, code="DEPLOYMENT_FAILED", evidence={}
+            )
+            value = rollback_phase(value, "ROLLBACK_STARTED")
+            value = rollback_phase(value, "ROLLED_BACK", {"status": "ok"})
+            value.update(
+                {
+                    "active_release_pointer": ROLLBACK_SHA,
+                    "autonomous_armed": False,
+                    "candidate_pointer": None,
+                    "contract_paused": True,
+                    "kill_switch": True,
+                }
+            )
+            atomic_write(state_file(paths, RELEASE_SHA), value)
+            with (
+                patch(
+                    "scripts.phoenix_release.gateway.status",
+                    return_value={
+                        "active_release": ROLLBACK_SHA,
+                        "phoenix_mode": "LIVE",
+                    },
+                ),
+                patch(
+                    "scripts.phoenix_release.gateway."
+                    "_require_fail_closed_live_executor_absence"
+                ),
+            ):
+                result = retry_rolled_back(paths, RELEASE_SHA)
+            retried = load_state(state_file(paths, RELEASE_SHA))
+            self.assertEqual(result["release_attempt"], 2)
+            self.assertEqual(retried["current_phase"], "BUILD_VERIFIED")
+            self.assertEqual(
+                retried["release_assets_digest"],
+                failed["release_assets_digest"],
+            )
+            self.assertTrue(
+                (
+                    state_file(paths, RELEASE_SHA).parent
+                    / result["archive"]
+                ).is_file()
+            )
+
+    def test_retry_rolled_back_cli_requires_exact_sha(self) -> None:
+        arguments = release_parser().parse_args(
+            ["retry-rolled-back", RELEASE_SHA]
+        )
+        self.assertEqual(arguments.command, "retry-rolled-back")
+        self.assertEqual(arguments.release_sha, RELEASE_SHA)
+
     def test_valid_package_is_received_once_with_durable_state(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             paths = self.paths(Path(temporary))
@@ -652,6 +926,31 @@ class BoundedTransportTests(unittest.TestCase):
         self.assertNotIn("password", output)
         self.assertEqual(output.count("[REDACTED_URL]"), 2)
 
+    def test_command_failure_preserves_exact_bounded_stdout_and_stderr(
+        self,
+    ) -> None:
+        completed = subprocess.CompletedProcess(
+            ["/bin/example", "check"],
+            19,
+            stdout="container=engine health=unhealthy\n",
+            stderr="mounted_sql_inode=441 expected_inode=442\n",
+        )
+        with (
+            patch(
+                "scripts.phoenix_release.gateway._run",
+                return_value=completed,
+            ),
+            self.assertRaisesRegex(GatewayError, "FOCUSED_CHECK_FAILED") as raised,
+        ):
+            _require_success(
+                ["/bin/example", "check"], "FOCUSED_CHECK_FAILED"
+            )
+        evidence = raised.exception.evidence
+        self.assertEqual(evidence["command"], "/bin/example check")
+        self.assertEqual(evidence["exit_code"], 19)
+        self.assertIn("container=engine", evidence["stdout"])
+        self.assertIn("mounted_sql_inode", evidence["stderr"])
+
     def test_failure_output_preserves_early_structured_diagnostic(self) -> None:
         diagnostic = (
             '{"code":"RUNNING_IMAGE_MISMATCH","evidence":'
@@ -677,7 +976,10 @@ class BoundedTransportTests(unittest.TestCase):
             "status",
             "history",
             "plan",
+            "readiness",
             "resume",
+            "retry-pre-mutation",
+            "retry-rolled-back",
             "rollback",
             "emergency-pause",
             "evidence",
@@ -750,6 +1052,44 @@ class BoundedTransportTests(unittest.TestCase):
             rollback_state = rollback.call_args.args[1]
             self.assertEqual(rollback_state["current_phase"], "FAILED_POST_MUTATION")
             self.assertTrue(rollback_state["mutation_started"])
+
+    def test_candidate_rehearsal_failure_precedes_mutation_and_install(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            paths = self.paths(Path(temporary))
+            value = state()
+            for phase in PHASES[
+                1 : PHASES.index("CANDIDATE_REHEARSED")
+            ]:
+                value = advance(value, phase)
+            atomic_write(state_file(paths, RELEASE_SHA), value)
+            request_path = request_file(paths, RELEASE_SHA)
+            request_path.parent.mkdir(parents=True)
+            request_path.write_text(
+                json.dumps(request()), encoding="utf-8"
+            )
+            with (
+                patch(
+                    "scripts.phoenix_release.gateway._rehearse_candidate",
+                    side_effect=GatewayError(
+                        "CANDIDATE_REHEARSAL_FAILED"
+                    ),
+                ),
+                patch(
+                    "scripts.phoenix_release.gateway._install_candidate"
+                ) as install_candidate,
+                self.assertRaisesRegex(
+                    GatewayError, "CANDIDATE_REHEARSAL_FAILED"
+                ),
+            ):
+                resume(paths, RELEASE_SHA)
+            failed = load_state(state_file(paths, RELEASE_SHA))
+            self.assertEqual(
+                failed["current_phase"], "FAILED_PRE_MUTATION"
+            )
+            self.assertFalse(failed["mutation_started"])
+            install_candidate.assert_not_called()
 
     def test_candidate_render_failure_needs_context_only_reconciliation(self) -> None:
         value = state()
@@ -935,6 +1275,9 @@ class ReconciliationTests(unittest.TestCase):
             "armed": False,
             "kill_switch": True,
             "active_attempts": 0,
+            "execution_mode": "disarmed",
+            "open_routes": 0,
+            "unresolved_submissions": 0,
         }
         self.assertTrue(
             _live_executor_absence_is_fail_closed(
@@ -950,6 +1293,9 @@ class ReconciliationTests(unittest.TestCase):
             ("kill_switch", False, "runtime"),
             ("active_attempts", 1, "runtime"),
             ("active_attempts", False, "runtime"),
+            ("execution_mode", "live", "runtime"),
+            ("open_routes", 1, "runtime"),
+            ("unresolved_submissions", 1, "runtime"),
         )
         for field, value, source in unsafe_values:
             with self.subTest(field=field, source=source):
@@ -979,6 +1325,9 @@ class ReconciliationTests(unittest.TestCase):
             "armed": False,
             "kill_switch": True,
             "active_attempts": 0,
+            "execution_mode": "disarmed",
+            "open_routes": 0,
+            "unresolved_submissions": 0,
             "unreviewed": True,
         }
         self.assertFalse(
@@ -995,6 +1344,9 @@ class WorkflowAndDeploymentContractTests(unittest.TestCase):
         ).read_text()
         self.deploy = (ROOT / "scripts/deploy-release.sh").read_text()
         self.rollback = (ROOT / "scripts/rollback-release.sh").read_text()
+        self.rehearsal = (
+            ROOT / "scripts/rehearse-production-release.sh"
+        ).read_text()
 
     def test_controller_is_automatic_resumable_and_serialized(self) -> None:
         self.assertIn('workflows: ["Phoenix CI"]', self.workflow)
@@ -1026,6 +1378,30 @@ class WorkflowAndDeploymentContractTests(unittest.TestCase):
         self.assertIn(
             "mv failed-release-evidence.json release-evidence.json", self.workflow
         )
+
+    def test_controller_gates_build_on_aggregated_readiness_and_safe_retry(
+        self,
+    ) -> None:
+        self.assertIn('"readiness ${RELEASE_SHA}"', self.workflow)
+        self.assertIn("needs: [prepare, host-plan]", self.workflow)
+        self.assertIn("phoenix-production-readiness-", self.workflow)
+        self.assertIn('"retry-pre-mutation ${RELEASE_SHA}"', self.workflow)
+        self.assertIn('"retry-rolled-back ${RELEASE_SHA}"', self.workflow)
+
+    def test_rehearsal_proves_exact_schema_monitor_inode_uid_and_health(
+        self,
+    ) -> None:
+        self.assertIn("migrations/*.sql", self.rehearsal)
+        self.assertIn("live-executor/schema/*.sql", self.rehearsal)
+        self.assertIn("BEGIN TRANSACTION READ ONLY", self.rehearsal)
+        self.assertIn(
+            "$candidate_root/scripts/sql/economic-dashboard-snapshot.sql",
+            self.rehearsal,
+        )
+        self.assertIn("candidate_monitor_sql_inode_mismatch", self.rehearsal)
+        self.assertIn("1000:1000", self.rehearsal)
+        self.assertIn("candidate_monitor_unhealthy", self.rehearsal)
+        self.assertIn("candidate_health_contract_failed", self.rehearsal)
 
     def test_candidate_render_precedes_any_runtime_mutation(self) -> None:
         preflight_render = self.deploy.index(

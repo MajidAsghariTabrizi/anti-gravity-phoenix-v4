@@ -26,7 +26,7 @@ command_name=${1:-}
 case "$command_name:$#" in
   status:1|history:1|emergency-pause:1|reconcile-active-context:1)
     ;;
-  receive:2|plan:2|resume:2|rollback:2|evidence:2)
+  receive:2|plan:2|readiness:2|resume:2|retry-pre-mutation:2|retry-rolled-back:2|rollback:2|evidence:2)
     case "${2:-}" in
       *[!0-9a-f]*|"") deny ;;
     esac

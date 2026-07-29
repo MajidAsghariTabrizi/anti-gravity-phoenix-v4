@@ -88,12 +88,12 @@ compose_with() (
   compose_release_env=$1
   shift
   unset COMPOSE_FILE COMPOSE_PROFILES ENGINE_ROUTE_REGISTRY_JSON
-  PHOENIX_ENV_FILE="$env_file" PHOENIX_RELEASE_ENV="$compose_release_env" \
-    docker compose \
-      --project-directory "$deploy_dir" \
-      --env-file "$env_file" \
-      --env-file "$compose_release_env" \
-      -f "$compose_file" "$@"
+  python3 "$deploy_dir/production_compose.py" \
+    --mode SHADOW \
+    --env-file "$env_file" \
+    --release-env "$compose_release_env" \
+    --compose-file "$compose_file" \
+    -- "$@"
 )
 
 container_id() (

@@ -243,7 +243,13 @@ class LiveExecutorSafetyTests(unittest.TestCase):
         )
         active_context = gateway.index("_host_preflight(paths, request)")
         immutable_install = gateway.index("_install_candidate(paths, request)")
-        live_deploy = gateway.index('"deploy-release.sh"')
+        candidate_installed = gateway.index(
+            'state["current_phase"] == "CANDIDATE_INSTALLED"'
+        )
+        live_deploy = gateway.index(
+            'str(paths.deploy_dir / "deploy-release.sh")',
+            candidate_installed,
+        )
         self.assertLess(active_context, immutable_install)
         self.assertLess(immutable_install, live_deploy)
         self.assertIn("validate-deploy-pair", gateway)

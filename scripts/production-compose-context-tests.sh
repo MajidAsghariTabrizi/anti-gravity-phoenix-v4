@@ -200,7 +200,7 @@ assert "live-executor" not in value["images"]
 if printf '%s' "$render_stdout" | grep -F "$provider_secret" >/dev/null; then
   fail "renderer printed a provider URL"
 fi
-expected_invocation="--env-file $operator_env --env-file $release_env -f $compose_file config --format json"
+expected_invocation="--env-file $operator_env --env-file $release_env -f $compose_file --project-directory $test_root config --format json"
 grep -Fx -- "$expected_invocation" "$compose_log" >/dev/null || fail "production Compose selection is not exact"
 if grep -F 'rogue.yml' "$compose_log" >/dev/null; then
   fail "inherited Compose override changed production selection"

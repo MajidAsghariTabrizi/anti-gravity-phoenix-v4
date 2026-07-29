@@ -233,8 +233,10 @@ done
 for safety_script in \
   install-release-assets.sh \
   install-production-release-context.sh \
+  production_compose.py \
   production_mode.py \
   production-healthcheck.sh \
+  rehearse-production-release.sh \
   prelive-protected-maintenance.sh \
   prelive_protected_maintenance.py \
   prelive-protected-maintenance-launch.sh \

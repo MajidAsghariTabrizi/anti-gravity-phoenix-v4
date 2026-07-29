@@ -1,15 +1,23 @@
 #!/usr/bin/env sh
 set -eu
 
+script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 deploy_root="${PHOENIX_DEPLOY_ROOT:-/opt/phoenix}"
 deploy_dir="$deploy_root/deploy"
 env_file="${PHOENIX_ENV_FILE:-/etc/phoenix/phoenix.env}"
 release_env="${PHOENIX_RELEASE_ENV:-$deploy_dir/current-release.env}"
-compose_file="$deploy_dir/compose.prod.yml"
-overlay_file="$deploy_dir/compose.live-autonomous.yml"
+compose_file="${PHOENIX_COMPOSE_FILE:-$deploy_dir/compose.prod.yml}"
+overlay_file="${PHOENIX_COMPOSE_OVERLAY_FILE:-$deploy_dir/compose.live-autonomous.yml}"
+project_directory="${PHOENIX_COMPOSE_PROJECT_DIRECTORY:-$deploy_dir}"
 retries="${PHOENIX_HEALTH_RETRIES:-20}"
 sleep_seconds="${PHOENIX_HEALTH_SLEEP_SECONDS:-3}"
 expected_mode="${PHOENIX_HEALTH_EXPECTED_MODE:-}"
+compose_runner=${PHOENIX_COMPOSE_RUNNER:-$deploy_dir/production_compose.py}
+if [ ! -f "$compose_runner" ] && [ -f "$script_dir/production_compose.py" ]; then
+  compose_runner=$script_dir/production_compose.py
+fi
+[ -f "$compose_runner" ] ||
+  { echo "HEALTH_FAIL: canonical-compose-runner"; exit 1; }
 
 case "$expected_mode" in
   ""|LIVE|SHADOW|DISARMED_EVIDENCE) ;;
@@ -27,16 +35,30 @@ set -a
 set +a
 
 health_mode=${expected_mode:-${PHOENIX_MODE:-SHADOW}}
+compose_mode=SHADOW
+if [ "$health_mode" = LIVE ] || [ "$health_mode" = DISARMED_EVIDENCE ]; then
+  compose_mode=LIVE
+fi
 
 compose() {
-  if [ "$health_mode" = LIVE ] || [ "$health_mode" = DISARMED_EVIDENCE ]; then
-    set -- --env-file "$env_file" --env-file "$release_env" \
-      -f "$compose_file" -f "$overlay_file" --profile live-autonomous "$@"
+  if [ "$compose_mode" = LIVE ]; then
+    python3 "$compose_runner" \
+      --mode LIVE \
+      --env-file "$env_file" \
+      --release-env "$release_env" \
+      --compose-file "$compose_file" \
+      --overlay-file "$overlay_file" \
+      --project-directory "$project_directory" \
+      -- "$@"
   else
-    set -- --env-file "$env_file" --env-file "$release_env" \
-      -f "$compose_file" "$@"
+    python3 "$compose_runner" \
+      --mode SHADOW \
+      --env-file "$env_file" \
+      --release-env "$release_env" \
+      --compose-file "$compose_file" \
+      --project-directory "$project_directory" \
+      -- "$@"
   fi
-  PHOENIX_ENV_FILE="$env_file" docker compose "$@"
 }
 
 check() {

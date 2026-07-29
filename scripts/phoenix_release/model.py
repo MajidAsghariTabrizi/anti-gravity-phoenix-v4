@@ -29,6 +29,7 @@ PHASES = (
     "HOST_PREFLIGHT_OK",
     "ACTIVE_CONTEXT_RECONCILED",
     "ROLLBACK_VERIFIED",
+    "CANDIDATE_REHEARSED",
     "CANDIDATE_INSTALLED",
     "CANDIDATE_LIVE_RENDER_VERIFIED",
     "MIGRATIONS_APPLIED",
@@ -64,6 +65,7 @@ REQUIRED_KEYS = {
     "build_run_id",
     "deploy_run_id",
     "deploy_run_attempt",
+    "release_attempt",
     "current_phase",
     "completed_phases",
     "phase_timestamps",
@@ -145,6 +147,7 @@ def new_state(
         "build_run_id": _run_id(build_run_id, "build_run_id"),
         "deploy_run_id": _run_id(deploy_run_id, "deploy_run_id"),
         "deploy_run_attempt": _run_id(deploy_run_attempt, "deploy_run_attempt"),
+        "release_attempt": 1,
         "current_phase": "REQUESTED",
         "completed_phases": ["REQUESTED"],
         "phase_timestamps": {"REQUESTED": timestamp},
@@ -173,7 +176,14 @@ def new_state(
 
 
 def validate_state(value: object) -> dict[str, Any]:
-    if not isinstance(value, dict) or set(value) != REQUIRED_KEYS:
+    if not isinstance(value, dict):
+        raise StateError("release state keys are invalid")
+    # State schema v1 predates durable same-SHA attempt numbering. Upgrade it
+    # in memory so already-recorded releases remain readable and the next
+    # atomic write persists the explicit attempt.
+    if set(value) == REQUIRED_KEYS - {"release_attempt"}:
+        value["release_attempt"] = 1
+    if set(value) != REQUIRED_KEYS:
         raise StateError("release state keys are invalid")
     if value["schema_version"] != STATE_SCHEMA:
         raise StateError("release state schema is invalid")
@@ -189,6 +199,7 @@ def validate_state(value: object) -> dict[str, Any]:
         "build_run_id",
         "deploy_run_id",
         "deploy_run_attempt",
+        "release_attempt",
     ):
         _run_id(value[key], key)
     phase = value["current_phase"]
@@ -364,6 +375,56 @@ def retry_failed_pre_mutation(value: dict[str, Any]) -> dict[str, Any]:
     value["failure_phase"] = None
     value["failure_code"] = None
     value["failure_evidence"] = None
+    value["release_attempt"] += 1
+    return validate_state(value)
+
+
+def retry_rolled_back_release(value: dict[str, Any]) -> dict[str, Any]:
+    """Reset a completely rolled-back, pre-activation release to its build."""
+    validate_state(value)
+    if value["current_phase"] != "ROLLED_BACK":
+        raise StateError("rolled-back retry requires ROLLED_BACK")
+    if value["owner_transaction_hash"] is not None:
+        raise StateError("rolled-back retry cannot follow an owner transaction")
+    if value["rollback_result"] is None or value["rollback_result"].get("status") != "ok":
+        raise StateError("rolled-back retry requires successful rollback evidence")
+    if (
+        value["active_release_pointer"] != value["rollback_sha"]
+        or value["candidate_pointer"] is not None
+        or value["contract_paused"] is not True
+        or value["autonomous_armed"] is not False
+        or value["kill_switch"] is not True
+    ):
+        raise StateError("rolled-back retry requires fail-closed rollback state")
+    if "BUILD_VERIFIED" not in value["completed_phases"]:
+        raise StateError("rolled-back retry requires verified build evidence")
+
+    retained_phases = list(PHASES[: PHASES.index("BUILD_VERIFIED") + 1])
+    value.update(
+        {
+            "active_release_pointer": value["rollback_sha"],
+            "actual_images": {},
+            "autonomous_armed": False,
+            "candidate_pointer": value["release_sha"],
+            "contract_paused": True,
+            "current_phase": "BUILD_VERIFIED",
+            "engine_container_id": None,
+            "engine_restart_baseline": None,
+            "engine_terminal_integrity_baseline": None,
+            "failure_code": None,
+            "failure_evidence": None,
+            "failure_phase": None,
+            "kill_switch": True,
+            "mutation_started": False,
+            "process_fatal_integrity_baseline": None,
+            "release_attempt": value["release_attempt"] + 1,
+            "rollback_result": None,
+        }
+    )
+    value["completed_phases"] = retained_phases
+    value["phase_timestamps"] = {
+        phase: value["phase_timestamps"][phase] for phase in retained_phases
+    }
     return validate_state(value)
 
 

@@ -50,13 +50,13 @@ readiness_id=$(printf '%s\n' "$read_ids" | sed -n '1p')
 authorization_id=$(printf '%s\n' "$read_ids" | sed -n '2p')
 
 compose() {
-  PHOENIX_ENV_FILE="$env_file" PHOENIX_RELEASE_ENV="$release_env" \
-    docker compose \
-      --env-file "$env_file" \
-      --env-file "$release_env" \
-      -f "$compose_file" \
-      -f "$overlay_file" \
-      --profile live-autonomous "$@"
+  python3 "$deploy_dir/production_compose.py" \
+    --mode LIVE \
+    --env-file "$env_file" \
+    --release-env "$release_env" \
+    --compose-file "$compose_file" \
+    --overlay-file "$overlay_file" \
+    -- "$@"
 }
 
 owner_unpause_attempted=0
