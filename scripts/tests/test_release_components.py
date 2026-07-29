@@ -112,9 +112,18 @@ class ReleaseComponentRegistryTests(unittest.TestCase):
             self.assertEqual(item["context"], component["build_context"])
             self.assertEqual(item["dockerfile"], component["dockerfile"])
             self.assertEqual(item["protected"], component["protected"])
+            self.assertTrue(item["build"])
             self.assertEqual(
                 item["live_canary_only"], component["live_canary_only"]
             )
+
+        selective = release_components.build_matrix(
+            built_images={"dashboard", "rpc-gateway"}
+        )["include"]
+        self.assertEqual(
+            tuple(item["image"] for item in selective if item["build"]),
+            ("dashboard", "rpc-gateway"),
+        )
 
     def test_six_eight_and_duplicate_component_registries_fail_closed(self) -> None:
         for mutation in ("six", "eight", "duplicate"):
@@ -310,11 +319,11 @@ class ReleaseComponentRegistryTests(unittest.TestCase):
         )
         self.assertEqual(
             tuple(provenance["properties"]["built_images"]["items"]["enum"]),
-            release_components.BUILT_IMAGES,
+            EXPECTED_IMAGES,
         )
         self.assertEqual(
             tuple(provenance["properties"]["inherited_images"]["items"]["enum"]),
-            EXPECTED_PROTECTED,
+            EXPECTED_IMAGES,
         )
         self.assertEqual(
             tuple(provenance["$defs"]["ciJobName"]["enum"]),
@@ -549,10 +558,18 @@ class ReleaseRoundTripTests(unittest.TestCase):
         )
         for env_name, reference in release_values.items():
             if env_name.endswith("_IMAGE"):
-                self.assertRegex(reference, r"^ghcr\.io/.+@sha256:[0-9a-f]{64}$")
+                self.assertRegex(
+                    reference,
+                    r"^ghcr\.io/.+@sha256:[0-9a-f]{64}$",
+                )
 
         route_raw = json.dumps(
-            json.loads((ROOT / "fixtures/routes/weth_usdc_uniswap_v3.json").read_text(encoding="utf-8")),
+            json.loads(
+                (
+                    ROOT
+                    / "fixtures/routes/weth_usdc_uniswap_v3.json"
+                ).read_text(encoding="utf-8")
+            ),
             separators=(",", ":"),
         )
         operator_env = candidate / "operator.env"
@@ -575,7 +592,8 @@ class ReleaseRoundTripTests(unittest.TestCase):
         )
         compose_path = candidate / "compose.json"
         compose_path.write_text(
-            json.dumps(self._rendered_compose(release_values, route_raw)), encoding="utf-8"
+            json.dumps(self._rendered_compose(release_values, route_raw)),
+            encoding="utf-8",
         )
         metadata = candidate / "render.json"
         production_context.validate_render(
@@ -590,6 +608,72 @@ class ReleaseRoundTripTests(unittest.TestCase):
         rendered = json.loads(metadata.read_text(encoding="utf-8"))
         self.assertEqual(rendered["status"], "ok")
         self.assertEqual(rendered["release_sha"], RELEASE_SHA)
+
+    def test_release_only_manifest_inherits_every_schema_valid_image(self) -> None:
+        rollback, _, rollback_manifest_path, rollback_provenance_path = (
+            self._full_release()
+        )
+        candidate = self.root / "release-only"
+        fragments = candidate / "fragments"
+        assets = candidate / "assets"
+        self._write_fragments(fragments, RELEASE_SHA, RELEASE_RUN)
+        self._write_assets(assets, RELEASE_SHA)
+        release_provenance.write_inherited_fragments(
+            fragments,
+            RELEASE_SHA,
+            RELEASE_RUN,
+            release_provenance.RELEASE_INTENT,
+            ROLLBACK_SHA,
+            ROLLBACK_RUN,
+            rollback_manifest_path,
+            rollback_provenance_path,
+            list(release_components.RELEASE_IMAGES),
+        )
+        manifest_path = candidate / "release-manifest.json"
+        provenance_path = candidate / "release-provenance.json"
+        with mock.patch.object(
+            release_provenance.release_assets, "verify_release_assets"
+        ):
+            manifest, provenance = release_provenance.assemble_release(
+                fragments,
+                assets,
+                RELEASE_SHA,
+                RELEASE_RUN,
+                release_provenance.RELEASE_INTENT,
+                manifest_path,
+                provenance_path,
+                source_ci(RELEASE_SHA),
+                created_at="2026-07-22T00:00:00Z",
+                protected_base_sha=ROLLBACK_SHA,
+                protected_base_build_run_id=ROLLBACK_RUN,
+                protected_base_manifest=rollback_manifest_path,
+                protected_base_provenance=rollback_provenance_path,
+                built_images=[],
+            )
+
+        manifest_schema = json.loads(
+            (
+                ROOT / "schemas/phoenix-release-manifest.schema.json"
+            ).read_text(encoding="utf-8")
+        )
+        provenance_schema = json.loads(
+            (
+                ROOT / "schemas/phoenix-release-provenance.schema.json"
+            ).read_text(encoding="utf-8")
+        )
+        Draft202012Validator(manifest_schema).validate(manifest)
+        Draft202012Validator(provenance_schema).validate(provenance)
+        self.assertEqual(provenance["built_images"], [])
+        self.assertEqual(
+            provenance["inherited_images"],
+            list(release_components.RELEASE_IMAGES),
+        )
+        for name in release_components.RELEASE_IMAGES:
+            self.assertEqual(manifest["images"][name]["origin"], "inherited")
+            self.assertEqual(
+                manifest["images"][name]["digest"],
+                rollback["images"][name]["digest"],
+            )
 
 
 if __name__ == "__main__":

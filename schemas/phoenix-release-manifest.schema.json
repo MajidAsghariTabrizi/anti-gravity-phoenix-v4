@@ -118,6 +118,16 @@
         }
       }
     },
+    "selectiveImage": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/builtImage"
+        },
+        {
+          "$ref": "#/$defs/inheritedImage"
+        }
+      ]
+    },
     "legacyImages": {
       "type": "object",
       "additionalProperties": false,
@@ -153,13 +163,13 @@
         "rpc-gateway"
       ],
       "properties": {
-        "dashboard": { "$ref": "#/$defs/builtImage" },
-        "feed-ingestor": { "$ref": "#/$defs/inheritedImage" },
-        "fork-sandbox": { "$ref": "#/$defs/builtImage" },
-        "live-executor": { "$ref": "#/$defs/builtImage" },
-        "phoenix-engine": { "$ref": "#/$defs/builtImage" },
-        "recorder": { "$ref": "#/$defs/inheritedImage" },
-        "rpc-gateway": { "$ref": "#/$defs/builtImage" }
+        "dashboard": { "$ref": "#/$defs/selectiveImage" },
+        "feed-ingestor": { "$ref": "#/$defs/selectiveImage" },
+        "fork-sandbox": { "$ref": "#/$defs/selectiveImage" },
+        "live-executor": { "$ref": "#/$defs/selectiveImage" },
+        "phoenix-engine": { "$ref": "#/$defs/selectiveImage" },
+        "recorder": { "$ref": "#/$defs/selectiveImage" },
+        "rpc-gateway": { "$ref": "#/$defs/selectiveImage" }
       }
     },
     "fullBuild": {

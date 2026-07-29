@@ -88,7 +88,10 @@ jobs:
       contents: read
       actions: read
     outputs:
-      build_matrix: ${{ steps.components.outputs.matrix }}
+      build_matrix: ${{ steps.impact.outputs.matrix }}
+      built_images: ${{ steps.impact.outputs.built_images }}
+      inherited_images: ${{ steps.impact.outputs.inherited_images }}
+      impact_plan: ${{ steps.impact.outputs.plan }}
     steps:
       - name: Checkout exact requested release
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
@@ -97,13 +100,49 @@ jobs:
           fetch-depth: 0
 
       - name: Load canonical release component matrix
-        id: components
         shell: bash
         run: |
           set -euo pipefail
           python3 scripts/release_components.py validate
-          printf 'matrix=%s\n' "$(python3 scripts/release_components.py build-matrix)" \
-            >> "$GITHUB_OUTPUT"
+
+      - name: Classify exact image impact
+        id: impact
+        shell: bash
+        env:
+          RELEASE_SHA: ${{ inputs.release_sha }}
+          PROTECTED_BASE_SHA: ${{ inputs.protected_base_sha }}
+        run: |
+          set -euo pipefail
+          if [ -n "$PROTECTED_BASE_SHA" ]; then
+            python3 scripts/change_impact.py git \
+              --base "$PROTECTED_BASE_SHA" \
+              --head "$RELEASE_SHA" \
+              --output change-impact.json
+          else
+            git diff --name-only "${RELEASE_SHA}^1" "$RELEASE_SHA" \
+              >changed-paths.txt
+            python3 scripts/change_impact.py paths \
+              --paths changed-paths.txt \
+              --output change-impact.json
+            all_images="$(
+              python3 -c \
+                'import json; from scripts import release_components; print(json.dumps(list(release_components.RELEASE_IMAGES)))'
+            )"
+            jq --argjson all "$all_images" \
+              '.built_images = $all | .inherited_images = []' \
+              change-impact.json >change-impact.full.json
+            mv change-impact.full.json change-impact.json
+          fi
+          built_images="$(jq -c '.built_images' change-impact.json)"
+          inherited_images="$(jq -c '.inherited_images' change-impact.json)"
+          matrix="$(
+            python3 scripts/release_components.py build-matrix \
+              --built-images-json "$built_images"
+          )"
+          printf 'plan=%s\n' "$(jq -c . change-impact.json)" >>"$GITHUB_OUTPUT"
+          printf 'built_images=%s\n' "$built_images" >>"$GITHUB_OUTPUT"
+          printf 'inherited_images=%s\n' "$inherited_images" >>"$GITHUB_OUTPUT"
+          printf 'matrix=%s\n' "$matrix" >>"$GITHUB_OUTPUT"
 
       - name: Validate explicit publication authorization
         shell: bash
@@ -193,7 +232,7 @@ jobs:
           path: protected-base/release
 
       - name: Materialize inherited protected image fragments
-        if: ${{ inputs.protected_base_sha != '' }}
+        if: ${{ inputs.protected_base_sha != '' && steps.impact.outputs.inherited_images != '[]' }}
         shell: bash
         env:
           RELEASE_SHA: ${{ inputs.release_sha }}
@@ -201,6 +240,7 @@ jobs:
           BUILD_RUN_ID: ${{ github.run_id }}
           PROTECTED_BASE_SHA: ${{ inputs.protected_base_sha }}
           PROTECTED_BASE_BUILD_RUN_ID: ${{ inputs.protected_base_build_run_id }}
+          INHERITED_IMAGES: ${{ steps.impact.outputs.inherited_images }}
         run: |
           set -euo pipefail
           python3 scripts/release_provenance.py inherit-protected \
@@ -211,10 +251,11 @@ jobs:
             --protected-base-sha "$PROTECTED_BASE_SHA" \
             --protected-base-build-run-id "$PROTECTED_BASE_BUILD_RUN_ID" \
             --protected-base-manifest protected-base/release/release-manifest.json \
-            --protected-base-provenance protected-base/release/release-provenance.json
+            --protected-base-provenance protected-base/release/release-provenance.json \
+            --inherited-images-json "$INHERITED_IMAGES"
 
       - name: Upload inherited protected image fragments
-        if: ${{ inputs.protected_base_sha != '' }}
+        if: ${{ inputs.protected_base_sha != '' && steps.impact.outputs.inherited_images != '[]' }}
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: inherited-protected-fragments
@@ -235,19 +276,19 @@ jobs:
       matrix: ${{ fromJSON(needs.preflight.outputs.build_matrix) }}
     steps:
       - name: Use inherited protected image
-        if: ${{ inputs.protected_base_sha != '' && matrix.protected == true }}
+        if: ${{ matrix.build == false }}
         shell: bash
         run: printf 'Protected image %s is inherited from the reviewed base release.\n' '${{ matrix.image }}'
 
       - name: Download inherited protected image fragments
-        if: ${{ inputs.protected_base_sha != '' && matrix.protected == true }}
+        if: ${{ matrix.build == false }}
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
         with:
           name: inherited-protected-fragments
           path: inherited-fragments
 
       - name: Upload inherited image manifest fragment
-        if: ${{ inputs.protected_base_sha != '' && matrix.protected == true }}
+        if: ${{ matrix.build == false }}
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: release-fragment-${{ matrix.image }}
@@ -256,17 +297,17 @@ jobs:
           retention-days: 30
 
       - name: Checkout
-        if: ${{ inputs.protected_base_sha == '' || matrix.protected == false }}
+        if: ${{ matrix.build == true }}
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
         with:
           ref: ${{ inputs.release_sha }}
 
       - name: Setup Docker Buildx
-        if: ${{ inputs.protected_base_sha == '' || matrix.protected == false }}
+        if: ${{ matrix.build == true }}
         uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f
 
       - name: Login to GHCR
-        if: ${{ inputs.protected_base_sha == '' || matrix.protected == false }}
+        if: ${{ matrix.build == true }}
         uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9
         with:
           registry: ghcr.io
@@ -274,13 +315,13 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Capture OCI created timestamp
-        if: ${{ inputs.protected_base_sha == '' || matrix.protected == false }}
+        if: ${{ matrix.build == true }}
         id: created
         shell: bash
         run: echo "value=$(date -u +'%Y-%m-%dT%H:%M:%SZ')" >> "$GITHUB_OUTPUT"
 
       - name: Build and push immutable image
-        if: ${{ inputs.protected_base_sha == '' || matrix.protected == false }}
+        if: ${{ matrix.build == true }}
         id: build
         uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8
         with:
@@ -298,7 +339,7 @@ jobs:
           cache-to: type=gha,mode=max,scope=${{ matrix.image }}
 
       - name: Verify immutable image runtime contract
-        if: ${{ (inputs.protected_base_sha == '' || matrix.protected == false) && matrix.live_canary_only == true }}
+        if: ${{ matrix.build == true && matrix.live_canary_only == true }}
         shell: bash
         env:
           IMAGE_NAME: ${{ matrix.image }}
@@ -311,7 +352,7 @@ jobs:
             "$IMAGE_NAME" "$IMAGE_REFERENCE" "$EXPECTED_REVISION"
 
       - name: Write image manifest fragment
-        if: ${{ inputs.protected_base_sha == '' || matrix.protected == false }}
+        if: ${{ matrix.build == true }}
         shell: bash
         run: |
           set -euo pipefail
@@ -330,7 +371,7 @@ jobs:
           EOF
 
       - name: Upload image manifest fragment
-        if: ${{ inputs.protected_base_sha == '' || matrix.protected == false }}
+        if: ${{ matrix.build == true }}
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: release-fragment-${{ matrix.image }}
@@ -433,6 +474,7 @@ jobs:
           BUILD_RUN_ID: ${{ github.run_id }}
           PROTECTED_BASE_SHA: ${{ inputs.protected_base_sha }}
           PROTECTED_BASE_BUILD_RUN_ID: ${{ inputs.protected_base_build_run_id }}
+          BUILT_IMAGES: ${{ needs.preflight.outputs.built_images }}
         run: |
           set -euo pipefail
           python3 scripts/release_assets.py verify \
@@ -458,6 +500,7 @@ jobs:
             --output-manifest release-manifest.json \
             --output-provenance release-provenance.json \
             --source-ci-evidence source-ci/evidence.json \
+            --built-images-json "$BUILT_IMAGES" \
             "${protected_args[@]}"
 
       - name: Upload release manifest and provenance

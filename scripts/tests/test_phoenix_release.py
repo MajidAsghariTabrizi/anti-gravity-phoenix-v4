@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import io
 import json
 import os
@@ -101,6 +102,7 @@ def state() -> dict[str, object]:
         build_run_id=202,
         deploy_run_id=303,
         deploy_run_attempt=1,
+        package_digest=f"sha256:{'9' * 64}",
     )
 
 
@@ -132,12 +134,13 @@ def package_bytes(
     *,
     link_member: str | None = None,
     extra_member: str | None = None,
+    content_suffix: bytes = b"",
 ) -> bytes:
     payloads = {
         name: (
             json.dumps(request()).encode()
             if name == "request.json"
-            else f"fixture:{name}\n".encode()
+            else f"fixture:{name}\n".encode() + content_suffix
         )
         for name in expected_members(release_sha)
     }
@@ -548,8 +551,11 @@ class BoundedTransportTests(unittest.TestCase):
         )
         assets = incoming / f"phoenix-release-assets-{RELEASE_SHA}.tar.gz"
         assets.write_bytes(b"verified release assets")
+        package = incoming / "release-package.tar.gz"
+        package.write_bytes(b"exact immutable release package")
 
         value = state()
+        value["package_digest"] = sha256_file(package)
         value = advance(
             value,
             "SOURCE_CI_VERIFIED",
@@ -630,6 +636,7 @@ class BoundedTransportTests(unittest.TestCase):
                 "deploy_run_attempt",
                 "release_manifest_digest",
                 "release_assets_digest",
+                "package_digest",
                 "expected_images",
                 "contract_paused",
                 "autonomous_armed",
@@ -754,6 +761,25 @@ class BoundedTransportTests(unittest.TestCase):
             ):
                 retry_pre_mutation(paths, RELEASE_SHA)
 
+        with tempfile.TemporaryDirectory() as temporary:
+            paths = self.paths(Path(temporary))
+            self.failed_pre_mutation_fixture(paths)
+            (
+                paths.incoming
+                / RELEASE_SHA
+                / "release-package.tar.gz"
+            ).write_bytes(b"tampered immutable package")
+            with (
+                patch(
+                    "scripts.phoenix_release.gateway.status",
+                    return_value={"active_release": ROLLBACK_SHA},
+                ),
+                self.assertRaisesRegex(
+                    GatewayError, "PRE_MUTATION_RETRY_BUILD_EVIDENCE_MISMATCH"
+                ),
+            ):
+                retry_pre_mutation(paths, RELEASE_SHA)
+
     def test_failed_pre_mutation_retry_refuses_after_reset(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             paths = self.paths(Path(temporary))
@@ -780,6 +806,7 @@ class BoundedTransportTests(unittest.TestCase):
             paths = self.paths(Path(temporary))
             failed = self.failed_pre_mutation_fixture(paths)
             value = state()
+            value["package_digest"] = failed["package_digest"]
             value = advance(
                 value,
                 "SOURCE_CI_VERIFIED",
@@ -848,6 +875,10 @@ class BoundedTransportTests(unittest.TestCase):
                 retried["release_assets_digest"],
                 failed["release_assets_digest"],
             )
+            self.assertEqual(
+                retried["package_digest"],
+                failed["package_digest"],
+            )
             self.assertTrue(
                 (
                     state_file(paths, RELEASE_SHA).parent
@@ -865,14 +896,44 @@ class BoundedTransportTests(unittest.TestCase):
     def test_valid_package_is_received_once_with_durable_state(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             paths = self.paths(Path(temporary))
-            received = receive_package(io.BytesIO(package_bytes()), paths)
+            package = package_bytes()
+            received = receive_package(io.BytesIO(package), paths)
             self.assertEqual(received["release_sha"], RELEASE_SHA)
             state_path = paths.release_states / RELEASE_SHA / "state.json"
-            self.assertEqual(load_state(state_path)["current_phase"], "REQUESTED")
+            persisted = load_state(state_path)
+            self.assertEqual(persisted["current_phase"], "REQUESTED")
             self.assertEqual(
-                receive_package(io.BytesIO(package_bytes()), paths),
+                persisted["package_digest"],
+                f"sha256:{hashlib.sha256(package).hexdigest()}",
+            )
+            self.assertEqual(
+                (
+                    paths.incoming
+                    / RELEASE_SHA
+                    / "release-package.tar.gz"
+                ).read_bytes(),
+                package,
+            )
+            self.assertEqual(
+                receive_package(io.BytesIO(package), paths),
                 received,
             )
+            with self.assertRaisesRegex(
+                GatewayError, "PACKAGE_IDENTITY_MISMATCH"
+            ):
+                receive_package(
+                    io.BytesIO(package_bytes(content_suffix=b"changed")),
+                    paths,
+                )
+            (
+                paths.incoming
+                / RELEASE_SHA
+                / "release-package.tar.gz"
+            ).write_bytes(b"tampered stored package")
+            with self.assertRaisesRegex(
+                GatewayError, "PACKAGE_IDENTITY_MISMATCH"
+            ):
+                receive_package(io.BytesIO(package), paths)
 
     def test_unexpected_member_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -1342,6 +1403,7 @@ class WorkflowAndDeploymentContractTests(unittest.TestCase):
         self.workflow = (
             ROOT / ".github/workflows/phoenix-release-controller.yml"
         ).read_text()
+        self.ci = (ROOT / ".github/workflows/ci.yml").read_text()
         self.deploy = (ROOT / "scripts/deploy-release.sh").read_text()
         self.rollback = (ROOT / "scripts/rollback-release.sh").read_text()
         self.rehearsal = (
@@ -1351,7 +1413,9 @@ class WorkflowAndDeploymentContractTests(unittest.TestCase):
     def test_controller_is_automatic_resumable_and_serialized(self) -> None:
         self.assertIn('workflows: ["Phoenix CI"]', self.workflow)
         self.assertIn("workflow_dispatch:", self.workflow)
-        self.assertIn('cron: "*/10 * * * *"', self.workflow)
+        self.assertNotIn("schedule:", self.workflow)
+        self.assertNotIn("cron:", self.workflow)
+        self.assertIn("RECOVER_EXACT_PHOENIX_RELEASE", self.workflow)
         self.assertIn("group: phoenix-production-release", self.workflow)
         self.assertIn("cancel-in-progress: false", self.workflow)
 
@@ -1387,6 +1451,36 @@ class WorkflowAndDeploymentContractTests(unittest.TestCase):
         self.assertIn("phoenix-production-readiness-", self.workflow)
         self.assertIn('"retry-pre-mutation ${RELEASE_SHA}"', self.workflow)
         self.assertIn('"retry-rolled-back ${RELEASE_SHA}"', self.workflow)
+        self.assertIn("package_digest", self.workflow)
+        self.assertIn("gzip -n", self.workflow)
+        self.assertNotIn("GITHUB_RUN_ATTEMPT", self.workflow)
+        self.assertIn("Probe durable exact-package evidence", self.workflow)
+
+    def test_ci_preserves_jobs_and_runs_expensive_suites_only_on_main(
+        self,
+    ) -> None:
+        for job in REQUIRED_JOBS:
+            self.assertIn(f"\n    name: {job}\n", self.ci)
+        self.assertIn("scripts/change_impact.py github-output", self.ci)
+        self.assertIn(
+            "integration fixtures run only once for affected exact-main changes",
+            self.ci,
+        )
+        self.assertIn(
+            "JetStream integration runs only once for affected exact-main changes",
+            self.ci,
+        )
+        self.assertIn("github.event_name != 'pull_request'", self.ci)
+        self.assertIn(
+            "Validate affected Dockerfiles without building",
+            self.ci,
+        )
+        self.assertIn("docker buildx build --check", self.ci)
+        self.assertIn('--cache-from "type=gha,scope=$image"', self.ci)
+        self.assertIn(
+            '--cache-to "type=gha,mode=max,scope=$image"',
+            self.ci,
+        )
 
     def test_rehearsal_proves_exact_schema_monitor_inode_uid_and_health(
         self,

@@ -84,6 +84,7 @@ STATIC_PATHS = (
     "scripts/release_platform.py",
     "scripts/provision-production-host.sh",
     "scripts/release_assets.py",
+    "scripts/change_impact.py",
     "scripts/release_components.py",
     "scripts/release_provenance.py",
     "scripts/render-production-compose.sh",

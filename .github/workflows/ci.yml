@@ -19,21 +19,77 @@ jobs:
     name: hygiene
     runs-on: ubuntu-24.04
     timeout-minutes: 10
+    outputs:
+      plan: ${{ steps.impact.outputs.plan }}
+      classification: ${{ steps.impact.outputs.classification }}
+      release_required: ${{ steps.impact.outputs.release_required }}
+      docker_static: ${{ steps.impact.outputs.docker_static }}
+      built_images: ${{ steps.impact.outputs.built_images }}
+      inherited_images: ${{ steps.impact.outputs.inherited_images }}
+      job_go: ${{ steps.impact.outputs.job_go }}
+      job_rust_phoenix: ${{ steps.impact.outputs.job_rust_phoenix }}
+      job_rust_rpc_gateway: ${{ steps.impact.outputs.job_rust_rpc_gateway }}
+      job_rust_recorder: ${{ steps.impact.outputs.job_rust_recorder }}
+      job_rust_replay: ${{ steps.impact.outputs.job_rust_replay }}
+      job_rust_fork_sandbox: ${{ steps.impact.outputs.job_rust_fork_sandbox }}
+      job_solidity: ${{ steps.impact.outputs.job_solidity }}
+      job_python_dashboard: ${{ steps.impact.outputs.job_python_dashboard }}
+      job_docker_validation: ${{ steps.impact.outputs.job_docker_validation }}
+      job_integration_fixtures: ${{ steps.impact.outputs.job_integration_fixtures }}
+      job_jetstream_integration: ${{ steps.impact.outputs.job_jetstream_integration }}
     steps:
       - name: Checkout
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          fetch-depth: 0
+
+      - name: Classify changed paths once
+        id: impact
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PUSH_BASE_SHA: ${{ github.event.before }}
+        run: |
+          set -euo pipefail
+          case "$EVENT_NAME" in
+            pull_request)
+              base_sha="$PR_BASE_SHA"
+              ;;
+            push)
+              base_sha="$PUSH_BASE_SHA"
+              ;;
+            workflow_dispatch)
+              base_sha="$(git rev-parse HEAD^)"
+              ;;
+            *)
+              echo "unsupported Phoenix CI trigger: $EVENT_NAME" >&2
+              exit 1
+              ;;
+          esac
+          python3 scripts/change_impact.py github-output \
+            --base "$base_sha" \
+            --head "$GITHUB_SHA" >>"$GITHUB_OUTPUT"
+          python3 scripts/change_impact.py git \
+            --base "$base_sha" \
+            --head "$GITHUB_SHA" \
+            --output change-impact.json
+          cat change-impact.json >>"$GITHUB_STEP_SUMMARY"
 
       - name: Setup Go for workflow lint
+        if: ${{ steps.impact.outputs.job_hygiene == 'true' }}
         uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff
         with:
           go-version-file: feed-ingestor/go.mod
           cache: false
 
       - name: Install release schema validator
+        if: ${{ steps.impact.outputs.job_hygiene == 'true' }}
         shell: bash
         run: python3 -m pip install --disable-pip-version-check jsonschema==4.25.1
 
       - name: Run secret scans
+        if: ${{ steps.impact.outputs.job_hygiene == 'true' }}
         shell: bash
         run: |
           set -euo pipefail
@@ -41,6 +97,7 @@ jobs:
           sh ./scripts/secret-scan.sh
 
       - name: Run forbidden file checks
+        if: ${{ steps.impact.outputs.job_hygiene == 'true' }}
         shell: bash
         run: |
           set -euo pipefail
@@ -48,6 +105,7 @@ jobs:
           sh ./scripts/forbidden-file-check.sh
 
       - name: Validate shell syntax
+        if: ${{ steps.impact.outputs.job_hygiene == 'true' }}
         shell: bash
         run: |
           set -euo pipefail
@@ -75,7 +133,29 @@ jobs:
           SHELLCHECK_OPTS=--severity=warning \
             go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.7
 
-      - name: Validate bounded Engine canary control
+      - name: Run focused pull-request release validation
+        if: ${{ steps.impact.outputs.job_hygiene == 'true' && github.event_name == 'pull_request' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m py_compile \
+            scripts/change_impact.py \
+            scripts/release_assets.py \
+            scripts/release_components.py \
+            scripts/release_platform.py \
+            scripts/release_provenance.py \
+            scripts/phoenix_release/*.py
+          python3 -m unittest \
+            scripts.tests.test_change_impact \
+            scripts.tests.test_release_assets \
+            scripts.tests.test_release_components \
+            scripts.tests.test_release_provenance \
+            scripts.tests.test_phoenix_release
+          sh ./scripts/production-compose-context-tests.sh
+          sh ./scripts/phoenix-release-platform-tests.sh
+
+      - name: Validate bounded Engine canary control on exact main
+        if: ${{ steps.impact.outputs.job_hygiene == 'true' && github.event_name != 'pull_request' }}
         shell: bash
         run: |
           set -euo pipefail
@@ -94,6 +174,8 @@ jobs:
           sh ./scripts/prelive-shadow-control-tests.sh
           python3 -m py_compile scripts/release_assets.py
           python3 -m unittest scripts.tests.test_release_assets
+          python3 -m py_compile scripts/change_impact.py
+          python3 -m unittest scripts.tests.test_change_impact
           python3 -m py_compile scripts/phoenix_release/*.py
           python3 -m unittest scripts.tests.test_phoenix_release -v
           sh ./scripts/phoenix-release-platform-tests.sh
@@ -124,6 +206,7 @@ jobs:
           python3 -m unittest scripts.tests.test_live_executor_safety -v
 
       - name: Validate tracked hygiene
+        if: ${{ steps.impact.outputs.job_hygiene == 'true' }}
         shell: bash
         run: |
           set -euo pipefail
@@ -147,13 +230,20 @@ jobs:
 
   go:
     name: go
+    needs: hygiene
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
+      - name: Record deterministic no-op
+        if: ${{ needs.hygiene.outputs.job_go != 'true' }}
+        run: echo "go is unaffected by the canonical change-impact plan."
+
       - name: Checkout
+        if: ${{ needs.hygiene.outputs.job_go == 'true' }}
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
 
       - name: Setup Go
+        if: ${{ needs.hygiene.outputs.job_go == 'true' }}
         uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff
         with:
           go-version-file: feed-ingestor/go.mod
@@ -163,6 +253,7 @@ jobs:
             migration-runner/go.sum
 
       - name: Verify feed-ingestor
+        if: ${{ needs.hygiene.outputs.job_go == 'true' }}
         shell: bash
         run: |
           set -euo pipefail
@@ -177,6 +268,7 @@ jobs:
           go test ./...
 
       - name: Verify migration-runner
+        if: ${{ needs.hygiene.outputs.job_go == 'true' }}
         shell: bash
         run: |
           set -euo pipefail
@@ -192,6 +284,7 @@ jobs:
 
   rust-phoenix:
     name: rust-phoenix
+    needs: hygiene
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     services:
@@ -213,12 +306,28 @@ jobs:
           --health-timeout 3s
           --health-retries 10
     steps:
+      - name: Record deterministic no-op
+        if: ${{ needs.hygiene.outputs.job_rust_phoenix != 'true' }}
+        run: echo "rust-phoenix is unaffected by the canonical change-impact plan."
+
       - name: Checkout
+        if: ${{ needs.hygiene.outputs.job_rust_phoenix == 'true' }}
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
       - name: Install Rust components
+        if: ${{ needs.hygiene.outputs.job_rust_phoenix == 'true' }}
         shell: bash
         run: rustup toolchain install stable --profile minimal --component rustfmt,clippy
-      - name: Verify phoenix-engine
+
+      - name: Focused pull-request phoenix-engine check
+        if: ${{ needs.hygiene.outputs.job_rust_phoenix == 'true' && github.event_name == 'pull_request' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo fmt --check --manifest-path phoenix-engine/Cargo.toml
+          cargo check --locked --manifest-path phoenix-engine/Cargo.toml --all-targets
+
+      - name: Verify phoenix-engine on exact main
+        if: ${{ needs.hygiene.outputs.job_rust_phoenix == 'true' && github.event_name != 'pull_request' }}
         shell: bash
         run: |
           set -euo pipefail
@@ -251,15 +360,32 @@ jobs:
 
   rust-rpc-gateway:
     name: rust-rpc-gateway
+    needs: hygiene
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
+      - name: Record deterministic no-op
+        if: ${{ needs.hygiene.outputs.job_rust_rpc_gateway != 'true' }}
+        run: echo "rust-rpc-gateway is unaffected by the canonical change-impact plan."
+
       - name: Checkout
+        if: ${{ needs.hygiene.outputs.job_rust_rpc_gateway == 'true' }}
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
       - name: Install Rust components
+        if: ${{ needs.hygiene.outputs.job_rust_rpc_gateway == 'true' }}
         shell: bash
         run: rustup toolchain install stable --profile minimal --component rustfmt,clippy
-      - name: Verify rpc-gateway
+
+      - name: Focused pull-request rpc-gateway check
+        if: ${{ needs.hygiene.outputs.job_rust_rpc_gateway == 'true' && github.event_name == 'pull_request' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo fmt --check --manifest-path rpc-gateway/Cargo.toml
+          cargo check --locked --manifest-path rpc-gateway/Cargo.toml --all-targets
+
+      - name: Verify rpc-gateway on exact main
+        if: ${{ needs.hygiene.outputs.job_rust_rpc_gateway == 'true' && github.event_name != 'pull_request' }}
         shell: bash
         run: |
           set -euo pipefail
@@ -269,6 +395,7 @@ jobs:
 
   rust-recorder:
     name: rust-recorder
+    needs: hygiene
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     services:
@@ -286,12 +413,28 @@ jobs:
           --health-timeout 3s
           --health-retries 10
     steps:
+      - name: Record deterministic no-op
+        if: ${{ needs.hygiene.outputs.job_rust_recorder != 'true' }}
+        run: echo "rust-recorder is unaffected by the canonical change-impact plan."
+
       - name: Checkout
+        if: ${{ needs.hygiene.outputs.job_rust_recorder == 'true' }}
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
       - name: Install Rust components
+        if: ${{ needs.hygiene.outputs.job_rust_recorder == 'true' }}
         shell: bash
         run: rustup toolchain install stable --profile minimal --component rustfmt,clippy
-      - name: Verify recorder
+
+      - name: Focused pull-request recorder check
+        if: ${{ needs.hygiene.outputs.job_rust_recorder == 'true' && github.event_name == 'pull_request' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo fmt --check --manifest-path recorder/Cargo.toml
+          cargo check --locked --manifest-path recorder/Cargo.toml --all-targets
+
+      - name: Verify recorder on exact main
+        if: ${{ needs.hygiene.outputs.job_rust_recorder == 'true' && github.event_name != 'pull_request' }}
         shell: bash
         run: |
           set -euo pipefail
@@ -311,15 +454,32 @@ jobs:
 
   rust-replay:
     name: rust-replay
+    needs: hygiene
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
+      - name: Record deterministic no-op
+        if: ${{ needs.hygiene.outputs.job_rust_replay != 'true' }}
+        run: echo "rust-replay is unaffected by the canonical change-impact plan."
+
       - name: Checkout
+        if: ${{ needs.hygiene.outputs.job_rust_replay == 'true' }}
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
       - name: Install Rust components
+        if: ${{ needs.hygiene.outputs.job_rust_replay == 'true' }}
         shell: bash
         run: rustup toolchain install stable --profile minimal --component rustfmt,clippy
-      - name: Verify replay
+
+      - name: Focused pull-request replay check
+        if: ${{ needs.hygiene.outputs.job_rust_replay == 'true' && github.event_name == 'pull_request' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo fmt --check --manifest-path replay/Cargo.toml
+          cargo check --locked --manifest-path replay/Cargo.toml --all-targets
+
+      - name: Verify replay on exact main
+        if: ${{ needs.hygiene.outputs.job_rust_replay == 'true' && github.event_name != 'pull_request' }}
         shell: bash
         run: |
           set -euo pipefail
@@ -329,6 +489,7 @@ jobs:
 
   rust-fork-sandbox:
     name: rust-fork-sandbox
+    needs: hygiene
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     services:
@@ -350,18 +511,36 @@ jobs:
           --health-timeout 3s
           --health-retries 10
     steps:
+      - name: Record deterministic no-op
+        if: ${{ needs.hygiene.outputs.job_rust_fork_sandbox != 'true' }}
+        run: echo "rust-fork-sandbox is unaffected by the canonical change-impact plan."
+
       - name: Checkout
+        if: ${{ needs.hygiene.outputs.job_rust_fork_sandbox == 'true' }}
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
       - name: Install Rust components
+        if: ${{ needs.hygiene.outputs.job_rust_fork_sandbox == 'true' }}
         shell: bash
         run: |
           rustup toolchain install stable --profile minimal --component rustfmt,clippy
           rustup toolchain install 1.79.0 --profile minimal --component rustfmt,clippy
       - name: Install Foundry
+        if: ${{ needs.hygiene.outputs.job_rust_fork_sandbox == 'true' && github.event_name != 'pull_request' }}
         uses: foundry-rs/foundry-toolchain@b00af27efadbc7b4ca8b82abbd903b17cc874d2a
         with:
           version: stable
-      - name: Verify isolated fork sandbox
+      - name: Focused pull-request fork and executor check
+        if: ${{ needs.hygiene.outputs.job_rust_fork_sandbox == 'true' && github.event_name == 'pull_request' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo fmt --check --manifest-path fork-sandbox/Cargo.toml
+          cargo check --locked --manifest-path fork-sandbox/Cargo.toml --all-targets
+          cargo +1.79.0 fmt --check --manifest-path live-executor/Cargo.toml
+          cargo +1.79.0 check --locked --manifest-path live-executor/Cargo.toml --all-targets
+
+      - name: Verify isolated fork sandbox on exact main
+        if: ${{ needs.hygiene.outputs.job_rust_fork_sandbox == 'true' && github.event_name != 'pull_request' }}
         shell: bash
         env:
           PHOENIX_TEST_POSTGRES_DSN: postgres://phoenix_fork_test:phoenix_fork_test_password@127.0.0.1:5432/phoenix_fork_test
@@ -381,16 +560,29 @@ jobs:
 
   solidity:
     name: solidity
+    needs: hygiene
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
+      - name: Record deterministic no-op
+        if: ${{ needs.hygiene.outputs.job_solidity != 'true' }}
+        run: echo "solidity is unaffected by the canonical change-impact plan."
+
       - name: Checkout
+        if: ${{ needs.hygiene.outputs.job_solidity == 'true' }}
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
       - name: Install Foundry
+        if: ${{ needs.hygiene.outputs.job_solidity == 'true' }}
         uses: foundry-rs/foundry-toolchain@b00af27efadbc7b4ca8b82abbd903b17cc874d2a
         with:
           version: stable
-      - name: Verify contracts
+      - name: Focused pull-request contract format
+        if: ${{ needs.hygiene.outputs.job_solidity == 'true' && github.event_name == 'pull_request' }}
+        shell: bash
+        run: forge fmt --check --root contracts
+
+      - name: Verify contracts on exact main
+        if: ${{ needs.hygiene.outputs.job_solidity == 'true' && github.event_name != 'pull_request' }}
         shell: bash
         run: |
           set -euo pipefail
@@ -401,18 +593,38 @@ jobs:
 
   python-dashboard:
     name: python-dashboard
+    needs: hygiene
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
+      - name: Record deterministic no-op
+        if: ${{ needs.hygiene.outputs.job_python_dashboard != 'true' }}
+        run: echo "python-dashboard is unaffected by the canonical change-impact plan."
+
       - name: Checkout
+        if: ${{ needs.hygiene.outputs.job_python_dashboard == 'true' }}
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
       - name: Setup Python
+        if: ${{ needs.hygiene.outputs.job_python_dashboard == 'true' }}
         uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
         with:
           python-version: "3.12"
           cache: pip
           cache-dependency-path: dashboard/requirements.txt
-      - name: Verify dashboard
+      - name: Focused pull-request dashboard syntax
+        if: ${{ needs.hygiene.outputs.job_python_dashboard == 'true' && github.event_name == 'pull_request' }}
+        shell: bash
+        run: |
+          python -m py_compile \
+            dashboard/app.py \
+            dashboard/snapshot_model.py \
+            scripts/prelive_dashboard_snapshot.py \
+            scripts/prelive_dashboard_live.py \
+            scripts/prelive_shadow_control.py \
+            scripts/verify_dashboard_compose.py
+
+      - name: Verify dashboard on exact main
+        if: ${{ needs.hygiene.outputs.job_python_dashboard == 'true' && github.event_name != 'pull_request' }}
         shell: bash
         run: |
           set -euo pipefail
@@ -429,14 +641,48 @@ jobs:
 
   docker-validation:
     name: docker-validation
+    needs: hygiene
     runs-on: ubuntu-24.04
     timeout-minutes: 25
     steps:
+      - name: Record deterministic no-op
+        if: ${{ needs.hygiene.outputs.job_docker_validation != 'true' }}
+        run: echo "docker-validation is unaffected by the canonical change-impact plan."
+
       - name: Checkout
+        if: ${{ needs.hygiene.outputs.job_docker_validation == 'true' }}
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
       - name: Setup Docker Buildx
+        if: ${{ needs.hygiene.outputs.job_docker_validation == 'true' && needs.hygiene.outputs.built_images != '[]' }}
         uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f
+
+      - name: Validate affected Dockerfiles without building
+        if: ${{ needs.hygiene.outputs.job_docker_validation == 'true' && github.event_name == 'pull_request' && needs.hygiene.outputs.built_images != '[]' }}
+        shell: bash
+        env:
+          BUILT_IMAGES: ${{ needs.hygiene.outputs.built_images }}
+        run: |
+          set -euo pipefail
+          while IFS= read -r component; do
+            context="$(jq -r .context <<<"$component")"
+            dockerfile="$(jq -r .dockerfile <<<"$component")"
+            command=(docker buildx build --check -f "$dockerfile")
+            while IFS= read -r build_arg; do
+              command+=(--build-arg "$build_arg")
+            done < <(
+              jq -r \
+                '.build_args | select(length > 0) | split("\n")[]' \
+                <<<"$component"
+            )
+            "${command[@]}" "$context"
+          done < <(
+            python3 scripts/release_components.py build-matrix |
+              jq -c --argjson built "$BUILT_IMAGES" \
+                '.include[] | select(.image as $name | $built | index($name))'
+          )
+
       - name: Validate Compose files
+        if: ${{ needs.hygiene.outputs.job_docker_validation == 'true' && needs.hygiene.outputs.docker_static == 'true' }}
         shell: bash
         run: |
           set -euo pipefail
@@ -643,27 +889,39 @@ jobs:
             --metadata-output "$PWD/.ci-live-render-metadata.json" >/dev/null
 
       - name: Validate Compose route registry preservation
+        if: ${{ needs.hygiene.outputs.job_docker_validation == 'true' && needs.hygiene.outputs.docker_static == 'true' }}
         shell: bash
         run: |
           set -euo pipefail
           sh ./scripts/compose-route-registry-tests.sh
 
       - name: Validate NATS JetStream configuration
+        if: ${{ needs.hygiene.outputs.job_docker_validation == 'true' && needs.hygiene.outputs.docker_static == 'true' }}
         shell: bash
         run: |
           set -euo pipefail
           docker run --rm \
             -v "$PWD/deploy/nats-server.conf:/etc/nats/nats-server.conf:ro" \
             nats@sha256:b83efabe3e7def1e0a4a31ec6e078999bb17c80363f881df35edc70fcb6bb927 -t -c /etc/nats/nats-server.conf
-      - name: Build Phoenix-owned Dockerfiles
+      - name: Build affected Phoenix-owned Dockerfiles once on exact main
+        if: ${{ needs.hygiene.outputs.job_docker_validation == 'true' && github.event_name != 'pull_request' && needs.hygiene.outputs.built_images != '[]' }}
         shell: bash
+        env:
+          BUILT_IMAGES: ${{ needs.hygiene.outputs.built_images }}
         run: |
           set -euo pipefail
           while IFS= read -r component; do
             image="$(jq -r .image <<<"$component")"
             context="$(jq -r .context <<<"$component")"
             dockerfile="$(jq -r .dockerfile <<<"$component")"
-            command=(docker buildx build --load -f "$dockerfile" -t "phoenix/$image:ci")
+            command=(
+              docker buildx build
+              --load
+              --cache-from "type=gha,scope=$image"
+              --cache-to "type=gha,mode=max,scope=$image"
+              -f "$dockerfile"
+              -t "phoenix/$image:ci"
+            )
             while IFS= read -r build_arg; do
               command+=(--build-arg "$build_arg")
             done < <(jq -r '.build_args | select(length > 0) | split("\n")[]' <<<"$component")
@@ -672,19 +930,31 @@ jobs:
               sh scripts/verify-image-runtime.sh \
                 "$image" "phoenix/$image:ci" ""
             fi
-          done < <(python3 scripts/release_components.py build-matrix | jq -c '.include[]')
+          done < <(
+            python3 scripts/release_components.py build-matrix |
+              jq -c --argjson built "$BUILT_IMAGES" \
+                '.include[] | select(.image as $name | $built | index($name))'
+          )
 
   integration-fixtures:
     name: integration-fixtures
+    needs: hygiene
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
+      - name: Record deterministic no-op
+        if: ${{ needs.hygiene.outputs.job_integration_fixtures != 'true' || github.event_name == 'pull_request' }}
+        run: echo "integration fixtures run only once for affected exact-main changes."
+
       - name: Checkout
+        if: ${{ needs.hygiene.outputs.job_integration_fixtures == 'true' && github.event_name != 'pull_request' }}
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
       - name: Install Rust components
+        if: ${{ needs.hygiene.outputs.job_integration_fixtures == 'true' && github.event_name != 'pull_request' }}
         shell: bash
         run: rustup toolchain install stable --profile minimal --component rustfmt,clippy
       - name: Run deterministic fixture checks
+        if: ${{ needs.hygiene.outputs.job_integration_fixtures == 'true' && github.event_name != 'pull_request' }}
         shell: bash
         run: |
           set -euo pipefail
@@ -695,12 +965,19 @@ jobs:
 
   jetstream-integration:
     name: jetstream-integration
+    needs: hygiene
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
+      - name: Record deterministic no-op
+        if: ${{ needs.hygiene.outputs.job_jetstream_integration != 'true' || github.event_name == 'pull_request' }}
+        run: echo "JetStream integration runs only once for affected exact-main changes."
+
       - name: Checkout
+        if: ${{ needs.hygiene.outputs.job_jetstream_integration == 'true' && github.event_name != 'pull_request' }}
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
       - name: Setup Go
+        if: ${{ needs.hygiene.outputs.job_jetstream_integration == 'true' && github.event_name != 'pull_request' }}
         uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff
         with:
           go-version-file: feed-ingestor/go.mod
@@ -709,9 +986,11 @@ jobs:
             feed-ingestor/go.sum
             migration-runner/go.sum
       - name: Install Rust components
+        if: ${{ needs.hygiene.outputs.job_jetstream_integration == 'true' && github.event_name != 'pull_request' }}
         shell: bash
         run: rustup toolchain install stable --profile minimal
       - name: Verify durable JetStream publication and consumption
+        if: ${{ needs.hygiene.outputs.job_jetstream_integration == 'true' && github.event_name != 'pull_request' }}
         shell: bash
         run: |
           set -euo pipefail

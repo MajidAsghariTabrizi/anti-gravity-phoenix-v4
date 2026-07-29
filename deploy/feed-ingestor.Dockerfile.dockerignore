@@ -1,0 +1,11 @@
+**
+!feed-ingestor/
+!feed-ingestor/**
+!migration-runner/
+!migration-runner/**
+!fixtures/
+!fixtures/**
+!migrations/
+!migrations/**
+!deploy/
+!deploy/feed-ingestor.Dockerfile

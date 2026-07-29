@@ -1,8 +1,14 @@
 .git
 .github
+.codex
 .env
 .env.local
 .env.*.local
+*.md
+docs/
+scripts/tests/
+**/tests/
+**/.pytest_cache/
 *.pem
 *.key
 *.pfx

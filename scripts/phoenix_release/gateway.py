@@ -297,6 +297,7 @@ def receive_package(
     package = stream.read(MAX_PACKAGE_BYTES + 1)
     if not package or len(package) > MAX_PACKAGE_BYTES:
         raise GatewayError("PACKAGE_SIZE_INVALID")
+    package_digest = f"sha256:{hashlib.sha256(package).hexdigest()}"
     with tempfile.TemporaryDirectory(prefix=".receive.", dir=paths.incoming) as temporary:
         staging = Path(temporary)
         try:
@@ -368,8 +369,20 @@ def receive_package(
         if destination.exists() or destination.is_symlink():
             existing_request = _read_json(destination / "request.json", 64 * 1024)
             if validate_request(existing_request) == request:
+                existing_state = load_state(
+                    state_file(paths, request["release_sha"])
+                )
+                existing_package = destination / "release-package.tar.gz"
+                if (
+                    existing_state["package_digest"] != package_digest
+                    or not existing_package.is_file()
+                    or existing_package.is_symlink()
+                    or sha256_file(existing_package) != package_digest
+                ):
+                    raise GatewayError("PACKAGE_IDENTITY_MISMATCH")
                 return request
             raise GatewayError("PACKAGE_ALREADY_EXISTS")
+        _atomic_bytes(staging / "release-package.tar.gz", package)
         os.chmod(staging, 0o700)
         os.replace(staging, destination)
         state_path = state_file(paths, request["release_sha"])
@@ -381,6 +394,7 @@ def receive_package(
             build_run_id=request["build_run_id"],
             deploy_run_id=request["deploy_run_id"],
             deploy_run_attempt=request["deploy_run_attempt"],
+            package_digest=package_digest,
         )
         atomic_write(state_path, state)
         return request
@@ -1768,11 +1782,16 @@ def retry_pre_mutation(paths: HostPaths, release_sha: str) -> dict[str, Any]:
     expected_images = _verify_evidence(paths, request)
     if expected_images != state["expected_images"]:
         raise GatewayError("PRE_MUTATION_RETRY_IMAGE_EVIDENCE_MISMATCH")
+    package_path = root / "release-package.tar.gz"
     if (
         sha256_file(root / "release-manifest.json")
         != state["release_manifest_digest"]
         or sha256_file(root / f"phoenix-release-assets-{release_sha}.tar.gz")
         != state["release_assets_digest"]
+        or not package_path.is_file()
+        or package_path.is_symlink()
+        or state["package_digest"] is None
+        or sha256_file(package_path) != state["package_digest"]
     ):
         raise GatewayError("PRE_MUTATION_RETRY_BUILD_EVIDENCE_MISMATCH")
 
@@ -1842,11 +1861,16 @@ def retry_rolled_back(paths: HostPaths, release_sha: str) -> dict[str, Any]:
     root = paths.incoming / release_sha
     if _verify_evidence(paths, request) != state["expected_images"]:
         raise GatewayError("ROLLED_BACK_RETRY_IMAGE_EVIDENCE_MISMATCH")
+    package_path = root / "release-package.tar.gz"
     if (
         sha256_file(root / "release-manifest.json")
         != state["release_manifest_digest"]
         or sha256_file(root / f"phoenix-release-assets-{release_sha}.tar.gz")
         != state["release_assets_digest"]
+        or not package_path.is_file()
+        or package_path.is_symlink()
+        or state["package_digest"] is None
+        or sha256_file(package_path) != state["package_digest"]
     ):
         raise GatewayError("ROLLED_BACK_RETRY_PACKAGE_EVIDENCE_MISMATCH")
 

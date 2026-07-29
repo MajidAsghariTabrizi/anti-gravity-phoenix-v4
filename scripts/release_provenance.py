@@ -27,6 +27,7 @@ LEGACY_PROVENANCE_SCHEMA = "phoenix.release-provenance.v1"
 LEGACY_INHERITED_PROVENANCE_SCHEMA = "phoenix.release-provenance.v2"
 PROVENANCE_SCHEMA = "phoenix.release-provenance.v3"
 INHERITED_PROVENANCE_SCHEMA = "phoenix.release-provenance.v4"
+SELECTIVE_INHERITED_PROVENANCE_SCHEMA = "phoenix.release-provenance.v5"
 SOURCE_CI_SCHEMA = "phoenix.source-ci.v1"
 RUN_EVIDENCE_SCHEMA = "phoenix.build-run-evidence.v1"
 FRAGMENT_SCHEMA = "phoenix.release-fragment.v1"
@@ -38,7 +39,7 @@ WORKFLOW = "Build Phoenix Images"
 WORKFLOW_PATH = ".github/workflows/build-images.yml"
 CONTROLLER_WORKFLOW = "Phoenix Release Controller"
 CONTROLLER_WORKFLOW_PATH = ".github/workflows/phoenix-release-controller.yml"
-CONTROLLER_EVENTS = ("workflow_run", "workflow_dispatch", "schedule")
+CONTROLLER_EVENTS = ("workflow_run", "workflow_dispatch")
 RELEASE_INTENT = "PHOENIX_PRELIVE_SHADOW_V5"
 PUBLISH_CONFIRMATION = "PUBLISH_IMMUTABLE_PHOENIX_IMAGES"
 QUARANTINED_RUNS = {
@@ -159,6 +160,41 @@ def _validate_repository(value: object, name: str, label: str) -> str:
     if value != expected:
         raise ReleaseProvenanceError(f"{label} is invalid for {name}")
     return expected
+
+
+def _image_partition(
+    built_images: list[str] | tuple[str, ...] | None = None,
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    built = BUILT_IMAGES if built_images is None else tuple(built_images)
+    if (
+        len(built) != len(set(built))
+        or any(name not in EXPECTED_IMAGES for name in built)
+    ):
+        raise ReleaseProvenanceError("built image selection is invalid")
+    built_set = set(built)
+    normalized_built = tuple(
+        name for name in EXPECTED_IMAGES if name in built_set
+    )
+    inherited = tuple(
+        name for name in EXPECTED_IMAGES if name not in built_set
+    )
+    return normalized_built, inherited
+
+
+def _parse_image_list(value: str | None, label: str) -> list[str] | None:
+    if value is None:
+        return None
+    try:
+        parsed = json.loads(value)
+    except json.JSONDecodeError as exc:
+        raise ReleaseProvenanceError(f"{label} is invalid JSON") from exc
+    if (
+        not isinstance(parsed, list)
+        or len(parsed) != len(set(parsed))
+        or any(not isinstance(name, str) for name in parsed)
+    ):
+        raise ReleaseProvenanceError(f"{label} is invalid")
+    return parsed
 
 
 def _validate_release_request(
@@ -493,16 +529,19 @@ def _validate_inherited_manifest(
             raise ReleaseProvenanceError(f"release manifest tag is invalid for {name}")
         if image["oci_revision"] != source_sha:
             raise ReleaseProvenanceError(f"OCI revision is invalid for {name}")
-        if name in PROTECTED_IMAGES:
-            if image["origin"] != "inherited":
-                raise ReleaseProvenanceError(f"protected image origin is invalid for {name}")
-        elif (
-            image["origin"] != "built"
-            or source_sha != expected_sha
-            or source_run_id != run_id
-        ):
+        if image["origin"] == "built":
+            if source_sha != expected_sha or source_run_id != run_id:
+                raise ReleaseProvenanceError(
+                    f"built image is not bound to release SHA for {name}"
+                )
+        elif image["origin"] == "inherited":
+            if source_sha == expected_sha and source_run_id == run_id:
+                raise ReleaseProvenanceError(
+                    f"inherited image is incorrectly bound to candidate for {name}"
+                )
+        else:
             raise ReleaseProvenanceError(
-                f"non-protected image is not bound to release SHA for {name}"
+                f"release manifest image origin is invalid for {name}"
             )
     # Keep these local variables validated and visible to type checkers.
     _ = base_run_id
@@ -582,6 +621,7 @@ def _load_fragments(
     release_intent: str,
     protected_base_sha: str = "",
     protected_base_build_run_id: str = "",
+    inherited_images: tuple[str, ...] = PROTECTED_IMAGES,
 ) -> tuple[dict[str, dict[str, str]], dict[str, dict[str, str]]]:
     if directory.is_symlink() or not directory.is_dir():
         raise ReleaseProvenanceError("fragment directory is invalid")
@@ -595,7 +635,7 @@ def _load_fragments(
     evidence: dict[str, dict[str, str]] = {}
     for path in paths:
         name = path.stem
-        if inherited and name in PROTECTED_IMAGES:
+        if inherited and name in inherited_images:
             fragment = _require_keys(
                 _read_json(path, f"release fragment {path.name}"),
                 {
@@ -731,6 +771,7 @@ def write_inherited_fragments(
     protected_base_build_run_id: str,
     protected_base_manifest: Path,
     protected_base_provenance: Path,
+    inherited_images: list[str] | tuple[str, ...] | None = None,
 ) -> None:
     _validate_release_request(
         release_sha,
@@ -747,8 +788,22 @@ def write_inherited_fragments(
         protected_base_sha,
         protected_base_build_run_id,
     )
+    if inherited_images is None:
+        selected = PROTECTED_IMAGES
+    else:
+        if (
+            len(inherited_images) != len(set(inherited_images))
+            or any(name not in EXPECTED_IMAGES for name in inherited_images)
+        ):
+            raise ReleaseProvenanceError(
+                "inherited image selection is invalid"
+            )
+        built = [
+            name for name in EXPECTED_IMAGES if name not in set(inherited_images)
+        ]
+        _, selected = _image_partition(built)
     output_dir.mkdir(parents=True, exist_ok=True)
-    for name in PROTECTED_IMAGES:
+    for name in selected:
         identity = _normalized_image_identity(
             base_manifest, name, protected_base_build_run_id
         )
@@ -780,6 +835,7 @@ def assemble_release(
     protected_base_build_run_id: str = "",
     protected_base_manifest: Path | None = None,
     protected_base_provenance: Path | None = None,
+    built_images: list[str] | tuple[str, ...] | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     _validate_release_request(
         release_sha,
@@ -795,6 +851,16 @@ def assemble_release(
     if inherited != bool(protected_base_manifest and protected_base_provenance):
         raise ReleaseProvenanceError(
             "protected base manifest and provenance are required together"
+        )
+    if built_images is None and not inherited:
+        selected_built, selected_inherited = EXPECTED_IMAGES, ()
+    else:
+        selected_built, selected_inherited = _image_partition(built_images)
+    if not inherited and (
+        selected_built != EXPECTED_IMAGES or selected_inherited
+    ):
+        raise ReleaseProvenanceError(
+            "selective image build requires a reviewed base release"
         )
 
     base_manifest: dict[str, Any] | None = None
@@ -815,10 +881,11 @@ def assemble_release(
         release_intent,
         protected_base_sha,
         protected_base_build_run_id,
+        selected_inherited,
     )
 
     if base_manifest is not None:
-        for name in PROTECTED_IMAGES:
+        for name in selected_inherited:
             inherited_identity = {
                 key: images[name][key]
                 for key in (
@@ -835,7 +902,7 @@ def assemble_release(
             )
             if inherited_identity != base_identity:
                 raise ReleaseProvenanceError(
-                    f"inherited protected image differs from base for {name}"
+                    f"inherited image differs from base for {name}"
                 )
 
     archive = release_assets_dir / f"phoenix-release-assets-{release_sha}.tar.gz"
@@ -865,7 +932,13 @@ def assemble_release(
     manifest_bytes = _canonical_json(manifest)
 
     provenance: dict[str, Any] = {
-        "schema": INHERITED_PROVENANCE_SCHEMA if inherited else PROVENANCE_SCHEMA,
+        "schema": (
+            SELECTIVE_INHERITED_PROVENANCE_SCHEMA
+            if inherited and built_images is not None
+            else INHERITED_PROVENANCE_SCHEMA
+            if inherited
+            else PROVENANCE_SCHEMA
+        ),
         "repository": REPOSITORY,
         "workflow": WORKFLOW,
         "release_sha": release_sha,
@@ -903,8 +976,8 @@ def assemble_release(
                         protected_base_provenance
                     ),
                 },
-                "built_images": list(BUILT_IMAGES),
-                "inherited_images": list(PROTECTED_IMAGES),
+                "built_images": list(selected_built),
+                "inherited_images": list(selected_inherited),
             }
         )
     output_manifest.parent.mkdir(parents=True, exist_ok=True)
@@ -1016,6 +1089,7 @@ def validate_provenance(
     inherited = schema in {
         LEGACY_INHERITED_PROVENANCE_SCHEMA,
         INHERITED_PROVENANCE_SCHEMA,
+        SELECTIVE_INHERITED_PROVENANCE_SCHEMA,
     }
     if legacy and not allow_legacy:
         raise ReleaseProvenanceError(
@@ -1026,6 +1100,7 @@ def validate_provenance(
         LEGACY_INHERITED_PROVENANCE_SCHEMA,
         PROVENANCE_SCHEMA,
         INHERITED_PROVENANCE_SCHEMA,
+        SELECTIVE_INHERITED_PROVENANCE_SCHEMA,
     }:
         raise ReleaseProvenanceError("release provenance schema is invalid")
     expected_keys = common_keys | (inherited_keys if inherited else set())
@@ -1068,10 +1143,30 @@ def validate_provenance(
         or base["build_run_id"] != manifest["protected_base_build_run_id"]
     ):
         raise ReleaseProvenanceError("protected base evidence identity is invalid")
-    if provenance["built_images"] != list(BUILT_IMAGES):
+    if schema == INHERITED_PROVENANCE_SCHEMA:
+        expected_built, expected_inherited = BUILT_IMAGES, PROTECTED_IMAGES
+    else:
+        raw_built = provenance["built_images"]
+        raw_inherited = provenance["inherited_images"]
+        if not isinstance(raw_built, list) or not isinstance(
+            raw_inherited, list
+        ):
+            raise ReleaseProvenanceError("image partition is invalid")
+        expected_built, expected_inherited = _image_partition(raw_built)
+        if raw_inherited != list(expected_inherited):
+            raise ReleaseProvenanceError("inherited image contract is invalid")
+    if provenance["built_images"] != list(expected_built):
         raise ReleaseProvenanceError("built image contract is invalid")
-    if provenance["inherited_images"] != list(PROTECTED_IMAGES):
+    if provenance["inherited_images"] != list(expected_inherited):
         raise ReleaseProvenanceError("inherited image contract is invalid")
+    for name in EXPECTED_IMAGES:
+        expected_origin = (
+            "built" if name in expected_built else "inherited"
+        )
+        if manifest["images"][name]["origin"] != expected_origin:
+            raise ReleaseProvenanceError(
+                f"image origin does not match partition for {name}"
+            )
     return provenance
 
 
@@ -1232,7 +1327,7 @@ def validate_deploy_pair(
             raise ReleaseProvenanceError(
                 "rollback provenance hash differs from protected base"
             )
-        for name in PROTECTED_IMAGES:
+        for name in candidate_provenance["inherited_images"]:
             candidate_identity = _normalized_image_identity(
                 candidate_manifest, name, candidate_run_id
             )
@@ -1241,7 +1336,7 @@ def validate_deploy_pair(
             )
             if candidate_identity != rollback_identity:
                 raise ReleaseProvenanceError(
-                    f"inherited protected image differs from rollback for {name}"
+                    f"inherited image differs from rollback for {name}"
                 )
         return
 
@@ -1301,6 +1396,7 @@ def _parser() -> argparse.ArgumentParser:
     inherit.add_argument("--protected-base-build-run-id", required=True)
     inherit.add_argument("--protected-base-manifest", type=Path, required=True)
     inherit.add_argument("--protected-base-provenance", type=Path, required=True)
+    inherit.add_argument("--inherited-images-json")
 
     assemble = subparsers.add_parser("assemble")
     assemble.add_argument("--fragments-dir", type=Path, required=True)
@@ -1315,6 +1411,7 @@ def _parser() -> argparse.ArgumentParser:
     assemble.add_argument("--protected-base-build-run-id", default="")
     assemble.add_argument("--protected-base-manifest", type=Path)
     assemble.add_argument("--protected-base-provenance", type=Path)
+    assemble.add_argument("--built-images-json")
 
     canonical = subparsers.add_parser("validate-canonical")
     canonical.add_argument("--release-manifest", type=Path, required=True)
@@ -1380,6 +1477,9 @@ def main() -> None:
                 args.protected_base_build_run_id,
                 args.protected_base_manifest,
                 args.protected_base_provenance,
+                _parse_image_list(
+                    args.inherited_images_json, "inherited image selection"
+                ),
             )
         elif args.command == "assemble":
             assemble_release(
@@ -1395,6 +1495,9 @@ def main() -> None:
                 protected_base_build_run_id=args.protected_base_build_run_id,
                 protected_base_manifest=args.protected_base_manifest,
                 protected_base_provenance=args.protected_base_provenance,
+                built_images=_parse_image_list(
+                    args.built_images_json, "built image selection"
+                ),
             )
         elif args.command == "validate-canonical":
             manifest = _read_json(args.release_manifest, "release manifest")

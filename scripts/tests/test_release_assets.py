@@ -89,6 +89,7 @@ class ReleaseAssetsTests(unittest.TestCase):
             self.assertIn("scripts/prelive-v5-fresh-database-gate.sh", paths)
             self.assertIn("scripts/prelive_v5_release.py", paths)
             self.assertIn("scripts/release_provenance.py", paths)
+            self.assertIn("scripts/change_impact.py", paths)
             self.assertIn("scripts/release_components.py", paths)
             self.assertIn("deploy/prelive-v5-release.example.json", paths)
             self.assertIn("schemas/phoenix-release-manifest.schema.json", paths)

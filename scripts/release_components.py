@@ -207,8 +207,19 @@ def load_registry(path: Path | None = None) -> dict[str, Any]:
     return value
 
 
-def build_matrix(registry: dict[str, Any] | None = None) -> dict[str, list[dict[str, Any]]]:
+def build_matrix(
+    registry: dict[str, Any] | None = None,
+    built_images: set[str] | None = None,
+) -> dict[str, list[dict[str, Any]]]:
     value = registry or REGISTRY
+    component_names = {
+        component["name"]
+        for component in value["components"]
+        if component["release_included"]
+    }
+    selected = component_names if built_images is None else set(built_images)
+    if not selected <= component_names:
+        raise ReleaseComponentError("build matrix contains an unknown image")
     include = []
     for component in value["components"]:
         if not component["release_included"]:
@@ -225,6 +236,7 @@ def build_matrix(registry: dict[str, Any] | None = None) -> dict[str, list[dict[
                 ),
                 "protected": component["protected"],
                 "live_canary_only": component["live_canary_only"],
+                "build": component["name"] in selected,
             }
         )
     return {"include": include}
@@ -271,9 +283,31 @@ REGISTRY_SHA256 = "sha256:" + hashlib.sha256(REGISTRY_PATH.read_bytes()).hexdige
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("command", choices=("validate", "build-matrix"))
+    parser.add_argument("--built-images-json")
     args = parser.parse_args()
     if args.command == "build-matrix":
-        print(json.dumps(build_matrix(), sort_keys=True, separators=(",", ":")))
+        selected = None
+        if args.built_images_json is not None:
+            try:
+                raw = json.loads(args.built_images_json)
+            except json.JSONDecodeError as exc:
+                raise ReleaseComponentError(
+                    "built image selection is invalid JSON"
+                ) from exc
+            if (
+                not isinstance(raw, list)
+                or len(raw) != len(set(raw))
+                or any(not isinstance(item, str) for item in raw)
+            ):
+                raise ReleaseComponentError("built image selection is invalid")
+            selected = set(raw)
+        print(
+            json.dumps(
+                build_matrix(built_images=selected),
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+        )
     else:
         print("RELEASE_COMPONENTS_OK")
 

@@ -1,6 +1,7 @@
 FROM golang:1.23-alpine AS feed-build
 WORKDIR /src/feed-ingestor
-COPY feed-ingestor/go.mod ./
+COPY feed-ingestor/go.mod feed-ingestor/go.sum ./
+RUN go mod download
 COPY feed-ingestor ./
 COPY fixtures /src/fixtures
 RUN go test ./...

@@ -131,7 +131,7 @@ class ReleaseProvenanceTests(unittest.TestCase):
             )
         return manifest, provenance, manifest_path, provenance_path
 
-    def _assemble_inherited(self):
+    def _assemble_inherited(self, built_images=None):
         base = self._build_full_release(self.root / "base", BASE_SHA, BASE_RUN_ID)
         base_manifest, base_provenance, base_manifest_path, base_provenance_path = base
         release_provenance.write_inherited_fragments(
@@ -143,6 +143,15 @@ class ReleaseProvenanceTests(unittest.TestCase):
             BASE_RUN_ID,
             base_manifest_path,
             base_provenance_path,
+            (
+                None
+                if built_images is None
+                else [
+                    name
+                    for name in release_provenance.EXPECTED_IMAGES
+                    if name not in set(built_images)
+                ]
+            ),
         )
         manifest_path = self.root / "inherited-release-manifest.json"
         provenance_path = self.root / "inherited-release-provenance.json"
@@ -163,6 +172,7 @@ class ReleaseProvenanceTests(unittest.TestCase):
                 protected_base_build_run_id=BASE_RUN_ID,
                 protected_base_manifest=base_manifest_path,
                 protected_base_provenance=base_provenance_path,
+                built_images=built_images,
             )
         return (
             manifest,
@@ -352,6 +362,36 @@ class ReleaseProvenanceTests(unittest.TestCase):
             references["recorder"],
             f"{base_manifest['images']['recorder']['repository']}@"
             f"{base_manifest['images']['recorder']['digest']}",
+        )
+
+    def test_release_only_plan_inherits_all_seven_images(self) -> None:
+        (
+            manifest,
+            provenance,
+            _,
+            _,
+            base_manifest,
+            _,
+            _,
+            _,
+        ) = self._assemble_inherited(built_images=[])
+        self.assertEqual(
+            provenance["schema"],
+            release_provenance.SELECTIVE_INHERITED_PROVENANCE_SCHEMA,
+        )
+        self.assertEqual(provenance["built_images"], [])
+        self.assertEqual(
+            provenance["inherited_images"],
+            list(release_provenance.EXPECTED_IMAGES),
+        )
+        for name in release_provenance.EXPECTED_IMAGES:
+            self.assertEqual(manifest["images"][name]["origin"], "inherited")
+            self.assertEqual(
+                manifest["images"][name]["digest"],
+                base_manifest["images"][name]["digest"],
+            )
+        release_provenance.validate_canonical_run(
+            provenance, manifest, self._run_evidence()
         )
 
     def test_protected_base_dispatch_inputs_are_atomic(self) -> None:
@@ -912,11 +952,16 @@ class ReleaseProvenanceTests(unittest.TestCase):
         self.assertIn("validate-github-run", workflow)
         self.assertIn("inherit-protected", workflow)
         self.assertGreaterEqual(
-            workflow.count(
-                "if: ${{ inputs.protected_base_sha == '' || matrix.protected == false }}"
-            ),
+            workflow.count("if: ${{ matrix.build == true }}"),
             7,
         )
+        self.assertGreaterEqual(
+            workflow.count("if: ${{ matrix.build == false }}"),
+            3,
+        )
+        self.assertIn("scripts/change_impact.py git", workflow)
+        self.assertIn("--built-images-json", workflow)
+        self.assertIn("--inherited-images-json", workflow)
         self.assertIn(
             "run-id: ${{ inputs.protected_base_build_run_id }}", workflow
         )
@@ -967,6 +1012,7 @@ class ReleaseProvenanceTests(unittest.TestCase):
                 release_provenance.LEGACY_INHERITED_PROVENANCE_SCHEMA,
                 release_provenance.PROVENANCE_SCHEMA,
                 release_provenance.INHERITED_PROVENANCE_SCHEMA,
+                release_provenance.SELECTIVE_INHERITED_PROVENANCE_SCHEMA,
             },
         )
         self.assertEqual(
@@ -976,7 +1022,7 @@ class ReleaseProvenanceTests(unittest.TestCase):
             "29683234024",
         )
         self.assertIn("source_ci", schema["properties"])
-        self.assertEqual(len(schema["oneOf"]), 4)
+        self.assertEqual(len(schema["oneOf"]), 5)
 
         manifest_schema = json.loads(
             (

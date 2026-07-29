@@ -1,0 +1,14 @@
+**
+!rpc-gateway/
+!rpc-gateway/**
+!fork-sandbox/
+!fork-sandbox/**
+!phoenix-engine/
+!phoenix-engine/Cargo.toml
+!migrations/
+!migrations/**
+!compose.prod.yml
+!deploy/
+!deploy/fork-sandbox.Dockerfile
+**/target
+**/target/**
