@@ -1059,6 +1059,9 @@ class WorkflowAndDeploymentContractTests(unittest.TestCase):
         self.assertLess(candidate, mutation)
         self.assertLess(mutation, live_mode)
         self.assertIn("PROTECTED_SERVICE_UNAVAILABLE:", self.deploy)
+        self.assertIn(
+            'compose up -d --no-deps --force-recreate "$service"', self.deploy
+        )
 
     def test_burn_in_preserves_the_disarmed_owner_boundary(self) -> None:
         burn_start = self.deploy.index("mark_engine_burn_in_started \\")
