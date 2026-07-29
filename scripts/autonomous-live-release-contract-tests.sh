@@ -83,6 +83,11 @@ require(
     "PHOENIX_ECONOMIC_DASHBOARD_INTERVAL_SECONDS: \"45\"" in compose,
     "dashboard_refresh_interval_not_45_seconds",
 )
+require(
+    "attempt.claimed_at >= params.window_start" in dashboard_sql
+    and "attempt.created_at" not in dashboard_sql,
+    "dashboard_attempt_timestamp_invalid",
+)
 
 for required in (
     "autonomous-control migrate",
