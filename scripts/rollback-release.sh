@@ -17,8 +17,10 @@ candidate_release_assets_file="$deploy_dir/candidate-release-assets.sha"
 previous_file="$deploy_dir/previous-release"
 runtime_dir="${PHOENIX_DEPLOY_RUNTIME_DIR:-$deploy_dir/.deploy-runtime}"
 protected_services='nitro-feed-relay feed-ingestor nats postgres recorder'
+fixed_protected_services='nitro-feed-relay nats postgres'
 optional_services='prometheus rpc-gateway shadow-dispatcher phoenix-engine dashboard'
 service_wait_seconds=${PHOENIX_DEPLOY_SERVICE_WAIT_SECONDS:-300}
+recorder_drain_seconds=${PHOENIX_RECORDER_DRAIN_SECONDS:-180}
 reconciliation_seconds=${PHOENIX_ROLLBACK_RECONCILIATION_SECONDS:-180}
 
 fail() {
@@ -52,6 +54,11 @@ case "$service_wait_seconds" in
 esac
 [ "$service_wait_seconds" -ge 30 ] && [ "$service_wait_seconds" -le 900 ] ||
   fail "service wait seconds must be from 30 through 900"
+case "$recorder_drain_seconds" in
+  ''|*[!0-9]*) fail "Recorder drain seconds must be an integer" ;;
+esac
+[ "$recorder_drain_seconds" -ge 30 ] && [ "$recorder_drain_seconds" -le 900 ] ||
+  fail "Recorder drain seconds must be from 30 through 900"
 case "$reconciliation_seconds" in
   ''|*[!0-9]*) fail "reconciliation seconds must be an integer" ;;
 esac
@@ -62,6 +69,188 @@ command -v python3 >/dev/null 2>&1 || fail "python3 is unavailable"
 command -v cmp >/dev/null 2>&1 || fail "cmp is unavailable"
 mkdir -p "$runtime_dir"
 chmod 0700 "$runtime_dir"
+
+rollback_from=
+if [ -s "$current_file" ]; then
+  rollback_from=$(tr -d '\r\n' <"$current_file")
+fi
+case "$rollback_from" in
+  *[!0-9a-f]*|"") fail "active release SHA is invalid" ;;
+esac
+[ "${#rollback_from}" -eq 40 ] || fail "active release SHA is invalid"
+source_release_env="$deploy_dir/manifests/$rollback_from.env"
+[ -s "$source_release_env" ] || fail "active release environment is missing"
+
+compose_with_release_env() {
+  selected_release_env=$1
+  shift
+  python3 "$deploy_dir/production_compose.py" \
+    --mode SHADOW \
+    --env-file "$env_file" \
+    --release-env "$selected_release_env" \
+    --compose-file "$compose_file" \
+    -- "$@"
+}
+
+release_env_value() {
+  value_file=$1
+  value_name=$2
+  awk -F= -v expected="$value_name" '
+    $1 == expected {
+      print substr($0, length($1) + 2)
+      found = 1
+      exit
+    }
+    END {
+      if (!found) {
+        exit 1
+      }
+    }
+  ' "$value_file"
+}
+
+wait_service_healthy_with_env() {
+  healthy_release_env=$1
+  healthy_service=$2
+  healthy_deadline=$(( $(date +%s) + service_wait_seconds ))
+  while [ "$(date +%s)" -lt "$healthy_deadline" ]; do
+    healthy_id=$(
+      compose_with_release_env "$healthy_release_env" ps -a -q \
+        "$healthy_service" | awk 'NF { print; exit }'
+    )
+    if [ -n "$healthy_id" ]; then
+      healthy_state=$(docker inspect --format \
+        '{{.State.Status}}|{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' \
+        "$healthy_id" 2>/dev/null || true)
+      [ "$healthy_state" = 'running|healthy' ] && return 0
+    fi
+    sleep 3
+  done
+  return 1
+}
+
+wait_recorder_drain() {
+  drain_release_env=$1
+  drain_helper="$release_root/$rollback_from/scripts/prelive_protected_maintenance.py"
+  [ -f "$drain_helper" ] && [ ! -L "$drain_helper" ] || return 1
+  drain_snapshot=$(mktemp "$runtime_dir/recorder-drain.XXXXXX") || return 1
+  drain_deadline=$(( $(date +%s) + recorder_drain_seconds ))
+  while [ "$(date +%s)" -lt "$drain_deadline" ]; do
+    if compose_with_release_env "$drain_release_env" exec -T nats \
+      wget -q -O - \
+        'http://127.0.0.1:8222/jsz?streams=true&consumers=true&config=true' \
+        >"$drain_snapshot"
+    then
+      drain_state=$(
+        python3 -I -B "$drain_helper" consumer-state \
+          --jetstream "$drain_snapshot"
+      ) || drain_state=
+      drain_pending=$(printf '%s\n' "$drain_state" | awk '{ print $1 }')
+      drain_ack_pending=$(printf '%s\n' "$drain_state" | awk '{ print $2 }')
+      case "$drain_pending:$drain_ack_pending" in
+        *[!0-9:]*|:*|*:|*::*) ;;
+        *)
+          if [ "$drain_pending" -eq 0 ] && [ "$drain_ack_pending" -eq 0 ]; then
+            rm -f "$drain_snapshot"
+            return 0
+          fi
+          ;;
+      esac
+    fi
+    sleep 3
+  done
+  rm -f "$drain_snapshot"
+  return 1
+}
+
+transition_mutable_protected() {
+  source_env=$1
+  target_env=$2
+  source_feed=$(release_env_value "$source_env" FEED_INGESTOR_IMAGE) ||
+    return 1
+  target_feed=$(release_env_value "$target_env" FEED_INGESTOR_IMAGE) ||
+    return 1
+  source_recorder=$(release_env_value "$source_env" RECORDER_IMAGE) ||
+    return 1
+  target_recorder=$(release_env_value "$target_env" RECORDER_IMAGE) ||
+    return 1
+  if [ "$source_feed" = "$target_feed" ] &&
+    [ "$source_recorder" = "$target_recorder" ]
+  then
+    return 0
+  fi
+
+  transition_started_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+  compose_with_release_env "$source_env" stop -t 30 feed-ingestor >/dev/null ||
+    return 1
+  wait_recorder_drain "$source_env" || return 1
+  if [ "$source_recorder" != "$target_recorder" ]; then
+    compose_with_release_env "$target_env" up -d --no-deps \
+      --force-recreate recorder >/dev/null || return 1
+    wait_service_healthy_with_env "$target_env" recorder || return 1
+  fi
+  if [ "$source_feed" = "$target_feed" ]; then
+    compose_with_release_env "$target_env" up -d --no-deps feed-ingestor \
+      >/dev/null || return 1
+  else
+    compose_with_release_env "$target_env" up -d --no-deps \
+      --force-recreate feed-ingestor >/dev/null || return 1
+  fi
+  wait_service_healthy_with_env "$target_env" feed-ingestor || return 1
+  transition_log=$(mktemp "$runtime_dir/protected-transition.XXXXXX") ||
+    return 1
+  if ! compose_with_release_env "$target_env" logs --no-color \
+    --since "$transition_started_at" nats recorder feed-ingestor \
+    >"$transition_log" 2>&1
+  then
+    rm -f "$transition_log"
+    return 1
+  fi
+  if grep -Eiq \
+    'slow consumer|core_nats_message_drop|Core NATS delivery loss|recorder_nats_slow_consumer' \
+    "$transition_log"
+  then
+    rm -f "$transition_log"
+    return 1
+  fi
+  rm -f "$transition_log"
+  return 0
+}
+
+capture_fixed_ids() {
+  fixed_release_env=$1
+  fixed_output=$2
+  : >"$fixed_output"
+  for fixed_service in $fixed_protected_services; do
+    fixed_id=$(
+      compose_with_release_env "$fixed_release_env" ps -a -q "$fixed_service" |
+        awk 'NF { print; exit }'
+    )
+    [ -n "$fixed_id" ] || return 1
+    fixed_state=$(docker inspect --format \
+      '{{.State.Status}}|{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' \
+      "$fixed_id") || return 1
+    [ "$fixed_state" = 'running|healthy' ] || return 1
+    printf '%s\t%s\n' "$fixed_service" "$fixed_id" >>"$fixed_output"
+  done
+}
+
+state_dir=
+mutable_transition_started=0
+restore_mutable_on_failure() {
+  rollback_exit_code=$?
+  trap - EXIT
+  if [ "$rollback_exit_code" -ne 0 ] &&
+    [ "$mutable_transition_started" -eq 1 ]
+  then
+    if ! transition_mutable_protected "$release_env" "$source_release_env"; then
+      echo "ROLLBACK_RESTORE_FAILED: mutable protected services require operator attention"
+    fi
+  fi
+  [ -z "$state_dir" ] || rm -rf "$state_dir"
+  exit "$rollback_exit_code"
+}
+trap restore_mutable_on_failure EXIT
 
 current_live_compose() {
   python3 "$deploy_dir/production_compose.py" \
@@ -107,6 +296,26 @@ fi
 python3 "$deploy_dir/production_mode.py" shadow --env-file "$env_file" ||
   fail "SHADOW production mode could not be restored"
 
+python3 "$deploy_dir/production_context.py" manifest-env \
+  --manifest "$manifest" \
+  --expected-sha "$release_sha" \
+  --output "$release_env" || fail "release manifest validation failed"
+chmod 0640 "$release_env"
+fixed_identity_before=$(mktemp "$runtime_dir/fixed-before.XXXXXX") ||
+  fail "fixed protected identity evidence could not be created"
+fixed_identity_after=$(mktemp "$runtime_dir/fixed-after.XXXXXX") ||
+  fail "fixed protected identity evidence could not be created"
+capture_fixed_ids "$source_release_env" "$fixed_identity_before" ||
+  fail "fixed protected services are not ready before rollback"
+mutable_transition_started=1
+transition_mutable_protected "$source_release_env" "$release_env" ||
+  fail "mutable protected services could not roll back without loss"
+capture_fixed_ids "$release_env" "$fixed_identity_after" ||
+  fail "fixed protected services are not ready after rollback transition"
+cmp "$fixed_identity_before" "$fixed_identity_after" >/dev/null ||
+  fail "fixed protected service identity changed during rollback transition"
+rm -f "$fixed_identity_before" "$fixed_identity_after"
+
 python3 "$deploy_dir/release_assets.py" verify-tree \
   --root "$release_assets_root" \
   --manifest "$release_assets_root/release-assets-manifest.json" \
@@ -119,20 +328,10 @@ PHOENIX_ENV_FILE="$env_file" \
 [ -s "$candidate_release_assets_file" ] || fail "rollback release-assets marker is missing"
 installed_assets_sha=$(tr -d '\r\n' <"$candidate_release_assets_file")
 [ "$installed_assets_sha" = "$release_sha" ] || fail "rollback release-assets marker is invalid"
-python3 "$deploy_dir/production_context.py" manifest-env \
-  --manifest "$manifest" \
-  --expected-sha "$release_sha" \
-  --output "$release_env" || fail "release manifest validation failed"
-chmod 0640 "$release_env"
-
 "$deploy_dir/validate-production-env.sh" "$env_file"
 
 state_dir=$(mktemp -d "$runtime_dir/rollback-$release_sha.XXXXXX") ||
   fail "temporary rollback state could not be created"
-cleanup_candidate() {
-  rm -rf "$state_dir"
-}
-trap cleanup_candidate EXIT
 trap 'exit 1' HUP INT TERM
 rendered_candidate="$state_dir/compose.rendered.json"
 metadata_candidate="$state_dir/render.metadata.json"
@@ -228,11 +427,6 @@ for name in sys.argv[2:]:
 PY
 }
 
-rollback_from=
-if [ -s "$current_file" ]; then
-  rollback_from=$(tr -d '\r\n' <"$current_file")
-fi
-
 capture_protected_ids "$protected_before" || fail "protected services are not ready before rollback"
 compose pull
 for service in $optional_services; do
@@ -283,6 +477,7 @@ verify_active_release_coherence "$release_sha" "$expected_previous_sha" ||
   fail "rollback release pointers are incoherent after promotion"
 rm -f "$candidate_release_assets_file"
 
+mutable_transition_started=0
 trap - EXIT HUP INT TERM
 rm -rf "$state_dir"
 echo "ROLLBACK_OK: $release_sha"

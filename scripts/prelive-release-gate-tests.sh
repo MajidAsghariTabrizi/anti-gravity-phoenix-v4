@@ -101,6 +101,8 @@ grep -F -- '--inherited-images-json' "$build_workflow" >/dev/null ||
 for release_script in "$deploy_script" "$rollback_script"; do
   grep -F "protected_services='nitro-feed-relay feed-ingestor nats postgres recorder'" "$release_script" >/dev/null ||
     fail "protected service set is incomplete: $release_script"
+  grep -F "fixed_protected_services='nitro-feed-relay nats postgres'" "$release_script" >/dev/null ||
+    fail "fixed protected service set is incomplete: $release_script"
   case "$release_script" in
     "$deploy_script")
       expected_optional_services='prometheus rpc-gateway shadow-dispatcher phoenix-engine dashboard economic-monitor economic-supervisor'
@@ -120,7 +122,32 @@ for release_script in "$deploy_script" "$rollback_script"; do
   if grep -E '^[[:space:]]*compose up -d[[:space:]]*$' "$release_script" >/dev/null; then
     fail "broad Compose startup remains: $release_script"
   fi
+  if ! grep -F 'prelive_protected_maintenance.py' "$release_script" >/dev/null ||
+    ! grep -F '"$drain_helper" consumer-state' "$release_script" >/dev/null
+  then
+    fail "Recorder durable-consumer drain validation is missing: $release_script"
+  fi
+  grep -F 'stop -t 30 feed-ingestor' "$release_script" >/dev/null ||
+    fail "Feed Ingestor is not quiesced before protected replacement: $release_script"
+  grep -F -- '--force-recreate recorder' "$release_script" >/dev/null ||
+    fail "changed Recorder is not deterministically replaced: $release_script"
+  grep -F -- '--force-recreate feed-ingestor' "$release_script" >/dev/null ||
+    fail "changed Feed Ingestor is not deterministically replaced: $release_script"
+  grep -F 'fixed protected service identity changed' "$release_script" >/dev/null ||
+    fail "fixed protected identity preservation is missing: $release_script"
 done
+grep -F 'transition_mutable_protected "$rollback_release_env" "$release_env"' \
+  "$deploy_script" >/dev/null ||
+  fail 'deploy does not use the bounded mutable protected transition'
+grep -F 'transition_mutable_protected "$release_env" "$rollback_release_env"' \
+  "$deploy_script" >/dev/null ||
+  fail 'deploy compensation does not reverse the mutable protected transition'
+grep -F 'transition_mutable_protected "$source_release_env" "$release_env"' \
+  "$rollback_script" >/dev/null ||
+  fail 'operator rollback does not transition mutable protected services'
+grep -F 'transition_mutable_protected "$release_env" "$source_release_env"' \
+  "$rollback_script" >/dev/null ||
+  fail 'failed operator rollback does not restore mutable protected services'
 grep -F 'compose run --rm --no-deps migration-runner' "$deploy_script" >/dev/null ||
   fail 'migration runner can still start dependencies'
 grep -F 'installed release assets do not match release SHA' "$deploy_script" >/dev/null ||
