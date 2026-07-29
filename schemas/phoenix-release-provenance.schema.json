@@ -24,7 +24,8 @@
         "phoenix.release-provenance.v1",
         "phoenix.release-provenance.v2",
         "phoenix.release-provenance.v3",
-        "phoenix.release-provenance.v4"
+        "phoenix.release-provenance.v4",
+        "phoenix.release-provenance.v5"
       ]
     },
     "repository": {
@@ -151,28 +152,35 @@
     },
     "built_images": {
       "type": "array",
-      "minItems": 5,
-      "maxItems": 5,
+      "minItems": 0,
+      "maxItems": 7,
       "uniqueItems": true,
       "items": {
         "enum": [
           "dashboard",
+          "feed-ingestor",
           "fork-sandbox",
           "live-executor",
           "phoenix-engine",
+          "recorder",
           "rpc-gateway"
         ]
       }
     },
     "inherited_images": {
       "type": "array",
-      "minItems": 2,
-      "maxItems": 2,
+      "minItems": 0,
+      "maxItems": 7,
       "uniqueItems": true,
       "items": {
         "enum": [
+          "dashboard",
           "feed-ingestor",
-          "recorder"
+          "fork-sandbox",
+          "live-executor",
+          "phoenix-engine",
+          "recorder",
+          "rpc-gateway"
         ]
       }
     }
@@ -247,6 +255,23 @@
       "properties": {
         "schema": {
           "const": "phoenix.release-provenance.v4"
+        },
+        "required_release_artifacts": {
+          "minItems": 10,
+          "maxItems": 10
+        }
+      }
+    },
+    {
+      "required": [
+        "source_ci",
+        "protected_base",
+        "built_images",
+        "inherited_images"
+      ],
+      "properties": {
+        "schema": {
+          "const": "phoenix.release-provenance.v5"
         },
         "required_release_artifacts": {
           "minItems": 10,

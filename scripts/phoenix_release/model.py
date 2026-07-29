@@ -79,6 +79,7 @@ REQUIRED_KEYS = {
     "actual_images",
     "release_manifest_digest",
     "release_assets_digest",
+    "package_digest",
     "engine_container_id",
     "engine_restart_baseline",
     "engine_terminal_integrity_baseline",
@@ -129,6 +130,7 @@ def new_state(
     build_run_id: int | str,
     deploy_run_id: int | str,
     deploy_run_attempt: int | str,
+    package_digest: str,
 ) -> dict[str, Any]:
     release_sha = _release_sha(release_sha, "release_sha")
     rollback_sha = _release_sha(rollback_sha, "rollback_sha")
@@ -161,6 +163,7 @@ def new_state(
         "actual_images": {},
         "release_manifest_digest": None,
         "release_assets_digest": None,
+        "package_digest": package_digest,
         "engine_container_id": None,
         "engine_restart_baseline": None,
         "engine_terminal_integrity_baseline": None,
@@ -181,8 +184,10 @@ def validate_state(value: object) -> dict[str, Any]:
     # State schema v1 predates durable same-SHA attempt numbering. Upgrade it
     # in memory so already-recorded releases remain readable and the next
     # atomic write persists the explicit attempt.
-    if set(value) == REQUIRED_KEYS - {"release_attempt"}:
+    if "release_attempt" not in value and set(value) <= REQUIRED_KEYS:
         value["release_attempt"] = 1
+    if "package_digest" not in value and set(value) <= REQUIRED_KEYS:
+        value["package_digest"] = None
     if set(value) != REQUIRED_KEYS:
         raise StateError("release state keys are invalid")
     if value["schema_version"] != STATE_SCHEMA:
@@ -247,7 +252,11 @@ def validate_state(value: object) -> dict[str, Any]:
         value["candidate_pointer"]
     ):
         raise StateError("candidate_pointer is invalid")
-    for key in ("release_manifest_digest", "release_assets_digest"):
+    for key in (
+        "release_manifest_digest",
+        "release_assets_digest",
+        "package_digest",
+    ):
         if value[key] is not None and not DIGEST_RE.fullmatch(value[key]):
             raise StateError(f"{key} is invalid")
     if value["owner_transaction_hash"] is not None and not TRANSACTION_RE.fullmatch(

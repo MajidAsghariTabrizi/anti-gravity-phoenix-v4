@@ -1,6 +1,42 @@
 FROM rust:1.79-bookworm AS build
 ARG CRATE
 WORKDIR /src
+COPY phoenix-engine/Cargo.toml phoenix-engine/Cargo.lock ./phoenix-engine/
+COPY rpc-gateway/Cargo.toml rpc-gateway/Cargo.lock ./rpc-gateway/
+COPY recorder/Cargo.toml recorder/Cargo.lock ./recorder/
+COPY replay/Cargo.toml replay/Cargo.lock ./replay/
+COPY live-executor/Cargo.toml live-executor/Cargo.lock ./live-executor/
+COPY fork-sandbox/Cargo.toml fork-sandbox/Cargo.lock ./fork-sandbox/
+COPY money-path-classifier/Cargo.toml money-path-classifier/Cargo.lock ./money-path-classifier/
+RUN set -eux; \
+    mkdir -p \
+      phoenix-engine/src \
+      rpc-gateway/src \
+      recorder/src/bin \
+      replay/src \
+      live-executor/src \
+      fork-sandbox/src \
+      money-path-classifier/src; \
+    printf 'pub fn dependency_cache() {}\n' >phoenix-engine/src/lib.rs; \
+    printf 'fn main() {}\n' >phoenix-engine/src/main.rs; \
+    printf 'fn main() {}\n' >phoenix-engine/src/shadow_positive_route_evidence_main.rs; \
+    printf 'pub fn dependency_cache() {}\n' >rpc-gateway/src/lib.rs; \
+    printf 'fn main() {}\n' >rpc-gateway/src/main.rs; \
+    printf 'pub fn dependency_cache() {}\n' >recorder/src/lib.rs; \
+    printf 'fn main() {}\n' >recorder/src/main.rs; \
+    printf 'fn main() {}\n' >recorder/src/bin/shadow-dispatcher.rs; \
+    printf 'pub fn dependency_cache() {}\n' >replay/src/lib.rs; \
+    printf 'fn main() {}\n' >replay/src/main.rs; \
+    printf 'pub fn dependency_cache() {}\n' >live-executor/src/lib.rs; \
+    printf 'fn main() {}\n' >live-executor/src/main.rs; \
+    printf 'fn main() {}\n' >live-executor/src/approve_execution_request_main.rs; \
+    printf 'fn main() {}\n' >live-executor/src/autonomous_live_control_main.rs; \
+    printf 'pub fn dependency_cache() {}\n' >fork-sandbox/src/lib.rs; \
+    printf 'fn main() {}\n' >fork-sandbox/src/main.rs; \
+    printf 'pub fn dependency_cache() {}\n' >money-path-classifier/src/lib.rs; \
+    cd "${CRATE}"; \
+    cargo build --locked; \
+    cargo build --locked --release
 COPY phoenix-engine ./phoenix-engine
 COPY rpc-gateway ./rpc-gateway
 COPY recorder ./recorder
@@ -19,6 +55,15 @@ COPY migrations ./migrations
 COPY deploy/nats-server.conf ./deploy/nats-server.conf
 COPY scripts/recorder-live-smoke.sh ./scripts/recorder-live-smoke.sh
 COPY scripts/sql/prelive-money-path-report.sql ./scripts/sql/prelive-money-path-report.sql
+RUN find \
+      phoenix-engine \
+      rpc-gateway \
+      recorder \
+      replay \
+      live-executor \
+      fork-sandbox \
+      money-path-classifier \
+      -type f -name '*.rs' -exec touch {} +
 RUN cd "${CRATE}" && cargo test --all
 RUN set -eux; \
     case "${CRATE}" in \

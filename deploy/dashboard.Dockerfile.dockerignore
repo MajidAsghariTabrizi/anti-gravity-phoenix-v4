@@ -1,0 +1,8 @@
+**
+!dashboard/
+!dashboard/__init__.py
+!dashboard/app.py
+!dashboard/requirements.txt
+!dashboard/snapshot_model.py
+!deploy/
+!deploy/dashboard.Dockerfile
