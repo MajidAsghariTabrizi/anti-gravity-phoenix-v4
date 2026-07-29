@@ -29,10 +29,12 @@ set +a
 health_mode=${expected_mode:-${PHOENIX_MODE:-SHADOW}}
 
 compose() {
-  set -- --env-file "$env_file" --env-file "$release_env" -f "$compose_file" "$@"
   if [ "$health_mode" = LIVE ] || [ "$health_mode" = DISARMED_EVIDENCE ]; then
     set -- --env-file "$env_file" --env-file "$release_env" \
       -f "$compose_file" -f "$overlay_file" --profile live-autonomous "$@"
+  else
+    set -- --env-file "$env_file" --env-file "$release_env" \
+      -f "$compose_file" "$@"
   fi
   PHOENIX_ENV_FILE="$env_file" docker compose "$@"
 }

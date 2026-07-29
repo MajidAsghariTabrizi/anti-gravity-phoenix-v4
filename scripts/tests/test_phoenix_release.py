@@ -1114,10 +1114,14 @@ class WorkflowAndDeploymentContractTests(unittest.TestCase):
         self.assertIn("production release context validation failed", self.deploy)
 
     def test_health_checks_receive_explicit_release_phase_mode(self) -> None:
+        health = (ROOT / "scripts/production-healthcheck.sh").read_text()
         self.assertIn("PHOENIX_HEALTH_EXPECTED_MODE=DISARMED_EVIDENCE", self.deploy)
         self.assertIn('PHOENIX_ENV_FILE="$env_file"', self.deploy)
         self.assertIn("PHOENIX_HEALTH_EXPECTED_MODE=SHADOW", self.rollback)
         self.assertIn('PHOENIX_ENV_FILE="$env_file"', self.rollback)
+        self.assertNotIn(
+            'compose() {\n  set -- --env-file "$env_file"', health
+        )
         live_health = self.deploy.index(
             "PHOENIX_HEALTH_EXPECTED_MODE=DISARMED_EVIDENCE"
         )
