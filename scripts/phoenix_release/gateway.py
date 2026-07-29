@@ -725,6 +725,81 @@ def _reconciliation_runtime(
     }
 
 
+def _historical_contract_evidence(
+    paths: HostPaths,
+    active_release: str,
+    *,
+    expected_uid: int = 0,
+    expected_gid: int = 0,
+) -> dict[str, object]:
+    path = state_file(paths, active_release)
+    try:
+        metadata = path.lstat()
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or path.is_symlink()
+            or metadata.st_nlink != 1
+            or stat.S_IMODE(metadata.st_mode) != 0o600
+            or metadata.st_uid != expected_uid
+            or metadata.st_gid != expected_gid
+            or metadata.st_size > 256 * 1024
+        ):
+            raise GatewayError("ACTIVE_RELEASE_HISTORICAL_STATE_INVALID")
+        raw = path.read_bytes()
+        historical_value = json.loads(raw)
+        if raw != _canonical(historical_value):
+            raise GatewayError("ACTIVE_RELEASE_HISTORICAL_STATE_INVALID")
+        try:
+            value = load_state(path)
+        except StateError:
+            value = historical_value
+    except GatewayError:
+        raise
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise GatewayError(
+            "ACTIVE_RELEASE_HISTORICAL_STATE_INVALID"
+        ) from exc
+
+    completed = value.get("completed_phases")
+    timestamps = value.get("phase_timestamps")
+    owner_transaction_hash = value.get("owner_transaction_hash")
+    if (
+        value.get("schema_version") != "phoenix.release-state.v1"
+        or value.get("controller_protocol_version") != PROTOCOL_VERSION
+        or value.get("release_sha") != active_release
+        or value.get("active_release_pointer") != active_release
+        or value.get("current_phase") != "COMPLETED"
+        or not isinstance(completed, list)
+        or not completed
+        or completed[0] != "REQUESTED"
+        or completed[-1] != "COMPLETED"
+        or len(completed) != len(set(completed))
+        or not isinstance(timestamps, dict)
+        or set(timestamps) != set(completed)
+        or any(
+            not isinstance(timestamps[phase], str)
+            or not timestamps[phase].endswith("Z")
+            for phase in completed
+        )
+        or type(value.get("contract_paused")) is not bool
+        or (
+            owner_transaction_hash is not None
+            and (
+                not isinstance(owner_transaction_hash, str)
+                or not re.fullmatch(
+                    r"0x[0-9a-f]{64}",
+                    owner_transaction_hash,
+                )
+            )
+        )
+    ):
+        raise GatewayError("ACTIVE_RELEASE_HISTORICAL_STATE_INVALID")
+    return {
+        "contract_paused": value["contract_paused"],
+        "owner_transaction_hash": owner_transaction_hash,
+    }
+
+
 def _readiness_chain_reconciliation(
     paths: HostPaths,
     *,
@@ -1002,8 +1077,9 @@ def production_readiness(
             failed(exc.code, exc.evidence)
 
         try:
-            active_state = load_state(
-                state_file(paths, active["active_release"])
+            active_state = _historical_contract_evidence(
+                paths,
+                active["active_release"],
             )
             contract = {
                 "contract_paused": active_state["contract_paused"],
@@ -1106,7 +1182,7 @@ def reconcile_chain_evidence(
                 "release_assets": release_assets_sha,
             },
         )
-    active_state = load_state(state_file(paths, active_release))
+    active_state = _historical_contract_evidence(paths, active_release)
     owner_transaction_hash = active_state["owner_transaction_hash"]
     historical_contract_paused = active_state["contract_paused"]
     if not isinstance(owner_transaction_hash, str):
