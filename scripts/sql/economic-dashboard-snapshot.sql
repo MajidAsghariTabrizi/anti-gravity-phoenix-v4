@@ -39,7 +39,7 @@ funnel AS (
         (SELECT count(*) FROM live_canary.execution_requests request, params
          WHERE request.created_at >= params.window_start) AS execution_requests,
         (SELECT count(*) FROM live_canary.execution_attempts attempt, params
-         WHERE attempt.created_at >= params.window_start) AS attempts,
+         WHERE attempt.claimed_at >= params.window_start) AS attempts,
         (SELECT count(*) FROM live_canary.execution_attempts attempt, params
          WHERE attempt.submitted_at >= params.window_start) AS submissions,
         (SELECT count(*) FROM live_canary.autonomous_outcome_attributions outcome, params
