@@ -93,7 +93,7 @@ esac
   fail "active release pointers are incoherent"
 rollback_release_root="$release_root/$rollback_sha"
 rollback_script="$rollback_release_root/scripts/rollback-release.sh"
-rollback_context_installer="$rollback_release_root/scripts/install-production-release-context.sh"
+rollback_context_installer="${PHOENIX_CONTEXT_INSTALLER:-$rollback_release_root/scripts/install-production-release-context.sh}"
 [ -f "$rollback_script" ] && [ ! -L "$rollback_script" ] ||
   fail "version-matched rollback script is missing or unsafe"
 [ -f "$rollback_context_installer" ] && [ ! -L "$rollback_context_installer" ] ||
@@ -201,13 +201,13 @@ PY
 }
 
 compose() {
-  PHOENIX_ENV_FILE="$env_file" PHOENIX_RELEASE_ENV="$release_env" \
-    docker compose \
-      --env-file "$env_file" \
-      --env-file "$release_env" \
-      -f "$compose_file" \
-      -f "$overlay_file" \
-      --profile live-autonomous "$@"
+  python3 "$deploy_dir/production_compose.py" \
+    --mode LIVE \
+    --env-file "$env_file" \
+    --release-env "$release_env" \
+    --compose-file "$compose_file" \
+    --overlay-file "$overlay_file" \
+    -- "$@"
 }
 
 capture_protected_ids() {

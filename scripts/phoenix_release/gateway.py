@@ -7,6 +7,7 @@ import io
 import json
 import os
 import re
+import shlex
 import shutil
 import stat
 import subprocess
@@ -32,6 +33,7 @@ from .model import (
     record_owner_transaction,
     record_engine_baseline,
     retry_failed_pre_mutation,
+    retry_rolled_back_release,
     set_mutation_started,
     sha256_file,
 )
@@ -146,6 +148,40 @@ def host_paths() -> HostPaths:
             )
         ),
     )
+
+
+def production_compose_command(
+    paths: HostPaths,
+    *,
+    mode: str,
+    release_env: Path,
+) -> list[str]:
+    """Return the single root-side entry to canonical Compose construction."""
+    if mode not in {"SHADOW", "LIVE"}:
+        raise GatewayError("PRODUCTION_COMPOSE_MODE_INVALID")
+    command = [
+        "/usr/bin/python3",
+        "-I",
+        "-B",
+        str(paths.libexec / "production_compose.py"),
+        "--mode",
+        mode,
+        "--env-file",
+        str(paths.env_file),
+        "--release-env",
+        str(release_env),
+        "--compose-file",
+        str(paths.deploy_dir / "compose.prod.yml"),
+    ]
+    if mode == "LIVE":
+        command.extend(
+            [
+                "--overlay-file",
+                str(paths.deploy_dir / "compose.live-autonomous.yml"),
+            ]
+        )
+    command.append("--")
+    return command
 
 
 def _canonical(value: object) -> bytes:
@@ -374,7 +410,7 @@ def _run(
         check=False,
         text=True,
         stdout=subprocess.PIPE if capture else None,
-        stderr=subprocess.STDOUT if capture else None,
+        stderr=subprocess.PIPE if capture else None,
         env=merged,
         timeout=3600,
     )
@@ -391,9 +427,24 @@ def _require_success(
         raise GatewayError(
             code,
             {
-                "command": Path(arguments[0]).name,
+                "command": _bounded_output(
+                    SENSITIVE_OUTPUT_RE.sub(
+                        "[REDACTED_URL]", shlex.join(arguments)
+                    )
+                ),
                 "exit_code": result.returncode,
-                "output": _bounded_output(result.stdout),
+                "output": _bounded_output(
+                    "\n".join(
+                        part
+                        for part in (
+                            result.stdout,
+                            getattr(result, "stderr", None),
+                        )
+                        if part
+                    )
+                ),
+                "stderr": _bounded_output(getattr(result, "stderr", None)),
+                "stdout": _bounded_output(result.stdout),
             },
         )
     return result.stdout or ""
@@ -456,6 +507,351 @@ def status(paths: HostPaths) -> dict[str, Any]:
         "live_execution": live_execution,
         "autonomous_execution": autonomous_execution,
     }
+
+
+def _path_evidence(path: Path) -> dict[str, Any]:
+    metadata = path.lstat()
+    return {
+        "gid": metadata.st_gid,
+        "inode": metadata.st_ino,
+        "mode": f"{stat.S_IMODE(metadata.st_mode):04o}",
+        "path": str(path),
+        "sha256": sha256_file(path) if stat.S_ISREG(metadata.st_mode) else None,
+        "uid": metadata.st_uid,
+    }
+
+
+def production_readiness(
+    paths: HostPaths, candidate_sha: str
+) -> dict[str, Any]:
+    """Aggregate every read-only host gate before any candidate image build."""
+    if not SHA_RE.fullmatch(candidate_sha):
+        raise GatewayError("RELEASE_SHA_INVALID")
+    failures: list[dict[str, Any]] = []
+    checks: dict[str, Any] = {}
+
+    def failed(code: str, evidence_value: dict[str, Any] | None = None) -> None:
+        failures.append({"code": code, "evidence": evidence_value or {}})
+
+    try:
+        active = status(paths)
+        checks["active_release"] = active
+    except GatewayError as exc:
+        failed(exc.code, exc.evidence)
+        active = None
+
+    required_paths = (
+        paths.env_file,
+        paths.deploy_dir / "current-release",
+        paths.deploy_dir / "release-assets.sha",
+        paths.deploy_dir / "current-release.env",
+        paths.deploy_dir / "compose.prod.yml",
+        paths.deploy_dir / "compose.live-autonomous.yml",
+        paths.libexec / "platform-manifest.json",
+        paths.libexec / "production_compose.py",
+    )
+    path_checks = []
+    for required in required_paths:
+        try:
+            evidence_value = _path_evidence(required)
+            if (
+                not required.is_file()
+                or required.is_symlink()
+                or required.stat().st_nlink != 1
+            ):
+                failed("READINESS_FILE_UNSAFE", {"path": str(required)})
+            path_checks.append(evidence_value)
+        except (OSError, StateError) as exc:
+            failed(
+                "READINESS_FILE_INVALID",
+                {"message": _bounded_output(str(exc)), "path": str(required)},
+            )
+    checks["files"] = path_checks
+
+    try:
+        platform_manifest = _read_json(
+            paths.libexec / "platform-manifest.json", 256 * 1024
+        )
+        installed_sha = (
+            platform_manifest.get("release_sha")
+            if isinstance(platform_manifest, dict)
+            else None
+        )
+        checks["release_platform"] = {
+            "candidate_sha": candidate_sha,
+            "installed_sha": installed_sha,
+            "upgrade_required": installed_sha != candidate_sha,
+        }
+        if not isinstance(installed_sha, str) or not SHA_RE.fullmatch(
+            installed_sha
+        ):
+            failed("READINESS_PLATFORM_MANIFEST_INVALID")
+        else:
+            try:
+                _require_success(
+                    [
+                        "/usr/bin/python3",
+                        "-I",
+                        "-B",
+                        str(paths.libexec / "release_platform.py"),
+                        "verify",
+                        "--installed-root",
+                        "/",
+                        "--expected-sha",
+                        installed_sha,
+                    ],
+                    "READINESS_PLATFORM_DRIFT",
+                )
+            except GatewayError as exc:
+                failed(exc.code, exc.evidence)
+    except GatewayError as exc:
+        failed(exc.code, exc.evidence)
+
+    capacity = []
+    for root in (paths.state_root, paths.deploy_root, paths.env_file.parent):
+        try:
+            usage = shutil.disk_usage(root)
+            available_inodes = (
+                os.statvfs(root).f_favail
+                if hasattr(os, "statvfs")
+                else None
+            )
+            value = {
+                "available_bytes": usage.free,
+                "available_inodes": available_inodes,
+                "path": str(root),
+            }
+            capacity.append(value)
+            if usage.free < 5 * 1024 * 1024 * 1024:
+                failed("READINESS_DISK_CAPACITY_LOW", value)
+            if (
+                available_inodes is not None
+                and available_inodes < 100_000
+            ):
+                failed("READINESS_INODE_CAPACITY_LOW", value)
+        except OSError as exc:
+            failed(
+                "READINESS_CAPACITY_UNAVAILABLE",
+                {"message": _bounded_output(str(exc)), "path": str(root)},
+            )
+    checks["capacity"] = capacity
+
+    if active is not None:
+        release_env = paths.deploy_dir / "current-release.env"
+        mode = "LIVE" if active["phoenix_mode"] == "LIVE" else "SHADOW"
+        compose = production_compose_command(
+            paths, mode=mode, release_env=release_env
+        )
+        try:
+            rendered = _require_success(
+                compose + ["config", "--format", "json"],
+                "READINESS_COMPOSE_RENDER_FAILED",
+            )
+            rendered_value = json.loads(rendered)
+            checks["compose_service_count"] = len(
+                rendered_value.get("services", {})
+            )
+        except GatewayError as exc:
+            failed(exc.code, exc.evidence)
+            rendered_value = {}
+        except json.JSONDecodeError:
+            failed("READINESS_COMPOSE_RENDER_INVALID")
+            rendered_value = {}
+
+        service_evidence = []
+        services = rendered_value.get("services", {})
+        if isinstance(services, dict):
+            for service in sorted(services):
+                if service in {"autonomous-control", "migration-runner"}:
+                    continue
+                try:
+                    container_id = _require_success(
+                        compose + ["ps", "-a", "-q", service],
+                        "READINESS_CONTAINER_LOOKUP_FAILED",
+                    ).strip()
+                    if not container_id:
+                        if service == "live-executor":
+                            service_evidence.append(
+                                {
+                                    "container_id": None,
+                                    "service": service,
+                                    "state": "stopped",
+                                }
+                            )
+                            continue
+                        failed(
+                            "READINESS_SERVICE_MISSING",
+                            {"service": service},
+                        )
+                        continue
+                    inspection = _require_success(
+                        [
+                            "/usr/bin/docker",
+                            "inspect",
+                            "--format",
+                            "{{json .}}",
+                            container_id,
+                        ],
+                        "READINESS_CONTAINER_INSPECT_FAILED",
+                    )
+                    inspected = json.loads(inspection)
+                    state_value = inspected.get("State", {})
+                    health = state_value.get("Health", {}).get("Status")
+                    observed = {
+                        "configured_image": inspected.get("Config", {}).get(
+                            "Image"
+                        ),
+                        "container_id": container_id,
+                        "health": health,
+                        "image_id": inspected.get("Image"),
+                        "mounts": [
+                            {
+                                "destination": mount.get("Destination"),
+                                "mode": mount.get("Mode"),
+                                "source": mount.get("Source"),
+                                "type": mount.get("Type"),
+                            }
+                            for mount in inspected.get("Mounts", [])
+                            if isinstance(mount, dict)
+                        ],
+                        "running": state_value.get("Running"),
+                        "service": service,
+                    }
+                    service_evidence.append(observed)
+                    if (
+                        observed["running"] is not True
+                        or health not in {None, "healthy"}
+                    ):
+                        failed("READINESS_SERVICE_UNHEALTHY", observed)
+                    if service == "live-executor":
+                        failed("READINESS_LIVE_EXECUTOR_ACTIVE", observed)
+                except GatewayError as exc:
+                    failed(exc.code, exc.evidence)
+                except (json.JSONDecodeError, TypeError):
+                    failed(
+                        "READINESS_CONTAINER_INSPECT_INVALID",
+                        {"service": service},
+                    )
+        checks["services"] = service_evidence
+
+        control_sql = (
+            "SELECT json_build_object("
+            "'armed', global_control.armed,"
+            "'kill_switch', global_control.kill_switch,"
+            "'execution_mode', global_control.execution_mode,"
+            "'open_routes', (SELECT count(*) FROM "
+            "live_canary.autonomous_route_controls "
+            "WHERE enabled OR NOT kill_switch),"
+            "'active_attempts', (SELECT count(*) FROM "
+            "live_canary.execution_attempts WHERE status IN "
+            "('claimed','nonce_allocated','submission_unknown','pending','timed_out')),"
+            "'unresolved_submissions', (SELECT count(*) FROM "
+            "live_canary.execution_attempts WHERE status IN "
+            "('submission_unknown','pending','timed_out')),"
+            "'outbox_pending', (SELECT count(*) FROM engine_outbox "
+            "WHERE published_at IS NULL),"
+            "'outbox_ack_pending', (SELECT count(*) FROM engine_outbox "
+            "WHERE published_at IS NOT NULL AND jetstream_ack_sequence IS NULL),"
+            "'outbox_claimable', (SELECT count(*) FROM engine_outbox "
+            "WHERE published_at IS NULL AND available_at <= now() "
+            "AND (claim_expires_at IS NULL OR claim_expires_at <= now())))::text "
+            "FROM live_canary.autonomous_global_control AS global_control "
+            "WHERE global_control.singleton"
+        )
+        try:
+            control_output = _require_success(
+                compose
+                + [
+                    "exec",
+                    "-T",
+                    "postgres",
+                    "/bin/sh",
+                    "-c",
+                    (
+                        "exec psql -X -qAt -v ON_ERROR_STOP=1 "
+                        '-U "$POSTGRES_USER" -d "$POSTGRES_DB" -c '
+                        + shlex.quote(control_sql)
+                    ),
+                ],
+                "READINESS_CONTROL_QUERY_FAILED",
+            )
+            controls = json.loads(control_output)
+            checks["controls"] = controls
+            expected_controls = {
+                "active_attempts": 0,
+                "armed": False,
+                "kill_switch": True,
+                "open_routes": 0,
+                "unresolved_submissions": 0,
+            }
+            for field, expected in expected_controls.items():
+                if controls.get(field) != expected:
+                    failed(
+                        "READINESS_CONTROL_OPEN",
+                        {
+                            "actual": controls.get(field),
+                            "expected": expected,
+                            "field": field,
+                        },
+                    )
+            if controls.get("execution_mode") == "live":
+                failed(
+                    "READINESS_EXECUTION_MODE_LIVE",
+                    {"execution_mode": controls.get("execution_mode")},
+                )
+        except GatewayError as exc:
+            failed(exc.code, exc.evidence)
+        except (json.JSONDecodeError, TypeError):
+            failed("READINESS_CONTROL_EVIDENCE_INVALID")
+
+        try:
+            active_state = load_state(
+                state_file(paths, active["active_release"])
+            )
+            contract = {
+                "contract_paused": active_state["contract_paused"],
+                "owner_transaction_hash": active_state[
+                    "owner_transaction_hash"
+                ],
+            }
+            checks["contract"] = contract
+            if contract["contract_paused"] is not True:
+                failed("READINESS_CONTRACT_NOT_PAUSED", contract)
+            if contract["owner_transaction_hash"] is not None:
+                failed("READINESS_OWNER_TRANSACTION_RECORDED", contract)
+        except (OSError, StateError, GatewayError) as exc:
+            failed(
+                "READINESS_ACTIVE_STATE_INVALID",
+                {"message": _bounded_output(str(exc))},
+            )
+
+    result = {
+        "candidate_sha": candidate_sha,
+        "checks": checks,
+        "failure_count": len(failures),
+        "failures": failures,
+        "schema": "phoenix.production-readiness.v1",
+        "status": "passed" if not failures else "failed",
+    }
+    if failures:
+        raise GatewayError("PRODUCTION_READINESS_FAILED", result)
+    return result
+
+
+def _deployment_diagnostics(
+    paths: HostPaths, release_sha: str
+) -> dict[str, Any]:
+    try:
+        return production_readiness(paths, release_sha)
+    except GatewayError as exc:
+        if exc.code == "PRODUCTION_READINESS_FAILED":
+            return exc.evidence
+        return {
+            "failure_count": 1,
+            "failures": [{"code": exc.code, "evidence": exc.evidence}],
+            "schema": "phoenix.production-readiness.v1",
+            "status": "failed",
+        }
 
 
 def reconcile_snapshot(snapshot: dict[str, Any]) -> dict[str, Any]:
@@ -523,11 +919,24 @@ def _live_executor_absence_is_fail_closed(
         and release_evidence.get("autonomous_armed") is False
         and release_evidence.get("kill_switch") is True
         and isinstance(runtime_evidence, dict)
-        and set(runtime_evidence) == {"armed", "kill_switch", "active_attempts"}
+        and set(runtime_evidence)
+        == {
+            "active_attempts",
+            "armed",
+            "execution_mode",
+            "kill_switch",
+            "open_routes",
+            "unresolved_submissions",
+        }
         and runtime_evidence["armed"] is False
         and runtime_evidence["kill_switch"] is True
+        and runtime_evidence["execution_mode"] == "disarmed"
         and type(runtime_evidence["active_attempts"]) is int
         and runtime_evidence["active_attempts"] == 0
+        and type(runtime_evidence["open_routes"]) is int
+        and runtime_evidence["open_routes"] == 0
+        and type(runtime_evidence["unresolved_submissions"]) is int
+        and runtime_evidence["unresolved_submissions"] == 0
     )
 
 
@@ -549,11 +958,19 @@ def _require_fail_closed_live_executor_absence(
                 "\"SELECT json_build_object("
                 "'armed', global_control.armed, "
                 "'kill_switch', global_control.kill_switch, "
+                "'execution_mode', global_control.execution_mode, "
+                "'open_routes', (SELECT count(*) "
+                "FROM live_canary.autonomous_route_controls "
+                "WHERE enabled OR NOT kill_switch), "
                 "'active_attempts', (SELECT count(*) "
                 "FROM live_canary.execution_attempts "
                 "WHERE status IN ("
                 "'claimed', 'nonce_allocated', 'submission_unknown', "
-                "'pending', 'timed_out'))"
+                "'pending', 'timed_out')), "
+                "'unresolved_submissions', (SELECT count(*) "
+                "FROM live_canary.execution_attempts "
+                "WHERE status IN ("
+                "'submission_unknown', 'pending', 'timed_out'))"
                 ")::text "
                 "FROM live_canary.autonomous_global_control AS global_control "
                 "WHERE global_control.singleton\""
@@ -579,6 +996,11 @@ def _require_fail_closed_live_executor_absence(
                 "armed": bounded_runtime.get("armed"),
                 "kill_switch": bounded_runtime.get("kill_switch"),
                 "active_attempts": bounded_runtime.get("active_attempts"),
+                "execution_mode": bounded_runtime.get("execution_mode"),
+                "open_routes": bounded_runtime.get("open_routes"),
+                "unresolved_submissions": bounded_runtime.get(
+                    "unresolved_submissions"
+                ),
             },
         )
 
@@ -597,25 +1019,11 @@ def reconcile_active_context(paths: HostPaths) -> dict[str, Any]:
     ):
         raise GatewayError("ACTIVE_MANIFEST_INVALID")
     release_env = paths.deploy_dir / "current-release.env"
-    compose_arguments = [
-        "/usr/bin/docker",
-        "compose",
-        "--env-file",
-        str(paths.env_file),
-        "--env-file",
-        str(release_env),
-        "-f",
-        str(paths.deploy_dir / "compose.prod.yml"),
-    ]
-    if active["phoenix_mode"] == "LIVE":
-        compose_arguments.extend(
-            [
-                "-f",
-                str(paths.deploy_dir / "compose.live-autonomous.yml"),
-                "--profile",
-                "live-autonomous",
-            ]
-        )
+    compose_arguments = production_compose_command(
+        paths,
+        mode="LIVE" if active["phoenix_mode"] == "LIVE" else "SHADOW",
+        release_env=release_env,
+    )
     rendered = _require_success(
         compose_arguments + ["config", "--format", "json"],
         "ACTIVE_COMPOSE_RENDER_FAILED",
@@ -775,6 +1183,88 @@ def _host_preflight(paths: HostPaths, request: dict[str, Any]) -> None:
             raise GatewayError("HOST_PREFLIGHT_FILE_INVALID", {"path": str(path)})
 
 
+def _rehearse_candidate(paths: HostPaths, request: dict[str, Any]) -> None:
+    root = paths.incoming / request["release_sha"]
+    release_sha = request["release_sha"]
+    archive_path = root / f"phoenix-release-assets-{release_sha}.tar.gz"
+    _require_success(
+        [
+            "/usr/bin/python3",
+            "-I",
+            "-B",
+            str(paths.libexec / "release_assets.py"),
+            "verify",
+            "--archive",
+            str(archive_path),
+            "--manifest",
+            str(root / "release-assets-manifest.json"),
+            "--checksums",
+            str(root / "release-assets-checksums.txt"),
+            "--expected-sha",
+            release_sha,
+        ],
+        "REHEARSAL_RELEASE_ASSETS_INVALID",
+    )
+    paths.state_root.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(
+        prefix=f".rehearse-{release_sha}.", dir=paths.state_root
+    ) as temporary:
+        staging = Path(temporary)
+        bundle_root = f"phoenix-release-{release_sha}"
+        try:
+            with tarfile.open(archive_path, mode="r:gz") as archive:
+                for member in archive.getmembers():
+                    if (
+                        not member.isfile()
+                        or not member.name.startswith(f"{bundle_root}/")
+                    ):
+                        raise GatewayError("REHEARSAL_ARCHIVE_INVALID")
+                    relative = Path(*Path(member.name).parts[1:])
+                    destination = staging / bundle_root / relative
+                    destination.parent.mkdir(parents=True, exist_ok=True)
+                    extracted = archive.extractfile(member)
+                    if extracted is None:
+                        raise GatewayError("REHEARSAL_ARCHIVE_INVALID")
+                    _atomic_bytes(
+                        destination,
+                        extracted.read(member.size + 1),
+                        member.mode,
+                    )
+        except (OSError, tarfile.TarError) as exc:
+            raise GatewayError("REHEARSAL_ARCHIVE_INVALID") from exc
+        candidate_root = staging / bundle_root
+        _require_success(
+            [
+                "/usr/bin/python3",
+                "-I",
+                "-B",
+                str(candidate_root / "scripts" / "release_assets.py"),
+                "verify-tree",
+                "--root",
+                str(candidate_root),
+                "--manifest",
+                str(candidate_root / "release-assets-manifest.json"),
+                "--expected-sha",
+                release_sha,
+            ],
+            "REHEARSAL_TREE_INVALID",
+        )
+        _require_success(
+            [
+                "/bin/sh",
+                str(candidate_root / "scripts" / "rehearse-production-release.sh"),
+                release_sha,
+                str(candidate_root),
+                str(root / "release-manifest.json"),
+            ],
+            "CANDIDATE_REHEARSAL_FAILED",
+            env={
+                "PHOENIX_DEPLOY_ROOT": str(paths.deploy_root),
+                "PHOENIX_ENV_FILE": str(paths.env_file),
+            },
+        )
+
+
 def _install_candidate(paths: HostPaths, request: dict[str, Any]) -> None:
     root = paths.incoming / request["release_sha"]
     release_sha = request["release_sha"]
@@ -826,9 +1316,6 @@ def _install_candidate(paths: HostPaths, request: dict[str, Any]) -> None:
     )
     environment = {
         "PHOENIX_RELEASE_ROOT": str(paths.releases),
-        "PHOENIX_CONTEXT_INSTALLER": str(
-            paths.libexec / "install-production-release-context.sh"
-        ),
     }
     _require_success(
         [
@@ -842,6 +1329,54 @@ def _install_candidate(paths: HostPaths, request: dict[str, Any]) -> None:
         "CANDIDATE_INSTALL_FAILED",
         env=environment,
     )
+    release_root = paths.releases / release_sha
+    authorized_keys = Path("/home/phoenix-deploy/.ssh/authorized_keys")
+    if not authorized_keys.is_file() or authorized_keys.is_symlink():
+        raise GatewayError("DEPLOY_PUBLIC_KEY_INVALID")
+    key_digest_before = sha256_file(authorized_keys)
+    _require_success(
+        [
+            "/bin/sh",
+            str(release_root / "scripts" / "install-phoenix-release-platform.sh"),
+            "--release-sha",
+            release_sha,
+            "--reuse-existing-key",
+        ],
+        "RELEASE_PLATFORM_INSTALL_FAILED",
+    )
+    if sha256_file(authorized_keys) != key_digest_before:
+        raise GatewayError("DEPLOY_PUBLIC_KEY_CHANGED")
+    _require_success(
+        [
+            "/usr/bin/python3",
+            "-I",
+            "-B",
+            str(paths.libexec / "release_platform.py"),
+            "verify",
+            "--installed-root",
+            "/",
+            "--expected-sha",
+            release_sha,
+        ],
+        "RELEASE_PLATFORM_IDENTITY_MISMATCH",
+    )
+    _require_success(
+        [
+            "/bin/sh",
+            str(
+                release_root
+                / "scripts"
+                / "install-production-release-context.sh"
+            ),
+            release_sha,
+            str(release_root),
+        ],
+        "EXACT_CANDIDATE_CONTEXT_INSTALL_FAILED",
+        env={
+            "PHOENIX_DEPLOY_ROOT": str(paths.deploy_root),
+            "PHOENIX_ENV_FILE": str(paths.env_file),
+        },
+    )
     manifest_dir = paths.deploy_dir / "manifests"
     manifest_dir.mkdir(parents=True, exist_ok=True)
     for source_name, suffix in (
@@ -850,6 +1385,43 @@ def _install_candidate(paths: HostPaths, request: dict[str, Any]) -> None:
     ):
         destination = manifest_dir / f"{release_sha}{suffix}"
         _atomic_bytes(destination, (root / source_name).read_bytes(), 0o640)
+
+
+def _verify_exact_platform(paths: HostPaths, release_sha: str) -> None:
+    _require_success(
+        [
+            "/usr/bin/python3",
+            "-I",
+            "-B",
+            str(paths.libexec / "release_platform.py"),
+            "verify",
+            "--installed-root",
+            "/",
+            "--expected-sha",
+            release_sha,
+        ],
+        "RELEASE_PLATFORM_IDENTITY_MISMATCH",
+    )
+    release_root = paths.releases / release_sha
+    for name in (
+        "deploy-release.sh",
+        "production-healthcheck.sh",
+        "production_compose.py",
+        "render-production-compose.sh",
+        "rollback-release.sh",
+    ):
+        installed = paths.deploy_dir / name
+        candidate = release_root / "scripts" / name
+        if (
+            not installed.is_file()
+            or installed.is_symlink()
+            or not candidate.is_file()
+            or candidate.is_symlink()
+            or sha256_file(installed) != sha256_file(candidate)
+        ):
+            raise GatewayError(
+                "RELEASE_CONTEXT_PLATFORM_DRIFT", {"file": name}
+            )
 
 
 def _write_state(paths: HostPaths, state: dict[str, Any]) -> None:
@@ -874,9 +1446,7 @@ def _rollback_failed_state(
         return state
     rollback_sha = state["rollback_sha"]
     rollback_root = paths.releases / rollback_sha
-    context_installer = (
-        rollback_root / "scripts" / "install-production-release-context.sh"
-    )
+    context_installer = paths.libexec / "install-production-release-context.sh"
     try:
         runtime_may_have_changed = _runtime_may_have_changed(state)
         if runtime_may_have_changed:
@@ -1035,18 +1605,26 @@ def resume(paths: HostPaths, release_sha: str) -> dict[str, Any]:
             state = advance(state, "ROLLBACK_VERIFIED")
             _write_state(paths, state)
         if state["current_phase"] == "ROLLBACK_VERIFIED":
+            _rehearse_candidate(paths, request)
+            state = advance(state, "CANDIDATE_REHEARSED")
+            _write_state(paths, state)
+        if state["current_phase"] == "CANDIDATE_REHEARSED":
             state = set_mutation_started(state)
             _write_state(paths, state)
             _install_candidate(paths, request)
             state = advance(state, "CANDIDATE_INSTALLED")
             _write_state(paths, state)
         if state["current_phase"] == "CANDIDATE_INSTALLED":
+            _verify_exact_platform(paths, release_sha)
             environment = {
                 "PHOENIX_DEPLOY_ROOT": str(paths.deploy_root),
                 "PHOENIX_RELEASE_ROOT": str(paths.releases),
                 "PHOENIX_ENV_FILE": str(paths.env_file),
                 "PHOENIX_RELEASE_STATE_ROOT": str(paths.state_root),
                 "PHOENIX_RELEASE_STATE_UPDATER": str(paths.state_updater),
+                "PHOENIX_CONTEXT_INSTALLER": str(
+                    paths.libexec / "install-production-release-context.sh"
+                ),
             }
             result = _run(
                 [
@@ -1058,10 +1636,27 @@ def resume(paths: HostPaths, release_sha: str) -> dict[str, Any]:
             )
             state = load_state(state_path)
             if result.returncode != 0:
+                combined_output = "\n".join(
+                    part
+                    for part in (result.stdout, result.stderr)
+                    if part
+                )
                 failure_evidence = {
+                    "command": shlex.join(
+                        [
+                            "/bin/sh",
+                            str(paths.deploy_dir / "deploy-release.sh"),
+                            release_sha,
+                        ]
+                    ),
                     "exit_code": result.returncode,
-                    "output": _bounded_output(result.stdout),
+                    "stderr": _bounded_output(result.stderr),
+                    "stdout": _bounded_output(result.stdout),
+                    "output": _bounded_output(combined_output),
                     "source": "deploy-release",
+                    "diagnostics": _deployment_diagnostics(
+                        paths, release_sha
+                    ),
                 }
                 if state["current_phase"] not in {
                     "FAILED_PRE_MUTATION",
@@ -1087,7 +1682,9 @@ def resume(paths: HostPaths, release_sha: str) -> dict[str, Any]:
                     {
                         "phase": state["current_phase"],
                         "exit_code": result.returncode,
-                        "output": _bounded_output(result.stdout),
+                        "stderr": _bounded_output(result.stderr),
+                        "stdout": _bounded_output(result.stdout),
+                        "output": _bounded_output(combined_output),
                     },
                 )
             state = load_state(state_path)
@@ -1211,6 +1808,90 @@ def retry_pre_mutation(paths: HostPaths, release_sha: str) -> dict[str, Any]:
     }
 
 
+def retry_rolled_back(paths: HostPaths, release_sha: str) -> dict[str, Any]:
+    """Create a new durable attempt from an unchanged safe rollback."""
+    state_path = state_file(paths, release_sha)
+    state = load_state(state_path)
+    if state["current_phase"] != "ROLLED_BACK":
+        raise GatewayError("ROLLED_BACK_RETRY_PHASE_INVALID")
+    if state["owner_transaction_hash"] is not None:
+        raise GatewayError("ROLLED_BACK_RETRY_OWNER_TRANSACTION_RECORDED")
+    request = validate_request(
+        _read_json(request_file(paths, release_sha), 64 * 1024)
+    )
+    identity_fields = (
+        "release_sha",
+        "rollback_sha",
+        "source_ci_run_id",
+        "source_ci_run_attempt",
+        "build_run_id",
+        "deploy_run_id",
+        "deploy_run_attempt",
+    )
+    if any(state[field] != request[field] for field in identity_fields):
+        raise GatewayError("ROLLED_BACK_RETRY_REQUEST_MISMATCH")
+    active = status(paths)
+    if active["active_release"] != state["rollback_sha"]:
+        raise GatewayError(
+            "ROLLED_BACK_RETRY_ACTIVE_RELEASE_CHANGED",
+            {
+                "actual": active["active_release"],
+                "expected": state["rollback_sha"],
+            },
+        )
+    root = paths.incoming / release_sha
+    if _verify_evidence(paths, request) != state["expected_images"]:
+        raise GatewayError("ROLLED_BACK_RETRY_IMAGE_EVIDENCE_MISMATCH")
+    if (
+        sha256_file(root / "release-manifest.json")
+        != state["release_manifest_digest"]
+        or sha256_file(root / f"phoenix-release-assets-{release_sha}.tar.gz")
+        != state["release_assets_digest"]
+    ):
+        raise GatewayError("ROLLED_BACK_RETRY_PACKAGE_EVIDENCE_MISMATCH")
+
+    release_env = paths.deploy_dir / "current-release.env"
+    compose = production_compose_command(
+        paths,
+        mode="LIVE" if active["phoenix_mode"] == "LIVE" else "SHADOW",
+        release_env=release_env,
+    )
+    _require_fail_closed_live_executor_absence(
+        paths, compose, release_sha
+    )
+
+    failed_state = json.loads(json.dumps(state))
+    try:
+        retried = retry_rolled_back_release(json.loads(json.dumps(state)))
+    except StateError as exc:
+        raise GatewayError("ROLLED_BACK_RETRY_STATE_INVALID") from exc
+    rolled_back_at = state["phase_timestamps"]["ROLLED_BACK"]
+    archive_payload = _canonical(
+        {
+            "failed_state": failed_state,
+            "rollback_evidence": failed_state["rollback_result"],
+            "rolled_back_at": rolled_back_at,
+            "schema": "phoenix.release-rolled-back-retry-archive.v1",
+        }
+    )
+    archive_digest = hashlib.sha256(archive_payload).hexdigest()
+    archive_name = (
+        f"rolled-back-{rolled_back_at.replace(':', '').replace('-', '')}-"
+        f"{archive_digest}.json"
+    )
+    archive_path = state_path.parent / "retry-archives" / archive_name
+    _atomic_archive(archive_path, archive_payload)
+    atomic_write(state_path, retried)
+    return {
+        "archive": f"retry-archives/{archive_name}",
+        "current_phase": retried["current_phase"],
+        "release_attempt": retried["release_attempt"],
+        "release_sha": release_sha,
+        "schema": "phoenix.release-rolled-back-retry.v1",
+        "status": "reset",
+    }
+
+
 def history(paths: HostPaths) -> list[dict[str, Any]]:
     if not paths.release_states.exists():
         return []
@@ -1239,20 +1920,9 @@ def emergency_pause(paths: HostPaths) -> dict[str, Any]:
     active = status(paths)
     release_sha = active["active_release"]
     release_env = paths.deploy_dir / "current-release.env"
-    compose = [
-        "/usr/bin/docker",
-        "compose",
-        "--env-file",
-        str(paths.env_file),
-        "--env-file",
-        str(release_env),
-        "-f",
-        str(paths.deploy_dir / "compose.prod.yml"),
-        "-f",
-        str(paths.deploy_dir / "compose.live-autonomous.yml"),
-        "--profile",
-        "live-autonomous",
-    ]
+    compose = production_compose_command(
+        paths, mode="LIVE", release_env=release_env
+    )
     _run(compose + ["stop", "-t", "30", "live-executor"])
     pause = _run(
         compose
@@ -1304,12 +1974,7 @@ def rollback_release(paths: HostPaths, target_sha: str) -> dict[str, Any]:
         )
     active_root = paths.releases / active["active_release"]
     rollback_script = active_root / "scripts" / "rollback-release.sh"
-    context_installer = (
-        paths.releases
-        / target_sha
-        / "scripts"
-        / "install-production-release-context.sh"
-    )
+    context_installer = paths.libexec / "install-production-release-context.sh"
     for path in (rollback_script, context_installer):
         if not path.is_file() or path.is_symlink():
             raise GatewayError("ROLLBACK_RELEASE_INCOMPATIBLE", {"path": str(path)})

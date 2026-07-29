@@ -26,7 +26,10 @@ only:
 status
 history
 plan <release-sha>
+readiness <release-sha>
 resume <release-sha>
+retry-pre-mutation <release-sha>
+retry-rolled-back <release-sha>
 rollback <release-sha>
 emergency-pause
 evidence <release-sha>
@@ -41,9 +44,31 @@ protocol only for break-glass diagnosis. Evidence is bounded JSON and a
 
 State lives at `/var/lib/phoenix-release/releases/<sha>/state.json`, is root-owned,
 atomically replaced, and records every postcondition. Completed phases are not
-repeated. Candidate installation can resume. An interruption after money-path
-mutation is never allowed to blindly repeat an owner transaction; it fails closed
-for state/receipt reconciliation or rollback.
+repeated. The controller runs one aggregated, read-only Production readiness
+report before image building. The immutable package is extracted to a root-only
+temporary directory and rehearsed against the candidate Compose render, live
+schema in a read-only transaction, isolated monitor output, control status, and
+health contracts before the mutation boundary.
+
+The durable release sequence is:
+
+```text
+BUILD_VERIFIED
+  -> HOST_PREFLIGHT_OK
+  -> ACTIVE_CONTEXT_RECONCILED
+  -> ROLLBACK_VERIFIED
+  -> CANDIDATE_REHEARSED
+  -> CANDIDATE_INSTALLED
+  -> DISARMED_EVIDENCE_STARTED
+  -> COMPLETED
+```
+
+A pre-mutation failure or a fully successful pre-activation rollback may create
+a new numbered attempt only when the original SHA, image manifest, package
+digest, rollback identity, fail-closed controls, and absence of owner
+transactions still match. The failed state is archived immutably. No image is
+rebuilt and no fake commit is required. An interruption after an owner
+transaction is never retried.
 
 ## Key rotation and protocol upgrades
 
@@ -52,10 +77,20 @@ public half for `phoenix-deploy`, replace the environment-scoped
 `PROD_SSH_PRIVATE_KEY`, prove `status`, then remove the old public key. Never print
 either private key.
 
-Gateway upgrades are reviewed release assets. Install
-`scripts/install-phoenix-release-platform.sh` from an exact merged commit, verify
-root ownership/modes, `sshd -t`, `sudo -l -U phoenix-deploy`, and protocol
-`phoenix-release.v1` before enabling the controller.
+Gateway upgrades are reviewed release assets. Install the exact merged platform
+while preserving the existing deploy key:
+
+```text
+sudo /bin/sh scripts/install-phoenix-release-platform.sh \
+  --release-sha <exact-merged-sha> --reuse-existing-key
+```
+
+The installer writes
+`/usr/local/libexec/phoenix-release/platform-manifest.json`. Every root platform
+and deploy-context safety file is hash-bound to that release SHA. Resume blocks
+if the installed platform, deploy context, ownership, or modes drift. Verify
+`release_platform.py verify`, `sshd -t`, `sudo -l -U phoenix-deploy`, and
+protocol `phoenix-release.v1` before enabling the controller.
 
 ## Migration policy
 

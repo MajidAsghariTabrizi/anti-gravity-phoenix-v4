@@ -257,6 +257,11 @@ jobs:
           [[ "$rollback_sha" =~ ^[0-9a-f]{40}$ ]]
           [[ "$rollback_build_run_id" =~ ^[1-9][0-9]*$ ]]
           [ "$rollback_sha" != 8f6a1c362773ba9e764954883402b0d6c7375349 ]
+          ssh "${ssh_opts[@]}" "${PROD_USER}@${PROD_HOST}" \
+            "readiness ${RELEASE_SHA}" >production-readiness.json
+          jq -e --arg sha "$RELEASE_SHA" \
+            '.candidate_sha == $sha and .status == "passed" and .failure_count == 0' \
+            production-readiness.json >/dev/null
           printf 'rollback_sha=%s\n' "$rollback_sha" >>"$GITHUB_OUTPUT"
           printf 'rollback_build_run_id=%s\n' "$rollback_build_run_id" >>"$GITHUB_OUTPUT"
           if [ "$rollback_sha" = "$RELEASE_SHA" ]; then
@@ -264,6 +269,15 @@ jobs:
           else
             echo "already_active=false" >>"$GITHUB_OUTPUT"
           fi
+
+      - name: Upload aggregated Production readiness
+        if: ${{ always() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: phoenix-production-readiness-${{ needs.prepare.outputs.release_sha }}
+          path: production-readiness.json
+          if-no-files-found: warn
+          retention-days: 30
 
   deploy:
     name: deploy-through-release-gateway
@@ -488,6 +502,23 @@ jobs:
               ssh "${ssh_opts[@]}" "${PROD_USER}@${PROD_HOST}" \
                 "receive ${RELEASE_SHA}" >receive-evidence.json
           fi
+          existing_phase="$(jq -r '.current_phase // empty' receive-evidence.json)"
+          case "$existing_phase" in
+            FAILED_PRE_MUTATION)
+              ssh "${ssh_opts[@]}" "${PROD_USER}@${PROD_HOST}" \
+                "retry-pre-mutation ${RELEASE_SHA}" >retry-evidence.json
+              ;;
+            ROLLED_BACK)
+              ssh "${ssh_opts[@]}" "${PROD_USER}@${PROD_HOST}" \
+                "retry-rolled-back ${RELEASE_SHA}" >retry-evidence.json
+              ;;
+            COMPLETED|"")
+              ;;
+            *)
+              echo "Existing release phase is not automatically retryable: $existing_phase" >&2
+              exit 1
+              ;;
+          esac
           set +e
           ssh "${ssh_opts[@]}" "${PROD_USER}@${PROD_HOST}" "resume ${RELEASE_SHA}" \
             >release-evidence.json

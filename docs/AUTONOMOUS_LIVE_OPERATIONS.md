@@ -18,7 +18,8 @@ After merged-main CI and the immutable release build succeed, an authorized
 administrator may install the gateway once from that verified release tree:
 
 ```text
-sudo /bin/sh scripts/install-phoenix-release-platform.sh /root/phoenix-deploy.pub
+sudo /bin/sh scripts/install-phoenix-release-platform.sh \
+  --release-sha <exact-merged-sha> --reuse-existing-key
 ```
 
 The `phoenix-deploy` account receives permission to invoke only that exact gateway

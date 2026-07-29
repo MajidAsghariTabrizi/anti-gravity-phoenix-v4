@@ -21,9 +21,11 @@ from phoenix_release.gateway import (  # noqa: E402
     host_paths,
     json_error,
     json_result,
+    production_readiness,
     receive_package,
     reconcile_active_context,
     retry_pre_mutation,
+    retry_rolled_back,
     rollback_release,
     resume,
     status,
@@ -43,6 +45,8 @@ def parser() -> argparse.ArgumentParser:
     subparsers = value.add_subparsers(dest="command", required=True)
     subparsers.add_parser("status")
     subparsers.add_parser("history")
+    readiness = subparsers.add_parser("readiness")
+    readiness.add_argument("release_sha", type=_sha)
     receive = subparsers.add_parser("receive")
     receive.add_argument("release_sha", type=_sha)
     plan = subparsers.add_parser("plan")
@@ -51,6 +55,8 @@ def parser() -> argparse.ArgumentParser:
     resume_parser.add_argument("release_sha", type=_sha)
     retry_parser = subparsers.add_parser("retry-pre-mutation")
     retry_parser.add_argument("release_sha", type=_sha)
+    retry_rollback = subparsers.add_parser("retry-rolled-back")
+    retry_rollback.add_argument("release_sha", type=_sha)
     rollback = subparsers.add_parser("rollback")
     rollback.add_argument("release_sha", type=_sha)
     subparsers.add_parser("emergency-pause")
@@ -72,6 +78,8 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if arguments.command == "status":
             result = status(paths)
+        elif arguments.command == "readiness":
+            result = production_readiness(paths, arguments.release_sha)
         elif arguments.command == "history":
             result = {
                 "schema": "phoenix.release-history.v1",
@@ -94,6 +102,8 @@ def main(argv: list[str] | None = None) -> int:
             result = resume(paths, arguments.release_sha)
         elif arguments.command == "retry-pre-mutation":
             result = retry_pre_mutation(paths, arguments.release_sha)
+        elif arguments.command == "retry-rolled-back":
+            result = retry_rolled_back(paths, arguments.release_sha)
         elif arguments.command == "evidence":
             result = evidence(paths, arguments.release_sha)
         elif arguments.command == "reconcile-active-context":

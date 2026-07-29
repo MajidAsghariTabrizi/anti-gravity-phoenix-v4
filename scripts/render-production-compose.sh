@@ -93,19 +93,19 @@ fi
 rendered_tmp=$state_dir/compose.rendered.json
 metadata_tmp=$state_dir/render.metadata.json
 
-if [ -n "${PHOENIX_COMPOSE_BIN:-}" ]; then
-  compose_command=$PHOENIX_COMPOSE_BIN
-  compose_prefix=
-else
-  command -v docker >/dev/null 2>&1 || fail PRODUCTION_COMPOSE_CONTEXT_MISSING
-  compose_command=docker
-  compose_prefix=compose
-fi
-
-set -- -f "$compose_file"
+compose_mode=SHADOW
 if [ -n "$overlay_file" ]; then
-  set -- "$@" -f "$overlay_file" --profile live-autonomous
+  compose_mode=LIVE
 fi
+set -- python3 "$script_dir/production_compose.py" \
+  --mode "$compose_mode" \
+  --env-file "$env_file" \
+  --release-env "$release_env" \
+  --compose-file "$compose_file"
+if [ -n "$overlay_file" ]; then
+  set -- "$@" --overlay-file "$overlay_file"
+fi
+set -- "$@" -- config --format json
 
 if ! env -i \
   PATH="${PATH:-}" \
@@ -114,12 +114,9 @@ if ! env -i \
   DOCKER_CONTEXT="${DOCKER_CONTEXT:-}" \
   DOCKER_HOST="${DOCKER_HOST:-}" \
   XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-}" \
-  PHOENIX_ENV_FILE="$env_file" \
-  "$compose_command" ${compose_prefix:+"$compose_prefix"} \
-    --env-file "$env_file" \
-    --env-file "$release_env" \
-    "$@" \
-    config --format json >"$rendered_tmp" 2>/dev/null; then
+  PHOENIX_COMPOSE_BIN="${PHOENIX_COMPOSE_BIN:-}" \
+  PHOENIX_DOCKER_BIN="${PHOENIX_DOCKER_BIN:-/usr/bin/docker}" \
+  "$@" >"$rendered_tmp" 2>/dev/null; then
   fail PRODUCTION_COMPOSE_CONTEXT_MISSING
 fi
 

@@ -64,13 +64,13 @@ mkdir -p "$runtime_dir"
 chmod 0700 "$runtime_dir"
 
 current_live_compose() {
-  PHOENIX_ENV_FILE="$env_file" PHOENIX_RELEASE_ENV="$live_release_env" \
-    docker compose \
-      --env-file "$env_file" \
-      --env-file "$live_release_env" \
-      -f "$compose_file" \
-      -f "$overlay_file" \
-      --profile live-autonomous "$@"
+  python3 "$deploy_dir/production_compose.py" \
+    --mode LIVE \
+    --env-file "$env_file" \
+    --release-env "$live_release_env" \
+    --compose-file "$compose_file" \
+    --overlay-file "$overlay_file" \
+    -- "$@"
 }
 
 if [ -f "$overlay_file" ] && [ -s "$live_release_env" ]; then
@@ -155,11 +155,12 @@ protected_after="$state_dir/protected.after.tsv"
   fail "canonical production rendering failed"
 
 compose() {
-  PHOENIX_ENV_FILE="$env_file" PHOENIX_RELEASE_ENV="$release_env" \
-    docker compose \
-      --env-file "$env_file" \
-      --env-file "$release_env" \
-      -f "$compose_file" "$@"
+  python3 "$deploy_dir/production_compose.py" \
+    --mode SHADOW \
+    --env-file "$env_file" \
+    --release-env "$release_env" \
+    --compose-file "$compose_file" \
+    -- "$@"
 }
 
 capture_protected_ids() {
