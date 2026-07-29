@@ -127,6 +127,9 @@ for release_script in "$deploy_script" "$rollback_script"; do
   then
     fail "Recorder durable-consumer drain validation is missing: $release_script"
   fi
+  if grep -F 'python3 -I -B "$drain_helper"' "$release_script" >/dev/null; then
+    fail "Recorder drain helper is isolated from its reviewed sibling module: $release_script"
+  fi
   grep -F 'stop -t 30 feed-ingestor' "$release_script" >/dev/null ||
     fail "Feed Ingestor is not quiesced before protected replacement: $release_script"
   grep -F -- '--force-recreate recorder' "$release_script" >/dev/null ||
@@ -148,6 +151,9 @@ grep -F 'transition_mutable_protected "$source_release_env" "$release_env"' \
 grep -F 'transition_mutable_protected "$release_env" "$source_release_env"' \
   "$rollback_script" >/dev/null ||
   fail 'failed operator rollback does not restore mutable protected services'
+grep -F 'compose_with_release_env "$target_env" up -d --no-deps feed-ingestor' \
+  "$rollback_script" >/dev/null ||
+  fail 'rollback cannot recover a quiesced unchanged Feed Ingestor'
 grep -F 'compose run --rm --no-deps migration-runner' "$deploy_script" >/dev/null ||
   fail 'migration runner can still start dependencies'
 grep -F 'installed release assets do not match release SHA' "$deploy_script" >/dev/null ||

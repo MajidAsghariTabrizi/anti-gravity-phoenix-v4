@@ -313,7 +313,7 @@ wait_recorder_drain() {
         >"$recorder_drain_snapshot"
     then
       drain_state=$(
-        python3 -I -B "$drain_helper" consumer-state \
+        python3 -B "$drain_helper" consumer-state \
           --jetstream "$recorder_drain_snapshot"
       ) || drain_state=
       drain_pending=$(printf '%s\n' "$drain_state" | awk '{ print $1 }')
