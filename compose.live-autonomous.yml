@@ -75,7 +75,7 @@ services:
       migration-runner:
         condition: service_completed_successfully
     networks: [phoenix-internal]
-    user: "0:0"
+    user: "1000:1000"
     read_only: true
     tmpfs:
       - /tmp:size=16m,mode=1777,noexec,nosuid,nodev
