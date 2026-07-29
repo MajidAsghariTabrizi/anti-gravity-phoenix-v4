@@ -215,9 +215,16 @@ capture_protected_ids() {
   : >"$output"
   for service in $protected_services; do
     id=$(compose ps -a -q "$service" | awk 'NF { print; exit }')
-    [ -n "$id" ] || return 1
-    state=$(docker inspect --format '{{.State.Status}}|{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "$id") || return 1
-    [ "$state" = 'running|healthy' ] || return 1
+    if [ -z "$id" ]; then
+      echo "PROTECTED_SERVICE_UNAVAILABLE: service=$service state=missing"
+      return 1
+    fi
+    state=$(docker inspect --format '{{.State.Status}}|{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "$id") ||
+      state=inspect_failed
+    if [ "$state" != 'running|healthy' ]; then
+      echo "PROTECTED_SERVICE_UNAVAILABLE: service=$service state=$state"
+      return 1
+    fi
     printf '%s\t%s\n' "$service" "$id" >>"$output"
   done
 }
