@@ -711,6 +711,12 @@ def _live_executor_stopped() -> dict[str, Any]:
     return evidence_value
 
 
+def _is_stopped_live_executor(
+    service: str, observed: dict[str, Any]
+) -> bool:
+    return service == "live-executor" and observed.get("running") is not True
+
+
 def _reconciliation_runtime(
     controls: dict[str, Any],
 ) -> dict[str, object]:
@@ -1057,6 +1063,8 @@ def production_readiness(
                         "service": service,
                     }
                     service_evidence.append(observed)
+                    if _is_stopped_live_executor(service, observed):
+                        continue
                     if (
                         observed["running"] is not True
                         or health not in {None, "healthy"}

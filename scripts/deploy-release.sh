@@ -614,6 +614,7 @@ context_validation_output=$(
     --current-release "$pointer_candidate" \
     --release-state "$state_candidate" \
     --inspect-running \
+    --allow-stopped-live-executor \
     --rendered-output "$context_rendered" \
     --metadata-output "$context_metadata" \
     --output "$context_candidate" 2>&1

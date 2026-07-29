@@ -130,6 +130,41 @@ python3 "$script_dir/release_assets.py" build \
   >/dev/null
 tar -xzf "$asset_dir/phoenix-release-assets-$legacy_sha.tar.gz" -C "$tmp_root"
 legacy_root=$tmp_root/phoenix-release-$legacy_sha
+
+declared_missing_root=$tmp_root/declared-missing
+cp -R "$legacy_root" "$declared_missing_root"
+rm -f -- "$declared_missing_root/docs/AUTOMATED_ECONOMIC_CONTROL.md"
+declared_missing_host=$tmp_root/declared-missing-host
+if run_installer \
+  "$declared_missing_host" "$legacy_sha" "$declared_missing_root" \
+  >/dev/null 2>&1
+then
+  fail 'manifest-declared release context source was allowed to be absent'
+fi
+
+python3 - "$legacy_root/release-assets-manifest.json" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+value = json.loads(path.read_text(encoding="utf-8"))
+legacy_absent = {
+    "docs/AUTOMATED_ECONOMIC_CONTROL.md",
+    "scripts/activate-economic-canary.sh",
+    "scripts/economic-dashboard-loop.sh",
+    "scripts/sql/economic-dashboard-snapshot.sql",
+}
+value["files"] = [
+    item for item in value["files"] if item["path"] not in legacy_absent
+]
+path.write_text(
+    json.dumps(value, indent=2, sort_keys=True) + "\n",
+    encoding="utf-8",
+)
+for relative in legacy_absent:
+    (path.parent / relative).unlink()
+PY
 rm -f -- "$legacy_root/release-components.json"
 cat >"$legacy_root/scripts/production-healthcheck.sh" <<'SH'
 #!/usr/bin/env sh
@@ -149,6 +184,15 @@ sudo cmp "$trusted_healthcheck" \
 if sudo grep -F '8547' "$legacy_host/deploy/production-healthcheck.sh" >/dev/null; then
   fail 'rollback context retained the legacy invalid healthcheck'
 fi
+for legacy_absent_target in \
+  docs/AUTOMATED_ECONOMIC_CONTROL.md \
+  activate-economic-canary.sh \
+  economic-dashboard-loop.sh \
+  sql/economic-dashboard-snapshot.sql
+do
+  [ ! -e "$legacy_host/deploy/$legacy_absent_target" ] ||
+    fail "legacy context installed an undeclared source: $legacy_absent_target"
+done
 
 expect_legacy_fallback_failure() {
   case_name=$1
