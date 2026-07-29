@@ -784,8 +784,6 @@ if [ "$context_validation_code" -ne 0 ]; then
   printf '%s\n' "$context_validation_evidence"
   fail "production release context validation failed"
 fi
-mark_phase POST_LIVE_VERIFIED
-
 install_active_file "$metadata_candidate" "$release_metadata" 0640
 install_active_file "$state_candidate" "$release_state" 0640
 install_active_file "$release_env" "$current_env" 0640
