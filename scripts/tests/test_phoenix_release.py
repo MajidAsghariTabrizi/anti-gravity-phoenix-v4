@@ -1768,6 +1768,8 @@ class WorkflowAndDeploymentContractTests(unittest.TestCase):
         evidence_phase = self.deploy.index(
             "mark_phase DISARMED_EVIDENCE_STARTED"
         )
+        self.assertNotIn("mark_phase POST_LIVE_VERIFIED", self.deploy)
+        self.assertLess(evidence_phase, promote)
         stopped_executor = self.deploy.rfind(
             'compose ps -q live-executor', 0, context_validation
         )
