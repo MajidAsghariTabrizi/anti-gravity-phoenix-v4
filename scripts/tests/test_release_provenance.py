@@ -394,6 +394,31 @@ class ReleaseProvenanceTests(unittest.TestCase):
             provenance, manifest, self._run_evidence()
         )
 
+    def test_impact_plan_may_rebuild_protected_images(self) -> None:
+        (
+            manifest,
+            provenance,
+            manifest_path,
+            _,
+            _,
+            _,
+            _,
+            _,
+        ) = self._assemble_inherited(
+            built_images=list(release_provenance.EXPECTED_IMAGES)
+        )
+        self.assertEqual(
+            provenance["built_images"],
+            list(release_provenance.EXPECTED_IMAGES),
+        )
+        self.assertEqual(provenance["inherited_images"], [])
+        for image in manifest["images"].values():
+            self.assertEqual(image["origin"], "built")
+            self.assertEqual(image["source_sha"], RELEASE_SHA)
+            self.assertEqual(image["source_build_run_id"], RUN_ID)
+        _, context_sha, _ = production_context.load_manifest(manifest_path)
+        self.assertEqual(context_sha, RELEASE_SHA)
+
     def test_protected_base_dispatch_inputs_are_atomic(self) -> None:
         for base_sha, base_run in ((BASE_SHA, ""), ("", BASE_RUN_ID)):
             with self.subTest(base_sha=base_sha, base_run=base_run):
