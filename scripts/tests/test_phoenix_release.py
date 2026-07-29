@@ -1412,6 +1412,7 @@ class WorkflowAndDeploymentContractTests(unittest.TestCase):
 
     def test_controller_is_automatic_resumable_and_serialized(self) -> None:
         self.assertIn('workflows: ["Phoenix CI"]', self.workflow)
+        self.assertIn("branches: [main]", self.workflow)
         self.assertIn("workflow_dispatch:", self.workflow)
         self.assertNotIn("schedule:", self.workflow)
         self.assertNotIn("cron:", self.workflow)

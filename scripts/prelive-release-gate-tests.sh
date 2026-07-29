@@ -93,8 +93,10 @@ grep -F 'needs: [preflight, build, assets]' "$build_workflow" >/dev/null ||
   fail 'release manifest is not gated on immutable assets'
 grep -F 'inherit-protected' "$build_workflow" >/dev/null ||
   fail 'protected image inheritance materialization is missing'
-grep -F 'matrix.protected == false' "$build_workflow" >/dev/null ||
-  fail 'protected images are not excluded from inherited builds'
+grep -F 'if: ${{ matrix.build == false }}' "$build_workflow" >/dev/null ||
+  fail 'unchanged image inheritance is not selected by the impact plan'
+grep -F -- '--inherited-images-json' "$build_workflow" >/dev/null ||
+  fail 'selective inherited image evidence is not materialized'
 
 for release_script in "$deploy_script" "$rollback_script"; do
   grep -F "protected_services='nitro-feed-relay feed-ingestor nats postgres recorder'" "$release_script" >/dev/null ||
