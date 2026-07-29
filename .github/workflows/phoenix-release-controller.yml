@@ -4,6 +4,7 @@ on:
   workflow_run:
     workflows: ["Phoenix CI"]
     types: [completed]
+    branches: [main]
   workflow_dispatch:
     inputs:
       release_sha:
