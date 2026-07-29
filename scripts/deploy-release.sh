@@ -541,8 +541,13 @@ mark_phase DISARMED_CONTROL_INSTALLED
 for service in $optional_services; do
   case "$service" in
     rpc-gateway|phoenix-engine) continue ;;
+    economic-monitor)
+      compose up -d --no-deps --force-recreate "$service"
+      ;;
+    *)
+      compose up -d --no-deps "$service"
+      ;;
   esac
-  compose up -d --no-deps "$service"
   wait_service_healthy "$service" || fail "optional service did not become healthy: $service"
 done
 compose up -d --no-deps rpc-gateway
