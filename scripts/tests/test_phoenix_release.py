@@ -1045,6 +1045,7 @@ class BoundedTransportTests(unittest.TestCase):
             "emergency-pause",
             "evidence",
             "reconcile-active-context",
+            "reconcile-chain-evidence",
         ):
             self.assertIn(command, transport)
 

@@ -147,6 +147,7 @@ jobs:
             scripts/phoenix_release/*.py
           python3 -m unittest \
             scripts.tests.test_change_impact \
+            scripts.tests.test_chain_reconciliation \
             scripts.tests.test_release_assets \
             scripts.tests.test_release_components \
             scripts.tests.test_release_provenance \
@@ -177,7 +178,10 @@ jobs:
           python3 -m py_compile scripts/change_impact.py
           python3 -m unittest scripts.tests.test_change_impact
           python3 -m py_compile scripts/phoenix_release/*.py
-          python3 -m unittest scripts.tests.test_phoenix_release -v
+          python3 -m unittest \
+            scripts.tests.test_chain_reconciliation \
+            scripts.tests.test_phoenix_release \
+            -v
           sh ./scripts/phoenix-release-platform-tests.sh
           python3 -m py_compile scripts/hunter_contracts.py
           python3 scripts/hunter_contracts.py validate-fixtures
