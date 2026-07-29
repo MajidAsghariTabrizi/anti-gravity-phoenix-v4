@@ -1159,7 +1159,7 @@ class BoundedTransportTests(unittest.TestCase):
             self.assertFalse(failed["mutation_started"])
             install_candidate.assert_not_called()
 
-    def test_candidate_render_failure_needs_context_only_reconciliation(self) -> None:
+    def test_candidate_render_failure_needs_runtime_reconciliation(self) -> None:
         value = state()
         value = set_mutation_started(value)
         value = fail_state(
@@ -1168,7 +1168,7 @@ class BoundedTransportTests(unittest.TestCase):
             evidence={},
         )
         value["failure_phase"] = "CANDIDATE_LIVE_RENDER_VERIFIED"
-        self.assertFalse(_runtime_may_have_changed(value))
+        self.assertTrue(_runtime_may_have_changed(value))
         value["failure_phase"] = "MIGRATIONS_APPLIED"
         self.assertTrue(_runtime_may_have_changed(value))
 
@@ -1199,7 +1199,7 @@ class BoundedTransportTests(unittest.TestCase):
                 },
             )
 
-    def test_resume_reconciles_context_only_rollback_failure(self) -> None:
+    def test_resume_reconciles_candidate_runtime_rollback_failure(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             paths = self.paths(Path(temporary))
             value = state()
@@ -1229,13 +1229,17 @@ class BoundedTransportTests(unittest.TestCase):
             ):
                 recovered = resume(paths, RELEASE_SHA)
 
-            require_success.assert_called_once()
-            emergency_pause.assert_not_called()
+            self.assertEqual(require_success.call_count, 2)
+            emergency_pause.assert_called_once()
+            self.assertEqual(
+                require_success.call_args_list[1].args[0][1],
+                str(paths.libexec / "rollback-release.sh"),
+            )
             self.assertEqual(recovered["current_phase"], "ROLLED_BACK")
             self.assertIsNone(recovered["candidate_pointer"])
             self.assertEqual(
                 recovered["rollback_result"]["runtime_reconciled"],
-                False,
+                True,
             )
 
     def test_failed_rollback_retry_keeps_terminal_state_and_new_evidence(self) -> None:

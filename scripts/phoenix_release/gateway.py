@@ -1897,7 +1897,8 @@ def _runtime_may_have_changed(state: dict[str, Any]) -> bool:
     failure_phase = state.get("failure_phase")
     return (
         failure_phase in PHASES
-        and PHASES.index(failure_phase) >= PHASES.index("MIGRATIONS_APPLIED")
+        and PHASES.index(failure_phase)
+        >= PHASES.index("CANDIDATE_LIVE_RENDER_VERIFIED")
     )
 
 
@@ -1927,7 +1928,7 @@ def _rollback_failed_state(
             env={"PHOENIX_DEPLOY_ROOT": str(paths.deploy_root)},
         )
         if runtime_may_have_changed:
-            rollback_script = rollback_root / "scripts" / "rollback-release.sh"
+            rollback_script = paths.libexec / "rollback-release.sh"
             _require_success(
                 ["/bin/sh", str(rollback_script)],
                 "ROLLBACK_FAILED",

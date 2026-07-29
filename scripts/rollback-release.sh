@@ -142,7 +142,7 @@ wait_recorder_drain() {
         >"$drain_snapshot"
     then
       drain_state=$(
-        python3 -I -B "$drain_helper" consumer-state \
+        python3 -B "$drain_helper" consumer-state \
           --jetstream "$drain_snapshot"
       ) || drain_state=
       drain_pending=$(printf '%s\n' "$drain_state" | awk '{ print $1 }')
@@ -177,6 +177,12 @@ transition_mutable_protected() {
   if [ "$source_feed" = "$target_feed" ] &&
     [ "$source_recorder" = "$target_recorder" ]
   then
+    compose_with_release_env "$target_env" up -d --no-deps recorder \
+      >/dev/null || return 1
+    wait_service_healthy_with_env "$target_env" recorder || return 1
+    compose_with_release_env "$target_env" up -d --no-deps feed-ingestor \
+      >/dev/null || return 1
+    wait_service_healthy_with_env "$target_env" feed-ingestor || return 1
     return 0
   fi
 
