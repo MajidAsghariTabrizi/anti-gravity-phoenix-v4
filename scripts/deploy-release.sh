@@ -21,8 +21,10 @@ runtime_dir="${PHOENIX_DEPLOY_RUNTIME_DIR:-$deploy_dir/.deploy-runtime}"
 candidate_release_assets_file="$deploy_dir/candidate-release-assets.sha"
 release_assets_file="$deploy_dir/release-assets.sha"
 protected_services='nitro-feed-relay feed-ingestor nats postgres recorder'
+fixed_protected_services='nitro-feed-relay nats postgres'
 optional_services='prometheus rpc-gateway shadow-dispatcher phoenix-engine dashboard economic-monitor economic-supervisor'
 service_wait_seconds=${PHOENIX_DEPLOY_SERVICE_WAIT_SECONDS:-300}
+recorder_drain_seconds=${PHOENIX_RECORDER_DRAIN_SECONDS:-180}
 engine_burn_in_seconds=${PHOENIX_ENGINE_BURN_IN_SECONDS:-120}
 release_state_updater=${PHOENIX_RELEASE_STATE_UPDATER:-}
 
@@ -103,6 +105,11 @@ case "$service_wait_seconds" in
 esac
 [ "$service_wait_seconds" -ge 30 ] && [ "$service_wait_seconds" -le 900 ] ||
   fail "service wait seconds must be from 30 through 900"
+case "$recorder_drain_seconds" in
+  ''|*[!0-9]*) fail "Recorder drain seconds must be an integer" ;;
+esac
+[ "$recorder_drain_seconds" -ge 30 ] && [ "$recorder_drain_seconds" -le 900 ] ||
+  fail "Recorder drain seconds must be from 30 through 900"
 case "$engine_burn_in_seconds" in
   ''|*[!0-9]*) fail "Engine burn-in seconds must be an integer" ;;
 esac
@@ -172,6 +179,10 @@ context_rendered="$state_dir/context.compose.json"
 context_metadata="$state_dir/context.metadata.json"
 protected_before="$state_dir/protected.before.tsv"
 protected_after="$state_dir/protected.after.tsv"
+fixed_before="$state_dir/fixed-protected.before.tsv"
+fixed_after="$state_dir/fixed-protected.after.tsv"
+recorder_drain_snapshot="$state_dir/recorder-drain.json"
+protected_transition_started=0
 
 verify_active_release_coherence() {
   expected_sha=$1
@@ -210,11 +221,30 @@ compose() {
     -- "$@"
 }
 
-capture_protected_ids() {
-  output=$1
+rollback_release_env="$deploy_dir/manifests/$rollback_sha.env"
+[ -s "$rollback_release_env" ] ||
+  fail "active rollback release environment is missing"
+
+compose_with_release_env() {
+  selected_release_env=$1
+  shift
+  python3 "$deploy_dir/production_compose.py" \
+    --mode LIVE \
+    --env-file "$env_file" \
+    --release-env "$selected_release_env" \
+    --compose-file "$compose_file" \
+    --overlay-file "$overlay_file" \
+    -- "$@"
+}
+
+capture_service_ids() {
+  capture_release_env=$1
+  capture_services=$2
+  output=$3
   : >"$output"
-  for service in $protected_services; do
-    id=$(compose ps -a -q "$service" | awk 'NF { print; exit }')
+  for service in $capture_services; do
+    id=$(compose_with_release_env "$capture_release_env" ps -a -q "$service" |
+      awk 'NF { print; exit }')
     if [ -z "$id" ]; then
       echo "PROTECTED_SERVICE_UNAVAILABLE: service=$service state=missing"
       return 1
@@ -229,11 +259,17 @@ capture_protected_ids() {
   done
 }
 
-wait_service_healthy() {
-  service=$1
+capture_protected_ids() {
+  capture_service_ids "$release_env" "$protected_services" "$1"
+}
+
+wait_service_healthy_with_env() {
+  healthy_release_env=$1
+  service=$2
   deadline=$(( $(date +%s) + service_wait_seconds ))
   while [ "$(date +%s)" -lt "$deadline" ]; do
-    id=$(compose ps -a -q "$service" | awk 'NF { print; exit }')
+    id=$(compose_with_release_env "$healthy_release_env" ps -a -q "$service" |
+      awk 'NF { print; exit }')
     if [ -n "$id" ]; then
       state=$(docker inspect --format '{{.State.Status}}|{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "$id" 2>/dev/null || true)
       [ "$state" = 'running|healthy' ] && return 0
@@ -241,6 +277,107 @@ wait_service_healthy() {
     sleep 3
   done
   return 1
+}
+
+wait_service_healthy() {
+  wait_service_healthy_with_env "$release_env" "$1"
+}
+
+release_env_value() {
+  value_file=$1
+  value_name=$2
+  awk -F= -v expected="$value_name" '
+    $1 == expected {
+      print substr($0, length($1) + 2)
+      found = 1
+      exit
+    }
+    END {
+      if (!found) {
+        exit 1
+      }
+    }
+  ' "$value_file"
+}
+
+wait_recorder_drain() {
+  drain_release_env=$1
+  drain_helper="$deploy_dir/prelive_protected_maintenance.py"
+  [ -f "$drain_helper" ] && [ ! -L "$drain_helper" ] ||
+    return 1
+  drain_deadline=$(( $(date +%s) + recorder_drain_seconds ))
+  while [ "$(date +%s)" -lt "$drain_deadline" ]; do
+    if compose_with_release_env "$drain_release_env" exec -T nats \
+      wget -q -O - \
+        'http://127.0.0.1:8222/jsz?streams=true&consumers=true&config=true' \
+        >"$recorder_drain_snapshot"
+    then
+      drain_state=$(
+        python3 -I -B "$drain_helper" consumer-state \
+          --jetstream "$recorder_drain_snapshot"
+      ) || drain_state=
+      drain_pending=$(printf '%s\n' "$drain_state" | awk '{ print $1 }')
+      drain_ack_pending=$(printf '%s\n' "$drain_state" | awk '{ print $2 }')
+      case "$drain_pending:$drain_ack_pending" in
+        *[!0-9:]*|:*|*:|*::*) ;;
+        *)
+          if [ "$drain_pending" -eq 0 ] && [ "$drain_ack_pending" -eq 0 ]; then
+            return 0
+          fi
+          ;;
+      esac
+    fi
+    sleep 3
+  done
+  return 1
+}
+
+transition_mutable_protected() {
+  source_release_env=$1
+  target_release_env=$2
+  source_feed=$(release_env_value "$source_release_env" FEED_INGESTOR_IMAGE) ||
+    return 1
+  target_feed=$(release_env_value "$target_release_env" FEED_INGESTOR_IMAGE) ||
+    return 1
+  source_recorder=$(release_env_value "$source_release_env" RECORDER_IMAGE) ||
+    return 1
+  target_recorder=$(release_env_value "$target_release_env" RECORDER_IMAGE) ||
+    return 1
+  if [ "$source_feed" = "$target_feed" ] &&
+    [ "$source_recorder" = "$target_recorder" ]
+  then
+    return 0
+  fi
+
+  protected_transition_started=1
+  transition_started_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+  compose_with_release_env "$source_release_env" stop -t 30 feed-ingestor \
+    >/dev/null || return 1
+  wait_recorder_drain "$source_release_env" || return 1
+  if [ "$source_recorder" != "$target_recorder" ]; then
+    compose_with_release_env "$target_release_env" up -d --no-deps \
+      --force-recreate recorder >/dev/null || return 1
+    wait_service_healthy_with_env "$target_release_env" recorder || return 1
+  fi
+  if [ "$source_feed" = "$target_feed" ]; then
+    compose_with_release_env "$target_release_env" up -d --no-deps \
+      feed-ingestor >/dev/null || return 1
+  else
+    compose_with_release_env "$target_release_env" up -d --no-deps \
+      --force-recreate feed-ingestor >/dev/null || return 1
+  fi
+  wait_service_healthy_with_env "$target_release_env" feed-ingestor || return 1
+  transition_log="$state_dir/protected-transition.log"
+  compose_with_release_env "$target_release_env" logs --no-color \
+    --since "$transition_started_at" nats recorder feed-ingestor \
+    >"$transition_log" 2>&1 || return 1
+  if grep -Eiq \
+      'slow consumer|core_nats_message_drop|Core NATS delivery loss|recorder_nats_slow_consumer' \
+      "$transition_log"
+  then
+    return 1
+  fi
+  return 0
 }
 
 validate_live_rpc_inputs() {
@@ -441,6 +578,8 @@ active_environment_identity_after=$(production_environment_identity "$env_file")
 [ "$active_environment_identity_after" = "$active_environment_identity_before" ] ||
   fail "active production environment changed during candidate preflight"
 capture_protected_ids "$protected_before" || fail "protected services are not ready before deployment"
+capture_service_ids "$release_env" "$fixed_protected_services" "$fixed_before" ||
+  fail "fixed protected services are not ready before deployment"
 mark_phase CANDIDATE_LIVE_RENDER_VERIFIED
 
 rollback_on_failure() {
@@ -469,6 +608,9 @@ rollback_on_failure() {
     set +e
     rollback_output=$(
       {
+        if [ "$protected_transition_started" -eq 1 ]; then
+          transition_mutable_protected "$release_env" "$rollback_release_env"
+        fi &&
         PHOENIX_DEPLOY_ROOT="$deploy_root" \
         PHOENIX_ENV_FILE="$env_file" \
           /bin/sh "$rollback_context_installer" \
@@ -528,6 +670,8 @@ assert_live_environment
   fail "canonical production rendering failed"
 validate_live_rpc_rendering ||
   fail "rendered LIVE RPC provider and priority configuration is invalid"
+transition_mutable_protected "$rollback_release_env" "$release_env" ||
+  fail "mutable protected services could not transition without loss"
 compose stop -t 30 live-executor >/dev/null 2>&1 || true
 compose run --rm --no-deps autonomous-control migrate
 compose run --rm --no-deps migration-runner
@@ -565,7 +709,14 @@ mark_phase POST_DISARMED_VERIFYING
 [ -z "$(compose ps -q live-executor | awk 'NF { print; exit }')" ] ||
   fail "live-executor started during disarmed deployment"
 capture_protected_ids "$protected_after" || fail "protected services are not ready after deployment"
-cmp "$protected_before" "$protected_after" >/dev/null || fail "protected service identity changed during deployment"
+capture_service_ids "$release_env" "$fixed_protected_services" "$fixed_after" ||
+  fail "fixed protected services are not ready after deployment"
+cmp "$fixed_before" "$fixed_after" >/dev/null ||
+  fail "fixed protected service identity changed during deployment"
+if [ "$protected_transition_started" -eq 0 ]; then
+  cmp "$protected_before" "$protected_after" >/dev/null ||
+    fail "protected service identity changed without an image transition"
+fi
 reload_environment
 assert_live_environment
 (
