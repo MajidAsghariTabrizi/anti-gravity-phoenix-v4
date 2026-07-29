@@ -74,6 +74,16 @@ def rpc_result(
             "status": "0x1",
             "transactionHash": OWNER_TRANSACTION,
         }
+    if method == "eth_getBlockReceipts":
+        assert params == ["0x123"]
+        return [
+            {
+                "blockHash": BLOCK_HASH,
+                "blockNumber": "0x123",
+                "status": "0x1",
+                "transactionHash": OWNER_TRANSACTION,
+            }
+        ]
     if method == "eth_getTransactionByHash":
         assert params == [OWNER_TRANSACTION]
         return {
@@ -168,6 +178,40 @@ class ProviderEvidenceTests(unittest.TestCase):
                 OWNER_TRANSACTION,
                 call=disagreeing,
             )
+
+    def test_block_receipts_fallback_preserves_provider_agreement(self) -> None:
+        def fallback(
+            url: str,
+            method: str,
+            params: list[object],
+        ) -> object:
+            if (
+                url == PROVIDERS[1]
+                and method == "eth_getTransactionReceipt"
+            ):
+                raise ReconciliationError(
+                    "CHAIN_EVIDENCE_RPC_UNAVAILABLE"
+                )
+            return rpc_result(url, method, params)
+
+        observed = collect_provider_evidence(
+            PROVIDERS,
+            EXECUTOR,
+            OWNER_TRANSACTION,
+            call=fallback,
+        )
+        self.assertEqual(
+            observed[0]["receipt_source"],
+            "eth_getTransactionReceipt",
+        )
+        self.assertEqual(
+            observed[1]["receipt_source"],
+            "eth_getBlockReceipts",
+        )
+        self.assertEqual(
+            observed[0]["receipt_status"],
+            observed[1]["receipt_status"],
+        )
 
     def test_paused_false_rejects(self) -> None:
         def unpaused(
