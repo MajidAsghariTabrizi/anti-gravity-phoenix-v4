@@ -1294,9 +1294,10 @@ async fn apply_autonomous_risk_feedback(
     let global_loss = global.0.parse::<u128>().map_err(|_| StoreError::Data)?;
     let global_limit = global.1.parse::<u128>().map_err(|_| StoreError::Data)?;
 
-    let policy: Value =
-        serde_json::from_str(include_str!("../../config/phoenix-route-policy-v1.json"))
-            .map_err(|_| StoreError::Data)?;
+    let policy: Value = serde_json::from_str(
+        crate::reviewed_route_policy(&route_fingerprint).ok_or(StoreError::Data)?,
+    )
+    .map_err(|_| StoreError::Data)?;
     let route_limit = policy
         .get("per_route_daily_loss")
         .and_then(Value::as_str)

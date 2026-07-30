@@ -25,7 +25,7 @@ use phoenix_live_executor::signer::TransactionSigner;
 use phoenix_live_executor::store::{ExecutorStore, PostgresExecutorStore};
 use phoenix_live_executor::{
     ARBITRUM_NATIVE_USDC_ADDRESS, ARBITRUM_ONE_CHAIN_ID, ARBITRUM_WETH_ADDRESS,
-    CURRENT_ROUTE_FINGERPRINT, CURRENT_ROUTE_POOL_3000_ADDRESS, CURRENT_ROUTE_POOL_500_ADDRESS,
+    CURRENT_ROUTE_POOL_3000_ADDRESS, CURRENT_ROUTE_POOL_500_ADDRESS, REVERSE_ROUTE_FINGERPRINT,
 };
 use rpc_gateway::hunter_state::{
     HunterStateResponse, PinnedV3PoolState, ProviderStateAgreement, HUNTER_STATE_RESPONSE_SCHEMA,
@@ -164,6 +164,7 @@ struct ControlSnapshot {
     global_contract: Option<Json<Value>>,
     route_enabled: bool,
     route_kill_switch: bool,
+    route_fingerprint: String,
     route_reason: Option<String>,
     route_hash: Option<String>,
     route_contract: Option<Json<Value>>,
@@ -185,19 +186,25 @@ impl ControlSnapshot {
         )
         .fetch_one(pool)
         .await?;
-        let route = sqlx::query(
-            "SELECT enabled, kill_switch, disarm_reason, control_hash, control_contract
-             FROM live_canary.autonomous_route_controls
-             WHERE route_fingerprint = $1",
-        )
-        .bind(CURRENT_ROUTE_FINGERPRINT)
-        .fetch_one(pool)
-        .await?;
         let economic_control: Json<Value> = sqlx::query_scalar(
             "SELECT to_jsonb(economic)
              FROM live_canary.economic_control economic
              WHERE singleton",
         )
+        .fetch_one(pool)
+        .await?;
+        let route_fingerprint = economic_control
+            .0
+            .get("route_fingerprint")
+            .and_then(Value::as_str)
+            .ok_or_else(|| failure("economic route fingerprint is missing"))?
+            .to_string();
+        let route = sqlx::query(
+            "SELECT enabled, kill_switch, disarm_reason, control_hash, control_contract
+             FROM live_canary.autonomous_route_controls
+             WHERE route_fingerprint = $1",
+        )
+        .bind(&route_fingerprint)
         .fetch_one(pool)
         .await?;
         Ok(Self {
@@ -212,6 +219,7 @@ impl ControlSnapshot {
             global_contract: global.try_get("control_contract")?,
             route_enabled: route.try_get("enabled")?,
             route_kill_switch: route.try_get("kill_switch")?,
+            route_fingerprint,
             route_reason: route.try_get("disarm_reason")?,
             route_hash: route.try_get("control_hash")?,
             route_contract: route.try_get("control_contract")?,
@@ -253,7 +261,7 @@ impl ControlSnapshot {
                  control_hash = $5, control_contract = $6, updated_at = $7
              WHERE route_fingerprint = $1",
         )
-        .bind(CURRENT_ROUTE_FINGERPRINT)
+        .bind(&self.route_fingerprint)
         .bind(self.route_enabled)
         .bind(self.route_kill_switch)
         .bind(&self.route_reason)
@@ -391,7 +399,7 @@ impl Fixture {
             .ok_or_else(|| failure("scenario clock is invalid"))?;
         reset_history(&pool).await?;
         controls.restore(&pool, base).await?;
-        validate_control_budgets(&pool).await?;
+        validate_control_budgets(&pool, &controls.route_fingerprint).await?;
         Ok(Some(Self {
             scenario,
             seed,
@@ -442,7 +450,13 @@ impl Fixture {
             block_hash: anchor.block_hash.clone(),
             observed_at_unix_ms: u64::try_from(at.timestamp_millis()).map_err(boxed)?,
             evaluated_at_unix_ms: u64::try_from(at.timestamp_millis()).map_err(boxed)?,
-            touched_pool_addresses: vec![CURRENT_ROUTE_POOL_500_ADDRESS.to_string()],
+            touched_pool_addresses: vec![if self.controls.route_fingerprint
+                == REVERSE_ROUTE_FINGERPRINT
+            {
+                CURRENT_ROUTE_POOL_3000_ADDRESS.to_string()
+            } else {
+                CURRENT_ROUTE_POOL_500_ADDRESS.to_string()
+            }],
             initiating_swap_direction: Some(Direction::ZeroForOne),
         };
         let states = states(
@@ -452,6 +466,7 @@ impl Fixture {
                 .checked_mul(100)
                 .and_then(|value| value.checked_add(variant))
                 .ok_or_else(|| failure("state seed overflow"))?,
+            &self.controls.route_fingerprint,
         );
         let bindings = CandidateBindings {
             risk_snapshot_hash: PREAPPROVAL_ZERO_DIGEST.to_string(),
@@ -467,9 +482,14 @@ impl Fixture {
     async fn candidate(&self, variant: u64) -> TestResult<CandidateBundle> {
         let (event, states, bindings) = self.hunter_input(variant).await?;
         let bounds = HunterBounds::default();
+        let policy = if self.controls.route_fingerprint == REVERSE_ROUTE_FINGERPRINT {
+            include_str!("../../config/phoenix-route-policy-3000-500-v1.json")
+        } else {
+            include_str!("../../config/phoenix-route-policy-v1.json")
+        };
         let graph = HunterRouteGraph::from_contracts(
             include_str!("../../config/phoenix-route-universe-v1.json"),
-            &[include_str!("../../config/phoenix-route-policy-v1.json")],
+            &[policy],
             bounds,
         )
         .map_err(boxed)?;
@@ -651,7 +671,7 @@ impl Fixture {
                    ON r.route_fingerprint = $1
                  WHERE c.singleton AND g.singleton",
         )
-        .bind(CURRENT_ROUTE_FINGERPRINT)
+        .bind(&self.controls.route_fingerprint)
         .fetch_optional(&self.pool)
         .await
         .ok()
@@ -1099,7 +1119,7 @@ async fn scenario_08_outcome_v1_and_realized_pnl() -> TestResult {
          CROSS JOIN live_canary.economic_control economic
          WHERE route.route_fingerprint = $1 AND economic.singleton",
     )
-    .bind(CURRENT_ROUTE_FINGERPRINT)
+    .bind(&fixture.controls.route_fingerprint)
     .fetch_one(&fixture.pool)
     .await?;
     require(
@@ -1324,7 +1344,7 @@ async fn scenario_11_route_risk_feedback_at_threshold() -> TestResult {
          CROSS JOIN live_canary.economic_control economic
          WHERE route.route_fingerprint = $1 AND economic.singleton",
     )
-    .bind(CURRENT_ROUTE_FINGERPRINT)
+    .bind(&fixture.controls.route_fingerprint)
     .fetch_one(&fixture.pool)
     .await?;
     require(
@@ -1815,7 +1835,7 @@ ON CONFLICT (result_hash) DO NOTHING
     Ok(())
 }
 
-async fn validate_control_budgets(pool: &PgPool) -> TestResult {
+async fn validate_control_budgets(pool: &PgPool, route_fingerprint: &str) -> TestResult {
     let global: (String, String) = sqlx::query_as(
         "SELECT daily_loss_limit::text, maximum_input_amount::text
          FROM live_canary.autonomous_global_control WHERE singleton",
@@ -1826,7 +1846,7 @@ async fn validate_control_budgets(pool: &PgPool) -> TestResult {
         "SELECT control_contract FROM live_canary.autonomous_route_controls
          WHERE route_fingerprint = $1",
     )
-    .bind(CURRENT_ROUTE_FINGERPRINT)
+    .bind(route_fingerprint)
     .fetch_one(pool)
     .await?;
     let route_loss = route
@@ -1997,7 +2017,9 @@ fn states(
     block_number: u64,
     block_hash: &str,
     seed: u64,
+    route_fingerprint: &str,
 ) -> BTreeMap<String, ProviderStateAgreement> {
+    let reverse = route_fingerprint == REVERSE_ROUTE_FINGERPRINT;
     let mut states = BTreeMap::new();
     for (index, pool_id, address, fee, spacing, tick) in [
         (
@@ -2006,7 +2028,7 @@ fn states(
             CURRENT_ROUTE_POOL_500_ADDRESS,
             500,
             10,
-            0,
+            if reverse { -300 } else { 0 },
         ),
         (
             2_u64,
@@ -2014,7 +2036,7 @@ fn states(
             CURRENT_ROUTE_POOL_3000_ADDRESS,
             3000,
             60,
-            -300,
+            if reverse { 0 } else { -300 },
         ),
     ] {
         let state = state(

@@ -327,6 +327,7 @@ pub enum ActivationRequestError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::REVERSE_ROUTE_FINGERPRINT;
     use chrono::TimeZone;
 
     fn now() -> DateTime<Utc> {
@@ -343,8 +344,9 @@ mod tests {
             candidate_plan_hash: "2".repeat(64),
             fork_plan_hash: "3".repeat(64),
             fork_result_hash: "4".repeat(64),
-            route_fingerprint: "route".to_string(),
-            route_policy_hash: "5".repeat(64),
+            route_fingerprint: REVERSE_ROUTE_FINGERPRINT.to_string(),
+            route_policy_hash: "36da85c0fd07e5d3a12726582b20c84d81cfbd2d1d982da8237d3b5cf38b83d5"
+                .to_string(),
             state_block_number: 1,
             state_block_hash: format!("0x{}", "6".repeat(64)),
             state_hash: "7".repeat(64),
@@ -365,7 +367,8 @@ mod tests {
             release_sha: "a".repeat(40),
             engine_image_digest: format!("sha256:{}", "b".repeat(64)),
             route_fingerprint: candidate.route_fingerprint.clone(),
-            route_universe_hash: "c".repeat(64),
+            route_universe_hash: "84adac686635535486e06e44fcaf90c812dc27273affc5bffc4eebd6c164928c"
+                .to_string(),
             route_policy_hash: candidate.route_policy_hash.clone(),
             risk_policy_hash: "d".repeat(64),
             economic_control_epoch: 1,
@@ -425,8 +428,14 @@ mod tests {
     }
 
     #[test]
-    fn canonical_fresh_request_passes() {
-        request().validate(now()).expect("valid request");
+    fn canonical_fresh_reverse_route_request_passes() {
+        let request = request();
+        assert_eq!(
+            request.candidate.route_fingerprint,
+            REVERSE_ROUTE_FINGERPRINT
+        );
+        assert_eq!(request.binding.route_fingerprint, REVERSE_ROUTE_FINGERPRINT);
+        request.validate(now()).expect("valid request");
     }
 
     #[test]

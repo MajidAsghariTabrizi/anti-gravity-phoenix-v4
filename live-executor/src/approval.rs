@@ -7,6 +7,7 @@ use crate::{
     APPROVAL_POLICY_VERSION, ARBITRUM_NATIVE_USDC_ADDRESS, ARBITRUM_ONE_CHAIN_ID,
     ARBITRUM_UNISWAP_V3_FACTORY_ADDRESS, ARBITRUM_WETH_ADDRESS, CURRENT_ROUTE_FINGERPRINT,
     CURRENT_ROUTE_POOL_3000_ADDRESS, CURRENT_ROUTE_POOL_500_ADDRESS, REQUEST_SCHEMA_VERSION,
+    REVERSE_ROUTE_FINGERPRINT,
 };
 use chrono::{DateTime, Duration, Timelike, Utc};
 use phoenix_fork_sandbox::model::{
@@ -586,15 +587,16 @@ fn ensure_same_evidence(
 }
 
 fn matches_current_route(plan: &UnsignedTransactionPlan) -> bool {
-    plan.route.route_fingerprint == CURRENT_ROUTE_FINGERPRINT
-        && exact_strings(
-            &plan.token_path,
-            &[
-                ARBITRUM_WETH_ADDRESS,
-                ARBITRUM_NATIVE_USDC_ADDRESS,
-                ARBITRUM_WETH_ADDRESS,
-            ],
-        )
+    let common = exact_strings(
+        &plan.token_path,
+        &[
+            ARBITRUM_WETH_ADDRESS,
+            ARBITRUM_NATIVE_USDC_ADDRESS,
+            ARBITRUM_WETH_ADDRESS,
+        ],
+    ) && exact_strings(&plan.route.protocols, &["UniswapV3", "UniswapV3"])
+        && exact_strings(&plan.route.directions, &["zero_for_one", "one_for_zero"]);
+    let forward = plan.route.route_fingerprint == CURRENT_ROUTE_FINGERPRINT
         && exact_strings(
             &plan.route.pool_ids,
             &[CURRENT_ROUTE_POOL_500_ID, CURRENT_ROUTE_POOL_3000_ID],
@@ -606,9 +608,21 @@ fn matches_current_route(plan: &UnsignedTransactionPlan) -> bool {
                 CURRENT_ROUTE_POOL_3000_ADDRESS,
             ],
         )
-        && exact_strings(&plan.route.protocols, &["UniswapV3", "UniswapV3"])
-        && exact_strings(&plan.route.directions, &["zero_for_one", "one_for_zero"])
-        && plan.route.fees == [500, 3_000]
+        && plan.route.fees == [500, 3_000];
+    let reverse = plan.route.route_fingerprint == REVERSE_ROUTE_FINGERPRINT
+        && exact_strings(
+            &plan.route.pool_ids,
+            &[CURRENT_ROUTE_POOL_3000_ID, CURRENT_ROUTE_POOL_500_ID],
+        )
+        && exact_strings(
+            &plan.route.pool_addresses,
+            &[
+                CURRENT_ROUTE_POOL_3000_ADDRESS,
+                CURRENT_ROUTE_POOL_500_ADDRESS,
+            ],
+        )
+        && plan.route.fees == [3_000, 500];
+    common && (forward || reverse)
 }
 
 fn exact_strings(actual: &[String], expected: &[&str]) -> bool {
@@ -766,6 +780,33 @@ mod tests {
         assert_eq!(request.plan_hash, result.body.plan_hash);
         assert_eq!(request.pinned_block_number, plan.pinned_block.number);
         assert_eq!(request.pinned_block_hash, plan.pinned_block.hash);
+        assert_eq!(
+            request.canonical_approval_digest().expect("digest"),
+            request.approval_digest
+        );
+    }
+
+    #[test]
+    fn independently_simulated_reverse_route_preserves_exact_execution_bindings() {
+        let now = fixture_time();
+        let (plan, result) = reverse_fixture(now);
+        let request = build_request(&plan, &result, &input(&result), now)
+            .expect("materialize reverse approved request");
+
+        assert_eq!(request.route_fingerprint, REVERSE_ROUTE_FINGERPRINT);
+        assert_eq!(
+            request
+                .legs
+                .iter()
+                .map(|leg| (leg.pool.to_string(), leg.fee, leg.zero_for_one))
+                .collect::<Vec<_>>(),
+            vec![
+                (CURRENT_ROUTE_POOL_3000_ADDRESS.to_string(), 3_000, true,),
+                (CURRENT_ROUTE_POOL_500_ADDRESS.to_string(), 500, false,),
+            ]
+        );
+        assert_eq!(request.calldata_hash, plan.calldata_hash);
+        assert_eq!(request.plan_hash, result.body.plan_hash);
         assert_eq!(
             request.canonical_approval_digest().expect("digest"),
             request.approval_digest
@@ -988,6 +1029,27 @@ mod tests {
         (plan, result)
     }
 
+    fn reverse_fixture(now: DateTime<Utc>) -> (UnsignedTransactionPlan, CounterfactualResult) {
+        let (mut plan, _) = fixture(now);
+        plan.route.route_fingerprint = REVERSE_ROUTE_FINGERPRINT.to_string();
+        plan.route.pool_ids = vec![
+            CURRENT_ROUTE_POOL_3000_ID.to_string(),
+            CURRENT_ROUTE_POOL_500_ID.to_string(),
+        ];
+        plan.route.pool_addresses = vec![
+            CURRENT_ROUTE_POOL_3000_ADDRESS.to_string(),
+            CURRENT_ROUTE_POOL_500_ADDRESS.to_string(),
+        ];
+        plan.route.fees = vec![3_000, 500];
+        let request = encoded_request(now, &plan);
+        let calldata =
+            encode_execute_opportunity(&request, request.executor_address).expect("calldata");
+        plan.calldata_hash = hex::encode(Sha256::digest(&calldata));
+        plan.calldata = format!("0x{}", hex::encode(calldata));
+        let result = result_for_plan(&plan, now, "230000000");
+        (plan, result)
+    }
+
     fn encoded_request(now: DateTime<Utc>, plan: &UnsignedTransactionPlan) -> ExecutionRequest {
         let weth = CanonicalAddress::parse(WETH).expect("WETH");
         let usdc = CanonicalAddress::parse(USDC).expect("USDC");
@@ -1024,9 +1086,9 @@ mod tests {
                     ),
                     token_in: weth,
                     token_out: usdc,
-                    fee: 500,
-                    zero_for_one: true,
-                    min_amount_out: 890_000_000,
+                    fee: plan.route.fees[0],
+                    zero_for_one: plan.route.directions[0] == "zero_for_one",
+                    min_amount_out: plan.minimum_leg_outputs[0].parse().expect("minimum output"),
                 },
                 ValidatedLeg {
                     pool: CanonicalAddress::parse(&plan.route.pool_addresses[1]).expect("pool"),
@@ -1036,9 +1098,9 @@ mod tests {
                     ),
                     token_in: usdc,
                     token_out: weth,
-                    fee: 3_000,
-                    zero_for_one: false,
-                    min_amount_out: 1_000_000_460_000_000,
+                    fee: plan.route.fees[1],
+                    zero_for_one: plan.route.directions[1] == "zero_for_one",
+                    min_amount_out: plan.minimum_leg_outputs[1].parse().expect("minimum output"),
                 },
             ],
             gas_limit: 400_000,

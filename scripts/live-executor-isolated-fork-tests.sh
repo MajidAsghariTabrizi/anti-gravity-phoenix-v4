@@ -261,7 +261,7 @@ $(psql -X -qAt "$test_dsn" -F ' ' -c \
    FROM live_canary.economic_control economic
    CROSS JOIN live_canary.autonomous_global_control global
    JOIN live_canary.autonomous_route_controls route
-     ON route.route_fingerprint = 'arbitrum-weth-usdc-uniswap-v3-500-3000-v1'
+     ON route.route_fingerprint = 'arbitrum-weth-usdc-uniswap-v3-3000-500-v1'
    WHERE economic.singleton AND global.singleton
      AND economic.phase = 'DISARMED_EVIDENCE'")
 EOF
@@ -293,10 +293,10 @@ evidence_started_at = datetime.datetime.fromisoformat(sys.argv[7].replace("Z", "
 binding = {
     "release_sha": "a" * 40,
     "engine_image_digest": "sha256:" + "b" * 64,
-    "route_fingerprint": "arbitrum-weth-usdc-uniswap-v3-500-3000-v1",
+    "route_fingerprint": "arbitrum-weth-usdc-uniswap-v3-3000-500-v1",
     "route_universe_hash": "84adac686635535486e06e44fcaf90c812dc27273affc5bffc4eebd6c164928c",
-    "route_policy_hash": "d7aff21eb025696208c646631772a45c241fc2971ef0c9866646d12dca12d476",
-    "risk_policy_hash": "d7aff21eb025696208c646631772a45c241fc2971ef0c9866646d12dca12d476",
+    "route_policy_hash": "36da85c0fd07e5d3a12726582b20c84d81cfbd2d1d982da8237d3b5cf38b83d5",
+    "risk_policy_hash": "36da85c0fd07e5d3a12726582b20c84d81cfbd2d1d982da8237d3b5cf38b83d5",
     "economic_control_epoch": int(sys.argv[3]),
     "global_control_epoch": int(sys.argv[4]),
     "route_control_epoch": int(sys.argv[5]),
@@ -395,6 +395,26 @@ PHOENIX_AUTOMATION_AUTHORIZATION_ID=22222222-2222-4222-8222-222222222222 \
 PHOENIX_AUTONOMOUS_ACTIVATION_ACK=ACTIVATE_READY_MIN_CANARY_42161 \
   cargo run --locked --quiet --manifest-path live-executor/Cargo.toml \
     --bin autonomous-live-control -- activate-ready-canary
+
+reverse_activation="$(
+  psql -X -qAt "$test_dsn" -c "
+    SELECT (
+      economic.phase = 'LIVE_CANARY_MIN'
+      AND economic.route_fingerprint = 'arbitrum-weth-usdc-uniswap-v3-3000-500-v1'
+      AND reverse_route.enabled AND NOT reverse_route.kill_switch
+      AND NOT forward_route.enabled AND forward_route.kill_switch
+    )::text
+    FROM live_canary.economic_control economic
+    JOIN live_canary.autonomous_route_controls reverse_route
+      ON reverse_route.route_fingerprint = 'arbitrum-weth-usdc-uniswap-v3-3000-500-v1'
+    JOIN live_canary.autonomous_route_controls forward_route
+      ON forward_route.route_fingerprint = 'arbitrum-weth-usdc-uniswap-v3-500-3000-v1'
+    WHERE economic.singleton"
+)"
+[ "$reverse_activation" = true ] || {
+  printf 'official activation did not enable only the exact reverse route\n' >&2
+  exit 1
+}
 
 PHOENIX_TEST_POSTGRES_DSN="$test_dsn" \
 PHOENIX_TEST_NATS_URL="${PHOENIX_TEST_NATS_URL:-nats://127.0.0.1:4222}" \
