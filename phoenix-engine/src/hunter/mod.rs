@@ -379,6 +379,25 @@ impl HunterRouteGraph {
             })
     }
 
+    pub fn affected_route_for_fingerprint(
+        &self,
+        pool_addresses: &[String],
+        route_fingerprint: &str,
+        maximum: usize,
+    ) -> Result<Option<EnumerableRoute>, HunterError> {
+        if route_fingerprint.is_empty() || route_fingerprint.len() > 256 {
+            return Err(HunterError::InvalidRoute);
+        }
+        self.affected_route_indices(pool_addresses, maximum)
+            .map(|indices| {
+                indices.into_iter().find_map(|index| {
+                    self.bound_routes.get(index).and_then(|route| {
+                        (route.route_fingerprint == route_fingerprint).then(|| route.route.clone())
+                    })
+                })
+            })
+    }
+
     fn prioritized_affected_route_indices(
         &self,
         pool_addresses: &[String],
@@ -625,6 +644,41 @@ impl HunterCore {
         bindings: &CandidateBindings,
         sink: &mut S,
     ) -> Result<HunterProcessResult, HunterError> {
+        self.process_event_inner(event, states, bindings, sink, None)
+    }
+
+    pub fn process_selected_route<S: CandidateSink>(
+        &mut self,
+        event: &HunterEvent,
+        states: &BTreeMap<String, ProviderStateAgreement>,
+        bindings: &CandidateBindings,
+        sink: &mut S,
+        selected_route_fingerprint: &str,
+        selected_size: u128,
+    ) -> Result<HunterProcessResult, HunterError> {
+        if selected_route_fingerprint.is_empty()
+            || selected_route_fingerprint.len() > 256
+            || selected_size == 0
+        {
+            return Err(HunterError::InvalidRoute);
+        }
+        self.process_event_inner(
+            event,
+            states,
+            bindings,
+            sink,
+            Some((selected_route_fingerprint, selected_size)),
+        )
+    }
+
+    fn process_event_inner<S: CandidateSink>(
+        &mut self,
+        event: &HunterEvent,
+        states: &BTreeMap<String, ProviderStateAgreement>,
+        bindings: &CandidateBindings,
+        sink: &mut S,
+        selected_route: Option<(&str, u128)>,
+    ) -> Result<HunterProcessResult, HunterError> {
         validate_event(event)?;
         validate_bindings(bindings)?;
         self.metrics.events_observed = self.metrics.events_observed.saturating_add(1);
@@ -632,11 +686,22 @@ impl HunterCore {
             .bounds
             .maximum_affected_routes_per_event
             .min(self.enabled_route_count().max(1));
-        let route_indices = self.graph.prioritized_affected_route_indices(
+        let mut route_indices = self.graph.prioritized_affected_route_indices(
             &event.touched_pool_addresses,
             affected_limit,
             event.initiating_swap_direction,
         )?;
+        if let Some((selected, _)) = selected_route {
+            route_indices.retain(|index| {
+                self.graph
+                    .bound_routes
+                    .get(*index)
+                    .is_some_and(|route| route.route_fingerprint == selected)
+            });
+            if route_indices.is_empty() {
+                return Err(HunterError::InvalidRoute);
+            }
+        }
         let matched_pools = event
             .touched_pool_addresses
             .iter()
@@ -678,7 +743,19 @@ impl HunterCore {
                 continue;
             }
             self.metrics.routes_evaluated = self.metrics.routes_evaluated.saturating_add(1);
-            match optimize_route(&route, states, &self.economics, self.bounds, event) {
+            let evaluation = if let Some((_, selected_size)) = selected_route {
+                evaluate_selected_size(
+                    &route,
+                    states,
+                    &self.economics,
+                    self.bounds,
+                    event,
+                    selected_size,
+                )
+            } else {
+                optimize_route(&route, states, &self.economics, self.bounds, event)
+            };
+            match evaluation {
                 Ok(Some(optimized)) => {
                     self.metrics.size_probes = self
                         .metrics
@@ -1293,6 +1370,42 @@ fn optimize_route(
         return Ok(None);
     }
     Ok(Some(best))
+}
+
+fn evaluate_selected_size(
+    route: &BoundRoute,
+    states: &BTreeMap<String, ProviderStateAgreement>,
+    economics: &HunterEconomicConfig,
+    bounds: HunterBounds,
+    event: &HunterEvent,
+    selected_size: u128,
+) -> Result<Option<RouteEvaluation>, HunterError> {
+    let minimum = parse_u128(&route.policy.minimum_input_amount)?;
+    let maximum = [
+        parse_u128(&route.policy.maximum_input_amount)?,
+        route.settlement_maximum_input,
+        route.universe_maximum_input,
+        economics.shadow_maximum_input,
+    ]
+    .into_iter()
+    .min()
+    .ok_or(HunterError::InvalidPolicy)?;
+    if selected_size < minimum || selected_size > maximum {
+        return Err(HunterError::EconomicInfeasible);
+    }
+    let mut evaluation =
+        match evaluate_route(route, states, economics, bounds, event, selected_size) {
+            Ok(evaluation) => evaluation,
+            Err(HunterError::EconomicInfeasible) => return Ok(None),
+            Err(error) => return Err(error),
+        };
+    evaluation.probes = 1;
+    let retained = i128::try_from(parse_u128(&route.policy.minimum_retained_profit)?)
+        .map_err(|_| HunterError::Arithmetic)?;
+    if evaluation.conservative_net_pnl <= retained || evaluation.conservative_net_pnl <= 0 {
+        return Ok(None);
+    }
+    Ok(Some(evaluation))
 }
 
 fn best_evaluation(evaluated: &BTreeMap<u128, RouteEvaluation>) -> Option<&RouteEvaluation> {
@@ -2273,6 +2386,75 @@ mod tests {
     }
 
     #[test]
+    fn selected_route_processing_cannot_materialize_a_competing_route() {
+        let bounds = HunterBounds::default();
+        let graph = production_graph();
+        let selected = "arbitrum-weth-usdc-uniswap-v3-3000-500-v1";
+        let selected_route = graph
+            .affected_route_for_fingerprint(&[POOL_500.to_string()], selected, 16)
+            .unwrap()
+            .expect("selected route is affected");
+        assert_eq!(
+            selected_route
+                .legs
+                .iter()
+                .map(|leg| leg.fee)
+                .collect::<Vec<_>>(),
+            vec![3_000, 500]
+        );
+
+        let mut core = HunterCore::new(
+            HunterMode::Live,
+            graph,
+            bounds,
+            HunterEconomicConfig {
+                flash_premium_bps: 5,
+                gas_cost: 1,
+                tick_crossing_gas_cost: 1,
+                ordering_cost_reserve: 0,
+                model_error_reserve_bps: 10,
+                shadow_maximum_input: 10_000_000_000_000_000,
+            },
+        )
+        .unwrap();
+        let event = HunterEvent {
+            origin_event_id: "phoenix.engine.input.v1:48379269:selected".to_string(),
+            origin_router: "0x68b3465833fb72a70ecdf485e0e4c7bd8665fc45".to_string(),
+            chain_id: 42_161,
+            block_number: 48_379_269,
+            block_hash: format!("0x{}", "a".repeat(64)),
+            observed_at_unix_ms: 1_784_878_802_000,
+            evaluated_at_unix_ms: 1_784_878_802_000,
+            touched_pool_addresses: vec![POOL_500.to_string()],
+            initiating_swap_direction: Some(Direction::ZeroForOne),
+        };
+        let bindings = CandidateBindings {
+            risk_snapshot_hash: "0".repeat(64),
+            submission_quote_hash: "0".repeat(64),
+            executor_address: "0x17a27f2a51983b574756c2e151ada767e7d54635".to_string(),
+            executor_code_hash: "7".repeat(64),
+            submission_channel: "standard_rpc".to_string(),
+        };
+        let mut sink = InMemoryCandidateSink::default();
+        let result = core
+            .process_selected_route(
+                &event,
+                &BTreeMap::new(),
+                &bindings,
+                &mut sink,
+                selected,
+                100_000_000_000_000,
+            )
+            .unwrap();
+        assert_eq!(result.affected_route_fingerprints, vec![selected]);
+        assert_eq!(result.metrics.routes_affected, 1);
+        assert_eq!(result.metrics.routes_evaluated, 1);
+        assert_eq!(result.metrics.state_incomplete, 1);
+        assert!(result.candidates.is_empty());
+        assert!(sink.is_empty());
+    }
+
+    #[test]
     fn multigraph_enumerates_two_three_and_four_leg_cycles_independent_of_pool_order() {
         let universe = graph_universe();
         let routes = enumerate_routes(&universe, HunterBounds::default()).unwrap();
@@ -2506,6 +2688,25 @@ mod tests {
                 .unwrap()
                 > 0
         );
+        let exact_selected = evaluate_selected_size(
+            &graph().bound_routes[0],
+            &states,
+            &HunterEconomicConfig {
+                flash_premium_bps: 5,
+                gas_cost: 1,
+                tick_crossing_gas_cost: 1,
+                ordering_cost_reserve: 0,
+                model_error_reserve_bps: 10,
+                shadow_maximum_input: 10_000_000_000_000_000,
+            },
+            bounds,
+            &event,
+            10_000_000_000_000_000,
+        )
+        .unwrap()
+        .expect("selected size remains profitable");
+        assert_eq!(exact_selected.selected_size, 10_000_000_000_000_000);
+        assert_eq!(exact_selected.probes, 1);
         let committed: Value = serde_json::from_str(include_str!(
             "../../../fixtures/hunter-a1/v1/autonomous-candidate.json"
         ))

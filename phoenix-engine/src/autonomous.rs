@@ -68,7 +68,13 @@ pub trait HunterStateProvider: Send + Sync {
 
 #[async_trait]
 pub trait AutonomousEventProcessor: Send + Sync {
-    async fn process(&self, input: &EngineInput, origin: &OriginEvent) -> ProcessResult;
+    async fn process(
+        &self,
+        input: &EngineInput,
+        origin: &OriginEvent,
+        selected_route_fingerprint: &str,
+        selected_size: crate::domain::Amount,
+    ) -> ProcessResult;
 }
 
 #[async_trait]
@@ -303,8 +309,17 @@ impl AutonomousHunterProcessor {
         }
     }
 
-    async fn process_event(&self, input: &EngineInput, origin: &OriginEvent) -> ProcessResult {
-        match self.process_inner(input, origin).await {
+    async fn process_event(
+        &self,
+        input: &EngineInput,
+        origin: &OriginEvent,
+        selected_route_fingerprint: &str,
+        selected_size: crate::domain::Amount,
+    ) -> ProcessResult {
+        match self
+            .process_inner(input, origin, selected_route_fingerprint, selected_size)
+            .await
+        {
             Ok(result) => result,
             Err(AutonomousError::Dependency) => ProcessResult::transient(
                 "autonomous_state_dependency_unavailable",
@@ -341,43 +356,44 @@ impl AutonomousHunterProcessor {
         &self,
         input: &EngineInput,
         origin: &OriginEvent,
+        selected_route_fingerprint: &str,
+        selected_size: crate::domain::Amount,
     ) -> Result<ProcessResult, AutonomousError> {
         let touched =
             resolve_origin_pool_addresses(&self.graph, origin, self.bounds.maximum_pools)?;
-        let routes = self
+        let route = self
             .graph
-            .affected_routes_for_pools(&touched, self.bounds.maximum_affected_routes_per_event)
+            .affected_route_for_fingerprint(
+                &touched,
+                selected_route_fingerprint,
+                self.bounds.maximum_affected_routes_per_event,
+            )
             .map_err(map_hunter_error)?;
-        if routes.is_empty() {
-            return Ok(ProcessResult::no_route(
-                "no_affected_hunter_route",
-                json!({"origin_classification": "supported_swap_origin"}),
-            ));
-        }
+        let Some(route) = route else {
+            return Ok(rejected("selected_route_not_authorized"));
+        };
         let mut pools = BTreeMap::new();
-        for route in &routes {
-            for leg in &route.legs {
-                pools
-                    .entry(leg.pool_address.clone())
-                    .or_insert_with(|| HunterPoolRequest {
-                        pool_id: leg.pool_id.clone(),
-                        pool_address: leg.pool_address.clone(),
-                        factory_address: leg.factory_address.clone(),
-                        protocol_id: leg.protocol_id.clone(),
-                        token0: if leg.token_in < leg.token_out {
-                            leg.token_in.clone()
-                        } else {
-                            leg.token_out.clone()
-                        },
-                        token1: if leg.token_in < leg.token_out {
-                            leg.token_out.clone()
-                        } else {
-                            leg.token_in.clone()
-                        },
-                        fee: leg.fee,
-                        tick_spacing: leg.tick_spacing,
-                    });
-            }
+        for leg in &route.legs {
+            pools
+                .entry(leg.pool_address.clone())
+                .or_insert_with(|| HunterPoolRequest {
+                    pool_id: leg.pool_id.clone(),
+                    pool_address: leg.pool_address.clone(),
+                    factory_address: leg.factory_address.clone(),
+                    protocol_id: leg.protocol_id.clone(),
+                    token0: if leg.token_in < leg.token_out {
+                        leg.token_in.clone()
+                    } else {
+                        leg.token_out.clone()
+                    },
+                    token1: if leg.token_in < leg.token_out {
+                        leg.token_out.clone()
+                    } else {
+                        leg.token_in.clone()
+                    },
+                    fee: leg.fee,
+                    tick_spacing: leg.tick_spacing,
+                });
         }
         let request = HunterStateRequest {
             schema_version: HUNTER_STATE_REQUEST_SCHEMA.to_string(),
@@ -432,7 +448,14 @@ impl AutonomousHunterProcessor {
             .core
             .lock()
             .await
-            .process_event(&event, &states, &self.bindings, &mut collector)
+            .process_selected_route(
+                &event,
+                &states,
+                &self.bindings,
+                &mut collector,
+                selected_route_fingerprint,
+                selected_size.0,
+            )
             .map_err(map_hunter_error)?;
         if result.candidates.is_empty() {
             return Err(AutonomousError::Economic);
@@ -459,8 +482,15 @@ impl AutonomousHunterProcessor {
 
 #[async_trait]
 impl AutonomousEventProcessor for AutonomousHunterProcessor {
-    async fn process(&self, input: &EngineInput, origin: &OriginEvent) -> ProcessResult {
-        self.process_event(input, origin).await
+    async fn process(
+        &self,
+        input: &EngineInput,
+        origin: &OriginEvent,
+        selected_route_fingerprint: &str,
+        selected_size: crate::domain::Amount,
+    ) -> ProcessResult {
+        self.process_event(input, origin, selected_route_fingerprint, selected_size)
+            .await
     }
 }
 

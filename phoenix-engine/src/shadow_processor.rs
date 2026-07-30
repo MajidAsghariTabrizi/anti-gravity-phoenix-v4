@@ -132,6 +132,19 @@ pub trait CandidateEvaluator: Send + Sync {
         origin: &OriginEvent,
         route: &RuntimeRoute,
     ) -> Result<CandidateBatch, EvaluationError>;
+
+    async fn evaluate_routes(
+        &self,
+        input: &EngineInput,
+        origin: &OriginEvent,
+        routes: &[RuntimeRoute],
+    ) -> Result<Vec<CandidateBatch>, EvaluationError> {
+        let mut batches = Vec::with_capacity(routes.len());
+        for route in routes {
+            batches.push(self.evaluate(input, origin, route).await?);
+        }
+        Ok(batches)
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -452,41 +465,57 @@ impl ShadowProcessor {
             .iter()
             .map(|route| route.fingerprint.clone())
             .collect::<Vec<_>>();
-        let mut evaluations = Vec::new();
-        let mut evaluation_evidence = Vec::new();
-        for route in &routes {
-            match self.evaluator.evaluate(input, &origin, route).await {
-                Ok(batch) => {
-                    evaluations.extend(batch.evaluations);
-                    evaluation_evidence.push(batch.evidence);
-                }
-                Err(EvaluationError::Transient(class)) => {
-                    return ProcessResult::transient(
-                        class,
-                        routes.len(),
-                        json!({
-                            "origin_classification": "supported_swap_origin",
-                            "origin_decoder": &origin_evidence,
-                            "route_fingerprints": route_fingerprints,
-                            "dependency_failure_class": class
-                        }),
-                    )
-                    .with_origin_metric(origin_metric);
-                }
-                Err(EvaluationError::Terminal(class)) => {
-                    return ProcessResult::terminal(
-                        class,
-                        routes.len(),
-                        json!({
-                            "origin_classification": "supported_swap_origin",
-                            "origin_decoder": &origin_evidence,
-                            "route_fingerprints": route_fingerprints,
-                            "integrity_failure_class": class
-                        }),
-                    )
-                    .with_origin_metric(origin_metric);
-                }
+        let batches = match self
+            .evaluator
+            .evaluate_routes(input, &origin, &routes)
+            .await
+        {
+            Ok(batches) if batches.len() == routes.len() => batches,
+            Ok(_) => {
+                return ProcessResult::terminal(
+                    "adaptive_route_batch_cardinality_mismatch",
+                    routes.len(),
+                    json!({
+                        "origin_classification": "supported_swap_origin",
+                        "origin_decoder": &origin_evidence,
+                        "route_fingerprints": route_fingerprints,
+                        "integrity_failure_class": "adaptive_route_batch_cardinality_mismatch"
+                    }),
+                )
+                .with_origin_metric(origin_metric);
             }
+            Err(EvaluationError::Transient(class)) => {
+                return ProcessResult::transient(
+                    class,
+                    routes.len(),
+                    json!({
+                        "origin_classification": "supported_swap_origin",
+                        "origin_decoder": &origin_evidence,
+                        "route_fingerprints": route_fingerprints,
+                        "dependency_failure_class": class
+                    }),
+                )
+                .with_origin_metric(origin_metric);
+            }
+            Err(EvaluationError::Terminal(class)) => {
+                return ProcessResult::terminal(
+                    class,
+                    routes.len(),
+                    json!({
+                        "origin_classification": "supported_swap_origin",
+                        "origin_decoder": &origin_evidence,
+                        "route_fingerprints": route_fingerprints,
+                        "integrity_failure_class": class
+                    }),
+                )
+                .with_origin_metric(origin_metric);
+            }
+        };
+        let mut evaluations = Vec::new();
+        let mut evaluation_evidence = Vec::with_capacity(batches.len());
+        for batch in batches {
+            evaluations.extend(batch.evaluations);
+            evaluation_evidence.push(batch.evidence);
         }
 
         if evaluations.is_empty() {
@@ -510,8 +539,7 @@ impl ShadowProcessor {
             .iter()
             .any(|value| value.opportunity.decision.disposition == ShadowDisposition::Accepted);
         if let Some(autonomous) = &self.autonomous {
-            let economic_screen_passed = independently_verified_profitable(&evaluations);
-            if !economic_screen_passed {
+            if !independently_verified_profitable(&evaluations) {
                 return ProcessResult {
                     classification: EngineClassification::CandidateRejected,
                     detail_class: "economic_screen_rejected",
@@ -530,8 +558,23 @@ impl ShadowProcessor {
                     origin_metric: Some(origin_metric),
                 };
             }
+            let Some((selected_route, selected_size)) =
+                best_independently_verified_route(&evaluations)
+            else {
+                return ProcessResult::process_fatal(
+                    "adaptive_route_rank_integrity_failure",
+                    routes.len(),
+                    json!({
+                        "stage": "adaptive_route_selection",
+                        "error_class": "adaptive_route_rank_integrity_failure"
+                    }),
+                )
+                .with_origin_metric(origin_metric);
+            };
 
-            let autonomous_result = autonomous.process(input, &origin).await;
+            let autonomous_result = autonomous
+                .process(input, &origin, selected_route, selected_size)
+                .await;
             if autonomous_result.action != ProcessingAction::Ack {
                 return autonomous_result.with_origin_metric(origin_metric);
             }
@@ -607,11 +650,39 @@ impl ShadowProcessor {
 }
 
 pub(crate) fn independently_verified_profitable(evaluations: &[EvaluatedOpportunity]) -> bool {
-    evaluations.iter().any(|value| {
-        value.opportunity.economics.primary_status == PrimaryProfitabilityStatus::MeetsMinimum
-            && value.opportunity.market.independent_verification_status
-                == IndependentVerificationStatus::Agreed
-    })
+    best_independently_verified_route(evaluations).is_some()
+}
+
+fn best_independently_verified_route(
+    evaluations: &[EvaluatedOpportunity],
+) -> Option<(&str, Amount)> {
+    evaluations
+        .iter()
+        .filter(|value| {
+            value.opportunity.economics.primary_status == PrimaryProfitabilityStatus::MeetsMinimum
+                && value.opportunity.market.independent_verification_status
+                    == IndependentVerificationStatus::Agreed
+        })
+        .max_by(|left, right| {
+            left.opportunity
+                .economics
+                .conservative
+                .expected_net_pnl
+                .cmp(&right.opportunity.economics.conservative.expected_net_pnl)
+                .then_with(|| {
+                    right
+                        .opportunity
+                        .route
+                        .route_fingerprint
+                        .cmp(&left.opportunity.route.route_fingerprint)
+                })
+        })
+        .map(|value| {
+            (
+                value.opportunity.route.route_fingerprint.as_str(),
+                value.opportunity.route.input_amount,
+            )
+        })
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -988,7 +1059,13 @@ mod tests {
 
     #[async_trait]
     impl AutonomousEventProcessor for UnexpectedAutonomousProcessor {
-        async fn process(&self, _input: &EngineInput, _origin: &OriginEvent) -> ProcessResult {
+        async fn process(
+            &self,
+            _input: &EngineInput,
+            _origin: &OriginEvent,
+            _selected_route_fingerprint: &str,
+            _selected_size: Amount,
+        ) -> ProcessResult {
             panic!("autonomous evaluation must not run after a negative economic screen");
         }
     }

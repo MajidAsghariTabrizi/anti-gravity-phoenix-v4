@@ -821,7 +821,13 @@ mod tests {
 
     #[async_trait]
     impl AutonomousEventProcessor for ScriptedAutonomousProcessor {
-        async fn process(&self, _input: &EngineInput, _origin: &OriginEvent) -> ProcessResult {
+        async fn process(
+            &self,
+            _input: &EngineInput,
+            _origin: &OriginEvent,
+            _selected_route_fingerprint: &str,
+            _selected_size: crate::domain::Amount,
+        ) -> ProcessResult {
             self.outcomes
                 .lock()
                 .unwrap()
