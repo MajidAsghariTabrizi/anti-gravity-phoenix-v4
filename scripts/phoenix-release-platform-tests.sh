@@ -57,4 +57,11 @@ fi
   "$repo_root/scripts/phoenix_release/cli.py" --help >/dev/null ||
   fail isolated_python_entrypoint_failed
 
+(
+  cd "$repo_root"
+  PYTHONDONTWRITEBYTECODE=1 /usr/bin/python3 -m unittest \
+    scripts.tests.test_economic_activation_runner
+) >/dev/null ||
+  fail economic_activation_runner_tests_failed
+
 printf '%s\n' PHOENIX_RELEASE_PLATFORM_TEST_OK

@@ -38,6 +38,7 @@ libc = "=0.2.186"
 primitive-types = { version = "=0.12.2", default-features = false }
 proc-macro-crate = "=3.2.0"
 phoenix-fork-sandbox = { path = "../fork-sandbox" }
+rpc-gateway = { path = "../rpc-gateway" }
 reqwest = { version = "=0.12.7", default-features = false, features = ["json", "rustls-tls"] }
 serde = { version = "=1.0.210", features = ["derive"] }
 serde_json = "=1.0.128"
@@ -52,5 +53,4 @@ uuid = { version = "=1.10.0", features = ["serde", "v4"] }
 zeroize = "=1.8.1"
 
 [dev-dependencies]
-rpc-gateway = { path = "../rpc-gateway" }
 tempfile = "=3.12.0"

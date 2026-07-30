@@ -1,0 +1,31 @@
+[Unit]
+Description=Validate and execute one bounded Phoenix economic activation request
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+UMask=0077
+ExecStart=/usr/bin/python3 -I -B /usr/local/libexec/phoenix-release/economic_activation_runner.py
+NoNewPrivileges=true
+PrivateDevices=true
+PrivateTmp=true
+ProtectClock=true
+ProtectControlGroups=true
+ProtectHome=read-only
+ProtectHostname=true
+ProtectKernelLogs=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ProtectSystem=strict
+ReadWritePaths=/opt/phoenix/evidence/activation-requests
+ReadWritePaths=/root/phoenix-authorization
+ReadWritePaths=/run/lock
+ReadWritePaths=/var/lib/phoenix-economic-activation
+RestrictAddressFamilies=AF_UNIX
+RestrictRealtime=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native

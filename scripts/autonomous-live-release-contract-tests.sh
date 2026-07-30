@@ -17,7 +17,10 @@ for path in \
   scripts/deploy-release.sh \
   scripts/rollback-release.sh \
   scripts/activate-economic-canary.sh \
+  scripts/economic_activation_runner.py \
   scripts/economic-dashboard-loop.sh \
+  deploy/phoenix-economic-activation.path \
+  deploy/phoenix-economic-activation.service \
   scripts/sql/economic-dashboard-snapshot.sql
 do
   [ -f "$repo_root/$path" ] && [ ! -L "$repo_root/$path" ] ||
@@ -52,6 +55,9 @@ schema = read("live-executor/schema/005_closed_loop_economic_control.sql")
 health = read("scripts/production-healthcheck.sh")
 monitor = read("scripts/economic-dashboard-loop.sh")
 dashboard_sql = read("scripts/sql/economic-dashboard-snapshot.sql")
+activation_runner = read("scripts/economic_activation_runner.py")
+activation_path = read("deploy/phoenix-economic-activation.path")
+activation_service = read("deploy/phoenix-economic-activation.service")
 release_model = read("scripts/phoenix_release/model.py")
 release_gateway = read("scripts/phoenix_release/gateway.py")
 assets = read("scripts/release_assets.py")
@@ -79,6 +85,31 @@ require(
 )
 require("economic-monitor:" in compose, "economic_monitor_service_missing")
 require("economic-supervisor:" in compose, "economic_supervisor_service_missing")
+supervisor = re.search(
+    r"(?ms)^  economic-supervisor:\s*\n(?P<body>.*?)(?=^  [a-zA-Z0-9_-]+:\s*\n|\Z)",
+    compose,
+)
+require(supervisor is not None, "economic_supervisor_service_missing")
+supervisor_service = supervisor.group("body")
+for required in (
+    'user: "65532:65532"',
+    "read_only: true",
+    "cap_drop: [ALL]",
+    "no-new-privileges:true",
+    "/activation-outbox",
+):
+    require(required in supervisor_service, f"activation_producer_hardening_missing:{required}")
+for forbidden in (
+    "/var/run/docker.sock",
+    "SIGNER_PRIVATE_KEY",
+    "SIGNER_PRIVATE_KEY_FILE",
+    "LIVE_EXECUTOR_SIGNER_FILE",
+    ":/root",
+):
+    require(
+        forbidden not in supervisor_service,
+        f"activation_producer_authority_leak:{forbidden}",
+    )
 require(
     "PHOENIX_ECONOMIC_DASHBOARD_INTERVAL_SECONDS: \"45\"" in compose,
     "dashboard_refresh_interval_not_45_seconds",
@@ -260,6 +291,49 @@ require(
     < activate.index("live-executor owner-unpause")
     < activate.index("compose up -d --no-deps live-executor"),
     "authorized_canary_sequence_invalid",
+)
+for required in (
+    "candidate.status = 'materialized'",
+    "candidate.conservative_predicted_net_pnl > 0",
+    "fact.verification_status = 'agreed'",
+    "fact.independent_verification_status = 'agreed'",
+    "result.status = 'passed'",
+    "result.simulated_net_pnl > 0",
+    "candidate.candidate_expires_at > $4",
+    "eligible_rpc_disagreements",
+    "unresolved_submissions",
+):
+    require(required in control, f"activation_request_gate_missing:{required}")
+for required in (
+    "REQUEST_OWNER_UID = 65532",
+    "REQUEST_OWNER_GID = 65532",
+    "MAX_REQUEST_BYTES = 256 * 1024",
+    "os.O_NOFOLLOW",
+    "metadata.st_nlink != 1",
+    "request_replayed",
+    "materialize-activation-contracts",
+    "activate-economic-canary.sh",
+):
+    require(required in activation_runner, f"activation_runner_contract_missing:{required}")
+require("shell=True" not in activation_runner, "activation_runner_shell_escape")
+require(
+    'PathExistsGlob=/opt/phoenix/evidence/activation-requests/activation-request-*.json'
+    in activation_path,
+    "activation_path_watch_invalid",
+)
+for required in (
+    "User=root",
+    "Group=root",
+    "NoNewPrivileges=true",
+    "ProtectSystem=strict",
+    "economic_activation_runner.py",
+):
+    require(required in activation_service, f"activation_service_contract_missing:{required}")
+require(
+    "phoenix-economic-activation.path" in read("scripts/install-phoenix-release-platform.sh")
+    and "systemctl enable --now phoenix-economic-activation.path"
+    in read("scripts/install-phoenix-release-platform.sh"),
+    "activation_runner_not_immutably_installed",
 )
 
 for required in (

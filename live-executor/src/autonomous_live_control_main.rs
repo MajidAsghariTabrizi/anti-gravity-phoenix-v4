@@ -1,4 +1,9 @@
-use chrono::{DateTime, SecondsFormat, Utc};
+use chrono::{DateTime, Duration as ChronoDuration, SecondsFormat, Utc};
+use phoenix_fork_sandbox::{CounterfactualResult, SimulationStatus, UnsignedTransactionPlan};
+use phoenix_live_executor::activation_request::{
+    canonical_domain_hash, write_atomic_request, ActivationCandidateEvidence, ActivationRequest,
+    ACTIVATION_REQUEST_SCHEMA, ACTIVATION_REQUEST_TTL_SECONDS,
+};
 use phoenix_live_executor::control_environment::{
     control_address_environment_with, required_environment_with, MissingEnvironment,
 };
@@ -15,7 +20,8 @@ use phoenix_live_executor::rpc::{ExecutionRpc, HttpExecutionRpc};
 use phoenix_live_executor::{
     APPROVAL_POLICY_VERSION, CURRENT_ROUTE_FINGERPRINT, REQUEST_SCHEMA_VERSION,
 };
-use serde::Deserialize;
+use rpc_gateway::hunter_state::{HunterStateResponse, HUNTER_STATE_RESPONSE_SCHEMA};
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use sqlx::postgres::PgPoolOptions;
@@ -26,7 +32,7 @@ use std::error::Error;
 use std::fmt::{Display, Formatter};
 use std::fs;
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 use url::Url;
 use uuid::Uuid;
@@ -61,6 +67,8 @@ const DISARMED_DEPLOY_ACK: &str = "INSTALL_DISARMED_EVIDENCE_RELEASE_42161";
 const EVIDENCE_START_ACK: &str = "START_DISARMED_EVIDENCE_42161";
 const READINESS_ACK: &str = "CREATE_HASH_BOUND_CANARY_READINESS_42161";
 const AUTHORIZATION_ACK: &str = "INSTALL_BOUNDED_AUTOMATION_AUTHORIZATION_42161";
+const MATERIALIZE_ACTIVATION_ACK: &str = "MATERIALIZE_VALIDATED_MIN_CANARY_42161";
+const ACTIVATION_REQUEST_OUTBOX_ENV: &str = "PHOENIX_ACTIVATION_REQUEST_OUTBOX";
 const MAX_CONTROL_FILE_BYTES: u64 = 256 * 1024;
 const IMAGE_RUNTIME_PROBE_COMMAND: &str = "__image_runtime_probe__";
 const IMAGE_RUNTIME_OK: &str = "AUTONOMOUS_CONTROL_RUNTIME_OK";
@@ -128,6 +136,7 @@ async fn run() -> ControlResult<()> {
         "evidence-start" => start_evidence().await?,
         "create-readiness" => create_readiness(&database_pool().await?).await?,
         "install-authorization" => install_authorization(&database_pool().await?).await?,
+        "materialize-activation-contracts" => materialize_activation_contracts().await?,
         "activate-ready-canary" => activate(&database_pool().await?).await?,
         "activate" => return Err("direct activation is disabled; use activate-ready-canary".into()),
         "evaluate-economic-control" => evaluate_economic_control(&database_pool().await?).await?,
@@ -418,19 +427,30 @@ async fn migrate(pool: &PgPool) -> Result<(), &'static str> {
     Ok(())
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 struct ReadinessFile {
+    schema_version: String,
     readiness_id: Uuid,
     binding: ReadinessBinding,
     evidence: EvidenceGate,
     readiness_hash: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 struct AuthorizationFile {
+    schema_version: String,
     authorization_id: Uuid,
     authorization: AutomationAuthorization,
     authorization_hash: String,
+}
+
+#[derive(Debug, Serialize)]
+struct ActivationMaterialization {
+    schema_version: &'static str,
+    request_id: Uuid,
+    request_hash: String,
+    readiness: Value,
+    authorization: Value,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1341,19 +1361,831 @@ async fn activate(pool: &PgPool) -> ControlResult<()> {
     Ok(())
 }
 
+async fn materialize_activation_contracts() -> ControlResult<()> {
+    if required("PHOENIX_ACTIVATION_MATERIALIZATION_ACK")? != MATERIALIZE_ACTIVATION_ACK {
+        return Err("activation materialization acknowledgement is invalid".into());
+    }
+    require_signerless_control()?;
+    let (value, _) = read_control_contract(
+        "PHOENIX_ACTIVATION_REQUEST_FILE",
+        "activation request file is invalid",
+    )?;
+    verify_hash(
+        &value,
+        "request_hash",
+        "economic-activation-request",
+        ACTIVATION_REQUEST_SCHEMA,
+    )?;
+    let request: ActivationRequest =
+        serde_json::from_value(value).map_err(|_| "activation request file is invalid")?;
+    let pool = database_pool().await?;
+    let database_now: DateTime<Utc> = sqlx::query_scalar("SELECT clock_timestamp()")
+        .fetch_one(&pool)
+        .await
+        .map_err(|_| "database clock is unavailable")?;
+    request
+        .validate(database_now)
+        .map_err(|_| "activation request validation failed")?;
+    let current = collect_activation_request(&pool, Some(&request))
+        .await?
+        .ok_or("activation request no longer has eligible Production evidence")?;
+    if current.candidate != request.candidate
+        || current.binding.release_sha != request.binding.release_sha
+        || current.binding.engine_image_digest != request.binding.engine_image_digest
+        || current.binding.route_universe_hash != request.binding.route_universe_hash
+        || current.binding.route_policy_hash != request.binding.route_policy_hash
+        || current.binding.risk_policy_hash != request.binding.risk_policy_hash
+        || current.binding.economic_control_epoch != request.binding.economic_control_epoch
+        || current.binding.global_control_epoch != request.binding.global_control_epoch
+        || current.binding.route_control_epoch != request.binding.route_control_epoch
+        || current.binding.executor_code_hash != request.binding.executor_code_hash
+        || current.binding.contract_identity_hash != request.binding.contract_identity_hash
+    {
+        return Err("activation request no longer binds current Production state".into());
+    }
+
+    let created_at = current.created_at;
+    let mut binding = current.binding;
+    binding.observed_until = created_at - ChronoDuration::microseconds(1);
+    binding.created_at = created_at;
+    binding.expires_at = created_at
+        + ChronoDuration::seconds(phoenix_live_executor::economic_control::READINESS_TTL_SECONDS);
+    binding
+        .validate(created_at)
+        .map_err(|_| "materialized readiness binding is invalid")?;
+    current
+        .evidence
+        .validate()
+        .map_err(|_| "materialized readiness evidence is invalid")?;
+    let mut readiness = json!({
+        "schema_version": "phoenix.canary-readiness.v1",
+        "readiness_id": Uuid::new_v4(),
+        "binding": binding,
+        "evidence": current.evidence,
+        "readiness_hash": "0".repeat(64)
+    });
+    set_hash(
+        &mut readiness,
+        "readiness_hash",
+        "canary-readiness",
+        "phoenix.canary-readiness.v1",
+    )?;
+
+    let authorization = AutomationAuthorization {
+        route_fingerprint: current.candidate.route_fingerprint,
+        route_policy_hash: current.candidate.route_policy_hash,
+        maximum_reviewed_input_wei: MAXIMUM_REVIEWED_INPUT_WEI,
+        executor_code_hash: current.candidate.executor_code_hash,
+        release_family: "phoenix-v4".to_string(),
+        one_transaction_at_a_time: true,
+        reviewed_ladder_only: true,
+        automatic_disarm_required: true,
+        expires_at: binding.expires_at,
+    };
+    authorization
+        .validate(&binding, created_at)
+        .map_err(|_| "materialized automation authorization is invalid")?;
+    let mut authorization_contract = json!({
+        "schema_version": "phoenix.automation-authorization.v1",
+        "authorization_id": Uuid::new_v4(),
+        "authorization": authorization,
+        "authorization_hash": "0".repeat(64)
+    });
+    set_hash(
+        &mut authorization_contract,
+        "authorization_hash",
+        "automation-authorization",
+        "phoenix.automation-authorization.v1",
+    )?;
+    let payload = ActivationMaterialization {
+        schema_version: "phoenix.activation-materialization.v1",
+        request_id: request.request_id,
+        request_hash: request.request_hash,
+        readiness,
+        authorization: authorization_contract,
+    };
+    println!(
+        "{}",
+        serde_json::to_string(&payload)
+            .map_err(|_| "activation materialization serialization failed")?
+    );
+    Ok(())
+}
+
 async fn supervise_economic_control() -> ControlResult<()> {
-    let interval = env::var("PHOENIX_ECONOMIC_SUPERVISOR_INTERVAL_SECONDS")
+    let live_interval = env::var("PHOENIX_ECONOMIC_SUPERVISOR_INTERVAL_SECONDS")
         .ok()
         .and_then(|value| value.parse::<u64>().ok())
         .filter(|value| (30..=60).contains(value))
         .unwrap_or(45);
+    let evidence_interval = env::var("PHOENIX_ACTIVATION_REQUEST_INTERVAL_MILLISECONDS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| (250..=2_000).contains(value))
+        .unwrap_or(500);
     let pool = database_pool().await?;
+    let mut emitted_fork_result = None;
     loop {
-        if let Err(error) = evaluate_economic_control(&pool).await {
-            eprintln!("ECONOMIC_SUPERVISION_STEP_FAILED: {error}");
-        }
-        tokio::time::sleep(Duration::from_secs(interval)).await;
+        let delay = if current_economic_phase(&pool).await? == EconomicPhase::DisarmedEvidence {
+            match collect_activation_request(&pool, None).await {
+                Ok(Some(request))
+                    if emitted_fork_result.as_deref()
+                        != Some(request.candidate.fork_result_hash.as_str()) =>
+                {
+                    let outbox_value = required(ACTIVATION_REQUEST_OUTBOX_ENV)?;
+                    let outbox = Path::new(&outbox_value);
+                    match write_atomic_request(outbox, &request) {
+                        Ok(path) => {
+                            emitted_fork_result = Some(request.candidate.fork_result_hash.clone());
+                            println!(
+                                "ECONOMIC_ACTIVATION_REQUEST_READY: request_id={} candidate_id={} source={}",
+                                request.request_id,
+                                request.candidate.candidate_id,
+                                path.display()
+                            );
+                        }
+                        Err(error) => {
+                            eprintln!("ECONOMIC_ACTIVATION_REQUEST_FAILED: {error}");
+                        }
+                    }
+                }
+                Ok(Some(_)) => {}
+                Ok(None) => {}
+                Err(error) => eprintln!("ECONOMIC_ACTIVATION_ASSESSMENT_FAILED: {error}"),
+            }
+            Duration::from_millis(evidence_interval)
+        } else {
+            if let Err(error) = evaluate_economic_control(&pool).await {
+                eprintln!("ECONOMIC_SUPERVISION_STEP_FAILED: {error}");
+            }
+            Duration::from_secs(live_interval)
+        };
+        tokio::time::sleep(delay).await;
     }
+}
+
+async fn current_economic_phase(pool: &PgPool) -> ControlResult<EconomicPhase> {
+    let phase: String =
+        sqlx::query_scalar("SELECT phase FROM live_canary.economic_control WHERE singleton")
+            .fetch_one(pool)
+            .await
+            .map_err(|_| "economic control is unavailable")?;
+    parse_phase(&phase)
+}
+
+#[derive(Debug)]
+struct ActivationCandidateAssessment {
+    candidate: ActivationCandidateEvidence,
+    prediction_error_bps: u16,
+}
+
+async fn eligible_activation_candidate(
+    pool: &PgPool,
+    state: &EconomicState,
+    expected_candidate: Option<Uuid>,
+    now: DateTime<Utc>,
+) -> ControlResult<Option<ActivationCandidateAssessment>> {
+    let route_fingerprint = state
+        .route_fingerprint
+        .as_deref()
+        .ok_or("economic route is unavailable")?;
+    let row = sqlx::query(
+        r#"
+SELECT candidate.candidate_id,
+       candidate.candidate_hash,
+       candidate.plan_hash AS candidate_plan_hash,
+       candidate.state_block_number::text,
+       candidate.state_block_hash,
+       candidate.state_hash,
+       candidate.executor_address,
+       candidate.executor_code_hash,
+       candidate.selected_size::text,
+       candidate.predicted_gross_profit::text,
+       candidate.predicted_total_cost::text,
+       candidate.conservative_predicted_net_pnl::text,
+       candidate.candidate_created_at,
+       candidate.candidate_expires_at,
+       candidate.candidate_contract,
+       candidate.plan_contract,
+       candidate.state_contract,
+       candidate.calldata_hash,
+       candidate.calldata_hex,
+       result.plan_hash AS fork_plan_hash,
+       result.result_hash AS fork_result_hash,
+       result.simulated_net_pnl::text AS fork_simulated_net_pnl,
+       result.simulated_gas_cost::text AS fork_simulated_gas_cost,
+       result.simulated_at AS fork_simulated_at,
+       result.plan AS fork_plan,
+       jsonb_build_object(
+           'result_hash', result.result_hash,
+           'schema_version', result.result_schema_version,
+           'plan_hash', result.plan_hash,
+           'shadow_decision_id', result.shadow_decision_id::text,
+           'status', result.status,
+           'predicted_gross_profit', result.predicted_gross_profit::text,
+           'predicted_total_cost', result.predicted_total_cost::text,
+           'predicted_net_pnl', result.predicted_net_pnl::text,
+           'simulated_gross_profit', result.simulated_gross_profit::text,
+           'simulated_gas_cost', result.simulated_gas_cost::text,
+           'simulated_balance_delta', result.simulated_balance_delta::text,
+           'simulated_net_pnl', result.simulated_net_pnl::text,
+           'prediction_error', result.prediction_error::text,
+           'gas_estimate', result.gas_estimate::bigint,
+           'gas_used', result.gas_used::bigint,
+           'model_version', result.model_version,
+           'policy_version', result.policy_version,
+           'fork', jsonb_build_object(
+               'chain_id', result.fork_chain_id,
+               'fork_block', jsonb_build_object(
+                   'number', result.fork_block_number::bigint,
+                   'hash', result.fork_block_hash
+               ),
+               'fork_instance_hash', result.fork_instance_hash,
+               'local_block', jsonb_build_object(
+                   'number', result.local_block_number::bigint,
+                   'hash', result.local_block_hash
+               )
+           ),
+           'simulated_at', result.simulated_at,
+           'revert_reason', result.revert_reason,
+           'evidence', result.evidence,
+           'fork_only', result.fork_only,
+           'shadow_only', result.shadow_only,
+           'live_execution', result.live_execution,
+           'execution_eligible', result.execution_eligible,
+           'execution_request_created', result.execution_request_created,
+           'public_broadcast', result.public_broadcast,
+           'signer_used', result.signer_used
+       ) AS fork_result
+FROM live_canary.autonomous_candidates candidate
+JOIN public.shadow_profitability_facts fact
+  ON fact.source_event_identity = candidate.origin_event_id
+ AND fact.route_fingerprint = candidate.route_fingerprint
+JOIN public.fork_simulation_results result
+  ON result.shadow_decision_id = fact.shadow_decision_id
+WHERE candidate.route_fingerprint = $1
+  AND candidate.status = 'materialized'
+  AND candidate.selected_size = $2::numeric
+  AND candidate.candidate_created_at >= $3
+  AND candidate.candidate_expires_at > $4
+  AND candidate.conservative_predicted_net_pnl > 0
+  AND candidate.risk_snapshot_hash = repeat('0', 64)
+  AND candidate.submission_quote_hash = repeat('0', 64)
+  AND fact.evidence_completeness_status = 'complete'
+  AND fact.disposition = 'accepted'
+  AND fact.primary_profitability_status = 'meets_minimum'
+  AND fact.expected_net_pnl > 0
+  AND fact.conservative_net_pnl > 0
+  AND fact.verification_status = 'agreed'
+  AND fact.independent_verification_status = 'agreed'
+  AND fact.agreement_state = 'agreed'
+  AND fact.secondary_provider_id IS NOT NULL
+  AND fact.secondary_provider_id <> fact.primary_provider_id
+  AND fact.opportunity_expires_at > $4
+  AND result.status = 'passed'
+  AND result.simulated_net_pnl > 0
+  AND result.simulated_at >= $3
+  AND result.plan #>> '{route,route_fingerprint}' = candidate.route_fingerprint
+  AND result.plan ->> 'source_event_identity' = candidate.origin_event_id
+  AND result.plan ->> 'input_amount' = candidate.selected_size::text
+  AND result.plan ->> 'calldata_hash' = candidate.calldata_hash
+  AND result.plan ->> 'target_contract' = candidate.executor_address
+  AND result.plan ->> 'target_code_hash' = candidate.executor_code_hash
+  AND result.plan #>> '{pinned_block,number}' = candidate.state_block_number::text
+  AND result.plan #>> '{pinned_block,hash}' = candidate.state_block_hash
+  AND ($5::uuid IS NULL OR candidate.candidate_id = $5)
+ORDER BY candidate.candidate_created_at DESC, result.simulated_at DESC
+LIMIT 1
+"#,
+    )
+    .bind(route_fingerprint)
+    .bind(SizeLevel::Min.amount_wei().to_string())
+    .bind(state.updated_at)
+    .bind(now)
+    .bind(expected_candidate)
+    .fetch_optional(pool)
+    .await
+    .map_err(|_| "eligible activation candidate inspection failed")?;
+    let Some(row) = row else {
+        return Ok(None);
+    };
+
+    let candidate_contract = row
+        .try_get::<sqlx::types::Json<Value>, _>("candidate_contract")
+        .map_err(|_| "candidate contract is invalid")?
+        .0;
+    verify_hash(
+        &candidate_contract,
+        "candidate_hash",
+        "autonomous-candidate",
+        "phoenix.autonomous-candidate.v1",
+    )?;
+    let candidate_hash: String = row
+        .try_get("candidate_hash")
+        .map_err(|_| "candidate hash is invalid")?;
+    if candidate_contract
+        .get("candidate_hash")
+        .and_then(Value::as_str)
+        != Some(candidate_hash.as_str())
+    {
+        return Err("candidate hash is invalid".into());
+    }
+
+    let candidate_plan = row
+        .try_get::<sqlx::types::Json<Value>, _>("plan_contract")
+        .map_err(|_| "candidate plan is invalid")?
+        .0;
+    let candidate_plan_schema = value_text(&candidate_plan, "schema_version")?;
+    if candidate_plan_schema != "phoenix.hunter-live-plan.v1"
+        || candidate_plan.get("mode").and_then(Value::as_str) != Some("live")
+        || candidate_plan
+            .get("execution_eligible")
+            .and_then(Value::as_bool)
+            != Some(true)
+        || candidate_plan.get("shadow_only").and_then(Value::as_bool) != Some(false)
+        || candidate_plan.get("signer_used").and_then(Value::as_bool) != Some(false)
+        || candidate_plan
+            .get("public_broadcast")
+            .and_then(Value::as_bool)
+            != Some(false)
+    {
+        return Err("candidate plan is not eligible LIVE evidence".into());
+    }
+    let candidate_plan_hash = canonical_domain_hash(candidate_plan_schema, &candidate_plan)
+        .map_err(|_| "candidate plan hash is invalid")?;
+    let persisted_candidate_plan_hash: String = row
+        .try_get("candidate_plan_hash")
+        .map_err(|_| "candidate plan hash is invalid")?;
+    if candidate_plan_hash != persisted_candidate_plan_hash
+        || candidate_contract.get("plan_hash").and_then(Value::as_str)
+            != Some(candidate_plan_hash.as_str())
+    {
+        return Err("candidate plan hash is invalid".into());
+    }
+
+    let calldata_hex: String = row
+        .try_get("calldata_hex")
+        .map_err(|_| "candidate calldata is invalid")?;
+    let calldata = calldata_hex
+        .strip_prefix("0x")
+        .and_then(|encoded| hex::decode(encoded).ok())
+        .filter(|value| !value.is_empty())
+        .ok_or("candidate calldata is invalid")?;
+    let calldata_hash: String = row
+        .try_get("calldata_hash")
+        .map_err(|_| "candidate calldata is invalid")?;
+    if hex::encode(Sha256::digest(calldata)) != calldata_hash {
+        return Err("candidate calldata hash is invalid".into());
+    }
+
+    let state_contract = row
+        .try_get::<sqlx::types::Json<Value>, _>("state_contract")
+        .map_err(|_| "candidate state evidence is invalid")?
+        .0;
+    let hunter_state: HunterStateResponse = serde_json::from_value(state_contract)
+        .map_err(|_| "candidate state evidence is invalid")?;
+    let state_block_number = row_u64_text(&row, "state_block_number")?;
+    let state_block_hash: String = row
+        .try_get("state_block_hash")
+        .map_err(|_| "candidate state evidence is invalid")?;
+    if hunter_state.schema_version != HUNTER_STATE_RESPONSE_SCHEMA
+        || hunter_state.chain_id != 42_161
+        || hunter_state.block_number != state_block_number
+        || hunter_state.block_hash != state_block_hash
+        || hunter_state.agreements.is_empty()
+    {
+        return Err("candidate state evidence is invalid".into());
+    }
+    for agreement in &hunter_state.agreements {
+        let agreed = agreement
+            .agreed()
+            .map_err(|_| "candidate providers do not agree")?;
+        if agreed.block_number != state_block_number || agreed.block_hash != state_block_hash {
+            return Err("candidate state evidence is invalid".into());
+        }
+    }
+
+    let fork_plan: UnsignedTransactionPlan = serde_json::from_value(
+        row.try_get::<sqlx::types::Json<Value>, _>("fork_plan")
+            .map_err(|_| "fork plan is invalid")?
+            .0,
+    )
+    .map_err(|_| "fork plan is invalid")?;
+    let fork_plan_hash = fork_plan
+        .canonical_hash()
+        .map_err(|_| "fork plan hash is invalid")?;
+    let persisted_fork_plan_hash: String = row
+        .try_get("fork_plan_hash")
+        .map_err(|_| "fork plan hash is invalid")?;
+    if fork_plan_hash != persisted_fork_plan_hash {
+        return Err("fork plan hash is invalid".into());
+    }
+    let fork_result: CounterfactualResult = serde_json::from_value(
+        row.try_get::<sqlx::types::Json<Value>, _>("fork_result")
+            .map_err(|_| "fork result is invalid")?
+            .0,
+    )
+    .map_err(|_| "fork result is invalid")?;
+    fork_result
+        .validate_plan_binding(&fork_plan)
+        .map_err(|_| "fork result binding is invalid")?;
+    let executor_address: String = row
+        .try_get("executor_address")
+        .map_err(|_| "candidate executor identity is invalid")?;
+    let executor_code_hash: String = row
+        .try_get("executor_code_hash")
+        .map_err(|_| "candidate executor identity is invalid")?;
+    let state_hash: String = row
+        .try_get("state_hash")
+        .map_err(|_| "candidate state evidence is invalid")?;
+    if fork_result.body.status != SimulationStatus::Passed
+        || fork_plan.source_event_identity
+            != candidate_contract
+                .get("origin_event_id")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+        || fork_plan.route.route_fingerprint != route_fingerprint
+        || fork_plan.calldata_hash != calldata_hash
+        || fork_plan.target_contract != executor_address
+        || fork_plan.target_code_hash != executor_code_hash
+        || fork_plan.pinned_block.number != state_block_number
+        || fork_plan.pinned_block.hash != state_block_hash
+        || fork_plan.primary_state_hash != state_hash
+    {
+        return Err("candidate and fork evidence do not bind".into());
+    }
+
+    let predicted_net = fork_result
+        .body
+        .predicted_net_pnl
+        .parse::<i128>()
+        .map_err(|_| "fork economics are invalid")?;
+    let simulated_net = fork_result
+        .body
+        .simulated_net_pnl
+        .as_deref()
+        .and_then(|value| value.parse::<i128>().ok())
+        .ok_or("fork economics are invalid")?;
+    let prediction_error_bps = if predicted_net == 0 {
+        u16::MAX
+    } else {
+        u16::try_from(
+            simulated_net
+                .saturating_sub(predicted_net)
+                .unsigned_abs()
+                .saturating_mul(10_000)
+                .checked_div(predicted_net.unsigned_abs())
+                .unwrap_or(u128::MAX)
+                .min(u128::from(u16::MAX)),
+        )
+        .map_err(|_| "fork economics are invalid")?
+    };
+    let candidate_created_at: DateTime<Utc> = row
+        .try_get("candidate_created_at")
+        .map_err(|_| "candidate clock evidence is invalid")?;
+    let candidate = ActivationCandidateEvidence {
+        candidate_id: row
+            .try_get("candidate_id")
+            .map_err(|_| "candidate identity is invalid")?,
+        candidate_hash,
+        candidate_plan_hash,
+        fork_plan_hash,
+        fork_result_hash: row
+            .try_get("fork_result_hash")
+            .map_err(|_| "fork result hash is invalid")?,
+        route_fingerprint: route_fingerprint.to_string(),
+        route_policy_hash: state
+            .route_policy_hash
+            .clone()
+            .ok_or("route policy identity is unavailable")?,
+        state_block_number,
+        state_block_hash,
+        state_hash,
+        executor_address,
+        executor_code_hash,
+        selected_size_wei: row_u128_text(&row, "selected_size")?,
+        predicted_gross_profit_wei: row_u128_text(&row, "predicted_gross_profit")?,
+        predicted_total_cost_wei: row_u128_text(&row, "predicted_total_cost")?,
+        conservative_predicted_net_pnl_wei: row_i128_text(&row, "conservative_predicted_net_pnl")?,
+        fork_simulated_net_pnl_wei: row_i128_text(&row, "fork_simulated_net_pnl")?,
+        fork_simulated_gas_cost_wei: row_u128_text(&row, "fork_simulated_gas_cost")?,
+        candidate_created_at,
+        candidate_expires_at: row
+            .try_get("candidate_expires_at")
+            .map_err(|_| "candidate clock evidence is invalid")?,
+        fork_simulated_at: row
+            .try_get("fork_simulated_at")
+            .map_err(|_| "fork clock evidence is invalid")?,
+    };
+    candidate
+        .validate(now)
+        .map_err(|_| "activation candidate is stale or invalid")?;
+    Ok(Some(ActivationCandidateAssessment {
+        candidate,
+        prediction_error_bps,
+    }))
+}
+
+async fn collect_activation_request(
+    pool: &PgPool,
+    expected: Option<&ActivationRequest>,
+) -> ControlResult<Option<ActivationRequest>> {
+    require_schema(pool).await?;
+    let state = economic_state(pool).await?;
+    if state.phase != EconomicPhase::DisarmedEvidence {
+        return Ok(None);
+    }
+    let release_sha = state
+        .release_sha
+        .as_deref()
+        .ok_or("economic release identity is unavailable")?;
+    if required("PHOENIX_RELEASE_SHA")? != release_sha {
+        return Err("economic release identity does not match the runtime".into());
+    }
+    let engine_image_digest = state
+        .engine_image_digest
+        .as_deref()
+        .ok_or("Engine image identity is unavailable")?;
+    if image_digest(&required("PHOENIX_ENGINE_IMAGE")?)? != engine_image_digest {
+        return Err("Engine image identity does not match the runtime".into());
+    }
+    let route_fingerprint = state
+        .route_fingerprint
+        .as_deref()
+        .ok_or("economic route is unavailable")?;
+    let database_now: DateTime<Utc> = sqlx::query_scalar("SELECT clock_timestamp()")
+        .fetch_one(pool)
+        .await
+        .map_err(|_| "database clock is unavailable")?;
+    let Some(assessment) = eligible_activation_candidate(
+        pool,
+        &state,
+        expected.map(|request| request.candidate.candidate_id),
+        database_now,
+    )
+    .await?
+    else {
+        return Ok(None);
+    };
+
+    let controls = sqlx::query(
+        r#"
+WITH observation AS (
+    SELECT count(*) AS total,
+           count(*) FILTER (
+               WHERE classification NOT IN (
+                   'malformed_internal_event', 'unsupported_schema',
+                   'terminal_integrity_failure'
+               )
+           ) AS supported,
+           count(*) FILTER (
+               WHERE classification = 'terminal_integrity_failure'
+           ) AS fatal
+    FROM public.shadow_engine_classifications
+    WHERE classified_at >= $2
+),
+quarantine AS (
+    SELECT max(classified_at) FILTER (
+               WHERE classification IN (
+                   'malformed_internal_event', 'unsupported_schema',
+                   'dependency_exhausted', 'terminal_integrity_failure'
+               )
+           ) AS latest
+    FROM public.shadow_engine_classifications
+    WHERE classified_at >= $2
+),
+outbox AS (
+    SELECT count(*) FILTER (WHERE published_at IS NULL) AS pending,
+           count(*) FILTER (
+               WHERE published_at IS NULL
+                 AND created_at < clock_timestamp() - interval '60 seconds'
+           ) AS stale
+    FROM public.engine_outbox
+),
+loss AS (
+    SELECT COALESCE(sum(
+               CASE WHEN outcome.net_pnl_wei < 0 THEN -outcome.net_pnl_wei ELSE 0 END
+           ) FILTER (
+               WHERE outcome.recorded_at >= date_trunc(
+                   'day', clock_timestamp() AT TIME ZONE 'UTC'
+               ) AT TIME ZONE 'UTC'
+           ), 0)::text AS current_daily_loss,
+           global.daily_loss_limit::text AS daily_loss_limit
+    FROM live_canary.autonomous_global_control global
+    LEFT JOIN live_canary.execution_outcomes outcome ON true
+    WHERE global.singleton
+    GROUP BY global.daily_loss_limit
+)
+SELECT NOT legacy.armed AND legacy.kill_switch
+           AND NOT global.armed AND global.kill_switch
+           AND global.execution_mode = 'disarmed'
+           AND NOT route.enabled AND route.kill_switch AS controls_closed,
+       global.control_epoch AS global_epoch,
+       route.control_epoch AS route_epoch,
+       observation.total,
+       observation.supported,
+       observation.fatal,
+       quarantine.latest IS NULL OR EXISTS (
+           SELECT 1 FROM public.shadow_engine_classifications later
+           WHERE later.classified_at > quarantine.latest
+             AND later.classification NOT IN (
+                 'malformed_internal_event', 'unsupported_schema',
+                 'terminal_integrity_failure'
+             )
+       ) AS quarantine_progress,
+       outbox.pending,
+       outbox.stale,
+       (SELECT count(*) FROM live_canary.execution_requests request
+        WHERE request.created_at >= $2) AS execution_requests,
+       (SELECT count(*) FROM live_canary.execution_attempts attempt
+        WHERE attempt.status IN (
+            'claimed', 'nonce_allocated', 'submission_unknown', 'pending', 'timed_out'
+        )) AS active_attempts,
+       (SELECT count(*) FROM live_canary.execution_attempts attempt
+        WHERE attempt.status IN ('submission_unknown', 'pending', 'timed_out')
+       ) AS unresolved_submissions,
+       (SELECT count(*) FROM public.shadow_profitability_facts fact
+        WHERE fact.evaluated_at >= $2
+          AND fact.primary_profitability_status = 'meets_minimum'
+          AND fact.independent_verification_status = 'disagreed'
+       ) AS rpc_disagreements,
+       loss.current_daily_loss,
+       loss.daily_loss_limit
+FROM live_canary.control legacy
+CROSS JOIN live_canary.autonomous_global_control global
+JOIN live_canary.autonomous_route_controls route
+  ON route.route_fingerprint = $1
+CROSS JOIN observation
+CROSS JOIN quarantine
+CROSS JOIN outbox
+CROSS JOIN loss
+WHERE legacy.singleton AND global.singleton
+"#,
+    )
+    .bind(route_fingerprint)
+    .bind(state.updated_at)
+    .fetch_one(pool)
+    .await
+    .map_err(|_| "activation readiness evidence is unavailable")?;
+    if !controls
+        .try_get::<bool, _>("controls_closed")
+        .map_err(|_| "activation controls are invalid")?
+        || nonnegative_u64(&controls, "active_attempts")? != 0
+        || nonnegative_u64(&controls, "unresolved_submissions")? != 0
+    {
+        return Ok(None);
+    }
+    let total = nonnegative_u64(&controls, "total")?;
+    let supported = nonnegative_u64(&controls, "supported")?;
+    let valid_acceptance_bps = u16::try_from(
+        supported
+            .saturating_mul(10_000)
+            .checked_div(total)
+            .unwrap_or(0),
+    )
+    .unwrap_or(0);
+    let candidate_age_ms = nonnegative_milliseconds(
+        database_now.signed_duration_since(assessment.candidate.candidate_created_at),
+    )?;
+    let evidence = EvidenceGate {
+        supported_observations: supported,
+        valid_acceptance_bps,
+        process_fatal_integrity_exits: nonnegative_u64(&controls, "fatal")?,
+        quarantine_progress_proven: controls
+            .try_get("quarantine_progress")
+            .map_err(|_| "quarantine evidence is invalid")?,
+        consumer_pending_bounded: nonnegative_u64(&controls, "pending")? <= 1_000,
+        ack_pending_bounded: nonnegative_u64(&controls, "stale")? == 0,
+        stale_outbox_rows: nonnegative_u64(&controls, "stale")?,
+        primary_rpc_healthy: true,
+        secondary_rpc_healthy: true,
+        rpc_providers_independent: true,
+        eligible_rpc_disagreements: nonnegative_u64(&controls, "rpc_disagreements")?,
+        maximum_state_age_blocks: 0,
+        maximum_quote_age_ms: candidate_age_ms,
+        maximum_candidate_age_ms: candidate_age_ms,
+        fork_attempts: 1,
+        fork_passes: 1,
+        prediction_error_bps: assessment.prediction_error_bps,
+        secondary_skips: 0,
+        fork_skips: 0,
+        execution_requests: nonnegative_u64(&controls, "execution_requests")?,
+        active_attempts: nonnegative_u64(&controls, "active_attempts")?,
+        positive_independent_fork_candidates: 1,
+    };
+    if evidence.validate().is_err() {
+        return Ok(None);
+    }
+
+    let reserve = wallet_gas_reserve().await?;
+    let current_daily_loss = row_u128_text(&controls, "current_daily_loss")?;
+    let daily_loss_limit = row_u128_text(&controls, "daily_loss_limit")?;
+    if reserve <= state.gas_reserve_floor_wei || current_daily_loss >= daily_loss_limit {
+        return Ok(None);
+    }
+    let owner_evidence = configured_preflight_from_environment().await?;
+    if owner_evidence.get("status").and_then(Value::as_str) != Some("ready-paused") {
+        return Ok(None);
+    }
+    let contract_identity_hash =
+        canonical_domain_hash("phoenix.executor-contract-identity.v1", &owner_evidence)
+            .map_err(|_| "contract identity evidence is invalid")?;
+    let expires_at = database_now + ChronoDuration::seconds(ACTIVATION_REQUEST_TTL_SECONDS);
+    let binding = ReadinessBinding {
+        release_sha: release_sha.to_string(),
+        engine_image_digest: engine_image_digest.to_string(),
+        route_fingerprint: route_fingerprint.to_string(),
+        route_universe_hash: state
+            .route_universe_hash
+            .clone()
+            .ok_or("route universe identity is unavailable")?,
+        route_policy_hash: state
+            .route_policy_hash
+            .clone()
+            .ok_or("route policy identity is unavailable")?,
+        risk_policy_hash: state
+            .risk_policy_hash
+            .clone()
+            .ok_or("risk policy identity is unavailable")?,
+        economic_control_epoch: u64::try_from(state.control_epoch)
+            .map_err(|_| "economic control epoch is invalid")?,
+        global_control_epoch: u64::try_from(
+            controls
+                .try_get::<i64, _>("global_epoch")
+                .map_err(|_| "global control epoch is invalid")?,
+        )
+        .map_err(|_| "global control epoch is invalid")?,
+        route_control_epoch: u64::try_from(
+            controls
+                .try_get::<i64, _>("route_epoch")
+                .map_err(|_| "route control epoch is invalid")?,
+        )
+        .map_err(|_| "route control epoch is invalid")?,
+        executor_code_hash: state
+            .executor_code_hash
+            .clone()
+            .ok_or("executor code identity is unavailable")?,
+        contract_identity_hash,
+        wallet_gas_reserve_wei: reserve,
+        gas_reserve_floor_wei: state.gas_reserve_floor_wei,
+        current_daily_loss_wei: current_daily_loss,
+        daily_loss_limit_wei: daily_loss_limit,
+        observed_from: state.updated_at,
+        observed_until: database_now - ChronoDuration::microseconds(1),
+        created_at: database_now,
+        expires_at,
+        candidate_evidence_hashes: vec![
+            assessment.candidate.candidate_hash.clone(),
+            assessment.candidate.fork_result_hash.clone(),
+        ],
+    };
+    let mut request = ActivationRequest {
+        schema_version: ACTIVATION_REQUEST_SCHEMA.to_string(),
+        request_id: expected
+            .map(|request| request.request_id)
+            .unwrap_or_else(Uuid::new_v4),
+        binding,
+        evidence,
+        candidate: assessment.candidate,
+        created_at: database_now,
+        expires_at,
+        request_hash: "0".repeat(64),
+    };
+    request
+        .seal()
+        .map_err(|_| "activation request hash failed")?;
+    request
+        .validate(database_now)
+        .map_err(|_| "activation request is invalid")?;
+    Ok(Some(request))
+}
+
+fn row_u64_text(row: &sqlx::postgres::PgRow, name: &str) -> ControlResult<u64> {
+    row.try_get::<String, _>(name)
+        .map_err(|_| "numeric evidence is invalid")?
+        .parse()
+        .map_err(|_| "numeric evidence is invalid".into())
+}
+
+fn row_u128_text(row: &sqlx::postgres::PgRow, name: &str) -> ControlResult<u128> {
+    row.try_get::<String, _>(name)
+        .map_err(|_| "numeric evidence is invalid")?
+        .parse()
+        .map_err(|_| "numeric evidence is invalid".into())
+}
+
+fn row_i128_text(row: &sqlx::postgres::PgRow, name: &str) -> ControlResult<i128> {
+    row.try_get::<String, _>(name)
+        .map_err(|_| "numeric evidence is invalid")?
+        .parse()
+        .map_err(|_| "numeric evidence is invalid".into())
+}
+
+fn nonnegative_u64(row: &sqlx::postgres::PgRow, name: &str) -> ControlResult<u64> {
+    let value = row
+        .try_get::<i64, _>(name)
+        .map_err(|_| "numeric evidence is invalid")?;
+    u64::try_from(value).map_err(|_| "numeric evidence is invalid".into())
 }
 
 async fn evaluate_economic_control(pool: &PgPool) -> ControlResult<()> {
@@ -2226,6 +3058,23 @@ fn validate_readiness_against_evidence(
     Ok(())
 }
 
+async fn economic_state(pool: &PgPool) -> ControlResult<EconomicState> {
+    let row = sqlx::query(
+        "SELECT phase, current_size_level, route_fingerprint, release_sha,
+                engine_image_digest, route_universe_hash, route_policy_hash,
+                risk_policy_hash, executor_code_hash,
+                readiness_id, authorization_id,
+                gas_reserve_floor_wei::text AS gas_reserve_floor_wei,
+                control_epoch, updated_at
+         FROM live_canary.economic_control
+         WHERE singleton",
+    )
+    .fetch_one(pool)
+    .await
+    .map_err(|_| "economic control is unavailable")?;
+    economic_state_from_row(&row)
+}
+
 async fn economic_state_for_update(
     transaction: &mut Transaction<'_, Postgres>,
 ) -> ControlResult<EconomicState> {
@@ -2243,6 +3092,10 @@ async fn economic_state_for_update(
     .fetch_one(&mut **transaction)
     .await
     .map_err(|_| "economic control is unavailable")?;
+    economic_state_from_row(&row)
+}
+
+fn economic_state_from_row(row: &sqlx::postgres::PgRow) -> ControlResult<EconomicState> {
     let phase = parse_phase(
         &row.try_get::<String, _>("phase")
             .map_err(|_| "economic control is invalid")?,
