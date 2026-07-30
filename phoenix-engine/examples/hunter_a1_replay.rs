@@ -1,4 +1,5 @@
 use phoenix_engine::amm::v3::sqrt_ratio_at_tick;
+use phoenix_engine::domain::Direction;
 use phoenix_engine::hunter::{
     CandidateBindings, HunterBounds, HunterCore, HunterEconomicConfig, HunterEvent, HunterMode,
     HunterRouteGraph, InMemoryCandidateSink,
@@ -117,6 +118,7 @@ fn main() {
         observed_at_unix_ms: 1_784_878_802_000,
         evaluated_at_unix_ms: 1_784_878_802_000,
         touched_pool_addresses: vec![POOL_500.to_string()],
+        initiating_swap_direction: Some(Direction::ZeroForOne),
     };
     let mut sink = InMemoryCandidateSink::default();
     let started = Instant::now();

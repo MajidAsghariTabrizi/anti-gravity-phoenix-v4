@@ -272,7 +272,10 @@ async fn run_daemon() -> Result<(), DaemonFailure> {
         let bounds = HunterBounds::default();
         let graph = HunterRouteGraph::from_contracts(
             include_str!("../../config/phoenix-route-universe-v1.json"),
-            &[include_str!("../../config/phoenix-route-policy-v1.json")],
+            &[
+                include_str!("../../config/phoenix-route-policy-v1.json"),
+                include_str!("../../config/phoenix-route-policy-3000-500-v1.json"),
+            ],
             bounds,
         )
         .map_err(|error| DaemonFailure::process("hunter_route_selection", error.code()))?;

@@ -45,6 +45,23 @@ class HunterA1Tests(unittest.TestCase):
         self.assertTrue(release_policy["enabled_for_shadow"])
         self.assertTrue(release_policy["enabled_for_autonomous_live"])
 
+    def test_reverse_policy_is_distinct_and_preserves_reviewed_capital(self) -> None:
+        forward = hunter_contracts.load_json(
+            ROOT / "config/phoenix-route-policy-v1.json"
+        )
+        reverse = hunter_contracts.load_json(
+            ROOT / "config/phoenix-route-policy-3000-500-v1.json"
+        )
+        hunter_contracts.validate_document(reverse, hunter_contracts._validator(ROOT))
+        self.assertNotEqual(reverse["route_fingerprint"], forward["route_fingerprint"])
+        self.assertNotEqual(reverse["policy_hash"], forward["policy_hash"])
+        self.assertEqual(reverse["pool_addresses"], list(reversed(forward["pool_addresses"])))
+        self.assertEqual(reverse["fees"], list(reversed(forward["fees"])))
+        self.assertEqual(reverse["minimum_input_amount"], forward["minimum_input_amount"])
+        self.assertEqual(reverse["maximum_input_amount"], forward["maximum_input_amount"])
+        self.assertTrue(reverse["enabled_for_shadow"])
+        self.assertTrue(reverse["enabled_for_autonomous_live"])
+
     def test_revenue_report_is_bounded_and_honest(self) -> None:
         report = json.loads(
             (ROOT / "fixtures/hunter-a1/v1/revenue-replay-evidence.json").read_text(
@@ -138,6 +155,7 @@ class HunterA1Tests(unittest.TestCase):
             )
         )
         for expected in (
+            "config/phoenix-route-policy-3000-500-v1.json",
             "config/phoenix-route-policy-v1.json",
             "docs/AUTONOMOUS_HUNTER_A1_REVENUE_EVIDENCE.md",
             "fixtures/hunter-a1/v1/autonomous-candidate.json",

@@ -379,6 +379,29 @@ impl HunterRouteGraph {
             })
     }
 
+    fn prioritized_affected_route_indices(
+        &self,
+        pool_addresses: &[String],
+        maximum: usize,
+        initiating_direction: Option<Direction>,
+    ) -> Result<Vec<usize>, HunterError> {
+        let mut indices = self.affected_route_indices(pool_addresses, maximum)?;
+        indices.sort_by(|left, right| {
+            hunter_direction_rank(
+                self.bound_routes.get(*left),
+                pool_addresses,
+                initiating_direction,
+            )
+            .cmp(&hunter_direction_rank(
+                self.bound_routes.get(*right),
+                pool_addresses,
+                initiating_direction,
+            ))
+            .then_with(|| left.cmp(right))
+        });
+        Ok(indices)
+    }
+
     pub fn pool_addresses_for_origin_pool_ids(
         &self,
         origin_pool_ids: &[String],
@@ -423,6 +446,28 @@ impl HunterRouteGraph {
     }
 }
 
+fn hunter_direction_rank(
+    route: Option<&BoundRoute>,
+    pool_addresses: &[String],
+    initiating_direction: Option<Direction>,
+) -> u8 {
+    if pool_addresses.len() != 1 {
+        return 1;
+    }
+    let Some(initiating_direction) = initiating_direction else {
+        return 1;
+    };
+    route
+        .and_then(|route| {
+            route
+                .route
+                .legs
+                .iter()
+                .find(|leg| leg.pool_address == pool_addresses[0])
+        })
+        .map_or(2, |leg| u8::from(leg.direction == initiating_direction))
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HunterMode {
     Shadow,
@@ -450,6 +495,7 @@ pub struct HunterEvent {
     pub observed_at_unix_ms: u64,
     pub evaluated_at_unix_ms: u64,
     pub touched_pool_addresses: Vec<String>,
+    pub initiating_swap_direction: Option<Direction>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -586,9 +632,11 @@ impl HunterCore {
             .bounds
             .maximum_affected_routes_per_event
             .min(self.enabled_route_count().max(1));
-        let route_indices = self
-            .graph
-            .affected_route_indices(&event.touched_pool_addresses, affected_limit)?;
+        let route_indices = self.graph.prioritized_affected_route_indices(
+            &event.touched_pool_addresses,
+            affected_limit,
+            event.initiating_swap_direction,
+        )?;
         let matched_pools = event
             .touched_pool_addresses
             .iter()
@@ -2031,6 +2079,9 @@ mod tests {
     const UNIVERSE: &str = include_str!("../../../config/phoenix-route-universe-v1.json");
     const POLICY: &str =
         include_str!("../../../fixtures/autonomous-hunter/v1/valid/route-policy.json");
+    const FORWARD_POLICY: &str = include_str!("../../../config/phoenix-route-policy-v1.json");
+    const REVERSE_POLICY: &str =
+        include_str!("../../../config/phoenix-route-policy-3000-500-v1.json");
     const PINNED_FORK_CROSS_TICK: &str =
         include_str!("../../../fixtures/hunter-a1/v1/pinned-fork-cross-tick.json");
     const WETH: &str = "0x82af49447d8a07e3bd95bd0d56f35241523fbab1";
@@ -2041,6 +2092,15 @@ mod tests {
 
     fn graph() -> HunterRouteGraph {
         HunterRouteGraph::from_contracts(UNIVERSE, &[POLICY], HunterBounds::default()).unwrap()
+    }
+
+    fn production_graph() -> HunterRouteGraph {
+        HunterRouteGraph::from_contracts(
+            UNIVERSE,
+            &[FORWARD_POLICY, REVERSE_POLICY],
+            HunterBounds::default(),
+        )
+        .unwrap()
     }
 
     fn state(
@@ -2152,6 +2212,64 @@ mod tests {
         assert_eq!(graph.summary.enumerable_route_count, 2);
         assert_eq!(graph.summary.shadow_enabled_route_count, 1);
         assert_eq!(graph.summary.routes_per_leg_count.get(&2), Some(&2));
+    }
+
+    #[test]
+    fn production_graph_binds_both_directions_to_distinct_policies_and_caps() {
+        let graph = production_graph();
+        assert_eq!(graph.summary.enumerable_route_count, 2);
+        assert_eq!(graph.summary.shadow_enabled_route_count, 2);
+        assert_eq!(graph.summary.autonomous_live_enabled_route_count, 2);
+        assert_eq!(
+            graph
+                .bound_routes
+                .iter()
+                .map(|route| route.route_fingerprint.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "arbitrum-weth-usdc-uniswap-v3-3000-500-v1",
+                "arbitrum-weth-usdc-uniswap-v3-500-3000-v1",
+            ]
+        );
+        assert_eq!(
+            graph
+                .bound_routes
+                .iter()
+                .map(|route| route.policy.policy_hash.as_str())
+                .collect::<HashSet<_>>()
+                .len(),
+            2
+        );
+        assert_eq!(
+            graph
+                .bound_routes
+                .iter()
+                .map(|route| route.route.semantic_hash.as_str())
+                .collect::<HashSet<_>>()
+                .len(),
+            2
+        );
+        assert!(graph.bound_routes.iter().all(|route| {
+            route.policy.minimum_input_amount == "100000000000000"
+                && route.policy.maximum_input_amount == "10000000000000000"
+        }));
+
+        let zero_for_one = graph
+            .prioritized_affected_route_indices(
+                &[POOL_500.to_string()],
+                16,
+                Some(Direction::ZeroForOne),
+            )
+            .unwrap();
+        let one_for_zero = graph
+            .prioritized_affected_route_indices(
+                &[POOL_500.to_string()],
+                16,
+                Some(Direction::OneForZero),
+            )
+            .unwrap();
+        assert_eq!(zero_for_one, vec![0, 1]);
+        assert_eq!(one_for_zero, vec![1, 0]);
     }
 
     #[test]
@@ -2357,6 +2475,7 @@ mod tests {
             observed_at_unix_ms: 1_784_878_802_000,
             evaluated_at_unix_ms: 1_784_878_802_000,
             touched_pool_addresses: vec![POOL_500.to_string()],
+            initiating_swap_direction: Some(Direction::ZeroForOne),
         };
         let bindings = CandidateBindings {
             risk_snapshot_hash: "f97f050be11ca15357191f946521b272167de5dc116bb2f86f1d417e220c3801"

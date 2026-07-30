@@ -1,7 +1,7 @@
 use crate::{
     ARBITRUM_NATIVE_USDC_ADDRESS, ARBITRUM_ONE_CHAIN_ID, ARBITRUM_WETH_ADDRESS,
     CURRENT_ROUTE_FINGERPRINT, CURRENT_ROUTE_POOL_3000_ADDRESS, CURRENT_ROUTE_POOL_500_ADDRESS,
-    REQUEST_SCHEMA_VERSION,
+    REQUEST_SCHEMA_VERSION, REVERSE_ROUTE_FINGERPRINT,
 };
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -346,20 +346,27 @@ impl ExecutionRequest {
         let usdc = CanonicalAddress::parse(ARBITRUM_NATIVE_USDC_ADDRESS)?;
         let pool_500 = CanonicalAddress::parse(CURRENT_ROUTE_POOL_500_ADDRESS)?;
         let pool_3000 = CanonicalAddress::parse(CURRENT_ROUTE_POOL_3000_ADDRESS)?;
-        if self.route_fingerprint != CURRENT_ROUTE_FINGERPRINT
-            || self.flash_asset != weth
+        let route_matches = self.legs.len() == 2
+            && ((self.route_fingerprint == CURRENT_ROUTE_FINGERPRINT
+                && self.legs[0].pool == pool_500
+                && self.legs[0].fee == 500
+                && self.legs[1].pool == pool_3000
+                && self.legs[1].fee == 3_000)
+                || (self.route_fingerprint == REVERSE_ROUTE_FINGERPRINT
+                    && self.legs[0].pool == pool_3000
+                    && self.legs[0].fee == 3_000
+                    && self.legs[1].pool == pool_500
+                    && self.legs[1].fee == 500));
+        if self.flash_asset != weth
             || self.token_path.as_slice() != [weth, usdc, weth]
             || self.legs.len() != 2
-            || self.legs[0].pool != pool_500
             || self.legs[0].token_in != weth
             || self.legs[0].token_out != usdc
-            || self.legs[0].fee != 500
             || !self.legs[0].zero_for_one
-            || self.legs[1].pool != pool_3000
             || self.legs[1].token_in != usdc
             || self.legs[1].token_out != weth
-            || self.legs[1].fee != 3_000
             || self.legs[1].zero_for_one
+            || !route_matches
         {
             return Err(ModelError::InvalidLegs);
         }

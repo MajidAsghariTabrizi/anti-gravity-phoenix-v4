@@ -17,8 +17,11 @@ use phoenix_live_executor::owner_bootstrap::{
     OwnerBootstrapError, OwnerMutation,
 };
 use phoenix_live_executor::rpc::{ExecutionRpc, HttpExecutionRpc};
+#[cfg(test)]
+use phoenix_live_executor::REVERSE_ROUTE_FINGERPRINT;
 use phoenix_live_executor::{
-    APPROVAL_POLICY_VERSION, CURRENT_ROUTE_FINGERPRINT, REQUEST_SCHEMA_VERSION,
+    reviewed_route_policies, reviewed_route_policy, APPROVAL_POLICY_VERSION,
+    CURRENT_ROUTE_FINGERPRINT, REQUEST_SCHEMA_VERSION,
 };
 use rpc_gateway::hunter_state::{HunterStateResponse, HUNTER_STATE_RESPONSE_SCHEMA};
 use serde::{Deserialize, Serialize};
@@ -72,6 +75,40 @@ const ACTIVATION_REQUEST_OUTBOX_ENV: &str = "PHOENIX_ACTIVATION_REQUEST_OUTBOX";
 const MAX_CONTROL_FILE_BYTES: u64 = 256 * 1024;
 const IMAGE_RUNTIME_PROBE_COMMAND: &str = "__image_runtime_probe__";
 const IMAGE_RUNTIME_OK: &str = "AUTONOMOUS_CONTROL_RUNTIME_OK";
+
+fn reviewed_policy_values() -> ControlResult<Vec<Value>> {
+    let mut policies = Vec::new();
+    let mut fingerprints = std::collections::BTreeSet::new();
+    for contract in reviewed_route_policies() {
+        let policy: Value =
+            serde_json::from_str(contract).map_err(|_| "route policy is invalid")?;
+        verify_hash(
+            &policy,
+            "policy_hash",
+            "route-policy",
+            "phoenix.route-policy.v1",
+        )?;
+        let fingerprint = value_text(&policy, "route_fingerprint")?;
+        if !fingerprints.insert(fingerprint.to_string()) {
+            return Err("reviewed route fingerprint is duplicated".into());
+        }
+        policies.push(policy);
+    }
+    Ok(policies)
+}
+
+fn reviewed_policy_value(fingerprint: &str) -> ControlResult<Value> {
+    let contract =
+        reviewed_route_policy(fingerprint).ok_or("route is outside the reviewed universe")?;
+    let policy: Value = serde_json::from_str(contract).map_err(|_| "route policy is invalid")?;
+    verify_hash(
+        &policy,
+        "policy_hash",
+        "route-policy",
+        "phoenix.route-policy.v1",
+    )?;
+    Ok(policy)
+}
 
 #[derive(Debug)]
 enum ControlError {
@@ -481,29 +518,32 @@ async fn disarmed_deploy(pool: &PgPool) -> ControlResult<()> {
         return Err("executor code hash is invalid".into());
     }
     let daily_loss_limit = required_u128("LIVE_EXECUTOR_MAX_DAILY_LOSS_WEI")?;
-    let policy: Value = serde_json::from_str(POLICY).map_err(|_| "route policy is invalid")?;
+    let policies = reviewed_policy_values()?;
+    let policy = policies
+        .iter()
+        .find(|policy| {
+            policy.get("route_fingerprint").and_then(Value::as_str)
+                == Some(CURRENT_ROUTE_FINGERPRINT)
+        })
+        .ok_or("default reviewed route policy is missing")?;
     let universe: Value =
         serde_json::from_str(UNIVERSE).map_err(|_| "route universe is invalid")?;
-    verify_hash(
-        &policy,
-        "policy_hash",
-        "route-policy",
-        "phoenix.route-policy.v1",
-    )?;
     verify_hash(
         &universe,
         "universe_hash",
         "route-universe",
         "phoenix.route-universe.v1",
     )?;
-    let route_fingerprint = value_text(&policy, "route_fingerprint")?;
-    let route_policy_hash = value_text(&policy, "policy_hash")?;
+    let route_fingerprint = value_text(policy, "route_fingerprint")?;
+    let route_policy_hash = value_text(policy, "policy_hash")?;
     let route_universe_hash = value_text(&universe, "universe_hash")?;
-    if value_text(&policy, "route_universe_hash")? != route_universe_hash
-        || value_u128(&policy, "maximum_input_amount")? != MAXIMUM_REVIEWED_INPUT_WEI
-        || value_u128(&policy, "minimum_input_amount")? != SizeLevel::Min.amount_wei()
-    {
-        return Err("reviewed route policy does not match the economic ladder".into());
+    for reviewed_policy in &policies {
+        if value_text(reviewed_policy, "route_universe_hash")? != route_universe_hash
+            || value_u128(reviewed_policy, "maximum_input_amount")? != MAXIMUM_REVIEWED_INPUT_WEI
+            || value_u128(reviewed_policy, "minimum_input_amount")? != SizeLevel::Min.amount_wei()
+        {
+            return Err("reviewed route policy does not match the economic ladder".into());
+        }
     }
 
     let mut transaction = pool
@@ -536,35 +576,44 @@ async fn disarmed_deploy(pool: &PgPool) -> ControlResult<()> {
     .execute(&mut *transaction)
     .await
     .map_err(|_| "legacy disarmed deployment failed")?;
-    let route_epoch: i64 = sqlx::query_scalar(
-        "INSERT INTO live_canary.autonomous_route_controls(
-            route_fingerprint, route_policy_hash, enabled, kill_switch,
-            current_size_level, maximum_permitted_size, cooldown_until,
-            control_epoch, disarm_reason, control_hash, control_contract, updated_at
-         ) VALUES (
-            $1, $2, false, true, 'MIN', $3::numeric, NULL,
-            0, 'disarmed_deploy', NULL, NULL, now()
-         )
-         ON CONFLICT (route_fingerprint) DO UPDATE SET
-            route_policy_hash = EXCLUDED.route_policy_hash,
-            enabled = false,
-            kill_switch = true,
-            current_size_level = 'MIN',
-            maximum_permitted_size = EXCLUDED.maximum_permitted_size,
-            cooldown_until = NULL,
-            control_epoch = live_canary.autonomous_route_controls.control_epoch + 1,
-            disarm_reason = 'disarmed_deploy',
-            control_hash = NULL,
-            control_contract = NULL,
-            updated_at = now()
-         RETURNING control_epoch",
-    )
-    .bind(route_fingerprint)
-    .bind(route_policy_hash)
-    .bind(MAXIMUM_REVIEWED_INPUT_WEI.to_string())
-    .fetch_one(&mut *transaction)
-    .await
-    .map_err(|_| "route disarmed deployment failed")?;
+    let mut route_epoch = None;
+    for reviewed_policy in &policies {
+        let fingerprint = value_text(reviewed_policy, "route_fingerprint")?;
+        let policy_hash = value_text(reviewed_policy, "policy_hash")?;
+        let epoch: i64 = sqlx::query_scalar(
+            "INSERT INTO live_canary.autonomous_route_controls(
+                route_fingerprint, route_policy_hash, enabled, kill_switch,
+                current_size_level, maximum_permitted_size, cooldown_until,
+                control_epoch, disarm_reason, control_hash, control_contract, updated_at
+             ) VALUES (
+                $1, $2, false, true, 'MIN', $3::numeric, NULL,
+                0, 'disarmed_deploy', NULL, NULL, now()
+             )
+             ON CONFLICT (route_fingerprint) DO UPDATE SET
+                route_policy_hash = EXCLUDED.route_policy_hash,
+                enabled = false,
+                kill_switch = true,
+                current_size_level = 'MIN',
+                maximum_permitted_size = EXCLUDED.maximum_permitted_size,
+                cooldown_until = NULL,
+                control_epoch = live_canary.autonomous_route_controls.control_epoch + 1,
+                disarm_reason = 'disarmed_deploy',
+                control_hash = NULL,
+                control_contract = NULL,
+                updated_at = now()
+             RETURNING control_epoch",
+        )
+        .bind(fingerprint)
+        .bind(policy_hash)
+        .bind(MAXIMUM_REVIEWED_INPUT_WEI.to_string())
+        .fetch_one(&mut *transaction)
+        .await
+        .map_err(|_| "route disarmed deployment failed")?;
+        if fingerprint == route_fingerprint {
+            route_epoch = Some(epoch);
+        }
+    }
+    let route_epoch = route_epoch.ok_or("default route control was not installed")?;
     sqlx::query(
         "UPDATE live_canary.autonomous_candidates
          SET status = 'disarmed', updated_at = now()
@@ -826,7 +875,8 @@ async fn create_readiness(pool: &PgPool) -> ControlResult<()> {
     let controls = sqlx::query(
         "SELECT NOT c.armed AND c.kill_switch
                     AND NOT g.armed AND g.kill_switch AND g.execution_mode = 'disarmed'
-                    AND NOT r.enabled AND r.kill_switch AS closed,
+                    AND NOT r.enabled AND r.kill_switch
+                    AND r.route_policy_hash = $2 AS closed,
                 g.control_epoch AS global_control_epoch,
                 r.control_epoch AS route_control_epoch
          FROM live_canary.control c
@@ -837,6 +887,7 @@ async fn create_readiness(pool: &PgPool) -> ControlResult<()> {
          FOR UPDATE OF c, g, r",
     )
     .bind(&input.binding.route_fingerprint)
+    .bind(&input.binding.route_policy_hash)
     .fetch_one(&mut *transaction)
     .await
     .map_err(|_| "disarmed controls are unavailable")?;
@@ -922,12 +973,16 @@ async fn create_readiness(pool: &PgPool) -> ControlResult<()> {
     sqlx::query(
         "UPDATE live_canary.economic_control
          SET phase = 'CANARY_READY', readiness_id = $1,
-             gas_reserve_wei = $2::numeric, gas_reserve_floor_wei = $3::numeric,
-             control_epoch = $4, last_transition_reason = 'evidence_gate_passed',
+             route_fingerprint = $2, route_policy_hash = $3,
+             risk_policy_hash = $3,
+             gas_reserve_wei = $4::numeric, gas_reserve_floor_wei = $5::numeric,
+             control_epoch = $6, last_transition_reason = 'evidence_gate_passed',
              updated_at = now()
          WHERE singleton",
     )
     .bind(input.readiness_id)
+    .bind(&input.binding.route_fingerprint)
+    .bind(&input.binding.route_policy_hash)
     .bind(input.binding.wallet_gas_reserve_wei.to_string())
     .bind(input.binding.gas_reserve_floor_wei.to_string())
     .bind(next_epoch)
@@ -1046,29 +1101,7 @@ async fn activate(pool: &PgPool) -> ControlResult<()> {
         .map_err(|_| "readiness ID is invalid")?;
     let authorization_id = Uuid::parse_str(&required("PHOENIX_AUTOMATION_AUTHORIZATION_ID")?)
         .map_err(|_| "authorization ID is invalid")?;
-    let policy: Value = serde_json::from_str(POLICY).map_err(|_| "route policy is invalid")?;
-    verify_hash(
-        &policy,
-        "policy_hash",
-        "route-policy",
-        "phoenix.route-policy.v1",
-    )?;
-    if policy
-        .get("enabled_for_autonomous_live")
-        .and_then(Value::as_bool)
-        != Some(true)
-    {
-        return Err("route policy is not enabled for autonomous LIVE".into());
-    }
     let configured_maximum = required_u128("LIVE_EXECUTOR_MAX_INPUT_AMOUNT")?;
-    let policy_minimum = value_u128(&policy, "minimum_input_amount")?;
-    let policy_maximum = value_u128(&policy, "maximum_input_amount")?;
-    if configured_maximum != MAXIMUM_REVIEWED_INPUT_WEI
-        || policy_maximum != MAXIMUM_REVIEWED_INPUT_WEI
-        || policy_minimum != SizeLevel::Min.amount_wei()
-    {
-        return Err("configured maximum does not match the reviewed ladder".into());
-    }
     let maximum_input = SizeLevel::Min.amount_wei();
     let daily_loss_limit = required_u128("LIVE_EXECUTOR_MAX_DAILY_LOSS_WEI")?;
     if daily_loss_limit == 0 {
@@ -1080,10 +1113,29 @@ async fn activate(pool: &PgPool) -> ControlResult<()> {
         .await
         .map_err(|_| "database transaction failed")?;
     let previous = economic_state_for_update(&mut transaction).await?;
+    let selected_route = previous
+        .route_fingerprint
+        .as_deref()
+        .ok_or("economic route is unavailable")?;
+    let policy = reviewed_policy_value(selected_route)?;
+    if policy
+        .get("enabled_for_autonomous_live")
+        .and_then(Value::as_bool)
+        != Some(true)
+    {
+        return Err("route policy is not enabled for autonomous LIVE".into());
+    }
+    let policy_minimum = value_u128(&policy, "minimum_input_amount")?;
+    let policy_maximum = value_u128(&policy, "maximum_input_amount")?;
+    if configured_maximum != MAXIMUM_REVIEWED_INPUT_WEI
+        || policy_maximum != MAXIMUM_REVIEWED_INPUT_WEI
+        || policy_minimum != SizeLevel::Min.amount_wei()
+    {
+        return Err("configured maximum does not match the reviewed ladder".into());
+    }
     if previous.phase != EconomicPhase::CanaryReady
         || previous.readiness_id != Some(readiness_id)
-        || previous.route_fingerprint.as_deref()
-            != policy.get("route_fingerprint").and_then(Value::as_str)
+        || policy.get("route_fingerprint").and_then(Value::as_str) != Some(selected_route)
     {
         return Err("economic control is not ready for this canary".into());
     }
@@ -1624,6 +1676,7 @@ JOIN public.shadow_profitability_facts fact
 JOIN public.fork_simulation_results result
   ON result.shadow_decision_id = fact.shadow_decision_id
 WHERE candidate.route_fingerprint = $1
+  AND candidate.route_policy_hash = $6
   AND candidate.status = 'materialized'
   AND candidate.selected_size = $2::numeric
   AND candidate.candidate_created_at >= $3
@@ -1663,6 +1716,12 @@ LIMIT 1
     .bind(state.updated_at)
     .bind(now)
     .bind(expected_candidate)
+    .bind(
+        state
+            .route_policy_hash
+            .as_deref()
+            .ok_or("route policy identity is unavailable")?,
+    )
     .fetch_optional(pool)
     .await
     .map_err(|_| "eligible activation candidate inspection failed")?;
@@ -1909,24 +1968,49 @@ async fn collect_activation_request(
     if image_digest(&required("PHOENIX_ENGINE_IMAGE")?)? != engine_image_digest {
         return Err("Engine image identity does not match the runtime".into());
     }
-    let route_fingerprint = state
-        .route_fingerprint
-        .as_deref()
-        .ok_or("economic route is unavailable")?;
     let database_now: DateTime<Utc> = sqlx::query_scalar("SELECT clock_timestamp()")
         .fetch_one(pool)
         .await
         .map_err(|_| "database clock is unavailable")?;
-    let Some(assessment) = eligible_activation_candidate(
-        pool,
-        &state,
-        expected.map(|request| request.candidate.candidate_id),
-        database_now,
-    )
-    .await?
-    else {
+    let mut policies = reviewed_policy_values()?;
+    policies.sort_by_key(|policy| {
+        policy.get("route_fingerprint").and_then(Value::as_str)
+            != state.route_fingerprint.as_deref()
+    });
+    let mut selected = None;
+    for policy in policies {
+        let fingerprint = value_text(&policy, "route_fingerprint")?;
+        if expected
+            .map(|request| request.candidate.route_fingerprint.as_str() != fingerprint)
+            .unwrap_or(false)
+        {
+            continue;
+        }
+        let mut route_state = state.clone();
+        route_state.route_fingerprint = Some(fingerprint.to_string());
+        route_state.route_policy_hash = Some(value_text(&policy, "policy_hash")?.to_string());
+        route_state
+            .risk_policy_hash
+            .clone_from(&route_state.route_policy_hash);
+        if let Some(assessment) = eligible_activation_candidate(
+            pool,
+            &route_state,
+            expected.map(|request| request.candidate.candidate_id),
+            database_now,
+        )
+        .await?
+        {
+            selected = Some((route_state, assessment));
+            break;
+        }
+    }
+    let Some((state, assessment)) = selected else {
         return Ok(None);
     };
+    let route_fingerprint = state
+        .route_fingerprint
+        .as_deref()
+        .ok_or("economic route is unavailable")?;
 
     let controls = sqlx::query(
         r#"
@@ -2699,7 +2783,7 @@ async fn apply_promotion(
         "current_size_level": next_level.as_str(),
         "maximum_permitted_size": next_level.amount_wei().to_string(),
         "daily_loss_limit": value_text(
-            &serde_json::from_str(POLICY).map_err(|_| "route policy is invalid")?,
+            &reviewed_policy_value(route_fingerprint)?,
             "per_route_daily_loss"
         )?,
         "maximum_consecutive_losses": 3,
@@ -3041,13 +3125,17 @@ fn validate_readiness_against_evidence(
     }
     if previous.release_sha.as_deref() != Some(binding.release_sha.as_str())
         || previous.engine_image_digest.as_deref() != Some(binding.engine_image_digest.as_str())
-        || previous.route_fingerprint.as_deref() != Some(binding.route_fingerprint.as_str())
         || previous.route_universe_hash.as_deref() != Some(binding.route_universe_hash.as_str())
-        || previous.route_policy_hash.as_deref() != Some(binding.route_policy_hash.as_str())
-        || previous.risk_policy_hash.as_deref() != Some(binding.risk_policy_hash.as_str())
         || previous.executor_code_hash.as_deref() != Some(binding.executor_code_hash.as_str())
+        || binding.risk_policy_hash != binding.route_policy_hash
     {
         return Err("readiness does not bind the current disarmed release".into());
+    }
+    let policy = reviewed_policy_value(&binding.route_fingerprint)?;
+    if value_text(&policy, "policy_hash")? != binding.route_policy_hash
+        || value_text(&policy, "route_universe_hash")? != binding.route_universe_hash
+    {
+        return Err("readiness route is outside the reviewed release universe".into());
     }
     if u64::try_from(previous.control_epoch).ok() != Some(binding.economic_control_epoch) {
         return Err("readiness does not bind the current economic control epoch".into());
@@ -3459,10 +3547,13 @@ mod tests {
         ReadinessBinding {
             release_sha: "a".repeat(40),
             engine_image_digest: format!("sha256:{}", "b".repeat(64)),
-            route_fingerprint: "route".to_string(),
-            route_universe_hash: "c".repeat(64),
-            route_policy_hash: "d".repeat(64),
-            risk_policy_hash: "d".repeat(64),
+            route_fingerprint: CURRENT_ROUTE_FINGERPRINT.to_string(),
+            route_universe_hash: "84adac686635535486e06e44fcaf90c812dc27273affc5bffc4eebd6c164928c"
+                .to_string(),
+            route_policy_hash: "d7aff21eb025696208c646631772a45c241fc2971ef0c9866646d12dca12d476"
+                .to_string(),
+            risk_policy_hash: "d7aff21eb025696208c646631772a45c241fc2971ef0c9866646d12dca12d476"
+                .to_string(),
             economic_control_epoch: 7,
             global_control_epoch: 8,
             route_control_epoch: 9,
@@ -3594,9 +3685,19 @@ mod tests {
 
     #[test]
     fn readiness_requires_evidence_phase_current_bindings_and_post_transition_window() {
-        let evidence = state(EconomicPhase::DisarmedEvidence);
         let binding = readiness();
+        let mut evidence = state(EconomicPhase::DisarmedEvidence);
+        evidence.route_universe_hash = Some(binding.route_universe_hash.clone());
         assert!(validate_readiness_against_evidence(&evidence, &binding).is_ok());
+
+        let mut reverse = binding.clone();
+        reverse.route_fingerprint = REVERSE_ROUTE_FINGERPRINT.to_string();
+        reverse.route_policy_hash =
+            "36da85c0fd07e5d3a12726582b20c84d81cfbd2d1d982da8237d3b5cf38b83d5".to_string();
+        reverse
+            .risk_policy_hash
+            .clone_from(&reverse.route_policy_hash);
+        assert!(validate_readiness_against_evidence(&evidence, &reverse).is_ok());
 
         let deploy = state(EconomicPhase::DisarmedDeploy);
         assert!(validate_readiness_against_evidence(&deploy, &binding).is_err());

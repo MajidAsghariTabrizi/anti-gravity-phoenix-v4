@@ -1,4 +1,4 @@
-use crate::domain::{Address, Amount, PoolId, SequenceNumber, TokenAddress, TxHash};
+use crate::domain::{Address, Amount, Direction, PoolId, SequenceNumber, TokenAddress, TxHash};
 use crate::messaging::NormalizedTx;
 pub use money_path_classifier::{
     DecodedSwapKind, OriginEvidence, OriginMetricKind, OuterSelectorKind, RouterKind,
@@ -28,6 +28,20 @@ pub struct OriginEvent {
     pub amount: Amount,
     pub candidate_touched_pools: Vec<PoolId>,
     pub classification_evidence: OriginEvidence,
+}
+
+impl OriginEvent {
+    pub fn initiating_swap_direction(&self) -> Option<Direction> {
+        let token_in = self.swap_path.first()?;
+        let token_out = self.swap_path.last()?;
+        if token_in == token_out {
+            None
+        } else if token_in.0.as_str() < token_out.0.as_str() {
+            Some(Direction::ZeroForOne)
+        } else {
+            Some(Direction::OneForZero)
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

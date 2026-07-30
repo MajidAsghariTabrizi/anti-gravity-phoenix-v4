@@ -4,7 +4,9 @@ use crate::economic_control::SizeLevel;
 use crate::model::{canonical_digest, CanonicalAddress, ExecutionRequest, ValidatedLeg};
 use crate::rpc::{HttpExecutionRpc, RpcErrorKind, TransactionQuote};
 use crate::store::insert_runtime_transition;
-use crate::{APPROVAL_POLICY_VERSION, REQUEST_SCHEMA_VERSION};
+use crate::{
+    reviewed_route_policies, reviewed_route_policy, APPROVAL_POLICY_VERSION, REQUEST_SCHEMA_VERSION,
+};
 use chrono::{DateTime, SecondsFormat, TimeZone, Utc};
 use phoenix_fork_sandbox::SimulationStatus;
 use serde_json::{json, Map, Value};
@@ -21,7 +23,6 @@ const SCHEMA_VERSION: &str = "phoenix.live-canary-schema.v5";
 const QUOTE_SCHEMA: &str = "phoenix.submission-quote.v1";
 const RISK_SCHEMA: &str = "phoenix.risk-snapshot.v1";
 const APPROVAL_SCHEMA: &str = "phoenix.automatic-approval.v1";
-const ROUTE_POLICY: &str = include_str!("../../config/phoenix-route-policy-v1.json");
 const MAX_CONSECUTIVE_OUTCOMES: i64 = 1_000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -42,7 +43,7 @@ pub struct AutonomousMaterializer {
     pool: PgPool,
     config: ExecutorConfig,
     rpc: HttpExecutionRpc,
-    route_policy: Value,
+    route_policies: BTreeMap<String, Value>,
 }
 
 impl AutonomousMaterializer {
@@ -66,26 +67,33 @@ impl AutonomousMaterializer {
         if version != SCHEMA_VERSION {
             return Err(AutonomousMaterializerError::Integrity);
         }
-        let route_policy: Value = serde_json::from_str(ROUTE_POLICY)
-            .map_err(|_| AutonomousMaterializerError::Integrity)?;
-        verify_hash(
-            &route_policy,
-            "policy_hash",
-            "route-policy",
-            "phoenix.route-policy.v1",
-        )?;
-        if route_policy
-            .get("enabled_for_autonomous_live")
-            .and_then(Value::as_bool)
-            != Some(true)
-        {
-            return Err(AutonomousMaterializerError::Configuration);
+        let mut route_policies = BTreeMap::new();
+        for contract in reviewed_route_policies() {
+            let route_policy: Value = serde_json::from_str(contract)
+                .map_err(|_| AutonomousMaterializerError::Integrity)?;
+            verify_hash(
+                &route_policy,
+                "policy_hash",
+                "route-policy",
+                "phoenix.route-policy.v1",
+            )?;
+            if route_policy
+                .get("enabled_for_autonomous_live")
+                .and_then(Value::as_bool)
+                != Some(true)
+            {
+                return Err(AutonomousMaterializerError::Configuration);
+            }
+            let fingerprint = policy_text(&route_policy, "route_fingerprint")?.to_string();
+            if route_policies.insert(fingerprint, route_policy).is_some() {
+                return Err(AutonomousMaterializerError::Configuration);
+            }
         }
         Ok(Self {
             pool,
             config,
             rpc,
-            route_policy,
+            route_policies,
         })
     }
 
@@ -205,18 +213,22 @@ impl AutonomousMaterializer {
         quote: TransactionQuote,
         now: DateTime<Utc>,
     ) -> Result<MaterializationState, AutonomousMaterializerError> {
+        let route_policy = self
+            .route_policies
+            .get(&candidate.route_fingerprint)
+            .ok_or(AutonomousMaterializerError::Policy)?;
         if candidate.chain_id != self.config.chain_id
             || candidate.executor_address != self.config.executor_address
             || candidate.executor_code_hash != self.config.executor_code_hash
-            || candidate.route_policy_hash != policy_text(&self.route_policy, "policy_hash")?
-            || candidate.route_fingerprint != policy_text(&self.route_policy, "route_fingerprint")?
+            || candidate.route_policy_hash != policy_text(route_policy, "policy_hash")?
+            || candidate.route_fingerprint != policy_text(route_policy, "route_fingerprint")?
             || candidate.expires_at <= now
         {
             return self
                 .reject(candidate.candidate_id, "rejected_policy", "identity_policy")
                 .await;
         }
-        let maximum_state_age = policy_u64(&self.route_policy, "maximum_state_age_blocks")?;
+        let maximum_state_age = policy_u64(route_policy, "maximum_state_age_blocks")?;
         if quote.block_number < candidate.state_block_number
             || quote.block_number - candidate.state_block_number > maximum_state_age
         {
@@ -243,7 +255,7 @@ impl AutonomousMaterializer {
         let total_fee = u128::from(quote.gas_limit)
             .checked_mul(quote.max_fee_per_gas)
             .ok_or(AutonomousMaterializerError::Arithmetic)?;
-        if total_fee > policy_u128(&self.route_policy, "per_transaction_maximum_loss")? {
+        if total_fee > policy_u128(route_policy, "per_transaction_maximum_loss")? {
             return self
                 .reject(
                     candidate.candidate_id,
@@ -272,7 +284,7 @@ impl AutonomousMaterializer {
                 i128::try_from(total_cost).map_err(|_| AutonomousMaterializerError::Arithmetic)?,
             )
             .ok_or(AutonomousMaterializerError::Arithmetic)?;
-        let minimum_retained_profit = policy_u128(&self.route_policy, "minimum_retained_profit")?;
+        let minimum_retained_profit = policy_u128(route_policy, "minimum_retained_profit")?;
         if executable_net
             <= i128::try_from(minimum_retained_profit)
                 .map_err(|_| AutonomousMaterializerError::Arithmetic)?
@@ -286,7 +298,7 @@ impl AutonomousMaterializer {
                 .await;
         }
 
-        let maximum_quote_age_ms = policy_u64(&self.route_policy, "maximum_quote_age_ms")?;
+        let maximum_quote_age_ms = policy_u64(route_policy, "maximum_quote_age_ms")?;
         let quote_expires = now
             .checked_add_signed(chrono::Duration::milliseconds(
                 i64::try_from(maximum_quote_age_ms)
@@ -390,8 +402,8 @@ impl AutonomousMaterializer {
         .await?;
         let risk_facts =
             load_risk_facts(&mut transaction, &candidate.route_fingerprint, now).await?;
-        let route_loss_limit = policy_u128(&self.route_policy, "per_route_daily_loss")?;
-        let consecutive_limit = policy_u64(&self.route_policy, "maximum_consecutive_losses")?;
+        let route_loss_limit = policy_u128(route_policy, "per_route_daily_loss")?;
+        let consecutive_limit = policy_u64(route_policy, "maximum_consecutive_losses")?;
         if risk_facts.route_daily_loss >= route_loss_limit
             || u64::from(risk_facts.consecutive_losses) >= consecutive_limit
         {
@@ -454,7 +466,7 @@ impl AutonomousMaterializer {
             &risk_facts,
             &candidate,
             &self.config,
-            &self.route_policy,
+            route_policy,
             quote.block_number,
             now,
         ) {
@@ -1262,10 +1274,11 @@ fn build_risk_snapshot(
     quote_block: u64,
     now: DateTime<Utc>,
 ) -> Result<Value, AutonomousMaterializerError> {
-    let route_loss_limit = policy_u128(
-        &serde_json::from_str(ROUTE_POLICY).map_err(|_| AutonomousMaterializerError::Integrity)?,
-        "per_route_daily_loss",
-    )?;
+    let route_policy = reviewed_route_policy(&candidate.route_fingerprint)
+        .ok_or(AutonomousMaterializerError::Integrity)?;
+    let route_policy: Value =
+        serde_json::from_str(route_policy).map_err(|_| AutonomousMaterializerError::Integrity)?;
+    let route_loss_limit = policy_u128(&route_policy, "per_route_daily_loss")?;
     Ok(json!({
         "schema_version": RISK_SCHEMA,
         "route_policy_hash": candidate.route_policy_hash,
