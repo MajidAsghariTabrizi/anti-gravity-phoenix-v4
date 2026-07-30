@@ -13,7 +13,7 @@ use async_trait::async_trait;
 use rpc_gateway::shadow_state::RpcQualityEvidence;
 use serde::Deserialize;
 use serde_json::{json, Value};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 use thiserror::Error;
 
@@ -138,6 +138,7 @@ pub trait CandidateEvaluator: Send + Sync {
         input: &EngineInput,
         origin: &OriginEvent,
         routes: &[RuntimeRoute],
+        _executable_route_fingerprints: &BTreeSet<String>,
     ) -> Result<Vec<CandidateBatch>, EvaluationError> {
         let mut batches = Vec::with_capacity(routes.len());
         for route in routes {
@@ -323,6 +324,7 @@ pub struct ShadowProcessor {
     routes: RouteRegistry,
     evaluator: Arc<dyn CandidateEvaluator>,
     autonomous: Option<Arc<dyn AutonomousEventProcessor>>,
+    executable_route_fingerprints: BTreeSet<String>,
 }
 
 impl std::fmt::Debug for ShadowProcessor {
@@ -346,10 +348,12 @@ impl ShadowProcessor {
             routes,
             evaluator,
             autonomous: None,
+            executable_route_fingerprints: BTreeSet::new(),
         })
     }
 
     pub fn with_autonomous(mut self, autonomous: Arc<AutonomousHunterProcessor>) -> Self {
+        self.executable_route_fingerprints = autonomous.executable_route_fingerprints();
         self.autonomous = Some(autonomous);
         self
     }
@@ -359,6 +363,7 @@ impl ShadowProcessor {
         mut self,
         autonomous: Arc<dyn AutonomousEventProcessor>,
     ) -> Self {
+        self.executable_route_fingerprints = autonomous.executable_route_fingerprints();
         self.autonomous = Some(autonomous);
         self
     }
@@ -467,7 +472,7 @@ impl ShadowProcessor {
             .collect::<Vec<_>>();
         let batches = match self
             .evaluator
-            .evaluate_routes(input, &origin, &routes)
+            .evaluate_routes(input, &origin, &routes, &self.executable_route_fingerprints)
             .await
         {
             Ok(batches) if batches.len() == routes.len() => batches,

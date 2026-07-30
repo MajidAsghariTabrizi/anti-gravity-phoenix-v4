@@ -39,6 +39,7 @@ use rpc_gateway::shadow_state::{
 use serde::Serialize;
 use serde_json::json;
 use sha2::{Digest, Sha256};
+use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::sync::Arc;
@@ -354,8 +355,14 @@ impl CandidateEvaluator for RpcCandidateEvaluator {
         origin: &OriginEvent,
         route: &RuntimeRoute,
     ) -> Result<CandidateBatch, EvaluationError> {
+        let executable_route_fingerprints = BTreeSet::from([route.fingerprint.clone()]);
         let mut batches = self
-            .evaluate_routes(input, origin, std::slice::from_ref(route))
+            .evaluate_routes(
+                input,
+                origin,
+                std::slice::from_ref(route),
+                &executable_route_fingerprints,
+            )
             .await?;
         batches.pop().ok_or(EvaluationError::Terminal(
             "adaptive_route_batch_cardinality_mismatch",
@@ -367,6 +374,7 @@ impl CandidateEvaluator for RpcCandidateEvaluator {
         input: &EngineInput,
         origin: &OriginEvent,
         routes: &[RuntimeRoute],
+        executable_route_fingerprints: &BTreeSet<String>,
     ) -> Result<Vec<CandidateBatch>, EvaluationError> {
         if routes.is_empty() {
             return Ok(Vec::new());
@@ -424,19 +432,39 @@ impl CandidateEvaluator for RpcCandidateEvaluator {
 
         let mut ranked = (0..screens.len()).collect::<Vec<_>>();
         ranked.sort_by(|left, right| {
-            primary_route_score(&screens[*right])
-                .cmp(&primary_route_score(&screens[*left]))
-                .then_with(|| left.cmp(right))
+            primary_route_ordering(
+                &routes[*left],
+                &screens[*left],
+                &routes[*right],
+                &screens[*right],
+            )
+            .reverse()
         });
         for (rank, index) in ranked.iter().enumerate() {
             screens[*index].profitability["route_rank"] = json!(rank + 1);
         }
-        let selected_route_index = ranked
-            .iter()
-            .copied()
-            .find(|index| screens[*index].ladder.selected_index.is_some());
-        let selected_route_fingerprint =
-            selected_route_index.map(|index| routes[index].fingerprint.as_str());
+        let global_best_observed = ranked.iter().find_map(|index| {
+            best_route_evaluation(&screens[*index])
+                .map(|evaluation| (routes[*index].fingerprint.as_str(), evaluation.input))
+        });
+        let selected_route_index = ranked.iter().copied().find(|index| {
+            executable_route_fingerprints.contains(&routes[*index].fingerprint)
+                && screens[*index].ladder.selected_index.is_some()
+        });
+        let best_executable = selected_route_index.and_then(|index| {
+            screens[index]
+                .ladder
+                .selected_index
+                .and_then(|selected| screens[index].ladder.attempts[selected].evaluation.as_ref())
+                .map(|evaluation| (routes[index].fingerprint.as_str(), evaluation.input))
+        });
+        let selection = AdaptiveSelectionEvidence {
+            global_best_observed_route_fingerprint: global_best_observed
+                .map(|(fingerprint, _)| fingerprint),
+            global_best_observed_input_amount: global_best_observed.map(|(_, input)| input),
+            best_executable_route_fingerprint: best_executable.map(|(fingerprint, _)| fingerprint),
+            best_executable_input_amount: best_executable.map(|(_, input)| input),
+        };
 
         let mut batches = Vec::with_capacity(routes.len());
         for (index, (route, screen)) in routes.iter().zip(screens).enumerate() {
@@ -458,6 +486,7 @@ impl CandidateEvaluator for RpcCandidateEvaluator {
                         requested_at,
                         &shared_response_hash,
                         rank,
+                        selection,
                     )
                     .await?,
                 );
@@ -467,8 +496,8 @@ impl CandidateEvaluator for RpcCandidateEvaluator {
                     route,
                     screen,
                     &shared_response_hash,
-                    selected_route_fingerprint,
                     rank,
+                    selection,
                 ));
             } else {
                 self.metrics.rpc_primary_screen_rejected();
@@ -481,8 +510,8 @@ impl CandidateEvaluator for RpcCandidateEvaluator {
                     requested_at,
                     now_ms,
                     &shared_response_hash,
-                    selected_route_fingerprint,
                     rank,
+                    selection,
                 )?);
             }
         }
@@ -500,6 +529,14 @@ struct PrimaryRouteScreen {
     profitability: serde_json::Value,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct AdaptiveSelectionEvidence<'a> {
+    global_best_observed_route_fingerprint: Option<&'a str>,
+    global_best_observed_input_amount: Option<Amount>,
+    best_executable_route_fingerprint: Option<&'a str>,
+    best_executable_input_amount: Option<Amount>,
+}
+
 impl RpcCandidateEvaluator {
     #[allow(clippy::too_many_arguments)]
     fn primary_rejection_batch(
@@ -511,8 +548,8 @@ impl RpcCandidateEvaluator {
         requested_at: Instant,
         now_ms: u64,
         shared_response_hash: &str,
-        selected_route_fingerprint: Option<&str>,
         rank: usize,
+        selection: AdaptiveSelectionEvidence<'_>,
     ) -> Result<CandidateBatch, EvaluationError> {
         let fallback = screen
             .ladder
@@ -555,11 +592,7 @@ impl RpcCandidateEvaluator {
                     shared_response_hash,
                     "primary_screen_no_profitable_candidate",
                 ),
-                "adaptive_selection": {
-                    "route_rank": rank,
-                    "selected_route_fingerprint": selected_route_fingerprint,
-                    "secondary_requested": false
-                },
+                "adaptive_selection": adaptive_selection_evidence(selection, rank, false),
                 "profitability_scale": {
                     "primary": screen.profitability,
                     "verified": null
@@ -579,6 +612,7 @@ impl RpcCandidateEvaluator {
         requested_at: Instant,
         shared_response_hash: &str,
         rank: usize,
+        selection: AdaptiveSelectionEvidence<'_>,
     ) -> Result<CandidateBatch, EvaluationError> {
         let primary_selected_index =
             screen
@@ -652,11 +686,7 @@ impl RpcCandidateEvaluator {
                 evaluations: Vec::new(),
                 evidence: json!({
                     "state": base_evidence,
-                    "adaptive_selection": {
-                        "route_rank": rank,
-                        "selected_route_fingerprint": route.fingerprint,
-                        "secondary_requested": true
-                    },
+                    "adaptive_selection": adaptive_selection_evidence(selection, rank, true),
                     "profitability_scale": {
                         "primary_selected_input_amount": primary_selected_amount.0.to_string(),
                         "primary": screen.profitability,
@@ -692,11 +722,7 @@ impl RpcCandidateEvaluator {
             }],
             evidence: json!({
                 "state": base_evidence,
-                "adaptive_selection": {
-                    "route_rank": rank,
-                    "selected_route_fingerprint": route.fingerprint,
-                    "secondary_requested": true
-                },
+                "adaptive_selection": adaptive_selection_evidence(selection, rank, true),
                 "profitability_scale": {
                     "primary_selected_input_amount": primary_selected_amount.0.to_string(),
                     "primary": screen.profitability,
@@ -707,38 +733,78 @@ impl RpcCandidateEvaluator {
     }
 }
 
-fn primary_route_score(screen: &PrimaryRouteScreen) -> i128 {
+fn best_route_evaluation(screen: &PrimaryRouteScreen) -> Option<&AmountEvaluation> {
     screen
         .ladder
         .attempts
         .iter()
         .filter_map(|attempt| attempt.evaluation.as_ref())
-        .map(|evaluation| evaluation.economics.conservative.expected_net_pnl.0)
-        .max()
-        .unwrap_or(i128::MIN)
+        .max_by(|left, right| amount_evaluation_ordering(left, right))
+}
+
+fn primary_route_ordering(
+    left_route: &RuntimeRoute,
+    left_screen: &PrimaryRouteScreen,
+    right_route: &RuntimeRoute,
+    right_screen: &PrimaryRouteScreen,
+) -> Ordering {
+    match (
+        best_route_evaluation(left_screen),
+        best_route_evaluation(right_screen),
+    ) {
+        (Some(left), Some(right)) => left
+            .economics
+            .conservative
+            .expected_net_pnl
+            .cmp(&right.economics.conservative.expected_net_pnl)
+            .then_with(|| right.threshold.required.cmp(&left.threshold.required))
+            .then_with(|| right_route.fingerprint.cmp(&left_route.fingerprint))
+            .then_with(|| right.input.cmp(&left.input)),
+        (Some(_), None) => Ordering::Greater,
+        (None, Some(_)) => Ordering::Less,
+        (None, None) => right_route.fingerprint.cmp(&left_route.fingerprint),
+    }
+}
+
+fn adaptive_selection_evidence(
+    selection: AdaptiveSelectionEvidence<'_>,
+    rank: usize,
+    secondary_requested: bool,
+) -> serde_json::Value {
+    json!({
+        "route_rank": rank,
+        "global_best_observed_route_fingerprint":
+            selection.global_best_observed_route_fingerprint,
+        "global_best_observed_input_amount": selection
+            .global_best_observed_input_amount
+            .map(|amount| amount.0.to_string()),
+        "best_executable_route_fingerprint": selection.best_executable_route_fingerprint,
+        "best_executable_input_amount": selection
+            .best_executable_input_amount
+            .map(|amount| amount.0.to_string()),
+        "selected_route_fingerprint": selection.best_executable_route_fingerprint,
+        "secondary_requested": secondary_requested
+    })
 }
 
 fn primary_competitor_batch(
     route: &RuntimeRoute,
     screen: PrimaryRouteScreen,
     shared_response_hash: &str,
-    selected_route_fingerprint: Option<&str>,
     rank: usize,
+    selection: AdaptiveSelectionEvidence<'_>,
 ) -> CandidateBatch {
+    let mut adaptive_selection = adaptive_selection_evidence(selection, rank, false);
+    adaptive_selection["route_fingerprint"] = json!(route.fingerprint);
     CandidateBatch {
         evaluations: Vec::new(),
         evidence: json!({
             "state": primary_state_evidence(
                 &screen,
                 shared_response_hash,
-                "higher_ranked_primary_winner",
+                "not_best_executable",
             ),
-            "adaptive_selection": {
-                "route_rank": rank,
-                "selected_route_fingerprint": selected_route_fingerprint,
-                "secondary_requested": false,
-                "route_fingerprint": route.fingerprint
-            },
+            "adaptive_selection": adaptive_selection,
             "profitability_scale": {
                 "primary": screen.profitability,
                 "verified": null
@@ -1467,8 +1533,16 @@ fn candidate_is_better(candidate: &CandidateAttempt, current: &CandidateAttempt)
         .evaluation
         .as_ref()
         .expect("completed candidate has an evaluation");
-    candidate.economics.conservative.expected_net_pnl
-        > current.economics.conservative.expected_net_pnl
+    amount_evaluation_ordering(candidate, current) == Ordering::Greater
+}
+
+fn amount_evaluation_ordering(left: &AmountEvaluation, right: &AmountEvaluation) -> Ordering {
+    left.economics
+        .conservative
+        .expected_net_pnl
+        .cmp(&right.economics.conservative.expected_net_pnl)
+        .then_with(|| right.threshold.required.cmp(&left.threshold.required))
+        .then_with(|| right.input.cmp(&left.input))
 }
 
 fn evaluate_amount(
@@ -2961,8 +3035,15 @@ mod tests {
         second.fingerprint = "two-pool-v2".to_string();
         second.state_targets[1] =
             Address::parse("0x5555555555555555555555555555555555555555").unwrap();
+        let executable_route_fingerprints =
+            BTreeSet::from([first.fingerprint.clone(), second.fingerprint.clone()]);
         let batches = evaluator
-            .evaluate_routes(&input(now), &origin(), &[first.clone(), second])
+            .evaluate_routes(
+                &input(now),
+                &origin(),
+                &[first.clone(), second],
+                &executable_route_fingerprints,
+            )
             .await
             .unwrap();
 
@@ -2999,7 +3080,7 @@ mod tests {
         );
         assert_eq!(
             batches[1].evidence["state"]["verification_skip_reason"],
-            "higher_ranked_primary_winner"
+            "not_best_executable"
         );
         assert_eq!(
             batches[0].evidence["adaptive_selection"]["secondary_requested"],
@@ -3011,6 +3092,65 @@ mod tests {
         );
         let rendered = metrics.render(&crate::runtime_state::RuntimeReadiness::new());
         assert!(rendered.contains("rpc_secondary_skipped_total 1"));
+    }
+
+    #[tokio::test]
+    async fn observation_only_global_winner_does_not_block_executable_runner_up() {
+        let now = unix_time_ms();
+        let (evaluator, client, _) =
+            evaluator_with_client(FakeMode::Profitable { agreement: true });
+        let mut observation_only = route();
+        observation_only.fingerprint = "a-observation-only".to_string();
+        let mut executable = route();
+        executable.route.route_id = RouteId("two-pool-executable".to_string());
+        executable.route.legs[1].pool_id = PoolId("comparison-pool-executable".to_string());
+        executable.fingerprint = "b-executable".to_string();
+        executable.state_targets[1] =
+            Address::parse("0x5555555555555555555555555555555555555555").unwrap();
+        let executable_route_fingerprints = BTreeSet::from([executable.fingerprint.clone()]);
+
+        let batches = evaluator
+            .evaluate_routes(
+                &input(now),
+                &origin(),
+                &[observation_only.clone(), executable.clone()],
+                &executable_route_fingerprints,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(client.calls.load(Ordering::Relaxed), 2);
+        assert!(batches[0].evaluations.is_empty());
+        assert_eq!(batches[1].evaluations.len(), 1);
+        assert_eq!(
+            batches[1].evaluations[0]
+                .opportunity
+                .route
+                .route_fingerprint,
+            executable.fingerprint
+        );
+        for batch in &batches {
+            assert_eq!(
+                batch.evidence["adaptive_selection"]["global_best_observed_route_fingerprint"],
+                observation_only.fingerprint
+            );
+            assert_eq!(
+                batch.evidence["adaptive_selection"]["best_executable_route_fingerprint"],
+                executable.fingerprint
+            );
+        }
+        assert_eq!(
+            batches[0].evidence["adaptive_selection"]["secondary_requested"],
+            false
+        );
+        assert_eq!(
+            batches[1].evidence["adaptive_selection"]["secondary_requested"],
+            true
+        );
+        assert_eq!(
+            batches[0].evidence["state"]["verification_skip_reason"],
+            "not_best_executable"
+        );
     }
 
     #[tokio::test]

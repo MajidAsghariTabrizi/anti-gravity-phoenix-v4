@@ -364,6 +364,14 @@ impl HunterRouteGraph {
         &self.routes
     }
 
+    pub fn autonomous_live_route_fingerprints(&self) -> BTreeSet<String> {
+        self.bound_routes
+            .iter()
+            .filter(|route| route.policy.enabled_for_autonomous_live)
+            .map(|route| route.route_fingerprint.clone())
+            .collect()
+    }
+
     pub fn affected_routes_for_pools(
         &self,
         pool_addresses: &[String],
