@@ -18,7 +18,12 @@ from scripts import production_context
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 ROUTE_PATH = REPO_ROOT / transition.CANDIDATE_ROUTE_SOURCE
-PROOF_PATH = REPO_ROOT / transition.ROUTE_PROOF_PATH
+PROOF_PATH = (
+    REPO_ROOT
+    / "fixtures"
+    / "routes"
+    / "arbitrum_uniswap_v3_pool_proofs_f1bb8268.json"
+)
 SHELL_PATH = REPO_ROOT / "scripts/prelive-shadow-contract-transition.sh"
 RECORDER_CONTAINER_ID = "a" * 64
 EXPECTED_RELEASE_SHA = "f1bb82681b02c9f6371c0a8de8c1f498fb307034"
