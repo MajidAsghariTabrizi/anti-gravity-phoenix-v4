@@ -1,5 +1,8 @@
 \set ON_ERROR_STOP on
 
+SELECT to_regclass('public.phoenix_live_economic_truth') IS NOT NULL
+    AS phoenix_has_economic_truth \gset
+
 BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY;
 
 WITH params AS (
@@ -157,6 +160,7 @@ window_documents AS (
     JOIN window_rejections rejection USING (label)
 ),
 size_points AS (
+\if :phoenix_has_economic_truth
     SELECT
         truth.classified_at,
         truth.route_fingerprint,
@@ -182,6 +186,26 @@ size_points AS (
         ) AS maximum_liquidity_utilization_bps
     FROM phoenix_live_economic_truth truth
     WHERE truth.classified_at >= now() - interval '7 days'
+\else
+    SELECT
+        NULL::timestamptz AS classified_at,
+        NULL::text AS route_fingerprint,
+        NULL::text AS input_size,
+        NULL::text AS expected_net_pnl,
+        NULL::text AS conservative_net_pnl,
+        NULL::text AS severe_net_pnl,
+        NULL::text AS margin_to_gate,
+        NULL::text AS gross_spread_bps,
+        NULL::text AS net_pnl_bps,
+        NULL::text AS break_even_spread_bps,
+        NULL::text AS fixed_cost,
+        NULL::text AS variable_cost,
+        NULL::text AS price_divergence_direction,
+        NULL::text AS rejection_reason,
+        NULL::integer AS tick_crossings,
+        NULL::numeric AS maximum_liquidity_utilization_bps
+    WHERE false
+\endif
 ),
 size_summary AS (
     SELECT coalesce(jsonb_agg(row_to_json(ranked)::jsonb ORDER BY ranked.route_rank, ranked.input_size), '[]'::jsonb) AS values
