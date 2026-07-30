@@ -510,7 +510,9 @@ docker run -d \
 postgres_ready=false
 attempt=0
 while [ "$attempt" -lt 30 ]; do
-  if docker exec "$postgres_container" \
+  if docker logs "$postgres_container" 2>&1 |
+    grep -Fq "PostgreSQL init process complete; ready for start up." &&
+    docker exec "$postgres_container" \
     pg_isready -U phoenix_test -d phoenix_test >/dev/null 2>&1
   then
     postgres_ready=true
