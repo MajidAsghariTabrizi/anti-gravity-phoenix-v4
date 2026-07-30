@@ -1599,6 +1599,15 @@ class WorkflowAndDeploymentContractTests(unittest.TestCase):
         self.assertIn("gzip -n", self.workflow)
         self.assertNotIn("GITHUB_RUN_ATTEMPT", self.workflow)
         self.assertIn("Probe durable exact-package evidence", self.workflow)
+        probe = self.workflow.split(
+            "- name: Probe durable exact-package evidence",
+            maxsplit=1,
+        )[1].split("- name:", maxsplit=1)[0]
+        self.assertIn(
+            '"evidence ${RELEASE_SHA}" >existing-evidence.json 2>/dev/null &&',
+            probe,
+        )
+        self.assertLess(probe.index("jq -e"), probe.index("then"))
 
     def test_deploy_checkout_preserves_rollback_history(self) -> None:
         checkout = self.workflow.split(

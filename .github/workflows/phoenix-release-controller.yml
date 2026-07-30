@@ -379,8 +379,7 @@ jobs:
             -o ConnectTimeout=20
           )
           if ssh "${ssh_opts[@]}" "${PROD_USER}@${PROD_HOST}" \
-            "evidence ${RELEASE_SHA}" >existing-evidence.json 2>/dev/null
-          then
+            "evidence ${RELEASE_SHA}" >existing-evidence.json 2>/dev/null &&
             jq -e \
               --arg sha "$RELEASE_SHA" \
               --argjson source "$SOURCE_CI_RUN_ID" \
@@ -393,6 +392,7 @@ jobs:
                 and .build_run_id == $build
                 and (.package_digest | test("^sha256:[0-9a-f]{64}$"))
               ' existing-evidence.json >/dev/null
+          then
             echo "found=true" >>"$GITHUB_OUTPUT"
             printf 'package_digest=%s\n' \
               "$(jq -er '.package_digest' existing-evidence.json)" >>"$GITHUB_OUTPUT"
