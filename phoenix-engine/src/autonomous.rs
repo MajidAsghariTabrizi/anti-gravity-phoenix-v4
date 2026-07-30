@@ -68,6 +68,10 @@ pub trait HunterStateProvider: Send + Sync {
 
 #[async_trait]
 pub trait AutonomousEventProcessor: Send + Sync {
+    fn executable_route_fingerprints(&self) -> BTreeSet<String> {
+        BTreeSet::new()
+    }
+
     async fn process(
         &self,
         input: &EngineInput,
@@ -482,6 +486,10 @@ impl AutonomousHunterProcessor {
 
 #[async_trait]
 impl AutonomousEventProcessor for AutonomousHunterProcessor {
+    fn executable_route_fingerprints(&self) -> BTreeSet<String> {
+        self.graph.autonomous_live_route_fingerprints()
+    }
+
     async fn process(
         &self,
         input: &EngineInput,
