@@ -1693,7 +1693,7 @@ class WorkflowAndDeploymentContractTests(unittest.TestCase):
         preflight_failure = self.deploy.index(
             'fail "preflight production rendering failed"', preflight_render
         )
-        self.assertNotIn(
+        self.assertIn(
             '--overlay-file "$overlay_file"',
             self.deploy[preflight_render:preflight_failure],
         )
