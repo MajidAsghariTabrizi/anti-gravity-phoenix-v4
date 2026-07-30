@@ -1814,7 +1814,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn autonomous_integrity_event_is_quarantined_and_next_valid_event_is_processed() {
+    async fn autonomous_candidate_path_waits_for_the_authoritative_economic_screen() {
         let events = Arc::new(Mutex::new(Vec::new()));
         let store = Arc::new(store(events.clone(), None, false));
         let autonomous = Arc::new(ScriptedAutonomousProcessor {
@@ -1838,7 +1838,8 @@ mod tests {
             ),
         });
         let processor = Arc::new(
-            route_processor(Arc::new(UnavailableEvaluator)).with_test_autonomous(autonomous),
+            route_processor(Arc::new(UnavailableEvaluator))
+                .with_test_autonomous(autonomous.clone()),
         );
         let readiness = ready_state();
         let metrics = RuntimeMetrics::default();
@@ -1868,40 +1869,21 @@ mod tests {
         assert_eq!(exit, RuntimeExit::Shutdown);
         assert_eq!(
             *events.lock().unwrap(),
-            vec!["persist", "term", "persist", "ack"]
+            vec!["persist", "nak", "persist", "nak"]
         );
         let records = store.records.lock().unwrap();
         assert_eq!(records.len(), 2);
-        let quarantined = &records[0];
-        assert_eq!(
-            quarantined.classification,
-            EngineClassification::TerminalIntegrityFailure
-        );
-        assert_eq!(quarantined.candidate_count, 0);
-        assert_eq!(quarantined.decision_count, 0);
-        assert!(quarantined.evaluations.is_empty());
-        assert_eq!(quarantined.evidence["stage"], "hunter_route_simulation");
-        assert_eq!(quarantined.evidence["error_class"], "hunter_arithmetic");
-        assert_eq!(
-            quarantined.evidence["hunter_error_code"],
-            "hunter_arithmetic"
-        );
-        assert_eq!(quarantined.evidence["source_sequence"], 501);
-        assert_eq!(quarantined.evidence["delivery_attempt"], 1);
-        assert_eq!(quarantined.evidence["execution_mode"], "LIVE");
-        assert_eq!(quarantined.evidence["execution_eligible"], false);
-        assert_eq!(quarantined.evidence["execution_request_created"], false);
-        assert_eq!(
-            records[1].classification,
-            EngineClassification::NoRelevantRoute
-        );
+        assert!(records.iter().all(|record| {
+            record.classification == EngineClassification::TransientDependencyFailure
+                && record.detail_class == Some("rpc_gateway_unavailable")
+                && record.evaluations.is_empty()
+        }));
+        assert_eq!(records[0].identity.source_sequence, 501);
         assert_eq!(records[1].identity.source_sequence, 502);
+        assert_eq!(autonomous.outcomes.lock().unwrap().len(), 2);
         assert_eq!(readiness.ready(), Ok(()));
         let rendered = metrics.render(&readiness);
-        assert!(rendered.contains("phoenix_engine_terminal_integrity_total 1"));
-        assert!(rendered.contains("phoenix_engine_later_message_progress_after_quarantine_total 1"));
-        assert!(!quarantined.evidence.to_string().contains("http"));
-        assert!(!quarantined.evidence.to_string().contains("private"));
+        assert!(rendered.contains("phoenix_engine_processing_failures_total 2"));
     }
 
     #[tokio::test]

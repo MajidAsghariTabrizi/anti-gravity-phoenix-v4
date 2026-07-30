@@ -11,6 +11,7 @@ fail() {
 
 for path in \
   compose.live-autonomous.yml \
+  migrations/012_live_economic_truth.sql \
   live-executor/schema/005_closed_loop_economic_control.sql \
   live-executor/src/economic_control.rs \
   live-executor/src/autonomous_live_control_main.rs \
@@ -55,6 +56,7 @@ schema = read("live-executor/schema/005_closed_loop_economic_control.sql")
 health = read("scripts/production-healthcheck.sh")
 monitor = read("scripts/economic-dashboard-loop.sh")
 dashboard_sql = read("scripts/sql/economic-dashboard-snapshot.sql")
+economic_truth = read("migrations/012_live_economic_truth.sql")
 activation_runner = read("scripts/economic_activation_runner.py")
 activation_path = read("deploy/phoenix-economic-activation.path")
 activation_service = read("deploy/phoenix-economic-activation.service")
@@ -115,9 +117,47 @@ require(
     "dashboard_refresh_interval_not_45_seconds",
 )
 require(
-    "attempt.claimed_at >= params.window_start" in dashboard_sql
+    "attempt.claimed_at >= evidence_window.window_start" in dashboard_sql
     and "attempt.created_at" not in dashboard_sql,
     "dashboard_attempt_timestamp_invalid",
+)
+for required in (
+    "SELECT '1h'",
+    "SELECT '24h'",
+    "SELECT '7d'",
+    "'route_matches'",
+    "'complete_evaluations'",
+    "'near_profitable'",
+    "'closest_margin_to_gate_wei'",
+    "'rpc_budget_exhaustions'",
+    "'rpc_disagreements'",
+    "'model_invariant_failures'",
+    "'route_ranking_7d'",
+    "'size_sweep_7d'",
+):
+    require(required in dashboard_sql, f"economic_truth_dashboard_missing:{required}")
+require("'relevant_inputs'" not in dashboard_sql, "candidate_count_mislabeled_as_relevant_inputs")
+for required in (
+    "CREATE OR REPLACE VIEW phoenix_live_economic_truth",
+    "initiating_transaction_hash",
+    "initiating_pool_ids",
+    "initiating_swap_direction",
+    "active_liquidity_near_current_tick",
+    "gross_spread_bps",
+    "net_pnl_bps",
+    "break_even_spread_bps",
+    "fixed_cost_wei",
+    "variable_cost_wei",
+    "margin_to_profitability_gate_wei",
+    "price_divergence_direction",
+    "size_elasticity",
+    "route_rank",
+    "fork_status",
+):
+    require(required in economic_truth, f"economic_truth_contract_missing:{required}")
+require(
+    "FROM phoenix_live_economic_truth truth" in dashboard_sql,
+    "dashboard_does_not_use_authoritative_economic_truth",
 )
 
 for required in (

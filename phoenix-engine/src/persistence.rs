@@ -1840,13 +1840,20 @@ pub(crate) fn validate_record(record: &ClassificationRecord) -> Result<(), Store
         .iter()
         .filter(|value| value.opportunity.decision.disposition == ShadowDisposition::Accepted)
         .count();
-    if (record.classification == EngineClassification::ShadowAccepted && accepted == 0)
-        || (record.classification == EngineClassification::CandidateRejected && accepted > 0)
-        || (!matches!(
-            record.classification,
-            EngineClassification::ShadowAccepted | EngineClassification::CandidateRejected
-        ) && !record.evaluations.is_empty())
-    {
+    let candidate_economic_screen_passed = record.evaluations.iter().any(|value| {
+        value.opportunity.economics.primary_status == PrimaryProfitabilityStatus::MeetsMinimum
+            && value.opportunity.market.independent_verification_status
+                == IndependentVerificationStatus::Agreed
+    });
+    let classification_matches_evaluations = match record.classification {
+        EngineClassification::ShadowAccepted => accepted > 0,
+        EngineClassification::CandidateRejected => accepted == 0,
+        EngineClassification::CandidateGenerated => {
+            !record.evaluations.is_empty() && candidate_economic_screen_passed
+        }
+        _ => record.evaluations.is_empty(),
+    };
+    if !classification_matches_evaluations {
         return Err(StoreError::Integrity);
     }
     if record.classification == EngineClassification::DependencyExhausted {
@@ -2545,6 +2552,17 @@ mod tests {
             "signer_used = false",
         ] {
             assert!(fork_migration.contains(required));
+        }
+        let economic_truth_migration = include_str!("../../migrations/012_live_economic_truth.sql");
+        for required in [
+            "CREATE OR REPLACE VIEW phoenix_live_economic_truth",
+            "initiating_transaction_hash",
+            "active_liquidity_near_current_tick",
+            "margin_to_profitability_gate_wei",
+            "independent_verification_status",
+            "fork_status",
+        ] {
+            assert!(economic_truth_migration.contains(required));
         }
     }
 }

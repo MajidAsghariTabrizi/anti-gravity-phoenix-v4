@@ -110,19 +110,60 @@ def _render_economic_snapshot(snapshot: dict[str, Any]) -> None:
         ],
         width=5,
     )
-    tabs = st.tabs(["Funnel", "Economics", "Safety", "Growth"])
-    for tab, section in zip(
-        tabs,
-        (
-            snapshot["funnel"],
-            snapshot["economics"],
-            snapshot["safety"],
-            snapshot["growth"],
-        ),
+    funnel_tab, economics_tab, safety_tab, growth_tab = st.tabs(
+        ["Funnel", "Economics", "Safety", "Growth"]
+    )
+    with funnel_tab:
+        windows = snapshot["funnel"].get("windows", {})
+        window_rows = [
+            {"window": label, **values}
+            for label, values in windows.items()
+            if isinstance(values, dict)
+        ]
+        st.dataframe(_rows(window_rows), width="stretch", hide_index=True)
+        semantics = snapshot["funnel"].get("semantics", {})
+        st.dataframe(
+            _rows(
+                [
+                    {"metric": key, "definition": value}
+                    for key, value in semantics.items()
+                ]
+            ),
+            width="stretch",
+            hide_index=True,
+        )
+    with economics_tab:
+        economics = snapshot["economics"]
+        scalar_rows = [
+            {"metric": key, "value": value}
+            for key, value in economics.items()
+            if not isinstance(value, (dict, list))
+        ]
+        st.dataframe(_rows(scalar_rows), width="stretch", hide_index=True)
+        st.subheader("Route ranking — 7 days")
+        st.dataframe(
+            _rows(economics.get("route_ranking_7d", [])),
+            width="stretch",
+            hide_index=True,
+        )
+        st.subheader("Bounded Size Sweep — 7 days")
+        st.dataframe(
+            _rows(economics.get("size_sweep_7d", [])),
+            width="stretch",
+            hide_index=True,
+        )
+    for tab, section in (
+        (safety_tab, snapshot["safety"]),
+        (growth_tab, snapshot["growth"]),
     ):
         with tab:
             rows = [
-                {"metric": key, "value": json.dumps(value, sort_keys=True) if isinstance(value, dict) else value}
+                {
+                    "metric": key,
+                    "value": json.dumps(value, sort_keys=True)
+                    if isinstance(value, dict)
+                    else value,
+                }
                 for key, value in section.items()
             ]
             st.dataframe(_rows(rows), width="stretch", hide_index=True)

@@ -2,7 +2,9 @@ use crate::autonomous::{AutonomousEventProcessor, AutonomousHunterProcessor};
 use crate::domain::{Address, Amount, Direction, PoolId, RouteId, TokenAddress};
 use crate::engine_input::{EngineClassification, EngineInput};
 use crate::graph::{PoolEdge, PoolGraph, Route};
-use crate::opportunity::{Opportunity, ShadowDisposition};
+use crate::opportunity::{
+    IndependentVerificationStatus, Opportunity, PrimaryProfitabilityStatus, ShadowDisposition,
+};
 use crate::origin::{
     OriginClassification, OriginConfigurationError, OriginDetector, OriginEvent, OriginMetricKind,
     UnsupportedReason,
@@ -377,12 +379,24 @@ impl ShadowProcessor {
             }
         };
         let origin_evidence = origin.classification_evidence.clone();
-        if let Some(autonomous) = &self.autonomous {
-            return autonomous
-                .process(input, &origin)
-                .await
-                .with_origin_metric(origin_metric);
-        }
+        let origin_token_in = origin.swap_path.first().map(|token| token.0.as_str());
+        let origin_token_out = origin.swap_path.last().map(|token| token.0.as_str());
+        let economic_origin = json!({
+            "initiating_router": origin.router.as_str(),
+            "initiating_pool_ids": origin
+                .candidate_touched_pools
+                .iter()
+                .map(|pool| pool.0.as_str())
+                .collect::<Vec<_>>(),
+            "initiating_token_in": origin_token_in,
+            "initiating_token_out": origin_token_out,
+            "initiating_swap_direction": match (origin_token_in, origin_token_out) {
+                (Some(token_in), Some(token_out)) if token_in < token_out => "zero_for_one",
+                (Some(_), Some(_)) => "one_for_zero",
+                _ => "unknown",
+            },
+            "initiating_input_amount": origin.amount.0.to_string()
+        });
         let routes = self.routes.affected_routes(&origin.candidate_touched_pools);
         if routes.is_empty() {
             return ProcessResult::no_route(
@@ -445,6 +459,7 @@ impl ShadowProcessor {
                 decision_count: 0,
                 evidence: json!({
                     "origin_decoder": &origin_evidence,
+                    "economic_origin": &economic_origin,
                     "route_fingerprints": route_fingerprints,
                     "evaluations": evaluation_evidence
                 }),
@@ -456,6 +471,77 @@ impl ShadowProcessor {
         let accepted = evaluations
             .iter()
             .any(|value| value.opportunity.decision.disposition == ShadowDisposition::Accepted);
+        if let Some(autonomous) = &self.autonomous {
+            let economic_screen_passed = independently_verified_profitable(&evaluations);
+            if !economic_screen_passed {
+                return ProcessResult {
+                    classification: EngineClassification::CandidateRejected,
+                    detail_class: "economic_screen_rejected",
+                    candidate_count: routes.len(),
+                    decision_count: evaluations.len(),
+                    evidence: json!({
+                        "origin_decoder": &origin_evidence,
+                        "economic_origin": &economic_origin,
+                        "route_fingerprints": route_fingerprints,
+                        "evaluations": evaluation_evidence,
+                        "autonomous_evaluation": "not_requested",
+                        "autonomous_skip_reason": "primary_screen_no_profitable_candidate"
+                    }),
+                    evaluations,
+                    action: ProcessingAction::Ack,
+                    origin_metric: Some(origin_metric),
+                };
+            }
+
+            let autonomous_result = autonomous.process(input, &origin).await;
+            if autonomous_result.action != ProcessingAction::Ack {
+                return autonomous_result.with_origin_metric(origin_metric);
+            }
+            if !matches!(
+                autonomous_result.classification,
+                EngineClassification::CandidateGenerated | EngineClassification::CandidateRejected
+            ) {
+                return ProcessResult::process_fatal(
+                    "autonomous_route_contract_mismatch",
+                    routes.len(),
+                    json!({
+                        "stage": "autonomous_route_selection",
+                        "error_class": "autonomous_route_contract_mismatch",
+                        "economic_route_fingerprints": route_fingerprints,
+                        "autonomous_classification": autonomous_result.classification.as_str()
+                    }),
+                )
+                .with_origin_metric(origin_metric);
+            }
+            let detail_class =
+                if autonomous_result.classification == EngineClassification::CandidateGenerated {
+                    "autonomous_candidate_materialized"
+                } else {
+                    "autonomous_exact_economics_rejected"
+                };
+            return ProcessResult {
+                classification: autonomous_result.classification,
+                detail_class,
+                candidate_count: routes.len(),
+                decision_count: evaluations.len(),
+                evidence: json!({
+                    "origin_decoder": &origin_evidence,
+                    "economic_origin": &economic_origin,
+                    "route_fingerprints": route_fingerprints,
+                    "evaluations": evaluation_evidence,
+                    "autonomous": {
+                        "classification": autonomous_result.classification.as_str(),
+                        "detail_class": autonomous_result.detail_class,
+                        "candidate_count": autonomous_result.candidate_count,
+                        "decision_count": autonomous_result.decision_count,
+                        "evidence": autonomous_result.evidence
+                    }
+                }),
+                evaluations,
+                action: ProcessingAction::Ack,
+                origin_metric: Some(origin_metric),
+            };
+        }
         ProcessResult {
             classification: if accepted {
                 EngineClassification::ShadowAccepted
@@ -471,6 +557,7 @@ impl ShadowProcessor {
             decision_count: evaluations.len(),
             evidence: json!({
                 "origin_decoder": &origin_evidence,
+                "economic_origin": &economic_origin,
                 "route_fingerprints": route_fingerprints,
                 "evaluations": evaluation_evidence
             }),
@@ -479,6 +566,14 @@ impl ShadowProcessor {
             origin_metric: Some(origin_metric),
         }
     }
+}
+
+pub(crate) fn independently_verified_profitable(evaluations: &[EvaluatedOpportunity]) -> bool {
+    evaluations.iter().any(|value| {
+        value.opportunity.economics.primary_status == PrimaryProfitabilityStatus::MeetsMinimum
+            && value.opportunity.market.independent_verification_status
+                == IndependentVerificationStatus::Agreed
+    })
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -826,6 +921,16 @@ mod tests {
         }
     }
 
+    #[derive(Debug)]
+    struct UnexpectedAutonomousProcessor;
+
+    #[async_trait]
+    impl AutonomousEventProcessor for UnexpectedAutonomousProcessor {
+        async fn process(&self, _input: &EngineInput, _origin: &OriginEvent) -> ProcessResult {
+            panic!("autonomous evaluation must not run after a negative economic screen");
+        }
+    }
+
     fn route_json() -> String {
         format!(
             r#"[{{
@@ -941,6 +1046,31 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn production_route_uses_the_exact_reviewed_seven_point_size_ladder() {
+        let registry = RouteRegistry::from_json(include_str!(
+            "../../fixtures/routes/weth_usdc_uniswap_v3.json"
+        ))
+        .unwrap();
+        let route = registry
+            .routes
+            .get("arbitrum-weth-usdc-uniswap-v3-500-3000")
+            .unwrap();
+        assert_eq!(
+            route.strategy.candidate_sizes,
+            Some(vec![
+                Amount(100_000_000_000_000),
+                Amount(250_000_000_000_000),
+                Amount(500_000_000_000_000),
+                Amount(1_000_000_000_000_000),
+                Amount(2_500_000_000_000_000),
+                Amount(5_000_000_000_000_000),
+                Amount(10_000_000_000_000_000),
+            ])
+        );
+        assert_eq!(route.strategy.max_evaluations, 7);
+    }
+
     #[tokio::test]
     async fn irrelevant_input_has_explicit_no_route_classification() {
         let processor = ShadowProcessor::new(
@@ -1049,6 +1179,37 @@ mod tests {
             result.classification,
             EngineClassification::CandidateRejected
         );
+        assert_eq!(result.action, ProcessingAction::Ack);
+    }
+
+    #[tokio::test]
+    async fn live_mode_does_not_request_autonomous_candidate_work_after_negative_screen() {
+        let evaluator = FakeEvaluator {
+            result: Mutex::new(Some(Ok(CandidateBatch {
+                evaluations: Vec::<EvaluatedOpportunity>::new(),
+                evidence: json!({
+                    "profitability_scale": {
+                        "primary": {
+                            "attempted_size_count": 4,
+                            "candidate_results": []
+                        }
+                    }
+                }),
+            }))),
+        };
+        let processor = ShadowProcessor::new(
+            vec![Address::parse(ROUTER).unwrap()],
+            RouteRegistry::from_json(&route_json()).unwrap(),
+            Arc::new(evaluator),
+        )
+        .unwrap()
+        .with_test_autonomous(Arc::new(UnexpectedAutonomousProcessor));
+        let result = processor.process(&input(ROUTER)).await;
+        assert_eq!(
+            result.classification,
+            EngineClassification::CandidateRejected
+        );
+        assert_eq!(result.detail_class, "no_profitable_candidate");
         assert_eq!(result.action, ProcessingAction::Ack);
     }
 }
