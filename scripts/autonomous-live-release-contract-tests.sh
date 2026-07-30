@@ -491,9 +491,12 @@ historical_view=$(
 [ "$historical_view" = t ] ||
   fail "historical schema unexpectedly contains phoenix_live_economic_truth"
 
-docker exec -i "$postgres_container" \
+{
+  printf '%s\n' 'BEGIN TRANSACTION READ ONLY;'
+  cat "$repo_root/scripts/sql/economic-dashboard-snapshot.sql"
+  printf '%s\n' 'ROLLBACK;'
+} | docker exec -i "$postgres_container" \
   psql -X -q -A -t -U phoenix_test -d phoenix_test \
-  <"$repo_root/scripts/sql/economic-dashboard-snapshot.sql" \
   >"$test_root/historical-dashboard.json" ||
   fail "dashboard snapshot rejected the historical Production schema"
 PYTHONDONTWRITEBYTECODE=1 python3 -I -B - "$test_root/historical-dashboard.json" <<'PY' ||
@@ -577,9 +580,12 @@ upgraded_view=$(
 )
 [ "$upgraded_view" = t ] ||
   fail "migration 012 did not create phoenix_live_economic_truth"
-docker exec -i "$postgres_container" \
+{
+  printf '%s\n' 'BEGIN TRANSACTION READ ONLY;'
+  cat "$repo_root/scripts/sql/economic-dashboard-snapshot.sql"
+  printf '%s\n' 'ROLLBACK;'
+} | docker exec -i "$postgres_container" \
   psql -X -q -A -t -U phoenix_test -d phoenix_test \
-  <"$repo_root/scripts/sql/economic-dashboard-snapshot.sql" \
   >"$test_root/upgraded-dashboard.json" ||
   fail "dashboard snapshot rejected the migration-012 schema"
 PYTHONDONTWRITEBYTECODE=1 python3 -I -B - "$test_root/upgraded-dashboard.json" <<'PY' ||
