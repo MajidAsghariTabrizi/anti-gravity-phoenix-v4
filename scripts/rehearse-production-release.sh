@@ -83,6 +83,7 @@ python3 "$candidate_root/scripts/production_context.py" manifest-env \
 
 "$candidate_root/scripts/render-production-compose.sh" \
   --compose-file "$compose_file" \
+  --overlay-file "$overlay_file" \
   --env-file "$env_file" \
   --release-env "$release_env" \
   --release-manifest "$release_manifest" \
@@ -303,7 +304,7 @@ PHOENIX_COMPOSE_FILE="$compose_file" \
 PHOENIX_COMPOSE_OVERLAY_FILE="$overlay_file" \
 PHOENIX_COMPOSE_PROJECT_DIRECTORY="$deploy_dir" \
 PHOENIX_COMPOSE_RUNNER="$compose_runner" \
-PHOENIX_HEALTH_EXPECTED_MODE=SHADOW \
+PHOENIX_HEALTH_EXPECTED_MODE=DISARMED_EVIDENCE \
   "$candidate_root/scripts/production-healthcheck.sh" >/dev/null ||
   fail candidate_health_contract_failed
 
