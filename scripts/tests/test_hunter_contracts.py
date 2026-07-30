@@ -161,16 +161,42 @@ class HunterContractsTests(unittest.TestCase):
             {factory["address"] for factory in universe["factories"]},
             {proofs["factory"]},
         )
-        self.assertEqual(
+        self.assertLessEqual(
             {pool["address"] for pool in universe["pools"]},
             {pool["pool_address"] for pool in proofs["pools"]},
         )
         self.assertEqual(universe["maximum_route_legs"], 4)
 
+    def test_discovered_routes_expand_shadow_observation_not_live_authority(self) -> None:
+        routes = json.loads(
+            (
+                ROOT / "fixtures" / "routes" / "weth_usdc_uniswap_v3.json"
+            ).read_text(encoding="utf-8")
+        )
+        policy_fingerprints = {
+            json.loads(path.read_text(encoding="utf-8"))["route_fingerprint"]
+            for path in (
+                ROOT / "config" / "phoenix-route-policy-v1.json",
+                ROOT / "config" / "phoenix-route-policy-3000-500-v1.json",
+            )
+        }
+        route_fingerprints = {route["route_fingerprint"] for route in routes}
+        discovered = {
+            "arbitrum-weth-usdc-uniswap-v3-500-100-v1",
+            "arbitrum-weth-usdc-uniswap-v3-100-500-v1",
+        }
+        self.assertEqual(len(routes), 4)
+        self.assertTrue(policy_fingerprints < route_fingerprints)
+        self.assertTrue(discovered <= route_fingerprints)
+        self.assertTrue(discovered.isdisjoint(policy_fingerprints))
+        for route in routes:
+            self.assertEqual(route["strategy"]["max_input_amount"], "10000000000000000")
+            self.assertEqual(len(route["strategy"]["candidate_sizes"]), 7)
+
     def test_database_schema_is_additive_safe_and_service_owned(self) -> None:
         root_migrations = sorted(path.name for path in (ROOT / "migrations").glob("*.sql"))
-        self.assertEqual(root_migrations[-1], "012_live_economic_truth.sql")
-        self.assertEqual(len(root_migrations), 12)
+        self.assertEqual(root_migrations[-1], "013_economic_loss_ledger.sql")
+        self.assertEqual(len(root_migrations), 13)
         sql = (
             ROOT / "live-executor" / "schema" / "003_autonomous_hunter_contracts.sql"
         ).read_text(encoding="utf-8")

@@ -12,6 +12,7 @@ fail() {
 for path in \
   compose.live-autonomous.yml \
   migrations/012_live_economic_truth.sql \
+  migrations/013_economic_loss_ledger.sql \
   live-executor/schema/005_closed_loop_economic_control.sql \
   live-executor/src/economic_control.rs \
   live-executor/src/autonomous_live_control_main.rs \
@@ -57,6 +58,7 @@ health = read("scripts/production-healthcheck.sh")
 monitor = read("scripts/economic-dashboard-loop.sh")
 dashboard_sql = read("scripts/sql/economic-dashboard-snapshot.sql")
 economic_truth = read("migrations/012_live_economic_truth.sql")
+economic_loss = read("migrations/013_economic_loss_ledger.sql")
 activation_runner = read("scripts/economic_activation_runner.py")
 activation_path = read("deploy/phoenix-economic-activation.path")
 activation_service = read("deploy/phoenix-economic-activation.service")
@@ -134,6 +136,9 @@ for required in (
     "'model_invariant_failures'",
     "'route_ranking_7d'",
     "'size_sweep_7d'",
+    "'loss_ledger_7d'",
+    "'daily_attack_surface_7d'",
+    "'loss_cause_contract'",
 ):
     require(required in dashboard_sql, f"economic_truth_dashboard_missing:{required}")
 require("'relevant_inputs'" not in dashboard_sql, "candidate_count_mislabeled_as_relevant_inputs")
@@ -159,6 +164,41 @@ require(
     "FROM phoenix_live_economic_truth truth" in dashboard_sql,
     "dashboard_does_not_use_authoritative_economic_truth",
 )
+for required in (
+    "CREATE OR REPLACE VIEW phoenix_live_economic_loss_ledger",
+    "CREATE OR REPLACE VIEW phoenix_daily_economic_attack_surface",
+    "primary_loss_cause",
+    "secondary_loss_causes",
+    "missing_break_even_amount_wei",
+    "best_counterfactual_route_fingerprint",
+    "recoverable_pnl_if_bottleneck_removed_wei",
+    "recommended_next_action",
+):
+    require(required in economic_loss, f"economic_loss_contract_missing:{required}")
+for cause in (
+    "wrong_direction",
+    "route_not_in_universe",
+    "gross_spread_negative",
+    "dex_fees_dominated",
+    "fixed_gas_dominated",
+    "l1_data_fee_dominated",
+    "flash_fee_dominated",
+    "price_impact_dominated",
+    "liquidity_utilization_limit",
+    "tick_crossing_limit",
+    "state_incomplete",
+    "state_stale",
+    "quote_stale",
+    "candidate_stale",
+    "rpc_budget_exhausted",
+    "rpc_disagreement",
+    "fork_revert",
+    "fork_pnl_below_gate",
+    "candidate_decay",
+    "contract_guard_rejection",
+    "unknown",
+):
+    require(f"'{cause}'" in economic_loss, f"economic_loss_cause_missing:{cause}")
 
 for required in (
     "autonomous-control migrate",
@@ -568,10 +608,15 @@ monitor_sql_sha=$(
 docker rm -f -v "$monitor_container" >/dev/null
 
 for pass in first idempotent; do
-  docker exec -i "$postgres_container" \
-    psql -X -v ON_ERROR_STOP=1 -U phoenix_test -d phoenix_test \
-    <"$repo_root/migrations/012_live_economic_truth.sql" >/dev/null ||
-    fail "migration 012 $pass application failed"
+  for migration in \
+    "$repo_root/migrations/012_live_economic_truth.sql" \
+    "$repo_root/migrations/013_economic_loss_ledger.sql"
+  do
+    docker exec -i "$postgres_container" \
+      psql -X -v ON_ERROR_STOP=1 -U phoenix_test -d phoenix_test \
+      <"$migration" >/dev/null ||
+      fail "economic truth migration $pass application failed: ${migration##*/}"
+  done
 done
 upgraded_view=$(
   docker exec "$postgres_container" \
@@ -580,6 +625,14 @@ upgraded_view=$(
 )
 [ "$upgraded_view" = t ] ||
   fail "migration 012 did not create phoenix_live_economic_truth"
+upgraded_loss_views=$(
+  docker exec "$postgres_container" \
+    psql -X -q -A -t -U phoenix_test -d phoenix_test \
+    -c "SELECT to_regclass('public.phoenix_live_economic_loss_ledger') IS NOT NULL
+             AND to_regclass('public.phoenix_daily_economic_attack_surface') IS NOT NULL"
+)
+[ "$upgraded_loss_views" = t ] ||
+  fail "migration 013 did not create the economic loss views"
 {
   printf '%s\n' 'BEGIN TRANSACTION READ ONLY;'
   cat "$repo_root/scripts/sql/economic-dashboard-snapshot.sql"
@@ -598,6 +651,10 @@ if document["schema"] != "phoenix.economic-dashboard.v1":
     raise SystemExit("upgraded dashboard schema is invalid")
 if document["economics"]["size_sweep_7d"] != []:
     raise SystemExit("empty upgraded database must have an empty size sweep")
+if document["economics"]["loss_ledger_7d"] != []:
+    raise SystemExit("empty upgraded database must have an empty loss ledger")
+if document["economics"]["daily_attack_surface_7d"] != []:
+    raise SystemExit("empty upgraded database must have an empty attack surface")
 PY
   fail "upgraded dashboard snapshot contract failed"
 

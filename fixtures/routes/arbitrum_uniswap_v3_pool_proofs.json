@@ -17,6 +17,15 @@
       "token1": "0xaf88d065e77c8cc2239327c5edb3a432268e5831",
       "token0_decimals": 18,
       "token1_decimals": 6,
+      "fee": 100,
+      "tick_spacing": 1,
+      "pool_address": "0x6f38e884725a116c9c7fbf208e79fe8828a2595f"
+    },
+    {
+      "token0": "0x82af49447d8a07e3bd95bd0d56f35241523fbab1",
+      "token1": "0xaf88d065e77c8cc2239327c5edb3a432268e5831",
+      "token0_decimals": 18,
+      "token1_decimals": 6,
       "fee": 500,
       "tick_spacing": 10,
       "pool_address": "0xc6962004f452be9203591991d15f6b388e09e8d0"
@@ -29,6 +38,15 @@
       "fee": 3000,
       "tick_spacing": 60,
       "pool_address": "0xc473e2aee3441bf9240be85eb122abb059a3b57c"
+    },
+    {
+      "token0": "0x82af49447d8a07e3bd95bd0d56f35241523fbab1",
+      "token1": "0xaf88d065e77c8cc2239327c5edb3a432268e5831",
+      "token0_decimals": 18,
+      "token1_decimals": 6,
+      "fee": 10000,
+      "tick_spacing": 200,
+      "pool_address": "0x42fc852a750ba93d5bf772ecdc857e87a86403a9"
     }
   ],
   "strategy_templates": [

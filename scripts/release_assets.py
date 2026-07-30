@@ -44,6 +44,7 @@ STATIC_PATHS = (
     "docs/AUTONOMOUS_LIVE_OPERATIONS.md",
     "docs/AUTOMATED_ECONOMIC_CONTROL.md",
     "fixtures/routes/arbitrum_uniswap_v3_pool_proofs.json",
+    "fixtures/routes/arbitrum_uniswap_v3_weth_usdc_discovery_v1.json",
     "fixtures/routes/weth_usdc_uniswap_v3_forward_v1.json",
     "fixtures/routes/weth_usdc_uniswap_v3.json",
     "live-executor/schema/001_live_canary.sql",

@@ -4,6 +4,8 @@ BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY;
 
 SELECT to_regclass('public.phoenix_live_economic_truth') IS NOT NULL
     AS phoenix_has_economic_truth \gset
+SELECT to_regclass('public.phoenix_live_economic_loss_ledger') IS NOT NULL
+    AS phoenix_has_economic_loss_ledger \gset
 
 WITH params AS (
     SELECT now() AS generated_at
@@ -285,6 +287,111 @@ route_ranking AS (
         GROUP BY fact.route_fingerprint
     ) ranked
 ),
+loss_points AS (
+\if :phoenix_has_economic_loss_ledger
+    SELECT
+        ledger.classified_at,
+        ledger.route_fingerprint,
+        ledger.input_size_wei,
+        CASE
+            WHEN outcome.outcome_class IN (
+                'submitted_too_late',
+                'competitor_or_state_changed',
+                'ordering_bid_too_low'
+            ) THEN 'candidate_decay'
+            WHEN outcome.outcome_class IN (
+                'policy_rejected',
+                'risk_rejected',
+                'integrity_failure',
+                'operator_killed'
+            ) THEN 'contract_guard_rejection'
+            WHEN candidate.status = 'expired' THEN 'candidate_stale'
+            WHEN candidate.status IN (
+                'rejected_policy',
+                'risk_rejected',
+                'integrity_failure',
+                'policy_rejected',
+                'operator_killed'
+            ) THEN 'contract_guard_rejection'
+            ELSE ledger.primary_loss_cause
+        END AS primary_loss_cause,
+        ledger.secondary_loss_causes,
+        ledger.missing_break_even_amount_wei,
+        ledger.best_counterfactual_route_fingerprint,
+        ledger.best_counterfactual_input_size_wei,
+        ledger.best_counterfactual_margin_to_gate_wei,
+        ledger.recoverable_pnl_if_bottleneck_removed_wei,
+        ledger.recommended_next_action
+    FROM phoenix_live_economic_loss_ledger ledger
+    LEFT JOIN LATERAL (
+        SELECT current_candidate.candidate_id,
+               current_candidate.status,
+               current_candidate.rejection_reason
+        FROM live_canary.autonomous_candidates current_candidate
+        WHERE current_candidate.origin_event_id = ledger.source_event_identity
+          AND current_candidate.route_fingerprint = ledger.route_fingerprint
+          AND current_candidate.selected_size::text = ledger.input_size_wei
+        ORDER BY current_candidate.candidate_created_at DESC,
+                 current_candidate.candidate_id
+        LIMIT 1
+    ) candidate ON true
+    LEFT JOIN live_canary.autonomous_outcome_attributions outcome
+      ON outcome.candidate_id = candidate.candidate_id
+    WHERE ledger.classified_at >= now() - interval '7 days'
+      AND (
+          outcome.candidate_id IS NULL
+          OR outcome.realized_business_net_pnl <= 0
+      )
+\else
+    SELECT
+        NULL::timestamptz AS classified_at,
+        NULL::text AS route_fingerprint,
+        NULL::text AS input_size_wei,
+        NULL::text AS primary_loss_cause,
+        '[]'::jsonb AS secondary_loss_causes,
+        NULL::numeric AS missing_break_even_amount_wei,
+        NULL::text AS best_counterfactual_route_fingerprint,
+        NULL::text AS best_counterfactual_input_size_wei,
+        NULL::numeric AS best_counterfactual_margin_to_gate_wei,
+        NULL::numeric AS recoverable_pnl_if_bottleneck_removed_wei,
+        NULL::text AS recommended_next_action
+    WHERE false
+\endif
+),
+loss_ledger AS (
+    SELECT coalesce(
+        jsonb_agg(
+            row_to_json(bucket)::jsonb
+            ORDER BY bucket.loss_count::bigint DESC, bucket.primary_loss_cause
+        ),
+        '[]'::jsonb
+    ) AS values
+    FROM (
+        SELECT
+            primary_loss_cause,
+            count(*)::text AS loss_count,
+            sum(coalesce(recoverable_pnl_if_bottleneck_removed_wei, 0))::text
+                AS recoverable_pnl_wei,
+            max(best_counterfactual_margin_to_gate_wei)::text
+                AS closest_margin_to_gate_wei,
+            mode() WITHIN GROUP (ORDER BY recommended_next_action)
+                AS recommended_next_action
+        FROM loss_points
+        GROUP BY primary_loss_cause
+    ) bucket
+),
+daily_attack_surface AS (
+\if :phoenix_has_economic_loss_ledger
+    SELECT coalesce(
+        jsonb_agg(row_to_json(report)::jsonb ORDER BY report.evaluation_day DESC),
+        '[]'::jsonb
+    ) AS values
+    FROM phoenix_daily_economic_attack_surface report
+    WHERE report.evaluation_day >= date_trunc('day', now() - interval '7 days')
+\else
+    SELECT '[]'::jsonb AS values
+\endif
+),
 safety AS (
     SELECT
         (SELECT count(*) FROM live_canary.execution_attempts
@@ -357,7 +464,32 @@ snapshot AS (
             'reconciled_outcomes', profit.reconciled_outcomes::text,
             'by_size_level', level_profit.values,
             'route_ranking_7d', route_ranking.values,
-            'size_sweep_7d', size_summary.values
+            'size_sweep_7d', size_summary.values,
+            'loss_ledger_7d', loss_ledger.values,
+            'daily_attack_surface_7d', daily_attack_surface.values,
+            'loss_cause_contract', jsonb_build_array(
+                'wrong_direction',
+                'route_not_in_universe',
+                'gross_spread_negative',
+                'dex_fees_dominated',
+                'fixed_gas_dominated',
+                'l1_data_fee_dominated',
+                'flash_fee_dominated',
+                'price_impact_dominated',
+                'liquidity_utilization_limit',
+                'tick_crossing_limit',
+                'state_incomplete',
+                'state_stale',
+                'quote_stale',
+                'candidate_stale',
+                'rpc_budget_exhausted',
+                'rpc_disagreement',
+                'fork_revert',
+                'fork_pnl_below_gate',
+                'candidate_decay',
+                'contract_guard_rejection',
+                'unknown'
+            )
         ),
         'safety', jsonb_build_object(
             'global_armed', global_control.armed,
@@ -386,6 +518,8 @@ snapshot AS (
     CROSS JOIN window_documents
     CROSS JOIN size_summary
     CROSS JOIN route_ranking
+    CROSS JOIN loss_ledger
+    CROSS JOIN daily_attack_surface
     CROSS JOIN safety
     CROSS JOIN level_profit
     CROSS JOIN live_canary.realized_profit_windows profit
