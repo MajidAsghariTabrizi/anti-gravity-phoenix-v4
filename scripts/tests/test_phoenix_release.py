@@ -69,6 +69,7 @@ from scripts.phoenix_release.model import (
 from scripts.production_compose import (
     ProductionComposeError,
     build_compose_command,
+    compose_environment,
 )
 from scripts.release_platform import (
     MANIFEST_PATH,
@@ -355,6 +356,22 @@ class ReleaseStateTests(unittest.TestCase):
 
 
 class CanonicalComposeAndPlatformTests(unittest.TestCase):
+    def test_route_registry_cannot_bypass_exact_env_file_precedence(self) -> None:
+        environment = compose_environment(
+            Path("/etc/phoenix/phoenix.env"),
+            Path("/opt/phoenix/deploy/current-release.env"),
+            {
+                "ENGINE_ROUTE_REGISTRY_JSON": '[{"route_id":"stale"}]',
+                "UNRELATED_PARENT_VALUE": "preserved",
+            },
+        )
+        self.assertNotIn("ENGINE_ROUTE_REGISTRY_JSON", environment)
+        self.assertEqual(environment["UNRELATED_PARENT_VALUE"], "preserved")
+        self.assertEqual(
+            environment["PHOENIX_RELEASE_ENV"],
+            str(Path("/opt/phoenix/deploy/current-release.env")),
+        )
+
     def test_one_builder_preserves_exact_live_overlay_without_duplicates(self) -> None:
         command = build_compose_command(
             mode="LIVE",
