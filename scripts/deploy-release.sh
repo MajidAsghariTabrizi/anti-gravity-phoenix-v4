@@ -132,6 +132,7 @@ runtime_metadata=$(stat -c '%u:%g:%a' "$runtime_dir") ||
 python3 "$deploy_dir/production_context.py" manifest-env \
   --manifest "$manifest" \
   --expected-sha "$release_sha" \
+  --route-registry "$deploy_dir/routes/weth_usdc_uniswap_v3.json" \
   --output "$release_env" || fail "release manifest validation failed"
 chmod 0640 "$release_env"
 

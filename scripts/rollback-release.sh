@@ -305,6 +305,7 @@ python3 "$deploy_dir/production_mode.py" shadow --env-file "$env_file" ||
 python3 "$deploy_dir/production_context.py" manifest-env \
   --manifest "$manifest" \
   --expected-sha "$release_sha" \
+  --route-registry "$release_assets_root/fixtures/routes/weth_usdc_uniswap_v3.json" \
   --output "$release_env" || fail "release manifest validation failed"
 chmod 0640 "$release_env"
 fixed_identity_before=$(mktemp "$runtime_dir/fixed-before.XXXXXX") ||

@@ -78,6 +78,7 @@ trap cleanup_all EXIT
 python3 "$candidate_root/scripts/production_context.py" manifest-env \
   --manifest "$release_manifest" \
   --expected-sha "$release_sha" \
+  --route-registry "$candidate_root/fixtures/routes/weth_usdc_uniswap_v3.json" \
   --output "$release_env" ||
   fail candidate_manifest_invalid
 
