@@ -39,7 +39,7 @@ use rpc_gateway::shadow_state::{
 use serde::Serialize;
 use serde_json::json;
 use sha2::{Digest, Sha256};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -354,14 +354,31 @@ impl CandidateEvaluator for RpcCandidateEvaluator {
         origin: &OriginEvent,
         route: &RuntimeRoute,
     ) -> Result<CandidateBatch, EvaluationError> {
+        let mut batches = self
+            .evaluate_routes(input, origin, std::slice::from_ref(route))
+            .await?;
+        batches.pop().ok_or(EvaluationError::Terminal(
+            "adaptive_route_batch_cardinality_mismatch",
+        ))
+    }
+
+    async fn evaluate_routes(
+        &self,
+        input: &EngineInput,
+        origin: &OriginEvent,
+        routes: &[RuntimeRoute],
+    ) -> Result<Vec<CandidateBatch>, EvaluationError> {
+        if routes.is_empty() {
+            return Ok(Vec::new());
+        }
         let _permit = self
             .evaluation_permits
             .acquire()
             .await
             .map_err(|_| EvaluationError::Terminal("evaluation_concurrency_closed"))?;
-        let request = state_request(route)?;
+        let request = batch_state_request(routes)?;
         let requested_at = Instant::now();
-        let primary_response = self
+        let shared_response = self
             .client
             .fetch(&request)
             .await
@@ -374,95 +391,219 @@ impl CandidateEvaluator for RpcCandidateEvaluator {
                 }
             })?;
         let now_ms = unix_time_ms();
-        validate_response(&request, &primary_response, now_ms)?;
-        let primary_response_hash =
-            canonical_hash_bytes(&serde_json::to_vec(&primary_response).map_err(|_| {
+        validate_response(&request, &shared_response, now_ms)?;
+        let shared_response_hash =
+            canonical_hash_bytes(&serde_json::to_vec(&shared_response).map_err(|_| {
                 EvaluationError::Terminal("rpc_gateway_response_integrity_failure")
             })?);
-        let pools = decode_pools(route, &primary_response)?;
         let gas_price_wei = parse_decimal_u128(&input.normalized.max_fee_per_gas)
             .ok_or(EvaluationError::Terminal("economic_input_out_of_range"))?;
-        let primary_ladder = evaluate_ladder(route, &pools, gas_price_wei)?;
-        let primary_profitability = profitability_scale_evidence(route, &primary_ladder)?;
-        let Some(primary_selected_index) = primary_ladder.selected_index else {
-            self.metrics.rpc_primary_screen_rejected();
-            self.metrics.rpc_secondary_skipped();
-            let fallback = primary_ladder
-                .economic_fallback_index
-                .and_then(|index| primary_ladder.attempts[index].evaluation.clone());
-            if fallback.is_none() {
-                self.metrics
-                    .profitability_without_candidate(primary_ladder.incomplete_state_seen);
-            }
-            let evaluations = fallback
-                .map(|selected| {
-                    build_opportunity(
+        let mut screens = routes
+            .iter()
+            .map(|route| {
+                let route_request = state_request(route)?;
+                let response = project_primary_response(&shared_response, &route_request)?;
+                validate_response(&route_request, &response, now_ms)?;
+                let response_hash =
+                    canonical_hash_bytes(&serde_json::to_vec(&response).map_err(|_| {
+                        EvaluationError::Terminal("rpc_gateway_response_integrity_failure")
+                    })?);
+                let pools = decode_pools(route, &response)?;
+                let ladder = evaluate_ladder(route, &pools, gas_price_wei)?;
+                let profitability = profitability_scale_evidence(route, &ladder)?;
+                Ok(PrimaryRouteScreen {
+                    request: route_request,
+                    response,
+                    response_hash,
+                    pools,
+                    ladder,
+                    profitability,
+                })
+            })
+            .collect::<Result<Vec<_>, EvaluationError>>()?;
+
+        let mut ranked = (0..screens.len()).collect::<Vec<_>>();
+        ranked.sort_by(|left, right| {
+            primary_route_score(&screens[*right])
+                .cmp(&primary_route_score(&screens[*left]))
+                .then_with(|| left.cmp(right))
+        });
+        for (rank, index) in ranked.iter().enumerate() {
+            screens[*index].profitability["route_rank"] = json!(rank + 1);
+        }
+        let selected_route_index = ranked
+            .iter()
+            .copied()
+            .find(|index| screens[*index].ladder.selected_index.is_some());
+        let selected_route_fingerprint =
+            selected_route_index.map(|index| routes[index].fingerprint.as_str());
+
+        let mut batches = Vec::with_capacity(routes.len());
+        for (index, (route, screen)) in routes.iter().zip(screens).enumerate() {
+            let rank = ranked
+                .iter()
+                .position(|candidate| *candidate == index)
+                .map(|value| value + 1)
+                .ok_or(EvaluationError::Terminal(
+                    "adaptive_route_rank_integrity_failure",
+                ))?;
+            if Some(index) == selected_route_index {
+                batches.push(
+                    self.verify_selected_route(
                         input,
                         origin,
                         route,
-                        &primary_response,
-                        &pools,
-                        primary_response_hash.clone(),
-                        selected,
-                        true,
-                        Some(VerificationSkipReason::PrimaryScreenNoProfitableCandidate),
-                        requested_at.elapsed(),
-                        now_ms,
-                        &self.code_version,
+                        screen,
+                        gas_price_wei,
+                        requested_at,
+                        &shared_response_hash,
+                        rank,
                     )
-                    .map(|opportunity| {
-                        vec![EvaluatedOpportunity {
-                            opportunity,
-                            rpc_quality: primary_response.quality.clone(),
-                        }]
-                    })
+                    .await?,
+                );
+            } else if screen.ladder.selected_index.is_some() {
+                self.metrics.rpc_secondary_skipped();
+                batches.push(primary_competitor_batch(
+                    route,
+                    screen,
+                    &shared_response_hash,
+                    selected_route_fingerprint,
+                    rank,
+                ));
+            } else {
+                self.metrics.rpc_primary_screen_rejected();
+                self.metrics.rpc_secondary_skipped();
+                batches.push(self.primary_rejection_batch(
+                    input,
+                    origin,
+                    route,
+                    screen,
+                    requested_at,
+                    now_ms,
+                    &shared_response_hash,
+                    selected_route_fingerprint,
+                    rank,
+                )?);
+            }
+        }
+        Ok(batches)
+    }
+}
+
+#[derive(Clone, Debug)]
+struct PrimaryRouteScreen {
+    request: ShadowStateRequest,
+    response: ShadowStateResponse,
+    response_hash: String,
+    pools: Vec<PoolState>,
+    ladder: LadderEvaluation,
+    profitability: serde_json::Value,
+}
+
+impl RpcCandidateEvaluator {
+    #[allow(clippy::too_many_arguments)]
+    fn primary_rejection_batch(
+        &self,
+        input: &EngineInput,
+        origin: &OriginEvent,
+        route: &RuntimeRoute,
+        screen: PrimaryRouteScreen,
+        requested_at: Instant,
+        now_ms: u64,
+        shared_response_hash: &str,
+        selected_route_fingerprint: Option<&str>,
+        rank: usize,
+    ) -> Result<CandidateBatch, EvaluationError> {
+        let fallback = screen
+            .ladder
+            .economic_fallback_index
+            .and_then(|index| screen.ladder.attempts[index].evaluation.clone());
+        if fallback.is_none() {
+            self.metrics
+                .profitability_without_candidate(screen.ladder.incomplete_state_seen);
+        }
+        let evaluations = fallback
+            .map(|selected| {
+                build_opportunity(
+                    input,
+                    origin,
+                    route,
+                    &screen.response,
+                    &screen.pools,
+                    screen.response_hash.clone(),
+                    selected,
+                    true,
+                    Some(VerificationSkipReason::PrimaryScreenNoProfitableCandidate),
+                    requested_at.elapsed(),
+                    now_ms,
+                    &self.code_version,
+                )
+                .map(|opportunity| {
+                    vec![EvaluatedOpportunity {
+                        opportunity,
+                        rpc_quality: screen.response.quality.clone(),
+                    }]
                 })
-                .transpose()?
-                .unwrap_or_default();
-            return Ok(CandidateBatch {
-                evaluations,
-                evidence: json!({
-                    "state": {
-                        "state_block": primary_response.block_number,
-                        "state_block_hash": &primary_response.block_hash,
-                        "state_hash": &primary_response.state_hash,
-                        "route_config_hash": &primary_response.route_config_hash,
-                        "primary_response_hash": primary_response_hash,
-                        "primary_provider_id": &primary_response.primary_provider_id,
-                        "verification_status": primary_response.verification_status,
-                        "independent_verification_status": "not_requested",
-                        "independent_verification_lifecycle": ["not_requested"],
-                        "verification_skip_reason": "primary_screen_no_profitable_candidate",
-                        "rpc_quality_record_count": primary_response.quality.len(),
-                        "state_model_scope": "verified_current_tick_range_only",
-                        "incomplete_state_seen": primary_ladder.incomplete_state_seen,
-                        "primary_screen_rejected": true,
-                        "secondary_skipped": true
-                    },
-                    "profitability_scale": {
-                        "primary": primary_profitability,
-                        "verified": null
-                    }
-                }),
-            });
-        };
-        let primary_selected_amount = primary_ladder.attempts[primary_selected_index]
+            })
+            .transpose()?
+            .unwrap_or_default();
+        Ok(CandidateBatch {
+            evaluations,
+            evidence: json!({
+                "state": primary_state_evidence(
+                    &screen,
+                    shared_response_hash,
+                    "primary_screen_no_profitable_candidate",
+                ),
+                "adaptive_selection": {
+                    "route_rank": rank,
+                    "selected_route_fingerprint": selected_route_fingerprint,
+                    "secondary_requested": false
+                },
+                "profitability_scale": {
+                    "primary": screen.profitability,
+                    "verified": null
+                }
+            }),
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn verify_selected_route(
+        &self,
+        input: &EngineInput,
+        origin: &OriginEvent,
+        route: &RuntimeRoute,
+        screen: PrimaryRouteScreen,
+        gas_price_wei: u128,
+        requested_at: Instant,
+        shared_response_hash: &str,
+        rank: usize,
+    ) -> Result<CandidateBatch, EvaluationError> {
+        let primary_selected_index =
+            screen
+                .ladder
+                .selected_index
+                .ok_or(EvaluationError::Terminal(
+                    "adaptive_route_rank_integrity_failure",
+                ))?;
+        let primary_selected_amount = screen.ladder.attempts[primary_selected_index]
             .evaluation
             .as_ref()
             .ok_or(EvaluationError::Terminal(
                 "shadow_model_selection_integrity_failure",
             ))?
             .input;
-        let verification_request = verification_request(&request, &primary_response)?;
+        let verification_request = verification_request(&screen.request, &screen.response)?;
         let response = match self.client.fetch(&verification_request).await {
             Ok(response) => response,
             Err(GatewayClientError::Retryable) => synthesize_failed_verification(
-                &primary_response,
+                &screen.response,
                 &verification_request,
                 GatewayIndependentVerificationStatus::ProviderUnavailable,
             )?,
             Err(GatewayClientError::Integrity) => synthesize_failed_verification(
-                &primary_response,
+                &screen.response,
                 &verification_request,
                 GatewayIndependentVerificationStatus::IntegrityFailure,
             )?,
@@ -481,7 +622,8 @@ impl CandidateEvaluator for RpcCandidateEvaluator {
             "state_block_hash": response.block_hash,
             "state_hash": response.state_hash,
             "route_config_hash": response.route_config_hash,
-            "primary_response_hash": primary_response_hash,
+            "primary_response_hash": screen.response_hash,
+            "shared_primary_response_hash": shared_response_hash,
             "verification_response_hash": verification_response_hash,
             "primary_provider_id": response.primary_provider_id,
             "agreement_provider_id": response.agreement_provider_id,
@@ -510,9 +652,14 @@ impl CandidateEvaluator for RpcCandidateEvaluator {
                 evaluations: Vec::new(),
                 evidence: json!({
                     "state": base_evidence,
+                    "adaptive_selection": {
+                        "route_rank": rank,
+                        "selected_route_fingerprint": route.fingerprint,
+                        "secondary_requested": true
+                    },
                     "profitability_scale": {
                         "primary_selected_input_amount": primary_selected_amount.0.to_string(),
-                        "primary": primary_profitability,
+                        "primary": screen.profitability,
                         "verified": verified_profitability
                     }
                 }),
@@ -530,7 +677,7 @@ impl CandidateEvaluator for RpcCandidateEvaluator {
             route,
             &response,
             &verified_pools,
-            primary_response_hash,
+            screen.response_hash,
             selected,
             true,
             None,
@@ -545,14 +692,188 @@ impl CandidateEvaluator for RpcCandidateEvaluator {
             }],
             evidence: json!({
                 "state": base_evidence,
+                "adaptive_selection": {
+                    "route_rank": rank,
+                    "selected_route_fingerprint": route.fingerprint,
+                    "secondary_requested": true
+                },
                 "profitability_scale": {
                     "primary_selected_input_amount": primary_selected_amount.0.to_string(),
-                    "primary": primary_profitability,
+                    "primary": screen.profitability,
                     "verified": verified_profitability
                 }
             }),
         })
     }
+}
+
+fn primary_route_score(screen: &PrimaryRouteScreen) -> i128 {
+    screen
+        .ladder
+        .attempts
+        .iter()
+        .filter_map(|attempt| attempt.evaluation.as_ref())
+        .map(|evaluation| evaluation.economics.conservative.expected_net_pnl.0)
+        .max()
+        .unwrap_or(i128::MIN)
+}
+
+fn primary_competitor_batch(
+    route: &RuntimeRoute,
+    screen: PrimaryRouteScreen,
+    shared_response_hash: &str,
+    selected_route_fingerprint: Option<&str>,
+    rank: usize,
+) -> CandidateBatch {
+    CandidateBatch {
+        evaluations: Vec::new(),
+        evidence: json!({
+            "state": primary_state_evidence(
+                &screen,
+                shared_response_hash,
+                "higher_ranked_primary_winner",
+            ),
+            "adaptive_selection": {
+                "route_rank": rank,
+                "selected_route_fingerprint": selected_route_fingerprint,
+                "secondary_requested": false,
+                "route_fingerprint": route.fingerprint
+            },
+            "profitability_scale": {
+                "primary": screen.profitability,
+                "verified": null
+            }
+        }),
+    }
+}
+
+fn primary_state_evidence(
+    screen: &PrimaryRouteScreen,
+    shared_response_hash: &str,
+    skip_reason: &str,
+) -> serde_json::Value {
+    json!({
+        "state_block": screen.response.block_number,
+        "state_block_hash": screen.response.block_hash,
+        "state_hash": screen.response.state_hash,
+        "route_config_hash": screen.response.route_config_hash,
+        "primary_response_hash": screen.response_hash,
+        "shared_primary_response_hash": shared_response_hash,
+        "primary_provider_id": screen.response.primary_provider_id,
+        "verification_status": screen.response.verification_status,
+        "independent_verification_status": "not_requested",
+        "independent_verification_lifecycle": ["not_requested"],
+        "verification_skip_reason": skip_reason,
+        "rpc_quality_record_count": screen.response.quality.len(),
+        "state_model_scope": "verified_current_tick_range_only",
+        "incomplete_state_seen": screen.ladder.incomplete_state_seen,
+        "primary_screen_rejected": screen.ladder.selected_index.is_none(),
+        "secondary_skipped": true
+    })
+}
+
+fn batch_state_request(routes: &[RuntimeRoute]) -> Result<ShadowStateRequest, EvaluationError> {
+    if routes.is_empty() {
+        return Err(EvaluationError::Terminal(
+            "adaptive_route_batch_cardinality_mismatch",
+        ));
+    }
+    let mut pools = BTreeMap::<String, PoolStateRequest>::new();
+    let mut route_fingerprints = Vec::with_capacity(routes.len());
+    for route in routes {
+        route_fingerprints.push(route.fingerprint.as_str());
+        for pool in state_request(route)?.pools {
+            if let Some(existing) = pools.get(&pool.address) {
+                if existing != &pool {
+                    return Err(EvaluationError::Terminal("shared_pool_identity_mismatch"));
+                }
+            } else {
+                pools.insert(pool.address.clone(), pool);
+            }
+        }
+    }
+    let identity = serde_json::to_vec(&(route_fingerprints, pools.values().collect::<Vec<_>>()))
+        .map_err(|_| EvaluationError::Terminal("route_state_request_invalid"))?;
+    let request = ShadowStateRequest {
+        schema_version: SHADOW_STATE_SCHEMA_VERSION.to_string(),
+        chain_id: ARBITRUM_ONE_CHAIN_ID,
+        route_fingerprint: format!("adaptive-route-batch:{}", canonical_hash_bytes(&identity)),
+        pools: pools.into_values().collect(),
+        evidence: EvidenceRequest::Primary,
+    };
+    request
+        .validate()
+        .map_err(|_| EvaluationError::Terminal("route_state_request_invalid"))?;
+    Ok(request)
+}
+
+fn project_primary_response(
+    shared: &ShadowStateResponse,
+    route_request: &ShadowStateRequest,
+) -> Result<ShadowStateResponse, EvaluationError> {
+    if shared.verification_status != GatewayVerificationStatus::PrimaryOnly
+        || shared.independent_verification_status
+            != GatewayIndependentVerificationStatus::NotRequested
+    {
+        return Err(EvaluationError::Terminal(
+            "rpc_gateway_response_integrity_failure",
+        ));
+    }
+    let shared_pools = shared
+        .pools
+        .iter()
+        .map(|pool| (pool.address.as_str(), pool))
+        .collect::<BTreeMap<_, _>>();
+    let pools = route_request
+        .pools
+        .iter()
+        .map(|expected| {
+            let actual = shared_pools
+                .get(expected.address.as_str())
+                .ok_or(EvaluationError::Terminal("pool_state_identity_mismatch"))?;
+            if actual.pool_id != expected.pool_id
+                || actual.protocol != expected.protocol
+                || actual.token0 != expected.token0
+                || actual.token1 != expected.token1
+                || actual.token0_decimals != expected.token0_decimals
+                || actual.token1_decimals != expected.token1_decimals
+                || actual.fee != expected.fee
+                || actual.tick_spacing != expected.tick_spacing
+            {
+                return Err(EvaluationError::Terminal("shared_pool_identity_mismatch"));
+            }
+            Ok((*actual).clone())
+        })
+        .collect::<Result<Vec<_>, EvaluationError>>()?;
+    let state_hash = canonical_hash_bytes(
+        &serde_json::to_vec(&pools)
+            .map_err(|_| EvaluationError::Terminal("pool_state_identity_mismatch"))?,
+    );
+    Ok(ShadowStateResponse {
+        schema_version: shared.schema_version.clone(),
+        chain_id: shared.chain_id,
+        request_hash: route_request
+            .canonical_hash()
+            .map_err(|_| EvaluationError::Terminal("route_state_request_invalid"))?,
+        route_config_hash: route_request
+            .route_config_hash()
+            .map_err(|_| EvaluationError::Terminal("route_state_request_invalid"))?,
+        block_number: shared.block_number,
+        block_hash: shared.block_hash.clone(),
+        state_hash,
+        pools,
+        primary_provider_id: shared.primary_provider_id.clone(),
+        agreement_provider_id: None,
+        secondary_state_hash: None,
+        secondary_block_number: None,
+        secondary_block_hash: None,
+        secondary_route_config_hash: None,
+        provider_agreement: false,
+        verification_status: GatewayVerificationStatus::PrimaryOnly,
+        independent_verification_status: GatewayIndependentVerificationStatus::NotRequested,
+        quality: shared.quality.clone(),
+        resolved_at_unix_ms: shared.resolved_at_unix_ms,
+    })
 }
 
 fn state_request(route: &RuntimeRoute) -> Result<ShadowStateRequest, EvaluationError> {
@@ -1550,12 +1871,10 @@ fn completed_candidate_evidence(
         variable_cost_wei: Some(variable_cost.to_string()),
         minimum_required_net_pnl: Some(evaluation.threshold.required.0.to_string()),
         margin_to_profitability_gate: Some(margin_to_profitability_gate.to_string()),
-        price_divergence_direction: Some(if base.gross_spread.0 > 0 {
-            "route_output_above_input"
-        } else if base.gross_spread.0 < 0 {
-            "route_output_below_input"
-        } else {
-            "flat"
+        price_divergence_direction: Some(match base.gross_spread.0.cmp(&0) {
+            std::cmp::Ordering::Greater => "route_output_above_input",
+            std::cmp::Ordering::Less => "route_output_below_input",
+            std::cmp::Ordering::Equal => "flat",
         }),
         threshold_components: Some(ProfitThresholdEvidence {
             configured_absolute_minimum: evaluation.threshold.absolute_minimum.0.to_string(),
@@ -1623,12 +1942,10 @@ fn profitability_scale_evidence(
         (Some(first), Some(last)) if first.input != last.input => {
             let first_net = first.economics.conservative.expected_net_pnl.0;
             let last_net = last.economics.conservative.expected_net_pnl.0;
-            if last_net > first_net {
-                "improving"
-            } else if last_net < first_net {
-                "deteriorating"
-            } else {
-                "flat"
+            match last_net.cmp(&first_net) {
+                std::cmp::Ordering::Greater => "improving",
+                std::cmp::Ordering::Less => "deteriorating",
+                std::cmp::Ordering::Equal => "flat",
             }
         }
         _ => "insufficient_data",
@@ -2630,6 +2947,70 @@ mod tests {
                 OpportunityIndependentVerificationStatus::Agreed,
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn adaptive_batch_reuses_primary_state_and_verifies_only_the_best_route() {
+        let now = unix_time_ms();
+        let (evaluator, client, metrics) =
+            evaluator_with_client(FakeMode::Profitable { agreement: true });
+        let first = route();
+        let mut second = route();
+        second.route.route_id = RouteId("two-pool-second".to_string());
+        second.route.legs[1].pool_id = PoolId("comparison-pool-second".to_string());
+        second.fingerprint = "two-pool-v2".to_string();
+        second.state_targets[1] =
+            Address::parse("0x5555555555555555555555555555555555555555").unwrap();
+        let batches = evaluator
+            .evaluate_routes(&input(now), &origin(), &[first.clone(), second])
+            .await
+            .unwrap();
+
+        assert_eq!(client.calls.load(Ordering::Relaxed), 2);
+        assert_eq!(batches.len(), 2);
+        assert_eq!(batches[0].evaluations.len(), 1);
+        assert!(batches[1].evaluations.is_empty());
+        assert_eq!(
+            batches[0].evaluations[0]
+                .opportunity
+                .route
+                .route_fingerprint,
+            first.fingerprint
+        );
+        assert_eq!(
+            batches[0].evidence["state"]["shared_primary_response_hash"],
+            batches[1].evidence["state"]["shared_primary_response_hash"]
+        );
+        assert_eq!(
+            batches[0].evidence["state"]["state_block"],
+            batches[1].evidence["state"]["state_block"]
+        );
+        assert_eq!(
+            batches[0].evidence["profitability_scale"]["primary"]["attempted_size_count"],
+            4
+        );
+        assert_eq!(
+            batches[1].evidence["profitability_scale"]["primary"]["attempted_size_count"],
+            4
+        );
+        assert_eq!(
+            batches[0].evidence["adaptive_selection"]["selected_route_fingerprint"],
+            first.fingerprint
+        );
+        assert_eq!(
+            batches[1].evidence["state"]["verification_skip_reason"],
+            "higher_ranked_primary_winner"
+        );
+        assert_eq!(
+            batches[0].evidence["adaptive_selection"]["secondary_requested"],
+            true
+        );
+        assert_eq!(
+            batches[1].evidence["adaptive_selection"]["secondary_requested"],
+            false
+        );
+        let rendered = metrics.render(&crate::runtime_state::RuntimeReadiness::new());
+        assert!(rendered.contains("rpc_secondary_skipped_total 1"));
     }
 
     #[tokio::test]
