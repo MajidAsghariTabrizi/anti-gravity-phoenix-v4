@@ -1,4 +1,5 @@
 pub mod abi;
+pub mod activation_request;
 pub mod approval;
 pub mod autonomous;
 pub mod config;

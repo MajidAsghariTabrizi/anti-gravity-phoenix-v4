@@ -20,7 +20,10 @@ LIVE_CANARY_ASSETS = (
     "live-executor/schema/004_autonomous_live_runtime.sql",
     "live-executor/schema/005_closed_loop_economic_control.sql",
     "compose.live-autonomous.yml",
+    "deploy/phoenix-economic-activation.path",
+    "deploy/phoenix-economic-activation.service",
     "scripts/activate-economic-canary.sh",
+    "scripts/economic_activation_runner.py",
     "scripts/economic-dashboard-loop.sh",
     "scripts/sql/economic-dashboard-snapshot.sql",
 )
@@ -139,7 +142,7 @@ class ReleaseAssetsTests(unittest.TestCase):
                     expected_mode = (
                         "0755"
                         if relative.startswith("scripts/")
-                        and relative.endswith(".sh")
+                        and relative.endswith((".sh", ".py"))
                         else "0644"
                     )
                     self.assertEqual(entry["mode"], expected_mode)

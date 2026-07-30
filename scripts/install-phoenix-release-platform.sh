@@ -111,6 +111,12 @@ install -d -m 0755 -o root -g root "$libexec/phoenix_release"
 install -d -m 0700 -o root -g root /var/lib/phoenix-release
 install -d -m 0700 -o root -g root /var/lib/phoenix-release/incoming
 install -d -m 0700 -o root -g root /var/lib/phoenix-release/releases
+install -d -m 0700 -o 65532 -g 65532 /opt/phoenix/evidence/activation-requests
+install -d -m 0700 -o root -g root /root/phoenix-authorization
+install -d -m 0700 -o root -g root /var/lib/phoenix-economic-activation
+install -d -m 0700 -o root -g root /var/lib/phoenix-economic-activation/consumed
+install -d -m 0700 -o root -g root /var/lib/phoenix-economic-activation/processed
+install -d -m 0700 -o root -g root /var/lib/phoenix-economic-activation/results
 
 install -m 0755 -o root -g root "$script_dir/phoenix-release-gateway.sh" "$gateway"
 install -m 0755 -o root -g root "$script_dir/phoenix-release-transport.sh" "$transport"
@@ -124,6 +130,7 @@ for specification in \
   'release_platform.py:0644' \
   'release_provenance.py:0644' \
   'activate-economic-canary.sh:0644' \
+  'economic_activation_runner.py:0644' \
   'deploy-release.sh:0644' \
   'install-release-assets.sh:0644' \
   'install-production-release-context.sh:0644' \
@@ -147,6 +154,12 @@ do
 done
 install -m 0644 -o root -g root \
   "$script_dir/../release-components.json" "$libexec/release-components.json"
+install -m 0644 -o root -g root \
+  "$source_root/deploy/phoenix-economic-activation.path" \
+  /etc/systemd/system/phoenix-economic-activation.path
+install -m 0644 -o root -g root \
+  "$source_root/deploy/phoenix-economic-activation.service" \
+  /etc/systemd/system/phoenix-economic-activation.service
 
 manifest_candidate=$(mktemp "$libexec/.platform-manifest.XXXXXX")
 trap 'rm -f "$manifest_candidate"' EXIT HUP INT TERM
@@ -213,6 +226,13 @@ python3 "$libexec/release_platform.py" verify \
   --expected-sha "$release_sha" >/dev/null ||
   fail installed_platform_identity_invalid
 sudo -l -U "$deploy_user" >/dev/null || fail sudo_policy_invalid
+systemctl daemon-reload || fail economic_activation_systemd_reload_failed
+systemctl enable --now phoenix-economic-activation.path ||
+  fail economic_activation_path_enable_failed
+systemctl is-enabled --quiet phoenix-economic-activation.path ||
+  fail economic_activation_path_not_enabled
+systemctl is-active --quiet phoenix-economic-activation.path ||
+  fail economic_activation_path_not_active
 
 printf '%s\n' \
   "{\"schema\":\"phoenix.release-platform-install.v1\",\"status\":\"ok\",\"protocol_version\":\"phoenix-release.v1\",\"deploy_user\":\"phoenix-deploy\",\"release_sha\":\"$release_sha\"}"

@@ -164,3 +164,21 @@ No route expansion or input above `MAX_REVIEWED` is authorized by this
 contract. Either change requires a new policy, protected review and CI,
 positive reconciled evidence at the existing boundary, and explicit owner
 approval.
+
+## Autonomous minimum-canary bridge
+
+While the durable phase is `DISARMED_EVIDENCE`, the unprivileged economic
+supervisor continuously revalidates the existing readiness gates. It emits one
+short-lived, canonical, hash-bound request only for a fresh supported
+Production candidate with independent RPC agreement and an exact profitable
+fork pass. The dedicated outbox is the supervisor's only host-facing
+capability; it has no Docker socket, signer, `/root`, or host command access.
+
+The root-owned `phoenix-economic-activation.path` unit consumes that fixed
+outbox through the immutable Release Platform. Its bounded runner rejects
+unsafe metadata, stale or replayed requests, revalidates authoritative state
+through `autonomous-control`, atomically materializes fresh readiness and
+authorization contracts, and invokes only `activate-economic-canary.sh`.
+Activation remains `MIN` and the reviewed script retains its fail-closed
+compensation. With no eligible opportunity the path remains idle and discovery
+continues normally.

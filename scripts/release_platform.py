@@ -24,6 +24,7 @@ PLATFORM_FILES = (
     ("scripts/phoenix-release-gateway.sh", "/usr/local/sbin/phoenix-release-gateway", 0o755),
     ("scripts/phoenix-release-transport.sh", "/usr/local/sbin/phoenix-release-transport", 0o755),
     ("scripts/activate-economic-canary.sh", "/usr/local/libexec/phoenix-release/activate-economic-canary.sh", 0o644),
+    ("scripts/economic_activation_runner.py", "/usr/local/libexec/phoenix-release/economic_activation_runner.py", 0o644),
     ("scripts/deploy-release.sh", "/usr/local/libexec/phoenix-release/deploy-release.sh", 0o644),
     ("scripts/install-production-release-context.sh", "/usr/local/libexec/phoenix-release/install-production-release-context.sh", 0o644),
     ("scripts/install-release-assets.sh", "/usr/local/libexec/phoenix-release/install-release-assets.sh", 0o644),
@@ -51,6 +52,8 @@ PLATFORM_FILES = (
     ("scripts/phoenix_release/gateway.py", "/usr/local/libexec/phoenix-release/phoenix_release/gateway.py", 0o644),
     ("scripts/phoenix_release/model.py", "/usr/local/libexec/phoenix-release/phoenix_release/model.py", 0o644),
     ("scripts/phoenix_release/phase_update.py", "/usr/local/libexec/phoenix-release/phoenix_release/phase_update.py", 0o644),
+    ("deploy/phoenix-economic-activation.path", "/etc/systemd/system/phoenix-economic-activation.path", 0o644),
+    ("deploy/phoenix-economic-activation.service", "/etc/systemd/system/phoenix-economic-activation.service", 0o644),
     ("release-components.json", "/usr/local/libexec/phoenix-release/release-components.json", 0o644),
 )
 MANIFEST_PATH = "/usr/local/libexec/phoenix-release/platform-manifest.json"

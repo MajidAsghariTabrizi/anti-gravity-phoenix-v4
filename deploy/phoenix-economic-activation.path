@@ -1,0 +1,10 @@
+[Unit]
+Description=Watch for bounded Phoenix economic activation requests
+After=docker.service
+
+[Path]
+PathExistsGlob=/opt/phoenix/evidence/activation-requests/activation-request-*.json
+Unit=phoenix-economic-activation.service
+
+[Install]
+WantedBy=multi-user.target
