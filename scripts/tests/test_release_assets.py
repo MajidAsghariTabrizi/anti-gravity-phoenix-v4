@@ -101,7 +101,10 @@ class ReleaseAssetsTests(unittest.TestCase):
             self.assertIn("schemas/phoenix-prelive-v5-release.schema.json", paths)
             for hunter_asset in (
                 "config/phoenix-route-universe-v1.json",
+                "config/phoenix-route-policy-3000-500-v1.json",
                 "config/phoenix-route-policy-v1.json",
+                "fixtures/routes/weth_usdc_uniswap_v3_forward_v1.json",
+                "fixtures/routes/weth_usdc_uniswap_v3.json",
                 "docs/AUTONOMOUS_HUNTER_CONTRACTS_V1.md",
                 "docs/AUTONOMOUS_HUNTER_A1_REVENUE_EVIDENCE.md",
                 "fixtures/autonomous-hunter/v1/fixture-manifest.json",

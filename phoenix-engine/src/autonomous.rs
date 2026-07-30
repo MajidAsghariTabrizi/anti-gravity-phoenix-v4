@@ -425,6 +425,7 @@ impl AutonomousHunterProcessor {
                 )
             })?,
             touched_pool_addresses: touched,
+            initiating_swap_direction: origin.initiating_swap_direction(),
         };
         let mut collector = ArtifactCollector::default();
         let result = self
@@ -841,7 +842,10 @@ mod tests {
         let bounds = HunterBounds::default();
         let graph = HunterRouteGraph::from_contracts(
             include_str!("../../config/phoenix-route-universe-v1.json"),
-            &[include_str!("../../config/phoenix-route-policy-v1.json")],
+            &[
+                include_str!("../../config/phoenix-route-policy-v1.json"),
+                include_str!("../../config/phoenix-route-policy-3000-500-v1.json"),
+            ],
             bounds,
         )
         .unwrap();
@@ -872,6 +876,7 @@ mod tests {
             observed_at_unix_ms: input.observed_at_unix_ms,
             evaluated_at_unix_ms: input.observed_at_unix_ms,
             touched_pool_addresses: touched,
+            initiating_swap_direction: origin.initiating_swap_direction(),
         };
         let bindings = CandidateBindings {
             risk_snapshot_hash: "0".repeat(64),
@@ -884,11 +889,11 @@ mod tests {
         let result = core
             .process_event(&event, &BTreeMap::new(), &bindings, &mut sink)
             .unwrap();
-        assert_eq!(result.affected_route_fingerprints.len(), 1);
+        assert_eq!(result.affected_route_fingerprints.len(), 2);
         assert_eq!(result.metrics.events_observed, 1);
         assert_eq!(result.metrics.pools_matched, 1);
-        assert_eq!(result.metrics.routes_affected, 1);
-        assert_eq!(result.metrics.state_incomplete, 1);
+        assert_eq!(result.metrics.routes_affected, 2);
+        assert_eq!(result.metrics.state_incomplete, 2);
         assert!(result.candidates.is_empty());
 
         origin.candidate_touched_pools = vec![PoolId(POOL_500.to_string())];

@@ -3,6 +3,7 @@ use chrono::{DateTime, Duration as ChronoDuration, SecondsFormat, TimeZone, Utc}
 use futures_util::StreamExt;
 use phoenix_engine::amm::v3::sqrt_ratio_at_tick;
 use phoenix_engine::autonomous::PostgresAutonomousCandidateStore;
+use phoenix_engine::domain::Direction;
 use phoenix_engine::hunter::{
     CandidateBindings, HunterBounds, HunterCore, HunterEconomicConfig, HunterEvent, HunterMode,
     HunterRouteGraph, InMemoryCandidateSink, MaterializedCandidate,
@@ -442,6 +443,7 @@ impl Fixture {
             observed_at_unix_ms: u64::try_from(at.timestamp_millis()).map_err(boxed)?,
             evaluated_at_unix_ms: u64::try_from(at.timestamp_millis()).map_err(boxed)?,
             touched_pool_addresses: vec![CURRENT_ROUTE_POOL_500_ADDRESS.to_string()],
+            initiating_swap_direction: Some(Direction::ZeroForOne),
         };
         let states = states(
             anchor.block_number,

@@ -239,6 +239,14 @@ impl RouteRegistry {
     }
 
     pub fn affected_routes(&self, touched_pools: &[PoolId]) -> Vec<RuntimeRoute> {
+        self.affected_routes_prioritized(touched_pools, None)
+    }
+
+    pub fn affected_routes_prioritized(
+        &self,
+        touched_pools: &[PoolId],
+        initiating_direction: Option<Direction>,
+    ) -> Vec<RuntimeRoute> {
         let mut seen = HashSet::new();
         let mut routes = Vec::new();
         for pool in touched_pools {
@@ -250,9 +258,36 @@ impl RouteRegistry {
                 }
             }
         }
-        routes.sort_by(|left, right| left.route.route_id.0.cmp(&right.route.route_id.0));
+        routes.sort_by(|left, right| {
+            likely_direction_rank(left, touched_pools, initiating_direction)
+                .cmp(&likely_direction_rank(
+                    right,
+                    touched_pools,
+                    initiating_direction,
+                ))
+                .then_with(|| left.route.route_id.0.cmp(&right.route.route_id.0))
+        });
         routes
     }
+}
+
+fn likely_direction_rank(
+    route: &RuntimeRoute,
+    touched_pools: &[PoolId],
+    initiating_direction: Option<Direction>,
+) -> u8 {
+    if touched_pools.len() != 1 {
+        return 1;
+    }
+    let Some(initiating_direction) = initiating_direction else {
+        return 1;
+    };
+    route
+        .route
+        .legs
+        .iter()
+        .find(|leg| leg.pool_id == touched_pools[0])
+        .map_or(2, |leg| u8::from(leg.direction == initiating_direction))
 }
 
 #[derive(Clone, Debug, Error, PartialEq, Eq)]
@@ -381,6 +416,7 @@ impl ShadowProcessor {
         let origin_evidence = origin.classification_evidence.clone();
         let origin_token_in = origin.swap_path.first().map(|token| token.0.as_str());
         let origin_token_out = origin.swap_path.last().map(|token| token.0.as_str());
+        let initiating_direction = origin.initiating_swap_direction();
         let economic_origin = json!({
             "initiating_router": origin.router.as_str(),
             "initiating_pool_ids": origin
@@ -390,14 +426,16 @@ impl ShadowProcessor {
                 .collect::<Vec<_>>(),
             "initiating_token_in": origin_token_in,
             "initiating_token_out": origin_token_out,
-            "initiating_swap_direction": match (origin_token_in, origin_token_out) {
-                (Some(token_in), Some(token_out)) if token_in < token_out => "zero_for_one",
-                (Some(_), Some(_)) => "one_for_zero",
+            "initiating_swap_direction": match initiating_direction {
+                Some(Direction::ZeroForOne) => "zero_for_one",
+                Some(Direction::OneForZero) => "one_for_zero",
                 _ => "unknown",
             },
             "initiating_input_amount": origin.amount.0.to_string()
         });
-        let routes = self.routes.affected_routes(&origin.candidate_touched_pools);
+        let routes = self
+            .routes
+            .affected_routes_prioritized(&origin.candidate_touched_pools, initiating_direction);
         if routes.is_empty() {
             return ProcessResult::no_route(
                 "no_affected_hunter_route",
@@ -921,6 +959,30 @@ mod tests {
         }
     }
 
+    #[derive(Debug, Default)]
+    struct RecordingEvaluator {
+        fingerprints: Mutex<Vec<String>>,
+    }
+
+    #[async_trait]
+    impl CandidateEvaluator for RecordingEvaluator {
+        async fn evaluate(
+            &self,
+            _input: &EngineInput,
+            _origin: &OriginEvent,
+            route: &RuntimeRoute,
+        ) -> Result<CandidateBatch, EvaluationError> {
+            self.fingerprints
+                .lock()
+                .unwrap()
+                .push(route.fingerprint.clone());
+            Ok(CandidateBatch {
+                evaluations: Vec::new(),
+                evidence: json!({"route_fingerprint": route.fingerprint}),
+            })
+        }
+    }
+
     #[derive(Debug)]
     struct UnexpectedAutonomousProcessor;
 
@@ -1047,28 +1109,90 @@ mod tests {
     }
 
     #[test]
-    fn production_route_uses_the_exact_reviewed_seven_point_size_ladder() {
+    fn production_routes_use_the_exact_reviewed_seven_point_size_ladder() {
         let registry = RouteRegistry::from_json(include_str!(
             "../../fixtures/routes/weth_usdc_uniswap_v3.json"
         ))
         .unwrap();
-        let route = registry
-            .routes
-            .get("arbitrum-weth-usdc-uniswap-v3-500-3000")
-            .unwrap();
+        let reviewed_sizes = Some(vec![
+            Amount(100_000_000_000_000),
+            Amount(250_000_000_000_000),
+            Amount(500_000_000_000_000),
+            Amount(1_000_000_000_000_000),
+            Amount(2_500_000_000_000_000),
+            Amount(5_000_000_000_000_000),
+            Amount(10_000_000_000_000_000),
+        ]);
+        for route_id in [
+            "arbitrum-weth-usdc-uniswap-v3-500-3000",
+            "arbitrum-weth-usdc-uniswap-v3-3000-500",
+        ] {
+            let route = registry.routes.get(route_id).unwrap();
+            assert_eq!(route.strategy.candidate_sizes, reviewed_sizes);
+            assert_eq!(route.strategy.max_evaluations, 7);
+            assert_eq!(
+                route.strategy.max_input_amount,
+                Amount(10_000_000_000_000_000)
+            );
+        }
+    }
+
+    #[test]
+    fn initiating_pool_impact_prioritizes_the_opposite_route_direction() {
+        let registry = RouteRegistry::from_json(include_str!(
+            "../../fixtures/routes/weth_usdc_uniswap_v3.json"
+        ))
+        .unwrap();
+        let touched = [PoolId(format!("{WETH}:{USDC}:500"))];
+        let fingerprints = |direction| {
+            registry
+                .affected_routes_prioritized(&touched, Some(direction))
+                .into_iter()
+                .map(|route| route.fingerprint)
+                .collect::<Vec<_>>()
+        };
         assert_eq!(
-            route.strategy.candidate_sizes,
-            Some(vec![
-                Amount(100_000_000_000_000),
-                Amount(250_000_000_000_000),
-                Amount(500_000_000_000_000),
-                Amount(1_000_000_000_000_000),
-                Amount(2_500_000_000_000_000),
-                Amount(5_000_000_000_000_000),
-                Amount(10_000_000_000_000_000),
-            ])
+            fingerprints(Direction::ZeroForOne),
+            vec![
+                "arbitrum-weth-usdc-uniswap-v3-3000-500-v1",
+                "arbitrum-weth-usdc-uniswap-v3-500-3000-v1",
+            ]
         );
-        assert_eq!(route.strategy.max_evaluations, 7);
+        assert_eq!(
+            fingerprints(Direction::OneForZero),
+            vec![
+                "arbitrum-weth-usdc-uniswap-v3-500-3000-v1",
+                "arbitrum-weth-usdc-uniswap-v3-3000-500-v1",
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn bounded_runtime_evaluates_both_directions_in_priority_order() {
+        let evaluator = Arc::new(RecordingEvaluator::default());
+        let processor = ShadowProcessor::new(
+            vec![Address::parse(ROUTER).unwrap()],
+            RouteRegistry::from_json(include_str!(
+                "../../fixtures/routes/weth_usdc_uniswap_v3.json"
+            ))
+            .unwrap(),
+            evaluator.clone(),
+        )
+        .unwrap();
+        let result = processor.process(&input(ROUTER)).await;
+        let expected = vec![
+            "arbitrum-weth-usdc-uniswap-v3-3000-500-v1",
+            "arbitrum-weth-usdc-uniswap-v3-500-3000-v1",
+        ];
+        assert_eq!(*evaluator.fingerprints.lock().unwrap(), expected);
+        assert_eq!(result.candidate_count, 2);
+        assert_eq!(result.evidence["route_fingerprints"], json!(expected));
+        assert_eq!(result.evidence["evaluations"].as_array().unwrap().len(), 2);
+        assert_eq!(
+            result.classification,
+            EngineClassification::CandidateRejected
+        );
+        assert_eq!(result.action, ProcessingAction::Ack);
     }
 
     #[tokio::test]

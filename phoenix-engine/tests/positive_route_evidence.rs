@@ -181,11 +181,21 @@ fn all_reviewed_official_router_families_reach_the_configured_route() {
         assert_eq!(summary.input_amount.as_deref(), Some("1000000"));
         assert_eq!(summary.decoded_token_path, [WETH, USDC]);
         assert_eq!(summary.decoded_fee_path, [500]);
-        assert_eq!(summary.candidate_count, 1);
+        assert_eq!(summary.candidate_count, 2);
         assert!(summary.candidate_produced);
         assert_eq!(
             summary.matched_route_ids,
-            ["arbitrum-weth-usdc-uniswap-v3-500-3000"]
+            [
+                "arbitrum-weth-usdc-uniswap-v3-3000-500",
+                "arbitrum-weth-usdc-uniswap-v3-500-3000",
+            ]
+        );
+        assert_eq!(
+            summary.matched_route_fingerprints,
+            [
+                "arbitrum-weth-usdc-uniswap-v3-3000-500-v1",
+                "arbitrum-weth-usdc-uniswap-v3-500-3000-v1",
+            ]
         );
         assert!(summary.shadow_only);
         assert!(!summary.execution_request_created);

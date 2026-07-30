@@ -17,7 +17,7 @@ from scripts import production_context
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-ROUTE_PATH = REPO_ROOT / "fixtures/routes/weth_usdc_uniswap_v3.json"
+ROUTE_PATH = REPO_ROOT / transition.CANDIDATE_ROUTE_SOURCE
 PROOF_PATH = REPO_ROOT / transition.ROUTE_PROOF_PATH
 SHELL_PATH = REPO_ROOT / "scripts/prelive-shadow-contract-transition.sh"
 RECORDER_CONTAINER_ID = "a" * 64

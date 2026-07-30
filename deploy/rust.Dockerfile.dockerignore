@@ -25,6 +25,7 @@
 !config/
 !config/phoenix-route-universe-v1.json
 !config/phoenix-route-policy-v1.json
+!config/phoenix-route-policy-3000-500-v1.json
 !migrations/
 !migrations/**
 !deploy/

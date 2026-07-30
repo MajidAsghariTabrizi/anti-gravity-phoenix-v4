@@ -79,6 +79,12 @@ grep -F '"$deploy_dir/live-executor/schema/003_autonomous_hunter_contracts.sql" 
 grep -F '"$deploy_dir/routes/phoenix-route-policy-v1.json" 0640' \
   "$context_installer" >/dev/null ||
   fail 'autonomous Hunter route policy does not use the existing data-file mode policy'
+grep -F '"$deploy_dir/routes/phoenix-route-policy-3000-500-v1.json" 0640' \
+  "$context_installer" >/dev/null ||
+  fail 'reverse Hunter route policy does not use the existing data-file mode policy'
+grep -F '"$deploy_dir/routes/weth_usdc_uniswap_v3.json" 0640' \
+  "$context_installer" >/dev/null ||
+  fail 'two-direction route registry does not use the existing data-file mode policy'
 if grep -E '(^|[[:space:]])psql([[:space:]]|$)|migration-runner' \
   "$context_installer" "$release_installer" >/dev/null
 then

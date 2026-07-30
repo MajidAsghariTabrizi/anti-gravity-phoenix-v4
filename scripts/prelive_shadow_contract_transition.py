@@ -39,7 +39,7 @@ DATABASE_NAME = "phoenix_v5_654dad17"
 CONFIRMATION = "APPLY_EXACT_PHOENIX_SHADOW_CONTRACT_TRANSITION"
 
 ROUTE_PROOF_PATH = "fixtures/routes/arbitrum_uniswap_v3_pool_proofs.json"
-CANDIDATE_ROUTE_SOURCE = "fixtures/routes/weth_usdc_uniswap_v3.json"
+CANDIDATE_ROUTE_SOURCE = "fixtures/routes/weth_usdc_uniswap_v3_forward_v1.json"
 CANDIDATE_PROOF_SHA256 = (
     "sha256:2a1e6ef082c74fecd30673be1261939208f9e0c21a51a76683c2717e55beee8a"
 )
