@@ -324,6 +324,9 @@ def validate_release_env(
     env_sha = values.get("PHOENIX_RELEASE_SHA")
     if release_sha is not None and env_sha not in (None, "", release_sha):
         raise ContextError("RELEASE_IMAGE_MISMATCH")
+    route_registry = values.get("ENGINE_ROUTE_REGISTRY_JSON")
+    if route_registry is not None:
+        validate_route_registry(route_registry)
     return rendered
 
 
@@ -336,6 +339,17 @@ def manifest_env(args: argparse.Namespace) -> None:
         reference = references.get(image_name)
         if reference is not None:
             lines.append(f"{env_name}={reference}")
+    route_registry_path = getattr(args, "route_registry", None)
+    if route_registry_path:
+        try:
+            route_registry_raw = Path(route_registry_path).read_text(encoding="utf-8")
+        except (OSError, UnicodeError):
+            raise ContextError("ROUTE_REGISTRY_MISSING") from None
+        routes, _ = validate_route_registry(route_registry_raw)
+        lines.append(
+            "ENGINE_ROUTE_REGISTRY_JSON="
+            + canonical_json(routes).decode("utf-8")
+        )
     lines.append(f"PHOENIX_RELEASE_SHA={release_sha}")
     atomic_write(Path(args.output), "\n".join(lines) + "\n")
 
@@ -437,7 +451,10 @@ def validate_render(args: argparse.Namespace) -> None:
         if images[service] != expected:
             raise ContextError("RELEASE_IMAGE_MISMATCH")
 
-    expected_route_raw = operator_env.get("ENGINE_ROUTE_REGISTRY_JSON")
+    expected_route_raw = release_env.get(
+        "ENGINE_ROUTE_REGISTRY_JSON",
+        operator_env.get("ENGINE_ROUTE_REGISTRY_JSON"),
+    )
     if expected_route_raw is None or expected_route_raw == "":
         raise ContextError("ROUTE_REGISTRY_MISSING")
     _, route_hash = validate_route_registry(expected_route_raw)
@@ -783,6 +800,7 @@ def parser() -> argparse.ArgumentParser:
     manifest = subcommands.add_parser("manifest-env")
     manifest.add_argument("--manifest", required=True)
     manifest.add_argument("--expected-sha")
+    manifest.add_argument("--route-registry")
     manifest.add_argument("--output", required=True)
     manifest.set_defaults(handler=manifest_env)
 

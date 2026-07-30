@@ -1616,6 +1616,20 @@ class WorkflowAndDeploymentContractTests(unittest.TestCase):
         )[1].split("- name:", maxsplit=1)[0]
         self.assertIn("fetch-depth: 0", checkout)
 
+    def test_release_environment_binds_the_exact_versioned_route_registry(self) -> None:
+        self.assertIn(
+            '--route-registry "$deploy_dir/routes/weth_usdc_uniswap_v3.json"',
+            self.deploy,
+        )
+        self.assertIn(
+            '--route-registry "$release_assets_root/fixtures/routes/weth_usdc_uniswap_v3.json"',
+            self.rollback,
+        )
+        self.assertIn(
+            '--route-registry "$candidate_root/fixtures/routes/weth_usdc_uniswap_v3.json"',
+            self.rehearsal,
+        )
+
     def test_ci_preserves_jobs_and_runs_expensive_suites_only_on_main(
         self,
     ) -> None:

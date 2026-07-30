@@ -539,6 +539,9 @@ class ReleaseRoundTripTests(unittest.TestCase):
             argparse.Namespace(
                 manifest=str(manifest_path),
                 expected_sha=RELEASE_SHA,
+                route_registry=str(
+                    ROOT / "fixtures/routes/weth_usdc_uniswap_v3.json"
+                ),
                 output=str(release_env),
             )
         )
@@ -549,7 +552,7 @@ class ReleaseRoundTripTests(unittest.TestCase):
                 component["image_environment"]
                 for component in release_components.IMAGE_ENVIRONMENT_COMPONENTS
             }
-            | {"PHOENIX_RELEASE_SHA"},
+            | {"ENGINE_ROUTE_REGISTRY_JSON", "PHOENIX_RELEASE_SHA"},
         )
         self.assertEqual(
             release_values["LIVE_EXECUTOR_IMAGE"],
@@ -571,6 +574,13 @@ class ReleaseRoundTripTests(unittest.TestCase):
                 ).read_text(encoding="utf-8")
             ),
             separators=(",", ":"),
+            sort_keys=True,
+        )
+        self.assertEqual(release_values["ENGINE_ROUTE_REGISTRY_JSON"], route_raw)
+        operator_route_raw = json.dumps(
+            json.loads(route_raw)[:1],
+            separators=(",", ":"),
+            sort_keys=True,
         )
         operator_env = candidate / "operator.env"
         operator_env.write_text(
@@ -584,7 +594,7 @@ class ReleaseRoundTripTests(unittest.TestCase):
                     "EXECUTOR_ADDRESS=",
                     "ENGINE_ROUTER_ADDRESSES=0x1111111111111111111111111111111111111111",
                     "RECORDER_PERSISTENCE_POLICY=money_path_v1",
-                    f"ENGINE_ROUTE_REGISTRY_JSON={route_raw}",
+                    f"ENGINE_ROUTE_REGISTRY_JSON={operator_route_raw}",
                 )
             )
             + "\n",
