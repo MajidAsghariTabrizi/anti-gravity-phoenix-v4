@@ -1661,11 +1661,11 @@ class WorkflowAndDeploymentContractTests(unittest.TestCase):
             self.rehearsal,
         )
         self.assertIn(
-            "PHOENIX_HEALTH_EXPECTED_MODE=SHADOW",
+            "PHOENIX_HEALTH_EXPECTED_MODE=DISARMED_EVIDENCE",
             self.rehearsal,
         )
         self.assertNotIn(
-            "PHOENIX_HEALTH_EXPECTED_MODE=DISARMED_EVIDENCE",
+            "PHOENIX_HEALTH_EXPECTED_MODE=SHADOW",
             self.rehearsal,
         )
         self.assertIn(
@@ -1677,14 +1677,14 @@ class WorkflowAndDeploymentContractTests(unittest.TestCase):
             self.rehearsal,
         )
 
-    def test_rehearsal_renders_disarmed_candidate_without_live_overlay(
+    def test_rehearsal_renders_disarmed_evidence_candidate_with_live_overlay(
         self,
     ) -> None:
         render = self.rehearsal.split(
             '"$candidate_root/scripts/render-production-compose.sh"',
             maxsplit=1,
         )[1].split("postgres_image=", maxsplit=1)[0]
-        self.assertNotIn("--overlay-file", render)
+        self.assertIn('--overlay-file "$overlay_file"', render)
 
     def test_candidate_render_precedes_any_runtime_mutation(self) -> None:
         preflight_render = self.deploy.index(
