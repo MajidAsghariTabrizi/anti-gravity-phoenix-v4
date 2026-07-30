@@ -103,6 +103,7 @@ class ReleaseAssetsTests(unittest.TestCase):
                 "config/phoenix-route-universe-v1.json",
                 "config/phoenix-route-policy-3000-500-v1.json",
                 "config/phoenix-route-policy-v1.json",
+                "fixtures/routes/arbitrum_uniswap_v3_weth_usdc_discovery_v1.json",
                 "fixtures/routes/weth_usdc_uniswap_v3_forward_v1.json",
                 "fixtures/routes/weth_usdc_uniswap_v3.json",
                 "docs/AUTONOMOUS_HUNTER_CONTRACTS_V1.md",

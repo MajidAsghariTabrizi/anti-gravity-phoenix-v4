@@ -2564,5 +2564,15 @@ mod tests {
         ] {
             assert!(economic_truth_migration.contains(required));
         }
+        let economic_loss_migration = include_str!("../../migrations/013_economic_loss_ledger.sql");
+        for required in [
+            "CREATE OR REPLACE VIEW phoenix_live_economic_loss_ledger",
+            "CREATE OR REPLACE VIEW phoenix_daily_economic_attack_surface",
+            "primary_loss_cause",
+            "missing_break_even_amount_wei",
+            "recoverable_pnl_if_bottleneck_removed_wei",
+        ] {
+            assert!(economic_loss_migration.contains(required));
+        }
     }
 }

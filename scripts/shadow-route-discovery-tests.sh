@@ -9,6 +9,7 @@ workflow=$script_dir/shadow-route-discovery.sh
 decoded=$repo_dir/fixtures/reports/shadow_route_discovery_decoded.ndjson
 enrichment=$repo_dir/fixtures/reports/shadow_route_discovery_enrichment.ndjson
 proofs=$repo_dir/fixtures/routes/arbitrum_uniswap_v3_pool_proofs.json
+discovery_proof=$repo_dir/fixtures/routes/arbitrum_uniswap_v3_weth_usdc_discovery_v1.json
 sql=$script_dir/sql/shadow-route-discovery-enrichment.sql
 test_root=$(mktemp -d)
 trap 'rm -rf "$test_root"' EXIT HUP INT TERM
@@ -128,6 +129,56 @@ spec.loader.exec_module(module)
 assert module.keccak256(b"").hex() == "c5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470"
 assert module.keccak256(b"abc").hex() == "4e03657aea45a94fc7d47ba826c8d667c0d1e6e33a64a036ec44f58fa12d6c45"
 PY
+
+"$python_command" - "$script_dir" "$proofs" "$discovery_proof" <<'PY' ||
+import importlib.util
+import json
+from pathlib import Path
+import sys
+
+script_dir = Path(sys.argv[1])
+spec = importlib.util.spec_from_file_location(
+    "shadow_route_discovery", script_dir / "shadow_route_discovery.py"
+)
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+proofs = json.loads(Path(sys.argv[2]).read_text(encoding="utf-8"))
+evidence = json.loads(Path(sys.argv[3]).read_text(encoding="utf-8"))
+assert evidence["schema_version"] == "phoenix.route-discovery-proof.v1"
+assert evidence["chain_id"] == 42161
+assert evidence["mode"] == "SHADOW"
+assert evidence["live_execution_authorized"] is False
+assert evidence["maximum_reviewed_input_wei"] == "10000000000000000"
+assert evidence["factory"]["address"] == proofs["factory"]
+assert evidence["factory"]["pool_init_code_hash"] == proofs["pool_init_code_hash"]
+assert evidence["evidence"]["chain_id_result"] == "0xa4b1"
+proof_by_fee = {pool["fee"]: pool for pool in proofs["pools"]}
+assert set(proof_by_fee) == {100, 500, 3000, 10000}
+for pool in evidence["pools"]:
+    reviewed = proof_by_fee[pool["fee"]]
+    assert pool["factory_result"] == proofs["factory"]
+    assert pool["token0_result"] == reviewed["token0"]
+    assert pool["token1_result"] == reviewed["token1"]
+    assert pool["fee_result"] == pool["fee"]
+    assert pool["tick_spacing"] == reviewed["tick_spacing"]
+    assert pool["pool_address"] == reviewed["pool_address"]
+    assert pool["create2_result"] == module.compute_pool_address(
+        proofs["factory"],
+        proofs["pool_init_code_hash"],
+        reviewed["token0"],
+        reviewed["token1"],
+        pool["fee"],
+    )
+    assert pool["deployed_code_bytes"] > 0
+    assert int(pool["liquidity"]) > 0
+assert evidence["selection"]["selected_ordered_fee_paths"] == [
+    [500, 3000],
+    [3000, 500],
+    [500, 100],
+    [100, 500],
+]
+PY
+  fail "immutable Production route-discovery proof failed"
 
 "$python_command" - "$decoded" "$test_root" <<'PY'
 import json

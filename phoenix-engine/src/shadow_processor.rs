@@ -1126,6 +1126,8 @@ mod tests {
         for route_id in [
             "arbitrum-weth-usdc-uniswap-v3-500-3000",
             "arbitrum-weth-usdc-uniswap-v3-3000-500",
+            "arbitrum-weth-usdc-uniswap-v3-500-100",
+            "arbitrum-weth-usdc-uniswap-v3-100-500",
         ] {
             let route = registry.routes.get(route_id).unwrap();
             assert_eq!(route.strategy.candidate_sizes, reviewed_sizes);
@@ -1154,14 +1156,18 @@ mod tests {
         assert_eq!(
             fingerprints(Direction::ZeroForOne),
             vec![
+                "arbitrum-weth-usdc-uniswap-v3-100-500-v1",
                 "arbitrum-weth-usdc-uniswap-v3-3000-500-v1",
+                "arbitrum-weth-usdc-uniswap-v3-500-100-v1",
                 "arbitrum-weth-usdc-uniswap-v3-500-3000-v1",
             ]
         );
         assert_eq!(
             fingerprints(Direction::OneForZero),
             vec![
+                "arbitrum-weth-usdc-uniswap-v3-500-100-v1",
                 "arbitrum-weth-usdc-uniswap-v3-500-3000-v1",
+                "arbitrum-weth-usdc-uniswap-v3-100-500-v1",
                 "arbitrum-weth-usdc-uniswap-v3-3000-500-v1",
             ]
         );
@@ -1181,13 +1187,15 @@ mod tests {
         .unwrap();
         let result = processor.process(&input(ROUTER)).await;
         let expected = vec![
+            "arbitrum-weth-usdc-uniswap-v3-100-500-v1",
             "arbitrum-weth-usdc-uniswap-v3-3000-500-v1",
+            "arbitrum-weth-usdc-uniswap-v3-500-100-v1",
             "arbitrum-weth-usdc-uniswap-v3-500-3000-v1",
         ];
         assert_eq!(*evaluator.fingerprints.lock().unwrap(), expected);
-        assert_eq!(result.candidate_count, 2);
+        assert_eq!(result.candidate_count, 4);
         assert_eq!(result.evidence["route_fingerprints"], json!(expected));
-        assert_eq!(result.evidence["evaluations"].as_array().unwrap().len(), 2);
+        assert_eq!(result.evidence["evaluations"].as_array().unwrap().len(), 4);
         assert_eq!(
             result.classification,
             EngineClassification::CandidateRejected
