@@ -67,6 +67,21 @@ release_gateway = read("scripts/phoenix_release/gateway.py")
 assets = read("scripts/release_assets.py")
 installer = read("scripts/install-production-release-context.sh")
 
+rpc_service = re.search(
+    r"(?ms)^  rpc-gateway:\s*\n(?P<body>.*?)(?=^  [a-zA-Z0-9_-]+:\s*\n|\Z)",
+    compose,
+)
+require(rpc_service is not None, "rpc_gateway_service_missing")
+for reviewed_budget in (
+    'RPC_UPSTREAM_CALLS_PER_SECOND: "16"',
+    'RPC_UPSTREAM_CALL_BURST: "64"',
+    'RPC_STATE_REQUESTS_PER_MINUTE: "60"',
+):
+    require(
+        reviewed_budget in rpc_service.group("body"),
+        f"live_rpc_budget_not_literal:{reviewed_budget}",
+    )
+
 service = re.search(
     r"(?ms)^  autonomous-control:\s*\n(?P<body>.*?)(?=^  [a-zA-Z0-9_-]+:\s*\n|\Z)",
     compose,
