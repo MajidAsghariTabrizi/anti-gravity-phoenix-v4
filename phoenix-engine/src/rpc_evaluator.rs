@@ -105,6 +105,7 @@ struct CandidateSizeEvidence {
     settlement_asset: String,
     settlement_asset_decimals: u8,
     monetary_unit: &'static str,
+    tick_crossings: u32,
     status: &'static str,
     selected: bool,
     liquidity_evidence_complete: bool,
@@ -113,14 +114,25 @@ struct CandidateSizeEvidence {
     spot_output: Option<String>,
     no_fee_curve_output: Option<String>,
     expected_output: Option<String>,
+    execution_gas: Option<String>,
+    gas_price: Option<String>,
     price_impact: Option<String>,
     price_impact_bps: Option<u16>,
     slippage_bps: Option<u16>,
     fee_components: Option<FeeComponentEvidence>,
+    gross_spread: Option<String>,
+    gross_profit: Option<String>,
     expected_net_pnl: Option<String>,
     conservative_net_pnl: Option<String>,
     severe_net_pnl: Option<String>,
+    gross_spread_bps: Option<String>,
+    net_pnl_bps: Option<String>,
+    break_even_spread_bps: Option<String>,
+    fixed_cost_wei: Option<String>,
+    variable_cost_wei: Option<String>,
     minimum_required_net_pnl: Option<String>,
+    margin_to_profitability_gate: Option<String>,
+    price_divergence_direction: Option<&'static str>,
     threshold_components: Option<ProfitThresholdEvidence>,
     rejection_reason: Option<&'static str>,
 }
@@ -371,7 +383,7 @@ impl CandidateEvaluator for RpcCandidateEvaluator {
         let gas_price_wei = parse_decimal_u128(&input.normalized.max_fee_per_gas)
             .ok_or(EvaluationError::Terminal("economic_input_out_of_range"))?;
         let primary_ladder = evaluate_ladder(route, &pools, gas_price_wei)?;
-        let primary_profitability = profitability_scale_evidence(route, &primary_ladder);
+        let primary_profitability = profitability_scale_evidence(route, &primary_ladder)?;
         let Some(primary_selected_index) = primary_ladder.selected_index else {
             self.metrics.rpc_primary_screen_rejected();
             self.metrics.rpc_secondary_skipped();
@@ -459,7 +471,7 @@ impl CandidateEvaluator for RpcCandidateEvaluator {
         validate_response(&verification_request, &response, now_ms)?;
         let verified_pools = decode_pools(route, &response)?;
         let verified_ladder = evaluate_ladder(route, &verified_pools, gas_price_wei)?;
-        let verified_profitability = profitability_scale_evidence(route, &verified_ladder);
+        let verified_profitability = profitability_scale_evidence(route, &verified_ladder)?;
         let verification_response_hash =
             canonical_hash_bytes(&serde_json::to_vec(&response).map_err(|_| {
                 EvaluationError::Terminal("rpc_gateway_response_integrity_failure")
@@ -1082,7 +1094,7 @@ fn evaluate_ladder(
         let economic_gate_passed = rejection_reason.is_none();
         let attempt_index = attempts.len();
         attempts.push(CandidateAttempt {
-            evidence: completed_candidate_evidence(route, &evaluation, rejection_reason),
+            evidence: completed_candidate_evidence(route, &evaluation, rejection_reason)?,
             evaluation: Some(evaluation),
             economic_gate_passed,
         });
@@ -1405,6 +1417,7 @@ fn incomplete_candidate_evidence(
         settlement_asset: route.settlement_asset.0.as_str().to_string(),
         settlement_asset_decimals: route.settlement_asset_decimals,
         monetary_unit: "settlement_asset_base_units",
+        tick_crossings: 0,
         status: "rejected",
         selected: false,
         liquidity_evidence_complete,
@@ -1413,14 +1426,25 @@ fn incomplete_candidate_evidence(
         spot_output: None,
         no_fee_curve_output: None,
         expected_output: None,
+        execution_gas: None,
+        gas_price: None,
         price_impact: None,
         price_impact_bps: None,
         slippage_bps: None,
         fee_components: None,
+        gross_spread: None,
+        gross_profit: None,
         expected_net_pnl: None,
         conservative_net_pnl: None,
         severe_net_pnl: None,
+        gross_spread_bps: None,
+        net_pnl_bps: None,
+        break_even_spread_bps: None,
+        fixed_cost_wei: None,
+        variable_cost_wei: None,
         minimum_required_net_pnl: None,
+        margin_to_profitability_gate: None,
+        price_divergence_direction: None,
         threshold_components: None,
         rejection_reason: Some(rejection_reason),
     }
@@ -1430,13 +1454,38 @@ fn completed_candidate_evidence(
     route: &RuntimeRoute,
     evaluation: &AmountEvaluation,
     rejection_reason: Option<&'static str>,
-) -> CandidateSizeEvidence {
+) -> Result<CandidateSizeEvidence, EvaluationError> {
     let base = &evaluation.economics.base;
-    CandidateSizeEvidence {
+    let variable_cost = [
+        base.protocol_fees.0,
+        base.pool_fees.0,
+        base.price_impact.0,
+        base.slippage_allowance.0,
+        base.flash_loan_fee.0,
+    ]
+    .into_iter()
+    .try_fold(0_u128, |total, value| total.checked_add(value))
+    .ok_or(EvaluationError::Terminal("shadow_model_arithmetic_failure"))?;
+    let fixed_cost = base
+        .total_cost
+        .0
+        .checked_sub(variable_cost)
+        .ok_or(EvaluationError::Terminal("shadow_model_arithmetic_failure"))?;
+    let required = i128::try_from(evaluation.threshold.required.0)
+        .map_err(|_| EvaluationError::Terminal("shadow_model_arithmetic_failure"))?;
+    let margin_to_profitability_gate = evaluation
+        .economics
+        .conservative
+        .expected_net_pnl
+        .0
+        .checked_sub(required)
+        .ok_or(EvaluationError::Terminal("shadow_model_arithmetic_failure"))?;
+    Ok(CandidateSizeEvidence {
         candidate_size: evaluation.input.0.to_string(),
         settlement_asset: route.settlement_asset.0.as_str().to_string(),
         settlement_asset_decimals: route.settlement_asset_decimals,
         monetary_unit: "settlement_asset_base_units",
+        tick_crossings: 0,
         status: if rejection_reason.is_some() {
             "rejected"
         } else {
@@ -1449,6 +1498,8 @@ fn completed_candidate_evidence(
         spot_output: Some(evaluation.spot_output.0.to_string()),
         no_fee_curve_output: Some(evaluation.no_fee_curve_output.0.to_string()),
         expected_output: Some(evaluation.output.0.to_string()),
+        execution_gas: Some(base.estimated_execution_gas.to_string()),
+        gas_price: Some(base.gas_price_wei.to_string()),
         price_impact: Some(evaluation.price_impact.0.to_string()),
         price_impact_bps: Some(evaluation.price_impact_bps),
         slippage_bps: Some(evaluation.slippage_bps),
@@ -1471,6 +1522,8 @@ fn completed_candidate_evidence(
             conservative_total_cost: evaluation.economics.conservative.total_cost.0.to_string(),
             severe_total_cost: evaluation.economics.severe.total_cost.0.to_string(),
         }),
+        gross_spread: Some(base.gross_spread.0.to_string()),
+        gross_profit: Some(base.gross_profit.0.to_string()),
         expected_net_pnl: Some(evaluation.economics.base.expected_net_pnl.0.to_string()),
         conservative_net_pnl: Some(
             evaluation
@@ -1481,7 +1534,29 @@ fn completed_candidate_evidence(
                 .to_string(),
         ),
         severe_net_pnl: Some(evaluation.economics.severe.expected_net_pnl.0.to_string()),
+        gross_spread_bps: Some(signed_ratio_bps_string(
+            base.gross_spread.0,
+            evaluation.input.0,
+        )?),
+        net_pnl_bps: Some(signed_ratio_bps_string(
+            evaluation.economics.conservative.expected_net_pnl.0,
+            evaluation.input.0,
+        )?),
+        break_even_spread_bps: Some(unsigned_ratio_bps_ceil_string(
+            evaluation.economics.conservative.total_cost.0,
+            evaluation.input.0,
+        )?),
+        fixed_cost_wei: Some(fixed_cost.to_string()),
+        variable_cost_wei: Some(variable_cost.to_string()),
         minimum_required_net_pnl: Some(evaluation.threshold.required.0.to_string()),
+        margin_to_profitability_gate: Some(margin_to_profitability_gate.to_string()),
+        price_divergence_direction: Some(if base.gross_spread.0 > 0 {
+            "route_output_above_input"
+        } else if base.gross_spread.0 < 0 {
+            "route_output_below_input"
+        } else {
+            "flat"
+        }),
         threshold_components: Some(ProfitThresholdEvidence {
             configured_absolute_minimum: evaluation.threshold.absolute_minimum.0.to_string(),
             configured_input_relative_minimum: evaluation
@@ -1497,13 +1572,13 @@ fn completed_candidate_evidence(
             required: evaluation.threshold.required.0.to_string(),
         }),
         rejection_reason,
-    }
+    })
 }
 
 fn profitability_scale_evidence(
     route: &RuntimeRoute,
     ladder: &LadderEvaluation,
-) -> serde_json::Value {
+) -> Result<serde_json::Value, EvaluationError> {
     let selected_best_size = ladder.selected_index.and_then(|index| {
         ladder.attempts[index]
             .evaluation
@@ -1515,7 +1590,68 @@ fn profitability_scale_evidence(
         .iter()
         .map(|attempt| &attempt.evidence)
         .collect::<Vec<_>>();
-    json!({
+    let completed = ladder
+        .attempts
+        .iter()
+        .filter_map(|attempt| attempt.evaluation.as_ref())
+        .collect::<Vec<_>>();
+    let completed_summary = completed
+        .iter()
+        .map(|evaluation| {
+            Ok((
+                *evaluation,
+                margin_to_gate(evaluation)?,
+                fixed_cost(&evaluation.economics.base)?,
+            ))
+        })
+        .collect::<Result<Vec<_>, EvaluationError>>()?;
+    let best_expected = completed
+        .iter()
+        .max_by_key(|evaluation| evaluation.economics.base.expected_net_pnl.0);
+    let best_conservative = completed
+        .iter()
+        .max_by_key(|evaluation| evaluation.economics.conservative.expected_net_pnl.0);
+    let best_margin = completed_summary
+        .iter()
+        .max_by_key(|(_, margin, _)| *margin);
+    let break_even_size = completed
+        .iter()
+        .filter(|evaluation| evaluation.economics.conservative.expected_net_pnl.0 > 0)
+        .min_by_key(|evaluation| evaluation.input.0)
+        .map(|evaluation| evaluation.input.0.to_string());
+    let size_elasticity = match (completed.first(), completed.last()) {
+        (Some(first), Some(last)) if first.input != last.input => {
+            let first_net = first.economics.conservative.expected_net_pnl.0;
+            let last_net = last.economics.conservative.expected_net_pnl.0;
+            if last_net > first_net {
+                "improving"
+            } else if last_net < first_net {
+                "deteriorating"
+            } else {
+                "flat"
+            }
+        }
+        _ => "insufficient_data",
+    };
+    let fixed_cost_amortization_improves = match (completed.first(), completed.last()) {
+        (Some(first), Some(last)) if first.input.0 > 0 && last.input.0 > first.input.0 => {
+            let first_fixed = fixed_cost(&first.economics.base)?;
+            let last_fixed = fixed_cost(&last.economics.base)?;
+            first_fixed
+                .checked_mul(last.input.0)
+                .zip(last_fixed.checked_mul(first.input.0))
+                .map(|(left, right)| left > right)
+                .ok_or(EvaluationError::Terminal("shadow_model_arithmetic_failure"))?
+        }
+        _ => false,
+    };
+    let price_impact_destroys_before_break_even = break_even_size.is_none()
+        && completed.iter().any(|evaluation| {
+            evaluation.economics.base.gross_spread.0 > 0
+                && evaluation.economics.conservative.expected_net_pnl.0 <= 0
+                && evaluation.price_impact.0 > 0
+        });
+    Ok(json!({
         "schema_version": PROFITABILITY_EVIDENCE_SCHEMA_VERSION,
         "route_id": route.route.route_id.0,
         "route_fingerprint": route.fingerprint,
@@ -1543,8 +1679,74 @@ fn profitability_scale_evidence(
         },
         "attempted_size_count": attempts.len(),
         "selected_best_size": selected_best_size,
+        "best_input_wei": best_conservative.map(|evaluation| evaluation.input.0.to_string()),
+        "best_expected_net_pnl_wei": best_expected.map(
+            |evaluation| evaluation.economics.base.expected_net_pnl.0.to_string()
+        ),
+        "best_conservative_net_pnl_wei": best_conservative.map(
+            |evaluation| evaluation.economics.conservative.expected_net_pnl.0.to_string()
+        ),
+        "best_margin_to_gate_wei": best_margin.map(|(_, margin, _)| margin.to_string()),
+        "break_even_size_wei": break_even_size,
+        "fixed_cost_amortization_improves": fixed_cost_amortization_improves,
+        "price_impact_destroys_before_break_even": price_impact_destroys_before_break_even,
+        "size_elasticity": size_elasticity,
+        "route_rank": null,
         "candidate_results": attempts
-    })
+    }))
+}
+
+fn fixed_cost(cost: &crate::opportunity::CostBreakdown) -> Result<u128, EvaluationError> {
+    let variable = [
+        cost.protocol_fees.0,
+        cost.pool_fees.0,
+        cost.price_impact.0,
+        cost.slippage_allowance.0,
+        cost.flash_loan_fee.0,
+    ]
+    .into_iter()
+    .try_fold(0_u128, |total, value| total.checked_add(value))
+    .ok_or(EvaluationError::Terminal("shadow_model_arithmetic_failure"))?;
+    cost.total_cost
+        .0
+        .checked_sub(variable)
+        .ok_or(EvaluationError::Terminal("shadow_model_arithmetic_failure"))
+}
+
+fn margin_to_gate(evaluation: &AmountEvaluation) -> Result<i128, EvaluationError> {
+    let required = i128::try_from(evaluation.threshold.required.0)
+        .map_err(|_| EvaluationError::Terminal("shadow_model_arithmetic_failure"))?;
+    evaluation
+        .economics
+        .conservative
+        .expected_net_pnl
+        .0
+        .checked_sub(required)
+        .ok_or(EvaluationError::Terminal("shadow_model_arithmetic_failure"))
+}
+
+fn signed_ratio_bps_string(value: i128, denominator: u128) -> Result<String, EvaluationError> {
+    if denominator == 0 || denominator > i128::MAX as u128 {
+        return Err(EvaluationError::Terminal("shadow_model_arithmetic_failure"));
+    }
+    value
+        .checked_mul(10_000)
+        .map(|numerator| (numerator / denominator as i128).to_string())
+        .ok_or(EvaluationError::Terminal("shadow_model_arithmetic_failure"))
+}
+
+fn unsigned_ratio_bps_ceil_string(
+    value: u128,
+    denominator: u128,
+) -> Result<String, EvaluationError> {
+    if denominator == 0 {
+        return Err(EvaluationError::Terminal("shadow_model_arithmetic_failure"));
+    }
+    value
+        .checked_mul(10_000)
+        .and_then(|numerator| numerator.checked_add(denominator - 1))
+        .map(|numerator| (numerator / denominator).to_string())
+        .ok_or(EvaluationError::Terminal("shadow_model_arithmetic_failure"))
 }
 
 fn bps_amount(amount: Amount, bps: u16) -> Result<Amount, ModelError> {
@@ -2328,6 +2530,9 @@ mod tests {
             .evaluate(&input(now), &origin(), &route())
             .await
             .unwrap();
+        assert!(!crate::shadow_processor::independently_verified_profitable(
+            &batch.evaluations
+        ));
         assert_eq!(batch.evaluations.len(), 1);
         assert_eq!(client.calls.load(Ordering::Relaxed), 1);
         let opportunity = &batch.evaluations[0].opportunity;
@@ -2362,6 +2567,33 @@ mod tests {
         assert!(opportunity.decision.shadow_only);
         assert!(!opportunity.decision.execution_eligible);
         assert!(!opportunity.decision.execution_request_created);
+        let scale = &batch.evidence["profitability_scale"]["primary"];
+        assert_eq!(scale["attempted_size_count"], 4);
+        assert_eq!(
+            scale["sizing_policy"]["candidate_sizes"],
+            json!(["100", "250", "500", "1000"])
+        );
+        assert!(scale["best_input_wei"].is_string());
+        assert!(scale["best_expected_net_pnl_wei"].is_string());
+        assert!(scale["best_conservative_net_pnl_wei"].is_string());
+        assert!(scale["best_margin_to_gate_wei"].is_string());
+        assert!(scale["size_elasticity"].is_string());
+        let points = scale["candidate_results"].as_array().unwrap();
+        assert_eq!(points.len(), 4);
+        for point in points {
+            assert_eq!(point["tick_crossings"], 0);
+            assert!(point["gross_spread_bps"].is_string());
+            assert!(point["net_pnl_bps"].is_string());
+            assert!(point["break_even_spread_bps"].is_string());
+            assert!(point["gross_spread"].is_string());
+            assert!(point["gross_profit"].is_string());
+            assert!(point["execution_gas"].is_string());
+            assert!(point["gas_price"].is_string());
+            assert!(point["fixed_cost_wei"].is_string());
+            assert!(point["variable_cost_wei"].is_string());
+            assert!(point["margin_to_profitability_gate"].is_string());
+            assert!(point["price_divergence_direction"].is_string());
+        }
         let rendered = metrics.render(&crate::runtime_state::RuntimeReadiness::new());
         assert!(rendered.contains("rpc_primary_screen_rejected_total 1"));
         assert!(rendered.contains("rpc_secondary_skipped_total 1"));
@@ -2376,6 +2608,9 @@ mod tests {
             .evaluate(&input(now), &origin(), &route())
             .await
             .unwrap();
+        assert!(crate::shadow_processor::independently_verified_profitable(
+            &batch.evaluations
+        ));
         assert_eq!(batch.evaluations.len(), 1);
         assert_eq!(client.calls.load(Ordering::Relaxed), 2);
         let market = &batch.evaluations[0].opportunity.market;
@@ -2563,8 +2798,15 @@ mod tests {
             first_received_at: now,
             completed_at: now,
             processing_latency_ns: 1,
-            evaluations: batch.evaluations,
+            evaluations: batch.evaluations.clone(),
         };
         assert_eq!(validate_record(&record), Ok(()));
+        let candidate_record = ClassificationRecord {
+            classification: crate::engine_input::EngineClassification::CandidateGenerated,
+            detail_class: Some("autonomous_candidate_materialized"),
+            evaluations: batch.evaluations,
+            ..record
+        };
+        assert_eq!(validate_record(&candidate_record), Ok(()));
     }
 }
