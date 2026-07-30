@@ -419,4 +419,180 @@ for installed in (
 PY
   fail "closed-loop release contract validation failed"
 
+postgres_image=postgres@sha256:57c72fd2a128e416c7fcc499958864df5301e940bca0a56f58fddf30ffc07777
+test_suffix="$$"
+postgres_container="phoenix-economic-schema-postgres-$test_suffix"
+monitor_container="phoenix-economic-schema-monitor-$test_suffix"
+test_network="phoenix-economic-schema-$test_suffix"
+test_root=$(mktemp -d "${TMPDIR:-/tmp}/phoenix-economic-schema.XXXXXX")
+monitor_output="$test_root/evidence"
+
+cleanup_schema_compatibility_test() {
+  docker rm -f -v "$monitor_container" "$postgres_container" >/dev/null 2>&1 || true
+  docker network rm "$test_network" >/dev/null 2>&1 || true
+  case "$test_root" in
+    "${TMPDIR:-/tmp}"/phoenix-economic-schema.*)
+      rm -rf -- "$test_root"
+      ;;
+  esac
+}
+trap cleanup_schema_compatibility_test EXIT HUP INT TERM
+
+command -v docker >/dev/null 2>&1 ||
+  fail "docker is required for economic dashboard schema compatibility"
+mkdir "$monitor_output"
+chmod 0777 "$monitor_output"
+docker network create --internal "$test_network" >/dev/null
+docker run -d \
+  --name "$postgres_container" \
+  --network "$test_network" \
+  --tmpfs /var/lib/postgresql/data:rw,nosuid,nodev,size=512m \
+  -e POSTGRES_USER=phoenix_test \
+  -e POSTGRES_PASSWORD=phoenix_test_password \
+  -e POSTGRES_DB=phoenix_test \
+  "$postgres_image" >/dev/null
+
+postgres_ready=false
+attempt=0
+while [ "$attempt" -lt 30 ]; do
+  if docker exec "$postgres_container" \
+    pg_isready -U phoenix_test -d phoenix_test >/dev/null 2>&1
+  then
+    postgres_ready=true
+    break
+  fi
+  attempt=$((attempt + 1))
+  sleep 1
+done
+[ "$postgres_ready" = true ] ||
+  fail "historical schema PostgreSQL did not become ready"
+
+for migration in "$repo_root"/migrations/*.sql; do
+  case "${migration##*/}" in
+    012_*) break ;;
+  esac
+  docker exec -i "$postgres_container" \
+    psql -X -v ON_ERROR_STOP=1 -U phoenix_test -d phoenix_test \
+    <"$migration" >/dev/null ||
+    fail "historical migration failed: ${migration##*/}"
+done
+for schema in "$repo_root"/live-executor/schema/*.sql; do
+  docker exec -i "$postgres_container" \
+    psql -X -v ON_ERROR_STOP=1 -U phoenix_test -d phoenix_test \
+    <"$schema" >/dev/null ||
+    fail "live schema failed: ${schema##*/}"
+done
+
+historical_view=$(
+  docker exec "$postgres_container" \
+    psql -X -q -A -t -U phoenix_test -d phoenix_test \
+    -c "SELECT to_regclass('public.phoenix_live_economic_truth') IS NULL"
+)
+[ "$historical_view" = t ] ||
+  fail "historical schema unexpectedly contains phoenix_live_economic_truth"
+
+docker exec -i "$postgres_container" \
+  psql -X -q -A -t -U phoenix_test -d phoenix_test \
+  <"$repo_root/scripts/sql/economic-dashboard-snapshot.sql" \
+  >"$test_root/historical-dashboard.json" ||
+  fail "dashboard snapshot rejected the historical Production schema"
+PYTHONDONTWRITEBYTECODE=1 python3 -I -B - "$test_root/historical-dashboard.json" <<'PY' ||
+import json
+import sys
+from pathlib import Path
+
+document = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+if document["economics"]["size_sweep_7d"] != []:
+    raise SystemExit("historical size sweep must be empty")
+if set(document["funnel"]["windows"]) != {"1h", "24h", "7d"}:
+    raise SystemExit("historical dashboard funnel is incomplete")
+PY
+  fail "historical dashboard snapshot contract failed"
+
+docker run -d \
+  --name "$monitor_container" \
+  --network "$test_network" \
+  --user 1000:1000 \
+  --read-only \
+  --cap-drop ALL \
+  --security-opt no-new-privileges:true \
+  --tmpfs /tmp:rw,noexec,nosuid,nodev,size=16m \
+  --health-cmd "test -s /evidence/latest-dashboard.json" \
+  --health-interval 1s \
+  --health-timeout 3s \
+  --health-retries 20 \
+  -e POSTGRES_DSN=postgres://phoenix_test:phoenix_test_password@"$postgres_container":5432/phoenix_test \
+  -e PHOENIX_ECONOMIC_DASHBOARD_INTERVAL_SECONDS=30 \
+  -e PHOENIX_ECONOMIC_DASHBOARD_SQL=/opt/phoenix/economic-dashboard-snapshot.sql \
+  -e PHOENIX_ECONOMIC_DASHBOARD_OUTPUT=/evidence/latest-dashboard.json \
+  -v "$repo_root/scripts/economic-dashboard-loop.sh:/opt/phoenix/economic-dashboard-loop.sh:ro" \
+  -v "$repo_root/scripts/sql/economic-dashboard-snapshot.sql:/opt/phoenix/economic-dashboard-snapshot.sql:ro" \
+  -v "$monitor_output:/evidence" \
+  --entrypoint /bin/sh \
+  "$postgres_image" \
+  /opt/phoenix/economic-dashboard-loop.sh >/dev/null
+
+monitor_healthy=false
+attempt=0
+while [ "$attempt" -lt 30 ]; do
+  monitor_health=$(
+    docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{end}}' \
+      "$monitor_container"
+  )
+  if [ "$monitor_health" = healthy ]; then
+    monitor_healthy=true
+    break
+  fi
+  [ "$monitor_health" != unhealthy ] ||
+    fail "economic monitor became unhealthy on historical schema"
+  attempt=$((attempt + 1))
+  sleep 1
+done
+[ "$monitor_healthy" = true ] ||
+  fail "economic monitor did not become healthy on historical schema"
+[ "$(docker exec "$monitor_container" id -u)" = 1000 ] ||
+  fail "economic monitor does not run as uid 1000"
+[ "$(stat -c '%u:%g:%a:%h' "$monitor_output/latest-dashboard.json")" = "1000:1000:640:1" ] ||
+  fail "economic monitor dashboard ownership or mode is invalid"
+host_sql_sha=$(sha256sum "$repo_root/scripts/sql/economic-dashboard-snapshot.sql" | cut -d' ' -f1)
+monitor_sql_sha=$(
+  docker exec "$monitor_container" \
+    sha256sum /opt/phoenix/economic-dashboard-snapshot.sql |
+    cut -d' ' -f1
+)
+[ "$host_sql_sha" = "$monitor_sql_sha" ] ||
+  fail "economic monitor did not mount the candidate SQL content"
+docker rm -f -v "$monitor_container" >/dev/null
+
+for pass in first idempotent; do
+  docker exec -i "$postgres_container" \
+    psql -X -v ON_ERROR_STOP=1 -U phoenix_test -d phoenix_test \
+    <"$repo_root/migrations/012_live_economic_truth.sql" >/dev/null ||
+    fail "migration 012 $pass application failed"
+done
+upgraded_view=$(
+  docker exec "$postgres_container" \
+    psql -X -q -A -t -U phoenix_test -d phoenix_test \
+    -c "SELECT to_regclass('public.phoenix_live_economic_truth') IS NOT NULL"
+)
+[ "$upgraded_view" = t ] ||
+  fail "migration 012 did not create phoenix_live_economic_truth"
+docker exec -i "$postgres_container" \
+  psql -X -q -A -t -U phoenix_test -d phoenix_test \
+  <"$repo_root/scripts/sql/economic-dashboard-snapshot.sql" \
+  >"$test_root/upgraded-dashboard.json" ||
+  fail "dashboard snapshot rejected the migration-012 schema"
+PYTHONDONTWRITEBYTECODE=1 python3 -I -B - "$test_root/upgraded-dashboard.json" <<'PY' ||
+import json
+import sys
+from pathlib import Path
+
+document = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+if document["schema"] != "phoenix.economic-dashboard.v1":
+    raise SystemExit("upgraded dashboard schema is invalid")
+if document["economics"]["size_sweep_7d"] != []:
+    raise SystemExit("empty upgraded database must have an empty size sweep")
+PY
+  fail "upgraded dashboard snapshot contract failed"
+
 echo "AUTONOMOUS_LIVE_RELEASE_CONTRACT_TEST_OK"
