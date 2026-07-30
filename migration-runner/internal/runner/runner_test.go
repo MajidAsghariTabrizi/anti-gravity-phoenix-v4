@@ -414,6 +414,7 @@ func runFreshV5DatabaseIntegration(t *testing.T, sanitized *url.URL) {
 		"010_fork_simulation_evidence",
 		"011_money_path_selective_persistence",
 		"012_live_economic_truth",
+		"013_economic_loss_ledger",
 	}
 	loadedVersions := make([]string, 0, len(migrations))
 	for _, migration := range migrations {
