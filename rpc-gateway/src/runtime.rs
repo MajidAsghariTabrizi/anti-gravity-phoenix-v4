@@ -253,61 +253,9 @@ impl GatewayRuntime {
             return Err(GatewayError::RequestBudgetExhausted);
         }
         let _operation_guard = self.upstream_operation_lock.lock().await;
-        let provider = self
-            .reserve_provider(&HashSet::new())
-            .await
-            .ok_or(GatewayError::ProviderUnavailable)?;
-        let required_calls = self.provider_setup_call_count(provider.provider_id()).await
-            + if request.state_reconstruction_required {
-                5
-            } else {
-                3
-            };
-        if !self.admit_upstream_sequence(required_calls).await {
-            return Err(GatewayError::UpstreamBudgetExhausted);
-        }
-        self.ensure_provider_verified(&provider)
-            .await
-            .map_err(map_call_failure)?;
-
-        let transaction = self
-            .upstream_call(
-                &provider,
-                RpcMethod::EthGetTransactionByHash,
-                json!([request.source_transaction_hash]),
-                ProviderSlot::Primary,
-                None,
-                false,
-            )
-            .await
-            .map_err(map_call_failure)?
-            .value;
-        let receipt = self
-            .upstream_call(
-                &provider,
-                RpcMethod::EthGetTransactionReceipt,
-                json!([request.source_transaction_hash]),
-                ProviderSlot::Primary,
-                None,
-                false,
-            )
-            .await
-            .map_err(map_call_failure)?
-            .value;
-        let block_number = required_quantity(&transaction, "blockNumber")?;
-        let block = self
-            .upstream_call(
-                &provider,
-                RpcMethod::EthGetBlockByNumber,
-                json!([format_quantity(block_number), false]),
-                ProviderSlot::Primary,
-                None,
-                false,
-            )
-            .await
-            .map_err(map_call_failure)?
-            .value;
-        let inclusion = verify_source_inclusion(&request, &transaction, &receipt, &block)?;
+        let resolved = self.resolve_source_inclusion(&request).await?;
+        let provider = resolved.provider;
+        let inclusion = resolved.inclusion;
         let block_number = inclusion.block_number;
         let block_hash = inclusion.block_hash;
         let transaction_index = inclusion.transaction_index;
@@ -316,12 +264,7 @@ impl GatewayRuntime {
         let status = inclusion.transaction_status;
         let source_event_index = inclusion.source_event_index;
         let source_pool_addresses = inclusion.source_pool_addresses;
-        let provider_response_hash = hash_json(&json!({
-            "transaction": transaction,
-            "receipt": receipt,
-            "block": block
-        }))
-        .map_err(|_| GatewayError::ProviderIntegrity)?;
+        let provider_response_hash = resolved.provider_response_hash;
 
         let (method, post_state_hash, completeness, failure_reason, state_evidence) =
             if request.state_reconstruction_required {
@@ -440,6 +383,116 @@ impl GatewayRuntime {
             .validate(&request)
             .map_err(|_| GatewayError::ProviderIntegrity)?;
         Ok(response)
+    }
+
+    async fn resolve_source_inclusion(
+        &self,
+        request: &SourceEvidenceRequest,
+    ) -> Result<ResolvedSourceInclusion, GatewayError> {
+        let provider_count = self.provider_count().await;
+        let mut excluded = HashSet::with_capacity(provider_count);
+        let mut integrity_failure = false;
+        for _ in 0..provider_count {
+            let Some(provider) = self.reserve_provider(&excluded).await else {
+                break;
+            };
+            excluded.insert(provider.provider_id().to_string());
+            let required_calls = self.provider_setup_call_count(provider.provider_id()).await
+                + if request.state_reconstruction_required {
+                    5
+                } else {
+                    3
+                };
+            if !self.admit_upstream_sequence(required_calls).await {
+                return Err(GatewayError::UpstreamBudgetExhausted);
+            }
+            if let Err(failure) = self.ensure_provider_verified(&provider).await {
+                if failure == CallFailure::Budget {
+                    return Err(GatewayError::UpstreamBudgetExhausted);
+                }
+                integrity_failure |= failure == CallFailure::Integrity;
+                self.apply_provider_failure(provider.provider_id(), failure)
+                    .await;
+                continue;
+            }
+            match self
+                .source_inclusion_from_provider(&provider, request)
+                .await
+            {
+                Ok(inclusion) => {
+                    self.mark_provider_success(provider.provider_id()).await;
+                    return Ok(inclusion);
+                }
+                Err(CallFailure::Budget) => {
+                    return Err(GatewayError::UpstreamBudgetExhausted);
+                }
+                Err(failure) => {
+                    integrity_failure |= failure == CallFailure::Integrity;
+                    self.apply_provider_failure(provider.provider_id(), failure)
+                        .await;
+                }
+            }
+        }
+        if integrity_failure {
+            Err(GatewayError::ProviderIntegrity)
+        } else {
+            Err(GatewayError::ProviderUnavailable)
+        }
+    }
+
+    async fn source_inclusion_from_provider(
+        &self,
+        provider: &ProviderLease,
+        request: &SourceEvidenceRequest,
+    ) -> Result<ResolvedSourceInclusion, CallFailure> {
+        let transaction = self
+            .upstream_call(
+                provider,
+                RpcMethod::EthGetTransactionByHash,
+                json!([request.source_transaction_hash]),
+                ProviderSlot::Primary,
+                None,
+                false,
+            )
+            .await?
+            .value;
+        let receipt = self
+            .upstream_call(
+                provider,
+                RpcMethod::EthGetTransactionReceipt,
+                json!([request.source_transaction_hash]),
+                ProviderSlot::Primary,
+                None,
+                false,
+            )
+            .await?
+            .value;
+        let block_number =
+            required_quantity(&transaction, "blockNumber").map_err(|_| CallFailure::Integrity)?;
+        let block = self
+            .upstream_call(
+                provider,
+                RpcMethod::EthGetBlockByNumber,
+                json!([format_quantity(block_number), false]),
+                ProviderSlot::Primary,
+                None,
+                false,
+            )
+            .await?
+            .value;
+        let inclusion = verify_source_inclusion(request, &transaction, &receipt, &block)
+            .map_err(|_| CallFailure::Integrity)?;
+        let provider_response_hash = hash_json(&json!({
+            "transaction": transaction,
+            "receipt": receipt,
+            "block": block
+        }))
+        .map_err(|_| CallFailure::Integrity)?;
+        Ok(ResolvedSourceInclusion {
+            provider: provider.clone(),
+            inclusion,
+            provider_response_hash,
+        })
     }
 
     pub async fn resolve_shadow_state(
@@ -2118,6 +2171,13 @@ struct VerifiedSourceInclusion {
     source_pool_addresses: Vec<String>,
 }
 
+#[derive(Clone, Debug)]
+struct ResolvedSourceInclusion {
+    provider: ProviderLease,
+    inclusion: VerifiedSourceInclusion,
+    provider_response_hash: String,
+}
+
 fn verify_source_inclusion(
     request: &SourceEvidenceRequest,
     transaction: &Value,
@@ -2509,6 +2569,7 @@ mod tests {
         calls: StdMutex<Vec<CallRecord>>,
         head: StdMutex<PinnedBlock>,
         rate_limit_once: StdMutex<HashSet<String>>,
+        source_receipt_failure: StdMutex<HashSet<String>>,
         disagreement: AtomicBool,
         malformed_multicall: AtomicBool,
         delay_multicall: Duration,
@@ -2523,6 +2584,7 @@ mod tests {
                     hash: BLOCK_HASH.to_string(),
                 }),
                 rate_limit_once: StdMutex::new(HashSet::new()),
+                source_receipt_failure: StdMutex::new(HashSet::new()),
                 disagreement: AtomicBool::new(false),
                 malformed_multicall: AtomicBool::new(false),
                 delay_multicall: Duration::ZERO,
@@ -2551,6 +2613,13 @@ mod tests {
 
         fn rate_limit_next_multicall(&self, provider_id: &str) {
             self.rate_limit_once
+                .lock()
+                .unwrap()
+                .insert(provider_id.to_string());
+        }
+
+        fn fail_source_receipt_for(&self, provider_id: &str) {
+            self.source_receipt_failure
                 .lock()
                 .unwrap()
                 .insert(provider_id.to_string());
@@ -2657,7 +2726,23 @@ mod tests {
                 RpcMethod::EthGetCode => json!("0x60006000"),
                 RpcMethod::EthGetBlockByNumber => {
                     let block = self.block_for_tag(params[0].as_str().unwrap());
-                    json!({"number": format_quantity(block.number), "hash": block.hash})
+                    if block.number == 100 && block.hash == BLOCK_HASH {
+                        source_block_fixture()
+                    } else {
+                        json!({"number": format_quantity(block.number), "hash": block.hash})
+                    }
+                }
+                RpcMethod::EthGetTransactionByHash => source_transaction_fixture(),
+                RpcMethod::EthGetTransactionReceipt => {
+                    if self
+                        .source_receipt_failure
+                        .lock()
+                        .unwrap()
+                        .contains(provider.provider_id())
+                    {
+                        return Err(TransportError::Http);
+                    }
+                    source_receipt_fixture()
                 }
                 RpcMethod::EthCall => {
                     if self
@@ -3367,6 +3452,33 @@ mod tests {
                 format!("0x{}", "2".repeat(64))
             ]
         })
+    }
+
+    #[tokio::test]
+    async fn source_inclusion_fails_over_as_one_bounded_provider_sequence() {
+        let client = Arc::new(ModelClient::default());
+        client.fail_source_receipt_for("provider_0");
+        let runtime = runtime(client.clone());
+        let mut request = source_evidence_request_fixture();
+        request.state_reconstruction_required = false;
+
+        let response = runtime.resolve_source_evidence(request).await.unwrap();
+
+        assert_eq!(response.provider_id, "provider_1");
+        assert_eq!(response.source_block_number, 100);
+        assert_eq!(response.source_transaction_index, 2);
+        assert_eq!(response.completeness_status, "incomplete");
+        assert_eq!(
+            response.failure_reason.as_deref(),
+            Some("state_reconstruction_not_selected")
+        );
+        let receipt_providers = client
+            .calls()
+            .into_iter()
+            .filter(|call| call.method == RpcMethod::EthGetTransactionReceipt)
+            .map(|call| call.provider_id)
+            .collect::<Vec<_>>();
+        assert_eq!(receipt_providers, vec!["provider_0", "provider_1"]);
     }
 
     #[test]
