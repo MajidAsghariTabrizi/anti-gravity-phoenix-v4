@@ -1686,6 +1686,7 @@ class WorkflowAndDeploymentContractTests(unittest.TestCase):
         self.assertIn("candidate_monitor_sql_inode_mismatch", self.rehearsal)
         self.assertIn("1000:1000", self.rehearsal)
         self.assertIn("candidate_monitor_unhealthy", self.rehearsal)
+        self.assertIn("deadline=$(( $(date +%s) + 180 ))", self.rehearsal)
         self.assertIn("candidate_health_contract_failed", self.rehearsal)
         self.assertIn(
             'docker rm -f -v "$monitor_container"',

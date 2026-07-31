@@ -267,7 +267,7 @@ container_sql_inode=$(
 ) || fail candidate_monitor_sql_inode_unavailable
 [ "$container_sql_inode" = "$host_sql_inode" ] ||
   fail candidate_monitor_sql_inode_mismatch
-deadline=$(( $(date +%s) + 75 ))
+deadline=$(( $(date +%s) + 180 ))
 monitor_health=
 while [ "$(date +%s)" -lt "$deadline" ]; do
   monitor_health=$(
