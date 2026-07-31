@@ -207,8 +207,11 @@ fn classify_universal(selector: [u8; 4], data: &[u8]) -> DecodeOutcome {
         _ => unreachable!("universal selector kind is fixed"),
     }];
     let mut supported_swap = None;
-    for ((command_byte, command_type), input) in
-        commands.iter().zip(command_types.iter()).zip(inputs.iter())
+    for (command_index, ((command_byte, command_type), input)) in commands
+        .iter()
+        .zip(command_types.iter())
+        .zip(inputs.iter())
+        .enumerate()
     {
         match *command_type {
             0x00 => {
@@ -223,7 +226,7 @@ fn classify_universal(selector: [u8; 4], data: &[u8]) -> DecodeOutcome {
                     Err(()) => return DecodeOutcome::Malformed(mark_malformed(evidence)),
                 };
                 decoded_commands.push("V3_SWAP_EXACT_IN".to_string());
-                supported_swap = Some(swap);
+                supported_swap = Some((command_index, swap));
             }
             0x01 => {
                 return DecodeOutcome::Unsupported(mark_unsupported(
@@ -258,13 +261,17 @@ fn classify_universal(selector: [u8; 4], data: &[u8]) -> DecodeOutcome {
         }
     }
 
-    let Some(swap) = supported_swap else {
+    let Some((command_index, swap)) = supported_swap else {
         return DecodeOutcome::Unsupported(mark_unsupported(
             evidence,
             UnsupportedReason::MissingSwap,
         ));
     };
-    DecodeOutcome::Supported(swap.into_decoded(evidence, decoded_commands))
+    DecodeOutcome::Supported(swap.into_decoded(
+        evidence,
+        decoded_commands,
+        u16::try_from(command_index).expect("Universal Router command count is bounded"),
+    ))
 }
 
 fn decode_legacy_multicall(data: &[u8]) -> DecodeOutcome {
@@ -308,21 +315,21 @@ fn decode_legacy_multicall(data: &[u8]) -> DecodeOutcome {
     let known = selectors();
     let mut supported_swap = None;
     let mut decoded_commands = vec!["multicall".to_string()];
-    for (selector, call_data) in parsed_calls {
+    for (command_index, (selector, call_data)) in parsed_calls.into_iter().enumerate() {
         if selector == known.legacy_exact_input_single {
             let swap = match decode_legacy_exact_input_single(call_data) {
                 Ok(swap) => swap,
                 Err(()) => return DecodeOutcome::Malformed(mark_malformed(evidence)),
             };
             decoded_commands.push("exactInputSingle".to_string());
-            supported_swap = Some(swap);
+            supported_swap = Some((command_index, swap));
         } else if selector == known.legacy_exact_input {
             let swap = match decode_legacy_exact_input(call_data) {
                 Ok(swap) => swap,
                 Err(()) => return DecodeOutcome::Malformed(mark_malformed(evidence)),
             };
             decoded_commands.push("exactInput".to_string());
-            supported_swap = Some(swap);
+            supported_swap = Some((command_index, swap));
         } else if selector == known.legacy_exact_output_single
             || selector == known.legacy_exact_output
         {
@@ -348,13 +355,17 @@ fn decode_legacy_multicall(data: &[u8]) -> DecodeOutcome {
             }
         }
     }
-    let Some(swap) = supported_swap else {
+    let Some((command_index, swap)) = supported_swap else {
         return DecodeOutcome::Unsupported(mark_unsupported(
             evidence,
             UnsupportedReason::MissingSwap,
         ));
     };
-    DecodeOutcome::Supported(swap.into_decoded(evidence, decoded_commands))
+    DecodeOutcome::Supported(swap.into_decoded(
+        evidence,
+        decoded_commands,
+        u16::try_from(command_index).expect("multicall command count is bounded"),
+    ))
 }
 
 #[derive(Clone, Debug)]
@@ -369,6 +380,7 @@ impl SwapData {
         self,
         mut evidence: OriginEvidence,
         decoded_commands: Vec<String>,
+        source_command_index: u16,
     ) -> DecodedSwap {
         evidence.decoded_swap_kind = self.kind;
         evidence.v3_hop_count = self.path.touched_pools.len();
@@ -377,7 +389,10 @@ impl SwapData {
         evidence.unsupported_reason = UnsupportedReason::None;
         DecodedSwap {
             decoded_commands,
+            source_command_index,
             swap_path: self.path.tokens,
+            encoded_token_path: self.path.encoded_token_path,
+            fee_path: self.path.fees,
             amount_in: self.amount_in,
             touched_pools: self.path.touched_pools,
             evidence,
@@ -388,6 +403,8 @@ impl SwapData {
 #[derive(Clone, Debug)]
 struct V3Path {
     tokens: Vec<Address>,
+    encoded_token_path: String,
+    fees: Vec<u32>,
     touched_pools: Vec<PoolId>,
 }
 
@@ -502,7 +519,9 @@ fn single_hop_swap(
     let touched_pool = canonical_pool_id(&token_in, &token_out, fee);
     Ok(SwapData {
         path: V3Path {
+            encoded_token_path: encode_v3_path(&token_in, fee, &token_out),
             tokens: vec![token_in, token_out],
+            fees: vec![fee],
             touched_pools: vec![touched_pool],
         },
         amount_in,
@@ -519,6 +538,7 @@ fn decode_v3_path(path: &[u8]) -> Result<V3Path, ()> {
         return Err(());
     }
     let mut tokens = Vec::with_capacity(hop_count + 1);
+    let mut fees = Vec::with_capacity(hop_count);
     let mut touched_pools = Vec::with_capacity(hop_count);
     let mut current = address_from_bytes(&path[0..20])?;
     tokens.push(current.clone());
@@ -530,13 +550,27 @@ fn decode_v3_path(path: &[u8]) -> Result<V3Path, ()> {
             return Err(());
         }
         touched_pools.push(canonical_pool_id(&current, &next, fee));
+        fees.push(fee);
         tokens.push(next.clone());
         current = next;
     }
     Ok(V3Path {
         tokens,
+        encoded_token_path: format!("0x{}", hex::encode(path)),
+        fees,
         touched_pools,
     })
+}
+
+fn encode_v3_path(token_in: &Address, fee: u32, token_out: &Address) -> String {
+    format!(
+        "{}{fee:06x}{}",
+        token_in.as_str(),
+        token_out
+            .as_str()
+            .strip_prefix("0x")
+            .expect("canonical address has prefix")
+    )
 }
 
 fn canonical_pool_id(token_a: &Address, token_b: &Address, fee: u32) -> PoolId {
@@ -703,7 +737,7 @@ fn finish_supported(
     commands: Vec<String>,
 ) -> DecodeOutcome {
     match decoded {
-        Ok(decoded) => DecodeOutcome::Supported(decoded.into_decoded(evidence, commands)),
+        Ok(decoded) => DecodeOutcome::Supported(decoded.into_decoded(evidence, commands, 0)),
         Err(()) => DecodeOutcome::Malformed(mark_malformed(evidence)),
     }
 }

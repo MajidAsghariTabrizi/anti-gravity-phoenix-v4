@@ -7,6 +7,7 @@ use rpc_gateway::runtime_state::GatewayReadiness;
 use rpc_gateway::shadow_state::{
     ShadowStateRequest, MAX_GATEWAY_REQUEST_BYTES, SHADOW_STATE_SCHEMA_VERSION,
 };
+use rpc_gateway::source_state::SourceEvidenceRequest;
 use rpc_gateway::transport::ReqwestJsonRpcClient;
 use serde::Serialize;
 use std::error::Error;
@@ -258,6 +259,30 @@ async fn handle_request(
             };
             match tokio::time::timeout(STATE_REQUEST_TIMEOUT, runtime.resolve_hunter_state(parsed))
                 .await
+            {
+                Ok(Ok(response)) => write_json(&mut stream, 200, &response).await,
+                Ok(Err(error)) => {
+                    write_json(&mut stream, error.http_status(), &error.response()).await
+                }
+                Err(_) => {
+                    let error = GatewayError::ProviderUnavailable;
+                    write_json(&mut stream, error.http_status(), &error.response()).await
+                }
+            }
+        }
+        ("POST", "/v1/source/evidence") => {
+            let parsed: SourceEvidenceRequest = match serde_json::from_slice(&request.body) {
+                Ok(parsed) => parsed,
+                Err(_) => {
+                    return write_json(&mut stream, 400, &GatewayError::InvalidRequest.response())
+                        .await;
+                }
+            };
+            match tokio::time::timeout(
+                STATE_REQUEST_TIMEOUT,
+                runtime.resolve_source_evidence(parsed),
+            )
+            .await
             {
                 Ok(Ok(response)) => write_json(&mut stream, 200, &response).await,
                 Ok(Err(error)) => {

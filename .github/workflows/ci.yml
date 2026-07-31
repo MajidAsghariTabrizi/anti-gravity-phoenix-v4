@@ -1051,6 +1051,9 @@ jobs:
             cd feed-ingestor
             PHOENIX_TEST_NATS_URL=nats://127.0.0.1:4222 \
               go test ./internal/publisher -run '^TestJetStreamPublisherIntegration$' -count=1 -v
+            PHOENIX_SOURCE_IDENTITY_FIXTURE_OUTPUT=/tmp/phoenix-source-identity-fixture.json \
+              go test ./internal/nitro \
+                -run '^TestExactSourceIdentityFixtureFromNestedNitroBatch$' -count=1 -v
           )
           PHOENIX_TEST_NATS_URL=nats://127.0.0.1:4222 \
           PHOENIX_TEST_POSTGRES_DSN=postgres://phoenix_test:phoenix_test_password@127.0.0.1:5432/phoenix_test \
@@ -1059,3 +1062,15 @@ jobs:
           PHOENIX_TEST_NATS_URL=nats://127.0.0.1:4222 \
             cargo test --locked --manifest-path recorder/Cargo.toml \
               --test engine_stream_integration -- --nocapture
+          docker exec \
+            --env PGPASSWORD=phoenix_test_password \
+            phoenix-ci-postgres \
+            psql -X -qAt -v ON_ERROR_STOP=1 \
+              -U phoenix_test -d postgres \
+              -c 'CREATE DATABASE phoenix_source_test'
+          PHOENIX_TEST_NATS_URL=nats://127.0.0.1:4222 \
+          PHOENIX_TEST_POSTGRES_DSN=postgres://phoenix_test:phoenix_test_password@127.0.0.1:5432/phoenix_source_test \
+          PHOENIX_SOURCE_IDENTITY_FIXTURE=/tmp/phoenix-source-identity-fixture.json \
+            cargo test --locked --manifest-path phoenix-engine/Cargo.toml --lib \
+              source_enrichment::tests::nitro_to_engine_identity_and_append_only_enrichment_are_exact \
+              -- --exact --nocapture --test-threads=1

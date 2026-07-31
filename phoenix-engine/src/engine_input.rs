@@ -184,6 +184,7 @@ pub fn decode_engine_input(
         },
         normalized: NormalizedTx {
             sequence: SequenceNumber(validated.tx.sequence),
+            source_feed_order_position: validated.tx.source_feed_order_position,
             tx_hash: TxHash(validated.tx.tx_hash),
             tx_type: validated.tx.tx_type,
             chain_id: ChainId(validated.tx.chain_id),
@@ -240,6 +241,7 @@ mod tests {
         serde_json::to_vec(&json!({
             "schema_version": NORMALIZED_SCHEMA_VERSION,
             "sequence": sequence,
+            "source_feed_order_position": 3,
             "timestamp_unix_ms": 1_700_000_000_000_u64,
             "tx_hash": format!("0x{}", hash_byte.to_string().repeat(64)),
             "tx_type": "0x02",
@@ -273,6 +275,7 @@ mod tests {
         assert_eq!(input.identity.source_sequence, 7);
         assert_eq!(input.identity.source_event_identity, identity);
         assert_eq!(input.normalized.chain_id, ChainId(42161));
+        assert_eq!(input.normalized.source_feed_order_position, Some(3));
     }
 
     #[test]

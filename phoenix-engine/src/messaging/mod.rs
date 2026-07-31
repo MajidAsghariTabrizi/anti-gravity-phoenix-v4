@@ -3,6 +3,7 @@ use crate::domain::{Address, ChainId, SequenceNumber, TxHash};
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NormalizedTx {
     pub sequence: SequenceNumber,
+    pub source_feed_order_position: Option<u64>,
     pub tx_hash: TxHash,
     pub tx_type: String,
     pub chain_id: ChainId,

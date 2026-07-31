@@ -5,6 +5,7 @@ use crate::opportunity::{
     VerificationSkipReason, VerificationStatus, PROFITABILITY_MODEL_VERSION,
 };
 use crate::shadow_processor::EvaluatedOpportunity;
+use crate::source_identity::SourceIdentity;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde::Serialize;
@@ -115,6 +116,10 @@ impl PostgresShadowStore {
         Ok(Self { pool })
     }
 
+    pub(crate) fn pool(&self) -> PgPool {
+        self.pool.clone()
+    }
+
     async fn load_schema_snapshot(&self) -> Result<SchemaSnapshot, StoreError> {
         let mut snapshot = SchemaSnapshot::default();
         let rows = sqlx::query(
@@ -127,7 +132,11 @@ WHERE table_schema = 'public'
       'shadow_engine_processing_attempts',
       'shadow_decisions',
       'rpc_quality_records',
-      'shadow_profitability_facts'
+      'shadow_profitability_facts',
+      'source_event_identities',
+      'source_block_enrichments',
+      'source_enrichment_attempts',
+      'transaction_boundary_state_evidence'
   )
 "#,
         )
@@ -163,7 +172,11 @@ WHERE tc.constraint_schema = 'public'
       'shadow_engine_processing_attempts',
       'shadow_decisions',
       'rpc_quality_records',
-      'shadow_profitability_facts'
+      'shadow_profitability_facts',
+      'source_event_identities',
+      'source_block_enrichments',
+      'source_enrichment_attempts',
+      'transaction_boundary_state_evidence'
   )
   AND tc.constraint_type IN ('PRIMARY KEY', 'UNIQUE')
 GROUP BY tc.table_name, tc.constraint_name
@@ -195,7 +208,11 @@ WHERE namespace_row.nspname = 'public'
       'shadow_engine_processing_attempts',
       'shadow_decisions',
       'rpc_quality_records',
-      'shadow_profitability_facts'
+      'shadow_profitability_facts',
+      'source_event_identities',
+      'source_block_enrichments',
+      'source_enrichment_attempts',
+      'transaction_boundary_state_evidence'
   )
   AND constraint_row.contype = 'c'
 "#,
@@ -449,6 +466,10 @@ ON CONFLICT (source_event_identity) DO UPDATE SET
         .await
         .map_err(classify_sqlx_error)?;
 
+        if let Some(source_identity) = validated_source_identity(record)? {
+            persist_source_identity(&mut transaction, &source_identity).await?;
+        }
+
         for evaluation in &record.evaluations {
             persist_decision(&mut transaction, record, evaluation).await?;
         }
@@ -456,6 +477,109 @@ ON CONFLICT (source_event_identity) DO UPDATE SET
         transaction.commit().await.map_err(classify_sqlx_error)?;
         Ok(PersistOutcome::Committed)
     }
+}
+
+fn validated_source_identity(
+    record: &ClassificationRecord,
+) -> Result<Option<SourceIdentity>, StoreError> {
+    let Some(value) = record.evidence.get("source_identity") else {
+        return Ok(None);
+    };
+    let source_identity: SourceIdentity =
+        serde_json::from_value(value.clone()).map_err(|_| StoreError::Integrity)?;
+    source_identity
+        .validate()
+        .map_err(|_| StoreError::Integrity)?;
+    if source_identity.source_event_identity != record.identity.source_event_identity
+        || source_identity.source_feed_sequence != record.identity.source_sequence
+        || source_identity.source_transaction_hash != record.identity.tx_hash
+        || source_identity.source_chain_id != record.identity.chain_id
+    {
+        return Err(StoreError::Integrity);
+    }
+    Ok(Some(source_identity))
+}
+
+async fn persist_source_identity(
+    transaction: &mut Transaction<'_, Postgres>,
+    identity: &SourceIdentity,
+) -> Result<(), StoreError> {
+    let observed_at = timestamp_from_millis(identity.source_observed_at_unix_ms)?;
+    sqlx::query(
+        r#"
+INSERT INTO source_event_identities (
+    source_event_identity,
+    schema_version,
+    source_chain_id,
+    source_transaction_hash,
+    source_feed_sequence,
+    source_feed_order_position,
+    source_block_number,
+    source_block_hash,
+    source_transaction_index,
+    source_command_index,
+    source_event_index,
+    source_observed_at,
+    source_router,
+    source_factory,
+    source_pool,
+    source_pool_path,
+    source_token_path,
+    source_encoded_token_path,
+    source_fee_path,
+    source_direction,
+    source_input_amount,
+    decoded_commands,
+    unavailable_reason,
+    source_identity_hash
+) VALUES (
+    $1, $2, $3, $4, CAST($5 AS numeric), CAST($6 AS numeric),
+    NULL, NULL, NULL, $7, NULL, $8, $9, $10, $11, $12, $13, $14,
+    $15, $16, CAST($17 AS numeric), $18, $19, $20
+)
+ON CONFLICT (source_event_identity) DO NOTHING
+"#,
+    )
+    .bind(&identity.source_event_identity)
+    .bind(&identity.schema_version)
+    .bind(identity.source_chain_id as i64)
+    .bind(&identity.source_transaction_hash)
+    .bind(identity.source_feed_sequence.to_string())
+    .bind(
+        identity
+            .source_feed_order_position
+            .map(|value| value.to_string()),
+    )
+    .bind(identity.source_command_index as i32)
+    .bind(observed_at)
+    .bind(&identity.source_router)
+    .bind(&identity.source_factory)
+    .bind(&identity.source_pool)
+    .bind(Json(&identity.source_pool_path))
+    .bind(Json(&identity.source_token_path))
+    .bind(&identity.source_encoded_token_path)
+    .bind(Json(&identity.source_fee_path))
+    .bind(&identity.source_direction)
+    .bind(&identity.source_input_amount)
+    .bind(Json(&identity.decoded_commands))
+    .bind(&identity.unavailable_reason)
+    .bind(&identity.source_identity_hash)
+    .execute(&mut **transaction)
+    .await
+    .map_err(classify_sqlx_error)?;
+
+    let persisted_hash: String = sqlx::query_scalar(
+        "SELECT source_identity_hash FROM source_event_identities \
+         WHERE source_event_identity = $1",
+    )
+    .bind(&identity.source_event_identity)
+    .fetch_one(&mut **transaction)
+    .await
+    .map_err(classify_sqlx_error)?;
+    if persisted_hash != identity.source_identity_hash {
+        return Err(StoreError::Integrity);
+    }
+    Ok(())
 }
 
 async fn persist_decision(
@@ -1684,6 +1808,336 @@ const REQUIRED_COLUMNS: &[(&str, &str, &str, bool)] = &[
         "timestamp with time zone",
         false,
     ),
+    (
+        "source_event_identities",
+        "source_event_identity",
+        "text",
+        false,
+    ),
+    ("source_event_identities", "schema_version", "text", false),
+    (
+        "source_event_identities",
+        "source_chain_id",
+        "bigint",
+        false,
+    ),
+    (
+        "source_event_identities",
+        "source_transaction_hash",
+        "text",
+        false,
+    ),
+    (
+        "source_event_identities",
+        "source_feed_sequence",
+        "numeric",
+        false,
+    ),
+    (
+        "source_event_identities",
+        "source_feed_order_position",
+        "numeric",
+        true,
+    ),
+    (
+        "source_event_identities",
+        "source_block_number",
+        "numeric",
+        true,
+    ),
+    ("source_event_identities", "source_block_hash", "text", true),
+    (
+        "source_event_identities",
+        "source_transaction_index",
+        "numeric",
+        true,
+    ),
+    (
+        "source_event_identities",
+        "source_command_index",
+        "integer",
+        false,
+    ),
+    (
+        "source_event_identities",
+        "source_event_index",
+        "numeric",
+        true,
+    ),
+    (
+        "source_event_identities",
+        "source_observed_at",
+        "timestamp with time zone",
+        false,
+    ),
+    ("source_event_identities", "source_router", "text", false),
+    ("source_event_identities", "source_factory", "text", false),
+    ("source_event_identities", "source_pool", "text", false),
+    (
+        "source_event_identities",
+        "source_pool_path",
+        "jsonb",
+        false,
+    ),
+    (
+        "source_event_identities",
+        "source_token_path",
+        "jsonb",
+        false,
+    ),
+    (
+        "source_event_identities",
+        "source_encoded_token_path",
+        "text",
+        false,
+    ),
+    ("source_event_identities", "source_fee_path", "jsonb", false),
+    ("source_event_identities", "source_direction", "text", false),
+    (
+        "source_event_identities",
+        "source_input_amount",
+        "numeric",
+        false,
+    ),
+    (
+        "source_event_identities",
+        "decoded_commands",
+        "jsonb",
+        false,
+    ),
+    (
+        "source_event_identities",
+        "unavailable_reason",
+        "text",
+        false,
+    ),
+    (
+        "source_event_identities",
+        "source_identity_hash",
+        "text",
+        false,
+    ),
+    (
+        "source_event_identities",
+        "recorded_at",
+        "timestamp with time zone",
+        false,
+    ),
+    ("source_block_enrichments", "enrichment_hash", "text", false),
+    (
+        "source_block_enrichments",
+        "source_event_identity",
+        "text",
+        false,
+    ),
+    (
+        "source_block_enrichments",
+        "source_identity_hash",
+        "text",
+        false,
+    ),
+    (
+        "source_block_enrichments",
+        "source_chain_id",
+        "bigint",
+        false,
+    ),
+    (
+        "source_block_enrichments",
+        "source_transaction_hash",
+        "text",
+        false,
+    ),
+    (
+        "source_block_enrichments",
+        "source_block_number",
+        "numeric",
+        false,
+    ),
+    (
+        "source_block_enrichments",
+        "source_block_hash",
+        "text",
+        false,
+    ),
+    (
+        "source_block_enrichments",
+        "source_transaction_index",
+        "numeric",
+        false,
+    ),
+    (
+        "source_block_enrichments",
+        "source_event_index",
+        "numeric",
+        true,
+    ),
+    (
+        "source_block_enrichments",
+        "source_pool_addresses",
+        "jsonb",
+        false,
+    ),
+    (
+        "source_block_enrichments",
+        "transaction_status",
+        "text",
+        false,
+    ),
+    ("source_block_enrichments", "provider_id", "text", false),
+    (
+        "source_block_enrichments",
+        "provider_response_hash",
+        "text",
+        false,
+    ),
+    (
+        "source_block_enrichments",
+        "enriched_at",
+        "timestamp with time zone",
+        false,
+    ),
+    ("source_enrichment_attempts", "id", "bigint", false),
+    (
+        "source_enrichment_attempts",
+        "source_event_identity",
+        "text",
+        false,
+    ),
+    (
+        "source_enrichment_attempts",
+        "attempt_number",
+        "integer",
+        false,
+    ),
+    ("source_enrichment_attempts", "result", "text", false),
+    ("source_enrichment_attempts", "failure_reason", "text", true),
+    (
+        "source_enrichment_attempts",
+        "attempted_at",
+        "timestamp with time zone",
+        false,
+    ),
+    (
+        "transaction_boundary_state_evidence",
+        "evidence_hash",
+        "text",
+        false,
+    ),
+    (
+        "transaction_boundary_state_evidence",
+        "source_event_identity",
+        "text",
+        false,
+    ),
+    (
+        "transaction_boundary_state_evidence",
+        "source_identity_hash",
+        "text",
+        false,
+    ),
+    (
+        "transaction_boundary_state_evidence",
+        "enrichment_hash",
+        "text",
+        false,
+    ),
+    (
+        "transaction_boundary_state_evidence",
+        "source_block_number",
+        "numeric",
+        false,
+    ),
+    (
+        "transaction_boundary_state_evidence",
+        "source_block_hash",
+        "text",
+        false,
+    ),
+    (
+        "transaction_boundary_state_evidence",
+        "source_transaction_hash",
+        "text",
+        false,
+    ),
+    (
+        "transaction_boundary_state_evidence",
+        "source_transaction_index",
+        "numeric",
+        false,
+    ),
+    (
+        "transaction_boundary_state_evidence",
+        "parent_block_number",
+        "numeric",
+        false,
+    ),
+    (
+        "transaction_boundary_state_evidence",
+        "parent_block_hash",
+        "text",
+        false,
+    ),
+    (
+        "transaction_boundary_state_evidence",
+        "reconstruction_method",
+        "text",
+        false,
+    ),
+    (
+        "transaction_boundary_state_evidence",
+        "prestate_hash",
+        "text",
+        true,
+    ),
+    (
+        "transaction_boundary_state_evidence",
+        "state_diff_hash",
+        "text",
+        true,
+    ),
+    (
+        "transaction_boundary_state_evidence",
+        "post_initiating_state_hash",
+        "text",
+        true,
+    ),
+    (
+        "transaction_boundary_state_evidence",
+        "completeness_status",
+        "text",
+        false,
+    ),
+    (
+        "transaction_boundary_state_evidence",
+        "failure_reason",
+        "text",
+        true,
+    ),
+    (
+        "transaction_boundary_state_evidence",
+        "provider_id",
+        "text",
+        false,
+    ),
+    (
+        "transaction_boundary_state_evidence",
+        "provider_response_hash",
+        "text",
+        false,
+    ),
+    (
+        "transaction_boundary_state_evidence",
+        "evidence",
+        "jsonb",
+        false,
+    ),
+    (
+        "transaction_boundary_state_evidence",
+        "reconstructed_at",
+        "timestamp with time zone",
+        false,
+    ),
 ];
 
 pub fn validate_schema_snapshot(snapshot: &SchemaSnapshot) -> Result<(), StoreError> {
@@ -1721,6 +2175,31 @@ pub fn validate_schema_snapshot(snapshot: &SchemaSnapshot) -> Result<(), StoreEr
         snapshot,
         "shadow_profitability_facts",
         &["shadow_decision_id"],
+    )?;
+    require_unique(
+        snapshot,
+        "source_event_identities",
+        &["source_event_identity"],
+    )?;
+    require_unique(
+        snapshot,
+        "source_event_identities",
+        &["source_identity_hash"],
+    )?;
+    require_unique(
+        snapshot,
+        "source_block_enrichments",
+        &["source_event_identity"],
+    )?;
+    require_unique(
+        snapshot,
+        "source_enrichment_attempts",
+        &["source_event_identity", "attempt_number"],
+    )?;
+    require_unique(
+        snapshot,
+        "transaction_boundary_state_evidence",
+        &["source_event_identity"],
     )?;
     require_index_fragment(
         snapshot,
@@ -1770,6 +2249,12 @@ pub fn validate_schema_snapshot(snapshot: &SchemaSnapshot) -> Result<(), StoreEr
         "retry_count>=0",
         "jsonb_typeofsecondary_rejection_reasons='array'::text",
         "jsonb_typeofrisk_flags='array'::text",
+        "source_block_numberisnull",
+        "source_feed_order_positionisnull",
+        "transaction_status='success'",
+        "prestate_hash~'^[0-9a-f]{64}$'",
+        "state_diff_hash~'^[0-9a-f]{64}$'",
+        "evidence->>'schema_version'",
     ] {
         if !checks.contains(required) {
             return Err(StoreError::Schema);
@@ -2350,6 +2835,32 @@ mod tests {
             .entry("shadow_profitability_facts".to_string())
             .or_default()
             .insert(vec!["shadow_decision_id".to_string()]);
+        snapshot
+            .unique_constraints
+            .entry("source_event_identities".to_string())
+            .or_default()
+            .extend([
+                vec!["source_event_identity".to_string()],
+                vec!["source_identity_hash".to_string()],
+            ]);
+        snapshot
+            .unique_constraints
+            .entry("source_block_enrichments".to_string())
+            .or_default()
+            .insert(vec!["source_event_identity".to_string()]);
+        snapshot
+            .unique_constraints
+            .entry("source_enrichment_attempts".to_string())
+            .or_default()
+            .insert(vec![
+                "source_event_identity".to_string(),
+                "attempt_number".to_string(),
+            ]);
+        snapshot
+            .unique_constraints
+            .entry("transaction_boundary_state_evidence".to_string())
+            .or_default()
+            .insert(vec!["source_event_identity".to_string()]);
         snapshot.check_constraints.insert(
             "shadow_engine_classifications".to_string(),
             vec![
@@ -2409,6 +2920,30 @@ mod tests {
                 "CHECK ((opportunity_expires_at > detected_at))".to_string(),
             ],
         );
+        snapshot.check_constraints.insert(
+            "source_event_identities".to_string(),
+            vec![
+                "CHECK ((source_block_number IS NULL))".to_string(),
+                "CHECK (((source_feed_order_position IS NULL) OR (source_feed_order_position IS NOT NULL)))"
+                    .to_string(),
+            ],
+        );
+        snapshot.check_constraints.insert(
+            "source_block_enrichments".to_string(),
+            vec![
+                "CHECK (((transaction_status = 'success') OR (transaction_status = 'reverted')))"
+                    .to_string(),
+            ],
+        );
+        snapshot.check_constraints.insert(
+            "transaction_boundary_state_evidence".to_string(),
+            vec![
+                "CHECK ((prestate_hash ~ '^[0-9a-f]{64}$'))".to_string(),
+                "CHECK ((state_diff_hash ~ '^[0-9a-f]{64}$'))".to_string(),
+                "CHECK ((evidence->>'schema_version' = 'phoenix.transaction-boundary-state.v1'))"
+                    .to_string(),
+            ],
+        );
         snapshot.indexes.insert(
             "shadow_decisions".to_string(),
             vec![
@@ -2446,6 +2981,39 @@ mod tests {
         }
     }
 
+    fn source_identity_for_record(record: &ClassificationRecord) -> SourceIdentity {
+        let token0 = "0x1111111111111111111111111111111111111111";
+        let token1 = "0x2222222222222222222222222222222222222222";
+        let mut identity = SourceIdentity {
+            schema_version: crate::source_identity::SOURCE_IDENTITY_SCHEMA_VERSION.to_string(),
+            source_event_identity: record.identity.source_event_identity.clone(),
+            source_chain_id: record.identity.chain_id,
+            source_transaction_hash: record.identity.tx_hash.clone(),
+            source_feed_sequence: record.identity.source_sequence,
+            source_feed_order_position: Some(0),
+            source_block_number: None,
+            source_block_hash: None,
+            source_transaction_index: None,
+            source_command_index: 0,
+            source_event_index: None,
+            source_observed_at_unix_ms: 1_700_000_000_000,
+            source_router: "0xe592427a0aece92de3edee1f18e0157c05861564".to_string(),
+            source_factory: crate::source_identity::UNISWAP_V3_FACTORY_ARBITRUM.to_string(),
+            source_pool: format!("{token0}:{token1}:500"),
+            source_pool_path: vec![format!("{token0}:{token1}:500")],
+            source_token_path: vec![token0.to_string(), token1.to_string()],
+            source_encoded_token_path: format!("{token0}0001f4{}", &token1[2..]),
+            source_fee_path: vec![500],
+            source_direction: "zero_for_one".to_string(),
+            source_input_amount: "100".to_string(),
+            decoded_commands: vec!["exactInputSingle".to_string()],
+            unavailable_reason: "awaiting_canonical_block_assignment".to_string(),
+            source_identity_hash: "0".repeat(64),
+        };
+        identity.source_identity_hash = identity.canonical_hash().unwrap();
+        identity
+    }
+
     #[test]
     fn exact_runtime_schema_contract_is_required() {
         assert_eq!(validate_schema_snapshot(&valid_snapshot()), Ok(()));
@@ -2467,6 +3035,23 @@ mod tests {
         let mut oversized = record();
         oversized.evidence = json!({"bounded": "x".repeat(MAX_EVIDENCE_BYTES)});
         assert_eq!(validate_record(&oversized), Err(StoreError::Integrity));
+    }
+
+    #[test]
+    fn source_identity_must_match_the_classification_transaction() {
+        let mut record = record();
+        record.evidence["source_identity"] =
+            serde_json::to_value(source_identity_for_record(&record)).unwrap();
+        assert!(validated_source_identity(&record).unwrap().is_some());
+
+        let mut wrong = source_identity_for_record(&record);
+        wrong.source_transaction_hash = format!("0x{}", "b".repeat(64));
+        wrong.source_identity_hash = wrong.canonical_hash().unwrap();
+        record.evidence["source_identity"] = serde_json::to_value(wrong).unwrap();
+        assert_eq!(
+            validated_source_identity(&record),
+            Err(StoreError::Integrity)
+        );
     }
 
     #[test]
@@ -2573,6 +3158,19 @@ mod tests {
             "recoverable_pnl_if_bottleneck_removed_wei",
         ] {
             assert!(economic_loss_migration.contains(required));
+        }
+        let source_identity_migration =
+            include_str!("../../migrations/014_exact_source_identity.sql");
+        for required in [
+            "CREATE TABLE IF NOT EXISTS source_event_identities",
+            "CREATE TABLE IF NOT EXISTS source_block_enrichments",
+            "CREATE TABLE IF NOT EXISTS source_enrichment_attempts",
+            "CREATE TABLE IF NOT EXISTS transaction_boundary_state_evidence",
+            "source_identity_unresolved_block_check",
+            "transaction_boundary_completeness_check",
+            "reject_exact_source_evidence_mutation",
+        ] {
+            assert!(source_identity_migration.contains(required));
         }
     }
 }

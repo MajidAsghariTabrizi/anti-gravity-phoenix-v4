@@ -6,9 +6,12 @@ import (
 	"encoding/json"
 	"errors"
 	"math/big"
+	"os"
 	"strings"
 	"testing"
+	"time"
 
+	"anti-gravity-phoenix-v4/feed-ingestor/internal/normalizer"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/crypto"
@@ -156,6 +159,9 @@ func TestDecodeBroadcastPayloadType03BatchContainsMultipleTransactions(t *testin
 	if frame.Transactions[0].Hash != first.Hash().Hex() || frame.Transactions[1].Hash != second.Hash().Hex() {
 		t.Fatalf("batch transaction order/hash mismatch: %+v", frame.Transactions)
 	}
+	if frame.Transactions[0].SourceFeedOrderPosition != 0 || frame.Transactions[1].SourceFeedOrderPosition != 1 {
+		t.Fatalf("batch transaction positions were not retained: %+v", frame.Transactions)
+	}
 	if frame.Sequence != 460530858 {
 		t.Fatalf("transactions lost shared feed sequence: %d", frame.Sequence)
 	}
@@ -187,6 +193,122 @@ func TestDecodeBroadcastBatchPreservesSupportedSiblingsAroundUnsupportedItem(t *
 	}
 	if len(report.UnsupportedKinds) != 1 || report.UnsupportedKinds[0] != (MessageKind{Layer: MessageLayerL2, Kind: 0x7f}) {
 		t.Fatalf("unsupported child lost structured kind evidence: %+v", report.UnsupportedKinds)
+	}
+}
+
+func TestExactSourceIdentityFixtureFromNestedNitroBatch(t *testing.T) {
+	chainID := new(big.Int).SetUint64(ArbitrumOneChainID)
+	first := signTestTransaction(t, types.NewTx(&types.LegacyTx{
+		Nonce:    40,
+		GasPrice: big.NewInt(100),
+		Gas:      21000,
+		To:       testDestination(),
+		Value:    big.NewInt(1),
+	}), chainID)
+	router := common.HexToAddress("0x68b3465833fb72a70ecdf485e0e4c7bd8665fc45")
+	second := signTestTransaction(t, types.NewTx(&types.DynamicFeeTx{
+		ChainID:   chainID,
+		Nonce:     41,
+		GasTipCap: big.NewInt(2),
+		GasFeeCap: big.NewInt(120),
+		Gas:       180000,
+		To:        &router,
+		Value:     big.NewInt(0),
+		Data:      router02ExactInputSingleFixture(),
+	}), chainID)
+
+	frame, report := decodeSingleFrame(t, l2BatchMessage(
+		signedTransactionMessage(t, first),
+		l2BatchMessage(signedTransactionMessage(t, second)),
+	))
+	if len(report.Unsupported) != 0 || len(report.Malformed) != 0 {
+		t.Fatalf("unexpected fixture decode issues: %+v", report)
+	}
+	if len(frame.Transactions) != 2 {
+		t.Fatalf("expected two decoded transactions, got %d", len(frame.Transactions))
+	}
+	target := frame.Transactions[1]
+	if target.Hash != second.Hash().Hex() || target.SourceFeedOrderPosition != 1 {
+		t.Fatalf("target transaction lost exact feed identity: %+v", target)
+	}
+	normalized, err := normalizer.Normalize(
+		frame.Sequence,
+		frame.TimestampUnixMS,
+		target,
+		time.Unix(1700000001, 123456789).UTC(),
+	)
+	if err != nil {
+		t.Fatalf("normalize exact source identity fixture: %v", err)
+	}
+	if normalized.SourceFeedOrderPosition != 1 || normalized.TxHash != strings.ToLower(second.Hash().Hex()) {
+		t.Fatalf("normalized fixture lost source identity: %+v", normalized)
+	}
+
+	output := os.Getenv("PHOENIX_SOURCE_IDENTITY_FIXTURE_OUTPUT")
+	if output == "" {
+		return
+	}
+	encoded, err := json.Marshal(normalized)
+	if err != nil {
+		t.Fatalf("encode exact source identity fixture: %v", err)
+	}
+	if err := os.WriteFile(output, encoded, 0o600); err != nil {
+		t.Fatalf("write exact source identity fixture: %v", err)
+	}
+}
+
+func TestDecodeBroadcastOrderPositionRetainsKnownUnsupportedTransactionSlot(t *testing.T) {
+	chainID := new(big.Int).SetUint64(ArbitrumOneChainID)
+	first := signTestTransaction(t, types.NewTx(&types.LegacyTx{
+		Nonce: 1, GasPrice: big.NewInt(100), Gas: 21000, To: testDestination(), Value: big.NewInt(1),
+	}), chainID)
+	second := signTestTransaction(t, types.NewTx(&types.LegacyTx{
+		Nonce: 2, GasPrice: big.NewInt(100), Gas: 21000, To: testDestination(), Value: big.NewInt(2),
+	}), chainID)
+	batch := l2BatchMessage(
+		signedTransactionMessage(t, first),
+		[]byte{L2MessageKindUnsignedUserTx},
+		signedTransactionMessage(t, second),
+	)
+
+	frame, report := decodeSingleFrame(t, batch)
+	if len(frame.Transactions) != 2 || len(report.Unsupported) != 1 {
+		t.Fatalf("unexpected transaction-slot decode: frame=%+v report=%+v", frame, report)
+	}
+	if frame.Transactions[0].SourceFeedOrderPosition != 0 || frame.Transactions[1].SourceFeedOrderPosition != 2 {
+		t.Fatalf("unsupported transaction slot was collapsed: %+v", frame.Transactions)
+	}
+}
+
+func TestDecodeBroadcastNestedBatchesAssignDistinctDeterministicFeedOrderPositions(t *testing.T) {
+	chainID := new(big.Int).SetUint64(ArbitrumOneChainID)
+	first := signTestTransaction(t, types.NewTx(&types.LegacyTx{
+		Nonce: 11, GasPrice: big.NewInt(100), Gas: 21000, To: testDestination(), Value: big.NewInt(1),
+	}), chainID)
+	second := signTestTransaction(t, types.NewTx(&types.LegacyTx{
+		Nonce: 12, GasPrice: big.NewInt(100), Gas: 21000, To: testDestination(), Value: big.NewInt(2),
+	}), chainID)
+	nested := l2BatchMessage(
+		l2BatchMessage(signedTransactionMessage(t, first)),
+		l2BatchMessage(l2BatchMessage(signedTransactionMessage(t, second))),
+	)
+
+	firstFrame, firstReport := decodeSingleFrame(t, nested)
+	secondFrame, secondReport := decodeSingleFrame(t, nested)
+	if len(firstReport.Unsupported)+len(firstReport.Malformed) != 0 ||
+		len(secondReport.Unsupported)+len(secondReport.Malformed) != 0 {
+		t.Fatalf("nested fixture unexpectedly failed: first=%+v second=%+v", firstReport, secondReport)
+	}
+	if len(firstFrame.Transactions) != 2 || len(secondFrame.Transactions) != 2 {
+		t.Fatalf("nested transactions were lost: first=%+v second=%+v", firstFrame, secondFrame)
+	}
+	if firstFrame.Transactions[0].SourceFeedOrderPosition != 0 ||
+		firstFrame.Transactions[1].SourceFeedOrderPosition != 1 {
+		t.Fatalf("nested transaction positions are not distinct: %+v", firstFrame.Transactions)
+	}
+	if firstFrame.Transactions[0].SourceFeedOrderPosition != secondFrame.Transactions[0].SourceFeedOrderPosition ||
+		firstFrame.Transactions[1].SourceFeedOrderPosition != secondFrame.Transactions[1].SourceFeedOrderPosition {
+		t.Fatalf("nested transaction positions are not deterministic: first=%+v second=%+v", firstFrame.Transactions, secondFrame.Transactions)
 	}
 }
 
@@ -269,7 +391,13 @@ func TestDecodeBroadcastContextPropagatesCancellation(t *testing.T) {
 }
 
 func TestDecodeL2MessageRejectsOversizedPayload(t *testing.T) {
-	result, err := decodeL2Message(context.Background(), make([]byte, MaxL2MessageSize+1), 0)
+	var nextOrderPosition uint64
+	result, err := decodeL2Message(
+		context.Background(),
+		make([]byte, MaxL2MessageSize+1),
+		0,
+		&nextOrderPosition,
+	)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -363,6 +491,25 @@ func l2BatchMessage(messages ...[]byte) []byte {
 		batch = append(batch, message...)
 	}
 	return batch
+}
+
+func router02ExactInputSingleFixture() []byte {
+	slotAddress := func(address string) string {
+		return strings.Repeat("0", 24) + strings.TrimPrefix(address, "0x")
+	}
+	slotUint := func(value string) string {
+		return strings.Repeat("0", 64-len(value)) + value
+	}
+	return common.FromHex(
+		"0x04e45aaf" +
+			slotAddress("0x82af49447d8a07e3bd95bd0d56f35241523fbab1") +
+			slotAddress("0xda10009cbd5d07dd0cecc66161fc93d7c9000da1") +
+			slotUint("1f4") +
+			slotAddress("0x2222222222222222222222222222222222222222") +
+			slotUint("186a0") +
+			slotUint("0") +
+			slotUint("0"),
+	)
 }
 
 func batchWithDeclaredLength(length uint64, payload []byte) []byte {

@@ -28,21 +28,47 @@ pub struct TransactionProvenance {
     pub source: String,
     pub feed_event_id: i64,
     pub recorded_at: String,
+    #[serde(default)]
+    pub source_feed_order_position: Option<u64>,
     pub source_block_number: Option<u64>,
     pub source_block_hash: Option<String>,
+    #[serde(default)]
+    pub source_transaction_index: Option<u64>,
+    #[serde(default)]
+    pub source_event_index: Option<u64>,
+    #[serde(default)]
+    pub source_identity_hash: Option<String>,
+    #[serde(default)]
+    pub source_pool_addresses: Vec<String>,
+    #[serde(default)]
+    pub transaction_status: Option<String>,
+    #[serde(default)]
+    pub transaction_boundary_completeness: Option<String>,
+    #[serde(default)]
+    pub post_initiating_state_hash: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 pub struct PositiveRouteSummary {
     pub transaction_hash: String,
     pub source_sequence: u64,
+    pub source_feed_order_position: Option<u64>,
     pub recorded_at: String,
     pub source_block_number: Option<u64>,
     pub source_block_hash: Option<String>,
+    pub source_transaction_index: Option<u64>,
+    pub source_event_index: Option<u64>,
+    pub source_identity_hash: Option<String>,
+    pub source_pool_addresses: Vec<String>,
+    pub transaction_status: Option<String>,
+    pub transaction_boundary_completeness: Option<String>,
+    pub post_initiating_state_hash: Option<String>,
     pub router_address: Option<String>,
     pub router_kind: Option<String>,
     pub selector: Option<String>,
     pub command_family: Vec<String>,
+    pub source_command_index: Option<u16>,
+    pub encoded_token_path: Option<String>,
     pub supported: bool,
     pub exact_input: Option<bool>,
     pub exact_output: bool,
@@ -150,17 +176,31 @@ pub fn analyze_stored_transaction(
         .map(str::to_string);
     let selector = bounded_selector(&input.normalized.calldata);
     let trusted_source = trusted_provenance(&stored.provenance);
+    let canonical_source = canonical_source_provenance(&stored.provenance);
 
     let mut summary = PositiveRouteSummary {
         transaction_hash: input.identity.tx_hash.clone(),
         source_sequence: input.identity.source_sequence,
+        source_feed_order_position: stored.provenance.source_feed_order_position,
         recorded_at: stored.provenance.recorded_at.clone(),
         source_block_number: stored.provenance.source_block_number,
         source_block_hash: stored.provenance.source_block_hash.clone(),
+        source_transaction_index: stored.provenance.source_transaction_index,
+        source_event_index: stored.provenance.source_event_index,
+        source_identity_hash: stored.provenance.source_identity_hash.clone(),
+        source_pool_addresses: stored.provenance.source_pool_addresses.clone(),
+        transaction_status: stored.provenance.transaction_status.clone(),
+        transaction_boundary_completeness: stored
+            .provenance
+            .transaction_boundary_completeness
+            .clone(),
+        post_initiating_state_hash: stored.provenance.post_initiating_state_hash.clone(),
         router_address,
         router_kind,
         selector,
         command_family: Vec::new(),
+        source_command_index: None,
+        encoded_token_path: None,
         supported: false,
         exact_input: None,
         exact_output: false,
@@ -190,6 +230,8 @@ pub fn analyze_stored_transaction(
                 .map(|leg| leg.pool_id.0.as_str())
                 .collect::<HashSet<_>>();
             summary.command_family = origin.decoded_commands;
+            summary.source_command_index = Some(origin.source_command_index);
+            summary.encoded_token_path = Some(origin.encoded_token_path);
             summary.supported = true;
             summary.exact_input = Some(origin.exact_in);
             summary.input_amount = Some(origin.amount.0.to_string());
@@ -198,11 +240,7 @@ pub fn analyze_stored_transaction(
                 .iter()
                 .map(|token| token.0.as_str().to_string())
                 .collect();
-            summary.decoded_fee_path = origin
-                .candidate_touched_pools
-                .iter()
-                .filter_map(|pool| pool.0.rsplit(':').next()?.parse().ok())
-                .collect();
+            summary.decoded_fee_path = origin.fee_path;
             summary.decoded_pool_ids = origin
                 .candidate_touched_pools
                 .iter()
@@ -227,7 +265,9 @@ pub fn analyze_stored_transaction(
             if summary.candidate_produced {
                 summary.route_match_result = "matched_configured_two_pool_route".to_string();
                 summary.rejection_detail_class = None;
-                summary.production_evidence = trusted_source;
+                summary.production_evidence = trusted_source
+                    && canonical_source
+                    && summary.source_pool_addresses.len() == summary.decoded_fee_path.len();
             } else {
                 summary.route_match_result = "decoded_but_irrelevant_pool".to_string();
                 summary.rejection_detail_class = Some("no_affected_two_pool_route".to_string());
@@ -284,6 +324,50 @@ fn trusted_provenance(provenance: &TransactionProvenance) -> bool {
         && provenance.feed_event_id > 0
         && (10..=64).contains(&provenance.recorded_at.len())
         && !provenance.recorded_at.chars().any(char::is_control)
+}
+
+fn canonical_source_provenance(provenance: &TransactionProvenance) -> bool {
+    provenance.source_feed_order_position.is_some()
+        && provenance
+            .source_block_number
+            .is_some_and(|number| number > 0)
+        && provenance
+            .source_block_hash
+            .as_deref()
+            .is_some_and(|hash| canonical_hex(hash, 32))
+        && provenance.source_transaction_index.is_some()
+        && provenance.source_event_index.is_some()
+        && provenance
+            .source_identity_hash
+            .as_deref()
+            .is_some_and(canonical_unprefixed_hash)
+        && provenance.transaction_status.as_deref() == Some("success")
+        && provenance.transaction_boundary_completeness.as_deref() == Some("complete")
+        && provenance
+            .post_initiating_state_hash
+            .as_deref()
+            .is_some_and(canonical_unprefixed_hash)
+        && !provenance.source_pool_addresses.is_empty()
+        && provenance.source_pool_addresses.len() <= 8
+        && provenance
+            .source_pool_addresses
+            .iter()
+            .all(|address| canonical_hex(address, 20))
+}
+
+fn canonical_hex(value: &str, byte_count: usize) -> bool {
+    value.len() == 2 + byte_count * 2
+        && value.starts_with("0x")
+        && value[2..]
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn canonical_unprefixed_hash(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 fn bounded_selector(calldata: &str) -> Option<String> {

@@ -13,6 +13,7 @@ for path in \
   compose.live-autonomous.yml \
   migrations/012_live_economic_truth.sql \
   migrations/013_economic_loss_ledger.sql \
+  migrations/014_exact_source_identity.sql \
   live-executor/schema/005_closed_loop_economic_control.sql \
   live-executor/src/economic_control.rs \
   live-executor/src/autonomous_live_control_main.rs \
@@ -59,6 +60,7 @@ monitor = read("scripts/economic-dashboard-loop.sh")
 dashboard_sql = read("scripts/sql/economic-dashboard-snapshot.sql")
 economic_truth = read("migrations/012_live_economic_truth.sql")
 economic_loss = read("migrations/013_economic_loss_ledger.sql")
+source_identity = read("migrations/014_exact_source_identity.sql")
 activation_runner = read("scripts/economic_activation_runner.py")
 activation_path = read("deploy/phoenix-economic-activation.path")
 activation_service = read("deploy/phoenix-economic-activation.service")
@@ -214,6 +216,22 @@ for cause in (
     "unknown",
 ):
     require(f"'{cause}'" in economic_loss, f"economic_loss_cause_missing:{cause}")
+for required in (
+    "CREATE TABLE IF NOT EXISTS source_event_identities",
+    "CREATE TABLE IF NOT EXISTS source_block_enrichments",
+    "CREATE TABLE IF NOT EXISTS source_enrichment_attempts",
+    "CREATE TABLE IF NOT EXISTS transaction_boundary_state_evidence",
+    "source_identity_unresolved_block_check",
+    "source_identity_event_hash_unique",
+    "source_block_identity_fk",
+    "source_block_status_evidence_check",
+    "transaction_boundary_enrichment_fk",
+    "transaction_boundary_completeness_check",
+    "prestate_hash",
+    "state_diff_hash",
+    "reject_exact_source_evidence_mutation",
+):
+    require(required in source_identity, f"source_identity_contract_missing:{required}")
 
 for required in (
     "autonomous-control migrate",
@@ -627,7 +645,8 @@ docker rm -f -v "$monitor_container" >/dev/null
 for pass in first idempotent; do
   for migration in \
     "$repo_root/migrations/012_live_economic_truth.sql" \
-    "$repo_root/migrations/013_economic_loss_ledger.sql"
+    "$repo_root/migrations/013_economic_loss_ledger.sql" \
+    "$repo_root/migrations/014_exact_source_identity.sql"
   do
     docker exec -i "$postgres_container" \
       psql -X -v ON_ERROR_STOP=1 -U phoenix_test -d phoenix_test \
@@ -650,6 +669,16 @@ upgraded_loss_views=$(
 )
 [ "$upgraded_loss_views" = t ] ||
   fail "migration 013 did not create the economic loss views"
+source_identity_tables=$(
+  docker exec "$postgres_container" \
+    psql -X -q -A -t -U phoenix_test -d phoenix_test \
+    -c "SELECT to_regclass('public.source_event_identities') IS NOT NULL
+             AND to_regclass('public.source_block_enrichments') IS NOT NULL
+             AND to_regclass('public.source_enrichment_attempts') IS NOT NULL
+             AND to_regclass('public.transaction_boundary_state_evidence') IS NOT NULL"
+)
+[ "$source_identity_tables" = t ] ||
+  fail "migration 014 did not create the exact source-evidence tables"
 {
   printf '%s\n' 'BEGIN TRANSACTION READ ONLY;'
   cat "$repo_root/scripts/sql/economic-dashboard-snapshot.sql"

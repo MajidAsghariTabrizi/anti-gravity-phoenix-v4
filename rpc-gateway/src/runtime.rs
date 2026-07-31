@@ -17,6 +17,10 @@ use crate::shadow_state::{
     ShadowStateRequest, ShadowStateResponse, VerificationStatus, ARBITRUM_ONE_CHAIN_ID,
     MAX_GATEWAY_RESPONSE_BYTES, SHADOW_STATE_SCHEMA_VERSION,
 };
+use crate::source_state::{
+    expected_uniswap_v3_pool_addresses, hash_json, SourceEvidenceRequest, SourceEvidenceResponse,
+    SOURCE_EVIDENCE_RESPONSE_SCHEMA,
+};
 use crate::transport::{JsonRpcClient, RpcCallResult, TransportError};
 use ethabi::{ParamType, Token};
 use primitive_types::U256;
@@ -46,6 +50,7 @@ const MAX_IN_FLIGHT_REQUESTS: usize = 64;
 const MAX_STATE_RESOLUTION: Duration = Duration::from_secs(25);
 const MAX_COALESCE_WAIT: Duration = Duration::from_secs(26);
 const HUNTER_STATE_CACHE_TTL: Duration = Duration::from_secs(5);
+const MAX_SOURCE_STATE_EVIDENCE_BYTES: usize = 512 * 1024;
 
 type SharedBundleResult = Option<Result<ProviderBundle, GatewayError>>;
 type SharedVerificationResult = Option<Result<VerificationEvidence, GatewayError>>;
@@ -234,6 +239,207 @@ impl GatewayRuntime {
 
     pub async fn probe(&self) -> Result<(), GatewayError> {
         self.refresh_head_shared(true).await.map(|_| ())
+    }
+
+    pub async fn resolve_source_evidence(
+        &self,
+        request: SourceEvidenceRequest,
+    ) -> Result<SourceEvidenceResponse, GatewayError> {
+        request
+            .validate()
+            .map_err(|_| GatewayError::InvalidRequest)?;
+        if !self.request_budget.lock().await.admit(Instant::now()) {
+            self.metrics.state_request_budget_rejected();
+            return Err(GatewayError::RequestBudgetExhausted);
+        }
+        let _operation_guard = self.upstream_operation_lock.lock().await;
+        let provider = self
+            .reserve_provider(&HashSet::new())
+            .await
+            .ok_or(GatewayError::ProviderUnavailable)?;
+        let required_calls = self.provider_setup_call_count(provider.provider_id()).await
+            + if request.state_reconstruction_required {
+                5
+            } else {
+                3
+            };
+        if !self.admit_upstream_sequence(required_calls).await {
+            return Err(GatewayError::UpstreamBudgetExhausted);
+        }
+        self.ensure_provider_verified(&provider)
+            .await
+            .map_err(map_call_failure)?;
+
+        let transaction = self
+            .upstream_call(
+                &provider,
+                RpcMethod::EthGetTransactionByHash,
+                json!([request.source_transaction_hash]),
+                ProviderSlot::Primary,
+                None,
+                false,
+            )
+            .await
+            .map_err(map_call_failure)?
+            .value;
+        let receipt = self
+            .upstream_call(
+                &provider,
+                RpcMethod::EthGetTransactionReceipt,
+                json!([request.source_transaction_hash]),
+                ProviderSlot::Primary,
+                None,
+                false,
+            )
+            .await
+            .map_err(map_call_failure)?
+            .value;
+        let block_number = required_quantity(&transaction, "blockNumber")?;
+        let block = self
+            .upstream_call(
+                &provider,
+                RpcMethod::EthGetBlockByNumber,
+                json!([format_quantity(block_number), false]),
+                ProviderSlot::Primary,
+                None,
+                false,
+            )
+            .await
+            .map_err(map_call_failure)?
+            .value;
+        let inclusion = verify_source_inclusion(&request, &transaction, &receipt, &block)?;
+        let block_number = inclusion.block_number;
+        let block_hash = inclusion.block_hash;
+        let transaction_index = inclusion.transaction_index;
+        let parent_block_number = inclusion.parent_block_number;
+        let parent_block_hash = inclusion.parent_block_hash;
+        let status = inclusion.transaction_status;
+        let source_event_index = inclusion.source_event_index;
+        let source_pool_addresses = inclusion.source_pool_addresses;
+        let provider_response_hash = hash_json(&json!({
+            "transaction": transaction,
+            "receipt": receipt,
+            "block": block
+        }))
+        .map_err(|_| GatewayError::ProviderIntegrity)?;
+
+        let (method, post_state_hash, completeness, failure_reason, state_evidence) =
+            if request.state_reconstruction_required {
+                let prestate_trace = self
+                    .upstream_call(
+                        &provider,
+                        RpcMethod::DebugTraceTransaction,
+                        json!([
+                            request.source_transaction_hash,
+                            {
+                                "tracer": "prestateTracer",
+                                "tracerConfig": {"disableCode": true}
+                            }
+                        ]),
+                        ProviderSlot::Primary,
+                        None,
+                        false,
+                    )
+                    .await;
+                let diff_trace = self
+                    .upstream_call(
+                        &provider,
+                        RpcMethod::DebugTraceTransaction,
+                        json!([
+                            request.source_transaction_hash,
+                            {
+                                "tracer": "prestateTracer",
+                                "tracerConfig": {"diffMode": true, "disableCode": true}
+                            }
+                        ]),
+                        ProviderSlot::Primary,
+                        None,
+                        false,
+                    )
+                    .await;
+                source_trace_evidence(
+                    prestate_trace,
+                    diff_trace,
+                    &source_pool_addresses,
+                    SourceTraceContext {
+                        request: &request,
+                        block_number,
+                        block_hash: &block_hash,
+                        transaction_index,
+                        parent_block_number,
+                        parent_block_hash: &parent_block_hash,
+                    },
+                )?
+            } else {
+                (
+                    "unavailable".to_string(),
+                    None,
+                    "incomplete".to_string(),
+                    Some("state_reconstruction_not_selected".to_string()),
+                    json!({
+                        "schema_version": "phoenix.transaction-boundary-state.v1",
+                        "complete": false,
+                        "failure_reason": "state_reconstruction_not_selected",
+                        "source_transaction_hash": request.source_transaction_hash,
+                        "source_block_number": block_number,
+                        "source_block_hash": block_hash,
+                        "source_transaction_index": transaction_index,
+                        "source_feed_sequence": request.source_feed_sequence,
+                        "source_feed_order_position": request.source_feed_order_position,
+                        "source_command_index": request.source_command_index,
+                        "parent_block_number": parent_block_number,
+                        "parent_block_hash": parent_block_hash,
+                        "source_factory": request.source_factory,
+                        "source_pool_path": request.source_pool_path,
+                        "source_token_path": request.source_token_path,
+                        "source_encoded_token_path": request.source_encoded_token_path,
+                        "source_fee_path": request.source_fee_path,
+                        "source_pool_addresses": source_pool_addresses
+                    }),
+                )
+            };
+
+        let mut response = SourceEvidenceResponse {
+            schema_version: SOURCE_EVIDENCE_RESPONSE_SCHEMA.to_string(),
+            source_event_identity: request.source_event_identity.clone(),
+            source_identity_hash: request.source_identity_hash.clone(),
+            source_chain_id: 42161,
+            source_transaction_hash: request.source_transaction_hash.clone(),
+            source_feed_sequence: request.source_feed_sequence,
+            source_feed_order_position: request.source_feed_order_position,
+            source_command_index: request.source_command_index,
+            source_pool_path: request.source_pool_path.clone(),
+            source_token_path: request.source_token_path.clone(),
+            source_encoded_token_path: request.source_encoded_token_path.clone(),
+            source_fee_path: request.source_fee_path.clone(),
+            source_block_number: block_number,
+            source_block_hash: block_hash,
+            source_transaction_index: transaction_index,
+            source_event_index,
+            source_pool_addresses,
+            transaction_status: status.to_string(),
+            parent_block_number,
+            parent_block_hash,
+            provider_id: provider.provider_id().to_string(),
+            provider_response_hash,
+            enrichment_hash: "0".repeat(64),
+            reconstruction_method: method,
+            post_initiating_state_hash: post_state_hash,
+            completeness_status: completeness,
+            failure_reason,
+            state_evidence,
+            evidence_hash: "0".repeat(64),
+        };
+        response.enrichment_hash = response
+            .canonical_enrichment_hash()
+            .map_err(|_| GatewayError::ProviderIntegrity)?;
+        response.evidence_hash = response
+            .canonical_evidence_hash()
+            .map_err(|_| GatewayError::ProviderIntegrity)?;
+        response
+            .validate(&request)
+            .map_err(|_| GatewayError::ProviderIntegrity)?;
+        Ok(response)
     }
 
     pub async fn resolve_shadow_state(
@@ -1874,6 +2080,399 @@ fn format_quantity(value: u64) -> String {
     format!("0x{value:x}")
 }
 
+fn required_quantity(value: &Value, field: &str) -> Result<u64, GatewayError> {
+    let encoded = value
+        .get(field)
+        .and_then(Value::as_str)
+        .and_then(|value| value.strip_prefix("0x"))
+        .filter(|value| !value.is_empty() && value.len() <= 16)
+        .ok_or(GatewayError::ProviderIntegrity)?;
+    u64::from_str_radix(encoded, 16).map_err(|_| GatewayError::ProviderIntegrity)
+}
+
+fn required_lower_hex(value: &Value, field: &str, bytes: usize) -> Result<String, GatewayError> {
+    let encoded = value
+        .get(field)
+        .and_then(Value::as_str)
+        .ok_or(GatewayError::ProviderIntegrity)?;
+    if encoded.len() != 2 + bytes * 2
+        || !encoded.starts_with("0x")
+        || encoded[2..]
+            .bytes()
+            .any(|byte| !byte.is_ascii_digit() && !(b'a'..=b'f').contains(&byte))
+    {
+        return Err(GatewayError::ProviderIntegrity);
+    }
+    Ok(encoded.to_string())
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct VerifiedSourceInclusion {
+    block_number: u64,
+    block_hash: String,
+    transaction_index: u64,
+    parent_block_number: u64,
+    parent_block_hash: String,
+    transaction_status: &'static str,
+    source_event_index: Option<u64>,
+    source_pool_addresses: Vec<String>,
+}
+
+fn verify_source_inclusion(
+    request: &SourceEvidenceRequest,
+    transaction: &Value,
+    receipt: &Value,
+    block: &Value,
+) -> Result<VerifiedSourceInclusion, GatewayError> {
+    let block_number = required_quantity(transaction, "blockNumber")?;
+    let block_hash = required_lower_hex(transaction, "blockHash", 32)?;
+    let transaction_index = required_quantity(transaction, "transactionIndex")?;
+    if required_lower_hex(transaction, "hash", 32)? != request.source_transaction_hash
+        || required_lower_hex(transaction, "to", 20)? != request.source_router
+        || required_lower_hex(receipt, "transactionHash", 32)? != request.source_transaction_hash
+        || required_quantity(receipt, "blockNumber")? != block_number
+        || required_lower_hex(receipt, "blockHash", 32)? != block_hash
+        || required_quantity(receipt, "transactionIndex")? != transaction_index
+        || required_quantity(block, "number")? != block_number
+        || required_lower_hex(block, "hash", 32)? != block_hash
+    {
+        return Err(GatewayError::ProviderIntegrity);
+    }
+    let transactions = block
+        .get("transactions")
+        .and_then(Value::as_array)
+        .ok_or(GatewayError::ProviderIntegrity)?;
+    if transactions
+        .get(usize::try_from(transaction_index).map_err(|_| GatewayError::ProviderIntegrity)?)
+        .and_then(Value::as_str)
+        != Some(request.source_transaction_hash.as_str())
+    {
+        return Err(GatewayError::ProviderIntegrity);
+    }
+    let transaction_status = match required_quantity(receipt, "status")? {
+        1 => "success",
+        0 => "reverted",
+        _ => return Err(GatewayError::ProviderIntegrity),
+    };
+    let expected_pool_addresses = expected_uniswap_v3_pool_addresses(
+        &request.source_factory,
+        &request.source_token_path,
+        &request.source_fee_path,
+    )
+    .map_err(|_| GatewayError::InvalidRequest)?;
+    let (source_event_index, source_pool_addresses) =
+        source_swap_logs(receipt, transaction_status, &expected_pool_addresses)?;
+    Ok(VerifiedSourceInclusion {
+        block_number,
+        block_hash,
+        transaction_index,
+        parent_block_number: block_number
+            .checked_sub(1)
+            .ok_or(GatewayError::ProviderIntegrity)?,
+        parent_block_hash: required_lower_hex(block, "parentHash", 32)?,
+        transaction_status,
+        source_event_index,
+        source_pool_addresses,
+    })
+}
+
+fn source_swap_logs(
+    receipt: &Value,
+    transaction_status: &str,
+    expected_pool_addresses: &[String],
+) -> Result<(Option<u64>, Vec<String>), GatewayError> {
+    let swap_topic = format!(
+        "0x{}",
+        hex::encode(ethabi::long_signature(
+            "Swap",
+            &[
+                ParamType::Address,
+                ParamType::Address,
+                ParamType::Int(256),
+                ParamType::Int(256),
+                ParamType::Uint(160),
+                ParamType::Uint(128),
+                ParamType::Int(24),
+            ],
+        ))
+    );
+    let logs = receipt
+        .get("logs")
+        .and_then(Value::as_array)
+        .ok_or(GatewayError::ProviderIntegrity)?;
+    let mut matches = Vec::new();
+    for log in logs {
+        let is_swap = log
+            .get("topics")
+            .and_then(Value::as_array)
+            .and_then(|topics| topics.first())
+            .and_then(Value::as_str)
+            == Some(swap_topic.as_str());
+        if !is_swap {
+            continue;
+        }
+        let address = required_lower_hex(log, "address", 20)?;
+        let index = required_quantity(log, "logIndex")?;
+        matches.push((index, address));
+    }
+    if matches.is_empty() {
+        return if transaction_status == "reverted" {
+            Ok((None, Vec::new()))
+        } else {
+            Err(GatewayError::ProviderIntegrity)
+        };
+    }
+    if transaction_status != "success" || matches.len() != expected_pool_addresses.len() {
+        return Err(GatewayError::ProviderIntegrity);
+    }
+    let selected = matches;
+    if selected.windows(2).any(|pair| pair[0].0 >= pair[1].0)
+        || selected
+            .iter()
+            .map(|(_, address)| address)
+            .ne(expected_pool_addresses.iter())
+    {
+        return Err(GatewayError::ProviderIntegrity);
+    }
+    Ok((
+        selected.first().map(|(index, _)| *index),
+        selected.into_iter().map(|(_, address)| address).collect(),
+    ))
+}
+
+type SourceTraceEvidence = (String, Option<String>, String, Option<String>, Value);
+
+#[derive(Clone, Copy)]
+struct SourceTraceContext<'a> {
+    request: &'a SourceEvidenceRequest,
+    block_number: u64,
+    block_hash: &'a str,
+    transaction_index: u64,
+    parent_block_number: u64,
+    parent_block_hash: &'a str,
+}
+
+fn source_trace_evidence(
+    prestate_trace: Result<RpcCallResult, CallFailure>,
+    diff_trace: Result<RpcCallResult, CallFailure>,
+    pool_addresses: &[String],
+    context: SourceTraceContext<'_>,
+) -> Result<SourceTraceEvidence, GatewayError> {
+    let unavailable = |reason: &str| {
+        Ok((
+            "unavailable".to_string(),
+            None,
+            "incomplete".to_string(),
+            Some(reason.to_string()),
+            json!({
+                "schema_version": "phoenix.transaction-boundary-state.v1",
+                "complete": false,
+                "failure_reason": reason,
+                "source_transaction_hash": context.request.source_transaction_hash,
+                "source_block_number": context.block_number,
+                "source_block_hash": context.block_hash,
+                "source_transaction_index": context.transaction_index,
+                "source_feed_sequence": context.request.source_feed_sequence,
+                "source_feed_order_position": context.request.source_feed_order_position,
+                "source_command_index": context.request.source_command_index,
+                "parent_block_number": context.parent_block_number,
+                "parent_block_hash": context.parent_block_hash,
+                "source_factory": context.request.source_factory,
+                "source_pool_path": context.request.source_pool_path,
+                "source_token_path": context.request.source_token_path,
+                "source_encoded_token_path": context.request.source_encoded_token_path,
+                "source_fee_path": context.request.source_fee_path,
+                "source_pool_addresses": pool_addresses
+            }),
+        ))
+    };
+    let prestate_trace = match prestate_trace {
+        Ok(value) => value,
+        Err(failure) => return unavailable(source_trace_failure_reason(failure)),
+    };
+    let diff_trace = match diff_trace {
+        Ok(value) => value,
+        Err(failure) => return unavailable(source_trace_failure_reason(failure)),
+    };
+    if pool_addresses.is_empty() {
+        return unavailable("source_pool_logs_unavailable");
+    }
+    let prestate_hash =
+        hash_json(&prestate_trace.value).map_err(|_| GatewayError::ProviderIntegrity)?;
+    let state_diff_hash =
+        hash_json(&diff_trace.value).map_err(|_| GatewayError::ProviderIntegrity)?;
+    let trace_response_hash = hash_json(&json!({
+        "prestate_hash": prestate_hash,
+        "state_diff_hash": state_diff_hash
+    }))
+    .map_err(|_| GatewayError::ProviderIntegrity)?;
+    let prestate = prestate_trace
+        .value
+        .as_object()
+        .ok_or(GatewayError::ProviderIntegrity)?;
+    let diff_pre = diff_trace
+        .value
+        .get("pre")
+        .and_then(Value::as_object)
+        .ok_or(GatewayError::ProviderIntegrity)?;
+    let diff_post = diff_trace
+        .value
+        .get("post")
+        .and_then(Value::as_object)
+        .ok_or(GatewayError::ProviderIntegrity)?;
+    let mut transitions = serde_json::Map::new();
+    for address in pool_addresses {
+        let Some(before) = prestate.get(address).cloned() else {
+            return unavailable("source_pool_trace_state_unavailable");
+        };
+        let changed_before = diff_pre.get(address).cloned().unwrap_or(Value::Null);
+        let changed_after = diff_post.get(address).cloned().unwrap_or(Value::Null);
+        if changed_before.is_null() && changed_after.is_null() {
+            return unavailable("source_pool_trace_diff_unavailable");
+        }
+        let Some(after) = apply_account_diff(&before, &changed_before, &changed_after) else {
+            return Err(GatewayError::ProviderIntegrity);
+        };
+        transitions.insert(
+            address.clone(),
+            json!({
+                "pre": before,
+                "post": after,
+                "diff_pre": changed_before,
+                "diff_post": changed_after
+            }),
+        );
+    }
+    let transitions = Value::Object(transitions);
+    let post_state_hash = hash_json(&json!({
+        "schema_version": "phoenix.post-initiating-state.v1",
+        "source_event_identity": context.request.source_event_identity,
+        "source_identity_hash": context.request.source_identity_hash,
+        "source_transaction_hash": context.request.source_transaction_hash,
+        "source_feed_sequence": context.request.source_feed_sequence,
+        "source_feed_order_position": context.request.source_feed_order_position,
+        "source_command_index": context.request.source_command_index,
+        "source_block_number": context.block_number,
+        "source_block_hash": context.block_hash,
+        "source_transaction_index": context.transaction_index,
+        "parent_block_number": context.parent_block_number,
+        "parent_block_hash": context.parent_block_hash,
+        "source_factory": context.request.source_factory,
+        "source_pool_path": context.request.source_pool_path,
+        "source_token_path": context.request.source_token_path,
+        "source_encoded_token_path": context.request.source_encoded_token_path,
+        "source_fee_path": context.request.source_fee_path,
+        "source_pool_addresses": pool_addresses,
+        "prestate_hash": prestate_hash,
+        "state_diff_hash": state_diff_hash,
+        "pool_state_transitions": transitions
+    }))
+    .map_err(|_| GatewayError::ProviderIntegrity)?;
+    let evidence = json!({
+        "schema_version": "phoenix.transaction-boundary-state.v1",
+        "complete": true,
+        "trace_response_hash": trace_response_hash,
+        "prestate_hash": prestate_hash,
+        "state_diff_hash": state_diff_hash,
+        "source_transaction_hash": context.request.source_transaction_hash,
+        "source_block_number": context.block_number,
+        "source_block_hash": context.block_hash,
+        "source_transaction_index": context.transaction_index,
+        "source_feed_sequence": context.request.source_feed_sequence,
+        "source_feed_order_position": context.request.source_feed_order_position,
+        "source_command_index": context.request.source_command_index,
+        "parent_block_number": context.parent_block_number,
+        "parent_block_hash": context.parent_block_hash,
+        "source_factory": context.request.source_factory,
+        "source_pool_path": context.request.source_pool_path,
+        "source_token_path": context.request.source_token_path,
+        "source_encoded_token_path": context.request.source_encoded_token_path,
+        "source_fee_path": context.request.source_fee_path,
+        "source_pool_addresses": pool_addresses,
+        "pool_state_transitions": transitions
+    });
+    if serde_json::to_vec(&evidence)
+        .map_err(|_| GatewayError::ProviderIntegrity)?
+        .len()
+        > MAX_SOURCE_STATE_EVIDENCE_BYTES
+    {
+        return unavailable("transaction_trace_evidence_oversized");
+    }
+    Ok((
+        "debug_trace_transaction_prestate_diff".to_string(),
+        Some(post_state_hash),
+        "complete".to_string(),
+        None,
+        evidence,
+    ))
+}
+
+fn source_trace_failure_reason(failure: CallFailure) -> &'static str {
+    match failure {
+        CallFailure::Budget => "transaction_trace_budget_unavailable",
+        CallFailure::Integrity => "transaction_trace_provider_integrity_failure",
+        CallFailure::Transport(TransportError::Timeout) => "transaction_trace_timeout",
+        CallFailure::Transport(TransportError::Oversized) => "transaction_trace_response_oversized",
+        CallFailure::Transport(TransportError::MethodUnsupported) => {
+            "transaction_trace_method_unsupported"
+        }
+        CallFailure::Transport(TransportError::HistoricalStateUnavailable) => {
+            "transaction_trace_historical_state_unavailable"
+        }
+        CallFailure::Transport(_) => "transaction_trace_provider_unavailable",
+    }
+}
+
+fn apply_account_diff(
+    before: &Value,
+    changed_before: &Value,
+    changed_after: &Value,
+) -> Option<Value> {
+    let mut after = before.as_object()?.clone();
+    let changed_before = changed_before.as_object()?;
+    let changed_after = changed_after.as_object()?;
+    let cleared_storage = changed_before
+        .get("storage")
+        .and_then(Value::as_object)
+        .into_iter()
+        .flat_map(|storage| storage.keys())
+        .filter(|slot| {
+            !changed_after
+                .get("storage")
+                .and_then(Value::as_object)
+                .is_some_and(|storage| storage.contains_key(*slot))
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    if !cleared_storage.is_empty() {
+        let storage = after.get_mut("storage")?.as_object_mut()?;
+        for slot in cleared_storage {
+            storage.remove(&slot);
+        }
+    }
+    for (field, value) in changed_after {
+        if field == "storage" {
+            let storage_changes = value.as_object()?;
+            let storage = after
+                .entry("storage".to_string())
+                .or_insert_with(|| Value::Object(serde_json::Map::new()))
+                .as_object_mut()?;
+            for (slot, slot_value) in storage_changes {
+                if slot_value.is_null() {
+                    storage.remove(slot);
+                } else {
+                    storage.insert(slot.clone(), slot_value.clone());
+                }
+            }
+        } else if value.is_null() {
+            after.remove(field);
+        } else {
+            after.insert(field.clone(), value.clone());
+        }
+    }
+    Some(Value::Object(after))
+}
+
 fn unix_time_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -2694,6 +3293,445 @@ mod tests {
         );
         assert_eq!(response.pools.len(), 2);
         server.await.unwrap();
+    }
+
+    fn source_evidence_request_fixture() -> SourceEvidenceRequest {
+        const WETH: &str = "0x82af49447d8a07e3bd95bd0d56f35241523fbab1";
+        const USDC: &str = "0xaf88d065e77c8cc2239327c5edb3a432268e5831";
+        SourceEvidenceRequest {
+            schema_version: crate::source_state::SOURCE_EVIDENCE_REQUEST_SCHEMA.to_string(),
+            source_event_identity: "source-event".to_string(),
+            source_identity_hash: "1".repeat(64),
+            source_transaction_hash: format!("0x{}", "2".repeat(64)),
+            source_router: "0x1111111111111111111111111111111111111111".to_string(),
+            source_factory: crate::source_state::UNISWAP_V3_FACTORY_ARBITRUM.to_string(),
+            source_feed_sequence: 7,
+            source_feed_order_position: 2,
+            source_command_index: 0,
+            source_pool_path: vec![format!("{WETH}:{USDC}:500")],
+            source_token_path: vec![WETH.to_string(), USDC.to_string()],
+            source_encoded_token_path: format!("{WETH}0001f4{}", &USDC[2..]),
+            source_fee_path: vec![500],
+            state_reconstruction_required: true,
+        }
+    }
+
+    fn source_receipt_fixture() -> Value {
+        let swap_topic = format!(
+            "0x{}",
+            hex::encode(ethabi::long_signature(
+                "Swap",
+                &[
+                    ParamType::Address,
+                    ParamType::Address,
+                    ParamType::Int(256),
+                    ParamType::Int(256),
+                    ParamType::Uint(160),
+                    ParamType::Uint(128),
+                    ParamType::Int(24),
+                ],
+            ))
+        );
+        json!({
+            "transactionHash": format!("0x{}", "2".repeat(64)),
+            "blockNumber": "0x64",
+            "blockHash": BLOCK_HASH,
+            "transactionIndex": "0x2",
+            "status": "0x1",
+            "logs": [{
+                "address": "0xc6962004f452be9203591991d15f6b388e09e8d0",
+                "logIndex": "0x7",
+                "topics": [swap_topic]
+            }]
+        })
+    }
+
+    fn source_transaction_fixture() -> Value {
+        json!({
+            "hash": format!("0x{}", "2".repeat(64)),
+            "to": "0x1111111111111111111111111111111111111111",
+            "blockNumber": "0x64",
+            "blockHash": BLOCK_HASH,
+            "transactionIndex": "0x2"
+        })
+    }
+
+    fn source_block_fixture() -> Value {
+        json!({
+            "number": "0x64",
+            "hash": BLOCK_HASH,
+            "parentHash": REORG_HASH,
+            "transactions": [
+                format!("0x{}", "8".repeat(64)),
+                format!("0x{}", "9".repeat(64)),
+                format!("0x{}", "2".repeat(64))
+            ]
+        })
+    }
+
+    #[test]
+    fn source_receipt_and_trace_bind_the_exact_transaction_boundary() {
+        const POOL_500: &str = "0xc6962004f452be9203591991d15f6b388e09e8d0";
+        let source_request = source_evidence_request_fixture();
+        let receipt = source_receipt_fixture();
+        assert_eq!(
+            source_swap_logs(&receipt, "success", &[POOL_500.to_string()]),
+            Ok((Some(7), vec![POOL_500.to_string()]))
+        );
+        assert!(verify_source_inclusion(
+            &source_request,
+            &source_transaction_fixture(),
+            &receipt,
+            &source_block_fixture()
+        )
+        .is_ok());
+        assert_eq!(
+            source_swap_logs(
+                &receipt,
+                "success",
+                &["0x2222222222222222222222222222222222222222".to_string()]
+            ),
+            Err(GatewayError::ProviderIntegrity)
+        );
+
+        let prestate_trace = RpcCallResult {
+            value: json!({
+                "0xc6962004f452be9203591991d15f6b388e09e8d0": {
+                    "storage": {"0x00": "0x01", "0x01": "0x03"}
+                }
+            }),
+            latency_ns: 1,
+        };
+        let diff_trace = RpcCallResult {
+            value: json!({
+                "pre": {
+                    "0xc6962004f452be9203591991d15f6b388e09e8d0": {
+                        "storage": {"0x00": "0x01"}
+                    }
+                },
+                "post": {
+                    "0xc6962004f452be9203591991d15f6b388e09e8d0": {
+                        "storage": {"0x00": "0x02"}
+                    }
+                }
+            }),
+            latency_ns: 1,
+        };
+        let complete = source_trace_evidence(
+            Ok(prestate_trace),
+            Ok(diff_trace),
+            &[POOL_500.to_string()],
+            SourceTraceContext {
+                request: &source_request,
+                block_number: 100,
+                block_hash: BLOCK_HASH,
+                transaction_index: 2,
+                parent_block_number: 99,
+                parent_block_hash: REORG_HASH,
+            },
+        )
+        .unwrap();
+        assert_eq!(complete.0, "debug_trace_transaction_prestate_diff");
+        assert!(complete.1.is_some());
+        assert_eq!(complete.2, "complete");
+        assert_eq!(complete.3, None);
+        assert_eq!(
+            complete.4["pool_state_transitions"][POOL_500]["post"]["storage"]["0x01"],
+            "0x03"
+        );
+
+        let unavailable = source_trace_evidence(
+            Err(CallFailure::Transport(TransportError::ProviderError)),
+            Err(CallFailure::Transport(TransportError::ProviderError)),
+            &[POOL_500.to_string()],
+            SourceTraceContext {
+                request: &source_request,
+                block_number: 100,
+                block_hash: BLOCK_HASH,
+                transaction_index: 2,
+                parent_block_number: 99,
+                parent_block_hash: REORG_HASH,
+            },
+        )
+        .unwrap();
+        assert_eq!(unavailable.0, "unavailable");
+        assert_eq!(
+            unavailable.3.as_deref(),
+            Some("transaction_trace_provider_unavailable")
+        );
+    }
+
+    #[test]
+    fn trace_diff_removes_cleared_storage_and_preserves_unchanged_storage() {
+        let reconstructed = apply_account_diff(
+            &json!({
+                "balance": "0x1",
+                "storage": {
+                    "0x00": "0x01",
+                    "0x01": "0x02",
+                    "0x02": "0x03"
+                }
+            }),
+            &json!({
+                "balance": "0x1",
+                "storage": {
+                    "0x00": "0x01",
+                    "0x01": "0x02"
+                }
+            }),
+            &json!({
+                "storage": {
+                    "0x00": "0x09"
+                }
+            }),
+        )
+        .expect("apply canonical prestate diff");
+        assert_eq!(reconstructed["storage"]["0x00"], "0x09");
+        assert!(reconstructed["storage"].get("0x01").is_none());
+        assert_eq!(reconstructed["storage"]["0x02"], "0x03");
+        assert_eq!(reconstructed["balance"], "0x1");
+    }
+
+    #[test]
+    fn source_inclusion_rejects_wrong_transaction_hash() {
+        let request = source_evidence_request_fixture();
+        let mut receipt = source_receipt_fixture();
+        receipt["transactionHash"] = json!(format!("0x{}", "3".repeat(64)));
+        assert_eq!(
+            verify_source_inclusion(
+                &request,
+                &source_transaction_fixture(),
+                &receipt,
+                &source_block_fixture()
+            ),
+            Err(GatewayError::ProviderIntegrity)
+        );
+    }
+
+    #[test]
+    fn source_inclusion_rejects_wrong_block_hash_and_mixed_block_state() {
+        let request = source_evidence_request_fixture();
+        let mut block = source_block_fixture();
+        block["hash"] = json!(NEXT_HASH);
+        assert_eq!(
+            verify_source_inclusion(
+                &request,
+                &source_transaction_fixture(),
+                &source_receipt_fixture(),
+                &block
+            ),
+            Err(GatewayError::ProviderIntegrity)
+        );
+    }
+
+    #[test]
+    fn source_inclusion_rejects_reordered_transaction() {
+        let request = source_evidence_request_fixture();
+        let mut block = source_block_fixture();
+        block["transactions"] = json!([
+            format!("0x{}", "8".repeat(64)),
+            format!("0x{}", "2".repeat(64)),
+            format!("0x{}", "9".repeat(64))
+        ]);
+        assert_eq!(
+            verify_source_inclusion(
+                &request,
+                &source_transaction_fixture(),
+                &source_receipt_fixture(),
+                &block
+            ),
+            Err(GatewayError::ProviderIntegrity)
+        );
+    }
+
+    #[test]
+    fn source_logs_reject_partial_or_reordered_touched_pool_evidence() {
+        const WETH: &str = "0x82af49447d8a07e3bd95bd0d56f35241523fbab1";
+        const USDC: &str = "0xaf88d065e77c8cc2239327c5edb3a432268e5831";
+        const POOL_500: &str = "0xc6962004f452be9203591991d15f6b388e09e8d0";
+        const POOL_3000: &str = "0xc473e2aee3441bf9240be85eb122abb059a3b57c";
+        let swap_topic = format!(
+            "0x{}",
+            hex::encode(ethabi::long_signature(
+                "Swap",
+                &[
+                    ParamType::Address,
+                    ParamType::Address,
+                    ParamType::Int(256),
+                    ParamType::Int(256),
+                    ParamType::Uint(160),
+                    ParamType::Uint(128),
+                    ParamType::Int(24),
+                ],
+            ))
+        );
+        let partial = json!({
+            "logs": [{
+                "address": POOL_500,
+                "logIndex": "0x7",
+                "topics": [swap_topic.clone()]
+            }]
+        });
+        let expected = vec![POOL_500.to_string(), POOL_3000.to_string()];
+        assert_eq!(
+            source_swap_logs(&partial, "success", &expected),
+            Err(GatewayError::ProviderIntegrity)
+        );
+        let reordered = json!({
+            "logs": [
+                {"address": POOL_3000, "logIndex": "0x7", "topics": [swap_topic.clone()]},
+                {"address": POOL_500, "logIndex": "0x8", "topics": [swap_topic.clone()]}
+            ]
+        });
+        assert_eq!(
+            source_swap_logs(&reordered, "success", &expected),
+            Err(GatewayError::ProviderIntegrity)
+        );
+        let non_monotonic = json!({
+            "logs": [
+                {"address": POOL_500, "logIndex": "0x8", "topics": [swap_topic.clone()]},
+                {"address": POOL_3000, "logIndex": "0x7", "topics": [swap_topic]}
+            ]
+        });
+        assert_eq!(
+            source_swap_logs(&non_monotonic, "success", &expected),
+            Err(GatewayError::ProviderIntegrity)
+        );
+        let request = SourceEvidenceRequest {
+            source_token_path: vec![WETH.to_string(), USDC.to_string(), WETH.to_string()],
+            source_fee_path: vec![500, 3000],
+            source_pool_path: vec![format!("{WETH}:{USDC}:500"), format!("{WETH}:{USDC}:3000")],
+            source_encoded_token_path: format!("{WETH}0001f4{}000bb8{}", &USDC[2..], &WETH[2..]),
+            ..source_evidence_request_fixture()
+        };
+        assert_eq!(request.validate(), Ok(()));
+    }
+
+    #[test]
+    fn partial_touched_pool_trace_evidence_is_incomplete() {
+        const WETH: &str = "0x82af49447d8a07e3bd95bd0d56f35241523fbab1";
+        const USDC: &str = "0xaf88d065e77c8cc2239327c5edb3a432268e5831";
+        const POOL_500: &str = "0xc6962004f452be9203591991d15f6b388e09e8d0";
+        const POOL_3000: &str = "0xc473e2aee3441bf9240be85eb122abb059a3b57c";
+        let request = SourceEvidenceRequest {
+            source_token_path: vec![WETH.to_string(), USDC.to_string(), WETH.to_string()],
+            source_fee_path: vec![500, 3000],
+            source_pool_path: vec![format!("{WETH}:{USDC}:500"), format!("{WETH}:{USDC}:3000")],
+            source_encoded_token_path: format!("{WETH}0001f4{}000bb8{}", &USDC[2..], &WETH[2..]),
+            ..source_evidence_request_fixture()
+        };
+        let evidence = source_trace_evidence(
+            Ok(RpcCallResult {
+                value: json!({
+                    POOL_500: {"storage": {"0x00": "0x01"}}
+                }),
+                latency_ns: 1,
+            }),
+            Ok(RpcCallResult {
+                value: json!({
+                    "pre": {POOL_500: {"storage": {"0x00": "0x01"}}},
+                    "post": {POOL_500: {"storage": {"0x00": "0x02"}}}
+                }),
+                latency_ns: 1,
+            }),
+            &[POOL_500.to_string(), POOL_3000.to_string()],
+            SourceTraceContext {
+                request: &request,
+                block_number: 100,
+                block_hash: BLOCK_HASH,
+                transaction_index: 2,
+                parent_block_number: 99,
+                parent_block_hash: REORG_HASH,
+            },
+        )
+        .unwrap();
+        assert_eq!(evidence.0, "unavailable");
+        assert_eq!(evidence.2, "incomplete");
+        assert_eq!(
+            evidence.3.as_deref(),
+            Some("source_pool_trace_state_unavailable")
+        );
+        assert_eq!(evidence.4["complete"], false);
+    }
+
+    #[test]
+    fn trace_capability_failures_remain_distinct_and_incomplete() {
+        const POOL_500: &str = "0xc6962004f452be9203591991d15f6b388e09e8d0";
+        let request = source_evidence_request_fixture();
+        let context = SourceTraceContext {
+            request: &request,
+            block_number: 100,
+            block_hash: BLOCK_HASH,
+            transaction_index: 2,
+            parent_block_number: 99,
+            parent_block_hash: REORG_HASH,
+        };
+        for (failure, expected) in [
+            (
+                TransportError::MethodUnsupported,
+                "transaction_trace_method_unsupported",
+            ),
+            (
+                TransportError::HistoricalStateUnavailable,
+                "transaction_trace_historical_state_unavailable",
+            ),
+            (TransportError::Timeout, "transaction_trace_timeout"),
+        ] {
+            let evidence = source_trace_evidence(
+                Err(CallFailure::Transport(failure)),
+                Err(CallFailure::Transport(failure)),
+                &[POOL_500.to_string()],
+                context,
+            )
+            .unwrap();
+            assert_eq!(evidence.0, "unavailable");
+            assert_eq!(evidence.2, "incomplete");
+            assert_eq!(evidence.3.as_deref(), Some(expected));
+            assert_eq!(evidence.4["complete"], false);
+        }
+    }
+
+    #[test]
+    fn oversized_trace_evidence_is_explicitly_incomplete() {
+        const POOL_500: &str = "0xc6962004f452be9203591991d15f6b388e09e8d0";
+        let request = source_evidence_request_fixture();
+        let mut storage = serde_json::Map::new();
+        for index in 0..8_000_u64 {
+            storage.insert(
+                format!("0x{index:064x}"),
+                Value::String(format!("0x{:064x}", index + 1)),
+            );
+        }
+        let prestate = RpcCallResult {
+            value: json!({POOL_500: {"storage": storage}}),
+            latency_ns: 1,
+        };
+        let diff = RpcCallResult {
+            value: json!({
+                "pre": {POOL_500: {"storage": {"0x00": "0x01"}}},
+                "post": {POOL_500: {"storage": {"0x00": "0x02"}}}
+            }),
+            latency_ns: 1,
+        };
+        let evidence = source_trace_evidence(
+            Ok(prestate),
+            Ok(diff),
+            &[POOL_500.to_string()],
+            SourceTraceContext {
+                request: &request,
+                block_number: 100,
+                block_hash: BLOCK_HASH,
+                transaction_index: 2,
+                parent_block_number: 99,
+                parent_block_hash: REORG_HASH,
+            },
+        )
+        .unwrap();
+        assert_eq!(evidence.0, "unavailable");
+        assert_eq!(
+            evidence.3.as_deref(),
+            Some("transaction_trace_evidence_oversized")
+        );
     }
 
     #[test]

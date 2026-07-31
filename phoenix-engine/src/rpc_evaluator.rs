@@ -36,6 +36,7 @@ use rpc_gateway::shadow_state::{
     VerificationStatus as GatewayVerificationStatus, ARBITRUM_ONE_CHAIN_ID,
     MAX_GATEWAY_REQUEST_BYTES, MAX_GATEWAY_RESPONSE_BYTES, SHADOW_STATE_SCHEMA_VERSION,
 };
+use rpc_gateway::source_state::{SourceEvidenceRequest, SourceEvidenceResponse};
 use serde::Serialize;
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -175,6 +176,7 @@ pub trait ShadowStateClient: Send + Sync {
 pub struct RpcGatewayClient {
     client: Client,
     state_endpoint: Url,
+    source_endpoint: Url,
     readiness_endpoint: Url,
 }
 
@@ -202,6 +204,9 @@ impl RpcGatewayClient {
         let state_endpoint = base
             .join("v1/shadow/state")
             .map_err(|_| GatewayClientError::Integrity)?;
+        let source_endpoint = base
+            .join("v1/source/evidence")
+            .map_err(|_| GatewayClientError::Integrity)?;
         let readiness_endpoint = base
             .join("readyz")
             .map_err(|_| GatewayClientError::Integrity)?;
@@ -215,8 +220,53 @@ impl RpcGatewayClient {
         Ok(Self {
             client,
             state_endpoint,
+            source_endpoint,
             readiness_endpoint,
         })
+    }
+
+    pub async fn fetch_source_evidence(
+        &self,
+        request: &SourceEvidenceRequest,
+    ) -> Result<SourceEvidenceResponse, GatewayClientError> {
+        request
+            .validate()
+            .map_err(|_| GatewayClientError::Integrity)?;
+        let encoded = serde_json::to_vec(request).map_err(|_| GatewayClientError::Integrity)?;
+        if encoded.len() > MAX_GATEWAY_REQUEST_BYTES {
+            return Err(GatewayClientError::Integrity);
+        }
+        let response = self
+            .client
+            .post(self.source_endpoint.clone())
+            .header("content-type", "application/json")
+            .body(encoded)
+            .send()
+            .await
+            .map_err(|_| GatewayClientError::Retryable)?;
+        let status = response.status();
+        let body = Self::bounded_body(response, MAX_GATEWAY_RESPONSE_BYTES).await?;
+        if status == StatusCode::OK {
+            let parsed: SourceEvidenceResponse =
+                serde_json::from_slice(&body).map_err(|_| GatewayClientError::Integrity)?;
+            parsed
+                .validate(request)
+                .map_err(|_| GatewayClientError::Integrity)?;
+            return Ok(parsed);
+        }
+        let failure: GatewayErrorResponse =
+            serde_json::from_slice(&body).map_err(|_| GatewayClientError::Integrity)?;
+        if failure.error_class.is_empty()
+            || failure.error_class.len() > 64
+            || failure.error_class.chars().any(char::is_control)
+        {
+            return Err(GatewayClientError::Integrity);
+        }
+        if failure.retryable && matches!(status.as_u16(), 429 | 503) {
+            Err(GatewayClientError::Retryable)
+        } else {
+            Err(GatewayClientError::Integrity)
+        }
     }
 
     async fn bounded_body(
@@ -2658,6 +2708,7 @@ mod tests {
             },
             normalized: NormalizedTx {
                 sequence: SequenceNumber(1),
+                source_feed_order_position: Some(0),
                 tx_hash: TxHash(format!("0x{}", "b".repeat(64))),
                 tx_type: "0x02".to_string(),
                 chain_id: ChainId(ARBITRUM_ONE_CHAIN_ID),
@@ -2682,7 +2733,10 @@ mod tests {
             origin_sequence: SequenceNumber(1),
             router: Address::parse("0x6666666666666666666666666666666666666666").unwrap(),
             decoded_commands: vec!["exactInputSingle".to_string()],
+            source_command_index: 0,
             swap_path: vec![token(TOKEN0), token(TOKEN1)],
+            encoded_token_path: format!("{TOKEN0}0001f4{}", &TOKEN1[2..]),
+            fee_path: vec![500],
             exact_in: true,
             amount: Amount(500),
             candidate_touched_pools: vec![PoolId("origin-pool".to_string())],

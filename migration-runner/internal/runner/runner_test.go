@@ -415,6 +415,7 @@ func runFreshV5DatabaseIntegration(t *testing.T, sanitized *url.URL) {
 		"011_money_path_selective_persistence",
 		"012_live_economic_truth",
 		"013_economic_loss_ledger",
+		"014_exact_source_identity",
 	}
 	loadedVersions := make([]string, 0, len(migrations))
 	for _, migration := range migrations {
@@ -460,15 +461,19 @@ func runFreshV5DatabaseIntegration(t *testing.T, sanitized *url.URL) {
 	}
 
 	requiredColumns := map[string][]string{
-		"origin_transactions":               {"tx_hash"},
-		"feed_events":                       {"sequence_number"},
-		"engine_outbox":                     {"outbox_id", "claim_owner", "claim_expires_at", "published_at"},
-		"shadow_engine_classifications":     {"source_event_identity"},
-		"shadow_decisions":                  {"execution_eligible"},
-		"money_path_ingress_daily":          {"event_count"},
-		"money_path_ingress_samples":        {"safe_decoder_summary"},
-		"shadow_profitability_facts":        {"shadow_decision_id", "execution_request_created"},
-		"shadow_engine_processing_attempts": {"source_event_identity"},
+		"origin_transactions":                 {"tx_hash"},
+		"feed_events":                         {"sequence_number"},
+		"engine_outbox":                       {"outbox_id", "claim_owner", "claim_expires_at", "published_at"},
+		"shadow_engine_classifications":       {"source_event_identity"},
+		"shadow_decisions":                    {"execution_eligible"},
+		"money_path_ingress_daily":            {"event_count"},
+		"money_path_ingress_samples":          {"safe_decoder_summary"},
+		"shadow_profitability_facts":          {"shadow_decision_id", "execution_request_created"},
+		"shadow_engine_processing_attempts":   {"source_event_identity"},
+		"source_event_identities":             {"source_event_identity", "source_feed_order_position", "source_identity_hash"},
+		"source_block_enrichments":            {"source_block_number", "source_transaction_index", "source_event_index"},
+		"source_enrichment_attempts":          {"source_event_identity", "attempt_number"},
+		"transaction_boundary_state_evidence": {"prestate_hash", "state_diff_hash", "post_initiating_state_hash", "completeness_status"},
 	}
 	for table, columns := range requiredColumns {
 		for _, column := range columns {
@@ -503,6 +508,10 @@ func runFreshV5DatabaseIntegration(t *testing.T, sanitized *url.URL) {
 		"fork_simulation_results",
 		"money_path_ingress_daily",
 		"money_path_ingress_samples",
+		"source_event_identities",
+		"source_block_enrichments",
+		"source_enrichment_attempts",
+		"transaction_boundary_state_evidence",
 		"execution_attempts",
 		"executions",
 		"realized_pnl",

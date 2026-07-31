@@ -212,10 +212,37 @@ pub async fn process_delivery(
         }
     }
 
-    let mut result = match decoded {
-        Ok(input) => processor.process(&input).await,
-        Err(failure) => decode_failure_result(failure.kind, failure.evidence),
+    let (mut result, source_identity) = match decoded {
+        Ok(input) => match processor.source_identity(&input) {
+            Ok(source_identity) => (processor.process(&input).await, source_identity),
+            Err(_) => (
+                ProcessResult::terminal(
+                    "source_identity_contract_invalid",
+                    0,
+                    json!({
+                        "origin_classification": "supported_swap_origin",
+                        "integrity_failure_class": "source_identity_contract_invalid"
+                    }),
+                ),
+                None,
+            ),
+        },
+        Err(failure) => (decode_failure_result(failure.kind, failure.evidence), None),
     };
+    if let Some(source_identity) = source_identity {
+        let Some(evidence) = result.evidence.as_object_mut() else {
+            return handle_store_failure(
+                delivery,
+                readiness,
+                metrics,
+                sampler,
+                "source_identity_evidence_failure",
+                StoreError::Integrity,
+            )
+            .await;
+        };
+        evidence.insert("source_identity".to_string(), json!(source_identity));
+    }
     if result.action == ProcessingAction::Retry && retry_policy.exhausted(delivery.delivery_count) {
         if result.classification == EngineClassification::TransientDependencyFailure {
             let first_failure = match store

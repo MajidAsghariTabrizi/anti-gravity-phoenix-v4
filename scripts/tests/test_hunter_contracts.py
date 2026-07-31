@@ -195,8 +195,8 @@ class HunterContractsTests(unittest.TestCase):
 
     def test_database_schema_is_additive_safe_and_service_owned(self) -> None:
         root_migrations = sorted(path.name for path in (ROOT / "migrations").glob("*.sql"))
-        self.assertEqual(root_migrations[-1], "013_economic_loss_ledger.sql")
-        self.assertEqual(len(root_migrations), 13)
+        self.assertEqual(root_migrations[-1], "014_exact_source_identity.sql")
+        self.assertEqual(len(root_migrations), 14)
         sql = (
             ROOT / "live-executor" / "schema" / "003_autonomous_hunter_contracts.sql"
         ).read_text(encoding="utf-8")

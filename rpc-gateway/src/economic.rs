@@ -32,6 +32,9 @@ pub enum RpcMethod {
     EthGetCode,
     EthGetLogs,
     EthGetStorageAt,
+    EthGetTransactionByHash,
+    EthGetTransactionReceipt,
+    DebugTraceTransaction,
 }
 
 impl RpcMethod {
@@ -44,6 +47,9 @@ impl RpcMethod {
             Self::EthGetCode => "eth_getCode",
             Self::EthGetLogs => "eth_getLogs",
             Self::EthGetStorageAt => "eth_getStorageAt",
+            Self::EthGetTransactionByHash => "eth_getTransactionByHash",
+            Self::EthGetTransactionReceipt => "eth_getTransactionReceipt",
+            Self::DebugTraceTransaction => "debug_traceTransaction",
         }
     }
 }
@@ -115,7 +121,10 @@ impl MethodTimeouts {
             | RpcMethod::EthGetBalance
             | RpcMethod::EthGetBlockByNumber
             | RpcMethod::EthGetCode
-            | RpcMethod::EthGetStorageAt => self.state_read,
+            | RpcMethod::EthGetStorageAt
+            | RpcMethod::EthGetTransactionByHash
+            | RpcMethod::EthGetTransactionReceipt
+            | RpcMethod::DebugTraceTransaction => self.state_read,
         }
     }
 }
