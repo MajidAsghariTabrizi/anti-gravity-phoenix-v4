@@ -19,6 +19,7 @@ use phoenix_engine::runtime::{
 };
 use phoenix_engine::runtime_state::RuntimeReadiness;
 use phoenix_engine::shadow_processor::{RouteRegistry, ShadowProcessor};
+use phoenix_engine::source_enrichment::run_source_enrichment;
 use phoenix_recorder::engine_stream::{
     ensure_engine_pipeline, EngineStreamError, ENGINE_DURABLE_NAME, ENGINE_STREAM_NAME,
 };
@@ -248,7 +249,7 @@ async fn run_daemon() -> Result<(), DaemonFailure> {
         signal_shutdown.cancel();
     });
     let rpc_monitor = tokio::spawn(monitor_rpc_gateway(
-        rpc_client,
+        rpc_client.clone(),
         readiness.clone(),
         sampler.clone(),
         shutdown.clone(),
@@ -267,6 +268,7 @@ async fn run_daemon() -> Result<(), DaemonFailure> {
     let store = connect_postgres_until_ready(&config, &readiness, &metrics, &sampler, &shutdown)
         .await
         .ok_or("Engine shutdown before PostgreSQL initialization")?;
+    let source_enrichment_store = store.clone();
     let store: Arc<dyn ShadowStore> = Arc::new(store);
     let processor = if config.autonomous_execution {
         let bounds = HunterBounds::default();
@@ -342,6 +344,12 @@ async fn run_daemon() -> Result<(), DaemonFailure> {
         store.clone(),
         readiness.clone(),
         metrics.clone(),
+        sampler.clone(),
+        shutdown.clone(),
+    ));
+    let source_enrichment = tokio::spawn(run_source_enrichment(
+        source_enrichment_store,
+        rpc_client,
         sampler.clone(),
         shutdown.clone(),
     ));
@@ -460,6 +468,7 @@ async fn run_daemon() -> Result<(), DaemonFailure> {
 
     shutdown.cancel();
     let _ = database_monitor.await;
+    let _ = source_enrichment.await;
     let _ = rpc_monitor.await;
     readiness.stop_event_loop();
     let _ = health_task.await;

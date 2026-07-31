@@ -104,6 +104,15 @@ Production rejects any configured fixture path and requires relay mode. Relay st
 
 The sequence number belongs to each Nitro `BroadcastFeedMessage`, not to a WebSocket frame or an individual transaction. One WebSocket broadcast may contain multiple feed messages. One feed message contains one L1 incoming message whose L2 payload may normalize to zero, one, or multiple transactions; sequence state advances exactly once for that feed message.
 
+`source_feed_order_position` is a separate zero-based position assigned by the
+adapter's deterministic preorder traversal of transaction-like L2 items within
+one feed message, including nested batches. Unsupported transaction-like items
+consume their position so supported siblings cannot collapse onto the same
+identity. This position is not a canonical L2 block number, transaction index,
+router command index, or receipt log index. Canonical block, transaction, and
+log identity is appended later only after RPC inclusion evidence verifies the
+mined transaction.
+
 Pinned Nitro `v3.11.2-3599aca` expects messages within one delivered batch to be contiguous. Its relay backlog can nevertheless discard older segments when an upstream jump occurs, and the official broadcast client advances its requested next sequence to every accepted feed message. Phoenix therefore records a received forward discontinuity once and advances its bounded local baseline instead of waiting indefinitely for messages the relay will not send later.
 
 The relay path uses this explicit state machine:
@@ -128,6 +137,8 @@ Relay mode reconnects to the local Nitro feed WebSocket with bounded exponential
 For supported Nitro Arbitrum unsigned transactions, the adapter derives:
 
 - `sequence` from the Nitro broadcast sequence number.
+- `source_feed_order_position` from deterministic transaction traversal within
+  that one broadcast feed message.
 - `timestamp_unix_ms` from the Nitro incoming message header timestamp.
 - `tx_hash` as Keccak-256 over the typed Arbitrum transaction payload.
 - `tx_type` as `0x65`.
@@ -136,6 +147,10 @@ For supported Nitro Arbitrum unsigned transactions, the adapter derives:
 - `raw_tx` from the original typed transaction bytes.
 
 If a field cannot be derived honestly from a supported payload, normalization fails and the transaction is not published.
+
+The incoming-message header timestamp is source observation time, not proof of
+an L2 block timestamp. Phoenix does not populate canonical L2 block identity
+from a feed sequence or timestamp.
 
 ## NATS Publishing
 

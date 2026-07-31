@@ -7,6 +7,7 @@ use phoenix_engine::positive_route_evidence::{
 use phoenix_engine::shadow_processor::RouteRegistry;
 use serde_json::Value;
 use sqlx::postgres::PgPoolOptions;
+use sqlx::types::Json;
 use sqlx::Row;
 use std::env;
 use std::fs::{File, OpenOptions};
@@ -227,10 +228,24 @@ FROM (
 SELECT feed.id,
        feed.payload,
        feed.recorded_at,
-       origin.metadata->>'block_number' AS source_block_number,
-       origin.metadata->>'block_hash' AS source_block_hash
+       identity.source_feed_order_position::text AS source_feed_order_position,
+       enrichment.source_block_number::text AS source_block_number,
+       enrichment.source_block_hash,
+       enrichment.source_transaction_index::text AS source_transaction_index,
+       enrichment.source_event_index::text AS source_event_index,
+       identity.source_identity_hash,
+       enrichment.source_pool_addresses,
+       enrichment.transaction_status,
+       state.completeness_status AS transaction_boundary_completeness,
+       state.post_initiating_state_hash
 FROM feed_events AS feed
-LEFT JOIN origin_transactions AS origin ON origin.tx_hash = feed.tx_hash
+LEFT JOIN source_event_identities AS identity
+  ON identity.source_transaction_hash = feed.tx_hash
+ AND identity.source_feed_sequence = feed.sequence_number
+LEFT JOIN source_block_enrichments AS enrichment
+  ON enrichment.source_event_identity = identity.source_event_identity
+LEFT JOIN transaction_boundary_state_evidence AS state
+  ON state.source_event_identity = identity.source_event_identity
 WHERE lower(feed.payload->>'to') IN ($1, $2, $3)
   AND ($4::text IS NULL OR feed.tx_hash = $4)
   AND ($5::numeric IS NULL OR feed.sequence_number = $5::numeric)
@@ -261,13 +276,36 @@ LIMIT $6
         let block_hash = row
             .try_get::<Option<String>, _>("source_block_hash")
             .map_err(|_| CliError::DatabaseQuery)?;
+        let source_feed_order_position = optional_u64(&row, "source_feed_order_position")?;
+        let source_transaction_index = optional_u64(&row, "source_transaction_index")?;
+        let source_event_index = optional_u64(&row, "source_event_index")?;
         let stored = StoredTransactionEvidence {
             provenance: TransactionProvenance {
                 source: POSTGRES_FEED_EVENT_SOURCE.to_string(),
                 feed_event_id,
                 recorded_at: recorded_at.to_rfc3339_opts(SecondsFormat::Nanos, true),
+                source_feed_order_position,
                 source_block_number: block_number,
                 source_block_hash: block_hash,
+                source_transaction_index,
+                source_event_index,
+                source_identity_hash: row
+                    .try_get("source_identity_hash")
+                    .map_err(|_| CliError::DatabaseQuery)?,
+                source_pool_addresses: row
+                    .try_get::<Option<Json<Vec<String>>>, _>("source_pool_addresses")
+                    .map_err(|_| CliError::DatabaseQuery)?
+                    .map(|Json(value)| value)
+                    .unwrap_or_default(),
+                transaction_status: row
+                    .try_get("transaction_status")
+                    .map_err(|_| CliError::DatabaseQuery)?,
+                transaction_boundary_completeness: row
+                    .try_get("transaction_boundary_completeness")
+                    .map_err(|_| CliError::DatabaseQuery)?,
+                post_initiating_state_hash: row
+                    .try_get("post_initiating_state_hash")
+                    .map_err(|_| CliError::DatabaseQuery)?,
             },
             payload,
         };
@@ -288,6 +326,13 @@ LIMIT $6
         .await
         .map_err(|_| CliError::DatabaseQuery)?;
     report_statistics(&statistics)
+}
+
+fn optional_u64(row: &sqlx::postgres::PgRow, field: &str) -> Result<Option<u64>, CliError> {
+    row.try_get::<Option<String>, _>(field)
+        .map_err(|_| CliError::DatabaseQuery)?
+        .map(|value| value.parse().map_err(|_| CliError::DatabaseQuery))
+        .transpose()
 }
 
 fn replay_jsonl(options: &Options, routes: &RouteRegistry) -> Result<(), CliError> {

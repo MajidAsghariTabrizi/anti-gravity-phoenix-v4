@@ -225,7 +225,8 @@ func decodeFeedMessage(ctx context.Context, feedMessage *BroadcastFeedMessage) (
 		return frame, nil
 	}
 
-	result, err := decodeL2Message(ctx, incoming.L2msg, 0)
+	var nextOrderPosition uint64
+	result, err := decodeL2Message(ctx, incoming.L2msg, 0, &nextOrderPosition)
 	if err != nil {
 		return Frame{}, err
 	}
@@ -238,7 +239,12 @@ func decodeFeedMessage(ctx context.Context, feedMessage *BroadcastFeedMessage) (
 	return frame, nil
 }
 
-func decodeL2Message(ctx context.Context, raw []byte, depth int) (l2DecodeResult, error) {
+func decodeL2Message(
+	ctx context.Context,
+	raw []byte,
+	depth int,
+	nextOrderPosition *uint64,
+) (l2DecodeResult, error) {
 	if err := ctx.Err(); err != nil {
 		return l2DecodeResult{}, err
 	}
@@ -251,10 +257,13 @@ func decodeL2Message(ctx context.Context, raw []byte, depth int) (l2DecodeResult
 
 	switch raw[0] {
 	case L2MessageKindBatch:
-		return decodeL2Batch(ctx, raw[1:], depth)
+		return decodeL2Batch(ctx, raw[1:], depth, nextOrderPosition)
 	case L2MessageKindSignedTx:
+		orderPosition := *nextOrderPosition
+		*nextOrderPosition = *nextOrderPosition + 1
 		tx, class, err := decodeSignedEthereumTx(raw[1:])
 		if err == nil {
+			tx.SourceFeedOrderPosition = orderPosition
 			return l2DecodeResult{transactions: []normalizer.RelayTx{tx}}, nil
 		}
 		if class == issueUnsupported {
@@ -273,6 +282,7 @@ func decodeL2Message(ctx context.Context, raw []byte, depth int) (l2DecodeResult
 		L2MessageKindContractTx,
 		L2MessageKindNonmutatingCall,
 		L2MessageKindSignedCompressed:
+		*nextOrderPosition = *nextOrderPosition + 1
 		return l2DecodeResult{
 			unsupported:      []string{fmt.Sprintf("unsupported L2 message kind 0x%02x", raw[0])},
 			unsupportedKinds: []MessageKind{{Layer: MessageLayerL2, Kind: raw[0]}},
@@ -285,7 +295,12 @@ func decodeL2Message(ctx context.Context, raw []byte, depth int) (l2DecodeResult
 	}
 }
 
-func decodeL2Batch(ctx context.Context, payload []byte, depth int) (l2DecodeResult, error) {
+func decodeL2Batch(
+	ctx context.Context,
+	payload []byte,
+	depth int,
+	nextOrderPosition *uint64,
+) (l2DecodeResult, error) {
 	if depth >= MaxL2BatchDepth {
 		return l2DecodeResult{malformed: []string{fmt.Sprintf("L2 message batches exceed max depth %d", MaxL2BatchDepth)}}, nil
 	}
@@ -305,7 +320,7 @@ func decodeL2Batch(ctx context.Context, payload []byte, depth int) (l2DecodeResu
 		if err := ctx.Err(); err != nil {
 			return l2DecodeResult{}, err
 		}
-		nestedResult, err := decodeL2Message(ctx, nestedMessage, depth+1)
+		nestedResult, err := decodeL2Message(ctx, nestedMessage, depth+1, nextOrderPosition)
 		if err != nil {
 			return l2DecodeResult{}, err
 		}

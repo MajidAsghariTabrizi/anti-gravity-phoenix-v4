@@ -11,37 +11,39 @@ import (
 const SchemaVersion = "phoenix.v4.normalized_tx.v1"
 
 type RelayTx struct {
-	Hash                 string `json:"hash"`
-	Type                 string `json:"type"`
-	ChainID              uint64 `json:"chain_id"`
-	From                 string `json:"from"`
-	To                   string `json:"to"`
-	Nonce                uint64 `json:"nonce"`
-	Value                string `json:"value"`
-	Calldata             string `json:"calldata"`
-	GasLimit             string `json:"gas_limit"`
-	MaxFeePerGas         string `json:"max_fee_per_gas"`
-	MaxPriorityFeePerGas string `json:"max_priority_fee_per_gas"`
-	RawTx                string `json:"raw_tx"`
+	Hash                    string `json:"hash"`
+	SourceFeedOrderPosition uint64 `json:"source_feed_order_position"`
+	Type                    string `json:"type"`
+	ChainID                 uint64 `json:"chain_id"`
+	From                    string `json:"from"`
+	To                      string `json:"to"`
+	Nonce                   uint64 `json:"nonce"`
+	Value                   string `json:"value"`
+	Calldata                string `json:"calldata"`
+	GasLimit                string `json:"gas_limit"`
+	MaxFeePerGas            string `json:"max_fee_per_gas"`
+	MaxPriorityFeePerGas    string `json:"max_priority_fee_per_gas"`
+	RawTx                   string `json:"raw_tx"`
 }
 
 type NormalizedTx struct {
-	SchemaVersion        string `json:"schema_version"`
-	Sequence             uint64 `json:"sequence"`
-	TimestampUnixMS      uint64 `json:"timestamp_unix_ms"`
-	TxHash               string `json:"tx_hash"`
-	TxType               string `json:"tx_type"`
-	ChainID              uint64 `json:"chain_id"`
-	From                 string `json:"from"`
-	To                   string `json:"to"`
-	Nonce                uint64 `json:"nonce"`
-	Value                string `json:"value"`
-	Calldata             string `json:"calldata"`
-	GasLimit             string `json:"gas_limit"`
-	MaxFeePerGas         string `json:"max_fee_per_gas"`
-	MaxPriorityFeePerGas string `json:"max_priority_fee_per_gas"`
-	RawTx                []byte `json:"raw_tx"`
-	IngestedAtUnixNS     int64  `json:"ingested_at_unix_ns"`
+	SchemaVersion           string `json:"schema_version"`
+	Sequence                uint64 `json:"sequence"`
+	SourceFeedOrderPosition uint64 `json:"source_feed_order_position"`
+	TimestampUnixMS         uint64 `json:"timestamp_unix_ms"`
+	TxHash                  string `json:"tx_hash"`
+	TxType                  string `json:"tx_type"`
+	ChainID                 uint64 `json:"chain_id"`
+	From                    string `json:"from"`
+	To                      string `json:"to"`
+	Nonce                   uint64 `json:"nonce"`
+	Value                   string `json:"value"`
+	Calldata                string `json:"calldata"`
+	GasLimit                string `json:"gas_limit"`
+	MaxFeePerGas            string `json:"max_fee_per_gas"`
+	MaxPriorityFeePerGas    string `json:"max_priority_fee_per_gas"`
+	RawTx                   []byte `json:"raw_tx"`
+	IngestedAtUnixNS        int64  `json:"ingested_at_unix_ns"`
 }
 
 func Normalize(sequence uint64, timestampMS uint64, tx RelayTx, now time.Time) (NormalizedTx, error) {
@@ -62,22 +64,23 @@ func Normalize(sequence uint64, timestampMS uint64, tx RelayTx, now time.Time) (
 		return NormalizedTx{}, err
 	}
 	return NormalizedTx{
-		SchemaVersion:        SchemaVersion,
-		Sequence:             sequence,
-		TimestampUnixMS:      timestampMS,
-		TxHash:               lowerHex(tx.Hash),
-		TxType:               tx.Type,
-		ChainID:              tx.ChainID,
-		From:                 lowerHex(tx.From),
-		To:                   lowerHex(tx.To),
-		Nonce:                tx.Nonce,
-		Value:                tx.Value,
-		Calldata:             lowerHex(tx.Calldata),
-		GasLimit:             tx.GasLimit,
-		MaxFeePerGas:         tx.MaxFeePerGas,
-		MaxPriorityFeePerGas: tx.MaxPriorityFeePerGas,
-		RawTx:                raw,
-		IngestedAtUnixNS:     now.UnixNano(),
+		SchemaVersion:           SchemaVersion,
+		Sequence:                sequence,
+		SourceFeedOrderPosition: tx.SourceFeedOrderPosition,
+		TimestampUnixMS:         timestampMS,
+		TxHash:                  lowerHex(tx.Hash),
+		TxType:                  tx.Type,
+		ChainID:                 tx.ChainID,
+		From:                    lowerHex(tx.From),
+		To:                      lowerHex(tx.To),
+		Nonce:                   tx.Nonce,
+		Value:                   tx.Value,
+		Calldata:                lowerHex(tx.Calldata),
+		GasLimit:                tx.GasLimit,
+		MaxFeePerGas:            tx.MaxFeePerGas,
+		MaxPriorityFeePerGas:    tx.MaxPriorityFeePerGas,
+		RawTx:                   raw,
+		IngestedAtUnixNS:        now.UnixNano(),
 	}, nil
 }
 

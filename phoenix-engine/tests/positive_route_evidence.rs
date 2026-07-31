@@ -27,8 +27,16 @@ fn stored(to: &str, calldata: String, hash_byte: char) -> StoredTransactionEvide
             source: "test.synthetic".to_string(),
             feed_event_id: 1,
             recorded_at: "2026-01-01T00:00:00Z".to_string(),
+            source_feed_order_position: None,
             source_block_number: None,
             source_block_hash: None,
+            source_transaction_index: None,
+            source_event_index: None,
+            source_identity_hash: None,
+            source_pool_addresses: Vec::new(),
+            transaction_status: None,
+            transaction_boundary_completeness: None,
+            post_initiating_state_hash: None,
         },
         payload: json!({
             "schema_version": "phoenix.v4.normalized_tx.v1",
@@ -181,6 +189,11 @@ fn all_reviewed_official_router_families_reach_the_configured_route() {
         assert_eq!(summary.input_amount.as_deref(), Some("1000000"));
         assert_eq!(summary.decoded_token_path, [WETH, USDC]);
         assert_eq!(summary.decoded_fee_path, [500]);
+        assert_eq!(summary.source_command_index, Some(0));
+        assert_eq!(
+            summary.encoded_token_path,
+            Some(format!("{WETH}0001f4{}", &USDC[2..]))
+        );
         assert_eq!(summary.candidate_count, 4);
         assert!(summary.candidate_produced);
         assert_eq!(
@@ -297,4 +310,35 @@ fn trusted_postgres_history_remains_distinct_from_configured_route_evidence() {
     assert!(!summary.candidate_produced);
     assert!(!summary.production_evidence);
     assert_eq!(summary.route_match_result, "decoded_but_irrelevant_pool");
+}
+
+#[test]
+fn production_route_evidence_requires_complete_canonical_source_identity() {
+    let mut evidence = stored(ROUTER_02, router02_single(WETH, USDC, 500), '6');
+    evidence.provenance.source = POSTGRES_FEED_EVENT_SOURCE.to_string();
+    evidence.provenance.source_feed_order_position = Some(3);
+    evidence.provenance.source_block_number = Some(123);
+    evidence.provenance.source_block_hash = Some(format!("0x{}", "a".repeat(64)));
+    evidence.provenance.source_transaction_index = Some(4);
+    evidence.provenance.source_event_index = Some(9);
+    evidence.provenance.source_identity_hash = Some("b".repeat(64));
+    evidence.provenance.source_pool_addresses =
+        vec!["0xc6962004f452be9203591991d15f6b388e09e8d0".to_string()];
+    evidence.provenance.transaction_status = Some("success".to_string());
+    evidence.provenance.transaction_boundary_completeness = Some("complete".to_string());
+    evidence.provenance.post_initiating_state_hash = Some("c".repeat(64));
+
+    let summary = analyze_stored_transaction(&evidence, &registry()).unwrap();
+    assert!(summary.trusted_persisted_source);
+    assert!(summary.production_evidence);
+
+    evidence.provenance.transaction_status = Some("reverted".to_string());
+    let reverted = analyze_stored_transaction(&evidence, &registry()).unwrap();
+    assert!(!reverted.production_evidence);
+
+    evidence.provenance.transaction_status = Some("success".to_string());
+    evidence.provenance.transaction_boundary_completeness = Some("incomplete".to_string());
+    evidence.provenance.post_initiating_state_hash = None;
+    let incomplete = analyze_stored_transaction(&evidence, &registry()).unwrap();
+    assert!(!incomplete.production_evidence);
 }

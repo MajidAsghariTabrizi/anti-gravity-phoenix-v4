@@ -65,11 +65,37 @@ the deployed pool bytecode contract:
 - Source: `https://github.com/Uniswap/v3-core/tree/main/contracts/interfaces`.
 - Pool implementation source:
   `https://github.com/Uniswap/v3-core/blob/main/contracts/UniswapV3Pool.sol`.
+- Canonical pool-address derivation is pinned to Uniswap V3 Periphery
+  `PoolAddress.sol`: ordered `token0`/`token1`, `uint24 fee`,
+  `keccak256(abi.encode(token0, token1, fee))`, factory, and pool init-code
+  hash
+  `e34f199b19b2b4f47f68442619d555527d244f78a3297ea89325f843f87b8b54`.
+  Source:
+  `https://github.com/Uniswap/v3-periphery/blob/main/contracts/libraries/PoolAddress.sol`.
 
 Pinned-block reads are batched through Multicall3 `aggregate3` at the canonical
 deployment `0xcA11bde05977b3631167028862bE2a173976CA11`. Each inner result must
 succeed and decode under its exact ABI; partial batches are rejected. Source:
 `https://github.com/mds1/multicall3`.
+
+## Exact Transaction-Boundary State Evidence
+
+Source identity enrichment uses the provider `debug_traceTransaction` method
+with the built-in `prestateTracer`. Prestate mode supplies the accounts and
+storage needed to execute the exact mined transaction; `diffMode: true`
+supplies the changes caused by that transaction. Phoenix binds both responses
+to the canonical transaction, receipt, block hash, transaction index, ordered
+Swap logs, decoded command, token/fee path, and CREATE2-derived pool addresses,
+then applies only the returned account diff to the matching prestate. A current
+head read, an end-of-block read, or an unrelated transaction trace is never
+substituted for this boundary.
+
+The trace is evidence rather than a cryptographic state proof. Missing trace
+support, pruned historical state, timeout, budget exhaustion, oversized output,
+partial touched-pool state, and provider-integrity failure remain distinct
+`incomplete` results and are never promoted to exact post-initiating state.
+Source:
+`https://geth.ethereum.org/docs/developers/evm-tracing/built-in-tracers`.
 
 ## SushiSwap V3 on Arbitrum One
 

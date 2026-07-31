@@ -44,6 +44,7 @@ fn fixture_tx(
     );
     phoenix_engine::messaging::NormalizedTx {
         sequence: SequenceNumber(1),
+        source_feed_order_position: Some(0),
         tx_hash: TxHash(
             "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
         ),

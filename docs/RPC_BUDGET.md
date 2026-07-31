@@ -39,6 +39,20 @@ The previous implementation performed 13 upstream requests per provider for two 
 
 One Multicall JSON-RPC request is not necessarily one provider billing unit. Providers may charge compute units according to execution cost, payload size, or inner calls. Production capacity planning must use provider invoices and observed CU consumption, not request count alone.
 
+Exact source enrichment is a separate, non-discovery evidence path for a
+recent supported feed transaction. A warm canonical inclusion check uses three
+calls: transaction, receipt, and block. When exact transaction-boundary state
+is required, two `debug_traceTransaction` calls bring the warm total to five.
+The first use of a provider adds its existing chain-ID and Multicall code
+checks, for a cold total of seven. The Engine examines at most one pending
+identity every 15 seconds and records at most three failed attempts; a complete
+or explicitly incomplete gateway response ends enrichment for that immutable
+identity. These calls use the existing request and transport budgets and do
+not change any configured limit. Consequently, the base burst of four rejects
+the five-call exact-state sequence before any upstream call, while the reviewed
+autonomous LIVE overlay burst of 64 can admit it. Budget rejection remains
+distinct incomplete/retry evidence; it never widens execution authority.
+
 ## Independent Limits
 
 - `RPC_STATE_REQUESTS_PER_MINUTE=12` limits incoming state HTTP requests.

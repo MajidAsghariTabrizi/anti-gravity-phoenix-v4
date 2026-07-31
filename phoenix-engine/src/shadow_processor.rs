@@ -9,6 +9,7 @@ use crate::origin::{
     OriginClassification, OriginConfigurationError, OriginDetector, OriginEvent, OriginMetricKind,
     UnsupportedReason,
 };
+use crate::source_identity::{SourceIdentity, SourceIdentityError};
 use async_trait::async_trait;
 use rpc_gateway::shadow_state::RpcQualityEvidence;
 use serde::Deserialize;
@@ -377,6 +378,18 @@ impl ShadowProcessor {
             "LIVE"
         } else {
             "SHADOW"
+        }
+    }
+
+    pub fn source_identity(
+        &self,
+        input: &EngineInput,
+    ) -> Result<Option<SourceIdentity>, SourceIdentityError> {
+        match self.detector.classify(&input.normalized) {
+            OriginClassification::SupportedSwapOrigin(origin) => {
+                SourceIdentity::from_event(input, &origin).map(Some)
+            }
+            _ => Ok(None),
         }
     }
 
@@ -1139,6 +1152,7 @@ mod tests {
             },
             normalized: NormalizedTx {
                 sequence: SequenceNumber(1),
+                source_feed_order_position: Some(0),
                 tx_hash: TxHash(
                     "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
                         .to_string(),

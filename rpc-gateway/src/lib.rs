@@ -10,4 +10,5 @@ pub mod providers;
 pub mod runtime;
 pub mod runtime_state;
 pub mod shadow_state;
+pub mod source_state;
 pub mod transport;

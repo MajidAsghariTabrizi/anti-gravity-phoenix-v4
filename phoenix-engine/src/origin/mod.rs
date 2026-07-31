@@ -23,7 +23,10 @@ pub struct OriginEvent {
     pub origin_sequence: SequenceNumber,
     pub router: Address,
     pub decoded_commands: Vec<String>,
+    pub source_command_index: u16,
     pub swap_path: Vec<TokenAddress>,
+    pub encoded_token_path: String,
+    pub fee_path: Vec<u32>,
     pub exact_in: bool,
     pub amount: Amount,
     pub candidate_touched_pools: Vec<PoolId>,
@@ -110,6 +113,7 @@ impl OriginDetector {
                     origin_sequence: tx.sequence,
                     router: to.clone(),
                     decoded_commands: decoded.decoded_commands,
+                    source_command_index: decoded.source_command_index,
                     swap_path: decoded
                         .swap_path
                         .into_iter()
@@ -119,6 +123,8 @@ impl OriginDetector {
                                 .expect("shared decoder returns canonical addresses")
                         })
                         .collect(),
+                    encoded_token_path: decoded.encoded_token_path,
+                    fee_path: decoded.fee_path,
                     exact_in: true,
                     amount: Amount(decoded.amount_in.0),
                     candidate_touched_pools: decoded

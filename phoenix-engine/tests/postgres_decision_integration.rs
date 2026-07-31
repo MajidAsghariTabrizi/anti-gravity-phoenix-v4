@@ -16,6 +16,9 @@ use phoenix_engine::persistence::{
     ClassificationRecord, PersistOutcome, PostgresShadowStore, ShadowStore, StoreError,
 };
 use phoenix_engine::shadow_processor::EvaluatedOpportunity;
+use phoenix_engine::source_identity::{
+    SourceIdentity, SOURCE_IDENTITY_SCHEMA_VERSION, UNISWAP_V3_FACTORY_ARBITRUM,
+};
 use phoenix_engine::Direction;
 use rpc_gateway::shadow_state::RpcQualityEvidence;
 use serde_json::json;
@@ -45,6 +48,7 @@ async fn apply_migrations(pool: &PgPool) {
         include_str!("../../migrations/009_profit_triggered_secondary_verification.sql"),
         include_str!("../../migrations/010_fork_simulation_evidence.sql"),
         include_str!("../../migrations/011_money_path_selective_persistence.sql"),
+        include_str!("../../migrations/014_exact_source_identity.sql"),
     ] {
         sqlx::raw_sql(migration)
             .execute(pool)
@@ -242,9 +246,41 @@ fn evaluation(hash_byte: char, opportunity_id: &str) -> EvaluatedOpportunity {
 fn record(hash_byte: char, opportunity_id: &str) -> ClassificationRecord {
     let now = Utc::now();
     let tx_hash = format!("0x{}", hash_byte.to_string().repeat(64));
+    let source_event_identity = format!("phoenix.engine.input.v1:7:{tx_hash}");
+    let token0 = "0x1111111111111111111111111111111111111111";
+    let token1 = "0x2222222222222222222222222222222222222222";
+    let mut source_identity = SourceIdentity {
+        schema_version: SOURCE_IDENTITY_SCHEMA_VERSION.to_string(),
+        source_event_identity: source_event_identity.clone(),
+        source_chain_id: 42161,
+        source_transaction_hash: tx_hash.clone(),
+        source_feed_sequence: 7,
+        source_feed_order_position: Some(0),
+        source_block_number: None,
+        source_block_hash: None,
+        source_transaction_index: None,
+        source_command_index: 0,
+        source_event_index: None,
+        source_observed_at_unix_ms: 1_700_000_000_000,
+        source_router: "0xe592427a0aece92de3edee1f18e0157c05861564".to_string(),
+        source_factory: UNISWAP_V3_FACTORY_ARBITRUM.to_string(),
+        source_pool: format!("{token0}:{token1}:500"),
+        source_pool_path: vec![format!("{token0}:{token1}:500")],
+        source_token_path: vec![token0.to_string(), token1.to_string()],
+        source_encoded_token_path: format!("{token0}0001f4{}", &token1[2..]),
+        source_fee_path: vec![500],
+        source_direction: "zero_for_one".to_string(),
+        source_input_amount: "100".to_string(),
+        decoded_commands: vec!["exactInputSingle".to_string()],
+        unavailable_reason: "awaiting_canonical_block_assignment".to_string(),
+        source_identity_hash: "0".repeat(64),
+    };
+    source_identity.source_identity_hash = source_identity
+        .canonical_hash()
+        .expect("canonical source identity");
     ClassificationRecord {
         identity: InputIdentity {
-            source_event_identity: format!("phoenix.engine.input.v1:7:{tx_hash}"),
+            source_event_identity,
             source_sequence: 7,
             tx_hash,
             chain_id: 42161,
@@ -254,7 +290,10 @@ fn record(hash_byte: char, opportunity_id: &str) -> ClassificationRecord {
         candidate_count: 1,
         decision_count: 1,
         delivery_attempt: 1,
-        evidence: json!({"evaluation": "block_pinned_rpc_state"}),
+        evidence: json!({
+            "evaluation": "block_pinned_rpc_state",
+            "source_identity": source_identity
+        }),
         first_received_at: now,
         completed_at: now,
         processing_latency_ns: 100,
@@ -316,7 +355,8 @@ SELECT
     (SELECT count(*) FROM rpc_quality_records) AS quality,
     (SELECT count(*) FROM shadow_decisions WHERE execution_eligible) AS executable,
     (SELECT count(*) FROM shadow_profitability_facts
-        WHERE NOT shadow_only OR execution_eligible OR execution_request_created) AS unsafe_facts
+        WHERE NOT shadow_only OR execution_eligible OR execution_request_created) AS unsafe_facts,
+    (SELECT count(*) FROM source_event_identities) AS source_identities
 "#,
     )
     .fetch_one(&pool)
@@ -329,6 +369,7 @@ SELECT
     assert_eq!(counts.try_get::<i64, _>("quality").unwrap(), 2);
     assert_eq!(counts.try_get::<i64, _>("executable").unwrap(), 0);
     assert_eq!(counts.try_get::<i64, _>("unsafe_facts").unwrap(), 0);
+    assert_eq!(counts.try_get::<i64, _>("source_identities").unwrap(), 2);
 
     let canonical = sqlx::query(
         r#"

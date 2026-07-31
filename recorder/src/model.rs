@@ -24,6 +24,8 @@ pub fn engine_event_identity(tx: &NormalizedTx) -> String {
 pub struct NormalizedTx {
     pub schema_version: String,
     pub sequence: u64,
+    #[serde(default)]
+    pub source_feed_order_position: Option<u64>,
     pub timestamp_unix_ms: u64,
     pub tx_hash: String,
     pub tx_type: String,
@@ -141,6 +143,7 @@ pub fn decode_message(raw: &[u8]) -> Result<ValidatedMessage, DecodeError> {
     let metadata = json!({
         "schema_version": tx.schema_version,
         "source_subject": crate::NATS_SUBJECT,
+        "source_feed_order_position": tx.source_feed_order_position,
         "feed_timestamp_unix_ms": tx.timestamp_unix_ms,
         "ingested_at_unix_ns": tx.ingested_at_unix_ns,
         "tx_type": tx.tx_type,
@@ -190,6 +193,7 @@ pub(crate) mod tests {
         serde_json::to_vec(&json!({
             "schema_version": NORMALIZED_SCHEMA_VERSION,
             "sequence": sequence,
+            "source_feed_order_position": 3,
             "timestamp_unix_ms": 1_700_000_000_000_u64,
             "tx_hash": format!("0x{}", hash_byte.to_string().repeat(64)),
             "tx_type": "0x02",
@@ -212,6 +216,8 @@ pub(crate) mod tests {
     fn validates_exact_normalized_contract() {
         let message = decode_message(&sample_payload(7, 'a')).unwrap();
         assert_eq!(message.tx.sequence, 7);
+        assert_eq!(message.tx.source_feed_order_position, Some(3));
+        assert_eq!(message.metadata["source_feed_order_position"], 3);
         assert_eq!(message.calldata, vec![0x12, 0x34]);
         assert_eq!(message.metadata["source_subject"], crate::NATS_SUBJECT);
         assert!(message.metadata.get("raw_tx").is_none());
@@ -220,6 +226,19 @@ pub(crate) mod tests {
             format!("{}:7:0x{}", ENGINE_INPUT_SCHEMA_VERSION, "a".repeat(64))
         );
         assert!(serde_json::to_vec(&message.payload).unwrap().len() <= MAX_MESSAGE_BYTES);
+    }
+
+    #[test]
+    fn historical_normalized_contract_without_feed_order_remains_readable() {
+        let mut payload: Value = serde_json::from_slice(&sample_payload(7, 'a')).unwrap();
+        payload
+            .as_object_mut()
+            .unwrap()
+            .remove("source_feed_order_position");
+        let encoded = serde_json::to_vec(&payload).unwrap();
+        let message = decode_message(&encoded).unwrap();
+        assert_eq!(message.tx.source_feed_order_position, None);
+        assert!(message.metadata["source_feed_order_position"].is_null());
     }
 
     #[test]

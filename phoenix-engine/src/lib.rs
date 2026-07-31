@@ -23,6 +23,8 @@ pub mod runtime;
 pub mod runtime_state;
 pub mod shadow_processor;
 pub mod simulation;
+pub mod source_enrichment;
+pub mod source_identity;
 pub mod state;
 
 pub use domain::*;

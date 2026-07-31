@@ -19,6 +19,7 @@ message NormalizedTx {
   string max_priority_fee_per_gas = 14;
   bytes raw_tx = 15;
   uint64 ingested_at_unix_ns = 16;
+  optional uint64 source_feed_order_position = 17;
 }
 
 message OpportunityLeg {
@@ -48,4 +49,3 @@ message Opportunity {
   uint64 expires_at_unix_ms = 13;
   string min_profit = 14;
 }
-

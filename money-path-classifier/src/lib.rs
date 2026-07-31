@@ -180,7 +180,10 @@ impl OriginEvidence {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DecodedSwap {
     pub decoded_commands: Vec<String>,
+    pub source_command_index: u16,
     pub swap_path: Vec<Address>,
+    pub encoded_token_path: String,
+    pub fee_path: Vec<u32>,
     pub amount_in: Amount,
     pub touched_pools: Vec<PoolId>,
     pub evidence: OriginEvidence,

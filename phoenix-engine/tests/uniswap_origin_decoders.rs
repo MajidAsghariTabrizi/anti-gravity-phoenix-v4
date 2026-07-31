@@ -177,6 +177,7 @@ fn detector() -> OriginDetector {
 fn transaction(to: &str, calldata: String) -> NormalizedTx {
     NormalizedTx {
         sequence: SequenceNumber(7),
+        source_feed_order_position: Some(0),
         tx_hash: TxHash(format!("0x{}", "a".repeat(64))),
         tx_type: "0x02".to_string(),
         chain_id: ChainId(42161),
@@ -356,6 +357,11 @@ fn legacy_exact_input_decodes_one_and_multiple_hops() {
     ));
     assert_eq!(two_hop.swap_path.len(), 3);
     assert_eq!(two_hop.candidate_touched_pools.len(), 2);
+    assert_eq!(two_hop.fee_path, vec![500, 3000]);
+    assert_eq!(
+        two_hop.encoded_token_path,
+        calldata(packed_path(&[WETH, USDC, DAI], &[500, 3000]))
+    );
     assert_eq!(two_hop.classification_evidence.v3_hop_count, 2);
     assert_eq!(
         two_hop.classification_evidence.decoded_swap_kind,
@@ -382,7 +388,7 @@ fn legacy_multicall_allows_one_swap_and_reviewed_companions() {
     let refund = function_call(selector("refundETH", &[]), &[]);
     let event = supported(classify(
         LEGACY_SWAP_ROUTER_ADDRESS,
-        legacy_multicall(vec![legacy_single(1, 500, WETH, USDC), refund]),
+        legacy_multicall(vec![refund, legacy_single(1, 500, WETH, USDC)]),
     ));
     assert_eq!(
         event.classification_evidence.wrapper_kind,
@@ -391,8 +397,9 @@ fn legacy_multicall_allows_one_swap_and_reviewed_companions() {
     assert_eq!(event.classification_evidence.command_count, 2);
     assert_eq!(
         event.decoded_commands,
-        vec!["multicall", "exactInputSingle", "refundETH"]
+        vec!["multicall", "refundETH", "exactInputSingle"]
     );
+    assert_eq!(event.source_command_index, 1);
 }
 
 #[test]
@@ -506,6 +513,7 @@ fn universal_router_reviewed_payment_companion_does_not_change_route() {
     ));
     assert_eq!(event.amount.0, 555);
     assert_eq!(event.classification_evidence.command_count, 2);
+    assert_eq!(event.source_command_index, 1);
     assert_eq!(
         event.candidate_touched_pools[0].0,
         format!("{WETH}:{USDC}:500")

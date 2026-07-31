@@ -29,6 +29,10 @@ pub enum TransportError {
     Oversized,
     #[error("RPC provider returned an invalid JSON-RPC response")]
     InvalidResponse,
+    #[error("RPC provider does not support the requested method")]
+    MethodUnsupported,
+    #[error("RPC provider cannot serve the requested historical state")]
+    HistoricalStateUnavailable,
     #[error("RPC provider returned a JSON-RPC error")]
     ProviderError,
     #[error("RPC provider applied an HTTP rate limit")]
@@ -42,6 +46,8 @@ impl TransportError {
             Self::Http => "provider_http_failure",
             Self::Oversized => "provider_oversized_response",
             Self::InvalidResponse => "provider_invalid_response",
+            Self::MethodUnsupported => "provider_method_unsupported",
+            Self::HistoricalStateUnavailable => "provider_historical_state_unavailable",
             Self::ProviderError => "provider_rpc_error",
             Self::RateLimited { .. } => "provider_rate_limited",
         }
@@ -98,6 +104,8 @@ struct JsonRpcEnvelope {
 #[derive(Debug, Deserialize)]
 struct JsonRpcErrorBody {
     code: i64,
+    #[serde(default)]
+    message: String,
 }
 
 #[async_trait]
@@ -171,13 +179,37 @@ impl JsonRpcClient for ReqwestJsonRpcClient {
             return Err(TransportError::InvalidResponse);
         }
         if let Some(error) = envelope.error {
-            let _bounded_error_code = error.code;
-            return Err(TransportError::ProviderError);
+            return Err(classify_provider_error(error.code, &error.message));
         }
         Ok(RpcCallResult {
             value: envelope.result.ok_or(TransportError::InvalidResponse)?,
             latency_ns: started.elapsed().as_nanos(),
         })
+    }
+}
+
+fn classify_provider_error(code: i64, message: &str) -> TransportError {
+    if code == -32601 {
+        return TransportError::MethodUnsupported;
+    }
+    let bounded = message
+        .get(..message.len().min(512))
+        .unwrap_or(message)
+        .to_ascii_lowercase();
+    if [
+        "missing trie",
+        "historical state",
+        "state is not available",
+        "state unavailable",
+        "archive node",
+        "pruned",
+    ]
+    .iter()
+    .any(|needle| bounded.contains(needle))
+    {
+        TransportError::HistoricalStateUnavailable
+    } else {
+        TransportError::ProviderError
     }
 }
 
@@ -217,6 +249,8 @@ mod tests {
             TransportError::Http,
             TransportError::Oversized,
             TransportError::InvalidResponse,
+            TransportError::MethodUnsupported,
+            TransportError::HistoricalStateUnavailable,
             TransportError::ProviderError,
             TransportError::RateLimited {
                 retry_after: Duration::from_secs(10),
@@ -227,6 +261,22 @@ mod tests {
             assert!(!rendered.contains("token"));
             assert!(error.class().len() <= 64);
         }
+    }
+
+    #[test]
+    fn provider_errors_classify_only_bounded_capability_failures() {
+        assert_eq!(
+            classify_provider_error(-32601, "method not found"),
+            TransportError::MethodUnsupported
+        );
+        assert_eq!(
+            classify_provider_error(-32000, "missing trie node 0x1234"),
+            TransportError::HistoricalStateUnavailable
+        );
+        assert_eq!(
+            classify_provider_error(-32000, "execution reverted"),
+            TransportError::ProviderError
+        );
     }
 
     #[test]
