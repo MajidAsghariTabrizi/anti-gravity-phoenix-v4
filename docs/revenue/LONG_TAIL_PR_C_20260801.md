@@ -24,6 +24,32 @@ It rejects `latest`, `pending`, safe/finalized head tags, end-of-block state,
 skipped or reordered transactions, replay past the target transaction, missing
 initiating/alternative pool state, and provider disagreement.
 
+### Reviewed provider and local-replay evidence
+
+The credential-redacting probe in
+`scripts/probe_long_tail_trace_providers.py` was run against both reviewed
+Production RPC providers for all ten immutable transactions.  The sanitized
+artifact has content SHA-256
+`2a524e8cca0ee96fce7de10a527d9b6c6eab2b5c2a644de75b95fb7201f0ddf4`.
+Provider 1 agreed on every canonical identity but returned no usable state
+diff: `debug_traceTransaction`, `trace_replayTransaction`, and
+`arbtrace_replayTransaction` were either method-not-found or transport-failed.
+Provider 2 returned no verified receipt-bound trace.  Trace-available count was
+zero for both providers.
+
+An event-specific Anvil v1.7.1 parent-boundary attempt used
+`--fork-transaction-hash` for the immutable UNI transaction at block
+`489692643`.  It failed before the initiating transaction with
+`Unknown transaction type: 0x6A`, an Arbitrum canonical system transaction.
+Skipping or substituting that transaction would violate the exact ordering
+contract, so the attempt is retained as a fail-closed boundary result rather
+than a replay proof.
+
+Consequently this PR remains analysis-only and must not be merged or deployed
+as a complete exact hunter until one reviewed provider supplies the required
+transaction-boundary state and an independent provider agrees.  Green CI proves
+the gate fails closed; it does not complete the missing public-chain state.
+
 ## Immutable target results
 
 | Surface | Transaction | Block / tx index / event index | Input | Parent | Result |
