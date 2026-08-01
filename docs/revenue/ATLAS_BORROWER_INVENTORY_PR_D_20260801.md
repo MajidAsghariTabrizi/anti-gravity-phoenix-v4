@@ -2,15 +2,23 @@
 
 ## Result
 
-The deterministic borrower index and future-auction evaluator are implemented
-as an offline, read-only Python tool. The implementation is signerless,
-bondless, bidless, Solver-free and incapable of Production writes.
+The deterministic borrower index, current-checkpoint importer and
+future-auction evaluator are implemented as read-only Python tools. The
+implementation is signerless, bondless, bidless, Solver-free and incapable of
+Production writes.
 
-Current real borrower coverage remains **incomplete**. No reviewed archive
-transcript was available to this PR, so the tracked evidence correctly yields
-zero *indexed* borrowers and zero evidence events. Those are not claims that
-Aave has zero borrowers. No current borrower count, health factor,
-liquidation pair, or PnL is asserted.
+The completed Borrow archive is bound to 242/242 verified ranges from block
+7,736,400 through 489,813,224, 1,547,315 canonical Borrow logs, 186,426
+historically discovered borrowers and content SHA-256
+`0f204e03a26ee26c1b9e295ab13e946f15a0102a6929c6d4c00f9c3b893f24a4`.
+The current exporter adds a bounded canonical Borrow tail, screens the entire
+union with exact Aave configuration debt bits, and retains only debt-bearing
+addresses for full state reads.
+
+Current real borrower coverage remains **incomplete** because the configured
+reviewed secondary provider returns HTTP 403 for exact current state reads.
+The exporter fails before emitting a checkpoint. No current borrower count,
+health factor, liquidation pair or PnL is asserted.
 
 ## Official Arbitrum identities
 
@@ -95,34 +103,29 @@ quotes produce no PnL and no bid value.
 
 ## Exact remaining external dependency
 
-Completion needs one sanitized, hash-bound Arbitrum archive evidence package:
+The historical archive dependency is complete. The shortest remaining blocker
+is one reviewed independent provider that can serve exact-block `eth_call` for
+the selected current finalized block. The already-configured secondary agrees
+on chain and block headers but returns HTTP 403 for exact state reads. It is not
+replaced or silently downgraded.
 
-1. independent agreement on a reviewed zero-state start and checkpoint block
-   number/hash;
-2. a complete `eth_getBlockByNumber` header chain and `eth_getLogs` range for
-   the Pool and every reviewed aToken/variable-debt/stable-debt token from that
-   start through the checkpoint;
-3. trace/state-diff evidence sufficient to derive exact scaled aToken transfer
-   movements (raw ERC-20 amounts are insufficient), or an equivalently reviewed
-   exact scaled-balance bootstrap supported by a future explicit snapshot
-   input;
-4. checkpoint reserve configuration/index/eMode reads and a
-   `getUserConfiguration` bitmap for every discovered borrower;
-5. deployed Pool proxy implementation, implementation code hash and exact
-   source-version mapping; and
-6. a second provider confirming the checkpoint hash and bound state reads.
-
-For any non-zero auction, a second package of checkpoint-bound flash and
-reviewed unwind quotes plus integer gas/L1 attribution is then required before
-residual PnL exists.
+Once that endpoint can serve the existing bounded request set, the exporter
+will independently agree reserve configuration/index/eMode data and every
+retained borrower configuration/balance used by economics. The broad screen
+and bounded Borrow tail may use the primary provider; the artifact records that
+scope explicitly. For any non-zero auction, checkpoint-bound flash and reviewed
+unwind quotes plus integer gas/L1 attribution remain required before residual
+PnL exists.
 
 ## Commands and tests
 
 ```text
 python -m py_compile scripts/atlas_borrower_index.py scripts/tests/test_atlas_borrower_index.py
-python -m unittest scripts.tests.test_atlas_borrower_index -v
+python -m unittest scripts.tests.test_atlas_borrower_index scripts.tests.test_export_aave_borrow_discovery scripts.tests.test_export_aave_checkpoint -v
 python scripts/atlas_borrower_index.py validate-market --input fixtures/atlas-borrowers/arbitrum-market-20260801.json
 python scripts/atlas_borrower_index.py build --market fixtures/atlas-borrowers/arbitrum-market-20260801.json --transcript fixtures/atlas-borrowers/archive-transcript-unavailable-20260801.json --output <local-output.json>
+python scripts/export_aave_checkpoint.py --container <reviewed-provider-container> --discovery <immutable-borrow-discovery.json> > <private-checkpoint.json>
+python scripts/atlas_borrower_index.py import-checkpoint --market fixtures/atlas-borrowers/arbitrum-market-20260801.json --checkpoint <private-checkpoint.json> --output <private-inventory.json>
 ```
 
 The focused suite covers replay idempotency, reorg rejection, snapshot hash
@@ -132,6 +135,8 @@ and incomplete-coverage preservation.
 
 ## Authority boundary
 
-The CLI reads local JSON and writes a local derived JSON report. It has no RPC,
-SSH, database, GitHub, signer, bond, bid, Solver, transaction-submission,
-contract, route-policy or Production integration.
+The importer and evaluator read local JSON and write local derived reports. The
+checkpoint exporter performs only bounded read-only RPC using provider URLs
+loaded without printing them. None of these tools has a database writer,
+signer, bond, bid, Solver, transaction-submission, contract, route-policy or
+Production mutation path.

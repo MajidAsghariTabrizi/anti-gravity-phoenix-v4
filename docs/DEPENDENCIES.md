@@ -148,6 +148,17 @@ amounts are not silently treated as scaled Aave balances. A missing archive
 range, missing scaled movement, checkpoint user-configuration bitmap, reorg,
 or incomplete reserve evidence keeps coverage incomplete.
 
+The reviewed current-checkpoint bootstrap additionally binds the deployed
+Arbitrum Pool implementation
+`0xf05fd3cc911b4c5e36e53c00354f645e22922c9a` to the address-book commit above.
+It uses a complete immutable Borrow archive plus a bounded primary-provider
+Borrow tail for discovery. Two reviewed providers must independently agree on
+the exact finalized block hash and every reserve/eMode/retained-borrower state
+read used by economics. Primary-only discovery and bytecode bindings are
+declared as such in the artifact. As of 2026-08-01 the configured secondary
+provider returns HTTP 403 for exact current state reads, so the exporter emits
+no checkpoint and coverage remains incomplete.
+
 ## Arbitrum Transaction Cost Components
 
 LIVE submission quotes use the official Nitro `NodeInterface` virtual contract

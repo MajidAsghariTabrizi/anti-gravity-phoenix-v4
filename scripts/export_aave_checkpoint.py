@@ -24,12 +24,15 @@ CHAIN_ID = 42161
 POOL = "0x794a61358d6845594f94dc1db02a252b5b4814ad"
 DATA_PROVIDER = "0x243aa95cac2a25651eda86e80bee66114413c43b"
 ORACLE = "0xb56c2f0b653b2e0b10c9b928c8580ac5df02c7c7"
+BORROW_TOPIC = "0xb3d084820fb1a9decffb176436bd02558d15fac9b0ddfed8c465bc7359d7dce0"
 POOL_IMPLEMENTATION = "0xf05fd3cc911b4c5e36e53c00354f645e22922c9a"
 AAVE_ADDRESS_BOOK_COMMIT = "a1770e87fd61db02a7725cd9eed3b1d07c3980af"
 AAVE_V3_ORIGIN_COMMIT = "fd1fbd9150426ca8ace9cee45b4acf912ae84f5b"
 MAX_PROVIDERS = 8
 MAX_BORROWERS = 250_000
 MAX_RESERVES = 128
+MAX_CHECKPOINT_TAIL_BLOCKS = 2_000_000
+MAX_LOG_BLOCK_RANGE = 2_000
 BATCH_SIZE = 80
 MAX_RPC_ATTEMPTS = 6
 BATCH_PACING_SECONDS = 0.20
@@ -153,6 +156,7 @@ class Provider:
             "eth_getCode",
             "eth_getStorageAt",
             "eth_call",
+            "eth_getLogs",
         }:
             raise ExportError("RPC method outside read-only allowlist")
         self._request_id += 1
@@ -290,6 +294,100 @@ def header(provider: Provider, block: int) -> dict[str, Any]:
     if len(block_hash) != 66 or len(parent_hash) != 66:
         raise ExportError(f"{provider.label}:checkpoint_hash_invalid")
     return {"number": block, "hash": block_hash, "parent_hash": parent_hash}
+
+
+def finalized_checkpoint(
+    providers: list[Provider],
+) -> tuple[int, list[dict[str, Any]], list[dict[str, Any]]]:
+    finalized_heads = []
+    for provider in providers:
+        value = provider.call("eth_getBlockByNumber", ["finalized", False])
+        if not isinstance(value, dict):
+            raise ExportError(f"{provider.label}:finalized_header_invalid")
+        number = int(str(value.get("number")), 16)
+        block_hash = str(value.get("hash", "")).lower()
+        if number < 1 or len(block_hash) != 66:
+            raise ExportError(f"{provider.label}:finalized_header_invalid")
+        finalized_heads.append(
+            {"provider_id": provider.label, "number": number, "hash": block_hash}
+        )
+    selected = min(int(item["number"]) for item in finalized_heads)
+    selected_headers = [
+        {"provider_id": provider.label, "checkpoint": header(provider, selected)}
+        for provider in providers
+    ]
+    if len({item["checkpoint"]["hash"] for item in selected_headers}) != 1:
+        raise ExportError("independent finalized checkpoint hash disagreement")
+    return selected, finalized_heads, selected_headers
+
+
+def sanitized_tail_borrow_logs(
+    provider: Provider, start: int, end: int
+) -> list[dict[str, Any]]:
+    if end < start:
+        return []
+    if end - start + 1 > MAX_CHECKPOINT_TAIL_BLOCKS:
+        raise ExportError("checkpoint Borrow continuity tail is unbounded")
+    output = []
+    cursor = start
+    while cursor <= end:
+        chunk_end = min(end, cursor + MAX_LOG_BLOCK_RANGE - 1)
+        value = provider.call(
+            "eth_getLogs",
+            [
+                {
+                    "address": POOL,
+                    "fromBlock": hex(cursor),
+                    "toBlock": hex(chunk_end),
+                    "topics": [BORROW_TOPIC],
+                }
+            ],
+        )
+        if not isinstance(value, list):
+            raise ExportError("checkpoint Borrow continuity tail is invalid")
+        for log in value:
+            if not isinstance(log, dict) or log.get("removed") is True:
+                raise ExportError("checkpoint Borrow continuity log is invalid")
+            topics = log.get("topics")
+            if str(log.get("address", "")).lower() != POOL:
+                raise ExportError("checkpoint Borrow continuity source mismatch")
+            if not isinstance(topics, list) or len(topics) != 4:
+                raise ExportError("checkpoint Borrow continuity topic shape is invalid")
+            if str(topics[0]).lower() != BORROW_TOPIC:
+                raise ExportError("checkpoint Borrow continuity signature mismatch")
+            output.append(
+                {
+                    "block_number": int(str(log.get("blockNumber")), 16),
+                    "block_hash": str(log.get("blockHash", "")).lower(),
+                    "transaction_hash": str(log.get("transactionHash", "")).lower(),
+                    "transaction_index": int(str(log.get("transactionIndex")), 16),
+                    "log_index": int(str(log.get("logIndex")), 16),
+                    "reserve": "0x" + str(topics[1]).lower()[-40:],
+                    "borrower": "0x" + str(topics[2]).lower()[-40:],
+                    "referral_code": int(str(topics[3]), 16),
+                    "data_sha256": hashlib.sha256(
+                        str(log.get("data", "")).lower().encode()
+                    ).hexdigest(),
+                }
+            )
+        cursor = chunk_end + 1
+        time.sleep(0.05)
+    output.sort(
+        key=lambda item: (
+            item["block_number"],
+            item["transaction_index"],
+            item["log_index"],
+        )
+    )
+    identities = {
+        (item["block_hash"], item["transaction_hash"], item["log_index"])
+        for item in output
+    }
+    if len(identities) != len(output):
+        raise ExportError("duplicate checkpoint Borrow continuity identity")
+    if any(not start <= item["block_number"] <= end for item in output):
+        raise ExportError("checkpoint Borrow continuity log is out of range")
+    return output
 
 
 def independently_agreed_calls(
@@ -443,23 +541,42 @@ def active_borrower_state(
 
     UserConfiguration debt bits are current checkpoint state and do not suffer
     from the base-currency rounding that can make tiny debt appear as zero in
-    getUserAccountData.  Independent agreement over the full ordered result
-    set proves that no discovered borrower was silently omitted.
+    getUserAccountData.  The primary provider performs the permitted broad
+    screen. Both providers then independently agree on every retained address.
     """
 
     calls = [
         (POOL, call_data(SELECTORS["get_user_configuration"], encode_address(borrower)))
         for borrower in borrowers
     ]
-    results, bindings = independently_agreed_calls(
-        providers, calls, block, "borrower_activity"
-    )
+    primary_results = providers[0].eth_calls(calls, block)
+    if len(primary_results) != len(borrowers):
+        raise ExportError("primary borrower activity screen is incomplete")
+    bindings = [
+        {
+            "provider_id": providers[0].label,
+            "context": "borrower_activity_primary",
+            "call_count": len(primary_results),
+            "result_sha256": canonical_hash(primary_results),
+        }
+    ]
     debt_mask = sum(1 << (int(reserve["reserve_id"]) * 2) for reserve in reserves)
     configurations = {
         borrower: word_uint(words(result)[0])
-        for borrower, result in zip(borrowers, results)
+        for borrower, result in zip(borrowers, primary_results)
     }
     active = [borrower for borrower in borrowers if configurations[borrower] & debt_mask]
+    retained_calls = [
+        (POOL, call_data(SELECTORS["get_user_configuration"], encode_address(borrower)))
+        for borrower in active
+    ]
+    retained_results, retained_bindings = independently_agreed_calls(
+        providers, retained_calls, block, "borrower_activity_retained"
+    )
+    for borrower, result in zip(active, retained_results):
+        if word_uint(words(result)[0]) != configurations[borrower]:
+            raise ExportError("retained borrower configuration disagreement")
+    bindings.extend(retained_bindings)
     return active, configurations, bindings
 
 
@@ -553,19 +670,33 @@ def main() -> int:
         with Path(args.discovery).open(encoding="utf-8") as handle:
             discovery = validate_discovery(json.load(handle))
         discovery.pop("logs", None)
-        block = int(discovery["checkpoint_block"])
+        archive_checkpoint = int(discovery["checkpoint_block"])
         providers = [
             Provider(f"reviewed-provider-{index}", url)
             for index, url in enumerate(provider_urls(args.container), 1)
         ]
-        headers = []
-        code_bindings = []
         for provider in providers:
             chain = provider.call("eth_chainId", [])
             if int(str(chain), 16) != CHAIN_ID:
                 raise ExportError(f"{provider.label}:chain disagreement")
-            checkpoint = header(provider, block)
-            headers.append({"provider_id": provider.label, "checkpoint": checkpoint})
+        block, finalized_heads, headers = finalized_checkpoint(providers)
+        if block < archive_checkpoint:
+            raise ExportError("finalized checkpoint regressed behind archive")
+        tail_logs = sanitized_tail_borrow_logs(
+            providers[0], archive_checkpoint + 1, block
+        )
+        print(
+            f"checkpoint_tail_collection_complete={providers[0].label} "
+            f"log_count={len(tail_logs)}",
+            file=sys.stderr,
+        )
+        historical_borrowers = list(discovery["borrowers"])
+        tail_borrowers = sorted({_address(item["borrower"], "tail borrower") for item in tail_logs})
+        screened_borrowers = sorted(set(historical_borrowers).union(tail_borrowers))
+        if len(screened_borrowers) > MAX_BORROWERS:
+            raise ExportError("current borrower screen exceeds bound")
+        code_bindings = []
+        for provider in providers[:1]:
             implementation_word = provider.call(
                 "eth_getStorageAt", [POOL, POOL_IMPLEMENTATION_SLOT, hex(block)]
             )
@@ -595,13 +726,9 @@ def main() -> int:
                     "code_sha256": code_hashes,
                 }
             )
-        if len({item["checkpoint"]["hash"] for item in headers}) != 1:
-            raise ExportError("independent checkpoint hash disagreement")
-        if len({canonical_hash(item["code_sha256"]) for item in code_bindings}) != 1:
-            raise ExportError("independent protocol code disagreement")
         reserves, reserve_bindings = reserve_state(providers, block)
         active_addresses, configurations, activity_bindings = active_borrower_state(
-            providers, block, list(discovery["borrowers"]), reserves
+            providers, block, screened_borrowers, reserves
         )
         borrowers, borrower_bindings = borrower_state(
             providers, block, active_addresses, reserves, configurations
@@ -627,6 +754,18 @@ def main() -> int:
             "checkpoint_block": block,
             "checkpoint_hash": headers[0]["checkpoint"]["hash"],
             "discovery_content_sha256": discovery["content_sha256"],
+            "archive_checkpoint_block": archive_checkpoint,
+            "finalized_heads": finalized_heads,
+            "tail_discovery": {
+                "collection_provider_id": providers[0].label,
+                "independent_log_verification": False,
+                "start_block": archive_checkpoint + 1,
+                "end_block": block,
+                "log_count": len(tail_logs),
+                "borrower_count": len(tail_borrowers),
+                "logs_content_sha256": canonical_hash(tail_logs),
+                "logs": tail_logs,
+            },
             "protocol": {
                 "pool": POOL,
                 "data_provider": DATA_PROVIDER,
@@ -652,6 +791,7 @@ def main() -> int:
             },
             "provider_headers": headers,
             "protocol_code_bindings": code_bindings,
+            "protocol_code_independent_agreement": False,
             "state_bindings": reserve_bindings
             + activity_bindings
             + borrower_bindings
@@ -662,15 +802,26 @@ def main() -> int:
                 "eth_getCode",
                 "eth_getStorageAt",
                 "eth_call",
+                "eth_getLogs",
             ],
             "archive_complete": True,
             "independent_state_agreement": True,
+            "independent_state_agreement_scope": [
+                "checkpoint_block_hash",
+                "reserve_state",
+                "retained_borrower_configuration",
+                "retained_borrower_state",
+                "emode_state",
+            ],
             "reserves": reserves,
             "emode_categories": emode_categories,
-            "discovered_borrower_count": len(discovery["borrowers"]),
-            "screened_borrower_count": len(discovery["borrowers"]),
-            "discovery_log_count": discovery["log_count"],
+            "historical_discovered_borrower_count": len(historical_borrowers),
+            "tail_discovered_borrower_count": len(tail_borrowers),
+            "discovered_borrower_count": len(screened_borrowers),
+            "screened_borrower_count": len(screened_borrowers),
+            "discovery_log_count": discovery["log_count"] + len(tail_logs),
             "active_borrower_count": len(active_borrowers),
+            "debt_bearing_borrower_count": len(active_borrowers),
             "borrowers": active_borrowers,
             "execution_authority": {
                 "signer": False,

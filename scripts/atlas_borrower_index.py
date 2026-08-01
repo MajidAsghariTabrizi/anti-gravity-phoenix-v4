@@ -721,6 +721,7 @@ def build_inventory_from_checkpoint(
         "eth_getCode",
         "eth_getStorageAt",
         "eth_call",
+        "eth_getLogs",
     }
     if not required_methods.issubset(set(checkpoint.get("source_methods", []))):
         raise EvidenceError("checkpoint source methods are incomplete")
@@ -759,10 +760,80 @@ def build_inventory_from_checkpoint(
             raise EvidenceError("provider checkpoint hash disagreement")
     if len(provider_ids) != len(headers):
         raise EvidenceError("checkpoint provider identities are duplicated")
+    finalized_heads = checkpoint.get("finalized_heads")
+    if not isinstance(finalized_heads, list) or len(finalized_heads) != len(headers):
+        raise EvidenceError("checkpoint finalized-head evidence is incomplete")
+    if {item.get("provider_id") for item in finalized_heads if isinstance(item, dict)} != provider_ids:
+        raise EvidenceError("checkpoint finalized-head provider set disagreement")
+    for item in finalized_heads:
+        if not isinstance(item, dict):
+            raise EvidenceError("checkpoint finalized-head evidence is malformed")
+        if _require_int(item.get("number"), "finalized head number", 1) < checkpoint_block:
+            raise EvidenceError("checkpoint is newer than a provider finalized head")
+        _require_hash(item.get("hash"), "finalized head hash")
+
+    archive_checkpoint = _require_int(
+        checkpoint.get("archive_checkpoint_block"), "archive_checkpoint_block", 1
+    )
+    if archive_checkpoint > checkpoint_block:
+        raise EvidenceError("archive checkpoint is newer than current checkpoint")
+    tail = checkpoint.get("tail_discovery")
+    collection_provider_id = (
+        tail.get("collection_provider_id") if isinstance(tail, dict) else None
+    )
+    if (
+        collection_provider_id not in provider_ids
+        or tail.get("independent_log_verification") is not False
+    ):
+        raise EvidenceError("checkpoint Borrow continuity evidence is missing")
+    expected_agreement_scope = {
+        "checkpoint_block_hash",
+        "reserve_state",
+        "retained_borrower_configuration",
+        "retained_borrower_state",
+        "emode_state",
+    }
+    if set(checkpoint.get("independent_state_agreement_scope", [])) != expected_agreement_scope:
+        raise EvidenceError("checkpoint independent state agreement scope is incomplete")
+    if _require_int(tail.get("start_block"), "tail start block", 1) != archive_checkpoint + 1:
+        raise EvidenceError("checkpoint Borrow continuity start is invalid")
+    if _require_int(tail.get("end_block"), "tail end block", 1) != checkpoint_block:
+        raise EvidenceError("checkpoint Borrow continuity end is invalid")
+    tail_logs = tail.get("logs")
+    if not isinstance(tail_logs, list) or len(tail_logs) != _require_int(
+        tail.get("log_count"), "tail log count"
+    ):
+        raise EvidenceError("checkpoint Borrow continuity logs are incomplete")
+    if tail.get("logs_content_sha256") != hashlib.sha256(canonical_json(tail_logs)).hexdigest():
+        raise EvidenceError("checkpoint Borrow continuity hash mismatch")
+    tail_borrowers = set()
+    tail_identities = set()
+    for log in tail_logs:
+        if not isinstance(log, dict):
+            raise EvidenceError("checkpoint Borrow continuity log is malformed")
+        number = _require_int(log.get("block_number"), "tail log block", archive_checkpoint + 1)
+        if number > checkpoint_block:
+            raise EvidenceError("checkpoint Borrow continuity log is out of range")
+        block_hash = _require_hash(log.get("block_hash"), "tail block hash")
+        tx_hash = _require_hash(log.get("transaction_hash"), "tail transaction hash")
+        _require_int(log.get("transaction_index"), "tail transaction index")
+        log_index = _require_int(log.get("log_index"), "tail log index")
+        tail_identities.add((block_hash, tx_hash, log_index))
+        tail_borrowers.add(_require_address(log.get("borrower"), "tail borrower"))
+        _require_address(log.get("reserve"), "tail reserve")
+        data_sha256 = log.get("data_sha256")
+        if not isinstance(data_sha256, str) or not re.fullmatch(r"[0-9a-f]{64}", data_sha256):
+            raise EvidenceError("checkpoint Borrow continuity data hash is invalid")
+    if len(tail_identities) != len(tail_logs):
+        raise EvidenceError("checkpoint Borrow continuity identity is duplicated")
+    if len(tail_borrowers) != _require_int(tail.get("borrower_count"), "tail borrower count"):
+        raise EvidenceError("checkpoint Borrow continuity borrower count mismatch")
 
     code_bindings = checkpoint.get("protocol_code_bindings")
-    if not isinstance(code_bindings, list) or len(code_bindings) < 2:
-        raise EvidenceError("checkpoint protocol code lacks independent bindings")
+    if not isinstance(code_bindings, list) or len(code_bindings) != 1:
+        raise EvidenceError("checkpoint primary protocol code binding is missing")
+    if checkpoint.get("protocol_code_independent_agreement") is not False:
+        raise EvidenceError("checkpoint protocol code agreement scope is misstated")
     implementation_hashes = set()
     code_provider_ids = set()
     for item in code_bindings:
@@ -776,8 +847,12 @@ def build_inventory_from_checkpoint(
         if not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest):
             raise EvidenceError("checkpoint implementation code hash is invalid")
         implementation_hashes.add(digest)
-    if len(code_provider_ids) != len(code_bindings) or len(implementation_hashes) != 1:
-        raise EvidenceError("checkpoint implementation code does not independently agree")
+    if (
+        len(code_provider_ids) != len(code_bindings)
+        or not code_provider_ids <= provider_ids
+        or len(implementation_hashes) != 1
+    ):
+        raise EvidenceError("checkpoint implementation code binding is invalid")
 
     source_bindings = checkpoint.get("source_bindings")
     if not isinstance(source_bindings, dict):
@@ -801,7 +876,7 @@ def build_inventory_from_checkpoint(
     for context in (
         "reserve_list",
         "reserve_state",
-        "borrower_activity",
+        "borrower_activity_retained",
         "borrower_state",
     ):
         rows = by_context.get(context, [])
@@ -813,6 +888,13 @@ def build_inventory_from_checkpoint(
             raise EvidenceError(f"checkpoint {context} state disagreement")
         if len({row.get("call_count") for row in rows}) != 1:
             raise EvidenceError(f"checkpoint {context} call-count disagreement")
+    broad_rows = by_context.get("borrower_activity_primary", [])
+    if len(broad_rows) != 1 or broad_rows[0].get("provider_id") not in provider_ids:
+        raise EvidenceError("checkpoint primary borrower screen binding is invalid")
+    if not isinstance(broad_rows[0].get("result_sha256"), str) or not re.fullmatch(
+        r"[0-9a-f]{64}", broad_rows[0]["result_sha256"]
+    ):
+        raise EvidenceError("checkpoint primary borrower screen hash is invalid")
 
     raw_reserves = checkpoint.get("reserves")
     if not isinstance(raw_reserves, list) or not 0 < len(raw_reserves) <= 128:
@@ -895,7 +977,7 @@ def build_inventory_from_checkpoint(
             _require_int(category.get(field), f"checkpoint.emode.{field}")
 
     raw_borrowers = checkpoint.get("borrowers")
-    if not isinstance(raw_borrowers, list) or len(raw_borrowers) > 100_000:
+    if not isinstance(raw_borrowers, list) or len(raw_borrowers) > 250_000:
         raise EvidenceError("checkpoint borrower state is missing")
     if _require_int(checkpoint.get("active_borrower_count"), "checkpoint.active_borrower_count") != len(
         raw_borrowers
@@ -909,6 +991,24 @@ def build_inventory_from_checkpoint(
     )
     if screened_borrower_count != discovered_borrower_count:
         raise EvidenceError("checkpoint borrower discovery was not completely screened")
+    historical_discovered = _require_int(
+        checkpoint.get("historical_discovered_borrower_count"),
+        "checkpoint.historical_discovered_borrower_count",
+    )
+    if historical_discovered > discovered_borrower_count:
+        raise EvidenceError("checkpoint historical discovery exceeds current screen")
+    if _require_int(
+        checkpoint.get("tail_discovered_borrower_count"),
+        "checkpoint.tail_discovered_borrower_count",
+    ) != len(tail_borrowers):
+        raise EvidenceError("checkpoint tail borrower count mismatch")
+    if _require_int(
+        checkpoint.get("debt_bearing_borrower_count"),
+        "checkpoint.debt_bearing_borrower_count",
+    ) != len(raw_borrowers):
+        raise EvidenceError("checkpoint debt-bearing borrower count mismatch")
+    if broad_rows[0].get("call_count") != screened_borrower_count:
+        raise EvidenceError("checkpoint primary borrower screen is incomplete")
     if discovered_borrower_count < len(raw_borrowers):
         raise EvidenceError("checkpoint discovered borrower count is below active count")
     inventory_borrowers = []

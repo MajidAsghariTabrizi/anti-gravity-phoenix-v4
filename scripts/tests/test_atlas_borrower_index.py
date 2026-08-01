@@ -1,4 +1,6 @@
 import copy
+import hashlib
+import json
 import unittest
 
 from scripts.atlas_borrower_index import (
@@ -210,12 +212,30 @@ def checkpoint(market_value):
             }
         )
     source_impl = market_value["liquidation_logic"]["pool_implementation"]
+    empty_tail_hash = hashlib.sha256(
+        json.dumps([], sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
     value = {
         "schema": "phoenix.atlas.aave-checkpoint.v1",
         "chain_id": 42161,
         "checkpoint_block": block,
         "checkpoint_hash": BLOCK_HASH,
         "discovery_content_sha256": "d" * 64,
+        "archive_checkpoint_block": 99,
+        "finalized_heads": [
+            {"provider_id": provider, "number": block, "hash": BLOCK_HASH}
+            for provider in providers
+        ],
+        "tail_discovery": {
+            "collection_provider_id": providers[0],
+            "independent_log_verification": False,
+            "start_block": block,
+            "end_block": block,
+            "log_count": 0,
+            "borrower_count": 0,
+            "logs_content_sha256": empty_tail_hash,
+            "logs": [],
+        },
         "protocol": {
             "pool": market_value["protocol"]["pool"],
             "data_provider": market_value["protocol"]["data_provider"],
@@ -237,8 +257,9 @@ def checkpoint(market_value):
                     "pool_implementation": "4" * 64,
                 },
             }
-            for provider in providers
+            for provider in providers[:1]
         ],
+        "protocol_code_independent_agreement": False,
         "state_bindings": [
             {
                 "provider_id": provider,
@@ -249,10 +270,18 @@ def checkpoint(market_value):
             for context in (
                 "reserve_list",
                 "reserve_state",
-                "borrower_activity",
+                "borrower_activity_retained",
                 "borrower_state",
             )
             for provider in providers
+        ]
+        + [
+            {
+                "provider_id": providers[0],
+                "context": "borrower_activity_primary",
+                "call_count": 1,
+                "result_sha256": "5" * 64,
+            }
         ],
         "source_bindings": {
             "aave_address_book": {
@@ -273,19 +302,30 @@ def checkpoint(market_value):
         },
         "archive_complete": True,
         "independent_state_agreement": True,
+        "independent_state_agreement_scope": [
+            "checkpoint_block_hash",
+            "reserve_state",
+            "retained_borrower_configuration",
+            "retained_borrower_state",
+            "emode_state",
+        ],
         "source_methods": [
             "eth_chainId",
             "eth_getBlockByNumber",
             "eth_getCode",
             "eth_getStorageAt",
             "eth_call",
+            "eth_getLogs",
         ],
         "reserves": reserves,
         "emode_categories": [],
         "discovered_borrower_count": 1,
+        "historical_discovered_borrower_count": 1,
+        "tail_discovered_borrower_count": 0,
         "screened_borrower_count": 1,
         "discovery_log_count": 3,
         "active_borrower_count": 1,
+        "debt_bearing_borrower_count": 1,
         "borrowers": [
             {
                 "address": BORROWER,
@@ -544,7 +584,12 @@ class AtlasBorrowerIndexTests(unittest.TestCase):
     def test_checkpoint_provider_disagreement_fails_closed(self):
         market_value = market()
         checkpoint_value = checkpoint(market_value)
-        checkpoint_value["state_bindings"][-1]["result_sha256"] = "6" * 64
+        borrower_state_rows = [
+            item
+            for item in checkpoint_value["state_bindings"]
+            if item["context"] == "borrower_state"
+        ]
+        borrower_state_rows[-1]["result_sha256"] = "6" * 64
         checkpoint_value = bind_hash(checkpoint_value)
         with self.assertRaisesRegex(EvidenceError, "borrower_state state disagreement"):
             build_inventory_from_checkpoint(market_value, checkpoint_value)

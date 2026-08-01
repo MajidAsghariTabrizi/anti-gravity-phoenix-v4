@@ -1,6 +1,7 @@
 import importlib.util
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -21,7 +22,20 @@ class StaticProvider:
         self.result = result
 
     def eth_calls(self, calls, block):
-        return list(self.result)
+        return list(self.result[: len(calls)])
+
+
+class EmptyLogProvider:
+    label = "logs"
+
+    def __init__(self):
+        self.ranges = []
+
+    def call(self, method, params):
+        assert method == "eth_getLogs"
+        query = params[0]
+        self.ranges.append((int(query["fromBlock"], 16), int(query["toBlock"], 16)))
+        return []
 
 
 class AaveCheckpointTests(unittest.TestCase):
@@ -82,7 +96,14 @@ class AaveCheckpointTests(unittest.TestCase):
         self.assertEqual(active, [borrowers[0]])
         self.assertEqual(configurations[borrowers[0]], 1 << 2)
         self.assertEqual(configurations[borrowers[1]], 1 << 1)
-        self.assertEqual({item["call_count"] for item in bindings}, {2})
+        primary = [item for item in bindings if item["context"] == "borrower_activity_primary"]
+        retained = [
+            item for item in bindings if item["context"] == "borrower_activity_retained"
+        ]
+        self.assertEqual(len(primary), 1)
+        self.assertEqual(primary[0]["call_count"], 2)
+        self.assertEqual(len(retained), 2)
+        self.assertEqual({item["call_count"] for item in retained}, {1})
 
     def test_abi_encoding_rejects_unbounded_values(self):
         with self.assertRaisesRegex(MODULE.ExportError, "out of bounds"):
@@ -91,6 +112,13 @@ class AaveCheckpointTests(unittest.TestCase):
             MODULE.uint_word(2**256)
         with self.assertRaisesRegex(MODULE.ExportError, "canonical address"):
             MODULE.encode_address("0x1234")
+
+    def test_tail_log_export_is_contiguous_and_bounded(self):
+        provider = EmptyLogProvider()
+        with mock.patch.object(MODULE.time, "sleep"):
+            logs = MODULE.sanitized_tail_borrow_logs(provider, 1, 4_501)
+        self.assertEqual(logs, [])
+        self.assertEqual(provider.ranges, [(1, 2_000), (2_001, 4_000), (4_001, 4_501)])
 
 
 if __name__ == "__main__":
