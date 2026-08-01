@@ -1611,7 +1611,7 @@ def _verify_evidence(paths: HostPaths, request: dict[str, Any]) -> dict[str, Any
     if str(provenance.get("build_run_id")) != str(request["build_run_id"]):
         raise GatewayError("RELEASE_BUILD_IDENTITY_MISMATCH")
     images = manifest.get("images")
-    if not isinstance(images, dict) or len(images) != 7:
+    if not isinstance(images, dict) or len(images) not in {7, 8}:
         raise GatewayError("RELEASE_IMAGE_SET_INVALID")
     expected_images: dict[str, str] = {}
     for name, image in images.items():
