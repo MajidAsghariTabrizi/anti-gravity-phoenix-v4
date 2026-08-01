@@ -257,7 +257,7 @@ LEGACY_RELEASE_IMAGES = tuple(
     for component in COMPONENTS
     if component["name"] != "atlas-observer"
 )
-_release_image_set = os.environ.get("PHOENIX_RELEASE_IMAGE_SET", "current")
+_release_image_set = os.environ.get("PHOENIX_RELEASE_IMAGE_SET", "legacy")
 if _release_image_set == "current":
     RELEASE_IMAGES = CURRENT_RELEASE_IMAGES
 elif _release_image_set == "legacy":

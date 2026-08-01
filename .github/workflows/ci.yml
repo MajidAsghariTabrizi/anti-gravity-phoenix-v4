@@ -14,6 +14,9 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.head.ref || github.ref_name }}
   cancel-in-progress: true
 
+env:
+  PHOENIX_RELEASE_IMAGE_SET: current
+
 jobs:
   hygiene:
     name: hygiene
