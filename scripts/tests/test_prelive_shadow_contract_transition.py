@@ -418,7 +418,7 @@ def compose_metadata(plan: dict, role: str) -> dict:
         "chain_id": 42161,
         "mode": "SHADOW",
         "live_execution": False,
-        "expected_services": list(maintenance.COMPOSE_SERVICES),
+        "expected_services": list(maintenance._compose_services(compatibility, role)),
         "route_registry_hash": plan["route_contract"][
             f"{role}_registry_sha256"
         ],
@@ -448,7 +448,7 @@ def rendered_compose(plan: dict, role: str) -> dict:
             "networks": {"phoenix-internal": None},
             "restart": "unless-stopped",
         }
-        for name in maintenance.COMPOSE_SERVICES
+        for name in maintenance._compose_services(compatibility, role)
     }
     for name in transition.ROUTE_ENV_SERVICES:
         services[name]["environment"][transition.ROUTE_ENV_NAME] = route_json

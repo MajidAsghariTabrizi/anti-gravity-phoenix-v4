@@ -56,7 +56,13 @@ REVIEWED_ROUTE_ID = "arbitrum-weth-usdc-uniswap-v3-500-3000"
 REVIEWED_ROUTE_FINGERPRINT = f"{REVIEWED_ROUTE_ID}-v1"
 
 LEGACY_IMAGES = maintenance.LEGACY_RELEASE_IMAGES
-CURRENT_IMAGES = maintenance.CURRENT_RELEASE_IMAGES
+# This transition is immutable evidence for the reviewed pre-Atlas release
+# pair above. It must retain that seven-image contract even after the active
+# release registry grows.
+REVIEWED_CANDIDATE_IMAGES = LEGACY_IMAGES
+REVIEWED_ROLLBACK_IMAGES = tuple(
+    name for name in LEGACY_IMAGES if name != "live-executor"
+)
 FIXED_SERVICES = maintenance.FIXED_SERVICES
 PROTECTED_SERVICES = maintenance.PROTECTED_SERVICES
 OPTIONAL_STOP_ORDER = (
@@ -611,9 +617,9 @@ def build_plan_from_evidence(
         or rollback.get("run_id") != ROLLBACK_RUN_ID
     ):
         _fail("release_pair_not_reviewed")
-    if tuple(sorted(release.get("images", {}))) != CURRENT_IMAGES:
+    if tuple(sorted(release.get("images", {}))) != REVIEWED_CANDIDATE_IMAGES:
         _fail("candidate_image_contract_invalid")
-    if tuple(sorted(rollback.get("images", {}))) != LEGACY_IMAGES:
+    if tuple(sorted(rollback.get("images", {}))) != REVIEWED_ROLLBACK_IMAGES:
         _fail("rollback_image_contract_invalid")
     if _sha256_bytes(release.get("proof", b"")) != CANDIDATE_PROOF_SHA256:
         _fail("candidate_route_evidence_invalid")
@@ -734,7 +740,7 @@ def build_plan(args: argparse.Namespace) -> dict[str, Any]:
         run_evidence_path=Path(args.release_run_evidence),
         release_sha=RELEASE_SHA,
         run_id=RELEASE_RUN_ID,
-        images=CURRENT_IMAGES,
+        images=REVIEWED_CANDIDATE_IMAGES,
     )
     rollback = validate_release_evidence(
         manifest_path=Path(args.rollback_manifest),
@@ -745,7 +751,7 @@ def build_plan(args: argparse.Namespace) -> dict[str, Any]:
         run_evidence_path=Path(args.rollback_run_evidence),
         release_sha=ROLLBACK_SHA,
         run_id=ROLLBACK_RUN_ID,
-        images=LEGACY_IMAGES,
+        images=REVIEWED_ROLLBACK_IMAGES,
     )
     return build_plan_from_evidence(
         release, rollback, Path(args.candidate_route_registry)
@@ -821,8 +827,12 @@ def validate_plan(value: Any) -> dict[str, Any]:
         _fail("plan_invalid")
 
     images = _exact(plan["images"], {"release", "rollback"}, "plan_invalid")
-    _validate_image_references(images["release"], CURRENT_IMAGES, RELEASE_SHA)
-    _validate_image_references(images["rollback"], LEGACY_IMAGES, ROLLBACK_SHA)
+    _validate_image_references(
+        images["release"], REVIEWED_CANDIDATE_IMAGES, RELEASE_SHA
+    )
+    _validate_image_references(
+        images["rollback"], REVIEWED_ROLLBACK_IMAGES, ROLLBACK_SHA
+    )
     artifacts = _exact(
         plan["artifacts"], {"release", "rollback"}, "plan_invalid"
     )
@@ -1005,7 +1015,11 @@ def _nonnegative_integer(value: Any, code: str) -> int:
 def _recorder_render_environment(
     plan: dict[str, Any], compose_value: Any
 ) -> tuple[str, dict[str, str]]:
-    rendered = maintenance._validate_rendered_compose(compose_value)
+    compose_plan = _plan_for_compose(plan)
+    rendered = maintenance._validate_rendered_compose(
+        compose_value,
+        maintenance._compose_services(compose_plan, "release"),
+    )
     recorder = rendered["services"]["recorder"]
     expected_image = plan["images"]["release"]["recorder"]
     if recorder.get("image") != expected_image:
@@ -1500,19 +1514,25 @@ def validate_render_pair(
     ):
         _fail("route_render_contract_invalid")
     rendered = {
-        "release": deepcopy(maintenance._validate_rendered_compose(release_compose)),
-        "rollback": deepcopy(maintenance._validate_rendered_compose(rollback_compose)),
+        role: deepcopy(
+            maintenance._validate_rendered_compose(
+                release_compose if role == "release" else rollback_compose,
+                maintenance._compose_services(compose_plan, role),
+            )
+        )
+        for role in ("release", "rollback")
     }
     release_services = rendered["release"]["services"]
     rollback_services = rendered["rollback"]["services"]
     expected_release = maintenance._expected_compose_images(compose_plan, "release")
     expected_rollback = maintenance._expected_compose_images(compose_plan, "rollback")
-    for service in maintenance.COMPOSE_SERVICES:
-        if (
-            release_services[service]["image"] != expected_release[service]
-            or rollback_services[service]["image"] != expected_rollback[service]
-        ):
-            _fail(f"protected_compose_service_changed:{service}")
+    for services, expected, role in (
+        (release_services, expected_release, "release"),
+        (rollback_services, expected_rollback, "rollback"),
+    ):
+        for service in maintenance._compose_services(compose_plan, role):
+            if services[service]["image"] != expected[service]:
+                _fail(f"protected_compose_service_changed:{service}")
     _normalize_render_environment(plan, rendered["release"], "release")
     _normalize_render_environment(plan, rendered["rollback"], "rollback")
     _normalize_reviewed_engine_default(release_services, rollback_services)
@@ -1525,6 +1545,12 @@ def validate_render_pair(
         ) != maintenance._without_image(rollback_services[service]):
             _fail(f"protected_compose_service_changed:{service}")
     for service in maintenance.OPTIONAL_SERVICES:
+        in_release = service in release_services
+        in_rollback = service in rollback_services
+        if not in_release and not in_rollback:
+            continue
+        if in_release != in_rollback:
+            _fail(f"protected_compose_service_changed:{service}")
         if service == "prometheus":
             maintenance._validate_prometheus_delta(
                 release_services[service], rollback_services[service]
@@ -2071,7 +2097,12 @@ def command_validate_state(args: argparse.Namespace) -> None:
 def command_image_refs(args: argparse.Namespace) -> None:
     plan = load_plan(Path(args.plan))
     for role in ("release", "rollback"):
-        for name in LEGACY_IMAGES:
+        names = (
+            REVIEWED_CANDIDATE_IMAGES
+            if role == "release"
+            else REVIEWED_ROLLBACK_IMAGES
+        )
+        for name in names:
             print(
                 "\t".join(
                     (

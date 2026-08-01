@@ -237,6 +237,34 @@ services:
       timeout: 3s
       retries: 5
 
+  atlas-observer:
+    image: ${ATLAS_OBSERVER_IMAGE:?ATLAS_OBSERVER_IMAGE is required}
+    command:
+      - --continuous
+      - --ledger-dir=/var/lib/phoenix-atlas-observer
+      - --health-addr=0.0.0.0:9700
+    volumes:
+      - /opt/phoenix/evidence/atlas-live:/var/lib/phoenix-atlas-observer
+    networks: [phoenix-internal]
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1777,noexec,nosuid,nodev
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 64
+    cpus: "0.25"
+    mem_limit: 192m
+    stop_grace_period: 15s
+    restart: unless-stopped
+    logging: *bounded-logging
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O - http://127.0.0.1:9700/readyz >/dev/null 2>&1"]
+      interval: 15s
+      timeout: 3s
+      retries: 5
+      start_period: 20s
+
   dashboard:
     image: ${DASHBOARD_IMAGE:?DASHBOARD_IMAGE is required}
     volumes:

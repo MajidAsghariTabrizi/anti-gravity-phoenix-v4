@@ -101,7 +101,7 @@ def load_registry(path: Path | None = None) -> dict[str, Any]:
         raise ReleaseComponentError("required CI job contract is invalid")
 
     components = value["components"]
-    if not isinstance(components, list) or len(components) != 7:
+    if not isinstance(components, list) or len(components) != 8:
         raise ReleaseComponentError("release component count is invalid")
     names: list[str] = []
     protected_count = 0
@@ -252,7 +252,9 @@ PROTECTED_IMAGES = tuple(
 )
 BUILT_IMAGES = tuple(name for name in RELEASE_IMAGES if name not in PROTECTED_IMAGES)
 LEGACY_RELEASE_IMAGES = tuple(
-    component["name"] for component in COMPONENTS if not component["live_canary_only"]
+    component["name"]
+    for component in COMPONENTS
+    if component["name"] != "atlas-observer"
 )
 IMAGE_ENVIRONMENT_COMPONENTS = tuple(
     sorted(

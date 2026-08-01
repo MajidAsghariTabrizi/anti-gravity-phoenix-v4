@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from copy import deepcopy
 import unittest
 
 from scripts import change_impact, release_components
@@ -54,6 +55,12 @@ class ChangeImpactTests(unittest.TestCase):
         plan = change_impact.classify(["deploy/dashboard.Dockerfile"])
         self.assertTrue(plan["docker_static"])
         self.assertEqual(plan["built_images"], ["dashboard"])
+        self.assertTrue(plan["jobs"]["docker-validation"])
+
+    def test_prometheus_config_builds_no_owned_image(self) -> None:
+        plan = change_impact.classify(["prometheus/prometheus.yml"])
+        self.assertEqual(plan["unknown_paths"], [])
+        self.assertEqual(plan["built_images"], [])
         self.assertTrue(plan["jobs"]["docker-validation"])
 
     def test_root_ignore_is_static_when_every_image_has_a_specific_contract(
@@ -122,12 +129,33 @@ class ChangeImpactTests(unittest.TestCase):
         self.assertNotIn("cargo fetch", rust_dockerfile)
         self.assertIn("cargo build --locked --release", rust_dockerfile)
 
-    def test_release_registry_change_is_conservative(self) -> None:
+    def test_release_registry_path_change_is_conservative(self) -> None:
         plan = change_impact.classify(["release-components.json"])
         self.assertEqual(
             plan["built_images"], sorted(release_components.RELEASE_IMAGES)
         )
         self.assertTrue(all(plan["jobs"][name] for name in ("hygiene", "docker-validation")))
+
+    def test_only_exact_atlas_registry_addition_can_narrow(self) -> None:
+        head = deepcopy(release_components.REGISTRY)
+        base = deepcopy(head)
+        base["components"] = [
+            component
+            for component in base["components"]
+            if component["name"] != "atlas-observer"
+        ]
+        self.assertTrue(change_impact._exact_atlas_registry_addition(base, head))
+
+        drifted = deepcopy(head)
+        next(
+            component
+            for component in drifted["components"]
+            if component["name"] == "dashboard"
+        )["build_context"] = "drifted"
+        self.assertFalse(
+            change_impact._exact_atlas_registry_addition(base, drifted)
+        )
+        self.assertFalse(change_impact._exact_atlas_registry_addition(None, head))
 
     def test_unknown_path_fails_conservative(self) -> None:
         plan = change_impact.classify(["new-runtime/component.bin"])

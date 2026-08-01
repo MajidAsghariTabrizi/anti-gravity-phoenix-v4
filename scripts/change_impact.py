@@ -48,6 +48,8 @@ ALL_IMAGE_CONTRACT_FILES = {
     "release-components.json",
 }
 DOCKERFILE_IMAGES = {
+    "deploy/atlas-observer.Dockerfile": ("atlas-observer",),
+    "deploy/atlas-observer.Dockerfile.dockerignore": ("atlas-observer",),
     "deploy/dashboard.Dockerfile": ("dashboard",),
     "deploy/dashboard.Dockerfile.dockerignore": ("dashboard",),
     "deploy/feed-ingestor.Dockerfile": ("feed-ingestor",),
@@ -157,6 +159,23 @@ def _classify_path(
             images,
             job_names=("hygiene", "python-dashboard", "docker-validation"),
             image_names=("dashboard",),
+        )
+        return True, True
+
+    if _under(path, "prometheus/"):
+        _mark(
+            jobs,
+            images,
+            job_names=("hygiene", "docker-validation"),
+        )
+        return True, False
+
+    if _under(path, "atlas-observer/"):
+        _mark(
+            jobs,
+            images,
+            job_names=("hygiene", "go", "docker-validation"),
+            image_names=("atlas-observer",),
         )
         return True, True
 
@@ -392,6 +411,84 @@ def _git_paths(base: str, head: str) -> list[str]:
     return result.stdout.splitlines()
 
 
+def _git_json(ref: str, path: str) -> dict[str, object] | None:
+    result = subprocess.run(
+        ["git", "show", f"{ref}:{path}"],
+        check=False,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    if result.returncode != 0:
+        return None
+    try:
+        value = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def _exact_atlas_registry_addition(
+    base_registry: dict[str, object] | None,
+    head_registry: dict[str, object] | None,
+) -> bool:
+    if base_registry is None or head_registry is None:
+        return False
+    if (
+        base_registry.get("schema") != head_registry.get("schema")
+        or base_registry.get("required_ci") != head_registry.get("required_ci")
+    ):
+        return False
+    base_components = base_registry.get("components")
+    head_components = head_registry.get("components")
+    if not isinstance(base_components, list) or not isinstance(head_components, list):
+        return False
+    if not all(
+        isinstance(item, dict) and isinstance(item.get("name"), str)
+        for item in (*base_components, *head_components)
+    ):
+        return False
+    base_by_name = {item["name"]: item for item in base_components}
+    head_by_name = {item["name"]: item for item in head_components}
+    if len(base_by_name) != len(base_components) or len(head_by_name) != len(
+        head_components
+    ):
+        return False
+    if set(head_by_name) - set(base_by_name) != {"atlas-observer"}:
+        return False
+    if set(base_by_name) - set(head_by_name):
+        return False
+    if any(
+        head_by_name[name] != component
+        for name, component in base_by_name.items()
+    ):
+        return False
+    return (
+        head_by_name["atlas-observer"]
+        == release_components.COMPONENTS_BY_NAME["atlas-observer"]
+    )
+
+
+def classify_git(base: str, head: str) -> dict[str, object]:
+    paths = _git_paths(base, head)
+    plan = classify(paths)
+    if "release-components.json" not in paths:
+        return plan
+    if not _exact_atlas_registry_addition(
+        _git_json(base, "release-components.json"),
+        _git_json(head, "release-components.json"),
+    ):
+        return plan
+    other_paths = [path for path in paths if path != "release-components.json"]
+    built = {"atlas-observer"}
+    if other_paths:
+        other_plan = classify(other_paths)
+        built.update(other_plan["built_images"])
+    plan["built_images"] = sorted(built)
+    plan["inherited_images"] = sorted(set(IMAGES) - built)
+    return plan
+
+
 def _canonical(value: object) -> str:
     return json.dumps(value, sort_keys=True, separators=(",", ":"))
 
@@ -442,7 +539,7 @@ def main(argv: list[str] | None = None) -> int:
             plan = classify(args.paths.read_text(encoding="utf-8").splitlines())
             _write_plan(plan, args.output)
         else:
-            plan = classify(_git_paths(args.base, args.head))
+            plan = classify_git(args.base, args.head)
             if args.command == "github-output":
                 _github_output(plan)
             else:

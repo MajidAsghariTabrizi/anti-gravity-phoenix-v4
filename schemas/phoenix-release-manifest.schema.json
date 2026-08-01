@@ -150,10 +150,11 @@
         "rpc-gateway": { "$ref": "#/$defs/legacyImage" }
       }
     },
-    "inheritedImages": {
+    "currentImages": {
       "type": "object",
       "additionalProperties": false,
       "required": [
+        "atlas-observer",
         "dashboard",
         "feed-ingestor",
         "fork-sandbox",
@@ -163,6 +164,31 @@
         "rpc-gateway"
       ],
       "properties": {
+        "atlas-observer": { "$ref": "#/$defs/legacyImage" },
+        "dashboard": { "$ref": "#/$defs/legacyImage" },
+        "feed-ingestor": { "$ref": "#/$defs/legacyImage" },
+        "fork-sandbox": { "$ref": "#/$defs/legacyImage" },
+        "live-executor": { "$ref": "#/$defs/legacyImage" },
+        "phoenix-engine": { "$ref": "#/$defs/legacyImage" },
+        "recorder": { "$ref": "#/$defs/legacyImage" },
+        "rpc-gateway": { "$ref": "#/$defs/legacyImage" }
+      }
+    },
+    "inheritedImages": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "atlas-observer",
+        "dashboard",
+        "feed-ingestor",
+        "fork-sandbox",
+        "live-executor",
+        "phoenix-engine",
+        "recorder",
+        "rpc-gateway"
+      ],
+      "properties": {
+        "atlas-observer": { "$ref": "#/$defs/selectiveImage" },
         "dashboard": { "$ref": "#/$defs/selectiveImage" },
         "feed-ingestor": { "$ref": "#/$defs/selectiveImage" },
         "fork-sandbox": { "$ref": "#/$defs/selectiveImage" },
@@ -193,7 +219,10 @@
           "minLength": 1
         },
         "images": {
-          "$ref": "#/$defs/legacyImages"
+          "oneOf": [
+            { "$ref": "#/$defs/currentImages" },
+            { "$ref": "#/$defs/legacyImages" }
+          ]
         }
       }
     },

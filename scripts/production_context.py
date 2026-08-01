@@ -39,6 +39,7 @@ LEGACY_RELEASE_IMAGES = release_components.LEGACY_RELEASE_IMAGES
 PROTECTED_IMAGES = release_components.PROTECTED_IMAGES
 
 EXPECTED_SERVICES = (
+    "atlas-observer",
     "nitro-feed-relay",
     "nats",
     "postgres",
@@ -307,7 +308,9 @@ def validate_release_env(
     rendered: dict[str, str] = {}
     for image_name, (env_name, _) in RELEASE_ENVIRONMENT_IMAGES.items():
         value = values.get(env_name, "")
-        required = image_name in DEFAULT_PRODUCTION_IMAGES
+        required = image_name in DEFAULT_PRODUCTION_IMAGES and (
+            references is None or image_name in references
+        )
         if not value:
             if required:
                 raise ContextError("RELEASE_IMAGE_MISMATCH")
@@ -398,6 +401,17 @@ def service_environment(services: dict, service: str) -> dict:
     return value["environment"]
 
 
+def expected_services_for_references(
+    references: dict[str, str] | None, autonomous_live: bool
+) -> tuple[str, ...]:
+    expected = list(EXPECTED_SERVICES)
+    if references is not None and "atlas-observer" not in references:
+        expected.remove("atlas-observer")
+    if autonomous_live:
+        expected.append("live-executor")
+    return tuple(expected)
+
+
 def validate_render(args: argparse.Namespace) -> None:
     compose = read_json(
         Path(args.compose_config),
@@ -413,14 +427,14 @@ def validate_render(args: argparse.Namespace) -> None:
         and operator_env.get("LIVE_EXECUTION") == "true"
         and operator_env.get("AUTONOMOUS_EXECUTION") == "true"
     )
-    expected_services = LIVE_EXPECTED_SERVICES if autonomous_live else EXPECTED_SERVICES
-    if any(service not in services for service in expected_services):
-        raise ContextError("PRODUCTION_COMPOSE_CONTEXT_MISSING")
     release_env = read_env(Path(args.release_env), "RELEASE_ENV_MISSING")
     release_sha = None
     references = None
     if args.manifest:
         _, release_sha, references = load_manifest(Path(args.manifest))
+    expected_services = expected_services_for_references(references, autonomous_live)
+    if any(service not in services for service in expected_services):
+        raise ContextError("PRODUCTION_COMPOSE_CONTEXT_MISSING")
     release_images = validate_release_env(release_env, release_sha, references)
     release_sha = release_sha or release_env.get("PHOENIX_RELEASE_SHA")
     if not isinstance(release_sha, str) or not SHA_PATTERN.fullmatch(release_sha):
@@ -441,6 +455,11 @@ def validate_render(args: argparse.Namespace) -> None:
         images[service] = image
 
     rendered_owned_images = dict(RENDERED_OWNED_IMAGES)
+    rendered_owned_images = {
+        service: env_name
+        for service, env_name in rendered_owned_images.items()
+        if service in expected_services
+    }
     if autonomous_live:
         for _, (env_name, service) in OPTIONAL_LIVE_IMAGES.items():
             rendered_owned_images[service] = env_name

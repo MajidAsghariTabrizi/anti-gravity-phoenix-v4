@@ -1,0 +1,5 @@
+**
+!atlas-observer/
+!atlas-observer/**
+!deploy/
+!deploy/atlas-observer.Dockerfile

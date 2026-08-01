@@ -130,14 +130,15 @@ class HunterA1Tests(unittest.TestCase):
         self.assertNotIn("SIGNER_PRIVATE_KEY", core)
         self.assertNotIn("private_key", core.lower())
 
-    def test_release_components_remain_exactly_seven(self) -> None:
+    def test_release_components_remain_exactly_eight(self) -> None:
         components = json.loads(
             (ROOT / "release-components.json").read_text(encoding="utf-8")
         )["components"]
-        self.assertEqual(len(components), 7)
+        self.assertEqual(len(components), 8)
         self.assertEqual(
             {item["name"] for item in components},
             {
+                "atlas-observer",
                 "dashboard",
                 "feed-ingestor",
                 "fork-sandbox",

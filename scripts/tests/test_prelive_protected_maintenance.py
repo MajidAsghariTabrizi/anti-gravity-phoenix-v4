@@ -31,7 +31,7 @@ def image_reference(name: str, value: int) -> str:
 def manifest(
     release_sha: str,
     offset: int,
-    image_names: tuple[str, ...] = maintenance.LEGACY_RELEASE_IMAGES,
+    image_names: tuple[str, ...] = maintenance.CURRENT_RELEASE_IMAGES,
 ) -> dict:
     return {
         "schema": maintenance.RELEASE_SCHEMA,
@@ -435,7 +435,7 @@ class ProtectedMaintenanceTests(unittest.TestCase):
         value["metrics"] = metrics(1010, 10)
         return value
 
-    def test_reviewed_six_and_seven_image_generation_pairs_pass(self) -> None:
+    def test_reviewed_seven_and_eight_image_generation_pairs_pass(self) -> None:
         cases = (
             (
                 "legacy-to-legacy",
@@ -479,7 +479,7 @@ class ProtectedMaintenanceTests(unittest.TestCase):
                 ),
             ),
             (
-                "unexpected-eighth-image",
+                "unexpected-ninth-image",
                 maintenance.CURRENT_RELEASE_IMAGES + ("unreviewed-image",),
             ),
         )
@@ -534,7 +534,7 @@ class ProtectedMaintenanceTests(unittest.TestCase):
                 ):
                     self.build_plan_from_manifests(release, rollback)
 
-    def test_seven_image_plan_keeps_production_render_set_exact(self) -> None:
+    def test_eight_image_plan_keeps_production_render_set_exact(self) -> None:
         plan = self.build_generation_plan(
             maintenance.CURRENT_RELEASE_IMAGES,
             maintenance.CURRENT_RELEASE_IMAGES,
@@ -575,7 +575,7 @@ class ProtectedMaintenanceTests(unittest.TestCase):
             maintenance.CURRENT_RELEASE_IMAGES,
             maintenance.CURRENT_RELEASE_IMAGES,
         )
-        plan_path = self.write("seven-image-plan.json", plan)
+        plan_path = self.write("eight-image-plan.json", plan)
         output = io.StringIO()
         with redirect_stdout(output):
             maintenance.command_image_refs(SimpleNamespace(plan=str(plan_path)))

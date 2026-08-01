@@ -144,7 +144,7 @@ func (c *Client) runConnection(ctx context.Context) (returnErr error) {
 			returnErr = err
 		}
 	}()
-	c.logger.Printf("atlas read-only subscription accepted id=%s", ack.Result)
+	c.logger.Print("atlas read-only subscription accepted")
 
 	for {
 		if complete, err := c.ledger.Complete(time.Now()); err != nil {
@@ -195,7 +195,7 @@ func (c *Client) runConnection(ctx context.Context) (returnErr error) {
 				asset = *record.OracleUpdate.Asset
 			}
 			state := c.ledger.Snapshot(time.Now())
-			c.logger.Printf("auction recorded id=%s asset=%s relevant_aave=%t count=%d", record.AuctionID, asset, record.RelevantAaveAuction, state.UniqueAuctionCount)
+			c.logger.Printf("auction recorded asset=%s relevant_aave=%t count=%d", asset, record.RelevantAaveAuction, state.UniqueAuctionCount)
 		}
 	}
 }

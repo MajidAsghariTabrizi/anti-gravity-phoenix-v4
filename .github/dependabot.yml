@@ -38,6 +38,18 @@ updates:
       - dependency-name: "*"
         update-types: ["version-update:semver-major"]
 
+  - package-ecosystem: gomod
+    directory: /atlas-observer
+    schedule:
+      interval: weekly
+    groups:
+      atlas-go-minor-patch:
+        patterns: ["*"]
+        update-types: ["minor", "patch"]
+    ignore:
+      - dependency-name: "*"
+        update-types: ["version-update:semver-major"]
+
   - package-ecosystem: cargo
     directory: /phoenix-engine
     schedule:

@@ -28,7 +28,9 @@ ASSET_SCHEMA = "phoenix.release-assets.v1"
 LEGACY_RELEASE_IMAGES = release_components.LEGACY_RELEASE_IMAGES
 CURRENT_RELEASE_IMAGES = release_components.RELEASE_IMAGES
 REVIEWED_RELEASE_IMAGE_SETS = (LEGACY_RELEASE_IMAGES, CURRENT_RELEASE_IMAGES)
-OWNED_IMAGES = LEGACY_RELEASE_IMAGES
+OWNED_IMAGES = tuple(
+    component["name"] for component in release_components.DEFAULT_PRODUCTION_COMPONENTS
+)
 MAINTENANCE_IMAGE_REFERENCES = OWNED_IMAGES
 PROTECTED_SERVICES = (
     "nitro-feed-relay",
@@ -41,6 +43,7 @@ FIXED_SERVICES = ("nitro-feed-relay", "nats", "postgres")
 MUTABLE_SERVICES = ("feed-ingestor", "recorder")
 MIGRATION_SERVICE = "migration-runner"
 OPTIONAL_SERVICES = (
+    "atlas-observer",
     "prometheus",
     "rpc-gateway",
     "shadow-dispatcher",
@@ -48,6 +51,7 @@ OPTIONAL_SERVICES = (
     "dashboard",
 )
 COMPOSE_SERVICES = (
+    "atlas-observer",
     "nitro-feed-relay",
     "nats",
     "postgres",
@@ -86,6 +90,7 @@ PROMETHEUS_IMAGE = (
     "sha256:075b1ba2c4ebb04bc3a6ab86c06ec8d8099f8fda1c96ef6d104d9bb1def1d8bc"
 )
 OPTIONAL_IMAGE_OWNERS = {
+    "atlas-observer": "atlas-observer",
     "rpc-gateway": "rpc-gateway",
     "phoenix-engine": "phoenix-engine",
     "shadow-dispatcher": "recorder",
@@ -533,13 +538,23 @@ def load_plan(path: Path) -> dict[str, Any]:
     return validate_plan(load_json(path, "plan_missing"))
 
 
+def _compose_services(plan: dict[str, Any], role: str) -> tuple[str, ...]:
+    role_images = plan["images"][role]
+    return tuple(
+        service
+        for service in COMPOSE_SERVICES
+        if service != "atlas-observer" or "atlas-observer" in role_images
+    )
+
+
 def _expected_compose_images(plan: dict[str, Any], role: str) -> dict[str, str]:
     images = dict(FIXED_IMAGES)
     images[MIGRATION_SERVICE] = plan["images"][role]["feed-ingestor"]
     for service in MUTABLE_SERVICES:
         images[service] = plan["images"][role][service]
     for service, owner in OPTIONAL_IMAGE_OWNERS.items():
-        images[service] = plan["images"][role][owner]
+        if owner in plan["images"][role]:
+            images[service] = plan["images"][role][owner]
     images["prometheus"] = PROMETHEUS_IMAGE
     return images
 
@@ -556,14 +571,14 @@ def _validate_render_metadata(
         or metadata.get("chain_id") != 42161
         or metadata.get("mode") != "SHADOW"
         or metadata.get("live_execution") is not False
-        or metadata.get("expected_services") != list(COMPOSE_SERVICES)
+        or metadata.get("expected_services") != list(_compose_services(plan, role))
         or DIGEST_RE.fullmatch(str(metadata.get("route_registry_hash", ""))) is None
         or not isinstance(metadata.get("images"), dict)
     ):
         _fail("render_contract_invalid")
     images = metadata["images"]
     expected = _expected_compose_images(plan, role)
-    if set(images) != set(COMPOSE_SERVICES):
+    if set(images) != set(_compose_services(plan, role)):
         _fail("render_contract_invalid")
     for service, reference in expected.items():
         if images.get(service) != reference:
@@ -597,7 +612,9 @@ def _normalize_resource_contract(
     return normalized
 
 
-def _validate_rendered_compose(value: Any) -> dict[str, Any]:
+def _validate_rendered_compose(
+    value: Any, expected_services: tuple[str, ...]
+) -> dict[str, Any]:
     expected_keys = {
         "name",
         "services",
@@ -625,7 +642,7 @@ def _validate_rendered_compose(value: Any) -> dict[str, Any]:
     services = value["services"]
     if not isinstance(services, dict):
         _fail("protected_compose_invalid")
-    if set(services) != set(COMPOSE_SERVICES):
+    if set(services) != set(expected_services):
         _fail("protected_compose_service_set_changed")
     for service, contract in services.items():
         if not isinstance(contract, dict) or not contract:
@@ -686,22 +703,24 @@ def validate_render_pair(
         "rollback": _validate_render_metadata(plan, "rollback", rollback_metadata),
     }
     rendered = {
-        "release": _validate_rendered_compose(release_compose),
-        "rollback": _validate_rendered_compose(rollback_compose),
+        role: _validate_rendered_compose(
+            release_compose if role == "release" else rollback_compose,
+            _compose_services(plan, role),
+        )
+        for role in ("release", "rollback")
     }
 
     release_services = rendered["release"]["services"]
     rollback_services = rendered["rollback"]["services"]
     expected_release_images = _expected_compose_images(plan, "release")
     expected_rollback_images = _expected_compose_images(plan, "rollback")
-    for service in COMPOSE_SERVICES:
-        release_service = release_services[service]
-        rollback_service = rollback_services[service]
-        if (
-            release_service["image"] != expected_release_images[service]
-            or rollback_service["image"] != expected_rollback_images[service]
-        ):
-            _fail(f"protected_compose_service_changed:{service}")
+    for role, services, expected_images in (
+        ("release", release_services, expected_release_images),
+        ("rollback", rollback_services, expected_rollback_images),
+    ):
+        for service in _compose_services(plan, role):
+            if services[service]["image"] != expected_images[service]:
+                _fail(f"protected_compose_service_changed:{service}")
 
     for service in FIXED_SERVICES:
         if release_services[service] != rollback_services[service]:
@@ -714,6 +733,12 @@ def validate_render_pair(
             _fail(f"protected_compose_service_changed:{service}")
 
     for service in OPTIONAL_SERVICES:
+        in_release = service in release_services
+        in_rollback = service in rollback_services
+        if in_release != in_rollback:
+            if service != "atlas-observer":
+                _fail(f"protected_compose_service_changed:{service}")
+            continue
         if service == "prometheus":
             _validate_prometheus_delta(
                 release_services[service], rollback_services[service]
