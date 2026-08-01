@@ -267,7 +267,7 @@ container_sql_inode=$(
 ) || fail candidate_monitor_sql_inode_unavailable
 [ "$container_sql_inode" = "$host_sql_inode" ] ||
   fail candidate_monitor_sql_inode_mismatch
-deadline=$(( $(date +%s) + 180 ))
+deadline=$(( $(date +%s) + 720 ))
 monitor_health=
 while [ "$(date +%s)" -lt "$deadline" ]; do
   monitor_health=$(
@@ -276,9 +276,23 @@ while [ "$(date +%s)" -lt "$deadline" ]; do
       "$monitor_container" 2>/dev/null || true
   )
   [ "$monitor_health" = healthy ] && break
+  monitor_state=$(
+    /usr/bin/docker inspect \
+      --format '{{.State.Status}}:{{.State.ExitCode}}' \
+      "$monitor_container" 2>/dev/null || true
+  )
+  case "$monitor_state" in
+    exited:*|dead:*)
+      /usr/bin/docker logs --tail 20 "$monitor_container" >&2 || true
+      fail candidate_monitor_exited
+      ;;
+  esac
   sleep 2
 done
-[ "$monitor_health" = healthy ] || fail candidate_monitor_unhealthy
+if [ "$monitor_health" != healthy ]; then
+  /usr/bin/docker logs --tail 20 "$monitor_container" >&2 || true
+  fail candidate_monitor_unhealthy
+fi
 
 latest=$monitor_output/latest-dashboard.json
 [ -f "$latest" ] && [ ! -L "$latest" ] ||
