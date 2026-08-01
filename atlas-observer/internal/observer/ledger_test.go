@@ -116,3 +116,35 @@ func TestSubscriptionIdentityIsDurable(t *testing.T) {
 		t.Fatal("subscription identity was not persisted")
 	}
 }
+
+func TestContinuousLedgerContractIsDurableAndUnboundedByTime(t *testing.T) {
+	dir := t.TempDir()
+	start := time.Unix(1_700_000_000, 0).UTC()
+	ledger, err := OpenLedger(dir, start, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	state := ledger.Snapshot(start.Add(10 * 365 * 24 * time.Hour))
+	if !state.Continuous || !state.StopAt.IsZero() || state.MaximumAuctions != 0 || state.Completed {
+		t.Fatalf("unexpected continuous contract: %#v", state)
+	}
+	complete, err := ledger.Complete(start.Add(10 * 365 * 24 * time.Hour))
+	if err != nil || complete {
+		t.Fatalf("continuous ledger completed by time: complete=%t err=%v", complete, err)
+	}
+	if _, err := OpenLedger(dir, start.Add(time.Hour), 0, 0); err != nil {
+		t.Fatalf("continuous ledger was not resumable: %v", err)
+	}
+	if _, err := OpenLedger(dir, start.Add(time.Hour), 500, 72*time.Hour); err == nil {
+		t.Fatal("continuous ledger reopened under a bounded contract")
+	}
+}
+
+func TestLedgerRejectsHalfBoundedContract(t *testing.T) {
+	if _, err := OpenLedger(t.TempDir(), time.Now(), 500, 0); err == nil {
+		t.Fatal("auction-only observation bound was accepted")
+	}
+	if _, err := OpenLedger(t.TempDir(), time.Now(), 0, time.Hour); err == nil {
+		t.Fatal("duration-only observation bound was accepted")
+	}
+}

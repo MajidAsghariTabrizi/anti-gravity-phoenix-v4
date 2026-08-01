@@ -18,6 +18,7 @@ const (
 	WebSocketReadLimitBytes   = 16 * 1024 * 1024
 	DefaultMaximumAuctions    = uint64(500)
 	DefaultMaximumObservation = "72h"
+	MaximumAuctionIdentities  = uint64(1_000_000)
 )
 
 type Feed struct {

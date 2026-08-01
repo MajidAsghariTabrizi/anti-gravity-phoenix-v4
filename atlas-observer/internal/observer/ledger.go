@@ -17,6 +17,7 @@ type LedgerState struct {
 	StartedAt               time.Time         `json:"started_at"`
 	StopAt                  time.Time         `json:"stop_at"`
 	MaximumAuctions         uint64            `json:"maximum_auctions"`
+	Continuous              bool              `json:"continuous"`
 	UniqueAuctionCount      uint64            `json:"unique_auction_count"`
 	ValidArbitrumCount      uint64            `json:"valid_arbitrum_count"`
 	RelevantAaveCount       uint64            `json:"relevant_aave_count"`
@@ -25,6 +26,12 @@ type LedgerState struct {
 	InvalidCount            uint64            `json:"invalid_count"`
 	ReconnectCount          uint64            `json:"reconnect_count"`
 	LastObservedAt          *time.Time        `json:"last_observed_at"`
+	LastMessageAt           *time.Time        `json:"last_message_at"`
+	LastConnectedAt         *time.Time        `json:"last_connected_at"`
+	LastDisconnectedAt      *time.Time        `json:"last_disconnected_at"`
+	LastSubscriptionAt      *time.Time        `json:"last_subscription_at"`
+	LastStateUpdatedAt      time.Time         `json:"last_state_updated_at"`
+	Connected               bool              `json:"connected"`
 	LastSubscriptionID      string            `json:"last_subscription_id,omitempty"`
 	PerFeed                 map[string]uint64 `json:"per_feed"`
 	Completed               bool              `json:"completed"`
@@ -45,8 +52,9 @@ func OpenLedger(dir string, now time.Time, maximumAuctions uint64, maximumDurati
 	if !filepath.IsAbs(dir) {
 		return nil, errors.New("ledger directory must be absolute")
 	}
-	if maximumAuctions == 0 || maximumDuration <= 0 {
-		return nil, errors.New("observation bounds must be positive")
+	continuous := maximumAuctions == 0 && maximumDuration == 0
+	if !continuous && (maximumAuctions == 0 || maximumDuration <= 0) {
+		return nil, errors.New("observation bounds must both be positive or both be zero for continuous mode")
 	}
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, fmt.Errorf("create ledger directory: %w", err)
@@ -74,6 +82,7 @@ func (l *Ledger) Append(record *LedgerRecord) (bool, error) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	if digest, exists := l.seen[record.AuctionID]; exists {
+		l.observeMessageLocked(record.ObservedAt)
 		l.state.DuplicateCount++
 		if digest != record.NotificationSHA256 {
 			l.state.InvalidCount++
@@ -89,12 +98,21 @@ func (l *Ledger) Append(record *LedgerRecord) (bool, error) {
 		}
 		return false, l.persistStateLocked(record.ObservedAt)
 	}
+	if uint64(len(l.seen)) >= MaximumAuctionIdentities {
+		l.state.Completed = true
+		l.state.CompletionReason = "safety_identity_limit"
+		if err := l.persistStateLocked(record.ObservedAt); err != nil {
+			return false, err
+		}
+		return false, errors.New("continuous ledger reached the reviewed identity safety limit")
+	}
 	if err := appendJSONLine(l.auctionsPath, record); err != nil {
 		return false, err
 	}
 	l.seen[record.AuctionID] = record.NotificationSHA256
 	l.state.UniqueAuctionCount++
 	l.state.ValidArbitrumCount++
+	l.observeMessageLocked(record.ObservedAt)
 	l.state.LastSubscriptionID = record.SubscriptionID
 	if record.RelevantAaveAuction {
 		l.state.RelevantAaveCount++
@@ -112,6 +130,7 @@ func (l *Ledger) AppendInvalid(record InvalidRecord) error {
 		return err
 	}
 	l.state.InvalidCount++
+	l.observeMessageLocked(record.ObservedAt)
 	return l.persistStateLocked(record.ObservedAt)
 }
 
@@ -126,6 +145,7 @@ func (l *Ledger) RecordFilteredOtherChain(now time.Time) error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	l.state.FilteredOtherChainCount++
+	l.observeMessageLocked(now)
 	return l.persistStateLocked(now)
 }
 
@@ -135,7 +155,20 @@ func (l *Ledger) RecordSubscription(now time.Time, subscriptionID string) error 
 	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	now = now.UTC()
+	l.state.Connected = true
+	l.state.LastConnectedAt = &now
+	l.state.LastSubscriptionAt = &now
 	l.state.LastSubscriptionID = subscriptionID
+	return l.persistStateLocked(now)
+}
+
+func (l *Ledger) RecordDisconnected(now time.Time) error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	now = now.UTC()
+	l.state.Connected = false
+	l.state.LastDisconnectedAt = &now
 	return l.persistStateLocked(now)
 }
 
@@ -192,28 +225,48 @@ func (l *Ledger) loadSeen() error {
 }
 
 func (l *Ledger) loadOrInitializeState(now time.Time, maximumAuctions uint64, maximumDuration time.Duration) error {
+	continuous := maximumAuctions == 0 && maximumDuration == 0
 	f, err := secureOpenForRead(l.statePath)
 	if err == nil {
 		defer f.Close()
 		if err := json.NewDecoder(f).Decode(&l.state); err != nil {
 			return fmt.Errorf("decode ledger state: %w", err)
 		}
-		if l.state.Schema != StateSchema || l.state.MaximumAuctions != maximumAuctions || !l.state.StopAt.Equal(l.state.StartedAt.Add(maximumDuration)) {
+		boundsMatch := l.state.MaximumAuctions == maximumAuctions && l.state.Continuous == continuous
+		if continuous {
+			boundsMatch = boundsMatch && l.state.StopAt.IsZero()
+		} else {
+			boundsMatch = boundsMatch && l.state.StopAt.Equal(l.state.StartedAt.Add(maximumDuration))
+		}
+		if l.state.Schema != StateSchema || !boundsMatch {
 			return errors.New("existing ledger observation contract differs from requested bounds")
 		}
 		if l.state.UniqueAuctionCount != uint64(len(l.seen)) {
 			return errors.New("ledger state count does not match durable auction records")
+		}
+		if l.state.PerFeed == nil {
+			l.state.PerFeed = make(map[string]uint64)
+		}
+		if l.state.Connected {
+			l.state.Connected = false
+			l.state.LastDisconnectedAt = &now
+			return l.persistStateLocked(now)
 		}
 		return nil
 	}
 	if !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
+	stopAt := time.Time{}
+	if !continuous {
+		stopAt = now.Add(maximumDuration)
+	}
 	l.state = LedgerState{
 		Schema:          StateSchema,
 		StartedAt:       now,
-		StopAt:          now.Add(maximumDuration),
+		StopAt:          stopAt,
 		MaximumAuctions: maximumAuctions,
+		Continuous:      continuous,
 		PerFeed:         make(map[string]uint64),
 	}
 	return l.persistStateLocked(now)
@@ -221,6 +274,9 @@ func (l *Ledger) loadOrInitializeState(now time.Time, maximumAuctions uint64, ma
 
 func (l *Ledger) applyCompletionLocked(now time.Time) bool {
 	if l.state.Completed {
+		return false
+	}
+	if l.state.Continuous {
 		return false
 	}
 	if l.state.UniqueAuctionCount >= l.state.MaximumAuctions {
@@ -238,9 +294,15 @@ func (l *Ledger) applyCompletionLocked(now time.Time) bool {
 
 func (l *Ledger) persistStateLocked(observedAt time.Time) error {
 	observedAt = observedAt.UTC()
-	l.state.LastObservedAt = &observedAt
+	l.state.LastStateUpdatedAt = observedAt
 	l.applyCompletionLocked(observedAt)
 	return writeJSONAtomically(l.statePath, &l.state)
+}
+
+func (l *Ledger) observeMessageLocked(observedAt time.Time) {
+	observedAt = observedAt.UTC()
+	l.state.LastObservedAt = &observedAt
+	l.state.LastMessageAt = &observedAt
 }
 
 func appendJSONLine(path string, value any) error {

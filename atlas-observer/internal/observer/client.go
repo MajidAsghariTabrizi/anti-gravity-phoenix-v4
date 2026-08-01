@@ -97,7 +97,7 @@ func (c *Client) Run(ctx context.Context) error {
 	}
 }
 
-func (c *Client) runConnection(ctx context.Context) error {
+func (c *Client) runConnection(ctx context.Context) (returnErr error) {
 	conn, response, err := c.dialer.DialContext(ctx, OfficialSearcherGateway, nil)
 	if err != nil {
 		if response != nil {
@@ -139,6 +139,11 @@ func (c *Client) runConnection(ctx context.Context) error {
 	if err := c.ledger.RecordSubscription(time.Now().UTC(), ack.Result); err != nil {
 		return err
 	}
+	defer func() {
+		if err := c.ledger.RecordDisconnected(time.Now().UTC()); err != nil && returnErr == nil {
+			returnErr = err
+		}
+	}()
 	c.logger.Printf("atlas read-only subscription accepted id=%s", ack.Result)
 
 	for {
