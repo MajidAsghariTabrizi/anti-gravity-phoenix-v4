@@ -69,6 +69,7 @@ STATIC_PATHS = (
     "scripts/phoenix-autonomous-live-deploy-gateway.sh",
     "scripts/phoenix-release-gateway.sh",
     "scripts/phoenix-release-transport.sh",
+    "scripts/phoenix-observer.sh",
     "scripts/phoenix_shadow_deploy.py",
     "scripts/hunter_contracts.py",
     "scripts/prelive-money-path-report.sh",
