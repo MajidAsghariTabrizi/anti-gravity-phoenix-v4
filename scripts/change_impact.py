@@ -480,10 +480,10 @@ def classify_git(base: str, head: str) -> dict[str, object]:
     ):
         return plan
     other_paths = [path for path in paths if path != "release-components.json"]
-    built = {"atlas-observer"}
+    built = {"atlas-observer"} & set(IMAGES)
     if other_paths:
         other_plan = classify(other_paths)
-        built.update(other_plan["built_images"])
+        built.update(set(other_plan["built_images"]) & set(IMAGES))
     plan["built_images"] = sorted(built)
     plan["inherited_images"] = sorted(set(IMAGES) - built)
     return plan
