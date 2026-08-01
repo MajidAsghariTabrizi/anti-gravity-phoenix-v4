@@ -1,0 +1,194 @@
+{
+  "schema": "phoenix.camelot-curve-revenue-proof.v1",
+  "classification": "B-B",
+  "captured_at": "2026-08-01T08:40:56.888827+00:00",
+  "chain_id": 42161,
+  "block_number": 489927908,
+  "block_hash": "0x88bf46c24f3a633e9f1683358e93b8c449323ace2c1f0d8d83a36365f7beacee",
+  "block_timestamp": "2026-08-01T08:40:42+00:00",
+  "provider_agreement": {
+    "reviewed_provider_count": 2,
+    "provider_0_head": 489927938,
+    "provider_1_head": 489927963,
+    "same_block_hash": true,
+    "same_identity": true,
+    "same_state": true,
+    "same_quotes": true
+  },
+  "official_sources": {
+    "camelot_deployments": "https://docs.camelot.exchange/contracts/arbitrum/one-mainnet",
+    "curve_repository": "https://github.com/curvefi/stableswap-ng",
+    "curve_commit": "2abe778f40206a6c0fd108a0a53ad3266cbedeee",
+    "curve_deployments_path": "scripts/deployments.py",
+    "curve_pool_source_path": "contracts/main/CurveStableSwapNG.vy",
+    "curve_api_pool_endpoint": "https://api.curve.finance/v1/getPools/arbitrum/factory-stable-ng",
+    "curve_api_pool_id": "factory-stable-ng-319"
+  },
+  "identity": {
+    "weth": {
+      "address": "0x82af49447d8a07e3bd95bd0d56f35241523fbab1",
+      "code_hash": "0x2d240bb4510ed1acfeaba905eb4bcc4524d63c8ae66e48fcccac55ea714db7a7"
+    },
+    "usdc": {
+      "address": "0xaf88d065e77c8cc2239327c5edb3a432268e5831",
+      "code_hash": "0xad30d819dbc47814b7e6cb837fd7cc57fcb591479a38596ee93de4fc52e8c435"
+    },
+    "aave_pool": {
+      "address": "0x794a61358d6845594f94dc1db02a252b5b4814ad",
+      "code_hash": "0xf168c2e9e4d04292c7d5d526a9a917175a44369ab63a2f9997537acf0ffaaf2e",
+      "addresses_provider": "0xa97684ead0e402dc232d5a977953df7ecbab3cdb",
+      "flash_premium_total_bps": 5
+    },
+    "camelot_factory": {
+      "address": "0x1a3c9b1d2f0529d97f2afc5136cc23e58f1fd35b",
+      "code_hash": "0xd2e121b20e1ffe21cebd67e884032884c11425315d7d0f746673b246371558d3"
+    },
+    "camelot_quoter": {
+      "address": "0x0fc73040b26e9bc8514fa028d998e73a254fa76e",
+      "code_hash": "0x0f9ba8ab527f7c6b6162fa4a42655acbdd57109f409e142d688dc4504e80443e"
+    },
+    "camelot_router": {
+      "address": "0x1f721e2e82f6676fce4ea07a5958cf098d339e18",
+      "code_hash": "0x21a5c887c1cd1b7a53bfa17970153bbe38c428f8accf4e6c010cd371b6b3c7a6"
+    },
+    "camelot_pool": {
+      "address": "0xb1026b8e7276e7ac75410f1fcbbe21796e8f7526",
+      "code_hash": "0xe7ec0fc6e905d165bbe5bc4a5e1e89b3e1e5ae237c67fb9b8f3dd4e07acee6f9",
+      "factory": "0x1a3c9b1d2f0529d97f2afc5136cc23e58f1fd35b",
+      "factory_pool_by_pair": "0xb1026b8e7276e7ac75410f1fcbbe21796e8f7526",
+      "token0": "0x82af49447d8a07e3bd95bd0d56f35241523fbab1",
+      "token1": "0xaf88d065e77c8cc2239327c5edb3a432268e5831"
+    },
+    "curve_factory": {
+      "address": "0x9af14d26075f142eb3f292d5065eb3faa646167b",
+      "code_hash": "0xa2360ff48b83e8eeb4a633f8f4c268a62c4f23c0d2da5b673423a2b58e7a78d2"
+    },
+    "curve_implementation": {
+      "address": "0xf6841c27fe35ed7069189afd5b81513578afd7ff",
+      "code_hash": "0xb7283520ec579d21cbcb603d7da789bccc5a7b1f48fe858af4ffd7dde9b16bc0"
+    },
+    "curve_pool": {
+      "address": "0x85bbd07ec4d0fc23c42b6ca4af266eaec65342fb",
+      "code_hash": "0xe87a07ad9df8621c0c62192814fa3a2ab5227ff035d852a06882ac5efb8cfb18",
+      "factory_implementation": "0xf6841c27fe35ed7069189afd5b81513578afd7ff",
+      "factory_token0": "0x82af49447d8a07e3bd95bd0d56f35241523fbab1",
+      "factory_token1": "0xaf88d065e77c8cc2239327c5edb3a432268e5831",
+      "token0": "0x82af49447d8a07e3bd95bd0d56f35241523fbab1",
+      "token1": "0xaf88d065e77c8cc2239327c5edb3a432268e5831"
+    }
+  },
+  "state": {
+    "base_fee_per_gas_wei": "20132000",
+    "max_priority_fee_per_gas_wei": "0",
+    "camelot": {
+      "sqrt_price_x96": "3422850554173943004289442",
+      "tick": -201003,
+      "current_fee_millionths": 100,
+      "liquidity": "30914771259629248"
+    },
+    "curve": {
+      "fee_1e10": "10000000",
+      "offpeg_fee_multiplier_1e10": "25000000000",
+      "balance0": "5194836625536080416",
+      "balance1": "10021136390"
+    }
+  },
+  "policy": {
+    "minimum_input_wei": "100000000000000",
+    "maximum_input_wei": "10000000000000000",
+    "minimum_retained_profit_wei": "1000000000000",
+    "flash_premium_bps": 5,
+    "conservative_cost_multiplier_bps": 12500,
+    "maximum_ordering_payment_wei": "0"
+  },
+  "cost_proof": {
+    "method": "monotone-negative upper bound",
+    "execution_gas_cost_lower_bound_wei": "0",
+    "l1_data_fee_lower_bound_wei": "0",
+    "ordering_cost_lower_bound_wei": "0",
+    "failure_reserve_lower_bound_wei": "0",
+    "fork_required": false,
+    "fork_skipped_reason": "Every exact gross quote is negative before flash premium, gas, L1 data fee, ordering cost, failure reserve, and retained-profit floor.",
+    "atomic_adapter_added": false
+  },
+  "seven_size_ladder": [
+    {
+      "amount_in_wei": "100000000000000",
+      "camelot_usdc_out": "186626",
+      "curve_weth_out_wei": "99379294658882",
+      "gross_profit_wei": "-620705341118",
+      "flash_premium_wei": "50000000000",
+      "expected_net_upper_bound_wei": "-670705341118",
+      "conservative_net_upper_bound_wei": "-683205341118",
+      "severe_net_upper_bound_wei": "-720705341118"
+    },
+    {
+      "amount_in_wei": "250000000000000",
+      "camelot_usdc_out": "466566",
+      "curve_weth_out_wei": "248448768217764",
+      "gross_profit_wei": "-1551231782236",
+      "flash_premium_wei": "125000000000",
+      "expected_net_upper_bound_wei": "-1676231782236",
+      "conservative_net_upper_bound_wei": "-1707481782236",
+      "severe_net_upper_bound_wei": "-1801231782236"
+    },
+    {
+      "amount_in_wei": "500000000000000",
+      "camelot_usdc_out": "933131",
+      "curve_weth_out_wei": "496897000865079",
+      "gross_profit_wei": "-3102999134921",
+      "flash_premium_wei": "250000000000",
+      "expected_net_upper_bound_wei": "-3352999134921",
+      "conservative_net_upper_bound_wei": "-3415499134921",
+      "severe_net_upper_bound_wei": "-3602999134921"
+    },
+    {
+      "amount_in_wei": "1000000000000000",
+      "camelot_usdc_out": "1866262",
+      "curve_weth_out_wei": "993793989468608",
+      "gross_profit_wei": "-6206010531392",
+      "flash_premium_wei": "500000000000",
+      "expected_net_upper_bound_wei": "-6706010531392",
+      "conservative_net_upper_bound_wei": "-6831010531392",
+      "severe_net_upper_bound_wei": "-7206010531392"
+    },
+    {
+      "amount_in_wei": "2500000000000000",
+      "camelot_usdc_out": "4665645",
+      "curve_weth_out_wei": "2484479556657797",
+      "gross_profit_wei": "-15520443342203",
+      "flash_premium_wei": "1250000000000",
+      "expected_net_upper_bound_wei": "-16770443342203",
+      "conservative_net_upper_bound_wei": "-17082943342203",
+      "severe_net_upper_bound_wei": "-18020443342203"
+    },
+    {
+      "amount_in_wei": "5000000000000000",
+      "camelot_usdc_out": "9331259",
+      "curve_weth_out_wei": "4968942299105771",
+      "gross_profit_wei": "-31057700894229",
+      "flash_premium_wei": "2500000000000",
+      "expected_net_upper_bound_wei": "-33557700894229",
+      "conservative_net_upper_bound_wei": "-34182700894229",
+      "severe_net_upper_bound_wei": "-36057700894229"
+    },
+    {
+      "amount_in_wei": "10000000000000000",
+      "camelot_usdc_out": "18662387",
+      "curve_weth_out_wei": "9937813610782093",
+      "gross_profit_wei": "-62186389217907",
+      "flash_premium_wei": "5000000000000",
+      "expected_net_upper_bound_wei": "-67186389217907",
+      "conservative_net_upper_bound_wei": "-68436389217907",
+      "severe_net_upper_bound_wei": "-72186389217907"
+    }
+  ],
+  "conclusion": {
+    "highest_expected_net_upper_bound_wei": "-670705341118",
+    "retained_profit_floor_satisfied": false,
+    "independent_rpc_agreement": true,
+    "exact_state_complete": true,
+    "security_or_accounting_defect": false,
+    "decision": "B-B"
+  }
+}
