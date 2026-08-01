@@ -31,6 +31,9 @@ concurrency:
   group: phoenix-production-release
   cancel-in-progress: false
 
+env:
+  PHOENIX_RELEASE_IMAGE_SET: legacy
+
 jobs:
   prepare:
     name: verify-release-eligibility

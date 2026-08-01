@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import re
 from pathlib import Path, PurePosixPath
 from typing import Any
@@ -212,17 +213,21 @@ def build_matrix(
     built_images: set[str] | None = None,
 ) -> dict[str, list[dict[str, Any]]]:
     value = registry or REGISTRY
-    component_names = {
-        component["name"]
-        for component in value["components"]
-        if component["release_included"]
-    }
+    component_names = (
+        set(RELEASE_IMAGES)
+        if registry is None
+        else {
+            component["name"]
+            for component in value["components"]
+            if component["release_included"]
+        }
+    )
     selected = component_names if built_images is None else set(built_images)
     if not selected <= component_names:
         raise ReleaseComponentError("build matrix contains an unknown image")
     include = []
     for component in value["components"]:
-        if not component["release_included"]:
+        if component["name"] not in component_names:
             continue
         include.append(
             {
@@ -246,16 +251,23 @@ REGISTRY_PATH = _registry_path()
 REGISTRY = load_registry(REGISTRY_PATH)
 COMPONENTS = tuple(REGISTRY["components"])
 COMPONENTS_BY_NAME = {component["name"]: component for component in COMPONENTS}
-RELEASE_IMAGES = tuple(component["name"] for component in COMPONENTS)
-PROTECTED_IMAGES = tuple(
-    component["name"] for component in COMPONENTS if component["protected"]
-)
-BUILT_IMAGES = tuple(name for name in RELEASE_IMAGES if name not in PROTECTED_IMAGES)
+CURRENT_RELEASE_IMAGES = tuple(component["name"] for component in COMPONENTS)
 LEGACY_RELEASE_IMAGES = tuple(
     component["name"]
     for component in COMPONENTS
     if component["name"] != "atlas-observer"
 )
+_release_image_set = os.environ.get("PHOENIX_RELEASE_IMAGE_SET", "current")
+if _release_image_set == "current":
+    RELEASE_IMAGES = CURRENT_RELEASE_IMAGES
+elif _release_image_set == "legacy":
+    RELEASE_IMAGES = LEGACY_RELEASE_IMAGES
+else:
+    raise ReleaseComponentError("release image-set selector is invalid")
+PROTECTED_IMAGES = tuple(
+    component["name"] for component in COMPONENTS if component["protected"]
+)
+BUILT_IMAGES = tuple(name for name in RELEASE_IMAGES if name not in PROTECTED_IMAGES)
 IMAGE_ENVIRONMENT_COMPONENTS = tuple(
     sorted(
         (
