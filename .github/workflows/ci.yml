@@ -140,12 +140,14 @@ jobs:
           set -euo pipefail
           python3 -m py_compile \
             scripts/change_impact.py \
+            scripts/long_tail_event_replay.py \
             scripts/release_assets.py \
             scripts/release_components.py \
             scripts/release_platform.py \
             scripts/release_provenance.py \
             scripts/phoenix_release/*.py
           python3 -m unittest \
+            scripts.tests.test_long_tail_event_replay \
             scripts.tests.test_change_impact \
             scripts.tests.test_chain_reconciliation \
             scripts.tests.test_release_assets \

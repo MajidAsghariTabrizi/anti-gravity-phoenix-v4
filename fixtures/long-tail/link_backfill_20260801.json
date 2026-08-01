@@ -1,0 +1,11 @@
+{
+  "schema_version": "phoenix.long-tail.link-backfill.v1",
+  "chain_id": 42161,
+  "captured_at": "2026-08-01T09:03:10.980248Z",
+  "source_identity_count": 288,
+  "records_scanned": 288,
+  "match_contract": "exact_adjacent_link_weth_token_pair_with_matching_fee_command_and_pool_identity",
+  "prohibited_match_fields": ["recipient", "calldata_substring", "final_token", "raw_substring"],
+  "exact_match_count": 0,
+  "records": []
+}
