@@ -14,6 +14,7 @@ deploy_user=phoenix-deploy
 libexec=/usr/local/libexec/phoenix-release
 gateway=/usr/local/sbin/phoenix-release-gateway
 transport=/usr/local/sbin/phoenix-release-transport
+observer=/usr/local/sbin/phoenix-observer
 sudoers=/etc/sudoers.d/phoenix-release
 authorized_keys=/home/$deploy_user/.ssh/authorized_keys
 sshd_dropin=/etc/ssh/sshd_config.d/89-phoenix-deploy.conf
@@ -120,6 +121,7 @@ install -d -m 0700 -o root -g root /var/lib/phoenix-economic-activation/results
 
 install -m 0755 -o root -g root "$script_dir/phoenix-release-gateway.sh" "$gateway"
 install -m 0755 -o root -g root "$script_dir/phoenix-release-transport.sh" "$transport"
+install -m 0755 -o root -g root "$script_dir/phoenix-observer.sh" "$observer"
 for name in __init__.py chain_reconciliation.py model.py controller.py gateway.py cli.py phase_update.py; do
   install -m 0644 -o root -g root \
     "$script_dir/phoenix_release/$name" "$libexec/phoenix_release/$name"
