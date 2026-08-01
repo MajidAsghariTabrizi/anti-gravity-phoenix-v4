@@ -7,6 +7,7 @@ from scripts.atlas_borrower_index import (
     WAD,
     bind_hash,
     build_inventory,
+    build_inventory_from_checkpoint,
     calculate_account,
     evaluate_auction,
     validate_transcript,
@@ -183,6 +184,145 @@ def transcript(market_value, *, complete=True):
                 "logs": logs,
             }
         ],
+    }
+    return bind_hash(value)
+
+
+def checkpoint(market_value):
+    block = 100
+    header = {"number": block, "hash": BLOCK_HASH, "parent_hash": PARENT_HASH}
+    providers = ("reviewed-provider-1", "reviewed-provider-2")
+    reserves = []
+    for reserve in market_value["reserves"]:
+        reserves.append(
+            {
+                **copy.deepcopy(reserve),
+                "configuration_bitmap": 0,
+                "ltv_bps": 7_500,
+                "reserve_factor_bps": 1_000,
+                "usage_as_collateral_enabled": True,
+                "borrowing_enabled": True,
+                "stable_borrowing_enabled": True,
+                "frozen": False,
+                "price_base_units": 10**8,
+                "price_base_decimals": 8,
+                "stable_debt_token": reserve["stable_debt_token"] or ZERO,
+            }
+        )
+    source_impl = market_value["liquidation_logic"]["pool_implementation"]
+    value = {
+        "schema": "phoenix.atlas.aave-checkpoint.v1",
+        "chain_id": 42161,
+        "checkpoint_block": block,
+        "checkpoint_hash": BLOCK_HASH,
+        "discovery_content_sha256": "d" * 64,
+        "protocol": {
+            "pool": market_value["protocol"]["pool"],
+            "data_provider": market_value["protocol"]["data_provider"],
+            "oracle": market_value["protocol"]["oracle"],
+            "pool_implementation": source_impl,
+        },
+        "provider_headers": [
+            {"provider_id": provider, "checkpoint": copy.deepcopy(header)}
+            for provider in providers
+        ],
+        "protocol_code_bindings": [
+            {
+                "provider_id": provider,
+                "pool_implementation": source_impl,
+                "code_sha256": {
+                    "pool": "1" * 64,
+                    "data_provider": "2" * 64,
+                    "oracle": "3" * 64,
+                    "pool_implementation": "4" * 64,
+                },
+            }
+            for provider in providers
+        ],
+        "state_bindings": [
+            {
+                "provider_id": provider,
+                "context": context,
+                "call_count": 2,
+                "result_sha256": "5" * 64,
+            }
+            for context in (
+                "reserve_list",
+                "reserve_state",
+                "borrower_activity",
+                "borrower_state",
+            )
+            for provider in providers
+        ],
+        "source_bindings": {
+            "aave_address_book": {
+                "commit": market_value["sources"]["aave_address_book"]["commit"],
+                "path": "src/AaveV3Arbitrum.sol",
+                "pool_implementation": source_impl,
+            },
+            "aave_v3_origin": {
+                "commit": market_value["sources"]["aave_v3_origin"]["commit"],
+                "path": "LiquidationLogic.sol",
+            },
+        },
+        "liquidation_logic": {
+            "default_close_factor_bps": 5_000,
+            "close_factor_hf_threshold_wad": 950_000_000_000_000_000,
+            "minimum_reserve_value_base": 2_000 * 10**8,
+            "minimum_leftover_base": 1_000 * 10**8,
+        },
+        "archive_complete": True,
+        "independent_state_agreement": True,
+        "source_methods": [
+            "eth_chainId",
+            "eth_getBlockByNumber",
+            "eth_getCode",
+            "eth_getStorageAt",
+            "eth_call",
+        ],
+        "reserves": reserves,
+        "emode_categories": [],
+        "discovered_borrower_count": 1,
+        "screened_borrower_count": 1,
+        "discovery_log_count": 3,
+        "active_borrower_count": 1,
+        "borrowers": [
+            {
+                "address": BORROWER,
+                "account_configuration_bitmap": 24,
+                "emode_category": 0,
+                "positions": [
+                    {
+                        "asset": ASSET_COLLATERAL,
+                        "current_supply": 100 * 10**18,
+                        "scaled_supply": 100 * 10**18,
+                        "current_stable_debt": 0,
+                        "current_variable_debt": 0,
+                        "principal_stable_debt": 0,
+                        "scaled_variable_debt": 0,
+                        "usage_as_collateral_enabled": True,
+                    },
+                    {
+                        "asset": ASSET_DEBT,
+                        "current_supply": 0,
+                        "scaled_supply": 0,
+                        "current_stable_debt": 0,
+                        "current_variable_debt": 80 * 10**18,
+                        "principal_stable_debt": 0,
+                        "scaled_variable_debt": 80 * 10**18,
+                        "usage_as_collateral_enabled": False,
+                    },
+                ],
+            }
+        ],
+        "execution_authority": {
+            "signer": False,
+            "bond": False,
+            "bid": False,
+            "solver": False,
+            "submission": False,
+            "production_write": False,
+        },
     }
     return bind_hash(value)
 
@@ -386,6 +526,28 @@ class AtlasBorrowerIndexTests(unittest.TestCase):
         )
         self.assertEqual(position["stable_debt"], 0)
         self.assertEqual(position["variable_debt"], 80 * 10**18)
+
+    def test_hash_bound_checkpoint_import_is_complete_and_deterministic(self):
+        market_value = market()
+        checkpoint_value = checkpoint(market_value)
+        first = build_inventory_from_checkpoint(market_value, checkpoint_value)
+        second = build_inventory_from_checkpoint(market_value, checkpoint_value)
+        self.assertEqual(first, second)
+        verify_inventory(first)
+        self.assertEqual(first["completeness_status"], "complete")
+        self.assertEqual(first["bootstrap_mode"], "hash_bound_independently_agreed_checkpoint")
+        self.assertEqual(first["unique_borrower_count"], 1)
+        self.assertIn(FEED_COLLATERAL, first["feed_index"])
+        self.assertIn(FEED_DEBT, first["feed_index"])
+        self.assertFalse(any(first["execution_authority"].values()))
+
+    def test_checkpoint_provider_disagreement_fails_closed(self):
+        market_value = market()
+        checkpoint_value = checkpoint(market_value)
+        checkpoint_value["state_bindings"][-1]["result_sha256"] = "6" * 64
+        checkpoint_value = bind_hash(checkpoint_value)
+        with self.assertRaisesRegex(EvidenceError, "borrower_state state disagreement"):
+            build_inventory_from_checkpoint(market_value, checkpoint_value)
 
 
 if __name__ == "__main__":

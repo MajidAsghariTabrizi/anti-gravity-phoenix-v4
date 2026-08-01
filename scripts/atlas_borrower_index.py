@@ -14,6 +14,7 @@ import argparse
 import copy
 import hashlib
 import json
+import re
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -683,6 +684,349 @@ def verify_inventory(inventory: dict[str, Any]) -> None:
         raise EvidenceError("unsupported inventory schema")
 
 
+def _checkpoint_hash(checkpoint: dict[str, Any]) -> None:
+    observed = checkpoint.get("content_sha256")
+    body = {key: value for key, value in checkpoint.items() if key != "content_sha256"}
+    if not isinstance(observed, str) or observed != hashlib.sha256(canonical_json(body)).hexdigest():
+        raise EvidenceError("checkpoint content_sha256 mismatch")
+
+
+def build_inventory_from_checkpoint(
+    market: dict[str, Any], checkpoint: dict[str, Any]
+) -> dict[str, Any]:
+    """Import a reviewed full-state checkpoint without inventing event history.
+
+    Borrow history proves the discovery set from Pool deployment, while the
+    independently agreed checkpoint is the accounting source of truth.  This
+    is the explicit hash-bound snapshot bootstrap permitted by the Phase 2
+    inventory contract; it is not interchangeable with a partial log replay.
+    """
+
+    market_reserves = validate_market(market)
+    _checkpoint_hash(checkpoint)
+    if checkpoint.get("schema") != "phoenix.atlas.aave-checkpoint.v1":
+        raise EvidenceError("unsupported checkpoint schema")
+    if checkpoint.get("chain_id") != 42161:
+        raise EvidenceError("checkpoint must be Arbitrum One")
+    if checkpoint.get("archive_complete") is not True:
+        raise EvidenceError("checkpoint discovery archive is incomplete")
+    if checkpoint.get("independent_state_agreement") is not True:
+        raise EvidenceError("checkpoint state lacks independent agreement")
+    discovery_hash = checkpoint.get("discovery_content_sha256")
+    if not isinstance(discovery_hash, str) or not re.fullmatch(r"[0-9a-f]{64}", discovery_hash):
+        raise EvidenceError("checkpoint discovery content hash is invalid")
+    required_methods = {
+        "eth_chainId",
+        "eth_getBlockByNumber",
+        "eth_getCode",
+        "eth_getStorageAt",
+        "eth_call",
+    }
+    if not required_methods.issubset(set(checkpoint.get("source_methods", []))):
+        raise EvidenceError("checkpoint source methods are incomplete")
+    authority = checkpoint.get("execution_authority")
+    if not isinstance(authority, dict) or any(authority.values()):
+        raise EvidenceError("checkpoint must not carry execution authority")
+
+    protocol = checkpoint.get("protocol")
+    if not isinstance(protocol, dict):
+        raise EvidenceError("checkpoint protocol identity is missing")
+    for field in ("pool", "data_provider", "oracle"):
+        if _require_address(protocol.get(field), f"checkpoint.protocol.{field}") != str(
+            market["protocol"][field]
+        ).lower():
+            raise EvidenceError(f"checkpoint protocol {field} disagrees with market")
+    pool_implementation = _require_address(
+        protocol.get("pool_implementation"), "checkpoint.protocol.pool_implementation"
+    )
+
+    checkpoint_block = _require_int(checkpoint.get("checkpoint_block"), "checkpoint_block", 1)
+    checkpoint_hash = _require_hash(checkpoint.get("checkpoint_hash"), "checkpoint_hash")
+    headers = checkpoint.get("provider_headers")
+    if not isinstance(headers, list) or len(headers) < 2:
+        raise EvidenceError("checkpoint needs two independent provider headers")
+    provider_ids = set()
+    for item in headers:
+        if not isinstance(item, dict) or not isinstance(item.get("provider_id"), str):
+            raise EvidenceError("checkpoint provider header is malformed")
+        provider_ids.add(item["provider_id"])
+        header = item.get("checkpoint")
+        if not isinstance(header, dict):
+            raise EvidenceError("checkpoint provider block is missing")
+        if _require_int(header.get("number"), "provider checkpoint number", 1) != checkpoint_block:
+            raise EvidenceError("provider checkpoint number disagreement")
+        if _require_hash(header.get("hash"), "provider checkpoint hash") != checkpoint_hash:
+            raise EvidenceError("provider checkpoint hash disagreement")
+    if len(provider_ids) != len(headers):
+        raise EvidenceError("checkpoint provider identities are duplicated")
+
+    code_bindings = checkpoint.get("protocol_code_bindings")
+    if not isinstance(code_bindings, list) or len(code_bindings) < 2:
+        raise EvidenceError("checkpoint protocol code lacks independent bindings")
+    implementation_hashes = set()
+    code_provider_ids = set()
+    for item in code_bindings:
+        if not isinstance(item, dict) or item.get("pool_implementation") != pool_implementation:
+            raise EvidenceError("checkpoint implementation binding disagreement")
+        code_provider_ids.add(item.get("provider_id"))
+        hashes = item.get("code_sha256")
+        if not isinstance(hashes, dict):
+            raise EvidenceError("checkpoint protocol code hashes are missing")
+        digest = hashes.get("pool_implementation")
+        if not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest):
+            raise EvidenceError("checkpoint implementation code hash is invalid")
+        implementation_hashes.add(digest)
+    if len(code_provider_ids) != len(code_bindings) or len(implementation_hashes) != 1:
+        raise EvidenceError("checkpoint implementation code does not independently agree")
+
+    source_bindings = checkpoint.get("source_bindings")
+    if not isinstance(source_bindings, dict):
+        raise EvidenceError("checkpoint official source bindings are missing")
+    for source_name in ("aave_address_book", "aave_v3_origin"):
+        expected = market.get("sources", {}).get(source_name, {}).get("commit")
+        observed = source_bindings.get(source_name, {}).get("commit")
+        if not expected or observed != expected:
+            raise EvidenceError(f"checkpoint source binding mismatch: {source_name}")
+    if source_bindings["aave_address_book"].get("pool_implementation") != pool_implementation:
+        raise EvidenceError("address-book Pool implementation mismatch")
+
+    state_bindings = checkpoint.get("state_bindings")
+    if not isinstance(state_bindings, list):
+        raise EvidenceError("checkpoint state bindings are missing")
+    by_context: dict[str, list[dict[str, Any]]] = {}
+    for item in state_bindings:
+        if not isinstance(item, dict) or not isinstance(item.get("context"), str):
+            raise EvidenceError("checkpoint state binding is malformed")
+        by_context.setdefault(item["context"], []).append(item)
+    for context in (
+        "reserve_list",
+        "reserve_state",
+        "borrower_activity",
+        "borrower_state",
+    ):
+        rows = by_context.get(context, [])
+        if len(rows) != len(headers):
+            raise EvidenceError(f"checkpoint {context} lacks independent bindings")
+        if {row.get("provider_id") for row in rows} != provider_ids:
+            raise EvidenceError(f"checkpoint {context} provider set disagreement")
+        if len({row.get("result_sha256") for row in rows}) != 1:
+            raise EvidenceError(f"checkpoint {context} state disagreement")
+        if len({row.get("call_count") for row in rows}) != 1:
+            raise EvidenceError(f"checkpoint {context} call-count disagreement")
+
+    raw_reserves = checkpoint.get("reserves")
+    if not isinstance(raw_reserves, list) or not 0 < len(raw_reserves) <= 128:
+        raise EvidenceError("checkpoint reserves are missing")
+    reserves: dict[str, dict[str, Any]] = {}
+    for raw in raw_reserves:
+        if not isinstance(raw, dict):
+            raise EvidenceError("checkpoint reserve is malformed")
+        asset = _require_address(raw.get("asset"), "checkpoint.reserve.asset")
+        if asset in reserves:
+            raise EvidenceError("checkpoint reserve is duplicated")
+        stable = _require_address(raw.get("stable_debt_token"), "checkpoint.reserve.stable_debt_token")
+        reserve = {
+            **copy.deepcopy(raw),
+            "asset": asset,
+            "atoken": _require_address(raw.get("atoken"), "checkpoint.reserve.atoken"),
+            "variable_debt_token": _require_address(
+                raw.get("variable_debt_token"), "checkpoint.reserve.variable_debt_token"
+            ),
+            "stable_debt_token": None if stable == "0x" + "0" * 40 else stable,
+            "price_feed": _require_address(raw.get("price_feed"), "checkpoint.reserve.price_feed"),
+        }
+        if not isinstance(reserve.get("symbol"), str) or not reserve["symbol"]:
+            raise EvidenceError("checkpoint reserve symbol is invalid")
+        for field in (
+            "reserve_id",
+            "decimals",
+            "liquidation_threshold_bps",
+            "liquidation_bonus_bps",
+            "liquidation_protocol_fee_bps",
+            "liquidity_index_ray",
+            "variable_borrow_index_ray",
+            "liquidation_grace_period_until",
+            "price_base_units",
+        ):
+            _require_int(reserve.get(field), f"checkpoint.reserve.{field}")
+        for field in ("active", "paused"):
+            if not isinstance(reserve.get(field), bool):
+                raise EvidenceError(f"checkpoint.reserve.{field} must be boolean")
+        if asset in market_reserves:
+            expected = market_reserves[asset]
+            for field in ("atoken", "variable_debt_token", "price_feed"):
+                if reserve[field] != str(expected[field]).lower():
+                    raise EvidenceError(f"checkpoint reserve {asset} {field} disagrees with market")
+        reserves[asset] = reserve
+
+    logic = checkpoint.get("liquidation_logic")
+    if not isinstance(logic, dict):
+        raise EvidenceError("checkpoint liquidation logic is missing")
+    liquidation_logic = {
+        "pool_implementation": pool_implementation,
+        "pool_implementation_code_hash": "0x" + next(iter(implementation_hashes)),
+    }
+    for field in (
+        "default_close_factor_bps",
+        "close_factor_hf_threshold_wad",
+        "minimum_reserve_value_base",
+        "minimum_leftover_base",
+    ):
+        liquidation_logic[field] = _require_int(logic.get(field), f"checkpoint.liquidation_logic.{field}")
+
+    raw_emodes = checkpoint.get("emode_categories", [])
+    if not isinstance(raw_emodes, list):
+        raise EvidenceError("checkpoint eMode categories are invalid")
+    emode_ids = set()
+    for category in raw_emodes:
+        if not isinstance(category, dict):
+            raise EvidenceError("checkpoint eMode category is malformed")
+        category_id = _require_int(category.get("category_id"), "checkpoint.emode.category_id", 1)
+        if category_id in emode_ids:
+            raise EvidenceError("checkpoint eMode category is duplicated")
+        emode_ids.add(category_id)
+        for field in (
+            "ltv_bps",
+            "liquidation_threshold_bps",
+            "liquidation_bonus_bps",
+            "collateral_bitmap",
+            "borrowable_bitmap",
+        ):
+            _require_int(category.get(field), f"checkpoint.emode.{field}")
+
+    raw_borrowers = checkpoint.get("borrowers")
+    if not isinstance(raw_borrowers, list) or len(raw_borrowers) > 100_000:
+        raise EvidenceError("checkpoint borrower state is missing")
+    if _require_int(checkpoint.get("active_borrower_count"), "checkpoint.active_borrower_count") != len(
+        raw_borrowers
+    ):
+        raise EvidenceError("checkpoint active borrower count mismatch")
+    discovered_borrower_count = _require_int(
+        checkpoint.get("discovered_borrower_count"), "checkpoint.discovered_borrower_count"
+    )
+    screened_borrower_count = _require_int(
+        checkpoint.get("screened_borrower_count"), "checkpoint.screened_borrower_count"
+    )
+    if screened_borrower_count != discovered_borrower_count:
+        raise EvidenceError("checkpoint borrower discovery was not completely screened")
+    if discovered_borrower_count < len(raw_borrowers):
+        raise EvidenceError("checkpoint discovered borrower count is below active count")
+    inventory_borrowers = []
+    feed_index: dict[str, list[str]] = {}
+    for raw in raw_borrowers:
+        if not isinstance(raw, dict):
+            raise EvidenceError("checkpoint borrower is malformed")
+        address = _require_address(raw.get("address"), "checkpoint.borrower.address")
+        configuration = _require_int(
+            raw.get("account_configuration_bitmap"), "checkpoint borrower configuration"
+        )
+        emode = _require_int(raw.get("emode_category"), "checkpoint borrower emode")
+        positions = []
+        derived_configuration = 0
+        for raw_position in raw.get("positions", []):
+            asset = _require_address(raw_position.get("asset"), "checkpoint.position.asset")
+            if asset not in reserves:
+                raise EvidenceError("checkpoint position references an unknown reserve")
+            reserve = reserves[asset]
+            supplied = _require_int(raw_position.get("current_supply"), "checkpoint.position.current_supply")
+            scaled_supply = _require_int(raw_position.get("scaled_supply"), "checkpoint.position.scaled_supply")
+            variable_debt = _require_int(
+                raw_position.get("current_variable_debt"), "checkpoint.position.current_variable_debt"
+            )
+            scaled_variable = _require_int(
+                raw_position.get("scaled_variable_debt"), "checkpoint.position.scaled_variable_debt"
+            )
+            stable_debt = _require_int(
+                raw_position.get("current_stable_debt"), "checkpoint.position.current_stable_debt"
+            )
+            collateral_enabled = raw_position.get("usage_as_collateral_enabled")
+            if not isinstance(collateral_enabled, bool):
+                raise EvidenceError("checkpoint collateral flag is invalid")
+            if supplied or variable_debt or stable_debt:
+                positions.append(
+                    {
+                        "asset": asset,
+                        "symbol": reserve.get("symbol"),
+                        "scaled_supply": scaled_supply,
+                        "supplied": supplied,
+                        "collateral_enabled": collateral_enabled,
+                        "scaled_variable_debt": scaled_variable,
+                        "variable_debt": variable_debt,
+                        "stable_debt": stable_debt,
+                        "debt_type": (
+                            "variable_and_stable"
+                            if variable_debt and stable_debt
+                            else "variable" if variable_debt
+                            else "stable" if stable_debt
+                            else "none"
+                        ),
+                        "price_feed": reserve["price_feed"],
+                    }
+                )
+                feed_index.setdefault(reserve["price_feed"], []).append(address)
+            reserve_id = reserve["reserve_id"]
+            if collateral_enabled and supplied:
+                derived_configuration |= 1 << (reserve_id * 2 + 1)
+            if variable_debt or stable_debt:
+                derived_configuration |= 1 << (reserve_id * 2)
+        if configuration != derived_configuration:
+            raise EvidenceError(f"checkpoint borrower configuration mismatch: {address}")
+        if not any(position["variable_debt"] or position["stable_debt"] for position in positions):
+            raise EvidenceError("checkpoint output contains a borrower without active debt")
+        inventory_borrowers.append(
+            {
+                "address": address,
+                "account_configuration_bitmap": configuration,
+                "derived_account_configuration_bitmap": derived_configuration,
+                "emode_category": emode,
+                "positions": positions,
+                "feed_dependencies": sorted({position["price_feed"] for position in positions}),
+                "last_block": checkpoint_block,
+                "last_block_hash": checkpoint_hash,
+                "evidence_sha256": sorted(
+                    {checkpoint["content_sha256"], checkpoint["discovery_content_sha256"]}
+                ),
+                "event_kinds": ["hash_bound_checkpoint"],
+                "completeness_status": "complete",
+                "incomplete_reasons": [],
+            }
+        )
+
+    inventory = {
+        "schema": "phoenix.atlas.borrower-inventory.v1",
+        "chain_id": 42161,
+        "market_content_sha256": market["content_sha256"],
+        "checkpoint_content_sha256": checkpoint["content_sha256"],
+        "discovery_content_sha256": checkpoint["discovery_content_sha256"],
+        "bootstrap_mode": "hash_bound_independently_agreed_checkpoint",
+        "checkpoint_block": checkpoint_block,
+        "checkpoint_hash": checkpoint_hash,
+        "reserves": [reserves[key] for key in sorted(reserves)],
+        "emode_categories": copy.deepcopy(raw_emodes),
+        "liquidation_logic": liquidation_logic,
+        "borrowers": sorted(inventory_borrowers, key=lambda item: item["address"]),
+        "feed_index": {
+            feed: sorted(set(addresses)) for feed, addresses in sorted(feed_index.items())
+        },
+        "evidence_event_count": _require_int(
+            checkpoint.get("discovery_log_count"), "checkpoint.discovery_log_count"
+        ),
+        "discovered_borrower_count": discovered_borrower_count,
+        "unique_borrower_count": len(inventory_borrowers),
+        "completeness_status": "complete",
+        "incomplete_reasons": [],
+        "execution_authority": {
+            "signer": False,
+            "bond": False,
+            "bid": False,
+            "solver": False,
+            "submission": False,
+            "production_write": False,
+        },
+    }
+    return bind_hash(inventory, "snapshot_sha256")
+
+
 def _reserve_map(inventory: dict[str, Any]) -> dict[str, dict[str, Any]]:
     return {reserve["asset"].lower(): reserve for reserve in inventory["reserves"]}
 
@@ -1161,6 +1505,10 @@ def _parser() -> argparse.ArgumentParser:
     build.add_argument("--market", required=True)
     build.add_argument("--transcript", required=True)
     build.add_argument("--output", required=True)
+    import_checkpoint = subparsers.add_parser("import-checkpoint")
+    import_checkpoint.add_argument("--market", required=True)
+    import_checkpoint.add_argument("--checkpoint", required=True)
+    import_checkpoint.add_argument("--output", required=True)
     evaluate = subparsers.add_parser("evaluate")
     evaluate.add_argument("--inventory", required=True)
     evaluate.add_argument("--auction", required=True)
@@ -1177,6 +1525,12 @@ def main(argv: Iterable[str] | None = None) -> int:
         return 0
     if args.command == "build":
         inventory = build_inventory(read_json(args.market), read_json(args.transcript))
+        write_json(args.output, inventory)
+        return 0
+    if args.command == "import-checkpoint":
+        inventory = build_inventory_from_checkpoint(
+            read_json(args.market), read_json(args.checkpoint)
+        )
         write_json(args.output, inventory)
         return 0
     if args.command == "evaluate":
