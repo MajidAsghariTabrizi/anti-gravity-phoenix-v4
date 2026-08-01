@@ -19,6 +19,8 @@
 /rpc-gateway/src/hunter_state.rs @MajidAsghariTabrizi
 /contracts/** @MajidAsghariTabrizi
 /live-executor/** @MajidAsghariTabrizi
+/atlas-observer/** @MajidAsghariTabrizi
+/deploy/atlas-observer.Dockerfile* @MajidAsghariTabrizi
 /scripts/install-production-release-context.sh @MajidAsghariTabrizi
 /scripts/install-shadow-deploy-gateway.sh @MajidAsghariTabrizi
 /scripts/phoenix-shadow-deploy-gateway.sh @MajidAsghariTabrizi

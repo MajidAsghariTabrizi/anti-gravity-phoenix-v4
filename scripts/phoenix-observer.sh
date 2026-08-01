@@ -4,7 +4,7 @@ export LC_ALL=C
 export LANG=C
 
 NOW_UTC="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-CRITICAL_SERVICES="rpc-gateway phoenix-engine live-executor feed-ingestor recorder shadow-dispatcher postgres nats prometheus dashboard"
+CRITICAL_SERVICES="rpc-gateway phoenix-engine live-executor feed-ingestor recorder shadow-dispatcher atlas-observer postgres nats prometheus dashboard"
 
 section() {
   printf '\n============================================================\n'
@@ -747,6 +747,7 @@ print_metrics phoenix-engine 9200
 print_metrics rpc-gateway 9300
 print_metrics recorder 9400
 print_metrics shadow-dispatcher 9500
+print_metrics atlas-observer 9700
 
 section "8. NATS JETSTREAM"
 

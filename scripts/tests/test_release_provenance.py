@@ -47,8 +47,9 @@ def source_ci_evidence(release_sha: str = RELEASE_SHA) -> dict:
 
 
 class ReleaseProvenanceTests(unittest.TestCase):
-    def test_release_contract_requires_the_seventh_live_executor_image(self) -> None:
-        self.assertEqual(len(release_provenance.EXPECTED_IMAGES), 7)
+    def test_release_contract_requires_atlas_and_live_executor_images(self) -> None:
+        self.assertEqual(len(release_provenance.EXPECTED_IMAGES), 8)
+        self.assertIn("atlas-observer", release_provenance.EXPECTED_IMAGES)
         self.assertIn("live-executor", release_provenance.EXPECTED_IMAGES)
         self.assertIn("build-live-executor", release_provenance.EXPECTED_JOBS)
 
@@ -364,7 +365,7 @@ class ReleaseProvenanceTests(unittest.TestCase):
             f"{base_manifest['images']['recorder']['digest']}",
         )
 
-    def test_release_only_plan_inherits_all_seven_images(self) -> None:
+    def test_release_only_plan_inherits_all_eight_images(self) -> None:
         (
             manifest,
             provenance,

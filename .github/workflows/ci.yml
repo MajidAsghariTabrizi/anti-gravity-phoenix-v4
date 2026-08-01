@@ -253,8 +253,24 @@ jobs:
           go-version-file: feed-ingestor/go.mod
           cache: true
           cache-dependency-path: |
+            atlas-observer/go.sum
             feed-ingestor/go.mod
             migration-runner/go.sum
+
+      - name: Verify atlas-observer
+        if: ${{ needs.hygiene.outputs.job_go == 'true' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd atlas-observer
+          files="$(gofmt -l .)"
+          if [ -n "$files" ]; then
+            echo "gofmt required for:"
+            echo "$files"
+            exit 1
+          fi
+          go vet ./...
+          go test ./...
 
       - name: Verify feed-ingestor
         if: ${{ needs.hygiene.outputs.job_go == 'true' }}
@@ -746,6 +762,7 @@ jobs:
             "release_sha": "0000000000000000000000000000000000000000",
             "created_at": "2026-07-24T00:00:00Z",
             "images": {
+              "atlas-observer": {"repository": "ghcr.io/majidasgharitabrizi/atlas-observer", "tag": "sha-0000000000000000000000000000000000000000", "digest": "sha256:8888888888888888888888888888888888888888888888888888888888888888"},
               "dashboard": {"repository": "ghcr.io/majidasgharitabrizi/dashboard", "tag": "sha-0000000000000000000000000000000000000000", "digest": "sha256:5555555555555555555555555555555555555555555555555555555555555555"},
               "feed-ingestor": {"repository": "ghcr.io/majidasgharitabrizi/feed-ingestor", "tag": "sha-0000000000000000000000000000000000000000", "digest": "sha256:1111111111111111111111111111111111111111111111111111111111111111"},
               "fork-sandbox": {"repository": "ghcr.io/majidasgharitabrizi/fork-sandbox", "tag": "sha-0000000000000000000000000000000000000000", "digest": "sha256:7777777777777777777777777777777777777777777777777777777777777777"},
@@ -796,6 +813,7 @@ jobs:
                   name, value = line.rstrip("\n").split("=", 1)
                   release_env[name] = value
           expected_names = {
+              "ATLAS_OBSERVER_IMAGE",
               "DASHBOARD_IMAGE",
               "FEED_INGESTOR_IMAGE",
               "LIVE_EXECUTOR_IMAGE",
@@ -805,7 +823,7 @@ jobs:
               "RPC_GATEWAY_IMAGE",
           }
           if set(release_env) != expected_names:
-              raise SystemExit("seven-image manifest environment is incomplete")
+              raise SystemExit("eight-image manifest environment is incomplete")
 
           rendered_profiles = {}
           for profile, path in (

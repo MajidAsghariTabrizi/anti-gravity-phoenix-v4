@@ -24,6 +24,7 @@ ROLLBACK_RUN = "30000001002"
 SOURCE_CI_RUN = "30000001003"
 
 EXPECTED_IMAGES = (
+    "atlas-observer",
     "dashboard",
     "feed-ingestor",
     "fork-sandbox",
@@ -33,6 +34,7 @@ EXPECTED_IMAGES = (
     "rpc-gateway",
 )
 EXPECTED_PROTECTED = ("feed-ingestor", "recorder")
+PREVIOUS_IMAGES = tuple(name for name in EXPECTED_IMAGES if name != "atlas-observer")
 
 
 def source_ci(release_sha: str, run_id: str = SOURCE_CI_RUN) -> dict:
@@ -65,10 +67,10 @@ def workflow_job_names(source: str) -> tuple[str, ...]:
 
 
 class ReleaseComponentRegistryTests(unittest.TestCase):
-    def test_registry_is_the_exact_seven_image_contract(self) -> None:
+    def test_registry_is_the_exact_eight_image_contract(self) -> None:
         self.assertEqual(release_components.RELEASE_IMAGES, EXPECTED_IMAGES)
         self.assertEqual(release_components.PROTECTED_IMAGES, EXPECTED_PROTECTED)
-        self.assertEqual(len(release_components.COMPONENTS_BY_NAME), 7)
+        self.assertEqual(len(release_components.COMPONENTS_BY_NAME), 8)
         self.assertTrue(all(item["release_included"] for item in release_components.COMPONENTS))
         live = release_components.COMPONENTS_BY_NAME["live-executor"]
         self.assertTrue(live["live_canary_only"])
@@ -90,6 +92,7 @@ class ReleaseComponentRegistryTests(unittest.TestCase):
                 "recorder",
                 "dashboard",
                 "live-executor",
+                "atlas-observer",
             ),
         )
         self.assertEqual(
@@ -125,14 +128,14 @@ class ReleaseComponentRegistryTests(unittest.TestCase):
             ("dashboard", "rpc-gateway"),
         )
 
-    def test_six_eight_and_duplicate_component_registries_fail_closed(self) -> None:
-        for mutation in ("six", "eight", "duplicate"):
+    def test_seven_nine_and_duplicate_component_registries_fail_closed(self) -> None:
+        for mutation in ("seven", "nine", "duplicate"):
             changed = copy.deepcopy(release_components.REGISTRY)
-            if mutation == "six":
+            if mutation == "seven":
                 changed["components"] = [
                     item for item in changed["components"] if item["name"] != "live-executor"
                 ]
-            elif mutation == "eight":
+            elif mutation == "nine":
                 extra = copy.deepcopy(changed["components"][-1])
                 extra.update(
                     {
@@ -244,13 +247,14 @@ class ReleaseComponentRegistryTests(unittest.TestCase):
             legacy_values = production_context.read_env(
                 legacy_env, "RELEASE_ENV_MISSING"
             )
-            self.assertNotIn("LIVE_EXECUTOR_IMAGE", legacy_values)
+            self.assertIn("LIVE_EXECUTOR_IMAGE", legacy_values)
+            self.assertNotIn("ATLAS_OBSERVER_IMAGE", legacy_values)
             _, _, legacy_references = production_context.load_manifest(legacy_manifest)
             production_context.validate_release_env(
                 legacy_values, RELEASE_SHA, legacy_references
             )
-            legacy_values["LIVE_EXECUTOR_IMAGE"] = current_values[
-                "LIVE_EXECUTOR_IMAGE"
+            legacy_values["ATLAS_OBSERVER_IMAGE"] = current_values[
+                "ATLAS_OBSERVER_IMAGE"
             ]
             with self.assertRaisesRegex(
                 production_context.ContextError, "RELEASE_IMAGE_MISMATCH"
@@ -276,6 +280,27 @@ class ReleaseComponentRegistryTests(unittest.TestCase):
         }
         self.assertEqual(production_context.RENDERED_OWNED_IMAGES, expected_rendered)
 
+    def test_expected_services_follow_manifest_generation(self) -> None:
+        self.assertIn(
+            "atlas-observer",
+            production_context.expected_services_for_references(None, False),
+        )
+        legacy_references = {
+            name: "ghcr.io/example/component@sha256:" + "1" * 64
+            for name in release_components.LEGACY_RELEASE_IMAGES
+        }
+        legacy_services = production_context.expected_services_for_references(
+            legacy_references, False
+        )
+        self.assertNotIn("atlas-observer", legacy_services)
+        self.assertNotIn("live-executor", legacy_services)
+        self.assertIn(
+            "live-executor",
+            production_context.expected_services_for_references(
+                legacy_references, True
+            ),
+        )
+
     def test_schemas_are_valid_and_component_sets_cannot_drift(self) -> None:
         registry_schema = json.loads(
             (ROOT / "schemas/release-components.schema.json").read_text(encoding="utf-8")
@@ -299,7 +324,7 @@ class ReleaseComponentRegistryTests(unittest.TestCase):
                 encoding="utf-8"
             )
         )
-        for definition in ("legacyImages", "inheritedImages"):
+        for definition in ("currentImages", "inheritedImages"):
             self.assertEqual(
                 tuple(sorted(manifest["$defs"][definition]["required"])),
                 EXPECTED_IMAGES,
@@ -308,13 +333,21 @@ class ReleaseComponentRegistryTests(unittest.TestCase):
                 tuple(sorted(manifest["$defs"][definition]["properties"])),
                 EXPECTED_IMAGES,
             )
+        self.assertEqual(
+            tuple(sorted(manifest["$defs"]["legacyImages"]["required"])),
+            PREVIOUS_IMAGES,
+        )
+        self.assertEqual(
+            tuple(sorted(manifest["$defs"]["legacyImages"]["properties"])),
+            PREVIOUS_IMAGES,
+        )
         provenance = json.loads(
             (ROOT / "schemas/phoenix-release-provenance.schema.json").read_text(
                 encoding="utf-8"
             )
         )
         self.assertEqual(
-            tuple(sorted(provenance["properties"]["image_fragments"]["required"])),
+            tuple(sorted(provenance["$defs"]["currentFragments"]["required"])),
             EXPECTED_IMAGES,
         )
         self.assertEqual(

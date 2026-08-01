@@ -395,7 +395,7 @@ class ReleaseContractTests(unittest.TestCase):
             (inputs / source.name).write_bytes(source.read_bytes())
         return inputs, candidate_manifest, rollback_manifest
 
-    def test_valid_seven_image_inherited_release_is_accepted(self) -> None:
+    def test_valid_eight_image_inherited_release_is_accepted(self) -> None:
         inputs, _, _ = self._inherited_inputs()
         with mock.patch.object(gateway.release_assets, "verify_release_assets"):
             gateway.validate_release_inputs(identity(), inputs)

@@ -3,6 +3,11 @@
   "release_sha": "0000000000000000000000000000000000000000",
   "created_at": "2026-07-08T00:00:00Z",
   "images": {
+    "atlas-observer": {
+      "repository": "ghcr.io/majidasgharitabrizi/atlas-observer",
+      "tag": "sha-0000000000000000000000000000000000000000",
+      "digest": "sha256:replace_with_atlas_observer_digest"
+    },
     "dashboard": {
       "repository": "ghcr.io/majidasgharitabrizi/dashboard",
       "tag": "sha-0000000000000000000000000000000000000000",

@@ -38,3 +38,10 @@ scrape_configs:
     label_value_length_limit: 128
     static_configs:
       - targets: ["shadow-dispatcher:9500"]
+  - job_name: atlas-observer
+    sample_limit: 256
+    label_limit: 4
+    label_name_length_limit: 64
+    label_value_length_limit: 32
+    static_configs:
+      - targets: ["atlas-observer:9700"]

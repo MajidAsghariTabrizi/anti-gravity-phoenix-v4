@@ -126,7 +126,7 @@ if [ "$inspect_running" -eq 1 ]; then
   if [ -z "${PHOENIX_DOCKER_BIN:-}" ]; then
     command -v docker >/dev/null 2>&1 || fail RUNNING_IMAGE_MISMATCH
   fi
-  services='nitro-feed-relay nats postgres rpc-gateway feed-ingestor phoenix-engine shadow-dispatcher recorder dashboard prometheus'
+  services='nitro-feed-relay nats postgres rpc-gateway feed-ingestor phoenix-engine shadow-dispatcher recorder atlas-observer dashboard prometheus'
   if [ -n "$overlay_file" ]; then
     services="$services live-executor"
   fi

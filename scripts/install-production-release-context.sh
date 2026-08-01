@@ -174,6 +174,8 @@ do
 done
 ensure_deploy_directory "$deploy_dir/.runtime" "$owner_user" "$owner_group" 0750
 ensure_deploy_directory "$deploy_dir/.deploy-runtime" root root 0700
+ensure_deploy_directory "$deploy_root/evidence" root "$owner_group" 0750
+ensure_deploy_directory "$deploy_root/evidence/atlas-live" 65532 65532 0700
 
 install_source "$source_root/compose.prod.yml" "$deploy_dir/compose.prod.yml" 0640
 if [ -f "$source_root/compose.live-autonomous.yml" ]; then

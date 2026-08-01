@@ -24,6 +24,22 @@
     {
       "build_args": {},
       "build_context": ".",
+      "dockerfile": "deploy/atlas-observer.Dockerfile",
+      "image_environment": "ATLAS_OBSERVER_IMAGE",
+      "live_canary_only": false,
+      "name": "atlas-observer",
+      "production_compose": true,
+      "production_order": 6,
+      "production_services": [
+        "atlas-observer"
+      ],
+      "protected": false,
+      "release_included": true,
+      "repository": "ghcr.io/majidasgharitabrizi/atlas-observer"
+    },
+    {
+      "build_args": {},
+      "build_context": ".",
       "dockerfile": "deploy/dashboard.Dockerfile",
       "image_environment": "DASHBOARD_IMAGE",
       "live_canary_only": false,

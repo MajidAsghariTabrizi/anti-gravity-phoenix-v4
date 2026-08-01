@@ -41,6 +41,7 @@ cat >"$manifest" <<EOF
   "release_sha": "$release_sha",
   "created_at": "2026-07-15T00:00:00Z",
   "images": {
+    "atlas-observer": {"repository": "ghcr.io/majidasgharitabrizi/atlas-observer", "tag": "sha-$release_sha", "digest": "sha256:8888888888888888888888888888888888888888888888888888888888888888"},
     "feed-ingestor": {"repository": "ghcr.io/majidasgharitabrizi/feed-ingestor", "tag": "sha-$release_sha", "digest": "sha256:1111111111111111111111111111111111111111111111111111111111111111"},
     "phoenix-engine": {"repository": "ghcr.io/majidasgharitabrizi/phoenix-engine", "tag": "sha-$release_sha", "digest": "sha256:2222222222222222222222222222222222222222222222222222222222222222"},
     "rpc-gateway": {"repository": "ghcr.io/majidasgharitabrizi/rpc-gateway", "tag": "sha-$release_sha", "digest": "sha256:3333333333333333333333333333333333333333333333333333333333333333"},
@@ -59,7 +60,7 @@ python3 "$helper" manifest-env \
 grep -Fx \
   'LIVE_EXECUTOR_IMAGE=ghcr.io/majidasgharitabrizi/live-executor@sha256:7777777777777777777777777777777777777777777777777777777777777777' \
   "$release_env" >/dev/null ||
-  fail "current seven-image manifest omitted the optional LIVE image"
+  fail "current eight-image manifest omitted the optional LIVE image"
 
 route_json=$(python3 -c 'import json,sys; print(json.dumps(json.load(open(sys.argv[1], encoding="utf-8")), separators=(",", ":")))' \
   "$repo_dir/fixtures/routes/weth_usdc_uniswap_v3.json")
@@ -107,6 +108,7 @@ import sys
 
 output, route, budget, engine_image, reviewed_routers = sys.argv[1:]
 images = {
+    "atlas-observer": "ghcr.io/majidasgharitabrizi/atlas-observer@sha256:8888888888888888888888888888888888888888888888888888888888888888",
     "nitro-feed-relay": "offchainlabs/nitro-node@sha256:ebc985e3b105980734630744981e1542001c22d74cba57509fe0d5ed8bb84c14",
     "nats": "nats@sha256:b83efabe3e7def1e0a4a31ec6e078999bb17c80363f881df35edc70fcb6bb927",
     "postgres": "postgres@sha256:57c72fd2a128e416c7fcc499958864df5301e940bca0a56f58fddf30ffc07777",
@@ -139,7 +141,7 @@ services["recorder"]["environment"] = {
     "RECORDER_PERSISTENCE_POLICY": "money_path_v1",
 }
 services["rpc-gateway"]["environment"] = {"RPC_STATE_REQUESTS_PER_MINUTE": budget}
-for service in ("nitro-feed-relay", "nats", "postgres", "migration-runner", "feed-ingestor", "dashboard", "prometheus"):
+for service in ("atlas-observer", "nitro-feed-relay", "nats", "postgres", "migration-runner", "feed-ingestor", "dashboard", "prometheus"):
     services[service]["environment"] = {}
 with open(output, "w", encoding="utf-8", newline="\n") as handle:
     json.dump({"services": services}, handle, sort_keys=True, separators=(",", ":"))

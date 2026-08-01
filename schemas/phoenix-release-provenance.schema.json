@@ -69,7 +69,7 @@
     "required_jobs": {
       "type": "array",
       "minItems": 10,
-      "maxItems": 10,
+      "maxItems": 11,
       "uniqueItems": true,
       "items": {
         "type": "string"
@@ -78,33 +78,17 @@
     "required_release_artifacts": {
       "type": "array",
       "minItems": 9,
-      "maxItems": 10,
+      "maxItems": 11,
       "uniqueItems": true,
       "items": {
         "type": "string"
       }
     },
     "image_fragments": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": [
-        "dashboard",
-        "feed-ingestor",
-        "fork-sandbox",
-        "live-executor",
-        "phoenix-engine",
-        "recorder",
-        "rpc-gateway"
-      ],
-      "properties": {
-        "dashboard": { "$ref": "#/$defs/fragment" },
-        "feed-ingestor": { "$ref": "#/$defs/fragment" },
-        "fork-sandbox": { "$ref": "#/$defs/fragment" },
-        "live-executor": { "$ref": "#/$defs/fragment" },
-        "phoenix-engine": { "$ref": "#/$defs/fragment" },
-        "recorder": { "$ref": "#/$defs/fragment" },
-        "rpc-gateway": { "$ref": "#/$defs/fragment" }
-      }
+      "oneOf": [
+        { "$ref": "#/$defs/currentFragments" },
+        { "$ref": "#/$defs/legacyFragments" }
+      ]
     },
     "release_assets": {
       "type": "object",
@@ -153,10 +137,11 @@
     "built_images": {
       "type": "array",
       "minItems": 0,
-      "maxItems": 7,
+      "maxItems": 8,
       "uniqueItems": true,
       "items": {
         "enum": [
+          "atlas-observer",
           "dashboard",
           "feed-ingestor",
           "fork-sandbox",
@@ -170,10 +155,11 @@
     "inherited_images": {
       "type": "array",
       "minItems": 0,
-      "maxItems": 7,
+      "maxItems": 8,
       "uniqueItems": true,
       "items": {
         "enum": [
+          "atlas-observer",
           "dashboard",
           "feed-ingestor",
           "fork-sandbox",
@@ -193,7 +179,7 @@
         },
         "required_release_artifacts": {
           "minItems": 9,
-          "maxItems": 9
+          "maxItems": 10
         }
       },
       "not": {
@@ -217,7 +203,7 @@
         },
         "required_release_artifacts": {
           "minItems": 9,
-          "maxItems": 9
+          "maxItems": 10
         }
       },
       "not": {
@@ -234,7 +220,7 @@
         },
         "required_release_artifacts": {
           "minItems": 10,
-          "maxItems": 10
+          "maxItems": 11
         }
       },
       "not": {
@@ -258,7 +244,7 @@
         },
         "required_release_artifacts": {
           "minItems": 10,
-          "maxItems": 10
+          "maxItems": 11
         }
       }
     },
@@ -275,12 +261,58 @@
         },
         "required_release_artifacts": {
           "minItems": 10,
-          "maxItems": 10
+          "maxItems": 11
         }
       }
     }
   ],
   "$defs": {
+    "currentFragments": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "atlas-observer",
+        "dashboard",
+        "feed-ingestor",
+        "fork-sandbox",
+        "live-executor",
+        "phoenix-engine",
+        "recorder",
+        "rpc-gateway"
+      ],
+      "properties": {
+        "atlas-observer": { "$ref": "#/$defs/fragment" },
+        "dashboard": { "$ref": "#/$defs/fragment" },
+        "feed-ingestor": { "$ref": "#/$defs/fragment" },
+        "fork-sandbox": { "$ref": "#/$defs/fragment" },
+        "live-executor": { "$ref": "#/$defs/fragment" },
+        "phoenix-engine": { "$ref": "#/$defs/fragment" },
+        "recorder": { "$ref": "#/$defs/fragment" },
+        "rpc-gateway": { "$ref": "#/$defs/fragment" }
+      }
+    },
+    "legacyFragments": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "dashboard",
+        "feed-ingestor",
+        "fork-sandbox",
+        "live-executor",
+        "phoenix-engine",
+        "recorder",
+        "rpc-gateway"
+      ],
+      "properties": {
+        "dashboard": { "$ref": "#/$defs/fragment" },
+        "feed-ingestor": { "$ref": "#/$defs/fragment" },
+        "fork-sandbox": { "$ref": "#/$defs/fragment" },
+        "live-executor": { "$ref": "#/$defs/fragment" },
+        "phoenix-engine": { "$ref": "#/$defs/fragment" },
+        "recorder": { "$ref": "#/$defs/fragment" },
+        "rpc-gateway": { "$ref": "#/$defs/fragment" }
+      }
+    },
     "sha": {
       "type": "string",
       "pattern": "^[0-9a-f]{40}$"
