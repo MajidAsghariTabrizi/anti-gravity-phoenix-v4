@@ -49,6 +49,7 @@ QUARANTINED_CI_RUNS = {
     "29683234024": "NON_CANONICAL_INCOMPLETE_BUILD",
 }
 EXPECTED_IMAGES = release_components.RELEASE_IMAGES
+LEGACY_IMAGES = release_components.LEGACY_RELEASE_IMAGES
 PROTECTED_IMAGES = release_components.PROTECTED_IMAGES
 BUILT_IMAGES = release_components.BUILT_IMAGES
 CI_WORKFLOW = release_components.REQUIRED_CI["workflow_name"]
@@ -105,9 +106,12 @@ def _read_json(path: Path, label: str) -> dict[str, Any]:
 
 
 def _release_artifact_names(
-    release_sha: str, *, include_source_ci: bool = True
+    release_sha: str,
+    *,
+    include_source_ci: bool = True,
+    image_names: tuple[str, ...] = EXPECTED_IMAGES,
 ) -> tuple[str, ...]:
-    artifacts = [f"release-fragment-{name}" for name in EXPECTED_IMAGES]
+    artifacts = [f"release-fragment-{name}" for name in image_names]
     if include_source_ci:
         artifacts.append(f"source-ci-evidence-{release_sha}")
     artifacts.extend(
@@ -164,19 +168,25 @@ def _validate_repository(value: object, name: str, label: str) -> str:
 
 def _image_partition(
     built_images: list[str] | tuple[str, ...] | None = None,
+    *,
+    image_names: tuple[str, ...] = EXPECTED_IMAGES,
 ) -> tuple[tuple[str, ...], tuple[str, ...]]:
-    built = BUILT_IMAGES if built_images is None else tuple(built_images)
+    built = (
+        tuple(name for name in BUILT_IMAGES if name in image_names)
+        if built_images is None
+        else tuple(built_images)
+    )
     if (
         len(built) != len(set(built))
-        or any(name not in EXPECTED_IMAGES for name in built)
+        or any(name not in image_names for name in built)
     ):
         raise ReleaseProvenanceError("built image selection is invalid")
     built_set = set(built)
     normalized_built = tuple(
-        name for name in EXPECTED_IMAGES if name in built_set
+        name for name in image_names if name in built_set
     )
     inherited = tuple(
-        name for name in EXPECTED_IMAGES if name not in built_set
+        name for name in image_names if name not in built_set
     )
     return normalized_built, inherited
 
@@ -454,9 +464,12 @@ def _validate_legacy_manifest(
         raise ReleaseProvenanceError("release manifest identity is invalid")
     _validate_created_at(manifest["created_at"])
     images = manifest["images"]
-    if not isinstance(images, dict) or tuple(sorted(images)) != EXPECTED_IMAGES:
+    if not isinstance(images, dict) or tuple(sorted(images)) not in (
+        EXPECTED_IMAGES,
+        LEGACY_IMAGES,
+    ):
         raise ReleaseProvenanceError("release manifest image set is invalid")
-    for name in EXPECTED_IMAGES:
+    for name in tuple(sorted(images)):
         image = _require_keys(
             images[name],
             {"repository", "tag", "digest"},
@@ -503,9 +516,12 @@ def _validate_inherited_manifest(
         raise ReleaseProvenanceError("protected base SHA matches release SHA")
     _validate_created_at(manifest["created_at"])
     images = manifest["images"]
-    if not isinstance(images, dict) or tuple(sorted(images)) != EXPECTED_IMAGES:
+    if not isinstance(images, dict) or tuple(sorted(images)) not in (
+        EXPECTED_IMAGES,
+        LEGACY_IMAGES,
+    ):
         raise ReleaseProvenanceError("release manifest image set is invalid")
-    for name in EXPECTED_IMAGES:
+    for name in tuple(sorted(images)):
         image = _require_keys(
             images[name],
             {
@@ -1004,6 +1020,7 @@ def _validate_common_provenance(
         provenance["build_run_id"], "release provenance build run ID"
     )
     manifest = validate_release_manifest(manifest_value, release_sha, run_id)
+    image_names = tuple(sorted(manifest["images"]))
 
     quarantine = _require_keys(
         provenance["quarantine"], {"classification", "run_ids"}, "quarantine"
@@ -1013,17 +1030,27 @@ def _validate_common_provenance(
         "run_ids": sorted(QUARANTINED_RUNS),
     }:
         raise ReleaseProvenanceError("quarantine contract is invalid")
-    if provenance["required_jobs"] != list(EXPECTED_JOBS):
+    expected_jobs = (
+        "publication-preflight",
+        *(f"build-{name}" for name in image_names),
+        "release-assets",
+        "release-manifest",
+    )
+    if provenance["required_jobs"] != list(expected_jobs):
         raise ReleaseProvenanceError("required build job contract is invalid")
     if provenance["required_release_artifacts"] != list(
-        _release_artifact_names(release_sha, include_source_ci=not legacy)
+        _release_artifact_names(
+            release_sha,
+            include_source_ci=not legacy,
+            image_names=image_names,
+        )
     ):
         raise ReleaseProvenanceError("required release artifact contract is invalid")
 
     fragments = provenance["image_fragments"]
-    if not isinstance(fragments, dict) or tuple(sorted(fragments)) != EXPECTED_IMAGES:
+    if not isinstance(fragments, dict) or tuple(sorted(fragments)) != image_names:
         raise ReleaseProvenanceError("image fragment evidence is invalid")
-    for name in EXPECTED_IMAGES:
+    for name in image_names:
         fragment = _require_keys(
             fragments[name], {"artifact_name", "sha256"}, f"fragment evidence {name}"
         )
@@ -1143,8 +1170,11 @@ def validate_provenance(
         or base["build_run_id"] != manifest["protected_base_build_run_id"]
     ):
         raise ReleaseProvenanceError("protected base evidence identity is invalid")
+    image_names = tuple(sorted(manifest["images"]))
     if schema == INHERITED_PROVENANCE_SCHEMA:
-        expected_built, expected_inherited = BUILT_IMAGES, PROTECTED_IMAGES
+        expected_built, expected_inherited = _image_partition(
+            image_names=image_names
+        )
     else:
         raw_built = provenance["built_images"]
         raw_inherited = provenance["inherited_images"]
@@ -1152,14 +1182,16 @@ def validate_provenance(
             raw_inherited, list
         ):
             raise ReleaseProvenanceError("image partition is invalid")
-        expected_built, expected_inherited = _image_partition(raw_built)
+        expected_built, expected_inherited = _image_partition(
+            raw_built, image_names=image_names
+        )
         if raw_inherited != list(expected_inherited):
             raise ReleaseProvenanceError("inherited image contract is invalid")
     if provenance["built_images"] != list(expected_built):
         raise ReleaseProvenanceError("built image contract is invalid")
     if provenance["inherited_images"] != list(expected_inherited):
         raise ReleaseProvenanceError("inherited image contract is invalid")
-    for name in EXPECTED_IMAGES:
+    for name in image_names:
         expected_origin = (
             "built" if name in expected_built else "inherited"
         )
