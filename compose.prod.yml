@@ -238,7 +238,7 @@ services:
       retries: 5
 
   atlas-observer:
-    image: ${ATLAS_OBSERVER_IMAGE:?ATLAS_OBSERVER_IMAGE is required}
+    image: ${ATLAS_OBSERVER_IMAGE:-${DASHBOARD_IMAGE:?DASHBOARD_IMAGE is required}}
     command:
       - --continuous
       - --ledger-dir=/var/lib/phoenix-atlas-observer
