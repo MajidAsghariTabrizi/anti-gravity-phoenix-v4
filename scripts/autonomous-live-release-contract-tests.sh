@@ -243,7 +243,8 @@ for required in (
     "mark_phase DISARMED_EVIDENCE_STARTED",
     "PHOENIX_HEALTH_EXPECTED_MODE=DISARMED_EVIDENCE",
     'compose stop -t 30 live-executor',
-    'live-executor started during disarmed deployment',
+    '--field intentional_absence',
+    'assert_intentional_absence ||',
 ):
     require(required in deploy, f"disarmed_deploy_contract_missing:{required}")
 for forbidden in (
