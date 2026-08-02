@@ -56,6 +56,7 @@ monitor_output=$state_dir/monitor
 mkdir -m 0700 "$monitor_output"
 chown 1000:1000 "$monitor_output"
 monitor_container=
+control_container=
 database_container=
 database_network=
 cleanup_monitor() {
@@ -68,8 +69,13 @@ cleanup_database() {
   [ -z "$database_network" ] ||
     /usr/bin/docker network rm "$database_network" >/dev/null 2>&1 || true
 }
+cleanup_control() {
+  [ -z "$control_container" ] ||
+    /usr/bin/docker rm -f "$control_container" >/dev/null 2>&1 || true
+}
 cleanup_all() {
   cleanup_monitor
+  cleanup_control
   cleanup_database
   cleanup
 }
@@ -156,6 +162,33 @@ PY
 ) || fail candidate_monitor_contract_invalid
 [ "$monitor_image" = "$postgres_image" ] || fail candidate_monitor_image_invalid
 
+control_image=$(
+  python3 -I -B - "$rendered" <<'PY'
+import json
+import re
+import sys
+from pathlib import Path
+
+value = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+service = value["services"]["autonomous-control"]
+image = service.get("image")
+if not isinstance(image, str) or re.fullmatch(
+    r"[a-z0-9._/-]+@sha256:[0-9a-f]{64}", image
+) is None:
+    raise SystemExit(1)
+expected = {
+    "entrypoint": ["/usr/local/bin/autonomous-live-control"],
+    "user": "65532:65532",
+    "read_only": True,
+    "cap_drop": ["ALL"],
+    "security_opt": ["no-new-privileges:true"],
+}
+if any(service.get(key) != expected_value for key, expected_value in expected.items()):
+    raise SystemExit(1)
+print(image)
+PY
+) || fail candidate_control_contract_invalid
+
 # Apply every candidate migration to an isolated, tmpfs-backed PostgreSQL
 # instance using the exact Compose-pinned image. It has no published port,
 # external network, persistent volume, or Production credential.
@@ -205,7 +238,8 @@ schema_contract=$(
 [ "$schema_contract" -gt 0 ] || fail candidate_schema_contract_missing
 
 compose() {
-  python3 "$compose_runner" \
+  /usr/bin/timeout --signal=TERM --kill-after=2s 45s \
+    python3 "$compose_runner" \
     --mode LIVE \
     --env-file "$env_file" \
     --release-env "$release_env" \
@@ -216,8 +250,39 @@ compose() {
 }
 
 compose config --quiet || fail candidate_compose_config_failed
-compose run --rm --no-deps autonomous-control status >/dev/null ||
+control_container="phoenix-release-rehearsal-control-$short_sha-$$"
+/usr/bin/timeout --signal=TERM --kill-after=2s 30s \
+  /usr/bin/docker run --rm \
+    --name "$control_container" \
+    --network "$database_network" \
+    --init \
+    --user 65532:65532 \
+    --read-only \
+    --cap-drop ALL \
+    --security-opt no-new-privileges:true \
+    --tmpfs /tmp:rw,noexec,nosuid,nodev,size=16m \
+    -e "POSTGRES_DSN=postgres://phoenix_rehearsal:phoenix_rehearsal_only@$database_container:5432/phoenix_rehearsal" \
+    --entrypoint /usr/local/bin/autonomous-live-control \
+    "$control_image" status >"$state_dir/control-status.json" ||
   fail candidate_control_status_failed
+control_container=
+python3 -I -B - "$state_dir/control-status.json" <<'PY' ||
+import json
+import sys
+from pathlib import Path
+
+value = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+global_control = value.get("global")
+if (
+    value.get("schema") != "phoenix.autonomous-live-status.v2"
+    or not isinstance(global_control, dict)
+    or global_control.get("armed") is not False
+    or global_control.get("kill_switch") is not True
+    or global_control.get("execution_mode") != "disarmed"
+):
+    raise SystemExit(1)
+PY
+  fail candidate_control_status_invalid
 
 # Prove the candidate dashboard query against the live schema in a read-only
 # transaction. psql receives the reviewed SQL over stdin; no host path is
@@ -227,7 +292,7 @@ compose run --rm --no-deps autonomous-control status >/dev/null ||
   cat "$candidate_root/scripts/sql/economic-dashboard-snapshot.sql"
   printf '%s\n' 'ROLLBACK;'
 } | compose exec -T postgres /bin/sh -c \
-  'exec psql -X -q -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d "$POSTGRES_DB"' \
+  'export PGOPTIONS="-c statement_timeout=30000 -c lock_timeout=5000"; exec psql -X -q -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d "$POSTGRES_DB"' \
   >"$state_dir/sql.stdout" 2>"$state_dir/sql.stderr" ||
   fail candidate_sql_or_schema_failed
 
@@ -395,7 +460,11 @@ PHOENIX_COMPOSE_FILE="$compose_file" \
 PHOENIX_COMPOSE_OVERLAY_FILE="$overlay_file" \
 PHOENIX_COMPOSE_PROJECT_DIRECTORY="$deploy_dir" \
 PHOENIX_COMPOSE_RUNNER="$compose_runner" \
+PHOENIX_RELEASE_MANIFEST="$release_manifest" \
 PHOENIX_HEALTH_EXPECTED_MODE=DISARMED_EVIDENCE \
+PHOENIX_HEALTH_RETRIES=1 \
+PHOENIX_HEALTH_SLEEP_SECONDS=0 \
+PHOENIX_HEALTH_COMMAND_TIMEOUT_SECONDS=15 \
   "$candidate_root/scripts/production-healthcheck.sh" >/dev/null ||
   fail candidate_health_contract_failed
 
