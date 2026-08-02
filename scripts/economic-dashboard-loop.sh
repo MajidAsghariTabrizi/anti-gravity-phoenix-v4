@@ -4,6 +4,7 @@ umask 027
 
 output=${PHOENIX_ECONOMIC_DASHBOARD_OUTPUT:-/evidence/latest-dashboard.json}
 interval=${PHOENIX_ECONOMIC_DASHBOARD_INTERVAL_SECONDS:-45}
+query_timeout=${PHOENIX_ECONOMIC_DASHBOARD_QUERY_TIMEOUT_SECONDS:-30}
 sql_file=${PHOENIX_ECONOMIC_DASHBOARD_SQL:-/opt/phoenix/economic-dashboard-snapshot.sql}
 
 case "$interval" in
@@ -11,6 +12,11 @@ case "$interval" in
 esac
 [ "$interval" -ge 30 ] && [ "$interval" -le 60 ] ||
   { echo "ECONOMIC_DASHBOARD_FAILED: interval must be 30-60 seconds" >&2; exit 1; }
+case "$query_timeout" in
+  ''|*[!0-9]*) echo "ECONOMIC_DASHBOARD_FAILED: invalid query timeout" >&2; exit 1 ;;
+esac
+[ "$query_timeout" -ge 5 ] && [ "$query_timeout" -le 60 ] ||
+  { echo "ECONOMIC_DASHBOARD_FAILED: query timeout must be 5-60 seconds" >&2; exit 1; }
 [ -f "$sql_file" ] && [ ! -L "$sql_file" ] ||
   { echo "ECONOMIC_DASHBOARD_FAILED: SQL contract is unavailable" >&2; exit 1; }
 
@@ -21,7 +27,8 @@ output_dir=${output%/*}
 while :; do
   candidate=$(mktemp "$output_dir/.economic-dashboard.XXXXXX") ||
     { echo "ECONOMIC_DASHBOARD_FAILED: staging failed" >&2; exit 1; }
-  if psql -X -q -A -t "$POSTGRES_DSN" -f "$sql_file" >"$candidate" &&
+  if PGOPTIONS="-c statement_timeout=${query_timeout}s -c lock_timeout=5s" \
+    psql -X -q -A -t "$POSTGRES_DSN" -f "$sql_file" >"$candidate" &&
     [ -s "$candidate" ]
   then
     chmod 0640 "$candidate"

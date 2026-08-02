@@ -321,7 +321,9 @@ loss_points AS (
         ledger.best_counterfactual_input_size_wei,
         ledger.best_counterfactual_margin_to_gate_wei,
         ledger.recoverable_pnl_if_bottleneck_removed_wei,
-        ledger.recommended_next_action
+        ledger.recommended_next_action,
+        ledger.route_direction_path,
+        ledger.event_to_evaluation_latency_ns
     FROM phoenix_live_economic_loss_ledger ledger
     LEFT JOIN LATERAL (
         SELECT current_candidate.candidate_id,
@@ -354,7 +356,9 @@ loss_points AS (
         NULL::text AS best_counterfactual_input_size_wei,
         NULL::numeric AS best_counterfactual_margin_to_gate_wei,
         NULL::numeric AS recoverable_pnl_if_bottleneck_removed_wei,
-        NULL::text AS recommended_next_action
+        NULL::text AS recommended_next_action,
+        NULL::jsonb AS route_direction_path,
+        NULL::bigint AS event_to_evaluation_latency_ns
     WHERE false
 \endif
 ),
@@ -380,17 +384,90 @@ loss_ledger AS (
         GROUP BY primary_loss_cause
     ) bucket
 ),
+daily_ranked AS (
+    SELECT
+        date_trunc('day', classified_at) AS evaluation_day,
+        loss_points.*,
+        row_number() OVER (
+            PARTITION BY date_trunc('day', classified_at)
+            ORDER BY best_counterfactual_margin_to_gate_wei DESC NULLS LAST,
+                     route_fingerprint,
+                     input_size_wei::numeric
+        ) AS opportunity_rank
+    FROM loss_points
+),
+daily_cause_totals AS (
+    SELECT
+        evaluation_day,
+        primary_loss_cause,
+        count(*) AS cause_count,
+        sum(coalesce(recoverable_pnl_if_bottleneck_removed_wei, 0))
+            AS recoverable_pnl_wei,
+        row_number() OVER (
+            PARTITION BY evaluation_day
+            ORDER BY sum(coalesce(recoverable_pnl_if_bottleneck_removed_wei, 0)) DESC,
+                     count(*) DESC,
+                     primary_loss_cause
+        ) AS recoverable_rank,
+        row_number() OVER (
+            PARTITION BY evaluation_day
+            ORDER BY count(*) DESC, primary_loss_cause
+        ) AS frequency_rank
+    FROM daily_ranked
+    GROUP BY evaluation_day, primary_loss_cause
+),
+daily_latency_routes AS (
+    SELECT
+        evaluation_day,
+        route_fingerprint,
+        sum(event_to_evaluation_latency_ns) AS latency_ns,
+        row_number() OVER (
+            PARTITION BY evaluation_day
+            ORDER BY sum(event_to_evaluation_latency_ns) DESC, route_fingerprint
+        ) AS latency_rank
+    FROM daily_ranked
+    GROUP BY evaluation_day, route_fingerprint
+),
+daily_attack_rows AS (
+    SELECT
+        best.evaluation_day,
+        best.best_counterfactual_route_fingerprint AS best_route_fingerprint,
+        best.route_direction_path AS best_direction,
+        best.best_counterfactual_input_size_wei AS best_input_size_wei,
+        best.best_counterfactual_margin_to_gate_wei AS closest_margin_to_gate_wei,
+        recoverable.primary_loss_cause AS largest_recoverable_bucket,
+        recoverable.recoverable_pnl_wei AS largest_recoverable_pnl_wei,
+        dominant.primary_loss_cause AS dominant_loss_cause,
+        dominant.cause_count AS dominant_loss_count,
+        (
+            SELECT missing.route_fingerprint
+            FROM daily_ranked missing
+            WHERE missing.evaluation_day = best.evaluation_day
+              AND missing.primary_loss_cause = 'route_not_in_universe'
+            ORDER BY missing.best_counterfactual_margin_to_gate_wei DESC NULLS LAST,
+                     missing.route_fingerprint
+            LIMIT 1
+        ) AS top_missing_route_fingerprint,
+        latency.route_fingerprint AS top_latency_loss_route_fingerprint,
+        best.recommended_next_action AS recommended_next_engineering_change
+    FROM daily_ranked best
+    JOIN daily_cause_totals recoverable
+      ON recoverable.evaluation_day = best.evaluation_day
+     AND recoverable.recoverable_rank = 1
+    JOIN daily_cause_totals dominant
+      ON dominant.evaluation_day = best.evaluation_day
+     AND dominant.frequency_rank = 1
+    JOIN daily_latency_routes latency
+      ON latency.evaluation_day = best.evaluation_day
+     AND latency.latency_rank = 1
+    WHERE best.opportunity_rank = 1
+),
 daily_attack_surface AS (
-\if :phoenix_has_economic_loss_ledger
     SELECT coalesce(
         jsonb_agg(row_to_json(report)::jsonb ORDER BY report.evaluation_day DESC),
         '[]'::jsonb
     ) AS values
-    FROM phoenix_daily_economic_attack_surface report
-    WHERE report.evaluation_day >= date_trunc('day', now() - interval '7 days')
-\else
-    SELECT '[]'::jsonb AS values
-\endif
+    FROM daily_attack_rows report
 ),
 safety AS (
     SELECT

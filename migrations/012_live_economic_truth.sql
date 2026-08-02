@@ -1,5 +1,5 @@
 CREATE OR REPLACE VIEW phoenix_live_economic_truth AS
-WITH size_points AS (
+WITH size_points AS NOT MATERIALIZED (
     SELECT
         classification.source_event_identity,
         classification.source_sequence,
@@ -29,7 +29,7 @@ WITH size_points AS (
         END
     ) WITH ORDINALITY AS candidate(point, point_ordinal)
 ),
-facts AS (
+facts AS NOT MATERIALIZED (
     SELECT
         size_points.*,
         fact.shadow_decision_id,

@@ -1,5 +1,5 @@
 CREATE OR REPLACE VIEW phoenix_live_economic_loss_ledger AS
-WITH numeric_truth AS (
+WITH numeric_truth AS NOT MATERIALIZED (
     SELECT
         truth.*,
         CASE WHEN truth.gross_spread_wei ~ '^-?[0-9]+$'
@@ -36,7 +36,7 @@ WITH numeric_truth AS (
         ) AS maximum_liquidity_utilization_bps
     FROM phoenix_live_economic_truth truth
 ),
-contextual AS (
+contextual AS NOT MATERIALIZED (
     SELECT
         truth.*,
         classification.classification,
@@ -79,7 +79,7 @@ contextual AS (
         LIMIT 1
     ) counterfactual ON true
 ),
-caused AS (
+caused AS NOT MATERIALIZED (
     SELECT
         contextual.*,
         CASE
@@ -266,7 +266,7 @@ LEFT JOIN LATERAL (
 ) secondary ON true;
 
 CREATE OR REPLACE VIEW phoenix_daily_economic_attack_surface AS
-WITH ranked AS (
+WITH ranked AS NOT MATERIALIZED (
     SELECT
         date_trunc('day', classified_at) AS evaluation_day,
         ledger.*,

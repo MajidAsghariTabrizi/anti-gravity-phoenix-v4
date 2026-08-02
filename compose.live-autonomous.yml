@@ -72,6 +72,7 @@ services:
     environment:
       POSTGRES_DSN: ${POSTGRES_DSN:?POSTGRES_DSN is required}
       PHOENIX_ECONOMIC_DASHBOARD_INTERVAL_SECONDS: "45"
+      PHOENIX_ECONOMIC_DASHBOARD_QUERY_TIMEOUT_SECONDS: "30"
       PHOENIX_ECONOMIC_DASHBOARD_SQL: /opt/phoenix/economic-dashboard-snapshot.sql
       PHOENIX_ECONOMIC_DASHBOARD_OUTPUT: /evidence/latest-dashboard.json
     volumes:
@@ -93,7 +94,7 @@ services:
       - no-new-privileges:true
     restart: unless-stopped
     healthcheck:
-      test: ["CMD-SHELL", "test -s /evidence/latest-dashboard.json"]
+      test: ["CMD-SHELL", "find /evidence/latest-dashboard.json -maxdepth 0 -type f -size +0c -mmin -3 -print -quit 2>/dev/null | grep -q ."]
       interval: 45s
       timeout: 3s
       retries: 3
