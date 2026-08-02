@@ -212,6 +212,41 @@ def production_compose_command(
     return command
 
 
+def _active_runtime_services(
+    paths: HostPaths, active_release: str, mode: str
+) -> list[str]:
+    if not SHA_RE.fullmatch(active_release) or mode not in {"SHADOW", "LIVE"}:
+        raise GatewayError("READINESS_TOPOLOGY_INVALID")
+    output = _require_success(
+        [
+            "/usr/bin/python3",
+            "-I",
+            "-B",
+            str(paths.libexec / "release_components.py"),
+            "topology",
+            "--manifest",
+            str(paths.deploy_dir / "manifests" / f"{active_release}.json"),
+            "--mode",
+            mode,
+            "--field",
+            "running_services",
+        ],
+        "READINESS_TOPOLOGY_FAILED",
+    )
+    services = output.split()
+    if (
+        not services
+        or len(services) > 64
+        or len(services) != len(set(services))
+        or any(
+            re.fullmatch(r"[a-z0-9][a-z0-9-]{0,63}", item) is None
+            for item in services
+        )
+    ):
+        raise GatewayError("READINESS_TOPOLOGY_INVALID")
+    return services
+
+
 def _canonical(value: object) -> bytes:
     return (json.dumps(value, indent=2, sort_keys=True) + "\n").encode("utf-8")
 
@@ -988,6 +1023,14 @@ def production_readiness(
             paths, mode=mode, release_env=release_env
         )
         try:
+            expected_services = _active_runtime_services(
+                paths, active["active_release"], mode
+            )
+            checks["expected_services"] = expected_services
+        except GatewayError as exc:
+            failed(exc.code, exc.evidence)
+            expected_services = []
+        try:
             rendered = _require_success(
                 compose + ["config", "--format", "json"],
                 "READINESS_COMPOSE_RENDER_FAILED",
@@ -1006,8 +1049,12 @@ def production_readiness(
         service_evidence = []
         services = rendered_value.get("services", {})
         if isinstance(services, dict):
-            for service in sorted(services):
-                if service in {"autonomous-control", "migration-runner"}:
+            for service in expected_services:
+                if service not in services:
+                    failed(
+                        "READINESS_SERVICE_UNCONFIGURED",
+                        {"service": service},
+                    )
                     continue
                 try:
                     container_id = _require_success(

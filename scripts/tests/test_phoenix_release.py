@@ -25,6 +25,7 @@ from scripts.phoenix_release.controller import (
 )
 from scripts.phoenix_release.cli import parser as release_parser
 from scripts.phoenix_release.gateway import (
+    _active_runtime_services,
     _bounded_output,
     _is_stopped_live_executor,
     _live_executor_absence_is_fail_closed,
@@ -628,6 +629,44 @@ class BoundedTransportTests(unittest.TestCase):
             self.assertEqual(
                 evidence["failure_count"], len(evidence["failures"])
             )
+
+    def test_readiness_runtime_services_follow_the_active_manifest(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            paths = self.paths(Path(temporary))
+            with patch(
+                "scripts.phoenix_release.gateway._require_success",
+                return_value="postgres phoenix-engine live-executor\n",
+            ) as required:
+                services = _active_runtime_services(
+                    paths, ROLLBACK_SHA, "LIVE"
+                )
+            self.assertEqual(
+                services, ["postgres", "phoenix-engine", "live-executor"]
+            )
+            command = required.call_args.args[0]
+            self.assertIn(
+                str(
+                    paths.deploy_dir
+                    / "manifests"
+                    / f"{ROLLBACK_SHA}.json"
+                ),
+                command,
+            )
+            self.assertEqual(
+                command[-4:],
+                ["--mode", "LIVE", "--field", "running_services"],
+            )
+
+    def test_readiness_runtime_services_reject_duplicate_topology(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            paths = self.paths(Path(temporary))
+            with patch(
+                "scripts.phoenix_release.gateway._require_success",
+                return_value="postgres postgres\n",
+            ), self.assertRaisesRegex(
+                GatewayError, "READINESS_TOPOLOGY_INVALID"
+            ):
+                _active_runtime_services(paths, ROLLBACK_SHA, "LIVE")
 
     def test_failed_pre_mutation_retry_archives_and_resets_to_build(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
