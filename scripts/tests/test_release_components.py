@@ -160,9 +160,16 @@ class ReleaseComponentRegistryTests(unittest.TestCase):
 
     def test_workflows_use_registry_and_main_push_runs_all_required_jobs(self) -> None:
         build = (ROOT / ".github/workflows/build-images.yml").read_text(encoding="utf-8")
+        controller = (
+            ROOT / ".github/workflows/phoenix-release-controller.yml"
+        ).read_text(encoding="utf-8")
         ci = (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
         self.assertIn("python3 scripts/release_components.py build-matrix", build)
         self.assertIn("fromJSON(needs.preflight.outputs.build_matrix)", build)
+        self.assertIn("PHOENIX_RELEASE_IMAGE_SET: current", build)
+        self.assertIn("PHOENIX_RELEASE_IMAGE_SET: current", controller)
+        self.assertNotIn("PHOENIX_RELEASE_IMAGE_SET: legacy", build)
+        self.assertNotIn("PHOENIX_RELEASE_IMAGE_SET: legacy", controller)
         for name in EXPECTED_IMAGES:
             self.assertNotIn(name, build)
         self.assertIn("\n  push:\n    branches: [main]", ci)
@@ -306,6 +313,14 @@ class ReleaseComponentRegistryTests(unittest.TestCase):
                 legacy_references, "LIVE"
             ),
         )
+
+    def test_atlas_compose_binding_is_real_or_fail_closed(self) -> None:
+        compose = (ROOT / "compose.prod.yml").read_text(encoding="utf-8")
+        self.assertIn(
+            "image: ${ATLAS_OBSERVER_IMAGE:-phoenix.invalid/atlas-observer:legacy-disabled}",
+            compose,
+        )
+        self.assertNotIn("${ATLAS_OBSERVER_IMAGE:-${DASHBOARD_IMAGE", compose)
 
     def test_runtime_topology_covers_modes_and_generation_transitions(self) -> None:
         legacy = release_components.LEGACY_RELEASE_IMAGES
