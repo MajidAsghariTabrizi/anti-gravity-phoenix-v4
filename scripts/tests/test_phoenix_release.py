@@ -1686,7 +1686,17 @@ class WorkflowAndDeploymentContractTests(unittest.TestCase):
         self.assertIn("candidate_monitor_sql_inode_mismatch", self.rehearsal)
         self.assertIn("1000:1000", self.rehearsal)
         self.assertIn("candidate_monitor_unhealthy", self.rehearsal)
-        self.assertIn("deadline=$(( $(date +%s) + 720 ))", self.rehearsal)
+        self.assertIn("candidate_monitor_contract_invalid", self.rehearsal)
+        self.assertIn("candidate_monitor_image_invalid", self.rehearsal)
+        self.assertIn('--network "$database_network"', self.rehearsal)
+        self.assertIn(
+            "POSTGRES_DSN=postgres://phoenix_rehearsal:", self.rehearsal
+        )
+        self.assertIn("PGCONNECT_TIMEOUT=5", self.rehearsal)
+        self.assertIn("statement_timeout=60000", self.rehearsal)
+        self.assertIn("deadline=$(( monitor_started_at + 180 ))", self.rehearsal)
+        self.assertIn("log_monitor_diagnostics", self.rehearsal)
+        self.assertIn("monitor_healthy_seconds", self.rehearsal)
         self.assertIn("candidate_monitor_exited", self.rehearsal)
         self.assertIn('docker logs --tail 20 "$monitor_container"', self.rehearsal)
         self.assertIn("candidate_health_contract_failed", self.rehearsal)

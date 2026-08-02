@@ -110,6 +110,52 @@ print(image)
 PY
 ) || fail candidate_postgres_image_invalid
 
+monitor_image=$(
+  python3 -I -B - "$rendered" <<'PY'
+import sys
+from pathlib import Path
+import json
+import re
+
+value = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+service = value["services"]["economic-monitor"]
+image = service.get("image")
+if not isinstance(image, str) or re.fullmatch(
+    r"[a-z0-9._/-]+@sha256:[0-9a-f]{64}", image
+) is None:
+    raise SystemExit(1)
+expected = {
+    "entrypoint": ["/bin/sh", "/opt/phoenix/economic-dashboard-loop.sh"],
+    "user": "1000:1000",
+    "read_only": True,
+    "cap_drop": ["ALL"],
+    "security_opt": ["no-new-privileges:true"],
+}
+for key, expected_value in expected.items():
+    if service.get(key) != expected_value:
+        raise SystemExit(1)
+healthcheck = service.get("healthcheck")
+if not isinstance(healthcheck, dict) or healthcheck.get("test") != [
+    "CMD-SHELL",
+    "test -s /evidence/latest-dashboard.json",
+]:
+    raise SystemExit(1)
+environment = service.get("environment")
+if not isinstance(environment, dict) or any(
+    environment.get(key) != expected_value
+    for key, expected_value in {
+        "PHOENIX_ECONOMIC_DASHBOARD_SQL": (
+            "/opt/phoenix/economic-dashboard-snapshot.sql"
+        ),
+        "PHOENIX_ECONOMIC_DASHBOARD_OUTPUT": "/evidence/latest-dashboard.json",
+    }.items()
+):
+    raise SystemExit(1)
+print(image)
+PY
+) || fail candidate_monitor_contract_invalid
+[ "$monitor_image" = "$postgres_image" ] || fail candidate_monitor_image_invalid
+
 # Apply every candidate migration to an isolated, tmpfs-backed PostgreSQL
 # instance using the exact Compose-pinned image. It has no published port,
 # external network, persistent volume, or Production credential.
@@ -157,9 +203,6 @@ schema_contract=$(
       -c "SELECT count(*) FROM live_canary.schema_contract"
 ) || fail candidate_schema_contract_failed
 [ "$schema_contract" -gt 0 ] || fail candidate_schema_contract_missing
-cleanup_database
-database_container=
-database_network=
 
 compose() {
   python3 "$compose_runner" \
@@ -189,16 +232,34 @@ compose run --rm --no-deps autonomous-control status >/dev/null ||
   fail candidate_sql_or_schema_failed
 
 # Run the complete candidate monitor entrypoint with an isolated writable
-# output directory. The Production database mount remains read-only to the
-# monitor and the existing output inode cannot be replaced.
+# output directory and the already-migrated tmpfs PostgreSQL fixture. The
+# rehearsal must never depend on the live Production DSN: that dependency can
+# hang before the loop emits evidence and does not prove the candidate schema.
 monitor_container=$(
-  compose run -d --no-deps \
-  --name "phoenix-release-rehearsal-monitor-$short_sha-$$" \
-  -e PHOENIX_ECONOMIC_DASHBOARD_INTERVAL_SECONDS=30 \
-  -v "$candidate_root/scripts/economic-dashboard-loop.sh:/opt/phoenix/economic-dashboard-loop.sh:ro" \
-  -v "$candidate_root/scripts/sql/economic-dashboard-snapshot.sql:/opt/phoenix/economic-dashboard-snapshot.sql:ro" \
-  -v "$monitor_output:/evidence" \
-  economic-monitor
+  /usr/bin/docker run -d \
+    --name "phoenix-release-rehearsal-monitor-$short_sha-$$" \
+    --network "$database_network" \
+    --user 1000:1000 \
+    --read-only \
+    --cap-drop ALL \
+    --security-opt no-new-privileges:true \
+    --tmpfs /tmp:rw,noexec,nosuid,nodev,size=16m \
+    --health-cmd 'test -s /evidence/latest-dashboard.json' \
+    --health-interval 45s \
+    --health-timeout 3s \
+    --health-retries 3 \
+    -e "POSTGRES_DSN=postgres://phoenix_rehearsal:phoenix_rehearsal_only@$database_container:5432/phoenix_rehearsal" \
+    -e PGCONNECT_TIMEOUT=5 \
+    -e 'PGOPTIONS=-c statement_timeout=60000 -c lock_timeout=5000' \
+    -e PHOENIX_ECONOMIC_DASHBOARD_INTERVAL_SECONDS=30 \
+    -e PHOENIX_ECONOMIC_DASHBOARD_SQL=/opt/phoenix/economic-dashboard-snapshot.sql \
+    -e PHOENIX_ECONOMIC_DASHBOARD_OUTPUT=/evidence/latest-dashboard.json \
+    -v "$candidate_root/scripts/economic-dashboard-loop.sh:/opt/phoenix/economic-dashboard-loop.sh:ro" \
+    -v "$candidate_root/scripts/sql/economic-dashboard-snapshot.sql:/opt/phoenix/economic-dashboard-snapshot.sql:ro" \
+    -v "$monitor_output:/evidence" \
+    --entrypoint /bin/sh \
+    "$monitor_image" \
+    /opt/phoenix/economic-dashboard-loop.sh
 ) ||
   fail candidate_monitor_failed
 case "$monitor_container" in
@@ -268,7 +329,17 @@ container_sql_inode=$(
 ) || fail candidate_monitor_sql_inode_unavailable
 [ "$container_sql_inode" = "$host_sql_inode" ] ||
   fail candidate_monitor_sql_inode_mismatch
-deadline=$(( $(date +%s) + 720 ))
+log_monitor_diagnostics() {
+  /usr/bin/docker inspect --format \
+    'state={{.State.Status}} exit={{.State.ExitCode}} oom={{.State.OOMKilled}} health={{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' \
+    "$monitor_container" >&2 || true
+  /usr/bin/docker inspect --format \
+    '{{if .State.Health}}{{json .State.Health.Log}}{{else}}[]{{end}}' \
+    "$monitor_container" >&2 || true
+  /usr/bin/docker logs --tail 20 "$monitor_container" >&2 || true
+}
+monitor_started_at=$(date +%s)
+deadline=$(( monitor_started_at + 180 ))
 monitor_health=
 while [ "$(date +%s)" -lt "$deadline" ]; do
   monitor_health=$(
@@ -284,16 +355,17 @@ while [ "$(date +%s)" -lt "$deadline" ]; do
   )
   case "$monitor_state" in
     exited:*|dead:*)
-      /usr/bin/docker logs --tail 20 "$monitor_container" >&2 || true
+      log_monitor_diagnostics
       fail candidate_monitor_exited
       ;;
   esac
   sleep 2
 done
 if [ "$monitor_health" != healthy ]; then
-  /usr/bin/docker logs --tail 20 "$monitor_container" >&2 || true
+  log_monitor_diagnostics
   fail candidate_monitor_unhealthy
 fi
+monitor_healthy_seconds=$(( $(date +%s) - monitor_started_at ))
 
 latest=$monitor_output/latest-dashboard.json
 [ -f "$latest" ] && [ ! -L "$latest" ] ||
@@ -312,6 +384,9 @@ PY
   fail candidate_monitor_output_invalid
 cleanup_monitor
 monitor_container=
+cleanup_database
+database_container=
+database_network=
 
 PHOENIX_DEPLOY_ROOT="$deploy_root" \
 PHOENIX_ENV_FILE="$env_file" \
@@ -325,4 +400,4 @@ PHOENIX_HEALTH_EXPECTED_MODE=DISARMED_EVIDENCE \
   fail candidate_health_contract_failed
 
 printf '%s\n' \
-  "{\"schema\":\"phoenix.release-rehearsal.v1\",\"release_sha\":\"$release_sha\",\"status\":\"passed\"}"
+  "{\"schema\":\"phoenix.release-rehearsal.v1\",\"release_sha\":\"$release_sha\",\"status\":\"passed\",\"monitor_healthy_seconds\":$monitor_healthy_seconds}"
