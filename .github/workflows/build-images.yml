@@ -78,7 +78,7 @@ concurrency:
 env:
   REGISTRY: ghcr.io
   IMAGE_OWNER: majidasgharitabrizi
-  PHOENIX_RELEASE_IMAGE_SET: legacy
+  PHOENIX_RELEASE_IMAGE_SET: current
 
 jobs:
   preflight:
