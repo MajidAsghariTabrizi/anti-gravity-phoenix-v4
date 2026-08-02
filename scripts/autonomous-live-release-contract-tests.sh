@@ -257,7 +257,7 @@ for forbidden in (
 ):
     require(forbidden not in deploy, f"normal_deploy_authority_leak:{forbidden}")
 
-operation = deploy.index("\ncompose pull\n")
+operation = deploy.index("\ncompose pull $pull_services\n")
 migrate = deploy.index("autonomous-control migrate", operation)
 disarmed = deploy.index("autonomous-control disarmed-deploy", operation)
 engine = deploy.index("compose up -d --no-deps phoenix-engine", operation)
