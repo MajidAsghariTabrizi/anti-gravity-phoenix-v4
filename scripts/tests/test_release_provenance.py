@@ -977,6 +977,8 @@ class ReleaseProvenanceTests(unittest.TestCase):
         self.assertIn("fromJSON(needs.preflight.outputs.build_matrix)", workflow)
         self.assertIn("validate-github-run", workflow)
         self.assertIn("inherit-protected", workflow)
+        self.assertIn("resolve-protected-build-plan", workflow)
+        self.assertIn("steps.plan.outputs.inherited_images", workflow)
         self.assertGreaterEqual(
             workflow.count("if: ${{ matrix.build == true }}"),
             7,

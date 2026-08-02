@@ -89,10 +89,10 @@ jobs:
       contents: read
       actions: read
     outputs:
-      build_matrix: ${{ steps.impact.outputs.matrix }}
-      built_images: ${{ steps.impact.outputs.built_images }}
-      inherited_images: ${{ steps.impact.outputs.inherited_images }}
-      impact_plan: ${{ steps.impact.outputs.plan }}
+      build_matrix: ${{ steps.plan.outputs.matrix }}
+      built_images: ${{ steps.plan.outputs.built_images }}
+      inherited_images: ${{ steps.plan.outputs.inherited_images }}
+      impact_plan: ${{ steps.plan.outputs.plan }}
     steps:
       - name: Checkout exact requested release
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
@@ -134,17 +134,6 @@ jobs:
               change-impact.json >change-impact.full.json
             mv change-impact.full.json change-impact.json
           fi
-          built_images="$(jq -c '.built_images' change-impact.json)"
-          inherited_images="$(jq -c '.inherited_images' change-impact.json)"
-          matrix="$(
-            python3 scripts/release_components.py build-matrix \
-              --built-images-json "$built_images"
-          )"
-          printf 'plan=%s\n' "$(jq -c . change-impact.json)" >>"$GITHUB_OUTPUT"
-          printf 'built_images=%s\n' "$built_images" >>"$GITHUB_OUTPUT"
-          printf 'inherited_images=%s\n' "$inherited_images" >>"$GITHUB_OUTPUT"
-          printf 'matrix=%s\n' "$matrix" >>"$GITHUB_OUTPUT"
-
       - name: Validate explicit publication authorization
         shell: bash
         env:
@@ -232,8 +221,35 @@ jobs:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           path: protected-base/release
 
+      - name: Reconcile protected generation image plan
+        id: plan
+        shell: bash
+        env:
+          PROTECTED_BASE_SHA: ${{ inputs.protected_base_sha }}
+        run: |
+          set -euo pipefail
+          if [ -n "$PROTECTED_BASE_SHA" ]; then
+            python3 scripts/release_components.py \
+              resolve-protected-build-plan \
+              --plan change-impact.json \
+              --protected-base-manifest \
+                protected-base/release/release-manifest.json \
+              >change-impact.resolved.json
+            mv change-impact.resolved.json change-impact.json
+          fi
+          built_images="$(jq -c '.built_images' change-impact.json)"
+          inherited_images="$(jq -c '.inherited_images' change-impact.json)"
+          matrix="$(
+            python3 scripts/release_components.py build-matrix \
+              --built-images-json "$built_images"
+          )"
+          printf 'plan=%s\n' "$(jq -c . change-impact.json)" >>"$GITHUB_OUTPUT"
+          printf 'built_images=%s\n' "$built_images" >>"$GITHUB_OUTPUT"
+          printf 'inherited_images=%s\n' "$inherited_images" >>"$GITHUB_OUTPUT"
+          printf 'matrix=%s\n' "$matrix" >>"$GITHUB_OUTPUT"
+
       - name: Materialize inherited protected image fragments
-        if: ${{ inputs.protected_base_sha != '' && steps.impact.outputs.inherited_images != '[]' }}
+        if: ${{ inputs.protected_base_sha != '' && steps.plan.outputs.inherited_images != '[]' }}
         shell: bash
         env:
           RELEASE_SHA: ${{ inputs.release_sha }}
@@ -241,7 +257,7 @@ jobs:
           BUILD_RUN_ID: ${{ github.run_id }}
           PROTECTED_BASE_SHA: ${{ inputs.protected_base_sha }}
           PROTECTED_BASE_BUILD_RUN_ID: ${{ inputs.protected_base_build_run_id }}
-          INHERITED_IMAGES: ${{ steps.impact.outputs.inherited_images }}
+          INHERITED_IMAGES: ${{ steps.plan.outputs.inherited_images }}
         run: |
           set -euo pipefail
           python3 scripts/release_provenance.py inherit-protected \
@@ -256,7 +272,7 @@ jobs:
             --inherited-images-json "$INHERITED_IMAGES"
 
       - name: Upload inherited protected image fragments
-        if: ${{ inputs.protected_base_sha != '' && steps.impact.outputs.inherited_images != '[]' }}
+        if: ${{ inputs.protected_base_sha != '' && steps.plan.outputs.inherited_images != '[]' }}
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: inherited-protected-fragments

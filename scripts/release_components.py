@@ -389,6 +389,49 @@ def manifest_images(path: Path) -> tuple[str, ...]:
     return names
 
 
+def load_build_plan(path: Path) -> dict[str, Any]:
+    try:
+        if (
+            path.is_symlink()
+            or not path.is_file()
+            or path.stat().st_size > MAX_REGISTRY_BYTES
+        ):
+            raise ReleaseComponentError("build plan is invalid")
+        value = json.loads(
+            path.read_text(encoding="utf-8"), object_pairs_hook=_unique_object
+        )
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise ReleaseComponentError("build plan is invalid") from exc
+    if not isinstance(value, dict) or value.get("schema") != "phoenix.change-impact.v1":
+        raise ReleaseComponentError("build plan is invalid")
+    for field in ("built_images", "inherited_images"):
+        items = value.get(field)
+        if (
+            not isinstance(items, list)
+            or len(items) != len(set(items))
+            or any(not isinstance(item, str) for item in items)
+        ):
+            raise ReleaseComponentError("build plan image selection is invalid")
+    return value
+
+
+def resolve_protected_build_plan(
+    plan: dict[str, Any], protected_base_images: set[str] | tuple[str, ...]
+) -> dict[str, Any]:
+    base = set(protected_base_images)
+    generation_for_images(base)
+    built = set(plan.get("built_images", []))
+    inherited = set(plan.get("inherited_images", []))
+    expected = set(RELEASE_IMAGES)
+    if built & inherited or built | inherited != expected:
+        raise ReleaseComponentError("build plan does not cover the release image set")
+    missing_from_base = expected - base
+    resolved = dict(plan)
+    resolved["built_images"] = sorted(built | missing_from_base)
+    resolved["inherited_images"] = sorted(inherited & base)
+    return resolved
+
+
 def runtime_topology(
     image_names: set[str] | tuple[str, ...],
     mode: str,
@@ -528,9 +571,19 @@ def runtime_topology(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=("validate", "build-matrix", "topology"))
+    parser.add_argument(
+        "command",
+        choices=(
+            "validate",
+            "build-matrix",
+            "resolve-protected-build-plan",
+            "topology",
+        ),
+    )
     parser.add_argument("--built-images-json")
     parser.add_argument("--manifest")
+    parser.add_argument("--plan")
+    parser.add_argument("--protected-base-manifest")
     parser.add_argument("--source-manifest")
     parser.add_argument("--mode", choices=RUNTIME_MODES)
     parser.add_argument("--field")
@@ -556,6 +609,20 @@ def main() -> None:
                 build_matrix(built_images=selected),
                 sort_keys=True,
                 separators=(",", ":"),
+            )
+        )
+    elif args.command == "resolve-protected-build-plan":
+        if not args.plan or not args.protected_base_manifest:
+            raise ReleaseComponentError(
+                "build plan and protected base manifest are required"
+            )
+        plan = load_build_plan(Path(args.plan))
+        protected_images = manifest_images(Path(args.protected_base_manifest))
+        print(
+            json.dumps(
+                resolve_protected_build_plan(plan, protected_images),
+                indent=2,
+                sort_keys=True,
             )
         )
     elif args.command == "topology":
