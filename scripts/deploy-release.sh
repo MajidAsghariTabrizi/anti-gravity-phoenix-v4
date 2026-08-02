@@ -186,6 +186,7 @@ trap cleanup_candidate EXIT
 trap 'exit 1' HUP INT TERM
 rendered_candidate="$state_dir/compose.rendered.json"
 metadata_candidate="$state_dir/render.metadata.json"
+candidate_evidence_env="$state_dir/candidate-evidence.env"
 candidate_live_env="$state_dir/candidate-live.env"
 state_candidate="$state_dir/release-state.json"
 pointer_candidate="$state_dir/current-release"
@@ -575,16 +576,25 @@ verify_active_release_coherence "$rollback_sha" "" ||
   fail "active release pointers are incoherent before deployment"
 active_environment_identity_before=$(production_environment_identity "$env_file") ||
   fail "active production environment identity is unavailable before preflight"
+cp "$env_file" "$candidate_evidence_env" ||
+  fail "candidate evidence environment could not be copied"
+chmod 0600 "$candidate_evidence_env"
+[ "$(stat -c '%u:%g:%a:%h' "$candidate_evidence_env")" = 0:0:600:1 ] ||
+  fail "candidate evidence environment metadata is unsafe"
+python3 "$deploy_dir/production_mode.py" shadow \
+  --env-file "$candidate_evidence_env" ||
+  fail "candidate evidence environment could not be materialized"
 "$deploy_dir/render-production-compose.sh" \
   --compose-file "$compose_file" \
   --overlay-file "$overlay_file" \
   --expected-mode DISARMED_EVIDENCE \
-  --env-file "$env_file" \
+  --env-file "$candidate_evidence_env" \
   --release-env "$release_env" \
   --release-manifest "$manifest" \
   --output "$rendered_candidate" \
   --metadata-output "$metadata_candidate" >/dev/null ||
   fail "preflight production rendering failed"
+rm -f "$candidate_evidence_env"
 validate_live_rpc_inputs ||
   fail "preflight LIVE RPC provider and priority configuration is invalid"
 cp "$env_file" "$candidate_live_env" ||

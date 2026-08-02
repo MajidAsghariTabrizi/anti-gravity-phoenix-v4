@@ -34,6 +34,7 @@ for required in \
   "$overlay_file" \
   "$compose_runner" \
   "$candidate_root/scripts/production_context.py" \
+  "$candidate_root/scripts/production_mode.py" \
   "$candidate_root/scripts/render-production-compose.sh" \
   "$candidate_root/scripts/sql/economic-dashboard-snapshot.sql"
 do
@@ -50,6 +51,7 @@ trap cleanup EXIT
 trap 'exit 1' HUP INT TERM
 
 release_env=$state_dir/candidate-release.env
+candidate_evidence_env=$state_dir/candidate-evidence.env
 rendered=$state_dir/candidate-compose.json
 metadata=$state_dir/candidate-render.json
 monitor_output=$state_dir/monitor
@@ -88,16 +90,26 @@ python3 "$candidate_root/scripts/production_context.py" manifest-env \
   --output "$release_env" ||
   fail candidate_manifest_invalid
 
+cp "$env_file" "$candidate_evidence_env" ||
+  fail candidate_evidence_environment_copy_failed
+chmod 0600 "$candidate_evidence_env"
+[ "$(stat -c '%u:%g:%a:%h' "$candidate_evidence_env")" = 0:0:600:1 ] ||
+  fail candidate_evidence_environment_metadata_invalid
+python3 "$candidate_root/scripts/production_mode.py" shadow \
+  --env-file "$candidate_evidence_env" ||
+  fail candidate_evidence_environment_invalid
+
 "$candidate_root/scripts/render-production-compose.sh" \
   --compose-file "$compose_file" \
   --overlay-file "$overlay_file" \
   --expected-mode DISARMED_EVIDENCE \
-  --env-file "$env_file" \
+  --env-file "$candidate_evidence_env" \
   --release-env "$release_env" \
   --release-manifest "$release_manifest" \
   --output "$rendered" \
   --metadata-output "$metadata" >/dev/null ||
   fail candidate_compose_render_failed
+rm -f "$candidate_evidence_env"
 
 postgres_image=$(
   python3 -I -B - "$rendered" <<'PY'
