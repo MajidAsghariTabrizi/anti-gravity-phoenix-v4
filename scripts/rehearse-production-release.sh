@@ -85,6 +85,7 @@ python3 "$candidate_root/scripts/production_context.py" manifest-env \
 "$candidate_root/scripts/render-production-compose.sh" \
   --compose-file "$compose_file" \
   --overlay-file "$overlay_file" \
+  --expected-mode DISARMED_EVIDENCE \
   --env-file "$env_file" \
   --release-env "$release_env" \
   --release-manifest "$release_manifest" \

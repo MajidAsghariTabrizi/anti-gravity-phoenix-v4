@@ -10,6 +10,7 @@ release_env=
 release_manifest=
 rendered_output=
 metadata_output=
+expected_mode=
 
 fail() {
   printf '{"code":"%s","status":"error"}\n' "$1" >&2
@@ -29,6 +30,7 @@ while [ "$#" -gt 0 ]; do
     --release-manifest) [ "$#" -ge 2 ] || usage; release_manifest=$2; shift 2 ;;
     --output) [ "$#" -ge 2 ] || usage; rendered_output=$2; shift 2 ;;
     --metadata-output) [ "$#" -ge 2 ] || usage; metadata_output=$2; shift 2 ;;
+    --expected-mode) [ "$#" -ge 2 ] || usage; expected_mode=$2; shift 2 ;;
     *) usage ;;
   esac
 done
@@ -37,6 +39,10 @@ done
 [ -n "$env_file" ] || usage
 [ -n "$rendered_output" ] || usage
 [ -n "$metadata_output" ] || usage
+case "$expected_mode" in
+  ""|SHADOW|DISARMED_EVIDENCE|LIVE) ;;
+  *) usage ;;
+esac
 [ -f "$compose_file" ] || fail PRODUCTION_COMPOSE_CONTEXT_MISSING
 if [ -n "$overlay_file" ]; then
   [ -f "$overlay_file" ] || fail PRODUCTION_COMPOSE_CONTEXT_MISSING
@@ -127,6 +133,9 @@ set -- python3 "$script_dir/production_context.py" validate-render \
   --metadata-output "$metadata_tmp"
 if [ -n "$manifest_args" ]; then
   set -- "$@" "$manifest_args"
+fi
+if [ -n "$expected_mode" ]; then
+  set -- "$@" --expected-mode "$expected_mode"
 fi
 "$@" || exit 1
 
