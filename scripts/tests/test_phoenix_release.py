@@ -1707,6 +1707,23 @@ class WorkflowAndDeploymentContractTests(unittest.TestCase):
         )[1].split("- name:", maxsplit=1)[0]
         self.assertIn("fetch-depth: 0", checkout)
 
+    def test_deploy_reconciles_generation_plan_before_provenance_check(
+        self,
+    ) -> None:
+        deploy = self.workflow.split(
+            "- name: Verify, package, receive, and resume",
+            maxsplit=1,
+        )[1].split("- name:", maxsplit=1)[0]
+        resolver = deploy.index("resolve-protected-build-plan")
+        built_check = deploy.index(
+            '"$(jq -c \'.built_images\' package/release-provenance.json)"'
+        )
+        self.assertLess(resolver, built_check)
+        self.assertIn(
+            "--protected-base-manifest package/rollback-manifest.json",
+            deploy,
+        )
+
     def test_release_environment_binds_the_exact_versioned_route_registry(self) -> None:
         self.assertIn(
             '--route-registry "$deploy_dir/routes/weth_usdc_uniswap_v3.json"',
