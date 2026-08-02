@@ -16,9 +16,6 @@ release_assets_file="$deploy_dir/release-assets.sha"
 candidate_release_assets_file="$deploy_dir/candidate-release-assets.sha"
 previous_file="$deploy_dir/previous-release"
 runtime_dir="${PHOENIX_DEPLOY_RUNTIME_DIR:-$deploy_dir/.deploy-runtime}"
-protected_services='nitro-feed-relay feed-ingestor nats postgres recorder'
-fixed_protected_services='nitro-feed-relay nats postgres'
-optional_services='prometheus rpc-gateway shadow-dispatcher phoenix-engine dashboard'
 service_wait_seconds=${PHOENIX_DEPLOY_SERVICE_WAIT_SECONDS:-300}
 recorder_drain_seconds=${PHOENIX_RECORDER_DRAIN_SECONDS:-180}
 reconciliation_seconds=${PHOENIX_ROLLBACK_RECONCILIATION_SECONDS:-180}
@@ -79,7 +76,25 @@ case "$rollback_from" in
 esac
 [ "${#rollback_from}" -eq 40 ] || fail "active release SHA is invalid"
 source_release_env="$deploy_dir/manifests/$rollback_from.env"
+source_manifest="$deploy_dir/manifests/$rollback_from.json"
 [ -s "$source_release_env" ] || fail "active release environment is missing"
+[ -f "$source_manifest" ] || fail "active release manifest is missing"
+protected_services=$(python3 "$deploy_dir/release_components.py" topology \
+  --manifest "$manifest" --mode SHADOW --field protected_services) ||
+  fail "rollback target topology is invalid"
+fixed_protected_services=$(python3 "$deploy_dir/release_components.py" topology \
+  --manifest "$manifest" --mode SHADOW --field fixed_protected_services) ||
+  fail "rollback target topology is invalid"
+start_services=$(python3 "$deploy_dir/release_components.py" topology \
+  --manifest "$manifest" --mode SHADOW --field start_services) ||
+  fail "rollback target topology is invalid"
+remove_services=$(python3 "$deploy_dir/release_components.py" topology \
+  --manifest "$manifest" --source-manifest "$source_manifest" \
+  --mode SHADOW --field remove_services) ||
+  fail "rollback transition topology is invalid"
+absent_services=$(python3 "$deploy_dir/release_components.py" topology \
+  --manifest "$manifest" --mode SHADOW --field intentional_absence) ||
+  fail "rollback target topology is invalid"
 
 compose_with_release_env() {
   selected_release_env=$1
@@ -90,6 +105,15 @@ compose_with_release_env() {
     --release-env "$selected_release_env" \
     --compose-file "$compose_file" \
     -- "$@"
+}
+
+remove_source_only_services() {
+  for service in $remove_services; do
+    compose_with_release_env "$source_release_env" stop -t 30 "$service" \
+      >/dev/null 2>&1 || true
+    compose_with_release_env "$source_release_env" rm -f "$service" \
+      >/dev/null || return 1
+  done
 }
 
 release_env_value() {
@@ -301,6 +325,8 @@ if [ -f "$overlay_file" ] && [ -s "$live_release_env" ]; then
 fi
 python3 "$deploy_dir/production_mode.py" shadow --env-file "$env_file" ||
   fail "SHADOW production mode could not be restored"
+remove_source_only_services ||
+  fail "source-only services could not be removed before rollback promotion"
 
 python3 "$deploy_dir/production_context.py" manifest-env \
   --manifest "$manifest" \
@@ -436,9 +462,13 @@ PY
 
 capture_protected_ids "$protected_before" || fail "protected services are not ready before rollback"
 compose pull
-for service in $optional_services; do
+for service in $start_services; do
   compose up -d --no-deps "$service"
   wait_service_healthy "$service" || fail "optional service did not become healthy during rollback: $service"
+done
+for service in $absent_services; do
+  [ -z "$(compose ps -a -q "$service" | awk 'NF { print; exit }')" ] ||
+    fail "a service required to be absent remained after rollback: $service"
 done
 capture_protected_ids "$protected_after" || fail "protected services are not ready after rollback"
 cmp "$protected_before" "$protected_after" >/dev/null || fail "protected service identity changed during rollback"

@@ -1,0 +1,32 @@
+{
+  "schema": "phoenix.silver-bullet-baseline.v1",
+  "generated_at": "2026-08-02T07:41:24.293Z",
+  "repository_sha": "aa4ab66de054b4a1ab0966d78923b78ab789ded1",
+  "active_release_sha": "c40ad821d564b30bf43d31d608669999f5e03efc",
+  "candidate_release_sha": "aa4ab66de054b4a1ab0966d78923b78ab789ded1",
+  "source_identities": {
+    "source_ci_run": "30707140905",
+    "release_run": "30707220498",
+    "release_job": "91388417515",
+    "release_manifest_sha256": "sha256:b6ea0f2620bda15cdfe3f9542cf1a103d80635661ac1239c02f67e572d31e7eb",
+    "release_evidence_sha256": "sha256:8213399750a3a95dd14ecf037481c9dd6df52d5ff31664e0b3b7b65b07dcbcc0",
+    "production_readiness_sha256": "sha256:bc61b4769f34b1b7d9def708a8ea6c28e77601b2cadb5af9db3ba76f6f54b4ef"
+  },
+  "facts": {
+    "release_result": "ROLLED_BACK",
+    "failure_code": "RUNNING_IMAGE_MISMATCH",
+    "failure_service": "atlas-observer",
+    "failure_stage": "container-missing",
+    "candidate_image_generation": "legacy-seven",
+    "candidate_context_bound": true,
+    "automatic_rollback_succeeded": true,
+    "production_mode": "SHADOW",
+    "live_execution": false,
+    "autonomous_execution": false
+  },
+  "completeness": "complete_for_platform_failure_reconstruction",
+  "unknowns": [
+    "No protected release was run for this branch because owner merge/release authorization is absent.",
+    "Current economic evidence was not refreshed while PLATFORM_READY is false."
+  ]
+}

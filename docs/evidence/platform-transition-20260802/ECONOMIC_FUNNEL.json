@@ -1,0 +1,26 @@
+{
+  "schema": "phoenix.economic-funnel.v1",
+  "generated_at": "2026-08-02T07:41:24.293Z",
+  "repository_sha": "aa4ab66de054b4a1ab0966d78923b78ab789ded1",
+  "active_release_sha": "c40ad821d564b30bf43d31d608669999f5e03efc",
+  "source_identities": {
+    "checkpoint_seed": "PHOENIX_SILVER_BULLET_PROMPT_2026-08-01",
+    "platform_release_run": "30707220498"
+  },
+  "last_verified_seed": {
+    "reviewed_dex_evaluations_7d": 2747,
+    "eligible_candidates": 0,
+    "profitable_candidates": 0,
+    "attempts": 0,
+    "outcomes": 0,
+    "realized_pnl": 0,
+    "atlas_positive_liquidation_opportunities": 0,
+    "exact_state_blocker": "independent historical exact-block eth_call unavailable on reviewed secondary provider"
+  },
+  "current_refresh": "not_run_while_PLATFORM_READY_false",
+  "completeness": "historical_seed_only",
+  "unknowns": [
+    "Current observed and protocol-linked event counts were not refreshed in this platform-only loop.",
+    "Exact-state completeness and conservative residual PnL remain unproven."
+  ]
+}

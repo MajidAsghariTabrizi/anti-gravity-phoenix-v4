@@ -126,10 +126,21 @@ if [ "$inspect_running" -eq 1 ]; then
   if [ -z "${PHOENIX_DOCKER_BIN:-}" ]; then
     command -v docker >/dev/null 2>&1 || fail RUNNING_IMAGE_MISMATCH
   fi
-  services='nitro-feed-relay nats postgres rpc-gateway feed-ingestor phoenix-engine shadow-dispatcher recorder atlas-observer dashboard prometheus'
+  runtime_mode=SHADOW
   if [ -n "$overlay_file" ]; then
-    services="$services live-executor"
+    runtime_mode=LIVE
   fi
+  if [ "$allow_stopped_live_executor" -eq 1 ]; then
+    runtime_mode=DISARMED_EVIDENCE
+  fi
+  services=$(python3 "$script_dir/release_components.py" topology \
+    --manifest "$release_manifest" \
+    --mode "$runtime_mode" \
+    --field inspect_services) || fail RUNNING_IMAGE_MISMATCH topology
+  absent_services=$(python3 "$script_dir/release_components.py" topology \
+    --manifest "$release_manifest" \
+    --mode "$runtime_mode" \
+    --field intentional_absence) || fail RUNNING_IMAGE_MISMATCH topology
   for service in $services
   do
     set -- -f "$compose_file"
@@ -149,12 +160,6 @@ if [ "$inspect_running" -eq 1 ]; then
         --env-file "$release_env" \
         "$@" ps -q "$service" 2>/dev/null) ||
       fail RUNNING_IMAGE_MISMATCH compose-ps "$service"
-    if [ -z "$container_id" ] &&
-      [ "$service" = live-executor ] &&
-      [ "$allow_stopped_live_executor" -eq 1 ]
-    then
-      continue
-    fi
     [ -n "$container_id" ] ||
       fail RUNNING_IMAGE_MISMATCH container-missing "$service"
     container_count=$(printf '%s\n' "$container_id" | awk 'NF { count += 1 } END { print count + 0 }')
@@ -171,6 +176,28 @@ if [ "$inspect_running" -eq 1 ]; then
       fail RUNNING_IMAGE_MISMATCH inspect-format "$service"
     printf '%s\t%s\t%s\t%s\n' \
       "$service" "$configured_image" "$image_id" "$container_id" >>"$running_tsv"
+  done
+  for service in $absent_services
+  do
+    set -- -f "$compose_file"
+    if [ -n "$overlay_file" ]; then
+      set -- "$@" -f "$overlay_file" --profile live-autonomous
+    fi
+    container_id=$(env -i \
+      PATH="${PATH:-}" \
+      HOME="${HOME:-}" \
+      DOCKER_CONFIG="${DOCKER_CONFIG:-}" \
+      DOCKER_CONTEXT="${DOCKER_CONTEXT:-}" \
+      DOCKER_HOST="${DOCKER_HOST:-}" \
+      XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-}" \
+      PHOENIX_ENV_FILE="$env_file" \
+      "$compose_command" ${compose_prefix:+"$compose_prefix"} \
+        --env-file "$env_file" \
+        --env-file "$release_env" \
+        "$@" ps -a -q "$service" 2>/dev/null) ||
+      fail RUNNING_IMAGE_MISMATCH compose-ps "$service"
+    [ -z "$container_id" ] ||
+      fail RUNNING_IMAGE_MISMATCH unexpected-present "$service"
   done
   python3 "$script_dir/production_context.py" running-from-tsv \
     --input "$running_tsv" \

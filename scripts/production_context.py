@@ -38,22 +38,17 @@ RELEASE_IMAGES = release_components.RELEASE_IMAGES
 LEGACY_RELEASE_IMAGES = release_components.LEGACY_RELEASE_IMAGES
 PROTECTED_IMAGES = release_components.PROTECTED_IMAGES
 
-EXPECTED_SERVICES = (
-    "atlas-observer",
-    "nitro-feed-relay",
-    "nats",
-    "postgres",
-    "migration-runner",
-    "rpc-gateway",
-    "feed-ingestor",
-    "phoenix-engine",
-    "shadow-dispatcher",
-    "recorder",
-    "dashboard",
-    "prometheus",
+EXPECTED_SERVICES = tuple(
+    release_components.runtime_topology(
+        release_components.CURRENT_RELEASE_IMAGES, "SHADOW"
+    )["rendered_expected_services"]
 )
 
-LIVE_EXPECTED_SERVICES = EXPECTED_SERVICES + ("live-executor",)
+LIVE_EXPECTED_SERVICES = tuple(
+    release_components.runtime_topology(
+        release_components.CURRENT_RELEASE_IMAGES, "LIVE"
+    )["rendered_expected_services"]
+)
 
 RENDERED_OWNED_IMAGES = {
     service: component["image_environment"]
@@ -61,12 +56,7 @@ RENDERED_OWNED_IMAGES = {
     for service in component["production_services"]
 }
 
-EXTERNAL_IMAGES = {
-    "nitro-feed-relay": "offchainlabs/nitro-node@sha256:ebc985e3b105980734630744981e1542001c22d74cba57509fe0d5ed8bb84c14",
-    "nats": "nats@sha256:b83efabe3e7def1e0a4a31ec6e078999bb17c80363f881df35edc70fcb6bb927",
-    "postgres": "postgres@sha256:57c72fd2a128e416c7fcc499958864df5301e940bca0a56f58fddf30ffc07777",
-    "prometheus": "prom/prometheus@sha256:075b1ba2c4ebb04bc3a6ab86c06ec8d8099f8fda1c96ef6d104d9bb1def1d8bc",
-}
+EXTERNAL_IMAGES = release_components.EXTERNAL_IMAGES
 
 SHA_PATTERN = re.compile(r"^[0-9a-f]{40}$")
 DIGEST_PATTERN = re.compile(r"^sha256:[0-9a-f]{64}$")
@@ -214,6 +204,12 @@ def load_manifest(path: Path) -> tuple[dict, str, dict[str, str]]:
     if not isinstance(images, dict):
         raise ContextError("RELEASE_IMAGE_MISMATCH")
 
+    image_names = tuple(sorted(images))
+    try:
+        release_components.generation_for_images(image_names)
+    except release_components.ReleaseComponentError:
+        raise ContextError("RELEASE_IMAGE_MISMATCH") from None
+
     inherited = manifest["schema"] == "phoenix.release.v2"
     build_run_id = manifest.get("build_run_id")
     if inherited:
@@ -235,19 +231,11 @@ def load_manifest(path: Path) -> tuple[dict, str, dict[str, str]]:
             or manifest["protected_base_sha"] == release_sha
             or not isinstance(manifest.get("protected_base_build_run_id"), str)
             or not RUN_ID_PATTERN.fullmatch(manifest["protected_base_build_run_id"])
-            or tuple(sorted(images)) != RELEASE_IMAGES
         ):
             raise ContextError("RELEASE_IMAGE_MISMATCH")
 
-    image_names = tuple(sorted(images))
-    if not inherited and image_names not in (
-        RELEASE_IMAGES,
-        LEGACY_RELEASE_IMAGES,
-    ):
-        raise ContextError("RELEASE_IMAGE_MISMATCH")
-
     references: dict[str, str] = {}
-    names = RELEASE_IMAGES if inherited else image_names
+    names = image_names
     for image_name in names:
         image = images.get(image_name)
         if not isinstance(image, dict):
@@ -404,12 +392,17 @@ def service_environment(services: dict, service: str) -> dict:
 def expected_services_for_references(
     references: dict[str, str] | None, autonomous_live: bool
 ) -> tuple[str, ...]:
-    expected = list(EXPECTED_SERVICES)
-    if references is not None and "atlas-observer" not in references:
-        expected.remove("atlas-observer")
-    if autonomous_live:
-        expected.append("live-executor")
-    return tuple(expected)
+    image_names = (
+        release_components.CURRENT_RELEASE_IMAGES
+        if references is None or "atlas-observer" in references
+        else release_components.LEGACY_RELEASE_IMAGES
+    )
+    mode = "LIVE" if autonomous_live else "SHADOW"
+    return tuple(
+        release_components.runtime_topology(image_names, mode)[
+            "rendered_expected_services"
+        ]
+    )
 
 
 def validate_render(args: argparse.Namespace) -> None:
@@ -732,19 +725,38 @@ def validate_active(args: argparse.Namespace) -> None:
     ):
         raise ContextError("RUNNING_IMAGE_MISMATCH")
     running_services = running["services"]
+    image_names = (
+        release_components.CURRENT_RELEASE_IMAGES
+        if "atlas-observer" in expected_state["images"]
+        else release_components.LEGACY_RELEASE_IMAGES
+    )
+    runtime_mode = (
+        "DISARMED_EVIDENCE"
+        if args.allow_stopped_live_executor
+        else expected_state["mode"]
+    )
+    topology = release_components.runtime_topology(
+        image_names, runtime_mode
+    )
+    for absent_service in topology["intentional_absence"]:
+        if absent_service in running_services:
+            raise ContextError(
+                "RUNNING_IMAGE_MISMATCH",
+                {
+                    "configured_image": None,
+                    "container_id": None,
+                    "expected_image": None,
+                    "image_id": None,
+                    "service": absent_service,
+                },
+            )
     for service in (
         service
-        for service in expected_state["images"]
-        if service != "migration-runner"
+        for service in topology["inspect_services"]
+        if service in expected_state["images"]
     ):
         item = running_services.get(service)
         expected_image = expected_state["images"].get(service)
-        if (
-            service == "live-executor"
-            and args.allow_stopped_live_executor
-            and item is None
-        ):
-            continue
         if not isinstance(item, dict) or not isinstance(expected_image, str):
             raise ContextError(
                 "RUNNING_IMAGE_MISMATCH",

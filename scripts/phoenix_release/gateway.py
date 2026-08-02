@@ -1506,9 +1506,28 @@ def reconcile_active_context(paths: HostPaths) -> dict[str, Any]:
         production_services = component.get("production_services")
         if (
             not isinstance(name, str)
-            or not isinstance(image_value, dict)
             or not isinstance(production_services, list)
         ):
+            raise GatewayError("ACTIVE_MANIFEST_INVALID")
+        if image_value is None:
+            for service in production_services:
+                container_id = _require_success(
+                    compose_arguments + ["ps", "-a", "-q", service],
+                    "ACTIVE_CONTAINER_LOOKUP_FAILED",
+                ).strip()
+                if container_id:
+                    raise GatewayError(
+                        "RUNNING_IMAGE_MISMATCH",
+                        {
+                            "service": service,
+                            "expected_image": None,
+                            "configured_image": None,
+                            "image_id": None,
+                            "container_id": container_id,
+                        },
+                    )
+            continue
+        if not isinstance(image_value, dict):
             raise GatewayError("ACTIVE_MANIFEST_INVALID")
         expected_image = f"{image_value.get('repository')}@{image_value.get('digest')}"
         for service in production_services:

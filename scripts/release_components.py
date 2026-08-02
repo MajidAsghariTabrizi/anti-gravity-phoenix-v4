@@ -247,6 +247,80 @@ def build_matrix(
     return {"include": include}
 
 
+RUNTIME_MODES = ("SHADOW", "DISARMED_EVIDENCE", "LIVE")
+EXTERNAL_IMAGES = {
+    "nitro-feed-relay": "offchainlabs/nitro-node@sha256:ebc985e3b105980734630744981e1542001c22d74cba57509fe0d5ed8bb84c14",
+    "nats": "nats@sha256:b83efabe3e7def1e0a4a31ec6e078999bb17c80363f881df35edc70fcb6bb927",
+    "postgres": "postgres@sha256:57c72fd2a128e416c7fcc499958864df5301e940bca0a56f58fddf30ffc07777",
+    "prometheus": "prom/prometheus@sha256:075b1ba2c4ebb04bc3a6ab86c06ec8d8099f8fda1c96ef6d104d9bb1def1d8bc",
+}
+BASE_SERVICE_ORDER = (
+    "nitro-feed-relay",
+    "nats",
+    "postgres",
+    "migration-runner",
+    "rpc-gateway",
+    "feed-ingestor",
+    "phoenix-engine",
+    "shadow-dispatcher",
+    "recorder",
+    "dashboard",
+    "prometheus",
+)
+EPHEMERAL_SERVICES = ("migration-runner",)
+PROTECTED_SERVICES = (
+    "nitro-feed-relay",
+    "feed-ingestor",
+    "nats",
+    "postgres",
+    "recorder",
+)
+FIXED_PROTECTED_SERVICES = ("nitro-feed-relay", "nats", "postgres")
+MUTABLE_PROTECTED_SERVICES = ("feed-ingestor", "recorder")
+OPERATIONAL_LIVE_SERVICES = ("economic-monitor", "economic-supervisor")
+DEPLOY_START_ORDER = (
+    "prometheus",
+    "shadow-dispatcher",
+    "dashboard",
+    "atlas-observer",
+    "economic-monitor",
+    "economic-supervisor",
+    "rpc-gateway",
+    "phoenix-engine",
+)
+HEALTH_SERVICE_ORDER = (
+    "nitro-feed-relay",
+    "nats",
+    "postgres",
+    "rpc-gateway",
+    "feed-ingestor",
+    "phoenix-engine",
+    "shadow-dispatcher",
+    "recorder",
+    "atlas-observer",
+    "prometheus",
+    "dashboard",
+)
+HEALTH_CONTRACTS = {
+    "postgres": "pg_isready",
+    "nats": "http://127.0.0.1:8222/healthz",
+    "nitro-feed-relay": "tcp-listener:9642",
+    "rpc-gateway": "http://127.0.0.1:9300/readyz",
+    "feed-ingestor": "http://127.0.0.1:9100/readyz",
+    "phoenix-engine": "http://127.0.0.1:9200/readyz",
+    "shadow-dispatcher": "http://127.0.0.1:9500/readyz",
+    "recorder": "http://127.0.0.1:9400/readyz",
+    "atlas-observer": "binary:/usr/local/bin/atlas-observer;http://127.0.0.1:9700/readyz",
+    "prometheus": "http://127.0.0.1:9090/-/ready",
+    "dashboard": "http://127.0.0.1:8501/_stcore/health",
+    "live-executor": "process:pid-1;autonomous-control:status",
+}
+CURSOR_CONTRACTS = {
+    "recorder": "durable-money-path-outbox",
+    "atlas-observer": "monotonic-auction-ledger",
+}
+
+
 REGISTRY_PATH = _registry_path()
 REGISTRY = load_registry(REGISTRY_PATH)
 COMPONENTS = tuple(REGISTRY["components"])
@@ -294,10 +368,172 @@ REQUIRED_CI_JOBS = tuple(REQUIRED_CI["jobs"])
 REGISTRY_SHA256 = "sha256:" + hashlib.sha256(REGISTRY_PATH.read_bytes()).hexdigest()
 
 
+def generation_for_images(image_names: set[str] | tuple[str, ...]) -> str:
+    names = tuple(sorted(image_names))
+    if names == CURRENT_RELEASE_IMAGES:
+        return "current"
+    if names == LEGACY_RELEASE_IMAGES:
+        return "legacy"
+    raise ReleaseComponentError("release image set is invalid")
+
+
+def manifest_images(path: Path) -> tuple[str, ...]:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"), object_pairs_hook=_unique_object)
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise ReleaseComponentError("release manifest is invalid") from exc
+    if not isinstance(value, dict) or not isinstance(value.get("images"), dict):
+        raise ReleaseComponentError("release manifest is invalid")
+    names = tuple(sorted(value["images"]))
+    generation_for_images(names)
+    return names
+
+
+def runtime_topology(
+    image_names: set[str] | tuple[str, ...],
+    mode: str,
+    *,
+    source_image_names: set[str] | tuple[str, ...] | None = None,
+) -> dict[str, Any]:
+    if mode not in RUNTIME_MODES:
+        raise ReleaseComponentError("runtime mode is invalid")
+    target_names = set(image_names)
+    generation = generation_for_images(target_names)
+    source_names = set(source_image_names) if source_image_names is not None else target_names
+    source_generation = generation_for_images(source_names)
+
+    component_services: list[str] = []
+    image_bindings: dict[str, str] = {}
+    for component in COMPONENTS:
+        if component["name"] in target_names:
+            component_services.extend(component["production_services"])
+            for service in component["production_services"]:
+                image_bindings[service] = component["name"]
+    image_bindings.update(
+        {
+            service: reference
+            for service, reference in EXTERNAL_IMAGES.items()
+            if service in BASE_SERVICE_ORDER
+        }
+    )
+    image_bindings["economic-monitor"] = EXTERNAL_IMAGES["postgres"]
+    image_bindings["economic-supervisor"] = "live-executor"
+
+    configured = list(BASE_SERVICE_ORDER)
+    if "atlas-observer" in target_names:
+        configured.insert(configured.index("dashboard"), "atlas-observer")
+    if mode != "SHADOW":
+        configured.append("live-executor")
+
+    persistent = [
+        service
+        for service in configured
+        if service not in EPHEMERAL_SERVICES and service != "live-executor"
+    ]
+    if mode != "SHADOW":
+        persistent.extend(OPERATIONAL_LIVE_SERVICES)
+    if mode == "LIVE":
+        persistent.append("live-executor")
+
+    start_services = [
+        service
+        for service in DEPLOY_START_ORDER
+        if service in persistent
+    ]
+    inspect_services = [
+        service
+        for service in HEALTH_SERVICE_ORDER
+        if service in persistent
+    ]
+    health_services = list(inspect_services)
+    if mode == "LIVE":
+        inspect_services.append("live-executor")
+
+    intentional_absence: list[str] = []
+    if "atlas-observer" not in target_names:
+        intentional_absence.append("atlas-observer")
+    if mode != "LIVE":
+        intentional_absence.append("live-executor")
+    if mode == "SHADOW":
+        intentional_absence.extend(OPERATIONAL_LIVE_SERVICES)
+
+    source_persistent = set(
+        runtime_topology(source_names, mode)["running_services"]
+        if source_image_names is not None and source_names != target_names
+        else persistent
+    )
+    remove_services = [
+        service
+        for service in reversed(DEPLOY_START_ORDER)
+        if service in source_persistent and service not in persistent
+    ]
+    service_contracts = {
+        service: {
+            "image_binding": image_bindings[service],
+            "lifecycle": "persistent",
+            "protection": (
+                "fixed"
+                if service in FIXED_PROTECTED_SERVICES
+                else "mutable"
+                if service in MUTABLE_PROTECTED_SERVICES
+                else "ordinary"
+            ),
+            "health": HEALTH_CONTRACTS.get(service),
+            "cursor": CURSOR_CONTRACTS.get(service),
+            "expected_modes": (
+                ["LIVE"]
+                if service == "live-executor"
+                else ["DISARMED_EVIDENCE", "LIVE"]
+                if service in OPERATIONAL_LIVE_SERVICES
+                else list(RUNTIME_MODES)
+            ),
+        }
+        for service in persistent
+    }
+
+    return {
+        "schema": "phoenix.release-topology.v1",
+        "generation": generation,
+        "source_generation": source_generation,
+        "manifest_images": sorted(target_names),
+        "manifest_services": sorted(component_services),
+        "rendered_expected_services": configured,
+        "running_services": persistent,
+        "start_services": start_services,
+        "stop_services": list(reversed(start_services)),
+        "inspect_services": inspect_services,
+        "health_services": health_services,
+        "ephemeral_services": [
+            service for service in EPHEMERAL_SERVICES if service in configured
+        ],
+        "protected_services": list(PROTECTED_SERVICES),
+        "fixed_protected_services": list(FIXED_PROTECTED_SERVICES),
+        "mutable_protected_services": list(MUTABLE_PROTECTED_SERVICES),
+        "ordinary_services": [
+            service for service in persistent if service not in PROTECTED_SERVICES
+        ],
+        "intentional_absence": intentional_absence,
+        "remove_services": remove_services,
+        "image_bindings": image_bindings,
+        "health_contracts": {
+            service: HEALTH_CONTRACTS[service]
+            for service in health_services
+        },
+        "service_contracts": service_contracts,
+        "cursor_services": [
+            service for service in ("recorder", "atlas-observer") if service in persistent
+        ],
+    }
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=("validate", "build-matrix"))
+    parser.add_argument("command", choices=("validate", "build-matrix", "topology"))
     parser.add_argument("--built-images-json")
+    parser.add_argument("--manifest")
+    parser.add_argument("--source-manifest")
+    parser.add_argument("--mode", choices=RUNTIME_MODES)
+    parser.add_argument("--field")
     args = parser.parse_args()
     if args.command == "build-matrix":
         selected = None
@@ -322,6 +558,26 @@ def main() -> None:
                 separators=(",", ":"),
             )
         )
+    elif args.command == "topology":
+        if not args.manifest or not args.mode:
+            raise ReleaseComponentError("topology manifest and mode are required")
+        target = manifest_images(Path(args.manifest))
+        source = (
+            manifest_images(Path(args.source_manifest))
+            if args.source_manifest
+            else None
+        )
+        value = runtime_topology(target, args.mode, source_image_names=source)
+        if args.field:
+            field = value.get(args.field)
+            if not isinstance(field, list) or any(
+                not isinstance(item, str) or not NAME_PATTERN.fullmatch(item)
+                for item in field
+            ):
+                raise ReleaseComponentError("topology field is invalid")
+            print(" ".join(field))
+        else:
+            print(json.dumps(value, indent=2, sort_keys=True))
     else:
         print("RELEASE_COMPONENTS_OK")
 

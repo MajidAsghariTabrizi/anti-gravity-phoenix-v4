@@ -301,6 +301,123 @@ class ReleaseComponentRegistryTests(unittest.TestCase):
             ),
         )
 
+    def test_runtime_topology_covers_modes_and_generation_transitions(self) -> None:
+        legacy = release_components.LEGACY_RELEASE_IMAGES
+        current = release_components.CURRENT_RELEASE_IMAGES
+
+        legacy_shadow = release_components.runtime_topology(legacy, "SHADOW")
+        self.assertEqual(legacy_shadow["generation"], "legacy")
+        self.assertNotIn("atlas-observer", legacy_shadow["running_services"])
+        self.assertNotIn("atlas-observer", legacy_shadow["start_services"])
+        self.assertIn("atlas-observer", legacy_shadow["intentional_absence"])
+        self.assertIn("live-executor", legacy_shadow["intentional_absence"])
+
+        current_disarmed = release_components.runtime_topology(
+            current, "DISARMED_EVIDENCE", source_image_names=legacy
+        )
+        self.assertEqual(current_disarmed["source_generation"], "legacy")
+        self.assertIn("atlas-observer", current_disarmed["start_services"])
+        self.assertIn("atlas-observer", current_disarmed["health_services"])
+        self.assertEqual(
+            current_disarmed["service_contracts"]["atlas-observer"],
+            {
+                "image_binding": "atlas-observer",
+                "lifecycle": "persistent",
+                "protection": "ordinary",
+                "health": "binary:/usr/local/bin/atlas-observer;http://127.0.0.1:9700/readyz",
+                "cursor": "monotonic-auction-ledger",
+                "expected_modes": ["SHADOW", "DISARMED_EVIDENCE", "LIVE"],
+            },
+        )
+        self.assertEqual(
+            current_disarmed["mutable_protected_services"],
+            ["feed-ingestor", "recorder"],
+        )
+        self.assertEqual(
+            current_disarmed["stop_services"],
+            list(reversed(current_disarmed["start_services"])),
+        )
+        self.assertNotIn("live-executor", current_disarmed["running_services"])
+        self.assertEqual(current_disarmed["remove_services"], [])
+
+        current_live = release_components.runtime_topology(current, "LIVE")
+        self.assertIn("live-executor", current_live["running_services"])
+        self.assertIn("live-executor", current_live["inspect_services"])
+        self.assertNotIn("live-executor", current_live["intentional_absence"])
+
+        rollback = release_components.runtime_topology(
+            legacy, "SHADOW", source_image_names=current
+        )
+        self.assertEqual(rollback["remove_services"], ["atlas-observer"])
+        self.assertIn("atlas-observer", rollback["intentional_absence"])
+
+        unchanged = release_components.runtime_topology(
+            current, "SHADOW", source_image_names=current
+        )
+        self.assertEqual(unchanged["remove_services"], [])
+
+    def test_runtime_topology_rejects_partial_or_unknown_generations(self) -> None:
+        for names in (
+            {"dashboard"},
+            set(release_components.CURRENT_RELEASE_IMAGES) | {"unknown-image"},
+        ):
+            with self.subTest(names=names), self.assertRaises(
+                release_components.ReleaseComponentError
+            ):
+                release_components.runtime_topology(names, "SHADOW")
+
+    def test_release_lifecycle_scripts_consume_topology_authority(self) -> None:
+        validator = (ROOT / "scripts/validate-production-release-context.sh").read_text(
+            encoding="utf-8"
+        )
+        deploy = (ROOT / "scripts/deploy-release.sh").read_text(encoding="utf-8")
+        rollback = (ROOT / "scripts/rollback-release.sh").read_text(encoding="utf-8")
+        health = (ROOT / "scripts/production-healthcheck.sh").read_text(
+            encoding="utf-8"
+        )
+        for source in (validator, deploy, rollback, health):
+            self.assertIn("release_components.py\" topology", source)
+        self.assertNotIn("optional_services='", deploy)
+        self.assertNotIn("optional_services='", rollback)
+        self.assertNotIn("services='nitro-feed-relay", validator)
+        self.assertIn('--field remove_services', deploy)
+        self.assertIn('--field remove_services', rollback)
+        self.assertIn('rm -f "$service"', deploy)
+        self.assertIn('rm -f "$service"', rollback)
+        self.assertIn("/usr/local/bin/atlas-observer", health)
+
+    def test_legacy_inherited_bridge_manifest_is_schema_valid(self) -> None:
+        schema = json.loads(
+            (ROOT / "schemas/phoenix-release-manifest.schema.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        images = {}
+        for index, name in enumerate(
+            release_components.LEGACY_RELEASE_IMAGES, start=1
+        ):
+            images[name] = {
+                "repository": release_components.COMPONENTS_BY_NAME[name][
+                    "repository"
+                ],
+                "tag": f"sha-{RELEASE_SHA}",
+                "digest": f"sha256:{index:064x}",
+                "origin": "built",
+                "source_sha": RELEASE_SHA,
+                "source_build_run_id": RELEASE_RUN,
+                "oci_revision": RELEASE_SHA,
+            }
+        bridge = {
+            "schema": "phoenix.release.v2",
+            "release_sha": RELEASE_SHA,
+            "build_run_id": RELEASE_RUN,
+            "created_at": "2026-08-01T00:00:00Z",
+            "protected_base_sha": ROLLBACK_SHA,
+            "protected_base_build_run_id": ROLLBACK_RUN,
+            "images": images,
+        }
+        Draft202012Validator(schema).validate(bridge)
+
     def test_schemas_are_valid_and_component_sets_cannot_drift(self) -> None:
         registry_schema = json.loads(
             (ROOT / "schemas/release-components.schema.json").read_text(encoding="utf-8")
