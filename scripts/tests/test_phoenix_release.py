@@ -1782,6 +1782,22 @@ class WorkflowAndDeploymentContractTests(unittest.TestCase):
         self.assertIn("candidate_monitor_unhealthy", self.rehearsal)
         self.assertIn("candidate_monitor_contract_invalid", self.rehearsal)
         self.assertIn("candidate_monitor_image_invalid", self.rehearsal)
+        self.assertIn(
+            "find /evidence/latest-dashboard.json -maxdepth 0 -type f "
+            "-size +0c -mmin -3 -print -quit 2>/dev/null | grep -q .",
+            self.rehearsal,
+        )
+        self.assertNotIn(
+            "test -s /evidence/latest-dashboard.json", self.rehearsal
+        )
+        self.assertIn(
+            "PHOENIX_ECONOMIC_DASHBOARD_QUERY_TIMEOUT_SECONDS=30",
+            self.rehearsal,
+        )
+        self.assertIn(
+            '"PHOENIX_ECONOMIC_DASHBOARD_QUERY_TIMEOUT_SECONDS": "30"',
+            self.rehearsal,
+        )
         self.assertIn('--network "$database_network"', self.rehearsal)
         self.assertIn(
             "POSTGRES_DSN=postgres://phoenix_rehearsal:", self.rehearsal

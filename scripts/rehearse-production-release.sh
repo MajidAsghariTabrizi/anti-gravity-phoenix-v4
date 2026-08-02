@@ -155,7 +155,10 @@ for key, expected_value in expected.items():
 healthcheck = service.get("healthcheck")
 if not isinstance(healthcheck, dict) or healthcheck.get("test") != [
     "CMD-SHELL",
-    "test -s /evidence/latest-dashboard.json",
+    (
+        "find /evidence/latest-dashboard.json -maxdepth 0 -type f "
+        "-size +0c -mmin -3 -print -quit 2>/dev/null | grep -q ."
+    ),
 ]:
     raise SystemExit(1)
 environment = service.get("environment")
@@ -166,6 +169,7 @@ if not isinstance(environment, dict) or any(
             "/opt/phoenix/economic-dashboard-snapshot.sql"
         ),
         "PHOENIX_ECONOMIC_DASHBOARD_OUTPUT": "/evidence/latest-dashboard.json",
+        "PHOENIX_ECONOMIC_DASHBOARD_QUERY_TIMEOUT_SECONDS": "30",
     }.items()
 ):
     raise SystemExit(1)
@@ -322,7 +326,7 @@ monitor_container=$(
     --cap-drop ALL \
     --security-opt no-new-privileges:true \
     --tmpfs /tmp:rw,noexec,nosuid,nodev,size=16m \
-    --health-cmd 'test -s /evidence/latest-dashboard.json' \
+    --health-cmd 'find /evidence/latest-dashboard.json -maxdepth 0 -type f -size +0c -mmin -3 -print -quit 2>/dev/null | grep -q .' \
     --health-interval 45s \
     --health-timeout 3s \
     --health-retries 3 \
@@ -330,6 +334,7 @@ monitor_container=$(
     -e PGCONNECT_TIMEOUT=5 \
     -e 'PGOPTIONS=-c statement_timeout=60000 -c lock_timeout=5000' \
     -e PHOENIX_ECONOMIC_DASHBOARD_INTERVAL_SECONDS=30 \
+    -e PHOENIX_ECONOMIC_DASHBOARD_QUERY_TIMEOUT_SECONDS=30 \
     -e PHOENIX_ECONOMIC_DASHBOARD_SQL=/opt/phoenix/economic-dashboard-snapshot.sql \
     -e PHOENIX_ECONOMIC_DASHBOARD_OUTPUT=/evidence/latest-dashboard.json \
     -v "$candidate_root/scripts/economic-dashboard-loop.sh:/opt/phoenix/economic-dashboard-loop.sh:ro" \
