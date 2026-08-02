@@ -1671,6 +1671,35 @@ class WorkflowAndDeploymentContractTests(unittest.TestCase):
         )
         self.assertLess(probe.index("jq -e"), probe.index("then"))
 
+    def test_controller_bootstrap_readiness_is_bound_and_fail_closed(
+        self,
+    ) -> None:
+        host_plan = self.workflow.split(
+            "- name: Read active immutable release",
+            maxsplit=1,
+        )[1].split("- name:", maxsplit=1)[0]
+        self.assertIn('readiness_rc=0', host_plan)
+        self.assertIn('[ "$readiness_rc" -eq 1 ]', host_plan)
+        self.assertIn(
+            '899daa33b99863f5076bd9b39b6237da19865a5f',
+            host_plan,
+        )
+        self.assertIn('.evidence.failure_count == 1', host_plan)
+        self.assertIn('"service": "atlas-observer"', host_plan)
+        self.assertIn('.evidence.checks.controls.armed == false', host_plan)
+        self.assertIn('.evidence.checks.controls.kill_switch == true', host_plan)
+        self.assertIn(
+            '.evidence.checks.contract.contract_paused == true',
+            host_plan,
+        )
+        self.assertIn('select(.service != "live-executor")', host_plan)
+        self.assertIn('.running == true and .health == "healthy"', host_plan)
+        self.assertIn('"state": "stopped"', host_plan)
+        self.assertIn(
+            'schema: "phoenix.production-readiness-bootstrap.v1"',
+            host_plan,
+        )
+
     def test_deploy_checkout_preserves_rollback_history(self) -> None:
         checkout = self.workflow.split(
             "- name: Checkout exact protected main release",
