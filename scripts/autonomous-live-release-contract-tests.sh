@@ -14,6 +14,7 @@ for path in \
   migrations/012_live_economic_truth.sql \
   migrations/013_economic_loss_ledger.sql \
   migrations/014_exact_source_identity.sql \
+  migrations/015_bounded_economic_view_plans.sql \
   live-executor/schema/005_closed_loop_economic_control.sql \
   live-executor/src/economic_control.rs \
   live-executor/src/autonomous_live_control_main.rs \
@@ -31,6 +32,7 @@ do
 done
 
 PYTHONDONTWRITEBYTECODE=1 python3 -I -B - "$repo_root" <<'PY' ||
+import hashlib
 import re
 import sys
 from pathlib import Path
@@ -41,6 +43,10 @@ root = Path(sys.argv[1])
 
 def read(path: str) -> str:
     return (root / path).read_text(encoding="utf-8")
+
+
+def sha256(path: str) -> str:
+    return hashlib.sha256((root / path).read_bytes()).hexdigest()
 
 
 def require(condition: bool, message: str) -> None:
@@ -61,6 +67,7 @@ dashboard_sql = read("scripts/sql/economic-dashboard-snapshot.sql")
 economic_truth = read("migrations/012_live_economic_truth.sql")
 economic_loss = read("migrations/013_economic_loss_ledger.sql")
 source_identity = read("migrations/014_exact_source_identity.sql")
+economic_plan = read("migrations/015_bounded_economic_view_plans.sql")
 activation_runner = read("scripts/economic_activation_runner.py")
 activation_path = read("deploy/phoenix-economic-activation.path")
 activation_service = read("deploy/phoenix-economic-activation.service")
@@ -206,17 +213,30 @@ for required in (
 ):
     require(required in economic_loss, f"economic_loss_contract_missing:{required}")
 require(
-    "size_points AS NOT MATERIALIZED" in economic_truth
-    and "facts AS NOT MATERIALIZED" in economic_truth,
-    "economic_truth_does_not_allow_bounded_predicate_pushdown",
+    "NOT MATERIALIZED" not in economic_truth
+    and "NOT MATERIALIZED" not in economic_loss,
+    "applied_economic_migration_content_changed",
+)
+require(
+    sha256("migrations/012_live_economic_truth.sql")
+    == "327dfc65fbe60b10b54b975777b6e6d95dbf165a9e1fb5d46adadc250d0017c7",
+    "applied_migration_012_checksum_changed",
+)
+require(
+    sha256("migrations/013_economic_loss_ledger.sql")
+    == "453957be9f6c9eaa35c87b98b9e9466e9ab419d42195bdc8271623e605ad478c",
+    "applied_migration_013_checksum_changed",
 )
 for required in (
-    "numeric_truth AS NOT MATERIALIZED",
-    "contextual AS NOT MATERIALIZED",
-    "caused AS NOT MATERIALIZED",
-    "ranked AS NOT MATERIALIZED",
+    "phoenix_live_economic_truth",
+    "phoenix_live_economic_loss_ledger",
+    "phoenix_daily_economic_attack_surface",
+    "ARRAY['size_points', 'facts']",
+    "ARRAY['numeric_truth', 'contextual', 'caused']",
+    "ARRAY['ranked']",
+    "RAISE EXCEPTION 'expected CTE % is missing from %'",
 ):
-    require(required in economic_loss, f"economic_loss_not_materialized_missing:{required}")
+    require(required in economic_plan, f"bounded_economic_plan_missing:{required}")
 for cause in (
     "wrong_direction",
     "route_not_in_universe",
@@ -714,7 +734,8 @@ for pass in first idempotent; do
   for migration in \
     "$repo_root/migrations/012_live_economic_truth.sql" \
     "$repo_root/migrations/013_economic_loss_ledger.sql" \
-    "$repo_root/migrations/014_exact_source_identity.sql"
+    "$repo_root/migrations/014_exact_source_identity.sql" \
+    "$repo_root/migrations/015_bounded_economic_view_plans.sql"
   do
     docker exec -i "$postgres_container" \
       psql -X -v ON_ERROR_STOP=1 -U phoenix_test -d phoenix_test \
@@ -737,6 +758,24 @@ upgraded_loss_views=$(
 )
 [ "$upgraded_loss_views" = t ] ||
   fail "migration 013 did not create the economic loss views"
+bounded_economic_plans=$(
+  docker exec "$postgres_container" \
+    psql -X -q -A -t -U phoenix_test -d phoenix_test \
+    -c "SELECT pg_get_viewdef('public.phoenix_live_economic_truth'::regclass, true)
+                  ~* 'size_points[[:space:]]+AS[[:space:]]+NOT[[:space:]]+MATERIALIZED'
+             AND pg_get_viewdef('public.phoenix_live_economic_truth'::regclass, true)
+                  ~* 'facts[[:space:]]+AS[[:space:]]+NOT[[:space:]]+MATERIALIZED'
+             AND pg_get_viewdef('public.phoenix_live_economic_loss_ledger'::regclass, true)
+                  ~* 'numeric_truth[[:space:]]+AS[[:space:]]+NOT[[:space:]]+MATERIALIZED'
+             AND pg_get_viewdef('public.phoenix_live_economic_loss_ledger'::regclass, true)
+                  ~* 'contextual[[:space:]]+AS[[:space:]]+NOT[[:space:]]+MATERIALIZED'
+             AND pg_get_viewdef('public.phoenix_live_economic_loss_ledger'::regclass, true)
+                  ~* 'caused[[:space:]]+AS[[:space:]]+NOT[[:space:]]+MATERIALIZED'
+             AND pg_get_viewdef('public.phoenix_daily_economic_attack_surface'::regclass, true)
+                  ~* 'ranked[[:space:]]+AS[[:space:]]+NOT[[:space:]]+MATERIALIZED'"
+)
+[ "$bounded_economic_plans" = t ] ||
+  fail "migration 015 did not install bounded economic view plans"
 source_identity_tables=$(
   docker exec "$postgres_container" \
     psql -X -q -A -t -U phoenix_test -d phoenix_test \
