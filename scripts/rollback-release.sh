@@ -88,6 +88,9 @@ fixed_protected_services=$(python3 "$deploy_dir/release_components.py" topology 
 start_services=$(python3 "$deploy_dir/release_components.py" topology \
   --manifest "$manifest" --mode SHADOW --field start_services) ||
   fail "rollback target topology is invalid"
+pull_services=$(python3 "$deploy_dir/release_components.py" topology \
+  --manifest "$manifest" --mode SHADOW --field pull_services) ||
+  fail "rollback target topology is invalid"
 remove_services=$(python3 "$deploy_dir/release_components.py" topology \
   --manifest "$manifest" --source-manifest "$source_manifest" \
   --mode SHADOW --field remove_services) ||
@@ -322,6 +325,8 @@ if [ -f "$overlay_file" ] && [ -s "$live_release_env" ]; then
   fi
   current_live_compose stop -t 30 economic-monitor >/dev/null 2>&1 || true
   current_live_compose stop -t 30 economic-supervisor >/dev/null 2>&1 || true
+  current_live_compose rm -f economic-monitor >/dev/null 2>&1 || true
+  current_live_compose rm -f economic-supervisor >/dev/null 2>&1 || true
 fi
 python3 "$deploy_dir/production_mode.py" shadow --env-file "$env_file" ||
   fail "SHADOW production mode could not be restored"
@@ -461,7 +466,9 @@ PY
 }
 
 capture_protected_ids "$protected_before" || fail "protected services are not ready before rollback"
-compose pull
+# Word splitting is intentional for manifest-derived validated service names.
+# shellcheck disable=SC2086
+compose pull $pull_services
 for service in $start_services; do
   compose up -d --no-deps "$service"
   wait_service_healthy "$service" || fail "optional service did not become healthy during rollback: $service"

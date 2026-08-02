@@ -468,6 +468,11 @@ def runtime_topology(
     if mode != "SHADOW":
         configured.append("live-executor")
 
+    pull_services = list(configured)
+    if mode != "SHADOW":
+        pull_services.extend(OPERATIONAL_LIVE_SERVICES)
+        pull_services.append("autonomous-control")
+
     persistent = [
         service
         for service in configured
@@ -541,6 +546,7 @@ def runtime_topology(
         "manifest_images": sorted(target_names),
         "manifest_services": sorted(component_services),
         "rendered_expected_services": configured,
+        "pull_services": pull_services,
         "running_services": persistent,
         "start_services": start_services,
         "stop_services": list(reversed(start_services)),

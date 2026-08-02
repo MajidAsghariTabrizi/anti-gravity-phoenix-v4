@@ -143,6 +143,9 @@ fixed_protected_services=$(python3 "$deploy_dir/release_components.py" topology 
 start_services=$(python3 "$deploy_dir/release_components.py" topology \
   --manifest "$manifest" --mode DISARMED_EVIDENCE \
   --field start_services) || fail "target topology is invalid"
+pull_services=$(python3 "$deploy_dir/release_components.py" topology \
+  --manifest "$manifest" --mode DISARMED_EVIDENCE \
+  --field pull_services) || fail "target topology is invalid"
 remove_services=$(python3 "$deploy_dir/release_components.py" topology \
   --manifest "$manifest" --source-manifest "$rollback_manifest" \
   --mode DISARMED_EVIDENCE --field remove_services) ||
@@ -693,7 +696,9 @@ rollback_on_failure() {
 mutation_started=0
 trap rollback_on_failure EXIT
 
-compose pull
+# Word splitting is intentional for manifest-derived validated service names.
+# shellcheck disable=SC2086
+compose pull $pull_services
 state_update mutation mutation_started
 mutation_started=1
 if [ -s "$current_file" ]; then
