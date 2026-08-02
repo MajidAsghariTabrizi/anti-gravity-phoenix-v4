@@ -113,6 +113,52 @@ Required next verification:
 
 Phoenix includes Aave V3 `flashLoanSimple` interfaces only. No Arbitrum provider address is hardcoded. The flash provider is a registry value validated through the cold RPC gateway before LIVE mode can be enabled.
 
+## Aave V3 Arbitrum Borrower Evidence
+
+The offline Atlas borrower index is source-bound to the following official
+repositories, but it does not claim that the current source head is the exact
+implementation behind the deployed Arbitrum Pool proxy:
+
+- Aave address book commit
+  `a1770e87fd61db02a7725cd9eed3b1d07c3980af`, file
+  `src/AaveV3Arbitrum.sol` in
+  `https://github.com/bgd-labs/aave-address-book`.
+- Aave v3-origin commit
+  `fd1fbd9150426ca8ace9cee45b4acf912ae84f5b` in
+  `https://github.com/aave-dao/aave-v3-origin`.
+- Event declarations: `src/contracts/interfaces/IPool.sol`.
+- Reserve configuration bit layout:
+  `src/contracts/protocol/libraries/configuration/ReserveConfiguration.sol`.
+- Health-factor and liquidation validation:
+  `src/contracts/protocol/libraries/logic/ValidationLogic.sol`.
+- Close factor, seize, fee and dust rounding:
+  `src/contracts/protocol/libraries/logic/LiquidationLogic.sol`.
+
+The tracked market fixture intentionally leaves the Pool implementation,
+implementation code hash, reserve configuration, reserve indexes and eMode
+configuration incomplete. Those values must be resolved at one canonical
+checkpoint and the deployed implementation must be mapped to reviewed source
+before an inventory can become `complete`. Candidate constants copied from the
+current v3-origin source are labeled `review_candidate_*` and are never used by
+the evaluator. Exact constants are deployment-bound evidence fields.
+
+The indexer is offline and signerless. It accepts only a hash-bound, contiguous
+block/hash transcript and exact scaled token movements. Raw ERC-20 `Transfer`
+amounts are not silently treated as scaled Aave balances. A missing archive
+range, missing scaled movement, checkpoint user-configuration bitmap, reorg,
+or incomplete reserve evidence keeps coverage incomplete.
+
+The reviewed current-checkpoint bootstrap additionally binds the deployed
+Arbitrum Pool implementation
+`0xf05fd3cc911b4c5e36e53c00354f645e22922c9a` to the address-book commit above.
+It uses a complete immutable Borrow archive plus a bounded primary-provider
+Borrow tail for discovery. Two reviewed providers must independently agree on
+the exact finalized block hash and every reserve/eMode/retained-borrower state
+read used by economics. Primary-only discovery and bytecode bindings are
+declared as such in the artifact. As of 2026-08-01 the configured secondary
+provider returns HTTP 403 for exact current state reads, so the exporter emits
+no checkpoint and coverage remains incomplete.
+
 ## Arbitrum Transaction Cost Components
 
 LIVE submission quotes use the official Nitro `NodeInterface` virtual contract

@@ -1,0 +1,14 @@
+{
+  "archive_complete": false,
+  "blocks": [],
+  "canonical_head_confirmed": false,
+  "content_sha256": "0a1fe7da30e27195a184b2d02984bc77d40b810bc6f9ef890bb02016b8620c5a",
+  "end_block": null,
+  "end_hash": null,
+  "market_content_sha256": "19ac2d2fac94147a232f2b53827642e01a76cdaae86a181b1065d1e647545d60",
+  "reviewed_start_state_zero": false,
+  "schema": "phoenix.atlas.aave-archive-transcript.v1",
+  "source_methods": [],
+  "start_block": null,
+  "start_hash": null
+}
