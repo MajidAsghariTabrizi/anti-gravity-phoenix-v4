@@ -284,15 +284,16 @@ if (
 PY
   fail candidate_control_status_invalid
 
-# Prove the candidate dashboard query against the live schema in a read-only
-# transaction. psql receives the reviewed SQL over stdin; no host path is
-# mounted into a long-running Production container.
-{
-  printf '%s\n' 'BEGIN TRANSACTION READ ONLY;'
-  cat "$candidate_root/scripts/sql/economic-dashboard-snapshot.sql"
-  printf '%s\n' 'ROLLBACK;'
-} | compose exec -T postgres /bin/sh -c \
-  'export PGOPTIONS="-c statement_timeout=30000 -c lock_timeout=5000"; exec psql -X -q -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d "$POSTGRES_DB"' \
+# Prove the candidate dashboard query against the fully migrated isolated
+# schema in a read-only transaction. The probe must not depend on or inspect
+# the live Production database.
+cat "$candidate_root/scripts/sql/economic-dashboard-snapshot.sql" | \
+  /usr/bin/timeout --signal=TERM --kill-after=2s 45s \
+  /usr/bin/docker exec -i \
+    -e 'PGOPTIONS=-c statement_timeout=30000 -c lock_timeout=5000' \
+    "$database_container" \
+    psql -X -q -v ON_ERROR_STOP=1 \
+      -U phoenix_rehearsal -d phoenix_rehearsal \
   >"$state_dir/sql.stdout" 2>"$state_dir/sql.stderr" ||
   fail candidate_sql_or_schema_failed
 
