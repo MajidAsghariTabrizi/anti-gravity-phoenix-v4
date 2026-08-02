@@ -142,6 +142,7 @@ jobs:
         run: |
           set -euo pipefail
           python3 -m py_compile \
+            scripts/atlas_borrower_index.py \
             scripts/change_impact.py \
             scripts/release_assets.py \
             scripts/release_components.py \
@@ -149,6 +150,7 @@ jobs:
             scripts/release_provenance.py \
             scripts/phoenix_release/*.py
           python3 -m unittest \
+            scripts.tests.test_atlas_borrower_index \
             scripts.tests.test_change_impact \
             scripts.tests.test_chain_reconciliation \
             scripts.tests.test_release_assets \
