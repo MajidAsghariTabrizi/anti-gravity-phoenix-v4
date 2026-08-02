@@ -179,6 +179,17 @@ require(
     "FROM phoenix_daily_economic_attack_surface" not in dashboard_sql,
     "dashboard_reexpands_unbounded_daily_attack_surface",
 )
+require(
+    "FROM phoenix_live_economic_loss_ledger" not in dashboard_sql,
+    "dashboard_reexpands_correlated_loss_ledger",
+)
+for required in (
+    "bounded_loss_truth AS MATERIALIZED",
+    "bounded_counterfactuals AS",
+    "bounded_reverse_routes AS",
+    "truth.classified_at >= now() - interval '7 days'",
+):
+    require(required in dashboard_sql, f"bounded_loss_snapshot_missing:{required}")
 for required in (
     "CREATE OR REPLACE VIEW phoenix_live_economic_truth",
     "initiating_transaction_hash",
