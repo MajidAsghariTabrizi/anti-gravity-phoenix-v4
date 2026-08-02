@@ -128,6 +128,55 @@ class ReleaseComponentRegistryTests(unittest.TestCase):
             ("dashboard", "rpc-gateway"),
         )
 
+    def test_generation_expansion_builds_only_the_missing_image(self) -> None:
+        plan = {
+            "schema": "phoenix.change-impact.v1",
+            "built_images": [],
+            "inherited_images": list(EXPECTED_IMAGES),
+        }
+        resolved = release_components.resolve_protected_build_plan(
+            plan, PREVIOUS_IMAGES
+        )
+        self.assertEqual(resolved["built_images"], ["atlas-observer"])
+        self.assertEqual(
+            resolved["inherited_images"], list(PREVIOUS_IMAGES)
+        )
+
+    def test_current_generation_build_plan_is_unchanged(self) -> None:
+        plan = {
+            "schema": "phoenix.change-impact.v1",
+            "built_images": ["dashboard"],
+            "inherited_images": [
+                name for name in EXPECTED_IMAGES if name != "dashboard"
+            ],
+        }
+        resolved = release_components.resolve_protected_build_plan(
+            plan, EXPECTED_IMAGES
+        )
+        self.assertEqual(resolved["built_images"], ["dashboard"])
+        self.assertEqual(
+            resolved["inherited_images"],
+            [name for name in EXPECTED_IMAGES if name != "dashboard"],
+        )
+
+    def test_incomplete_or_overlapping_build_plan_fails_closed(self) -> None:
+        for plan in (
+            {
+                "built_images": [],
+                "inherited_images": list(PREVIOUS_IMAGES),
+            },
+            {
+                "built_images": ["atlas-observer"],
+                "inherited_images": list(EXPECTED_IMAGES),
+            },
+        ):
+            with self.subTest(plan=plan), self.assertRaises(
+                release_components.ReleaseComponentError
+            ):
+                release_components.resolve_protected_build_plan(
+                    plan, PREVIOUS_IMAGES
+                )
+
     def test_seven_nine_and_duplicate_component_registries_fail_closed(self) -> None:
         for mutation in ("seven", "nine", "duplicate"):
             changed = copy.deepcopy(release_components.REGISTRY)
