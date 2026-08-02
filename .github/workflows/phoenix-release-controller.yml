@@ -604,12 +604,18 @@ jobs:
               --rollback-provenance package/rollback-provenance.json \
               --rollback-sha "$ROLLBACK_SHA" \
               --rollback-build-run-id "$ROLLBACK_BUILD_RUN_ID"
-            python3 scripts/change_impact.py git \
-              --base "$ROLLBACK_SHA" \
-              --head "$RELEASE_SHA" \
-              --output deployment-impact.json
-            [ "$(jq -c '.built_images' deployment-impact.json)" = \
-              "$(jq -c '.built_images' package/release-provenance.json)" ]
+          python3 scripts/change_impact.py git \
+            --base "$ROLLBACK_SHA" \
+            --head "$RELEASE_SHA" \
+            --output deployment-impact.json
+          python3 scripts/release_components.py \
+            resolve-protected-build-plan \
+            --plan deployment-impact.json \
+            --protected-base-manifest package/rollback-manifest.json \
+            >deployment-impact.resolved.json
+          mv deployment-impact.resolved.json deployment-impact.json
+          [ "$(jq -c '.built_images' deployment-impact.json)" = \
+            "$(jq -c '.built_images' package/release-provenance.json)" ]
             [ "$(jq -c '.inherited_images' deployment-impact.json)" = \
               "$(jq -c '.inherited_images' package/release-provenance.json)" ]
             python3 - "$RELEASE_SHA" "$ROLLBACK_SHA" "$SOURCE_CI_RUN_ID" \
