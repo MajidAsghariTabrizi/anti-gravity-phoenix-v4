@@ -99,20 +99,12 @@ grep -F -- '--inherited-images-json' "$build_workflow" >/dev/null ||
   fail 'selective inherited image evidence is not materialized'
 
 for release_script in "$deploy_script" "$rollback_script"; do
-  grep -F "protected_services='nitro-feed-relay feed-ingestor nats postgres recorder'" "$release_script" >/dev/null ||
-    fail "protected service set is incomplete: $release_script"
-  grep -F "fixed_protected_services='nitro-feed-relay nats postgres'" "$release_script" >/dev/null ||
-    fail "fixed protected service set is incomplete: $release_script"
-  case "$release_script" in
-    "$deploy_script")
-      expected_optional_services='prometheus rpc-gateway shadow-dispatcher phoenix-engine dashboard economic-monitor economic-supervisor'
-      ;;
-    "$rollback_script")
-      expected_optional_services='prometheus rpc-gateway shadow-dispatcher phoenix-engine dashboard'
-      ;;
-  esac
-  grep -F "optional_services='$expected_optional_services'" "$release_script" >/dev/null ||
-    fail "optional service set is incomplete: $release_script"
+  grep -F -- '--field protected_services' "$release_script" >/dev/null ||
+    fail "protected service set is not topology-derived: $release_script"
+  grep -F -- '--field fixed_protected_services' "$release_script" >/dev/null ||
+    fail "fixed protected service set is not topology-derived: $release_script"
+  grep -F -- '--field start_services' "$release_script" >/dev/null ||
+    fail "start service set is not topology-derived: $release_script"
   grep -F 'compose up -d --no-deps "$service"' "$release_script" >/dev/null ||
     fail "optional services are not started individually: $release_script"
   grep -F 'wait_service_healthy "$service"' "$release_script" >/dev/null ||
