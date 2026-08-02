@@ -1569,6 +1569,9 @@ class WorkflowAndDeploymentContractTests(unittest.TestCase):
         self.rehearsal = (
             ROOT / "scripts/rehearse-production-release.sh"
         ).read_text()
+        self.autonomous_schema = (
+            ROOT / "live-executor/schema/003_autonomous_hunter_contracts.sql"
+        ).read_text()
 
     def test_controller_is_automatic_resumable_and_serialized(self) -> None:
         self.assertIn('workflows: ["Phoenix CI"]', self.workflow)
@@ -1702,6 +1705,14 @@ class WorkflowAndDeploymentContractTests(unittest.TestCase):
         self.assertIn("candidate_control_contract_invalid", self.rehearsal)
         self.assertIn("candidate_control_status_invalid", self.rehearsal)
         self.assertIn('"$control_image" status', self.rehearsal)
+        self.assertIn(
+            'global_control.get("execution_mode") != "disabled"',
+            self.rehearsal,
+        )
+        self.assertIn(
+            "execution_mode TEXT NOT NULL DEFAULT 'disabled'",
+            self.autonomous_schema,
+        )
         self.assertIn(
             "/usr/bin/timeout --signal=TERM --kill-after=2s 45s",
             self.rehearsal,
