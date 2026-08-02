@@ -1719,6 +1719,7 @@ class WorkflowAndDeploymentContractTests(unittest.TestCase):
             maxsplit=1,
         )[1].split("postgres_image=", maxsplit=1)[0]
         self.assertIn('--overlay-file "$overlay_file"', render)
+        self.assertIn("--expected-mode DISARMED_EVIDENCE", render)
 
     def test_candidate_render_precedes_any_runtime_mutation(self) -> None:
         preflight_render = self.deploy.index(
@@ -1729,6 +1730,10 @@ class WorkflowAndDeploymentContractTests(unittest.TestCase):
         )
         self.assertIn(
             '--overlay-file "$overlay_file"',
+            self.deploy[preflight_render:preflight_failure],
+        )
+        self.assertIn(
+            "--expected-mode DISARMED_EVIDENCE",
             self.deploy[preflight_render:preflight_failure],
         )
         live_candidate = self.deploy.index(
@@ -1742,6 +1747,10 @@ class WorkflowAndDeploymentContractTests(unittest.TestCase):
         )
         self.assertIn(
             '--overlay-file "$overlay_file"',
+            self.deploy[candidate_render:candidate_failure],
+        )
+        self.assertIn(
+            "--expected-mode LIVE",
             self.deploy[candidate_render:candidate_failure],
         )
         candidate = self.deploy.index("mark_phase CANDIDATE_LIVE_RENDER_VERIFIED")

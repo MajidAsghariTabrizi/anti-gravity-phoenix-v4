@@ -390,16 +390,15 @@ def service_environment(services: dict, service: str) -> dict:
 
 
 def expected_services_for_references(
-    references: dict[str, str] | None, autonomous_live: bool
+    references: dict[str, str] | None, runtime_mode: str
 ) -> tuple[str, ...]:
     image_names = (
         release_components.CURRENT_RELEASE_IMAGES
         if references is None or "atlas-observer" in references
         else release_components.LEGACY_RELEASE_IMAGES
     )
-    mode = "LIVE" if autonomous_live else "SHADOW"
     return tuple(
-        release_components.runtime_topology(image_names, mode)[
+        release_components.runtime_topology(image_names, runtime_mode)[
             "rendered_expected_services"
         ]
     )
@@ -415,17 +414,29 @@ def validate_render(args: argparse.Namespace) -> None:
         raise ContextError("PRODUCTION_COMPOSE_CONTEXT_MISSING")
     services = compose["services"]
     operator_env = read_env(Path(args.env_file), "PRODUCTION_ENV_MISSING")
-    autonomous_live = (
+    operator_live = (
         operator_env.get("PHOENIX_MODE") == "LIVE"
         and operator_env.get("LIVE_EXECUTION") == "true"
         and operator_env.get("AUTONOMOUS_EXECUTION") == "true"
     )
+    operator_shadow = (
+        operator_env.get("PHOENIX_MODE") == "SHADOW"
+        and operator_env.get("LIVE_EXECUTION") == "false"
+        and operator_env.get("AUTONOMOUS_EXECUTION") == "false"
+    )
+    runtime_mode = args.expected_mode or ("LIVE" if operator_live else "SHADOW")
+    if runtime_mode == "LIVE" and not operator_live:
+        raise ContextError("AUTONOMOUS_LIVE_MODE_REQUIRED")
+    if runtime_mode == "DISARMED_EVIDENCE" and not operator_shadow:
+        raise ContextError("DISARMED_EVIDENCE_OPERATOR_MODE_INVALID")
+    rendered_live = runtime_mode != "SHADOW"
+    autonomous_live = runtime_mode == "LIVE"
     release_env = read_env(Path(args.release_env), "RELEASE_ENV_MISSING")
     release_sha = None
     references = None
     if args.manifest:
         _, release_sha, references = load_manifest(Path(args.manifest))
-    expected_services = expected_services_for_references(references, autonomous_live)
+    expected_services = expected_services_for_references(references, runtime_mode)
     if any(service not in services for service in expected_services):
         raise ContextError("PRODUCTION_COMPOSE_CONTEXT_MISSING")
     release_images = validate_release_env(release_env, release_sha, references)
@@ -453,7 +464,7 @@ def validate_render(args: argparse.Namespace) -> None:
         for service, env_name in rendered_owned_images.items()
         if service in expected_services
     }
-    if autonomous_live:
+    if rendered_live:
         for _, (env_name, service) in OPTIONAL_LIVE_IMAGES.items():
             rendered_owned_images[service] = env_name
     for service, env_name in rendered_owned_images.items():
@@ -503,7 +514,7 @@ def validate_render(args: argparse.Namespace) -> None:
         "RECORDER_PERSISTENCE_POLICY"
     ) != "money_path_v1":
         raise ContextError("RECORDER_PERSISTENCE_POLICY_INVALID")
-    if autonomous_live:
+    if rendered_live:
         live_env = service_environment(services, "live-executor")
         if (
             engine_env.get("PHOENIX_MODE") != "LIVE"
@@ -609,7 +620,7 @@ def validate_render(args: argparse.Namespace) -> None:
         "expected_services": list(expected_services),
         "images": images,
         "live_execution": autonomous_live,
-        "mode": "LIVE" if autonomous_live else "SHADOW",
+        "mode": runtime_mode,
         "release_sha": release_sha,
         "route_count": len(json.loads(expected_route_raw)),
         "route_registry_hash": route_hash,
@@ -846,6 +857,10 @@ def parser() -> argparse.ArgumentParser:
     render.add_argument("--env-file", required=True)
     render.add_argument("--release-env", required=True)
     render.add_argument("--manifest")
+    render.add_argument(
+        "--expected-mode",
+        choices=release_components.RUNTIME_MODES,
+    )
     render.add_argument("--metadata-output", required=True)
     render.set_defaults(handler=validate_render)
 

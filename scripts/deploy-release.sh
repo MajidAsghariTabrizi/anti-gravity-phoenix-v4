@@ -578,6 +578,7 @@ active_environment_identity_before=$(production_environment_identity "$env_file"
 "$deploy_dir/render-production-compose.sh" \
   --compose-file "$compose_file" \
   --overlay-file "$overlay_file" \
+  --expected-mode DISARMED_EVIDENCE \
   --env-file "$env_file" \
   --release-env "$release_env" \
   --release-manifest "$manifest" \
@@ -597,6 +598,7 @@ python3 "$deploy_dir/production_mode.py" live --env-file "$candidate_live_env" |
 "$deploy_dir/render-production-compose.sh" \
   --compose-file "$compose_file" \
   --overlay-file "$overlay_file" \
+  --expected-mode LIVE \
   --env-file "$candidate_live_env" \
   --release-env "$release_env" \
   --release-manifest "$manifest" \

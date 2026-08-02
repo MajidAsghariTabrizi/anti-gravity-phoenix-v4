@@ -283,21 +283,27 @@ class ReleaseComponentRegistryTests(unittest.TestCase):
     def test_expected_services_follow_manifest_generation(self) -> None:
         self.assertIn(
             "atlas-observer",
-            production_context.expected_services_for_references(None, False),
+            production_context.expected_services_for_references(None, "SHADOW"),
         )
         legacy_references = {
             name: "ghcr.io/example/component@sha256:" + "1" * 64
             for name in release_components.LEGACY_RELEASE_IMAGES
         }
         legacy_services = production_context.expected_services_for_references(
-            legacy_references, False
+            legacy_references, "SHADOW"
         )
         self.assertNotIn("atlas-observer", legacy_services)
         self.assertNotIn("live-executor", legacy_services)
         self.assertIn(
             "live-executor",
             production_context.expected_services_for_references(
-                legacy_references, True
+                legacy_references, "DISARMED_EVIDENCE"
+            ),
+        )
+        self.assertIn(
+            "live-executor",
+            production_context.expected_services_for_references(
+                legacy_references, "LIVE"
             ),
         )
 
@@ -578,10 +584,20 @@ class ReleaseRoundTripTests(unittest.TestCase):
         provenance_path.write_bytes(release_provenance._canonical_json(provenance))
         return manifest, provenance, manifest_path, provenance_path
 
-    def _rendered_compose(self, release_values: dict[str, str], route_raw: str) -> dict:
+    def _rendered_compose(
+        self,
+        release_values: dict[str, str],
+        route_raw: str,
+        mode: str = "SHADOW",
+    ) -> dict:
         images: dict[str, str] = {}
-        for service in production_context.EXPECTED_SERVICES:
+        expected_services = production_context.expected_services_for_references(
+            None, mode
+        )
+        for service in expected_services:
             env_name = production_context.RENDERED_OWNED_IMAGES.get(service)
+            if service == "live-executor":
+                env_name = "LIVE_EXECUTOR_IMAGE"
             if env_name is not None:
                 images[service] = release_values[env_name]
             else:
@@ -609,6 +625,50 @@ class ReleaseRoundTripTests(unittest.TestCase):
         services["rpc-gateway"]["environment"] = {
             "RPC_STATE_REQUESTS_PER_MINUTE": "12"
         }
+        if mode != "SHADOW":
+            executor_address = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+            services["phoenix-engine"]["environment"].update(
+                {
+                    "PHOENIX_MODE": "LIVE",
+                    "LIVE_EXECUTION": "true",
+                    "AUTONOMOUS_EXECUTION": "true",
+                    "EXECUTOR_ADDRESS": executor_address,
+                }
+            )
+            services["live-executor"].update(
+                {
+                    "environment": {
+                        "PHOENIX_MODE": "LIVE",
+                        "LIVE_EXECUTION": "true",
+                        "AUTONOMOUS_EXECUTION": "true",
+                        "LIVE_EXECUTOR_ARMED": "true",
+                        "LIVE_EXECUTOR_KILL_SWITCH": "false",
+                        "LIVE_EXECUTOR_ONE_TRANSACTION_AT_A_TIME": "true",
+                        "SIGNER_PRIVATE_KEY": "",
+                        "SIGNER_PRIVATE_KEY_FILE": "/run/secrets/phoenix-live-executor-signer",
+                        "WALLET_ADDRESS": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                        "EXECUTOR_ADDRESS": executor_address,
+                        "LIVE_EXECUTOR_EXECUTOR_CODE_HASH": "0x" + "c" * 64,
+                        "LIVE_EXECUTOR_EXPECTED_OWNER": "0x" + "d" * 40,
+                        "LIVE_EXECUTOR_EXPECTED_FLASH_PROVIDER": "0x" + "e" * 40,
+                        "PRODUCTION_RPC_URL": "https://primary.invalid",
+                        "SECONDARY_RPC_URL": "https://secondary.invalid",
+                    },
+                    "volumes": [
+                        {
+                            "type": "bind",
+                            "source": "/run/secrets/phoenix-signer",
+                            "target": "/run/secrets/phoenix-live-executor-signer",
+                            "read_only": True,
+                        }
+                    ],
+                    "read_only": True,
+                    "user": "65532:65532",
+                    "cap_drop": ["ALL"],
+                    "security_opt": ["no-new-privileges:true"],
+                    "restart": "unless-stopped",
+                }
+            )
         return {"services": services}
 
     def test_registry_to_inherited_deploy_and_compose_round_trip(self) -> None:
@@ -738,10 +798,19 @@ class ReleaseRoundTripTests(unittest.TestCase):
                 (
                     "PHOENIX_MODE=SHADOW",
                     "LIVE_EXECUTION=false",
+                    "AUTONOMOUS_EXECUTION=false",
                     "CHAIN_ID=42161",
                     "SIGNER_PRIVATE_KEY=",
                     "WALLET_ADDRESS=",
                     "EXECUTOR_ADDRESS=",
+                    "LIVE_EXECUTOR_WALLET_ADDRESS=0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    "LIVE_EXECUTOR_EXECUTOR_ADDRESS=0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                    f"LIVE_EXECUTOR_EXECUTOR_CODE_HASH=0x{'c' * 64}",
+                    f"LIVE_EXECUTOR_EXPECTED_OWNER=0x{'d' * 40}",
+                    f"LIVE_EXECUTOR_EXPECTED_FLASH_PROVIDER=0x{'e' * 40}",
+                    "LIVE_EXECUTOR_SIGNER_FILE=/run/secrets/phoenix-signer",
+                    "PRODUCTION_RPC_URL=https://primary.invalid",
+                    "SECONDARY_RPC_URL=https://secondary.invalid",
                     "ENGINE_ROUTER_ADDRESSES=0x1111111111111111111111111111111111111111",
                     "RECORDER_PERSISTENCE_POLICY=money_path_v1",
                     f"ENGINE_ROUTE_REGISTRY_JSON={operator_route_raw}",
@@ -762,12 +831,71 @@ class ReleaseRoundTripTests(unittest.TestCase):
                 env_file=str(operator_env),
                 release_env=str(release_env),
                 manifest=str(manifest_path),
+                expected_mode=None,
                 metadata_output=str(metadata),
             )
         )
         rendered = json.loads(metadata.read_text(encoding="utf-8"))
         self.assertEqual(rendered["status"], "ok")
         self.assertEqual(rendered["release_sha"], RELEASE_SHA)
+
+        compose_path.write_text(
+            json.dumps(
+                self._rendered_compose(
+                    release_values, route_raw, "DISARMED_EVIDENCE"
+                )
+            ),
+            encoding="utf-8",
+        )
+        disarmed_args = argparse.Namespace(
+            compose_config=str(compose_path),
+            env_file=str(operator_env),
+            release_env=str(release_env),
+            manifest=str(manifest_path),
+            expected_mode="DISARMED_EVIDENCE",
+            metadata_output=str(metadata),
+        )
+        production_context.validate_render(disarmed_args)
+        rendered = json.loads(metadata.read_text(encoding="utf-8"))
+        self.assertEqual(rendered["mode"], "DISARMED_EVIDENCE")
+        self.assertFalse(rendered["live_execution"])
+        self.assertFalse(rendered["autonomous_execution"])
+        self.assertIn("live-executor", rendered["expected_services"])
+
+        live_operator = candidate / "operator-live.env"
+        live_operator.write_text(
+            operator_env.read_text(encoding="utf-8")
+            .replace("PHOENIX_MODE=SHADOW", "PHOENIX_MODE=LIVE")
+            .replace("LIVE_EXECUTION=false", "LIVE_EXECUTION=true")
+            .replace("AUTONOMOUS_EXECUTION=false", "AUTONOMOUS_EXECUTION=true"),
+            encoding="utf-8",
+        )
+        with self.assertRaisesRegex(
+            production_context.ContextError,
+            "DISARMED_EVIDENCE_OPERATOR_MODE_INVALID",
+        ):
+            production_context.validate_render(
+                argparse.Namespace(**{**vars(disarmed_args), "env_file": str(live_operator)})
+            )
+        with self.assertRaisesRegex(
+            production_context.ContextError, "AUTONOMOUS_LIVE_MODE_REQUIRED"
+        ):
+            production_context.validate_render(
+                argparse.Namespace(**{**vars(disarmed_args), "expected_mode": "LIVE"})
+            )
+        production_context.validate_render(
+            argparse.Namespace(
+                **{
+                    **vars(disarmed_args),
+                    "env_file": str(live_operator),
+                    "expected_mode": "LIVE",
+                }
+            )
+        )
+        rendered = json.loads(metadata.read_text(encoding="utf-8"))
+        self.assertEqual(rendered["mode"], "LIVE")
+        self.assertTrue(rendered["live_execution"])
+        self.assertTrue(rendered["autonomous_execution"])
 
     def test_release_only_manifest_inherits_every_schema_valid_image(self) -> None:
         rollback, _, rollback_manifest_path, rollback_provenance_path = (
