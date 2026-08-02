@@ -238,10 +238,11 @@ services:
       retries: 5
 
   atlas-observer:
-    # Stage-A bridge render shim only. Release topology forbids starting this
-    # service unless the manifest contains the independently bound Atlas image.
-    # Stage B removes this fallback when the eight-image generation activates.
-    image: ${ATLAS_OBSERVER_IMAGE:-${DASHBOARD_IMAGE:?DASHBOARD_IMAGE is required}}
+    # The current manifest always supplies the independently bound Atlas image.
+    # The placeholder only keeps emergency legacy manifests renderable; topology
+    # removes Atlas before reconciling a seven-image rollback, and this reference
+    # deliberately cannot be confused with or pulled as another Phoenix service.
+    image: ${ATLAS_OBSERVER_IMAGE:-phoenix.invalid/atlas-observer:legacy-disabled}
     command:
       - --continuous
       - --ledger-dir=/var/lib/phoenix-atlas-observer
