@@ -381,8 +381,9 @@ class ReleaseComponentRegistryTests(unittest.TestCase):
         health = (ROOT / "scripts/production-healthcheck.sh").read_text(
             encoding="utf-8"
         )
-        for source in (validator, deploy, rollback, health):
+        for source in (validator, deploy, rollback):
             self.assertIn("release_components.py\" topology", source)
+        self.assertIn('python3 "$release_components" topology', health)
         self.assertNotIn("optional_services='", deploy)
         self.assertNotIn("optional_services='", rollback)
         self.assertNotIn("services='nitro-feed-relay", validator)

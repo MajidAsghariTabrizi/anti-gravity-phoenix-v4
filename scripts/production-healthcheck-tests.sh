@@ -153,6 +153,9 @@ grep -F '<live-executor></usr/local/bin/autonomous-live-control><status>' \
 candidate_manifest=$tmp_root/candidate-manifest.json
 cp "$deploy_dir/manifests/$release_sha.json" "$candidate_manifest"
 rm -f "$deploy_dir/manifests/$release_sha.json"
+cat >"$deploy_dir/release_components.py" <<'PY'
+raise SystemExit("active release helper must not validate a candidate")
+PY
 : >"$docker_log"
 PATH="$fake_bin:$PATH" \
 PHOENIX_DEPLOY_ROOT="$deploy_root" \
