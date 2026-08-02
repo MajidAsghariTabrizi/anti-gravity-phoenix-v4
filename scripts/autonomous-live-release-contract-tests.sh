@@ -136,6 +136,15 @@ require(
     "dashboard_refresh_interval_not_45_seconds",
 )
 require(
+    "PHOENIX_ECONOMIC_DASHBOARD_QUERY_TIMEOUT_SECONDS: \"30\"" in compose,
+    "dashboard_query_timeout_not_30_seconds",
+)
+require(
+    "find /evidence/latest-dashboard.json -maxdepth 0 -type f -size +0c -mmin -3"
+    in compose,
+    "dashboard_health_does_not_require_fresh_output",
+)
+require(
     "attempt.claimed_at >= evidence_window.window_start" in dashboard_sql
     and "attempt.created_at" not in dashboard_sql,
     "dashboard_attempt_timestamp_invalid",
@@ -159,6 +168,10 @@ for required in (
 ):
     require(required in dashboard_sql, f"economic_truth_dashboard_missing:{required}")
 require("'relevant_inputs'" not in dashboard_sql, "candidate_count_mislabeled_as_relevant_inputs")
+require(
+    "FROM phoenix_daily_economic_attack_surface" not in dashboard_sql,
+    "dashboard_reexpands_unbounded_daily_attack_surface",
+)
 for required in (
     "CREATE OR REPLACE VIEW phoenix_live_economic_truth",
     "initiating_transaction_hash",
@@ -192,6 +205,18 @@ for required in (
     "recommended_next_action",
 ):
     require(required in economic_loss, f"economic_loss_contract_missing:{required}")
+require(
+    "size_points AS NOT MATERIALIZED" in economic_truth
+    and "facts AS NOT MATERIALIZED" in economic_truth,
+    "economic_truth_does_not_allow_bounded_predicate_pushdown",
+)
+for required in (
+    "numeric_truth AS NOT MATERIALIZED",
+    "contextual AS NOT MATERIALIZED",
+    "caused AS NOT MATERIALIZED",
+    "ranked AS NOT MATERIALIZED",
+):
+    require(required in economic_loss, f"economic_loss_not_materialized_missing:{required}")
 for cause in (
     "wrong_direction",
     "route_not_in_universe",
@@ -461,6 +486,11 @@ for required in (
 ):
     require(required in dashboard_sql, f"dashboard_section_missing:{required}")
 require("interval must be 30-60 seconds" in monitor, "monitor_interval_guard_missing")
+require("query timeout must be 5-60 seconds" in monitor, "monitor_timeout_guard_missing")
+require(
+    'statement_timeout=${query_timeout}s' in monitor and "lock_timeout=5s" in monitor,
+    "monitor_query_timeout_not_enforced",
+)
 
 for phase in (
     "EVIDENCE_MODE_INSTALLED",
@@ -500,6 +530,7 @@ monitor_container="phoenix-economic-schema-monitor-$test_suffix"
 test_network="phoenix-economic-schema-$test_suffix"
 test_root=$(mktemp -d "${TMPDIR:-/tmp}/phoenix-economic-schema.XXXXXX")
 monitor_output="$test_root/evidence"
+monitor_health_cmd='find /evidence/latest-dashboard.json -maxdepth 0 -type f -size +0c -mmin -3 -print -quit 2>/dev/null | grep -q .'
 
 cleanup_schema_compatibility_test() {
   docker rm -f -v "$monitor_container" "$postgres_container" >/dev/null 2>&1 || true
@@ -516,6 +547,41 @@ command -v docker >/dev/null 2>&1 ||
   fail "docker is required for economic dashboard schema compatibility"
 mkdir "$monitor_output"
 chmod 0777 "$monitor_output"
+
+if PHOENIX_ECONOMIC_DASHBOARD_QUERY_TIMEOUT_SECONDS=4 \
+  POSTGRES_DSN=postgres://invalid.invalid/invalid \
+  "$repo_root/scripts/economic-dashboard-loop.sh" >/dev/null 2>&1
+then
+  fail "economic monitor accepted a query timeout below the fail-closed minimum"
+fi
+
+printf '%s\n' '{}' >"$monitor_output/latest-dashboard.json"
+touch -d '10 minutes ago' "$monitor_output/latest-dashboard.json"
+if docker run --rm \
+  --network none \
+  --read-only \
+  --cap-drop ALL \
+  --security-opt no-new-privileges:true \
+  -v "$monitor_output:/evidence:ro" \
+  --entrypoint /bin/sh \
+  "$postgres_image" \
+  -c "$monitor_health_cmd"
+then
+  fail "economic monitor health accepted a nonempty stale dashboard"
+fi
+touch "$monitor_output/latest-dashboard.json"
+docker run --rm \
+  --network none \
+  --read-only \
+  --cap-drop ALL \
+  --security-opt no-new-privileges:true \
+  -v "$monitor_output:/evidence:ro" \
+  --entrypoint /bin/sh \
+  "$postgres_image" \
+  -c "$monitor_health_cmd" >/dev/null ||
+  fail "economic monitor health rejected a nonempty fresh dashboard"
+rm -f "$monitor_output/latest-dashboard.json"
+
 docker network create --internal "$test_network" >/dev/null
 docker run -d \
   --name "$postgres_container" \
@@ -596,12 +662,13 @@ docker run -d \
   --cap-drop ALL \
   --security-opt no-new-privileges:true \
   --tmpfs /tmp:rw,noexec,nosuid,nodev,size=16m \
-  --health-cmd "test -s /evidence/latest-dashboard.json" \
+  --health-cmd "$monitor_health_cmd" \
   --health-interval 1s \
   --health-timeout 3s \
   --health-retries 20 \
   -e POSTGRES_DSN=postgres://phoenix_test:phoenix_test_password@"$postgres_container":5432/phoenix_test \
   -e PHOENIX_ECONOMIC_DASHBOARD_INTERVAL_SECONDS=30 \
+  -e PHOENIX_ECONOMIC_DASHBOARD_QUERY_TIMEOUT_SECONDS=30 \
   -e PHOENIX_ECONOMIC_DASHBOARD_SQL=/opt/phoenix/economic-dashboard-snapshot.sql \
   -e PHOENIX_ECONOMIC_DASHBOARD_OUTPUT=/evidence/latest-dashboard.json \
   -v "$repo_root/scripts/economic-dashboard-loop.sh:/opt/phoenix/economic-dashboard-loop.sh:ro" \
