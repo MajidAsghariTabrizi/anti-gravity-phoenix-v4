@@ -1831,11 +1831,11 @@ class WorkflowAndDeploymentContractTests(unittest.TestCase):
             self.rehearsal,
         )
         self.assertIn(
-            "PHOENIX_HEALTH_EXPECTED_MODE=SHADOW",
+            "PHOENIX_HEALTH_EXPECTED_MODE=DISARMED_EVIDENCE",
             health_rehearsal,
         )
         self.assertNotIn(
-            "PHOENIX_HEALTH_EXPECTED_MODE=DISARMED_EVIDENCE",
+            "PHOENIX_HEALTH_EXPECTED_MODE=SHADOW",
             health_rehearsal,
         )
         self.assertIn(
