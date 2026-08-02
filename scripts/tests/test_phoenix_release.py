@@ -1856,6 +1856,18 @@ class WorkflowAndDeploymentContractTests(unittest.TestCase):
         )[1].split("postgres_image=", maxsplit=1)[0]
         self.assertIn('--overlay-file "$overlay_file"', render)
         self.assertIn("--expected-mode DISARMED_EVIDENCE", render)
+        self.assertIn('--env-file "$candidate_evidence_env"', render)
+        self.assertNotIn('--env-file "$env_file"', render)
+        preparation = self.rehearsal.split(
+            'python3 "$candidate_root/scripts/production_context.py" manifest-env',
+            maxsplit=1,
+        )[1].split(
+            '"$candidate_root/scripts/render-production-compose.sh"',
+            maxsplit=1,
+        )[0]
+        self.assertIn('cp "$env_file" "$candidate_evidence_env"', preparation)
+        self.assertIn('production_mode.py" shadow', preparation)
+        self.assertIn('--env-file "$candidate_evidence_env"', preparation)
 
     def test_candidate_render_precedes_any_runtime_mutation(self) -> None:
         preflight_render = self.deploy.index(
@@ -1871,6 +1883,22 @@ class WorkflowAndDeploymentContractTests(unittest.TestCase):
         self.assertIn(
             "--expected-mode DISARMED_EVIDENCE",
             self.deploy[preflight_render:preflight_failure],
+        )
+        self.assertIn(
+            '--env-file "$candidate_evidence_env"',
+            self.deploy[preflight_render:preflight_failure],
+        )
+        self.assertNotIn(
+            '--env-file "$env_file"',
+            self.deploy[preflight_render:preflight_failure],
+        )
+        evidence_preparation = self.deploy[
+            self.deploy.index('cp "$env_file" "$candidate_evidence_env"'):
+            preflight_render
+        ]
+        self.assertIn('production_mode.py" shadow', evidence_preparation)
+        self.assertIn(
+            '--env-file "$candidate_evidence_env"', evidence_preparation
         )
         live_candidate = self.deploy.index(
             'production_mode.py" live --env-file "$candidate_live_env"'
