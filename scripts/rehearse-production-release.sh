@@ -278,7 +278,7 @@ if (
     or not isinstance(global_control, dict)
     or global_control.get("armed") is not False
     or global_control.get("kill_switch") is not True
-    or global_control.get("execution_mode") != "disarmed"
+    or global_control.get("execution_mode") != "disabled"
 ):
     raise SystemExit(1)
 PY
