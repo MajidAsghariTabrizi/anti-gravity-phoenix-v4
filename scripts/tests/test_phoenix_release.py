@@ -1831,13 +1831,15 @@ class WorkflowAndDeploymentContractTests(unittest.TestCase):
             self.rehearsal,
         )
         self.assertIn(
-            "PHOENIX_HEALTH_EXPECTED_MODE=DISARMED_EVIDENCE",
+            'PHOENIX_HEALTH_EXPECTED_MODE="$active_health_mode"',
             health_rehearsal,
         )
-        self.assertNotIn(
-            "PHOENIX_HEALTH_EXPECTED_MODE=SHADOW",
+        self.assertIn("SHADOW) ;;", health_rehearsal)
+        self.assertIn(
+            "LIVE) active_health_mode=DISARMED_EVIDENCE",
             health_rehearsal,
         )
+        self.assertIn("active_health_mode_invalid", health_rehearsal)
         self.assertIn(
             'image_volume = "/var/lib/postgresql/data"',
             self.rehearsal,
@@ -2017,6 +2019,26 @@ class WorkflowAndDeploymentContractTests(unittest.TestCase):
         shadow_install = self.rollback.index('production_mode.py" shadow')
         shadow_health = self.rollback.index("PHOENIX_HEALTH_EXPECTED_MODE=SHADOW")
         self.assertLess(shadow_install, shadow_health)
+
+    def test_generation_transitions_pull_only_manifest_bound_services(self) -> None:
+        pull_plan = self.deploy.split("pull_services=$(", maxsplit=1)[1].split(
+            "remove_services=$(", maxsplit=1
+        )[0]
+        self.assertIn("--mode DISARMED_EVIDENCE", pull_plan)
+        self.assertIn("--field pull_services", pull_plan)
+        self.assertIn("compose pull $pull_services", self.deploy)
+        self.assertNotIn("\ncompose pull\n", self.deploy)
+        self.assertIn(
+            '--mode SHADOW --field pull_services', self.rollback
+        )
+        self.assertIn("compose pull $pull_services", self.rollback)
+        self.assertNotIn("\ncompose pull\n", self.rollback)
+        self.assertIn(
+            "current_live_compose rm -f economic-monitor", self.rollback
+        )
+        self.assertIn(
+            "current_live_compose rm -f economic-supervisor", self.rollback
+        )
 
     def test_failure_path_persists_rollback_phases(self) -> None:
         self.assertIn("state_update failure deployment_failed", self.deploy)

@@ -381,6 +381,18 @@ class ReleaseComponentRegistryTests(unittest.TestCase):
         self.assertNotIn("atlas-observer", legacy_shadow["start_services"])
         self.assertIn("atlas-observer", legacy_shadow["intentional_absence"])
         self.assertIn("live-executor", legacy_shadow["intentional_absence"])
+        self.assertNotIn("atlas-observer", legacy_shadow["pull_services"])
+        self.assertIn("migration-runner", legacy_shadow["pull_services"])
+        self.assertNotIn("autonomous-control", legacy_shadow["pull_services"])
+
+        legacy_disarmed = release_components.runtime_topology(
+            legacy, "DISARMED_EVIDENCE"
+        )
+        self.assertNotIn("atlas-observer", legacy_disarmed["pull_services"])
+        self.assertIn("live-executor", legacy_disarmed["pull_services"])
+        self.assertIn("economic-monitor", legacy_disarmed["pull_services"])
+        self.assertIn("economic-supervisor", legacy_disarmed["pull_services"])
+        self.assertIn("autonomous-control", legacy_disarmed["pull_services"])
 
         current_disarmed = release_components.runtime_topology(
             current, "DISARMED_EVIDENCE", source_image_names=legacy
@@ -388,6 +400,7 @@ class ReleaseComponentRegistryTests(unittest.TestCase):
         self.assertEqual(current_disarmed["source_generation"], "legacy")
         self.assertIn("atlas-observer", current_disarmed["start_services"])
         self.assertIn("atlas-observer", current_disarmed["health_services"])
+        self.assertIn("atlas-observer", current_disarmed["pull_services"])
         self.assertEqual(
             current_disarmed["service_contracts"]["atlas-observer"],
             {
