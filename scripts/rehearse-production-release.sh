@@ -454,19 +454,21 @@ cleanup_database
 database_container=
 database_network=
 
+# Exercise the candidate health implementation against the immutable active
+# release topology. Target-mode health is necessarily a post-mutation gate;
+# requiring it here would ask a running SHADOW service to report LIVE state.
 PHOENIX_DEPLOY_ROOT="$deploy_root" \
 PHOENIX_ENV_FILE="$env_file" \
-PHOENIX_RELEASE_ENV="$release_env" \
+PHOENIX_RELEASE_ENV="$active_release_env" \
 PHOENIX_COMPOSE_FILE="$compose_file" \
 PHOENIX_COMPOSE_OVERLAY_FILE="$overlay_file" \
 PHOENIX_COMPOSE_PROJECT_DIRECTORY="$deploy_dir" \
 PHOENIX_COMPOSE_RUNNER="$compose_runner" \
-PHOENIX_RELEASE_MANIFEST="$release_manifest" \
-PHOENIX_HEALTH_EXPECTED_MODE=DISARMED_EVIDENCE \
+PHOENIX_HEALTH_EXPECTED_MODE=SHADOW \
 PHOENIX_HEALTH_RETRIES=1 \
 PHOENIX_HEALTH_SLEEP_SECONDS=0 \
 PHOENIX_HEALTH_COMMAND_TIMEOUT_SECONDS=15 \
-  "$candidate_root/scripts/production-healthcheck.sh" >/dev/null ||
+  "$candidate_root/scripts/production-healthcheck.sh" ||
   fail candidate_health_contract_failed
 
 printf '%s\n' \

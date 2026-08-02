@@ -1730,9 +1730,13 @@ class WorkflowAndDeploymentContractTests(unittest.TestCase):
         self.assertIn('/usr/bin/docker exec -i \\', sql_probe)
         self.assertIn('"$database_container"', sql_probe)
         self.assertNotIn("compose exec", sql_probe)
+        health_rehearsal = self.rehearsal.split(
+            "# Exercise the candidate health implementation", maxsplit=1
+        )[1]
         self.assertIn(
-            'PHOENIX_RELEASE_MANIFEST="$release_manifest"', self.rehearsal
+            'PHOENIX_RELEASE_ENV="$active_release_env"', health_rehearsal
         )
+        self.assertNotIn("PHOENIX_RELEASE_MANIFEST=", health_rehearsal)
         self.assertIn(
             "PHOENIX_HEALTH_COMMAND_TIMEOUT_SECONDS=15", self.rehearsal
         )
@@ -1742,12 +1746,12 @@ class WorkflowAndDeploymentContractTests(unittest.TestCase):
             self.rehearsal,
         )
         self.assertIn(
-            "PHOENIX_HEALTH_EXPECTED_MODE=DISARMED_EVIDENCE",
-            self.rehearsal,
+            "PHOENIX_HEALTH_EXPECTED_MODE=SHADOW",
+            health_rehearsal,
         )
         self.assertNotIn(
-            "PHOENIX_HEALTH_EXPECTED_MODE=SHADOW",
-            self.rehearsal,
+            "PHOENIX_HEALTH_EXPECTED_MODE=DISARMED_EVIDENCE",
+            health_rehearsal,
         )
         self.assertIn(
             'image_volume = "/var/lib/postgresql/data"',
