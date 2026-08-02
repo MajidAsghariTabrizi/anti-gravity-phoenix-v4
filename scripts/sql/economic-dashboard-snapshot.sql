@@ -288,11 +288,238 @@ route_ranking AS (
     ) ranked
 ),
 loss_points AS (
-\if :phoenix_has_economic_loss_ledger
+\if :phoenix_has_economic_truth
+    WITH bounded_loss_truth AS MATERIALIZED (
+        SELECT
+            truth.evaluation_point_id,
+            truth.source_event_identity,
+            truth.classified_at,
+            truth.route_fingerprint,
+            truth.input_size_wei,
+            truth.direction_path AS route_direction_path,
+            truth.event_to_evaluation_latency_ns,
+            truth.pool_address_path,
+            CASE WHEN truth.gross_spread_wei ~ '^-?[0-9]+$'
+                THEN truth.gross_spread_wei::numeric END AS gross_spread_value,
+            CASE WHEN truth.minimum_required_net_pnl_wei ~ '^[0-9]+$'
+                THEN truth.minimum_required_net_pnl_wei::numeric END
+                AS minimum_required_value,
+            CASE WHEN truth.margin_to_profitability_gate_wei ~ '^-?[0-9]+$'
+                THEN truth.margin_to_profitability_gate_wei::numeric END
+                AS margin_to_gate_value,
+            CASE WHEN truth.dex_fees_wei ~ '^[0-9]+$'
+                THEN truth.dex_fees_wei::numeric ELSE 0 END AS dex_fees_value,
+            CASE WHEN truth.arbitrum_execution_fee_wei ~ '^[0-9]+$'
+                THEN truth.arbitrum_execution_fee_wei::numeric ELSE 0 END
+                AS execution_fee_value,
+            CASE WHEN truth.l1_data_fee_wei ~ '^[0-9]+$'
+                THEN truth.l1_data_fee_wei::numeric ELSE 0 END AS l1_fee_value,
+            CASE WHEN truth.flash_premium_wei ~ '^[0-9]+$'
+                THEN truth.flash_premium_wei::numeric ELSE 0 END AS flash_fee_value,
+            CASE WHEN truth.price_impact_wei ~ '^[0-9]+$'
+                THEN truth.price_impact_wei::numeric ELSE 0 END AS price_impact_value,
+            truth.exact_rejection_reason,
+            truth.independent_verification_status,
+            truth.independent_verification_lifecycle,
+            truth.fork_status,
+            truth.fork_simulated_net_pnl_wei,
+            truth.state_age_blocks,
+            truth.tick_crossings,
+            classification.detail_class,
+            (
+                SELECT max((leg->>'utilization_bps')::numeric)
+                FROM jsonb_array_elements(
+                    coalesce(truth.active_liquidity_near_current_tick, '[]'::jsonb)
+                ) leg
+                WHERE leg->>'utilization_bps' ~ '^[0-9]+$'
+            ) AS maximum_liquidity_utilization_bps,
+            (
+                SELECT jsonb_agg(pool.value ORDER BY pool.ordinality DESC)
+                FROM jsonb_array_elements(truth.pool_address_path)
+                     WITH ORDINALITY AS pool(value, ordinality)
+            ) AS reverse_pool_address_path
+        FROM phoenix_live_economic_truth truth
+        JOIN shadow_engine_classifications classification
+          ON classification.source_event_identity = truth.source_event_identity
+        WHERE truth.classified_at >= now() - interval '7 days'
+    ),
+    bounded_counterfactuals AS (
+        SELECT DISTINCT ON (source_event_identity)
+            source_event_identity,
+            route_fingerprint,
+            input_size_wei,
+            margin_to_gate_value
+        FROM bounded_loss_truth
+        ORDER BY source_event_identity,
+                 margin_to_gate_value DESC NULLS LAST,
+                 route_fingerprint,
+                 input_size_wei::numeric
+    ),
+    bounded_reverse_routes AS (
+        SELECT DISTINCT ON (truth.evaluation_point_id)
+            truth.evaluation_point_id,
+            candidate.route_fingerprint,
+            candidate.margin_to_gate_value,
+            candidate.gross_spread_value
+        FROM bounded_loss_truth truth
+        JOIN bounded_loss_truth candidate
+          ON candidate.source_event_identity = truth.source_event_identity
+         AND candidate.input_size_wei = truth.input_size_wei
+         AND candidate.route_fingerprint <> truth.route_fingerprint
+         AND candidate.pool_address_path = truth.reverse_pool_address_path
+        ORDER BY truth.evaluation_point_id,
+                 candidate.margin_to_gate_value DESC NULLS LAST,
+                 candidate.route_fingerprint
+    ),
+    bounded_causes AS (
+        SELECT
+            truth.*,
+            counterfactual.route_fingerprint
+                AS best_counterfactual_route_fingerprint,
+            counterfactual.input_size_wei
+                AS best_counterfactual_input_size_wei,
+            counterfactual.margin_to_gate_value
+                AS best_counterfactual_margin_to_gate_wei,
+            reverse_route.margin_to_gate_value AS reverse_margin_to_gate_value,
+            CASE
+                WHEN truth.detail_class = 'upstream_call_budget_exhausted'
+                    THEN 'rpc_budget_exhausted'
+                WHEN truth.independent_verification_status = 'disagreed'
+                    OR truth.independent_verification_lifecycle
+                       @> '["disagreed"]'::jsonb
+                    THEN 'rpc_disagreement'
+                WHEN truth.fork_status = 'reverted'
+                    THEN 'fork_revert'
+                WHEN truth.fork_status = 'passed'
+                 AND truth.fork_simulated_net_pnl_wei <= truth.minimum_required_value
+                    THEN 'fork_pnl_below_gate'
+                WHEN truth.exact_rejection_reason IN ('quote_stale', 'quote_expired')
+                    THEN 'quote_stale'
+                WHEN truth.state_age_blocks > 1
+                    THEN 'state_stale'
+                WHEN truth.exact_rejection_reason IN (
+                    'liquidity_unknown',
+                    'quote_incomplete'
+                ) THEN 'state_incomplete'
+                WHEN truth.exact_rejection_reason = 'liquidity_insufficient'
+                  OR truth.maximum_liquidity_utilization_bps > 1000
+                    THEN 'liquidity_utilization_limit'
+                WHEN truth.tick_crossings > 64
+                    THEN 'tick_crossing_limit'
+                WHEN truth.exact_rejection_reason IN (
+                    'price_impact_limit_exceeded',
+                    'slippage_limit_exceeded'
+                ) THEN 'price_impact_dominated'
+                WHEN truth.exact_rejection_reason IN (
+                    'token_not_allowed',
+                    'protocol_not_allowed',
+                    'route_not_in_universe'
+                ) THEN 'route_not_in_universe'
+                WHEN truth.gross_spread_value < 0
+                 AND reverse_route.gross_spread_value > 0
+                    THEN 'wrong_direction'
+                WHEN truth.gross_spread_value <= 0
+                    THEN 'gross_spread_negative'
+                WHEN truth.margin_to_gate_value < 0
+                 AND truth.dex_fees_value >= greatest(
+                        truth.execution_fee_value,
+                        truth.l1_fee_value,
+                        truth.flash_fee_value,
+                        truth.price_impact_value
+                     )
+                 AND truth.dex_fees_value > 0
+                    THEN 'dex_fees_dominated'
+                WHEN truth.margin_to_gate_value < 0
+                 AND truth.execution_fee_value >= greatest(
+                        truth.l1_fee_value,
+                        truth.flash_fee_value,
+                        truth.price_impact_value
+                     )
+                 AND truth.execution_fee_value > 0
+                    THEN 'fixed_gas_dominated'
+                WHEN truth.margin_to_gate_value < 0
+                 AND truth.l1_fee_value >= greatest(
+                        truth.flash_fee_value,
+                        truth.price_impact_value
+                     )
+                 AND truth.l1_fee_value > 0
+                    THEN 'l1_data_fee_dominated'
+                WHEN truth.margin_to_gate_value < 0
+                 AND truth.flash_fee_value >= truth.price_impact_value
+                 AND truth.flash_fee_value > 0
+                    THEN 'flash_fee_dominated'
+                WHEN truth.margin_to_gate_value < 0
+                 AND truth.price_impact_value > 0
+                    THEN 'price_impact_dominated'
+                ELSE 'unknown'
+            END AS primary_loss_cause
+        FROM bounded_loss_truth truth
+        LEFT JOIN bounded_counterfactuals counterfactual
+          ON counterfactual.source_event_identity = truth.source_event_identity
+        LEFT JOIN bounded_reverse_routes reverse_route
+          ON reverse_route.evaluation_point_id = truth.evaluation_point_id
+    ),
+    bounded_loss_rows AS (
+        SELECT
+            caused.*,
+            greatest(-caused.margin_to_gate_value, 0)
+                AS missing_break_even_amount_wei,
+            CASE caused.primary_loss_cause
+                WHEN 'wrong_direction' THEN greatest(
+                    caused.reverse_margin_to_gate_value - caused.margin_to_gate_value,
+                    0
+                )
+                WHEN 'gross_spread_negative' THEN greatest(
+                    -caused.margin_to_gate_value,
+                    0
+                )
+                WHEN 'dex_fees_dominated' THEN caused.dex_fees_value
+                WHEN 'fixed_gas_dominated' THEN caused.execution_fee_value
+                WHEN 'l1_data_fee_dominated' THEN caused.l1_fee_value
+                WHEN 'flash_fee_dominated' THEN caused.flash_fee_value
+                WHEN 'price_impact_dominated' THEN caused.price_impact_value
+                WHEN 'fork_pnl_below_gate' THEN greatest(
+                    caused.minimum_required_value - caused.fork_simulated_net_pnl_wei,
+                    0
+                )
+                ELSE NULL
+            END AS recoverable_pnl_if_bottleneck_removed_wei,
+            CASE caused.primary_loss_cause
+                WHEN 'wrong_direction' THEN 'prioritize_reverse_direction'
+                WHEN 'route_not_in_universe' THEN 'verify_and_rank_missing_route'
+                WHEN 'gross_spread_negative' THEN 'expand_verified_route_universe'
+                WHEN 'dex_fees_dominated' THEN 'prefer_lower_fee_pool_pair'
+                WHEN 'fixed_gas_dominated' THEN 'reduce_fixed_execution_gas'
+                WHEN 'l1_data_fee_dominated'
+                    THEN 'reduce_calldata_or_wait_for_lower_l1_fee'
+                WHEN 'flash_fee_dominated' THEN 'evaluate_lower_cost_capital_source'
+                WHEN 'price_impact_dominated' THEN 'prefer_smaller_size_or_deeper_pool'
+                WHEN 'liquidity_utilization_limit'
+                    THEN 'prefer_smaller_size_or_deeper_pool'
+                WHEN 'tick_crossing_limit' THEN 'prefer_smaller_size_or_deeper_pool'
+                WHEN 'state_incomplete' THEN 'repair_state_completeness'
+                WHEN 'state_stale' THEN 'reduce_state_latency'
+                WHEN 'quote_stale' THEN 'reduce_quote_latency'
+                WHEN 'candidate_stale'
+                    THEN 'reduce_candidate_materialization_latency'
+                WHEN 'rpc_budget_exhausted'
+                    THEN 'prioritize_promising_primary_routes'
+                WHEN 'rpc_disagreement'
+                    THEN 'investigate_provider_state_divergence'
+                WHEN 'fork_revert' THEN 'inspect_fork_revert_evidence'
+                WHEN 'fork_pnl_below_gate' THEN 'calibrate_prediction_against_fork'
+                WHEN 'candidate_decay'
+                    THEN 'reduce_detection_to_submission_latency'
+                WHEN 'contract_guard_rejection'
+                    THEN 'retain_guard_and_fix_plan_binding'
+                ELSE 'collect_more_bounded_evidence'
+            END AS recommended_next_action
+        FROM bounded_causes caused
+    )
     SELECT
-        ledger.classified_at,
-        ledger.route_fingerprint,
-        ledger.input_size_wei,
+        loss.classified_at,
+        loss.route_fingerprint,
+        loss.input_size_wei,
         CASE
             WHEN outcome.outcome_class IN (
                 'submitted_too_late',
@@ -313,34 +540,32 @@ loss_points AS (
                 'policy_rejected',
                 'operator_killed'
             ) THEN 'contract_guard_rejection'
-            ELSE ledger.primary_loss_cause
+            ELSE loss.primary_loss_cause
         END AS primary_loss_cause,
-        ledger.secondary_loss_causes,
-        ledger.missing_break_even_amount_wei,
-        ledger.best_counterfactual_route_fingerprint,
-        ledger.best_counterfactual_input_size_wei,
-        ledger.best_counterfactual_margin_to_gate_wei,
-        ledger.recoverable_pnl_if_bottleneck_removed_wei,
-        ledger.recommended_next_action,
-        ledger.route_direction_path,
-        ledger.event_to_evaluation_latency_ns
-    FROM phoenix_live_economic_loss_ledger ledger
+        loss.missing_break_even_amount_wei,
+        loss.best_counterfactual_route_fingerprint,
+        loss.best_counterfactual_input_size_wei,
+        loss.best_counterfactual_margin_to_gate_wei,
+        loss.recoverable_pnl_if_bottleneck_removed_wei,
+        loss.recommended_next_action,
+        loss.route_direction_path,
+        loss.event_to_evaluation_latency_ns
+    FROM bounded_loss_rows loss
     LEFT JOIN LATERAL (
         SELECT current_candidate.candidate_id,
                current_candidate.status,
                current_candidate.rejection_reason
         FROM live_canary.autonomous_candidates current_candidate
-        WHERE current_candidate.origin_event_id = ledger.source_event_identity
-          AND current_candidate.route_fingerprint = ledger.route_fingerprint
-          AND current_candidate.selected_size::text = ledger.input_size_wei
+        WHERE current_candidate.origin_event_id = loss.source_event_identity
+          AND current_candidate.route_fingerprint = loss.route_fingerprint
+          AND current_candidate.selected_size::text = loss.input_size_wei
         ORDER BY current_candidate.candidate_created_at DESC,
                  current_candidate.candidate_id
         LIMIT 1
     ) candidate ON true
     LEFT JOIN live_canary.autonomous_outcome_attributions outcome
       ON outcome.candidate_id = candidate.candidate_id
-    WHERE ledger.classified_at >= now() - interval '7 days'
-      AND (
+    WHERE (
           outcome.candidate_id IS NULL
           OR outcome.realized_business_net_pnl <= 0
       )
@@ -350,7 +575,6 @@ loss_points AS (
         NULL::text AS route_fingerprint,
         NULL::text AS input_size_wei,
         NULL::text AS primary_loss_cause,
-        '[]'::jsonb AS secondary_loss_causes,
         NULL::numeric AS missing_break_even_amount_wei,
         NULL::text AS best_counterfactual_route_fingerprint,
         NULL::text AS best_counterfactual_input_size_wei,
