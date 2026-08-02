@@ -11,6 +11,7 @@ overlay_file="${PHOENIX_COMPOSE_OVERLAY_FILE:-$deploy_dir/compose.live-autonomou
 project_directory="${PHOENIX_COMPOSE_PROJECT_DIRECTORY:-$deploy_dir}"
 retries="${PHOENIX_HEALTH_RETRIES:-20}"
 sleep_seconds="${PHOENIX_HEALTH_SLEEP_SECONDS:-3}"
+command_timeout_seconds="${PHOENIX_HEALTH_COMMAND_TIMEOUT_SECONDS:-15}"
 expected_mode="${PHOENIX_HEALTH_EXPECTED_MODE:-}"
 compose_runner=${PHOENIX_COMPOSE_RUNNER:-$deploy_dir/production_compose.py}
 if [ ! -f "$compose_runner" ] && [ -f "$script_dir/production_compose.py" ]; then
@@ -26,6 +27,13 @@ esac
 
 [ -f "$release_env" ] ||
   { echo "HEALTH_FAIL: missing release env $release_env"; exit 1; }
+case "$command_timeout_seconds" in
+  ""|*[!0-9]*) echo "HEALTH_FAIL: invalid command timeout"; exit 1 ;;
+esac
+[ "$command_timeout_seconds" -ge 1 ] && [ "$command_timeout_seconds" -le 60 ] ||
+  { echo "HEALTH_FAIL: invalid command timeout"; exit 1; }
+[ -x /usr/bin/timeout ] ||
+  { echo "HEALTH_FAIL: command timeout unavailable"; exit 1; }
 
 set -a
 # shellcheck disable=SC1090
@@ -35,7 +43,7 @@ set -a
 set +a
 [ -n "${PHOENIX_RELEASE_SHA:-}" ] ||
   { echo "HEALTH_FAIL: release-sha"; exit 1; }
-release_manifest="$deploy_dir/manifests/$PHOENIX_RELEASE_SHA.json"
+release_manifest="${PHOENIX_RELEASE_MANIFEST:-$deploy_dir/manifests/$PHOENIX_RELEASE_SHA.json}"
 [ -f "$release_manifest" ] ||
   { echo "HEALTH_FAIL: release-manifest"; exit 1; }
 
@@ -47,7 +55,8 @@ fi
 
 compose() {
   if [ "$compose_mode" = LIVE ]; then
-    python3 "$compose_runner" \
+    /usr/bin/timeout --signal=TERM --kill-after=2s \
+      "${command_timeout_seconds}s" python3 "$compose_runner" \
       --mode LIVE \
       --env-file "$env_file" \
       --release-env "$release_env" \
@@ -56,7 +65,8 @@ compose() {
       --project-directory "$project_directory" \
       -- "$@"
   else
-    python3 "$compose_runner" \
+    /usr/bin/timeout --signal=TERM --kill-after=2s \
+      "${command_timeout_seconds}s" python3 "$compose_runner" \
       --mode SHADOW \
       --env-file "$env_file" \
       --release-env "$release_env" \

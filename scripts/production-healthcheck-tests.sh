@@ -60,6 +60,12 @@ set -eu
   done
   printf '\n'
 } >>"$PHOENIX_HEALTHCHECK_DOCKER_LOG"
+case " $* " in
+  *' nitro-feed-relay '*)
+    [ -z "${PHOENIX_HEALTHCHECK_DOCKER_SLEEP_SECONDS:-}" ] ||
+      sleep "$PHOENIX_HEALTHCHECK_DOCKER_SLEEP_SECONDS"
+    ;;
+esac
 SH
 chmod 0755 "$fake_bin/docker"
 
@@ -143,6 +149,42 @@ grep -F '<--profile><live-autonomous>' "$docker_log" >/dev/null ||
 grep -F '<live-executor></usr/local/bin/autonomous-live-control><status>' \
   "$docker_log" >/dev/null ||
   fail 'LIVE healthcheck did not inspect autonomous controls'
+
+candidate_manifest=$tmp_root/candidate-manifest.json
+cp "$deploy_dir/manifests/$release_sha.json" "$candidate_manifest"
+rm -f "$deploy_dir/manifests/$release_sha.json"
+: >"$docker_log"
+PATH="$fake_bin:$PATH" \
+PHOENIX_DEPLOY_ROOT="$deploy_root" \
+PHOENIX_ENV_FILE="$env_file" \
+PHOENIX_RELEASE_ENV="$release_env" \
+PHOENIX_RELEASE_MANIFEST="$candidate_manifest" \
+PHOENIX_HEALTH_EXPECTED_MODE=DISARMED_EVIDENCE \
+PHOENIX_HEALTH_RETRIES=1 \
+PHOENIX_HEALTH_SLEEP_SECONDS=0 \
+PHOENIX_HEALTH_COMMAND_TIMEOUT_SECONDS=15 \
+PHOENIX_HEALTHCHECK_DOCKER_LOG="$docker_log" \
+  /bin/sh "$healthcheck" >"$output"
+grep -Fx 'PRODUCTION_HEALTH_OK' "$output" >/dev/null ||
+  fail 'explicit candidate release manifest did not pass'
+
+if PATH="$fake_bin:$PATH" \
+  PHOENIX_DEPLOY_ROOT="$deploy_root" \
+  PHOENIX_ENV_FILE="$env_file" \
+  PHOENIX_RELEASE_ENV="$release_env" \
+  PHOENIX_RELEASE_MANIFEST="$candidate_manifest" \
+  PHOENIX_HEALTH_EXPECTED_MODE=DISARMED_EVIDENCE \
+  PHOENIX_HEALTH_RETRIES=1 \
+  PHOENIX_HEALTH_SLEEP_SECONDS=0 \
+  PHOENIX_HEALTH_COMMAND_TIMEOUT_SECONDS=1 \
+  PHOENIX_HEALTHCHECK_DOCKER_SLEEP_SECONDS=3 \
+  PHOENIX_HEALTHCHECK_DOCKER_LOG="$docker_log" \
+    /bin/sh "$healthcheck" >"$output" 2>&1
+then
+  fail 'stalled Compose health command passed its bound'
+fi
+grep -Fx 'HEALTH_FAIL: nitro-feed-relay' "$output" >/dev/null ||
+  fail 'stalled Compose health command did not fail at its named contract'
 
 if PATH="$fake_bin:$PATH" \
   PHOENIX_DEPLOY_ROOT="$deploy_root" \

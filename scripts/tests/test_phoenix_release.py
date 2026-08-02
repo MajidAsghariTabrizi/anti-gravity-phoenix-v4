@@ -1699,6 +1699,20 @@ class WorkflowAndDeploymentContractTests(unittest.TestCase):
         self.assertIn("monitor_healthy_seconds", self.rehearsal)
         self.assertIn("candidate_monitor_exited", self.rehearsal)
         self.assertIn('docker logs --tail 20 "$monitor_container"', self.rehearsal)
+        self.assertIn("candidate_control_contract_invalid", self.rehearsal)
+        self.assertIn("candidate_control_status_invalid", self.rehearsal)
+        self.assertIn('"$control_image" status', self.rehearsal)
+        self.assertIn(
+            "/usr/bin/timeout --signal=TERM --kill-after=2s 45s",
+            self.rehearsal,
+        )
+        self.assertIn("statement_timeout=30000", self.rehearsal)
+        self.assertIn(
+            'PHOENIX_RELEASE_MANIFEST="$release_manifest"', self.rehearsal
+        )
+        self.assertIn(
+            "PHOENIX_HEALTH_COMMAND_TIMEOUT_SECONDS=15", self.rehearsal
+        )
         self.assertIn("candidate_health_contract_failed", self.rehearsal)
         self.assertIn(
             'docker rm -f -v "$monitor_container"',
