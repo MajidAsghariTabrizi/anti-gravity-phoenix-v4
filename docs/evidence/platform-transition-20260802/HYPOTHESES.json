@@ -1,0 +1,59 @@
+{
+  "schema": "phoenix.hypotheses.v1",
+  "generated_at": "2026-08-02T07:41:24.293Z",
+  "repository_sha": "aa4ab66de054b4a1ab0966d78923b78ab789ded1",
+  "active_release_sha": "c40ad821d564b30bf43d31d608669999f5e03efc",
+  "source_identities": {
+    "release_run": "30707220498",
+    "manifest_sha256": "sha256:b6ea0f2620bda15cdfe3f9542cf1a103d80635661ac1239c02f67e572d31e7eb"
+  },
+  "hypotheses": [
+    {
+      "id": "H1",
+      "claim": "Only the hard-coded validator service list is wrong.",
+      "evidence_for": ["The causal failure was validator container-missing for Atlas after all prior deploy steps passed."],
+      "evidence_against": ["Deploy, health, rollback, and active reconciliation also had generation-incomplete lifecycle behavior."],
+      "cheapest_falsifier": "Compare manifest, render, start, inspect, health, and rollback sets for both generations.",
+      "blast_radius_if_wrong": "A one-line exception would allow activation without starting or safely removing Atlas.",
+      "state": "WEAKENED"
+    },
+    {
+      "id": "H2",
+      "claim": "Dashboard substitution is semantically invalid beyond rendering.",
+      "evidence_for": ["Dashboard uses a Streamlit entrypoint; Atlas requires /usr/local/bin/atlas-observer."],
+      "evidence_against": ["The substitution can permit legacy Compose rendering when topology structurally prevents start."],
+      "cheapest_falsifier": "Compare Dockerfile entrypoints and require Atlas binary identity in health validation.",
+      "blast_radius_if_wrong": "A Dashboard container could be mislabeled as Atlas.",
+      "state": "SURVIVED"
+    },
+    {
+      "id": "H3",
+      "claim": "Deploy lifecycle is correct for seven images but incomplete for eight images.",
+      "evidence_for": ["The old start list omitted Atlas for every generation."],
+      "evidence_against": [],
+      "cheapest_falsifier": "Generate target start sets for 7->7 and 7->8.",
+      "blast_radius_if_wrong": "An eight-image release could promote with Atlas absent.",
+      "state": "SURVIVED"
+    },
+    {
+      "id": "H4",
+      "claim": "Rollback cannot safely remove Atlas when the target generation omits it.",
+      "evidence_for": ["The old rollback list had no Atlas source-context stop/remove operation."],
+      "evidence_against": [],
+      "cheapest_falsifier": "Generate and rehearse the 8->7 source-only removal set.",
+      "blast_radius_if_wrong": "A stale Atlas container could survive rollback under the shared Compose project.",
+      "state": "SURVIVED"
+    },
+    {
+      "id": "H5",
+      "claim": "Candidate, active, and rollback contexts were mixed in run 30707220498.",
+      "evidence_for": [],
+      "evidence_against": ["Candidate manifest, env, state, and pointer paths remained candidate-bound through validation; rollback context began only after failure."],
+      "cheapest_falsifier": "Trace exact arguments and file hashes through deploy and validator evidence.",
+      "blast_radius_if_wrong": "A context repair could target the wrong release.",
+      "state": "FALSIFIED"
+    }
+  ],
+  "completeness": "complete_for_H1_through_H5",
+  "unknowns": ["Production transition results remain unmeasured until an owner-authorized protected release."]
+}

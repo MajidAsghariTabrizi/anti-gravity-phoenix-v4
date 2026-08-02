@@ -198,6 +198,28 @@
         "rpc-gateway": { "$ref": "#/$defs/selectiveImage" }
       }
     },
+    "legacyInheritedImages": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "dashboard",
+        "feed-ingestor",
+        "fork-sandbox",
+        "live-executor",
+        "phoenix-engine",
+        "recorder",
+        "rpc-gateway"
+      ],
+      "properties": {
+        "dashboard": { "$ref": "#/$defs/selectiveImage" },
+        "feed-ingestor": { "$ref": "#/$defs/selectiveImage" },
+        "fork-sandbox": { "$ref": "#/$defs/selectiveImage" },
+        "live-executor": { "$ref": "#/$defs/selectiveImage" },
+        "phoenix-engine": { "$ref": "#/$defs/selectiveImage" },
+        "recorder": { "$ref": "#/$defs/selectiveImage" },
+        "rpc-gateway": { "$ref": "#/$defs/selectiveImage" }
+      }
+    },
     "fullBuild": {
       "type": "object",
       "additionalProperties": false,
@@ -259,7 +281,10 @@
           "$ref": "#/$defs/runId"
         },
         "images": {
-          "$ref": "#/$defs/inheritedImages"
+          "oneOf": [
+            { "$ref": "#/$defs/inheritedImages" },
+            { "$ref": "#/$defs/legacyInheritedImages" }
+          ]
         }
       }
     }

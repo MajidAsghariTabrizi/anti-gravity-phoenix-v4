@@ -37,11 +37,17 @@ docker_log=$tmp_root/docker.log
 output=$tmp_root/output.log
 env_file=$tmp_root/phoenix.env
 release_env=$deploy_dir/current-release.env
-mkdir -p "$deploy_dir" "$fake_bin"
+release_sha=1111111111111111111111111111111111111111
+mkdir -p "$deploy_dir/manifests" "$fake_bin"
 : >"$env_file"
-: >"$release_env"
+printf 'PHOENIX_RELEASE_SHA=%s\n' "$release_sha" >"$release_env"
 : >"$deploy_dir/compose.prod.yml"
 : >"$docker_log"
+cp "$repo_root/release-components.json" "$deploy_dir/release-components.json"
+cp "$script_dir/release_components.py" "$deploy_dir/release_components.py"
+cat >"$deploy_dir/manifests/$release_sha.json" <<EOF
+{"images":{"dashboard":{},"feed-ingestor":{},"fork-sandbox":{},"live-executor":{},"phoenix-engine":{},"recorder":{},"rpc-gateway":{}}}
+EOF
 
 cat >"$fake_bin/docker" <<'SH'
 #!/usr/bin/env sh

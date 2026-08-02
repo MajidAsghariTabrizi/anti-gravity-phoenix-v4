@@ -238,6 +238,9 @@ services:
       retries: 5
 
   atlas-observer:
+    # Stage-A bridge render shim only. Release topology forbids starting this
+    # service unless the manifest contains the independently bound Atlas image.
+    # Stage B removes this fallback when the eight-image generation activates.
     image: ${ATLAS_OBSERVER_IMAGE:-${DASHBOARD_IMAGE:?DASHBOARD_IMAGE is required}}
     command:
       - --continuous

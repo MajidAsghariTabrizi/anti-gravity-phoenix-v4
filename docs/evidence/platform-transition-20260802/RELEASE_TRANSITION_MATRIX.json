@@ -1,0 +1,48 @@
+{
+  "schema": "phoenix.release-transition-matrix.v1",
+  "generated_at": "2026-08-02T07:41:24.293Z",
+  "repository_sha": "aa4ab66de054b4a1ab0966d78923b78ab789ded1",
+  "active_release_sha": "c40ad821d564b30bf43d31d608669999f5e03efc",
+  "source_identities": {
+    "historical_release_run": "30707220498",
+    "historical_manifest_sha256": "sha256:b6ea0f2620bda15cdfe3f9542cf1a103d80635661ac1239c02f67e572d31e7eb",
+    "topology_authority": "scripts/release_components.py"
+  },
+  "historical_reproduction": {
+    "mode": "DISARMED_EVIDENCE",
+    "manifest_services": ["dashboard", "feed-ingestor", "live-executor", "migration-runner", "phoenix-engine", "recorder", "rpc-gateway", "shadow-dispatcher"],
+    "rendered_expected_services": ["nitro-feed-relay", "nats", "postgres", "migration-runner", "rpc-gateway", "feed-ingestor", "phoenix-engine", "shadow-dispatcher", "recorder", "dashboard", "prometheus", "live-executor"],
+    "started_services": ["prometheus", "shadow-dispatcher", "dashboard", "economic-monitor", "economic-supervisor", "rpc-gateway", "phoenix-engine"],
+    "inspected_running_services_before_fix": ["nitro-feed-relay", "nats", "postgres", "rpc-gateway", "feed-ingestor", "phoenix-engine", "shadow-dispatcher", "recorder", "atlas-observer", "dashboard", "prometheus", "live-executor"],
+    "inspected_running_services_after_fix": ["nitro-feed-relay", "nats", "postgres", "rpc-gateway", "feed-ingestor", "phoenix-engine", "shadow-dispatcher", "recorder", "prometheus", "dashboard"],
+    "intentional_absence": ["atlas-observer", "live-executor"],
+    "observed_result_before_fix": "RUNNING_IMAGE_MISMATCH:atlas-observer:container-missing",
+    "expected_result_after_fix": "pass_with_atlas_absent"
+  },
+  "transitions": [
+    {"id":"T1-7-to-7-bridge","source":"legacy","target":"legacy","mode":"DISARMED_EVIDENCE","manifest_services":["dashboard","feed-ingestor","live-executor","migration-runner","phoenix-engine","recorder","rpc-gateway","shadow-dispatcher"],"rendered_expected_services":["nitro-feed-relay","nats","postgres","migration-runner","rpc-gateway","feed-ingestor","phoenix-engine","shadow-dispatcher","recorder","dashboard","prometheus","live-executor"],"started_services":["prometheus","shadow-dispatcher","dashboard","economic-monitor","economic-supervisor","rpc-gateway","phoenix-engine"],"healthy_running_services":["nitro-feed-relay","nats","postgres","rpc-gateway","feed-ingestor","phoenix-engine","shadow-dispatcher","recorder","dashboard","prometheus","economic-monitor","economic-supervisor"],"intentional_absence":["atlas-observer","live-executor"],"remove_services":[],"result":"pass"},
+    {"id":"T2-7-to-8-activation","source":"legacy","target":"current","mode":"DISARMED_EVIDENCE","manifest_services":["atlas-observer","dashboard","feed-ingestor","live-executor","migration-runner","phoenix-engine","recorder","rpc-gateway","shadow-dispatcher"],"rendered_expected_services":["nitro-feed-relay","nats","postgres","migration-runner","rpc-gateway","feed-ingestor","phoenix-engine","shadow-dispatcher","recorder","atlas-observer","dashboard","prometheus","live-executor"],"started_services":["prometheus","shadow-dispatcher","dashboard","atlas-observer","economic-monitor","economic-supervisor","rpc-gateway","phoenix-engine"],"healthy_running_services":["nitro-feed-relay","nats","postgres","rpc-gateway","feed-ingestor","phoenix-engine","shadow-dispatcher","recorder","atlas-observer","dashboard","prometheus","economic-monitor","economic-supervisor"],"intentional_absence":["live-executor"],"remove_services":[],"result":"pass"},
+    {"id":"T3-8-to-8-unchanged-atlas","source":"current","target":"current","mode":"SHADOW","atlas_image":"unchanged","remove_services":[],"started_services":["prometheus","shadow-dispatcher","dashboard","atlas-observer","rpc-gateway","phoenix-engine"],"intentional_absence":["live-executor","economic-monitor","economic-supervisor"],"result":"pass"},
+    {"id":"T3-8-to-8-changed-atlas","source":"current","target":"current","mode":"SHADOW","atlas_image":"changed","required_behavior":"compose_up_recreates_digest_changed_service_then_real_health_and_binary_identity_pass","remove_services":[],"result":"pass_contract"},
+    {"id":"T4-8-to-7-rollback","source":"current","target":"legacy","mode":"SHADOW","remove_services":["atlas-observer"],"required_behavior":"source_context_stop_then_rm_before_target_promotion","intentional_absence":["atlas-observer","live-executor","economic-monitor","economic-supervisor"],"result":"pass_contract"},
+    {"id":"MODE-SHADOW","source":"current","target":"current","mode":"SHADOW","live_executor":"absent","economic_sidecars":"absent","result":"pass"},
+    {"id":"MODE-DISARMED-EVIDENCE","source":"current","target":"current","mode":"DISARMED_EVIDENCE","live_executor":"absent","economic_sidecars":"running","result":"pass"},
+    {"id":"MODE-LIVE","source":"current","target":"current","mode":"LIVE","live_executor":"running_and_inspected","authorization":"owner_canary_required","result":"contract_only"}
+  ],
+  "negative_cases": [
+    {"id":"atlas-image-absent-current","expected":"pre_mutation_RELEASE_IMAGE_MISMATCH","result":"pass_contract"},
+    {"id":"atlas-image-substituted","expected":"pre_mutation_RELEASE_IMAGE_MISMATCH","result":"pass_contract"},
+    {"id":"atlas-container-absent-current","expected":"RUNNING_IMAGE_MISMATCH_container_missing","result":"pass_contract"},
+    {"id":"atlas-unhealthy","expected":"deployment_failure_then_automatic_rollback","result":"pass_contract"},
+    {"id":"atlas-present-legacy","expected":"RUNNING_IMAGE_MISMATCH_unexpected_present","result":"pass_contract"},
+    {"id":"stale-atlas-after-rollback","expected":"rollback_failure","result":"pass_contract"},
+    {"id":"candidate-active-rollback-context-mismatch","expected":"release_identity_failure","result":"pass_existing_contract"},
+    {"id":"protected-digest-mismatch","expected":"protected_image_changed_failure","result":"pass_existing_contract"},
+    {"id":"same-package-retry","expected":"immutable_idempotent_or_fail_closed","result":"pass_existing_contract"},
+    {"id":"pre-mutation-failure","expected":"no_runtime_mutation","result":"pass_existing_contract"},
+    {"id":"post-mutation-failure","expected":"automatic_rollback_and_fail_closed_controls","result":"pass_existing_contract"}
+  ],
+  "safety": {"armed":false,"kill_switch":true,"live_executor":"stopped_or_absent_unless_separately_authorized","contract_paused":true},
+  "completeness": "local_contract_complete_production_measurement_pending",
+  "unknowns": ["No owner-authorized protected transition was executed.", "Cursor monotonicity requires Stage-B runtime evidence with real events."]
+}

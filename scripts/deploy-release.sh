@@ -20,9 +20,6 @@ previous_file="$deploy_dir/previous-release"
 runtime_dir="${PHOENIX_DEPLOY_RUNTIME_DIR:-$deploy_dir/.deploy-runtime}"
 candidate_release_assets_file="$deploy_dir/candidate-release-assets.sha"
 release_assets_file="$deploy_dir/release-assets.sha"
-protected_services='nitro-feed-relay feed-ingestor nats postgres recorder'
-fixed_protected_services='nitro-feed-relay nats postgres'
-optional_services='prometheus rpc-gateway shadow-dispatcher phoenix-engine dashboard economic-monitor economic-supervisor'
 service_wait_seconds=${PHOENIX_DEPLOY_SERVICE_WAIT_SECONDS:-300}
 recorder_drain_seconds=${PHOENIX_RECORDER_DRAIN_SECONDS:-180}
 engine_burn_in_seconds=${PHOENIX_ENGINE_BURN_IN_SECONDS:-120}
@@ -94,10 +91,12 @@ esac
 [ "$(tr -d '\r\n' <"$release_assets_file")" = "$rollback_sha" ] ||
   fail "active release pointers are incoherent"
 rollback_release_root="$release_root/$rollback_sha"
+rollback_manifest="$deploy_dir/manifests/$rollback_sha.json"
 rollback_script="$rollback_release_root/scripts/rollback-release.sh"
 rollback_context_installer="${PHOENIX_CONTEXT_INSTALLER:-$rollback_release_root/scripts/install-production-release-context.sh}"
 [ -f "$rollback_script" ] && [ ! -L "$rollback_script" ] ||
   fail "version-matched rollback script is missing or unsafe"
+[ -f "$rollback_manifest" ] || fail "active rollback release manifest is missing"
 [ -f "$rollback_context_installer" ] && [ ! -L "$rollback_context_installer" ] ||
   fail "version-matched rollback context installer is missing or unsafe"
 case "$service_wait_seconds" in
@@ -135,6 +134,22 @@ python3 "$deploy_dir/production_context.py" manifest-env \
   --route-registry "$deploy_dir/routes/weth_usdc_uniswap_v3.json" \
   --output "$release_env" || fail "release manifest validation failed"
 chmod 0640 "$release_env"
+protected_services=$(python3 "$deploy_dir/release_components.py" topology \
+  --manifest "$manifest" --mode DISARMED_EVIDENCE \
+  --field protected_services) || fail "target topology is invalid"
+fixed_protected_services=$(python3 "$deploy_dir/release_components.py" topology \
+  --manifest "$manifest" --mode DISARMED_EVIDENCE \
+  --field fixed_protected_services) || fail "target topology is invalid"
+start_services=$(python3 "$deploy_dir/release_components.py" topology \
+  --manifest "$manifest" --mode DISARMED_EVIDENCE \
+  --field start_services) || fail "target topology is invalid"
+remove_services=$(python3 "$deploy_dir/release_components.py" topology \
+  --manifest "$manifest" --source-manifest "$rollback_manifest" \
+  --mode DISARMED_EVIDENCE --field remove_services) ||
+  fail "release transition topology is invalid"
+absent_services=$(python3 "$deploy_dir/release_components.py" topology \
+  --manifest "$manifest" --mode DISARMED_EVIDENCE \
+  --field intentional_absence) || fail "target topology is invalid"
 
 reload_environment() {
   unset PHOENIX_MODE LIVE_EXECUTION AUTONOMOUS_EXECUTION
@@ -282,6 +297,22 @@ wait_service_healthy_with_env() {
 
 wait_service_healthy() {
   wait_service_healthy_with_env "$release_env" "$1"
+}
+
+remove_source_only_services() {
+  for service in $remove_services; do
+    compose_with_release_env "$rollback_release_env" stop -t 30 "$service" \
+      >/dev/null 2>&1 || true
+    compose_with_release_env "$rollback_release_env" rm -f "$service" \
+      >/dev/null || return 1
+  done
+}
+
+assert_intentional_absence() {
+  for service in $absent_services; do
+    [ -z "$(compose ps -a -q "$service" | awk 'NF { print; exit }')" ] ||
+      return 1
+  done
 }
 
 release_env_value() {
@@ -684,7 +715,9 @@ compose run --rm --no-deps \
   -e PHOENIX_DISARMED_DEPLOY_ACK=INSTALL_DISARMED_EVIDENCE_RELEASE_42161 \
   autonomous-control disarmed-deploy
 mark_phase DISARMED_CONTROL_INSTALLED
-for service in $optional_services; do
+remove_source_only_services ||
+  fail "source-only services could not be removed before target activation"
+for service in $start_services; do
   case "$service" in
     rpc-gateway|phoenix-engine) continue ;;
     economic-monitor)
@@ -708,8 +741,8 @@ run_live_engine_burn_in ||
   fail "disarmed evidence Engine burn-in failed"
 mark_phase ENGINE_BURN_IN_PASSED
 mark_phase POST_DISARMED_VERIFYING
-[ -z "$(compose ps -q live-executor | awk 'NF { print; exit }')" ] ||
-  fail "live-executor started during disarmed deployment"
+assert_intentional_absence ||
+  fail "a service required to be absent is present after target activation"
 capture_protected_ids "$protected_after" || fail "protected services are not ready after deployment"
 capture_service_ids "$release_env" "$fixed_protected_services" "$fixed_after" ||
   fail "fixed protected services are not ready after deployment"

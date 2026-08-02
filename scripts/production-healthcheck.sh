@@ -33,6 +33,11 @@ set -a
 # shellcheck disable=SC1090
 . "$release_env"
 set +a
+[ -n "${PHOENIX_RELEASE_SHA:-}" ] ||
+  { echo "HEALTH_FAIL: release-sha"; exit 1; }
+release_manifest="$deploy_dir/manifests/$PHOENIX_RELEASE_SHA.json"
+[ -f "$release_manifest" ] ||
+  { echo "HEALTH_FAIL: release-manifest"; exit 1; }
 
 health_mode=${expected_mode:-${PHOENIX_MODE:-SHADOW}}
 compose_mode=SHADOW
@@ -77,16 +82,55 @@ check() {
   return 1
 }
 
-check postgres compose exec -T postgres /bin/sh -c 'pg_isready -U "$POSTGRES_USER" -d "$POSTGRES_DB"'
-check nats compose exec -T nats wget -q -O - http://127.0.0.1:8222/healthz
-check nitro-feed-relay compose exec -T nitro-feed-relay /bin/sh -c \
-  "grep -Eq ':25AA[[:space:]].*[[:space:]]0A[[:space:]]' /proc/net/tcp /proc/net/tcp6"
-check rpc-gateway compose exec -T rpc-gateway wget -q -O - http://127.0.0.1:9300/readyz
-check feed-ingestor compose exec -T feed-ingestor wget -q -O - http://127.0.0.1:9100/readyz
-check phoenix-engine compose exec -T phoenix-engine wget -q -O - http://127.0.0.1:9200/readyz
-check recorder compose exec -T recorder wget -q -O - http://127.0.0.1:9400/readyz
-check prometheus compose exec -T prometheus wget -q -O - http://127.0.0.1:9090/-/ready
-check dashboard compose exec -T dashboard python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8501/_stcore/health', timeout=2)"
+health_services=$(python3 "$deploy_dir/release_components.py" topology \
+  --manifest "$release_manifest" --mode "$health_mode" \
+  --field health_services) ||
+  { echo "HEALTH_FAIL: release-topology"; exit 1; }
+for service in $health_services; do
+  case "$service" in
+    postgres)
+      check postgres compose exec -T postgres /bin/sh -c \
+        'pg_isready -U "$POSTGRES_USER" -d "$POSTGRES_DB"'
+      ;;
+    nats)
+      check nats compose exec -T nats wget -q -O - http://127.0.0.1:8222/healthz
+      ;;
+    nitro-feed-relay)
+      check nitro-feed-relay compose exec -T nitro-feed-relay /bin/sh -c \
+        "grep -Eq ':25AA[[:space:]].*[[:space:]]0A[[:space:]]' /proc/net/tcp /proc/net/tcp6"
+      ;;
+    rpc-gateway)
+      check rpc-gateway compose exec -T rpc-gateway wget -q -O - http://127.0.0.1:9300/readyz
+      ;;
+    feed-ingestor)
+      check feed-ingestor compose exec -T feed-ingestor wget -q -O - http://127.0.0.1:9100/readyz
+      ;;
+    phoenix-engine)
+      check phoenix-engine compose exec -T phoenix-engine wget -q -O - http://127.0.0.1:9200/readyz
+      ;;
+    shadow-dispatcher)
+      check shadow-dispatcher compose exec -T shadow-dispatcher wget -q -O - http://127.0.0.1:9500/readyz
+      ;;
+    recorder)
+      check recorder compose exec -T recorder wget -q -O - http://127.0.0.1:9400/readyz
+      ;;
+    atlas-observer)
+      check atlas-observer compose exec -T atlas-observer /bin/sh -c \
+        '[ "$(readlink /proc/1/exe)" = /usr/local/bin/atlas-observer ] && wget -q -O - http://127.0.0.1:9700/readyz'
+      ;;
+    prometheus)
+      check prometheus compose exec -T prometheus wget -q -O - http://127.0.0.1:9090/-/ready
+      ;;
+    dashboard)
+      check dashboard compose exec -T dashboard python -c \
+        "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8501/_stcore/health', timeout=2)"
+      ;;
+    *)
+      echo "HEALTH_FAIL: unsupported-topology-service-$service"
+      exit 1
+      ;;
+  esac
+done
 if [ "$health_mode" = LIVE ]; then
   if [ -z "$expected_mode" ]; then
     [ "${PHOENIX_MODE:-}" = LIVE ] &&

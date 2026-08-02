@@ -1,0 +1,26 @@
+{
+  "schema": "phoenix.readiness-gates.v1",
+  "generated_at": "2026-08-02T07:41:24.293Z",
+  "repository_sha": "aa4ab66de054b4a1ab0966d78923b78ab789ded1",
+  "active_release_sha": "c40ad821d564b30bf43d31d608669999f5e03efc",
+  "source_identities": {
+    "release_run": "30707220498",
+    "transition_matrix": "RELEASE_TRANSITION_MATRIX.json"
+  },
+  "gates": {
+    "PLATFORM_READY": {
+      "value": false,
+      "reason": "Local contract is under review; CI and owner-authorized protected Stage-A/Stage-B release evidence do not yet exist."
+    },
+    "EVIDENCE_READY": {
+      "value": false,
+      "reason": "No refreshed set of 20 independently reconciled STATE_COMPLETE positive events."
+    },
+    "CAPITAL_READY": {
+      "value": false,
+      "reason": "PLATFORM_READY and EVIDENCE_READY are false; no canary authorization exists."
+    }
+  },
+  "completeness": "complete_for_current_gate_decision",
+  "unknowns": ["CI identity is pending draft PR creation.", "Release identity is intentionally absent."]
+}

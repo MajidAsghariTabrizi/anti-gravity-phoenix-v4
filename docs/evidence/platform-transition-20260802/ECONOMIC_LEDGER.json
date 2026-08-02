@@ -1,0 +1,16 @@
+{
+  "schema": "phoenix.economic-ledger.v1",
+  "generated_at": "2026-08-02T07:41:24.293Z",
+  "repository_sha": "aa4ab66de054b4a1ab0966d78923b78ab789ded1",
+  "active_release_sha": "c40ad821d564b30bf43d31d608669999f5e03efc",
+  "source_identities": {
+    "checkpoint_seed": "PHOENIX_SILVER_BULLET_PROMPT_2026-08-01"
+  },
+  "entries": [],
+  "realized_net_pnl": 0,
+  "completeness": "no_current_exact_state_entries",
+  "unknowns": [
+    "No candidate has complete independent transaction-boundary state in this loop.",
+    "No expected, conservative, or severe residual PnL was recomputed while the platform gate remained open."
+  ]
+}
