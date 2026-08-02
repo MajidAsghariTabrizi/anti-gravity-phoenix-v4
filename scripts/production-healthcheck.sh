@@ -19,6 +19,12 @@ if [ ! -f "$compose_runner" ] && [ -f "$script_dir/production_compose.py" ]; the
 fi
 [ -f "$compose_runner" ] ||
   { echo "HEALTH_FAIL: canonical-compose-runner"; exit 1; }
+release_components=${PHOENIX_RELEASE_COMPONENTS:-$script_dir/release_components.py}
+if [ ! -f "$release_components" ] && [ -f "$deploy_dir/release_components.py" ]; then
+  release_components=$deploy_dir/release_components.py
+fi
+[ -f "$release_components" ] ||
+  { echo "HEALTH_FAIL: release-components"; exit 1; }
 
 case "$expected_mode" in
   ""|LIVE|SHADOW|DISARMED_EVIDENCE) ;;
@@ -92,7 +98,7 @@ check() {
   return 1
 }
 
-health_services=$(python3 "$deploy_dir/release_components.py" topology \
+health_services=$(python3 "$release_components" topology \
   --manifest "$release_manifest" --mode "$health_mode" \
   --field health_services) ||
   { echo "HEALTH_FAIL: release-topology"; exit 1; }
