@@ -32,7 +32,7 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  PHOENIX_RELEASE_IMAGE_SET: current
+  PHOENIX_RELEASE_IMAGE_SET: legacy
 
 jobs:
   prepare:
