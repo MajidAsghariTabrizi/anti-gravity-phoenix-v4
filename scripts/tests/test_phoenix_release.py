@@ -1572,6 +1572,9 @@ class WorkflowAndDeploymentContractTests(unittest.TestCase):
         self.autonomous_schema = (
             ROOT / "live-executor/schema/003_autonomous_hunter_contracts.sql"
         ).read_text()
+        self.dashboard_sql = (
+            ROOT / "scripts/sql/economic-dashboard-snapshot.sql"
+        ).read_text()
 
     def test_controller_is_automatic_resumable_and_serialized(self) -> None:
         self.assertIn('workflows: ["Phoenix CI"]', self.workflow)
@@ -1681,7 +1684,10 @@ class WorkflowAndDeploymentContractTests(unittest.TestCase):
     ) -> None:
         self.assertIn("migrations/*.sql", self.rehearsal)
         self.assertIn("live-executor/schema/*.sql", self.rehearsal)
-        self.assertIn("BEGIN TRANSACTION READ ONLY", self.rehearsal)
+        self.assertIn(
+            "BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY",
+            self.dashboard_sql,
+        )
         self.assertIn(
             "$candidate_root/scripts/sql/economic-dashboard-snapshot.sql",
             self.rehearsal,
@@ -1718,6 +1724,12 @@ class WorkflowAndDeploymentContractTests(unittest.TestCase):
             self.rehearsal,
         )
         self.assertIn("statement_timeout=30000", self.rehearsal)
+        sql_probe = self.rehearsal.split(
+            "# Prove the candidate dashboard query", maxsplit=1
+        )[1].split("# Run the complete candidate monitor", maxsplit=1)[0]
+        self.assertIn('/usr/bin/docker exec -i \\', sql_probe)
+        self.assertIn('"$database_container"', sql_probe)
+        self.assertNotIn("compose exec", sql_probe)
         self.assertIn(
             'PHOENIX_RELEASE_MANIFEST="$release_manifest"', self.rehearsal
         )
