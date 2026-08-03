@@ -647,6 +647,10 @@ jobs:
           python-version: "3.12"
           cache: pip
           cache-dependency-path: dashboard/requirements.txt
+      - name: Ensure dashboard pip cache exists
+        if: ${{ needs.hygiene.outputs.job_python_dashboard == 'true' && github.event_name == 'pull_request' }}
+        shell: bash
+        run: mkdir -p "$HOME/.cache/pip"
       - name: Focused pull-request dashboard syntax
         if: ${{ needs.hygiene.outputs.job_python_dashboard == 'true' && github.event_name == 'pull_request' }}
         shell: bash
