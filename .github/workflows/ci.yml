@@ -147,6 +147,9 @@ jobs:
             scripts/release_components.py \
             scripts/release_platform.py \
             scripts/release_provenance.py \
+            scripts/export_aave_borrow_discovery.py \
+            scripts/probe_aave_archive_provider.py \
+            scripts/verify_aave_borrow_archive.py \
             scripts/phoenix_release/*.py
           python3 -m unittest \
             scripts.tests.test_change_impact \
@@ -154,7 +157,9 @@ jobs:
             scripts.tests.test_release_assets \
             scripts.tests.test_release_components \
             scripts.tests.test_release_provenance \
-            scripts.tests.test_phoenix_release
+            scripts.tests.test_phoenix_release \
+            scripts.tests.test_export_aave_borrow_discovery \
+            scripts.tests.test_verify_aave_borrow_archive
           sh ./scripts/production-compose-context-tests.sh
           sh ./scripts/phoenix-release-platform-tests.sh
 
@@ -211,6 +216,14 @@ jobs:
           sh ./scripts/production-bootstrap-safety-tests.sh
           sh ./scripts/autonomous-live-release-contract-tests.sh
           python3 -m unittest scripts.tests.test_live_executor_safety -v
+          python3 -m py_compile \
+            scripts/export_aave_borrow_discovery.py \
+            scripts/probe_aave_archive_provider.py \
+            scripts/verify_aave_borrow_archive.py
+          python3 -m unittest \
+            scripts.tests.test_export_aave_borrow_discovery \
+            scripts.tests.test_verify_aave_borrow_archive \
+            -v
 
       - name: Validate tracked hygiene
         if: ${{ steps.impact.outputs.job_hygiene == 'true' }}
@@ -634,6 +647,10 @@ jobs:
           python-version: "3.12"
           cache: pip
           cache-dependency-path: dashboard/requirements.txt
+      - name: Ensure dashboard pip cache exists
+        if: ${{ needs.hygiene.outputs.job_python_dashboard == 'true' && github.event_name == 'pull_request' }}
+        shell: bash
+        run: mkdir -p "$HOME/.cache/pip"
       - name: Focused pull-request dashboard syntax
         if: ${{ needs.hygiene.outputs.job_python_dashboard == 'true' && github.event_name == 'pull_request' }}
         shell: bash
