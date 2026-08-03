@@ -76,6 +76,7 @@ class Provider:
             "eth_chainId",
             "eth_blockNumber",
             "eth_getBlockByNumber",
+            "eth_getCode",
             "eth_call",
             "eth_getLogs",
         }:
