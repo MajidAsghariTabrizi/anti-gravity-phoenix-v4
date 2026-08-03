@@ -1,0 +1,152 @@
+{
+  "chain_id": 42161,
+  "content_sha256": "19ac2d2fac94147a232f2b53827642e01a76cdaae86a181b1065d1e647545d60",
+  "emode_categories": [],
+  "evidence_status": "incomplete",
+  "incomplete_reasons": [
+    "archive reserve-configuration and index transcript is not available in this PR",
+    "checkpoint block/hash has not been independently reconciled",
+    "deployed Pool implementation and code hash have not been source-version mapped"
+  ],
+  "liquidation_logic": {
+    "close_factor_hf_threshold_wad": null,
+    "default_close_factor_bps": null,
+    "minimum_leftover_base": null,
+    "minimum_reserve_value_base": null,
+    "pool_implementation": null,
+    "pool_implementation_code_hash": null,
+    "review_candidate_close_factor_hf_threshold_wad": 950000000000000000,
+    "review_candidate_default_close_factor_bps": 5000,
+    "review_candidate_minimum_leftover_base": 100000000000,
+    "review_candidate_minimum_reserve_value_base": 200000000000,
+    "source_commit": "fd1fbd9150426ca8ace9cee45b4acf912ae84f5b"
+  },
+  "protocol": {
+    "data_provider": "0x243aa95cac2a25651eda86e80bee66114413c43b",
+    "oracle": "0xb56c2f0b653b2e0b10c9b928c8580ac5df02c7c7",
+    "pool": "0x794a61358d6845594f94dc1db02a252b5b4814ad",
+    "pool_addresses_provider": "0xa97684ead0e402dc232d5a977953df7ecbab3cdb"
+  },
+  "reserves": [
+    {
+      "asset": "0x912ce59144191c1204e64559fe8253a0e49e6548",
+      "atoken": "0x6533afac2e7bccb20dca161449a13a32d391fb00",
+      "active": null,
+      "decimals": 18,
+      "liquidation_bonus_bps": null,
+      "liquidation_protocol_fee_bps": null,
+      "liquidation_threshold_bps": null,
+      "liquidity_index_ray": null,
+      "liquidation_grace_period_until": null,
+      "paused": null,
+      "price_feed": "0x339a66699167d8bc7105c4b9772492d2576e5183",
+      "reserve_id": null,
+      "stable_debt_token": null,
+      "symbol": "ARB",
+      "variable_borrow_index_ray": null,
+      "variable_debt_token": "0x44705f578135cc5d703b4c9c122528c73eb87145"
+    },
+    {
+      "asset": "0x82af49447d8a07e3bd95bd0d56f35241523fbab1",
+      "atoken": "0xe50fa9b3c56fbf159cb0fca61f5c9d750e8128c8",
+      "active": null,
+      "decimals": 18,
+      "liquidation_bonus_bps": null,
+      "liquidation_protocol_fee_bps": null,
+      "liquidation_threshold_bps": null,
+      "liquidity_index_ray": null,
+      "liquidation_grace_period_until": null,
+      "paused": null,
+      "price_feed": "0xbd41b1548a5a06544cbcf87c0c54864312842c00",
+      "reserve_id": null,
+      "stable_debt_token": null,
+      "symbol": "WETH",
+      "variable_borrow_index_ray": null,
+      "variable_debt_token": "0x0c84331e39d6658cd6e6b9ba04736cc4c4734351"
+    },
+    {
+      "asset": "0x2f2a2543b76a4166549f7aab2e75bef0aefc5b0f",
+      "atoken": "0x078f358208685046a11c85e8ad32895ded33a249",
+      "active": null,
+      "decimals": 8,
+      "liquidation_bonus_bps": null,
+      "liquidation_protocol_fee_bps": null,
+      "liquidation_threshold_bps": null,
+      "liquidity_index_ray": null,
+      "liquidation_grace_period_until": null,
+      "paused": null,
+      "price_feed": "0xde4af8b4747192ea29339d0feb36d9830d399134",
+      "reserve_id": null,
+      "stable_debt_token": null,
+      "symbol": "WBTC",
+      "variable_borrow_index_ray": null,
+      "variable_debt_token": "0x92b42c66840c7ad907b4bf74879ff3ef7c529473"
+    },
+    {
+      "asset": "0xba5ddd1f9d7f570dc94a51479a000e3bce967196",
+      "atoken": "0xf329e36c7bf6e5e86ce2150875a84ce77f477375",
+      "active": null,
+      "decimals": 18,
+      "liquidation_bonus_bps": null,
+      "liquidation_protocol_fee_bps": null,
+      "liquidation_threshold_bps": null,
+      "liquidity_index_ray": null,
+      "liquidation_grace_period_until": null,
+      "paused": null,
+      "price_feed": "0xf97eeaac36bdd096bb2445c7582f9095bfce04c7",
+      "reserve_id": null,
+      "stable_debt_token": null,
+      "symbol": "AAVE",
+      "variable_borrow_index_ray": null,
+      "variable_debt_token": "0xe80761ea617f66f96274ea5e8c37f03960ecc679"
+    },
+    {
+      "asset": "0xf97f4df75117a78c1a5a0dbb814af92458539fb4",
+      "atoken": "0x191c10aa4af7c30e871e70c95db0e4eb77237530",
+      "active": null,
+      "decimals": 18,
+      "liquidation_bonus_bps": null,
+      "liquidation_protocol_fee_bps": null,
+      "liquidation_threshold_bps": null,
+      "liquidity_index_ray": null,
+      "liquidation_grace_period_until": null,
+      "paused": null,
+      "price_feed": "0x2c1c5eab455a91cead280b12650faaa7bfdd59e6",
+      "reserve_id": null,
+      "stable_debt_token": null,
+      "symbol": "LINK",
+      "variable_borrow_index_ray": null,
+      "variable_debt_token": "0x953a573793604af8d41f306feb8274190db4ae0e"
+    },
+    {
+      "asset": "0xaf88d065e77c8cc2239327c5edb3a432268e5831",
+      "atoken": "0x724dc807b04555b71ed48a6896b6f41593b8c637",
+      "active": null,
+      "decimals": 6,
+      "liquidation_bonus_bps": null,
+      "liquidation_protocol_fee_bps": null,
+      "liquidation_threshold_bps": null,
+      "liquidity_index_ray": null,
+      "liquidation_grace_period_until": null,
+      "paused": null,
+      "price_feed": "0xb0c9a7122aab68f75cffd9851e867144dbff113b",
+      "reserve_id": null,
+      "stable_debt_token": null,
+      "symbol": "USDC",
+      "variable_borrow_index_ray": null,
+      "variable_debt_token": "0xf611aeb5013fd2c0511c9cd55c7dc5c1140741a6"
+    }
+  ],
+  "schema": "phoenix.atlas.aave-market.v1",
+  "sources": {
+    "aave_address_book": {
+      "commit": "a1770e87fd61db02a7725cd9eed3b1d07c3980af",
+      "path": "src/AaveV3Arbitrum.sol",
+      "repository": "https://github.com/bgd-labs/aave-address-book"
+    },
+    "aave_v3_origin": {
+      "commit": "fd1fbd9150426ca8ace9cee45b4acf912ae84f5b",
+      "repository": "https://github.com/aave-dao/aave-v3-origin"
+    }
+  }
+}

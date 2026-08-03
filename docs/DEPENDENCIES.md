@@ -113,6 +113,45 @@ Required next verification:
 
 Phoenix includes Aave V3 `flashLoanSimple` interfaces only. No Arbitrum provider address is hardcoded. The flash provider is a registry value validated through the cold RPC gateway before LIVE mode can be enabled.
 
+## Atlas/Aave Archive Authority
+
+The read-only borrower archive is bound to Arbitrum One chain ID 42161, the
+official Aave V3 Arbitrum Pool
+0x794a61358D6845594F94dc1DB02A252b5b4814aD, and the Pool Borrow topic
+0xb3d084820fb1a9decffb176436bd02558d15fac9b0ddfed8c465bc7359d7dce0.
+Address identities are pinned in
+fixtures/atlas-borrowers/arbitrum-market-20260801.json to
+aave-dao/aave-address-book commit
+a1770e87fd61db02a7725cd9eed3b1d07c3980af. Liquidation math source is
+aave-dao/aave-v3-origin commit
+fd1fbd9150426ca8ace9cee45b4acf912ae84f5b.
+
+scripts/export_aave_borrow_discovery.py builds hash-bound, resumable primary
+chunks. scripts/verify_aave_borrow_archive.py rejects gaps, duplicate
+canonical identities, range/header disagreement, and provider log
+disagreement.
+
+Credential-bearing endpoints are referenced only by environment-variable
+name. The canonical owner-supplied secondary authority reference is
+PHOENIX_ATLAS_ARCHIVE_SECONDARY_RPC_URL. The value must be a protected GitHub
+Environment/repository secret or an equivalently protected operator secret;
+it must never be committed, printed, included in a CLI argument, or written
+to an evidence artifact. The endpoint must independently provide archive
+eth_getLogs, finalized headers, exact-block eth_call, eth_getCode,
+eth_getStorageAt, and JSON-RPC batches for Arbitrum One.
+
+Capability preflight:
+
+    python scripts/probe_aave_archive_provider.py \
+      --provider-env PHOENIX_ATLAS_ARCHIVE_SECONDARY_RPC_URL \
+      --provider-id owner-independent-archive \
+      --from-block <verified-first-boundary> \
+      --to-block <bounded-test-end>
+
+The primary and secondary operators must be independently identified. A
+credentialless endpoint that merely agrees on returned inclusion but cannot
+prove the complete requested range does not satisfy archive authority.
+
 ## Arbitrum Transaction Cost Components
 
 LIVE submission quotes use the official Nitro `NodeInterface` virtual contract
