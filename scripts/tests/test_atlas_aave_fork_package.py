@@ -49,6 +49,7 @@ def exact_inputs():
                 "conservative": 82 * 10**18,
                 "severe": 79 * 10**18,
             },
+            "unwind_outputs_are_net_of_dex_fee_and_price_impact": True,
             "scenario_costs_base": scenario_costs(),
             "retained_profit_floor_base": 0,
         }
@@ -68,8 +69,13 @@ def exact_inputs():
             "debt_asset": ASSET_DEBT,
             "collateral_asset": ASSET_COLLATERAL,
             "repay": pair["repay"],
+            "max_repay": pair["repay"],
             "seized_collateral": pair["liquidator_collateral"],
-            "atlas_bid_base": pair["max_rational_atlas_bid_base"],
+            "atlas_bid_base": pair["atlas_bid_base"],
+            "max_atlas_bid_base": pair["max_rational_atlas_bid_base"],
+            "minimum_final_realized_profit": 1,
+            "minimum_final_realized_profit_base": 1,
+            "atomic_bounds_enforced": True,
             "calldata": calldata,
             "calldata_sha256": hashlib.sha256(calldata.encode()).hexdigest(),
             "flash_amount": pair["repay"],
@@ -131,6 +137,15 @@ class AtlasAaveForkPackageTests(unittest.TestCase):
             {key: value for key, value in plan.items() if key != "content_sha256"}
         )
         with self.assertRaisesRegex(EvidenceError, "must not grant"):
+            build_package(inventory, auction_value, result, agreement, plan)
+
+    def test_atomic_candidate_bounds_are_required(self):
+        inventory, auction_value, result, agreement, plan = exact_inputs()
+        plan["atomic_bounds_enforced"] = False
+        plan = bind_hash(
+            {key: value for key, value in plan.items() if key != "content_sha256"}
+        )
+        with self.assertRaisesRegex(EvidenceError, "atomic bounds"):
             build_package(inventory, auction_value, result, agreement, plan)
 
 

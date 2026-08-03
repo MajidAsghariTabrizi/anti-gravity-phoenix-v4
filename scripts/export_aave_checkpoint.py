@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """Export a sanitized, independently agreed Aave V3 checkpoint snapshot.
 
-The exporter consumes the hash-bound Borrow discovery artifact and reads only
-canonical view state at its checkpoint block. Provider URLs are obtained from
-the reviewed gateway container and are never written to stdout or stderr.
+The exporter treats Borrow history only as a discovery seed. Candidate state is
+authorized solely by exact finalized-block agreement between independently
+configured current-state providers. Provider URLs are obtained from protected
+references and are never written to stdout or stderr.
 """
 
 from __future__ import annotations
@@ -42,11 +43,18 @@ MAX_LOG_BLOCK_RANGE = 2_000
 BATCH_SIZE = 80
 MAX_RPC_ATTEMPTS = 6
 BATCH_PACING_SECONDS = 0.20
+MAX_SCREEN_BATCH_SIZE = 5_000
+DEFAULT_SCREEN_BATCH_SIZE = 1_000
+SCREEN_STATE_SCHEMA = "phoenix.atlas.aave-current-screen-state.v1"
 POOL_IMPLEMENTATION_SLOT = (
     "0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc"
 )
 ARCHIVE_MANIFEST_SCHEMA = "phoenix.atlas.aave-borrow-archive-manifest.v1"
 DEFAULT_SECONDARY_PROVIDER_ENV = "PHOENIX_ATLAS_ARCHIVE_SECONDARY_RPC_URL"
+AUTHORITY_HISTORICAL = "historical-authority"
+AUTHORITY_CURRENT_STATE = "discovery-only-current-state"
+CHECKPOINT_SCHEMA_V1 = "phoenix.atlas.aave-checkpoint.v1"
+CHECKPOINT_SCHEMA_V2 = "phoenix.atlas.aave-checkpoint.v2"
 
 SELECTORS = {
     "get_reserves_list": "d1946dbc",
@@ -58,6 +66,7 @@ SELECTORS = {
     "get_reserve_tokens": "d2493b6c",
     "get_reserve_configuration": "3e150141",
     "get_user_configuration": "4417a583",
+    "get_user_account_data": "bf92857c",
     "get_user_emode": "eddf1b79",
     "get_user_reserve_data": "28dd2d01",
     "scaled_balance_of": "1da24f3e",
@@ -68,6 +77,8 @@ SELECTORS = {
     "get_emode_borrowable_bitmap": "903a2c71",
     "get_emode_label": "2083e183",
     "symbol": "95d89b41",
+    "decimals": "313ce567",
+    "latest_round_data": "feaf968c",
 }
 
 
@@ -81,7 +92,144 @@ def canonical_hash(value: Any) -> str:
     ).hexdigest()
 
 
-def validate_discovery(value: Any) -> dict[str, Any]:
+def bind_hash(value: dict[str, Any]) -> dict[str, Any]:
+    body = {key: item for key, item in value.items() if key != "content_sha256"}
+    return {**body, "content_sha256": canonical_hash(body)}
+
+
+def write_private_json(path: Path, value: dict[str, Any]) -> None:
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    try:
+        path.parent.chmod(0o700)
+    except OSError:
+        pass
+    temporary = path.parent / f".{path.name}.{os.getpid()}.tmp"
+    temporary.write_text(
+        json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n",
+        encoding="utf-8",
+    )
+    try:
+        temporary.chmod(0o600)
+    except OSError:
+        pass
+    os.replace(temporary, path)
+
+
+def initial_screen_state(
+    discovery: dict[str, Any], archive_manifest: dict[str, Any]
+) -> dict[str, Any]:
+    return bind_hash(
+        {
+            "schema": SCREEN_STATE_SCHEMA,
+            "authority_mode": AUTHORITY_CURRENT_STATE,
+            "discovery_content_sha256": discovery["content_sha256"],
+            "archive_manifest_content_sha256": archive_manifest["content_sha256"],
+            "archive_checkpoint_block": int(discovery["checkpoint_block"]),
+            "discovery_start_block": int(discovery["start_block"]),
+            "discovery_log_count": int(discovery["log_count"]),
+            "archive_complete_claimed": bool(
+                discovery.get("archive_complete") is True
+            ),
+            "tail_cursor_block": int(discovery["checkpoint_block"]),
+            "tail_log_count": 0,
+            "addresses": list(discovery["borrowers"]),
+            "historical_seed_count": len(discovery["borrowers"]),
+            "next_address_index": 0,
+            "completed_batches": 0,
+            "batch_artifacts": [],
+        }
+    )
+
+
+def validate_screen_state(
+    value: Any, discovery: dict[str, Any], archive_manifest: dict[str, Any]
+) -> dict[str, Any]:
+    value = validate_screen_state_standalone(value)
+    if (
+        value.get("discovery_content_sha256") != discovery["content_sha256"]
+        or value.get("archive_manifest_content_sha256")
+        != archive_manifest["content_sha256"]
+        or value.get("archive_checkpoint_block") != discovery["checkpoint_block"]
+        or value.get("discovery_start_block") != discovery["start_block"]
+        or value.get("discovery_log_count") != discovery["log_count"]
+        or value.get("historical_seed_count") != len(discovery["borrowers"])
+        or value["addresses"][: value["historical_seed_count"]]
+        != discovery["borrowers"]
+    ):
+        raise ExportError("current screen state binding mismatch")
+    return value
+
+
+def validate_screen_state_standalone(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise ExportError("current screen state must be an object")
+    observed = value.get("content_sha256")
+    body = {key: item for key, item in value.items() if key != "content_sha256"}
+    if observed != canonical_hash(body):
+        raise ExportError("current screen state hash mismatch")
+    if (
+        value.get("schema") != SCREEN_STATE_SCHEMA
+        or value.get("authority_mode") != AUTHORITY_CURRENT_STATE
+    ):
+        raise ExportError("current screen state identity mismatch")
+    addresses = value.get("addresses")
+    if not isinstance(addresses, list) or not addresses or len(addresses) > MAX_BORROWERS:
+        raise ExportError("current screen state address cohort is invalid")
+    canonical = [_address(item, "screen state address") for item in addresses]
+    if canonical != addresses or len(set(canonical)) != len(canonical):
+        raise ExportError("current screen state address cohort is not unique")
+    for field in (
+        "archive_checkpoint_block",
+        "discovery_start_block",
+        "discovery_log_count",
+        "historical_seed_count",
+        "tail_log_count",
+    ):
+        item = value.get(field)
+        if not isinstance(item, int) or isinstance(item, bool) or item < 0:
+            raise ExportError("current screen state discovery metadata is invalid")
+    next_index = value.get("next_address_index")
+    tail_cursor = value.get("tail_cursor_block")
+    completed = value.get("completed_batches")
+    artifacts = value.get("batch_artifacts")
+    if (
+        not isinstance(next_index, int)
+        or isinstance(next_index, bool)
+        or not 0 <= next_index <= len(addresses)
+        or not isinstance(tail_cursor, int)
+        or isinstance(tail_cursor, bool)
+        or tail_cursor < value.get("archive_checkpoint_block", 0)
+        or not isinstance(completed, int)
+        or isinstance(completed, bool)
+        or completed < 0
+        or not isinstance(artifacts, list)
+        or len(artifacts) != completed
+    ):
+        raise ExportError("current screen state cursor is invalid")
+    if (
+        value["discovery_start_block"] < 1
+        or value["archive_checkpoint_block"] < value["discovery_start_block"]
+        or not 0 < value["historical_seed_count"] <= len(addresses)
+        or not isinstance(value.get("archive_complete_claimed"), bool)
+    ):
+        raise ExportError("current screen state discovery metadata is invalid")
+    for field in (
+        "discovery_content_sha256",
+        "archive_manifest_content_sha256",
+    ):
+        digest = value.get(field)
+        if (
+            not isinstance(digest, str)
+            or len(digest) != 64
+            or any(character not in "0123456789abcdef" for character in digest)
+        ):
+            raise ExportError("current screen state digest is invalid")
+    return value
+
+
+def validate_discovery(
+    value: Any, authority_mode: str = AUTHORITY_HISTORICAL
+) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise ExportError("discovery artifact must be an object")
     observed = value.get("content_sha256")
@@ -92,7 +240,7 @@ def validate_discovery(value: Any) -> dict[str, Any]:
         raise ExportError("unsupported discovery schema")
     if value.get("chain_id") != CHAIN_ID or str(value.get("pool", "")).lower() != POOL:
         raise ExportError("discovery identity mismatch")
-    if value.get("archive_complete") is not True:
+    if authority_mode == AUTHORITY_HISTORICAL and value.get("archive_complete") is not True:
         raise ExportError("discovery archive is incomplete")
     start_block = value.get("start_block")
     checkpoint_block = value.get("checkpoint_block")
@@ -108,6 +256,9 @@ def validate_discovery(value: Any) -> dict[str, Any]:
     borrowers = value.get("borrowers")
     if not isinstance(borrowers, list) or not (0 < len(borrowers) <= MAX_BORROWERS):
         raise ExportError("discovery borrower set is invalid")
+    log_count = value.get("log_count")
+    if not isinstance(log_count, int) or isinstance(log_count, bool) or log_count < 0:
+        raise ExportError("discovery log count is invalid")
     canonical = sorted({_address(item, "borrower") for item in borrowers})
     if canonical != borrowers or len(canonical) != value.get("borrower_count"):
         raise ExportError("discovery borrower set is not canonical")
@@ -115,7 +266,9 @@ def validate_discovery(value: Any) -> dict[str, Any]:
 
 
 def validate_archive_manifest(
-    value: Any, discovery: dict[str, Any]
+    value: Any,
+    discovery: dict[str, Any],
+    authority_mode: str = AUTHORITY_HISTORICAL,
 ) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise ExportError("archive manifest must be an object")
@@ -131,29 +284,32 @@ def validate_archive_manifest(
         or str(value.get("event_topic0", "")).lower() != BORROW_TOPIC
     ):
         raise ExportError("archive manifest identity mismatch")
-    if value.get("archive_complete") is not True:
-        raise ExportError("archive manifest is incomplete")
-    if value.get("independent_validation") is not True:
-        raise ExportError("archive manifest lacks independent validation")
-    if value.get("coverage_gaps") != []:
-        raise ExportError("archive manifest contains coverage gaps")
-    boundary = value.get("deployment_boundary")
-    deployment_header = (
-        boundary.get("deployment_block") if isinstance(boundary, dict) else None
-    )
-    prior_header = boundary.get("prior_block") if isinstance(boundary, dict) else None
-    if (
-        not isinstance(boundary, dict)
-        or boundary.get("status") != "verified_exact_creation"
-        or boundary.get("prior_code") != "0x"
-        or not isinstance(deployment_header, dict)
-        or deployment_header.get("number") != discovery["start_block"]
-        or not isinstance(prior_header, dict)
-        or prior_header.get("number") != discovery["start_block"] - 1
-    ):
-        raise ExportError("archive manifest lacks exact deployment boundary proof")
     if value.get("final_archive_sha256") != discovery["content_sha256"]:
         raise ExportError("archive manifest/discovery hash mismatch")
+    if authority_mode == AUTHORITY_HISTORICAL:
+        if value.get("archive_complete") is not True:
+            raise ExportError("archive manifest is incomplete")
+        if value.get("independent_validation") is not True:
+            raise ExportError("archive manifest lacks independent validation")
+        if value.get("coverage_gaps") != []:
+            raise ExportError("archive manifest contains coverage gaps")
+        boundary = value.get("deployment_boundary")
+        deployment_header = (
+            boundary.get("deployment_block") if isinstance(boundary, dict) else None
+        )
+        prior_header = boundary.get("prior_block") if isinstance(boundary, dict) else None
+        if (
+            not isinstance(boundary, dict)
+            or boundary.get("status") != "verified_exact_creation"
+            or boundary.get("prior_code") != "0x"
+            or not isinstance(deployment_header, dict)
+            or deployment_header.get("number") != discovery["start_block"]
+            or not isinstance(prior_header, dict)
+            or prior_header.get("number") != discovery["start_block"] - 1
+        ):
+            raise ExportError("archive manifest lacks exact deployment boundary proof")
+    elif authority_mode != AUTHORITY_CURRENT_STATE:
+        raise ExportError("unsupported candidate authority mode")
     return value
 
 
@@ -204,6 +360,7 @@ class Provider:
     def __init__(self, label: str, url: str) -> None:
         self.label = label
         self._url = url
+        self.provider_reference_sha256 = hashlib.sha256(url.encode()).hexdigest()
         self._request_id = 0
 
     def _request(self, payload: Any, attempts: int = MAX_RPC_ATTEMPTS) -> Any:
@@ -331,6 +488,11 @@ def word_uint(value: str) -> int:
     return int(value, 16)
 
 
+def word_int(value: str) -> int:
+    unsigned = word_uint(value)
+    return unsigned - 2**256 if unsigned >= 2**255 else unsigned
+
+
 def word_address(value: str) -> str:
     return _address("0x" + value[-40:], "ABI address")
 
@@ -373,7 +535,15 @@ def header(provider: Provider, block: int) -> dict[str, Any]:
     parent_hash = str(value.get("parentHash", "")).lower()
     if len(block_hash) != 66 or len(parent_hash) != 66:
         raise ExportError(f"{provider.label}:checkpoint_hash_invalid")
-    return {"number": block, "hash": block_hash, "parent_hash": parent_hash}
+    timestamp = int(str(value.get("timestamp")), 16)
+    if timestamp < 1:
+        raise ExportError(f"{provider.label}:checkpoint_timestamp_invalid")
+    return {
+        "number": block,
+        "hash": block_hash,
+        "parent_hash": parent_hash,
+        "timestamp": timestamp,
+    }
 
 
 def finalized_checkpoint(
@@ -389,11 +559,20 @@ def finalized_checkpoint(
         if number < 1 or len(block_hash) != 66:
             raise ExportError(f"{provider.label}:finalized_header_invalid")
         finalized_heads.append(
-            {"provider_id": provider.label, "number": number, "hash": block_hash}
+            {
+                "provider_id": provider.label,
+                "provider_reference_sha256": provider.provider_reference_sha256,
+                "number": number,
+                "hash": block_hash,
+            }
         )
     selected = min(int(item["number"]) for item in finalized_heads)
     selected_headers = [
-        {"provider_id": provider.label, "checkpoint": header(provider, selected)}
+        {
+            "provider_id": provider.label,
+            "provider_reference_sha256": provider.provider_reference_sha256,
+            "checkpoint": header(provider, selected),
+        }
         for provider in providers
     ]
     if len({item["checkpoint"]["hash"] for item in selected_headers}) != 1:
@@ -569,6 +748,14 @@ def reserve_state(providers: list[Provider], block: int) -> tuple[list[dict[str,
                 "active": bool(word_uint(config_words[8])),
                 "frozen": bool(word_uint(config_words[9])),
                 "paused": bool((configuration_bitmap >> 60) & 1),
+                "borrowable_in_isolation": bool(
+                    (configuration_bitmap >> 61) & 1
+                ),
+                "siloed_borrowing": bool((configuration_bitmap >> 62) & 1),
+                "isolation_mode_debt_ceiling": (
+                    configuration_bitmap >> 212
+                )
+                & ((1 << 40) - 1),
                 "liquidity_index_ray": liquidity_index,
                 "variable_borrow_index_ray": variable_borrow_index,
                 "liquidation_grace_period_until": liquidation_grace_period_until,
@@ -579,6 +766,53 @@ def reserve_state(providers: list[Provider], block: int) -> tuple[list[dict[str,
                 "price_base_units": word_uint(words(values[8])[0]),
                 "price_base_decimals": 8,
                 "symbol": decode_symbol(values[9]),
+            }
+        )
+    oracle_calls: list[tuple[str, str]] = []
+    for reserve in output:
+        oracle_calls.extend(
+            [
+                (reserve["price_feed"], call_data(SELECTORS["decimals"])),
+                (reserve["price_feed"], call_data(SELECTORS["latest_round_data"])),
+            ]
+        )
+    oracle_results, oracle_bindings = independently_agreed_calls(
+        providers, oracle_calls, block, "oracle_round_state"
+    )
+    bindings.extend(oracle_bindings)
+    cursor = 0
+    for reserve in output:
+        feed_decimals = word_uint(words(oracle_results[cursor])[0])
+        round_words = words(oracle_results[cursor + 1], 5)
+        cursor += 2
+        round_id = word_uint(round_words[0])
+        answer = word_int(round_words[1])
+        started_at = word_uint(round_words[2])
+        updated_at = word_uint(round_words[3])
+        answered_in_round = word_uint(round_words[4])
+        if (
+            feed_decimals > 36
+            or round_id == 0
+            or answer <= 0
+            or started_at == 0
+            or updated_at == 0
+            or answered_in_round < round_id
+        ):
+            raise ExportError("oracle round state is invalid")
+        if feed_decimals >= 8:
+            normalized_answer = answer // (10 ** (feed_decimals - 8))
+        else:
+            normalized_answer = answer * (10 ** (8 - feed_decimals))
+        if normalized_answer != reserve["price_base_units"]:
+            raise ExportError("Aave oracle price/feed round disagreement")
+        reserve.update(
+            {
+                "price_feed_decimals": feed_decimals,
+                "price_feed_round_id": round_id,
+                "price_feed_answer": answer,
+                "price_feed_started_at": started_at,
+                "price_feed_updated_at": updated_at,
+                "price_feed_answered_in_round": answered_in_round,
             }
         )
     return output, bindings
@@ -610,7 +844,15 @@ def emode_state(
             ]
         )
     if not calls:
-        return [], []
+        return [], [
+            {
+                "provider_id": provider.label,
+                "context": "emode_state",
+                "call_count": 0,
+                "result_sha256": canonical_hash([]),
+            }
+            for provider in providers
+        ]
     results, bindings = independently_agreed_calls(providers, calls, block, "emode_state")
     output = []
     cursor = 0
@@ -692,6 +934,9 @@ def borrower_state(
     for borrower in borrowers:
         borrower_word = encode_address(borrower)
         calls.append((POOL, call_data(SELECTORS["get_user_emode"], borrower_word)))
+        calls.append(
+            (POOL, call_data(SELECTORS["get_user_account_data"], borrower_word))
+        )
         configuration = configurations[borrower]
         flagged = []
         for reserve in reserves:
@@ -725,7 +970,8 @@ def borrower_state(
     for borrower in borrowers:
         configuration_bitmap = configurations[borrower]
         emode_category = word_uint(words(results[cursor])[0])
-        cursor += 1
+        account_words = words(results[cursor + 1], 6)
+        cursor += 2
         positions = []
         for reserve in query_plan[borrower]:
             values = words(results[cursor], 9)
@@ -755,6 +1001,16 @@ def borrower_state(
                 "address": borrower,
                 "account_configuration_bitmap": configuration_bitmap,
                 "emode_category": emode_category,
+                "protocol_account_data": {
+                    "total_collateral_base": word_uint(account_words[0]),
+                    "total_debt_base": word_uint(account_words[1]),
+                    "available_borrows_base": word_uint(account_words[2]),
+                    "current_liquidation_threshold_bps": word_uint(
+                        account_words[3]
+                    ),
+                    "ltv_bps": word_uint(account_words[4]),
+                    "health_factor_wad": word_uint(account_words[5]),
+                },
                 "positions": positions,
             }
         )
@@ -766,25 +1022,66 @@ def main() -> int:
     parser.add_argument("--container")
     parser.add_argument("--provider-env", action="append", default=[])
     parser.add_argument("--provider-id", action="append", default=[])
+    parser.add_argument(
+        "--authority-mode",
+        choices=(AUTHORITY_HISTORICAL, AUTHORITY_CURRENT_STATE),
+        default=AUTHORITY_HISTORICAL,
+    )
     parser.add_argument("--ssh-executable", default="ssh")
     parser.add_argument("--ssh-provider-host")
     parser.add_argument("--ssh-provider-port", type=int, default=22)
     parser.add_argument("--ssh-provider-identity", type=Path)
     parser.add_argument("--ssh-provider-known-hosts", type=Path)
     parser.add_argument("--ssh-provider-container")
-    parser.add_argument("--ssh-provider-index", type=int, default=0)
-    parser.add_argument("--ssh-provider-id", default="phoenix-reviewed-primary")
+    parser.add_argument("--ssh-provider-index", type=int, action="append", default=[])
+    parser.add_argument("--ssh-provider-id", action="append", default=[])
     parser.add_argument("--discovery", required=True)
     parser.add_argument("--archive-manifest", required=True)
+    parser.add_argument("--market", type=Path)
+    parser.add_argument("--resume-dir", type=Path)
+    parser.add_argument(
+        "--screen-batch-size", type=int, default=DEFAULT_SCREEN_BATCH_SIZE
+    )
     args = parser.parse_args()
     providers: list[object] = []
     try:
-        with Path(args.discovery).open(encoding="utf-8") as handle:
-            discovery = validate_discovery(json.load(handle))
+        if args.resume_dir is not None and args.authority_mode != AUTHORITY_CURRENT_STATE:
+            raise ExportError("resumable screening requires current-state authority mode")
+        if args.resume_dir is not None and args.market is None:
+            raise ExportError("resumable screening requires the reviewed market fixture")
+        if not 1 <= args.screen_batch_size <= MAX_SCREEN_BATCH_SIZE:
+            raise ExportError("screen batch size is outside the reviewed bound")
+        existing_state: dict[str, Any] | None = None
+        existing_state_path = (
+            args.resume_dir / "state.json" if args.resume_dir is not None else None
+        )
+        if existing_state_path is not None and existing_state_path.exists():
+            with existing_state_path.open(encoding="utf-8") as handle:
+                existing_state = validate_screen_state_standalone(json.load(handle))
+            historical_count = int(existing_state["historical_seed_count"])
+            discovery = {
+                "schema": "phoenix.atlas.aave-borrow-discovery.v1",
+                "chain_id": CHAIN_ID,
+                "pool": POOL,
+                "archive_complete": existing_state["archive_complete_claimed"],
+                "start_block": existing_state["discovery_start_block"],
+                "checkpoint_block": existing_state["archive_checkpoint_block"],
+                "borrower_count": historical_count,
+                "borrowers": existing_state["addresses"][:historical_count],
+                "log_count": existing_state["discovery_log_count"],
+                "content_sha256": existing_state["discovery_content_sha256"],
+            }
+        else:
+            with Path(args.discovery).open(encoding="utf-8") as handle:
+                discovery = validate_discovery(
+                    json.load(handle), args.authority_mode
+                )
         with Path(args.archive_manifest).open(encoding="utf-8") as handle:
             archive_manifest = validate_archive_manifest(
-                json.load(handle), discovery
+                json.load(handle), discovery, args.authority_mode
             )
+        if existing_state is not None:
+            validate_screen_state(existing_state, discovery, archive_manifest)
         discovery.pop("logs", None)
         archive_checkpoint = int(discovery["checkpoint_block"])
         ssh_selected = any(
@@ -811,18 +1108,28 @@ def main() -> int:
                     or not args.ssh_provider_container
                 ):
                     raise ExportError("SSH provider arguments are incomplete")
-                providers.append(
-                    SSHContainerProvider(
-                        args.ssh_provider_id,
-                        args.ssh_executable,
-                        args.ssh_provider_host,
-                        args.ssh_provider_port,
-                        args.ssh_provider_identity,
-                        args.ssh_provider_known_hosts,
-                        args.ssh_provider_container,
-                        args.ssh_provider_index,
+                ssh_indices = args.ssh_provider_index or [0]
+                if args.ssh_provider_id and len(args.ssh_provider_id) != len(
+                    ssh_indices
+                ):
+                    raise ExportError("SSH provider identity count mismatch")
+                ssh_ids = args.ssh_provider_id or [
+                    f"phoenix-reviewed-provider-{index + 1}"
+                    for index in range(len(ssh_indices))
+                ]
+                for provider_id, provider_index in zip(ssh_ids, ssh_indices):
+                    providers.append(
+                        SSHContainerProvider(
+                            provider_id,
+                            args.ssh_executable,
+                            args.ssh_provider_host,
+                            args.ssh_provider_port,
+                            args.ssh_provider_identity,
+                            args.ssh_provider_known_hosts,
+                            args.ssh_provider_container,
+                            provider_index,
+                        )
                     )
-                )
             urls = environment_provider_urls(args.provider_env) if args.provider_env else []
             if args.provider_id and len(args.provider_id) != len(urls):
                 raise ExportError("provider identity count mismatch")
@@ -837,6 +1144,15 @@ def main() -> int:
         labels = [provider.label for provider in providers]
         if len(set(labels)) != len(labels):
             raise ExportError("provider identities contain duplicates")
+        provider_references = [
+            getattr(provider, "provider_reference_sha256", None)
+            for provider in providers
+        ]
+        if (
+            any(reference is None for reference in provider_references)
+            or len(set(provider_references)) != len(provider_references)
+        ):
+            raise ExportError("independent provider references are unavailable or duplicated")
         for provider in providers:
             chain = provider.call("eth_chainId", [])
             if int(str(chain), 16) != CHAIN_ID:
@@ -844,8 +1160,24 @@ def main() -> int:
         block, finalized_heads, headers = finalized_checkpoint(providers)
         if block < archive_checkpoint:
             raise ExportError("finalized checkpoint regressed behind archive")
+        screen_state_before: dict[str, Any] | None = None
+        screen_state_path: Path | None = None
+        if args.resume_dir is not None:
+            screen_state_path = args.resume_dir / "state.json"
+            if screen_state_path.exists():
+                with screen_state_path.open(encoding="utf-8") as handle:
+                    screen_state_before = validate_screen_state(
+                        json.load(handle), discovery, archive_manifest
+                    )
+            else:
+                screen_state_before = initial_screen_state(
+                    discovery, archive_manifest
+                )
+            tail_start = int(screen_state_before["tail_cursor_block"]) + 1
+        else:
+            tail_start = archive_checkpoint + 1
         tail_logs, tail_bindings = independently_agreed_tail_logs(
-            providers, archive_checkpoint + 1, block
+            providers, tail_start, block
         )
         print(
             f"checkpoint_tail_collection_complete={providers[0].label} "
@@ -854,7 +1186,35 @@ def main() -> int:
         )
         historical_borrowers = list(discovery["borrowers"])
         tail_borrowers = sorted({_address(item["borrower"], "tail borrower") for item in tail_logs})
-        screened_borrowers = sorted(set(historical_borrowers).union(tail_borrowers))
+        screen_scope: dict[str, Any] | None = None
+        if screen_state_before is not None:
+            cohort = list(screen_state_before["addresses"])
+            cohort_set = set(cohort)
+            for borrower in tail_borrowers:
+                if borrower not in cohort_set:
+                    cohort.append(borrower)
+                    cohort_set.add(borrower)
+            offset = int(screen_state_before["next_address_index"])
+            end = min(offset + args.screen_batch_size, len(cohort))
+            screened_borrowers = cohort[offset:end]
+            if not screened_borrowers:
+                raise ExportError("current screen is complete at the selected finalized block")
+            screen_scope = {
+                "mode": "bounded_resumable_exact_batch",
+                "batch_index": int(screen_state_before["completed_batches"]),
+                "state_before_sha256": screen_state_before["content_sha256"],
+                "address_offset_start": offset,
+                "address_offset_end_exclusive": end,
+                "batch_address_count": len(screened_borrowers),
+                "queued_address_count": len(cohort),
+                "historical_seed_count": len(historical_borrowers),
+                "tail_cursor_before": int(screen_state_before["tail_cursor_block"]),
+                "tail_cursor_after": block,
+                "seed_scan_complete_after_batch": end == len(cohort),
+            }
+        else:
+            cohort = sorted(set(historical_borrowers).union(tail_borrowers))
+            screened_borrowers = cohort
         if len(screened_borrowers) > MAX_BORROWERS:
             raise ExportError("current borrower screen exceeds bound")
         code_bindings = []
@@ -893,6 +1253,17 @@ def main() -> int:
         if len({canonical_hash(item["code_sha256"]) for item in code_bindings}) != 1:
             raise ExportError("independent provider disagreement: protocol code")
         reserves, reserve_bindings = reserve_state(providers, block)
+        for provider, binding in zip(providers, code_bindings):
+            for reserve in reserves:
+                feed = reserve["price_feed"]
+                code = provider.call("eth_getCode", [feed, hex(block)])
+                if not isinstance(code, str) or code == "0x":
+                    raise ExportError(f"{provider.label}:oracle source code missing")
+                binding["code_sha256"][f"price_feed:{feed}"] = hashlib.sha256(
+                    bytes.fromhex(code[2:])
+                ).hexdigest()
+        if len({canonical_hash(item["code_sha256"]) for item in code_bindings}) != 1:
+            raise ExportError("independent provider disagreement: protocol/feed code")
         active_addresses, configurations, activity_bindings = active_borrower_state(
             providers, block, screened_borrowers, reserves
         )
@@ -915,10 +1286,15 @@ def main() -> int:
         if len(active_borrowers) != len(borrowers):
             raise ExportError("borrower debt flag/state disagreement")
         output = {
-            "schema": "phoenix.atlas.aave-checkpoint.v1",
+            "schema": (
+                CHECKPOINT_SCHEMA_V2
+                if args.authority_mode == AUTHORITY_CURRENT_STATE
+                else CHECKPOINT_SCHEMA_V1
+            ),
             "chain_id": CHAIN_ID,
             "checkpoint_block": block,
             "checkpoint_hash": headers[0]["checkpoint"]["hash"],
+            "checkpoint_timestamp": headers[0]["checkpoint"]["timestamp"],
             "discovery_content_sha256": discovery["content_sha256"],
             "archive_manifest_content_sha256": archive_manifest["content_sha256"],
             "archive_checkpoint_block": archive_checkpoint,
@@ -927,7 +1303,7 @@ def main() -> int:
                 "collection_provider_id": providers[0].label,
                 "independent_log_verification": True,
                 "provider_bindings": tail_bindings,
-                "start_block": archive_checkpoint + 1,
+                "start_block": tail_start,
                 "end_block": block,
                 "log_count": len(tail_logs),
                 "borrower_count": len(tail_borrowers),
@@ -972,22 +1348,32 @@ def main() -> int:
                 "eth_call",
                 "eth_getLogs",
             ],
-            "archive_complete": True,
             "independent_state_agreement": True,
             "independent_state_agreement_scope": [
                 "checkpoint_block_hash",
+                "protocol_implementation_and_code",
                 "reserve_state",
+                "oracle_round_state",
                 "retained_borrower_configuration",
                 "retained_borrower_state",
                 "emode_state",
             ],
             "reserves": reserves,
             "emode_categories": emode_categories,
-            "historical_discovered_borrower_count": len(historical_borrowers),
+            "historical_discovered_borrower_count": len(
+                set(screened_borrowers).intersection(historical_borrowers)
+            ),
+            "discovery_seed_borrower_count": len(historical_borrowers),
             "tail_discovered_borrower_count": len(tail_borrowers),
             "discovered_borrower_count": len(screened_borrowers),
             "screened_borrower_count": len(screened_borrowers),
-            "discovery_log_count": discovery["log_count"] + len(tail_logs),
+            "discovery_log_count": discovery["log_count"]
+            + (
+                int(screen_state_before["tail_log_count"])
+                if screen_state_before is not None
+                else 0
+            )
+            + len(tail_logs),
             "active_borrower_count": len(active_borrowers),
             "debt_bearing_borrower_count": len(active_borrowers),
             "borrowers": active_borrowers,
@@ -1000,9 +1386,178 @@ def main() -> int:
                 "production_write": False,
             },
         }
-        output["content_sha256"] = canonical_hash(output)
-        json.dump(output, sys.stdout, sort_keys=True, separators=(",", ":"))
-        sys.stdout.write("\n")
+        if args.authority_mode == AUTHORITY_HISTORICAL:
+            output["archive_complete"] = True
+        else:
+            output["seed_provenance"] = {
+                "role": "discovery_only",
+                "grants_candidate_authority": False,
+                "grants_execution_authority": False,
+                "archive_complete_claimed": bool(
+                    archive_manifest.get("archive_complete") is True
+                ),
+                "historical_independent_validation_claimed": False,
+            }
+            output["candidate_authority"] = {
+                "source": "exact_finalized_current_state",
+                "requires_two_independent_provider_agreement": True,
+                "historical_archive_required": False,
+                "execution_authority": False,
+            }
+            output["screen_scope"] = screen_scope or {
+                "mode": "exact_full_discovery_set",
+                "batch_address_count": len(screened_borrowers),
+                "seed_scan_complete_after_batch": True,
+            }
+        output = bind_hash(output)
+        if args.resume_dir is not None:
+            assert screen_state_before is not None
+            assert screen_state_path is not None
+            assert screen_scope is not None
+            artifact_name = (
+                f"batch-{screen_scope['batch_index']:06d}-"
+                f"checkpoint-{output['content_sha256']}.json"
+            )
+            artifact_path = args.resume_dir / "batches" / artifact_name
+            write_private_json(artifact_path, output)
+            try:
+                from scripts.atlas_borrower_index import (
+                    build_inventory_from_checkpoint,
+                    summarize_current_state,
+                )
+                from scripts.atlas_aave_provider_agreement import build_agreement
+            except ModuleNotFoundError:
+                from atlas_borrower_index import (  # type: ignore[no-redef]
+                    build_inventory_from_checkpoint,
+                    summarize_current_state,
+                )
+                from atlas_aave_provider_agreement import (  # type: ignore[no-redef]
+                    build_agreement,
+                )
+            assert args.market is not None
+            with args.market.open(encoding="utf-8") as handle:
+                market = json.load(handle)
+            inventory = build_inventory_from_checkpoint(market, output)
+            inventory_name = (
+                f"batch-{screen_scope['batch_index']:06d}-"
+                f"inventory-{inventory['snapshot_sha256']}.json"
+            )
+            write_private_json(
+                args.resume_dir / "batches" / inventory_name, inventory
+            )
+            agreement = build_agreement(inventory, output)
+            agreement_name = (
+                f"batch-{screen_scope['batch_index']:06d}-"
+                f"agreement-{agreement['content_sha256']}.json"
+            )
+            write_private_json(
+                args.resume_dir / "batches" / agreement_name, agreement
+            )
+            summary = summarize_current_state(inventory)
+            summary_name = (
+                f"batch-{screen_scope['batch_index']:06d}-"
+                f"summary-{summary['content_sha256']}.json"
+            )
+            write_private_json(
+                args.resume_dir / "batches" / summary_name, summary
+            )
+            next_state_body = {
+                key: item
+                for key, item in screen_state_before.items()
+                if key != "content_sha256"
+            }
+            next_state_body.update(
+                {
+                    "tail_cursor_block": block,
+                    "tail_log_count": int(screen_state_before["tail_log_count"])
+                    + len(tail_logs),
+                    "addresses": cohort,
+                    "next_address_index": screen_scope[
+                        "address_offset_end_exclusive"
+                    ],
+                    "completed_batches": int(
+                        screen_state_before["completed_batches"]
+                    )
+                    + 1,
+                    "batch_artifacts": list(
+                        screen_state_before["batch_artifacts"]
+                    )
+                    + [
+                        {
+                            "file": f"batches/{artifact_name}",
+                            "checkpoint_content_sha256": output[
+                                "content_sha256"
+                            ],
+                            "checkpoint_block": block,
+                            "inventory_file": f"batches/{inventory_name}",
+                            "inventory_snapshot_sha256": inventory[
+                                "snapshot_sha256"
+                            ],
+                            "provider_agreement_file": f"batches/{agreement_name}",
+                            "provider_agreement_content_sha256": agreement[
+                                "content_sha256"
+                            ],
+                            "summary_file": f"batches/{summary_name}",
+                            "summary_content_sha256": summary[
+                                "content_sha256"
+                            ],
+                            "screened_borrower_count": len(
+                                screened_borrowers
+                            ),
+                            "debt_bearing_borrower_count": len(
+                                active_borrowers
+                            ),
+                            "liquidatable_borrower_count": summary[
+                                "bucket_counts"
+                            ]["liquidatable"],
+                            "liquidatable_pair_count": summary[
+                                "liquidatable_pair_count"
+                            ],
+                        }
+                    ],
+                }
+            )
+            next_state = bind_hash(next_state_body)
+            write_private_json(screen_state_path, next_state)
+            print(
+                json.dumps(
+                    {
+                        "status": "batch_complete",
+                        "batch_index": screen_scope["batch_index"],
+                        "checkpoint_block": block,
+                        "checkpoint_content_sha256": output[
+                            "content_sha256"
+                        ],
+                        "screened_borrower_count": len(
+                            screened_borrowers
+                        ),
+                        "debt_bearing_borrower_count": len(
+                            active_borrowers
+                        ),
+                        "liquidatable_borrower_count": summary[
+                            "bucket_counts"
+                        ]["liquidatable"],
+                        "liquidatable_pair_count": summary[
+                            "liquidatable_pair_count"
+                        ],
+                        "next_address_index": next_state[
+                            "next_address_index"
+                        ],
+                        "queued_address_count": len(cohort),
+                        "seed_scan_complete": next_state[
+                            "next_address_index"
+                        ]
+                        == len(cohort),
+                        "state_content_sha256": next_state[
+                            "content_sha256"
+                        ],
+                    },
+                    sort_keys=True,
+                )
+            )
+        else:
+            json.dump(output, sys.stdout, sort_keys=True, separators=(",", ":"))
+            sys.stdout.write("\n")
         return 0
     except Exception as error:
         print(f"bounded Aave checkpoint export failed: {error}", file=sys.stderr)

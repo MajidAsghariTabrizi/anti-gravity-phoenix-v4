@@ -6,7 +6,11 @@ from scripts.atlas_borrower_index import (
     bind_hash,
     build_inventory_from_checkpoint,
 )
-from scripts.tests.test_atlas_borrower_index import checkpoint, market
+from scripts.tests.test_atlas_borrower_index import (
+    checkpoint,
+    current_state_checkpoint,
+    market,
+)
 
 
 def exact_checkpoint_inputs():
@@ -36,6 +40,34 @@ class AtlasAaveProviderAgreementTests(unittest.TestCase):
             }
         )
         with self.assertRaisesRegex(EvidenceError, "inventory checkpoint binding"):
+            build_agreement(inventory, changed)
+
+    def test_current_state_checkpoint_binds_distinct_provider_references(self):
+        market_value = market()
+        checkpoint_value = current_state_checkpoint(market_value)
+        inventory = build_inventory_from_checkpoint(market_value, checkpoint_value)
+        agreement = build_agreement(inventory, checkpoint_value)
+        self.assertIn("oracle_round_state", agreement["agreement_scope"])
+        self.assertEqual(len(set(agreement["state_hashes"])), 1)
+
+        changed = copy.deepcopy(checkpoint_value)
+        changed["provider_headers"][1]["provider_reference_sha256"] = changed[
+            "provider_headers"
+        ][0]["provider_reference_sha256"]
+        changed = bind_hash(
+            {key: value for key, value in changed.items() if key != "content_sha256"}
+        )
+        inventory = copy.deepcopy(inventory)
+        inventory["checkpoint_content_sha256"] = changed["content_sha256"]
+        inventory = bind_hash(
+            {
+                key: value
+                for key, value in inventory.items()
+                if key != "snapshot_sha256"
+            },
+            "snapshot_sha256",
+        )
+        with self.assertRaisesRegex(EvidenceError, "provider references are duplicated"):
             build_agreement(inventory, changed)
 
     def test_protocol_code_disagreement_fails_closed(self):

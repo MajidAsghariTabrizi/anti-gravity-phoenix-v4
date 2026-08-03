@@ -28,14 +28,18 @@ except ModuleNotFoundError:
 
 
 SCHEMA = "phoenix.atlas.aave-provider-agreement.v1"
-CHECKPOINT_SCHEMA = "phoenix.atlas.aave-checkpoint.v1"
-REQUIRED_CONTEXTS = (
+CHECKPOINT_SCHEMAS = {
+    "phoenix.atlas.aave-checkpoint.v1",
+    "phoenix.atlas.aave-checkpoint.v2",
+}
+LEGACY_REQUIRED_CONTEXTS = (
     "reserve_list",
     "reserve_state",
     "borrower_activity_retained",
     "borrower_state",
     "emode_state",
 )
+CURRENT_STATE_REQUIRED_CONTEXTS = (*LEGACY_REQUIRED_CONTEXTS, "oracle_round_state")
 
 
 def canonical_hash(value: Any) -> str:
@@ -49,19 +53,39 @@ def sha256(value: object, name: str) -> str:
 
 
 def verify_checkpoint(checkpoint: dict[str, Any]) -> None:
-    if checkpoint.get("schema") != CHECKPOINT_SCHEMA:
+    schema = checkpoint.get("schema")
+    if schema not in CHECKPOINT_SCHEMAS:
         raise EvidenceError("checkpoint schema mismatch")
     observed = checkpoint.get("content_sha256")
     body = {key: value for key, value in checkpoint.items() if key != "content_sha256"}
     if observed != canonical_hash(body):
         raise EvidenceError("checkpoint content hash mismatch")
+    current_state = schema == "phoenix.atlas.aave-checkpoint.v2"
+    if checkpoint.get("chain_id") != 42161:
+        raise EvidenceError("checkpoint independent agreement is incomplete")
+    if not current_state and checkpoint.get("archive_complete") is not True:
+        raise EvidenceError("checkpoint independent agreement is incomplete")
     if (
-        checkpoint.get("chain_id") != 42161
-        or checkpoint.get("archive_complete") is not True
-        or checkpoint.get("independent_state_agreement") is not True
+        checkpoint.get("independent_state_agreement") is not True
         or checkpoint.get("protocol_code_independent_agreement") is not True
     ):
         raise EvidenceError("checkpoint independent agreement is incomplete")
+    if current_state:
+        seed = checkpoint.get("seed_provenance")
+        candidate = checkpoint.get("candidate_authority")
+        if (
+            not isinstance(seed, dict)
+            or seed.get("role") != "discovery_only"
+            or seed.get("grants_candidate_authority") is not False
+            or seed.get("grants_execution_authority") is not False
+            or seed.get("historical_independent_validation_claimed") is not False
+            or not isinstance(candidate, dict)
+            or candidate.get("source") != "exact_finalized_current_state"
+            or candidate.get("requires_two_independent_provider_agreement") is not True
+            or candidate.get("historical_archive_required") is not False
+            or candidate.get("execution_authority") is not False
+        ):
+            raise EvidenceError("checkpoint current-state authority contract is invalid")
     authority = checkpoint.get("execution_authority")
     if not isinstance(authority, dict) or any(authority.values()):
         raise EvidenceError("checkpoint carries execution authority")
@@ -90,6 +114,19 @@ def build_agreement(
         or len(set(providers)) != len(providers)
     ):
         raise EvidenceError("provider header identities are invalid")
+    current_state = checkpoint.get("schema") == "phoenix.atlas.aave-checkpoint.v2"
+    if current_state:
+        provider_references = [
+            sha256(item.get("provider_reference_sha256"), "provider reference")
+            for item in headers
+        ]
+        if len(set(provider_references)) != len(headers):
+            raise EvidenceError("provider references are duplicated")
+        if inventory.get("checkpoint_timestamp") != checkpoint.get("checkpoint_timestamp"):
+            raise EvidenceError("inventory checkpoint timestamp mismatch")
+    required_contexts = (
+        CURRENT_STATE_REQUIRED_CONTEXTS if current_state else LEGACY_REQUIRED_CONTEXTS
+    )
 
     bindings = checkpoint.get("state_bindings")
     if not isinstance(bindings, list):
@@ -105,7 +142,7 @@ def build_agreement(
     provider_evidence = []
     for provider in providers:
         contexts: dict[str, dict[str, Any]] = {}
-        for context in REQUIRED_CONTEXTS:
+        for context in required_contexts:
             rows = [
                 row
                 for row in bindings
@@ -138,10 +175,27 @@ def build_agreement(
             raise EvidenceError("provider code hashes are missing")
         for name in ("pool", "data_provider", "oracle", "pool_implementation"):
             sha256(code_hashes.get(name), f"{name} code")
+        if current_state:
+            feed_hashes = {
+                name: digest
+                for name, digest in code_hashes.items()
+                if isinstance(name, str) and name.startswith("price_feed:")
+            }
+            expected_feeds = {
+                f"price_feed:{reserve['price_feed']}"
+                for reserve in checkpoint.get("reserves", [])
+                if isinstance(reserve, dict)
+                and isinstance(reserve.get("price_feed"), str)
+            }
+            if set(feed_hashes) != expected_feeds or not expected_feeds:
+                raise EvidenceError("provider price-feed code coverage is incomplete")
+            for name, digest in feed_hashes.items():
+                sha256(digest, f"{name} code")
         tail_hash = sha256(tails[0].get("logs_content_sha256"), "tail logs")
         evidence = {
             "block_number": checkpoint["checkpoint_block"],
             "block_hash": checkpoint["checkpoint_hash"],
+            "block_timestamp": checkpoint.get("checkpoint_timestamp"),
             "inventory_snapshot_sha256": inventory["snapshot_sha256"],
             "checkpoint_content_sha256": checkpoint["content_sha256"],
             "contexts": contexts,
@@ -171,7 +225,7 @@ def build_agreement(
             "checkpoint_header",
             "borrow_tail",
             "protocol_code",
-            *REQUIRED_CONTEXTS,
+            *required_contexts,
         ],
         "execution_authority": {
             "signer": False,

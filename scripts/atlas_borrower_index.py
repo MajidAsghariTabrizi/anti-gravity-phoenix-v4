@@ -126,6 +126,12 @@ def _require_hash(value: Any, name: str) -> str:
     return value.lower()
 
 
+def _require_sha256(value: Any, name: str) -> str:
+    if not isinstance(value, str) or not re.fullmatch(r"[0-9a-f]{64}", value):
+        raise EvidenceError(f"{name} must be a SHA-256 digest")
+    return value
+
+
 def percent_mul(value: int, percentage: int) -> int:
     return (value * percentage + HALF_PERCENTAGE_FACTOR) // PERCENTAGE_FACTOR
 
@@ -704,11 +710,38 @@ def build_inventory_from_checkpoint(
 
     market_reserves = validate_market(market)
     _checkpoint_hash(checkpoint)
-    if checkpoint.get("schema") != "phoenix.atlas.aave-checkpoint.v1":
+    checkpoint_schema = checkpoint.get("schema")
+    if checkpoint_schema not in {
+        "phoenix.atlas.aave-checkpoint.v1",
+        "phoenix.atlas.aave-checkpoint.v2",
+    }:
         raise EvidenceError("unsupported checkpoint schema")
     if checkpoint.get("chain_id") != 42161:
         raise EvidenceError("checkpoint must be Arbitrum One")
-    if checkpoint.get("archive_complete") is not True:
+    current_state_authority = checkpoint_schema == "phoenix.atlas.aave-checkpoint.v2"
+    if current_state_authority:
+        seed = checkpoint.get("seed_provenance")
+        candidate_authority = checkpoint.get("candidate_authority")
+        if (
+            not isinstance(seed, dict)
+            or seed.get("role") != "discovery_only"
+            or seed.get("grants_candidate_authority") is not False
+            or seed.get("grants_execution_authority") is not False
+            or seed.get("historical_independent_validation_claimed") is not False
+            or not isinstance(candidate_authority, dict)
+            or candidate_authority.get("source")
+            != "exact_finalized_current_state"
+            or candidate_authority.get(
+                "requires_two_independent_provider_agreement"
+            )
+            is not True
+            or candidate_authority.get("historical_archive_required") is not False
+            or candidate_authority.get("execution_authority") is not False
+        ):
+            raise EvidenceError("checkpoint current-state authority contract is invalid")
+        if not isinstance(checkpoint.get("screen_scope"), dict):
+            raise EvidenceError("checkpoint bounded screen scope is missing")
+    elif checkpoint.get("archive_complete") is not True:
         raise EvidenceError("checkpoint discovery archive is incomplete")
     if checkpoint.get("independent_state_agreement") is not True:
         raise EvidenceError("checkpoint state lacks independent agreement")
@@ -743,14 +776,28 @@ def build_inventory_from_checkpoint(
 
     checkpoint_block = _require_int(checkpoint.get("checkpoint_block"), "checkpoint_block", 1)
     checkpoint_hash = _require_hash(checkpoint.get("checkpoint_hash"), "checkpoint_hash")
+    checkpoint_timestamp = (
+        _require_int(
+            checkpoint.get("checkpoint_timestamp"), "checkpoint_timestamp", 1
+        )
+        if current_state_authority
+        else None
+    )
     headers = checkpoint.get("provider_headers")
     if not isinstance(headers, list) or len(headers) < 2:
         raise EvidenceError("checkpoint needs two independent provider headers")
     provider_ids = set()
+    provider_references = set()
     for item in headers:
         if not isinstance(item, dict) or not isinstance(item.get("provider_id"), str):
             raise EvidenceError("checkpoint provider header is malformed")
         provider_ids.add(item["provider_id"])
+        if current_state_authority:
+            provider_references.add(
+                _require_sha256(
+                    item.get("provider_reference_sha256"), "provider reference"
+                )
+            )
         header = item.get("checkpoint")
         if not isinstance(header, dict):
             raise EvidenceError("checkpoint provider block is missing")
@@ -758,8 +805,14 @@ def build_inventory_from_checkpoint(
             raise EvidenceError("provider checkpoint number disagreement")
         if _require_hash(header.get("hash"), "provider checkpoint hash") != checkpoint_hash:
             raise EvidenceError("provider checkpoint hash disagreement")
+        if current_state_authority and _require_int(
+            header.get("timestamp"), "provider checkpoint timestamp", 1
+        ) != checkpoint_timestamp:
+            raise EvidenceError("provider checkpoint timestamp disagreement")
     if len(provider_ids) != len(headers):
         raise EvidenceError("checkpoint provider identities are duplicated")
+    if current_state_authority and len(provider_references) != len(headers):
+        raise EvidenceError("checkpoint provider references are duplicated")
     finalized_heads = checkpoint.get("finalized_heads")
     if not isinstance(finalized_heads, list) or len(finalized_heads) != len(headers):
         raise EvidenceError("checkpoint finalized-head evidence is incomplete")
@@ -793,9 +846,17 @@ def build_inventory_from_checkpoint(
         "retained_borrower_state",
         "emode_state",
     }
+    if current_state_authority:
+        expected_agreement_scope.update(
+            {"protocol_implementation_and_code", "oracle_round_state"}
+        )
     if set(checkpoint.get("independent_state_agreement_scope", [])) != expected_agreement_scope:
         raise EvidenceError("checkpoint independent state agreement scope is incomplete")
-    if _require_int(tail.get("start_block"), "tail start block", 1) != archive_checkpoint + 1:
+    tail_start = _require_int(tail.get("start_block"), "tail start block", 1)
+    if (
+        (not current_state_authority and tail_start != archive_checkpoint + 1)
+        or (current_state_authority and tail_start < archive_checkpoint + 1)
+    ):
         raise EvidenceError("checkpoint Borrow continuity start is invalid")
     if _require_int(tail.get("end_block"), "tail end block", 1) != checkpoint_block:
         raise EvidenceError("checkpoint Borrow continuity end is invalid")
@@ -851,6 +912,7 @@ def build_inventory_from_checkpoint(
         raise EvidenceError("checkpoint protocol code agreement is absent")
     implementation_hashes = set()
     code_provider_ids = set()
+    bound_price_feeds: set[str] | None = None
     for item in code_bindings:
         if not isinstance(item, dict) or item.get("pool_implementation") != pool_implementation:
             raise EvidenceError("checkpoint implementation binding disagreement")
@@ -862,6 +924,25 @@ def build_inventory_from_checkpoint(
             digest = hashes.get(code_name)
             if not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest):
                 raise EvidenceError(f"checkpoint {code_name} code hash is invalid")
+        if current_state_authority:
+            feed_hashes = {
+                key: value
+                for key, value in hashes.items()
+                if isinstance(key, str) and key.startswith("price_feed:")
+            }
+            if not feed_hashes:
+                raise EvidenceError("checkpoint oracle source code hashes are missing")
+            for key, value in feed_hashes.items():
+                _require_address(key.removeprefix("price_feed:"), "checkpoint price feed code")
+                if not isinstance(value, str) or not re.fullmatch(r"[0-9a-f]{64}", value):
+                    raise EvidenceError("checkpoint price feed code hash is invalid")
+            current_bound_feeds = {
+                key.removeprefix("price_feed:") for key in feed_hashes
+            }
+            if bound_price_feeds is None:
+                bound_price_feeds = current_bound_feeds
+            elif bound_price_feeds != current_bound_feeds:
+                raise EvidenceError("checkpoint price feed code set disagrees")
         implementation_hashes.add(hashlib.sha256(canonical_json(hashes)).hexdigest())
     if (
         len(code_provider_ids) != len(code_bindings)
@@ -905,6 +986,15 @@ def build_inventory_from_checkpoint(
             raise EvidenceError(f"checkpoint {context} state disagreement")
         if len({row.get("call_count") for row in rows}) != 1:
             raise EvidenceError(f"checkpoint {context} call-count disagreement")
+    if current_state_authority:
+        rows = by_context.get("oracle_round_state", [])
+        if (
+            len(rows) != len(headers)
+            or {row.get("provider_id") for row in rows} != provider_ids
+            or len({row.get("result_sha256") for row in rows}) != 1
+            or len({row.get("call_count") for row in rows}) != 1
+        ):
+            raise EvidenceError("checkpoint oracle round state lacks independent agreement")
     broad_rows = by_context.get("borrower_activity_primary", [])
     if len(broad_rows) != 1 or broad_rows[0].get("provider_id") not in provider_ids:
         raise EvidenceError("checkpoint primary borrower screen binding is invalid")
@@ -948,15 +1038,41 @@ def build_inventory_from_checkpoint(
             "price_base_units",
         ):
             _require_int(reserve.get(field), f"checkpoint.reserve.{field}")
+        if current_state_authority:
+            _require_int(
+                reserve.get("isolation_mode_debt_ceiling"),
+                "checkpoint.reserve.isolation_mode_debt_ceiling",
+            )
+            for field in (
+                "price_feed_decimals",
+                "price_feed_round_id",
+                "price_feed_answer",
+                "price_feed_started_at",
+                "price_feed_updated_at",
+                "price_feed_answered_in_round",
+            ):
+                _require_int(reserve.get(field), f"checkpoint.reserve.{field}", 1)
+            if reserve["price_feed_answered_in_round"] < reserve["price_feed_round_id"]:
+                raise EvidenceError("checkpoint oracle answered round is stale")
+            if reserve["price_feed_updated_at"] > checkpoint_timestamp:
+                raise EvidenceError("checkpoint oracle timestamp is newer than its block")
         for field in ("active", "paused"):
             if not isinstance(reserve.get(field), bool):
                 raise EvidenceError(f"checkpoint.reserve.{field} must be boolean")
+        if current_state_authority:
+            for field in ("borrowable_in_isolation", "siloed_borrowing"):
+                if not isinstance(reserve.get(field), bool):
+                    raise EvidenceError(f"checkpoint.reserve.{field} must be boolean")
         if asset in market_reserves:
             expected = market_reserves[asset]
             for field in ("atoken", "variable_debt_token", "price_feed"):
                 if reserve[field] != str(expected[field]).lower():
                     raise EvidenceError(f"checkpoint reserve {asset} {field} disagrees with market")
         reserves[asset] = reserve
+    if current_state_authority and bound_price_feeds != {
+        reserve["price_feed"] for reserve in reserves.values()
+    }:
+        raise EvidenceError("checkpoint price feed code coverage is incomplete")
 
     logic = checkpoint.get("liquidation_logic")
     if not isinstance(logic, dict):
@@ -1028,6 +1144,25 @@ def build_inventory_from_checkpoint(
         raise EvidenceError("checkpoint primary borrower screen is incomplete")
     if discovered_borrower_count < len(raw_borrowers):
         raise EvidenceError("checkpoint discovered borrower count is below active count")
+    if current_state_authority:
+        screen_scope = checkpoint["screen_scope"]
+        if (
+            screen_scope.get("mode")
+            not in {"bounded_resumable_exact_batch", "exact_full_discovery_set"}
+            or _require_int(
+                screen_scope.get("batch_address_count"),
+                "checkpoint.screen_scope.batch_address_count",
+                1,
+            )
+            != screened_borrower_count
+            or not isinstance(
+                screen_scope.get("seed_scan_complete_after_batch"), bool
+            )
+        ):
+            raise EvidenceError("checkpoint bounded screen scope is invalid")
+    checkpoint_emodes = {
+        int(category["category_id"]): category for category in raw_emodes
+    }
     inventory_borrowers = []
     feed_index: dict[str, list[str]] = {}
     for raw in raw_borrowers:
@@ -1090,24 +1225,72 @@ def build_inventory_from_checkpoint(
             raise EvidenceError(f"checkpoint borrower configuration mismatch: {address}")
         if not any(position["variable_debt"] or position["stable_debt"] for position in positions):
             raise EvidenceError("checkpoint output contains a borrower without active debt")
-        inventory_borrowers.append(
-            {
-                "address": address,
-                "account_configuration_bitmap": configuration,
-                "derived_account_configuration_bitmap": derived_configuration,
-                "emode_category": emode,
-                "positions": positions,
-                "feed_dependencies": sorted({position["price_feed"] for position in positions}),
-                "last_block": checkpoint_block,
-                "last_block_hash": checkpoint_hash,
-                "evidence_sha256": sorted(
-                    {checkpoint["content_sha256"], checkpoint["discovery_content_sha256"]}
-                ),
-                "event_kinds": ["hash_bound_checkpoint"],
-                "completeness_status": "complete",
-                "incomplete_reasons": [],
+        normalized_protocol_account = None
+        if current_state_authority:
+            protocol_account = raw.get("protocol_account_data")
+            if not isinstance(protocol_account, dict):
+                raise EvidenceError("checkpoint protocol account data is missing")
+            normalized_protocol_account = {
+                field: _require_int(
+                    protocol_account.get(field),
+                    f"checkpoint.protocol_account.{field}",
+                )
+                for field in (
+                    "total_collateral_base",
+                    "total_debt_base",
+                    "available_borrows_base",
+                    "current_liquidation_threshold_bps",
+                    "ltv_bps",
+                    "health_factor_wad",
+                )
             }
-        )
+        borrower_record = {
+            "address": address,
+            "account_configuration_bitmap": configuration,
+            "derived_account_configuration_bitmap": derived_configuration,
+            "emode_category": emode,
+            "positions": positions,
+            "feed_dependencies": sorted({position["price_feed"] for position in positions}),
+            "last_block": checkpoint_block,
+            "last_block_hash": checkpoint_hash,
+            "evidence_sha256": sorted(
+                {checkpoint["content_sha256"], checkpoint["discovery_content_sha256"]}
+            ),
+            "event_kinds": [
+                "exact_current_state_checkpoint"
+                if current_state_authority
+                else "hash_bound_checkpoint"
+            ],
+            "completeness_status": "complete",
+            "incomplete_reasons": [],
+        }
+        if normalized_protocol_account is not None:
+            borrower_record["protocol_account_data"] = normalized_protocol_account
+            derived_account = calculate_account(
+                borrower_record,
+                reserves,
+                checkpoint_emodes,
+                {
+                    asset: _require_int(
+                        reserve.get("price_base_units"),
+                        f"checkpoint.price.{asset}",
+                        1,
+                    )
+                    for asset, reserve in reserves.items()
+                },
+            )
+            if (
+                derived_account["total_collateral_base"]
+                != normalized_protocol_account["total_collateral_base"]
+                or derived_account["total_debt_base"]
+                != normalized_protocol_account["total_debt_base"]
+                or derived_account["health_factor_wad"]
+                != normalized_protocol_account["health_factor_wad"]
+            ):
+                raise EvidenceError(
+                    f"checkpoint protocol/derived account disagreement: {address}"
+                )
+        inventory_borrowers.append(borrower_record)
 
     inventory = {
         "schema": "phoenix.atlas.borrower-inventory.v1",
@@ -1115,9 +1298,14 @@ def build_inventory_from_checkpoint(
         "market_content_sha256": market["content_sha256"],
         "checkpoint_content_sha256": checkpoint["content_sha256"],
         "discovery_content_sha256": checkpoint["discovery_content_sha256"],
-        "bootstrap_mode": "hash_bound_independently_agreed_checkpoint",
+        "bootstrap_mode": (
+            "discovery_seed_current_state_exact_batch"
+            if current_state_authority
+            else "hash_bound_independently_agreed_checkpoint"
+        ),
         "checkpoint_block": checkpoint_block,
         "checkpoint_hash": checkpoint_hash,
+        "checkpoint_timestamp": checkpoint_timestamp,
         "reserves": [reserves[key] for key in sorted(reserves)],
         "emode_categories": copy.deepcopy(raw_emodes),
         "liquidation_logic": liquidation_logic,
@@ -1141,6 +1329,12 @@ def build_inventory_from_checkpoint(
             "production_write": False,
         },
     }
+    if current_state_authority:
+        inventory["seed_provenance"] = copy.deepcopy(checkpoint["seed_provenance"])
+        inventory["candidate_authority"] = copy.deepcopy(
+            checkpoint["candidate_authority"]
+        )
+        inventory["screen_scope"] = copy.deepcopy(checkpoint["screen_scope"])
     return bind_hash(inventory, "snapshot_sha256")
 
 
@@ -1213,13 +1407,21 @@ def _scenario_costs(quote: dict[str, Any], scenario: str) -> int:
     values = quote.get("scenario_costs_base", {}).get(scenario)
     if not isinstance(values, dict):
         raise EvidenceError(f"quote.scenario_costs_base.{scenario} is missing")
+    if quote.get("unwind_outputs_are_net_of_dex_fee_and_price_impact") is not True:
+        raise EvidenceError(
+            "quote must bind unwind output as net of DEX fee and price impact"
+        )
+    for embedded in ("dex_fee_base", "price_impact_base"):
+        _require_int(values.get(embedded), f"quote.{scenario}.{embedded}")
     total = 0
-    for attribution in ("dex_fee_base", "price_impact_base"):
-        _require_int(values.get(attribution), f"quote.{scenario}.{attribution}")
     for field in (
-        "gas_and_l1_data_base",
+        "gas_base",
+        "arbitrum_l1_fee_base",
+        "atlas_bid_base",
         "ordering_cost_base",
         "failure_reserve_base",
+        "latency_reserve_base",
+        "state_drift_reserve_base",
     ):
         total += _require_int(values.get(field), f"quote.{scenario}.{field}")
     return total
@@ -1447,6 +1649,16 @@ def _pair_economics(
             - flash_premium_base
             - _scenario_costs(quote, scenario)
         )
+    atlas_bids = {
+        _require_int(
+            quote["scenario_costs_base"][scenario].get("atlas_bid_base"),
+            f"quote.{scenario}.atlas_bid_base",
+        )
+        for scenario in ("expected", "conservative", "severe")
+    }
+    if len(atlas_bids) != 1:
+        raise EvidenceError("Atlas bid must be invariant across scenarios")
+    atlas_bid_base = next(iter(atlas_bids))
     retained_floor = _require_int(
         quote.get("retained_profit_floor_base"),
         "quote.retained_profit_floor_base",
@@ -1469,11 +1681,17 @@ def _pair_economics(
             "unwind_output_base": output_base,
             "gross_unwind_margin_base": gross_unwind_margin_base,
             "cost_attribution_base": copy.deepcopy(quote["scenario_costs_base"]),
+            "unwind_outputs_are_net_of_dex_fee_and_price_impact": True,
             "pnl_base": pnl,
+            "atlas_bid_base": atlas_bid_base,
             "max_rational_atlas_bid_base": max(
-                0, pnl["conservative"] - retained_floor
+                0,
+                pnl["conservative"]
+                + atlas_bid_base
+                - retained_floor,
             ),
             "retained_profit_floor_base": retained_floor,
+            "margin_to_gate_base": pnl["conservative"] - retained_floor,
         }
     )
     return result
@@ -1613,6 +1831,91 @@ def evaluate_auction(
     )
 
 
+def summarize_current_state(inventory: dict[str, Any]) -> dict[str, Any]:
+    """Classify one exact current-state batch without granting authority.
+
+    The summary is a discovery accelerator. A liquidatable row must still be
+    reconstructed at a fresh exact finalized block, independently agreed, fully
+    costed, and Fork-passed before it can become a candidate.
+    """
+
+    verify_inventory(inventory)
+    reserves = _reserve_map(inventory)
+    emodes = _emode_map(inventory)
+    prices = {
+        asset: _require_int(reserve.get("price_base_units"), f"price.{asset}", 1)
+        for asset, reserve in reserves.items()
+    }
+    bucket_bounds = (
+        ("liquidatable", WAD),
+        ("hf_1_00_to_1_01", 1_010_000_000_000_000_000),
+        ("hf_1_01_to_1_05", 1_050_000_000_000_000_000),
+        ("hf_1_05_to_1_10", 1_100_000_000_000_000_000),
+    )
+    buckets: dict[str, list[dict[str, Any]]] = {
+        name: [] for name, _ in bucket_bounds
+    }
+    buckets["hf_at_or_above_1_10"] = []
+    liquidatable_pairs: list[dict[str, Any]] = []
+    for borrower in inventory.get("borrowers", []):
+        account = calculate_account(borrower, reserves, emodes, prices)
+        health_factor = _require_int(
+            account.get("health_factor_wad"), "current health factor"
+        )
+        record = {
+            "borrower": borrower["address"],
+            "health_factor_wad": health_factor,
+            "total_collateral_base": account["total_collateral_base"],
+            "total_debt_base": account["total_debt_base"],
+        }
+        bucket_name = "hf_at_or_above_1_10"
+        for name, upper_bound in bucket_bounds:
+            if health_factor < upper_bound:
+                bucket_name = name
+                break
+        buckets[bucket_name].append(record)
+        if health_factor >= WAD:
+            continue
+        debts = [
+            position
+            for position in borrower["positions"]
+            if position["variable_debt"] or position["stable_debt"]
+        ]
+        collaterals = [
+            position
+            for position in borrower["positions"]
+            if position["collateral_enabled"] and position["supplied"]
+        ]
+        for debt in debts:
+            for collateral in collaterals:
+                liquidatable_pairs.append(
+                    {
+                        "borrower": borrower["address"],
+                        "debt_asset": debt["asset"],
+                        "collateral_asset": collateral["asset"],
+                        "health_factor_wad": health_factor,
+                    }
+                )
+    output = {
+        "schema": "phoenix.atlas.aave-current-screen-summary.v1",
+        "inventory_snapshot_sha256": inventory["snapshot_sha256"],
+        "checkpoint_block": inventory["checkpoint_block"],
+        "checkpoint_hash": inventory["checkpoint_hash"],
+        "checkpoint_timestamp": inventory.get("checkpoint_timestamp"),
+        "screen_scope": copy.deepcopy(inventory.get("screen_scope")),
+        "debt_bearing_borrower_count": len(inventory.get("borrowers", [])),
+        "bucket_counts": {
+            name: len(records) for name, records in buckets.items()
+        },
+        "buckets": buckets,
+        "liquidatable_pair_count": len(liquidatable_pairs),
+        "liquidatable_pairs": liquidatable_pairs,
+        "candidate_authority": False,
+        "execution_authority": copy.deepcopy(inventory["execution_authority"]),
+    }
+    return bind_hash(output, "content_sha256")
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -1630,6 +1933,9 @@ def _parser() -> argparse.ArgumentParser:
     evaluate.add_argument("--inventory", required=True)
     evaluate.add_argument("--auction", required=True)
     evaluate.add_argument("--output", required=True)
+    summarize = subparsers.add_parser("summarize-current")
+    summarize.add_argument("--inventory", required=True)
+    summarize.add_argument("--output", required=True)
     return parser
 
 
@@ -1653,6 +1959,10 @@ def main(argv: Iterable[str] | None = None) -> int:
     if args.command == "evaluate":
         result = evaluate_auction(read_json(args.inventory), read_json(args.auction))
         write_json(args.output, result)
+        return 0
+    if args.command == "summarize-current":
+        summary = summarize_current_state(read_json(args.inventory))
+        write_json(args.output, summary)
         return 0
     raise AssertionError(args.command)
 
