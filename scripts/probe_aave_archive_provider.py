@@ -121,6 +121,15 @@ def canonical_log_hash(logs: list[dict[str, object]]) -> str:
     ).hexdigest()
 
 
+def bytecode_hash(value: object) -> str | None:
+    if not isinstance(value, str) or not value.startswith("0x") or value == "0x":
+        return None
+    try:
+        return hashlib.sha256(bytes.fromhex(value[2:])).hexdigest()
+    except ValueError:
+        return None
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--container")
@@ -165,6 +174,28 @@ def main() -> int:
                 if finalized_number is not None
                 else (False, "finalized_unavailable")
             )
+            ok_prior_header, prior_header = (
+                provider.call(
+                    "eth_getBlockByNumber", [hex(args.from_block - 1), False]
+                )
+                if args.from_block > 0
+                else (False, "prior_block_unavailable")
+            )
+            ok_start_header, start_header = provider.call(
+                "eth_getBlockByNumber", [hex(args.from_block), False]
+            )
+            ok_prior_code, prior_code = (
+                provider.call("eth_getCode", [POOL, hex(args.from_block - 1)])
+                if args.from_block > 0
+                else (False, "prior_block_unavailable")
+            )
+            ok_start_code, start_code = provider.call(
+                "eth_getCode", [POOL, hex(args.from_block)]
+            )
+            ok_boundary_state, boundary_state = provider.call(
+                "eth_call",
+                [{"to": POOL, "data": GET_RESERVES_LIST_CALL}, hex(args.from_block)],
+            )
             ok_logs, logs = provider.call(
                 "eth_getLogs",
                 [{"address": POOL, "fromBlock": hex(args.from_block), "toBlock": hex(args.to_block), "topics": [BORROW_TOPIC]}],
@@ -187,6 +218,33 @@ def main() -> int:
                 "exact_aave_call_sha256": (
                     hashlib.sha256(str(state).lower().encode()).hexdigest()
                     if ok_state and isinstance(state, str)
+                    else None
+                ),
+                "deployment_boundary_status": (
+                    "verified_exact_creation"
+                    if ok_prior_header
+                    and isinstance(prior_header, dict)
+                    and ok_start_header
+                    and isinstance(start_header, dict)
+                    and ok_prior_code
+                    and prior_code == "0x"
+                    and ok_start_code
+                    and isinstance(start_code, str)
+                    and start_code != "0x"
+                    and bytecode_hash(start_code) is not None
+                    and ok_boundary_state
+                    and isinstance(boundary_state, str)
+                    else "unavailable_or_disagreed"
+                ),
+                "deployment_block_hash": (
+                    str(start_header.get("hash", "")).lower()
+                    if isinstance(start_header, dict)
+                    else None
+                ),
+                "deployment_code_sha256": bytecode_hash(start_code),
+                "deployment_state_sha256": (
+                    hashlib.sha256(str(boundary_state).lower().encode()).hexdigest()
+                    if ok_boundary_state and isinstance(boundary_state, str)
                     else None
                 ),
             }

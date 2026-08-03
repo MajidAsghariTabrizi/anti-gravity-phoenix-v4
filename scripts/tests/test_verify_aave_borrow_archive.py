@@ -42,6 +42,30 @@ def log(block, tx_byte, log_index, borrower_byte):
 
 
 class ArchiveVerifierTests(unittest.TestCase):
+    def test_exact_deployment_boundary_requires_code_transition(self):
+        class BoundaryProvider:
+            label = "boundary"
+
+            def __init__(self, prior_code="0x"):
+                self.prior_code = prior_code
+
+            def call(self, method, params):
+                if method == "eth_getCode":
+                    block = int(params[-1], 16)
+                    return self.prior_code if block == 99 else "0x6000"
+                block = int(params[0], 16)
+                return {
+                    "number": hex(block),
+                    "hash": hash_value("a" if block == 99 else "b"),
+                    "parentHash": hash_value("c"),
+                }
+
+        proof = VERIFY.prove_deployment_boundary(BoundaryProvider(), 100)
+        self.assertEqual(proof["status"], "verified_exact_creation")
+        self.assertEqual(proof["prior_code"], "0x")
+        with self.assertRaisesRegex(VERIFY.VerificationError, "exists before"):
+            VERIFY.prove_deployment_boundary(BoundaryProvider("0x6000"), 100)
+
     def test_hash_bound_state_requires_exact_contiguous_ranges(self):
         chunks = [
             {

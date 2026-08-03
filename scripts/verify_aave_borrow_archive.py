@@ -177,6 +177,32 @@ def request_profile_hash(start: int, end: int) -> str:
     )
 
 
+def prove_deployment_boundary(provider: object, start: int) -> dict[str, object]:
+    if start < 1:
+        raise VerificationError("deployment boundary requires a prior block")
+    prior_code = provider.call("eth_getCode", [POOL, hex(start - 1)])
+    deployed_code = provider.call("eth_getCode", [POOL, hex(start)])
+    if prior_code != "0x":
+        raise VerificationError("Pool code exists before the claimed deployment boundary")
+    if (
+        not isinstance(deployed_code, str)
+        or not deployed_code.startswith("0x")
+        or deployed_code == "0x"
+    ):
+        raise VerificationError("Pool code is absent at the claimed deployment boundary")
+    try:
+        code_sha256 = hashlib.sha256(bytes.fromhex(deployed_code[2:])).hexdigest()
+    except ValueError as error:
+        raise VerificationError("Pool deployment code is not hexadecimal") from error
+    return {
+        "status": "verified_exact_creation",
+        "prior_block": header(provider, start - 1),
+        "deployment_block": header(provider, start),
+        "prior_code": "0x",
+        "deployment_code_sha256": code_sha256,
+    }
+
+
 def mtime_utc(path: Path) -> str:
     return datetime.fromtimestamp(path.stat().st_mtime, timezone.utc).isoformat()
 
@@ -247,6 +273,7 @@ def main() -> int:
     parser.add_argument("--require-complete", action="store_true")
     parser.add_argument("--revalidate-rpc", action="store_true")
     parser.add_argument("--require-boundary-headers", action="store_true")
+    parser.add_argument("--require-deployment-boundary", action="store_true")
     parser.add_argument("--provider-env")
     parser.add_argument("--provider-id", default="reviewed-authority")
     parser.add_argument("--ssh-executable", default="ssh")
@@ -267,12 +294,21 @@ def main() -> int:
         ranges = validate_state(state, args.require_complete)
         completed = int(state["completed_chunk_count"])
         provider = configured_provider(args)
-        if (args.revalidate_rpc or args.require_boundary_headers) and provider is None:
+        if (
+            args.revalidate_rpc
+            or args.require_boundary_headers
+            or args.require_deployment_boundary
+        ) and provider is None:
             raise VerificationError("reviewed provider is required")
+        deployment_boundary = None
         if provider is not None:
             chain = provider.call("eth_chainId", [])
             if int(str(chain), 16) != CHAIN_ID:
                 raise VerificationError("provider chain disagreement")
+            if args.require_deployment_boundary:
+                deployment_boundary = prove_deployment_boundary(
+                    provider, int(state["start_block"])
+                )
 
         seen: set[tuple[object, ...]] = set()
         borrowers: set[str] = set()
@@ -389,6 +425,7 @@ def main() -> int:
             "total_unique_borrowers": len(borrowers),
             "total_duplicates_rejected": total_duplicates,
             "coverage_gaps": coverage_gaps,
+            "deployment_boundary": deployment_boundary,
             "build_code_sha256": build_code_sha,
             "final_archive_sha256": final_archive_sha,
         }

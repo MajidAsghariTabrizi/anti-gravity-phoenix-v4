@@ -148,6 +148,11 @@ Capability preflight:
       --from-block <verified-first-boundary> \
       --to-block <bounded-test-end>
 
+Final manifest validation must also pass
+`scripts/verify_aave_borrow_archive.py --require-deployment-boundary`, which
+requires canonical headers and an exact Pool code transition from `0x` at the
+prior block to deployed bytecode at the archive start block.
+
 The primary and secondary operators must be independently identified. A
 credentialless endpoint that merely agrees on returned inclusion but cannot
 prove the complete requested range does not satisfy archive authority.
