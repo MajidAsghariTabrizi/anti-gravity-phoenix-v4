@@ -319,6 +319,23 @@ jobs:
         with:
           ref: ${{ inputs.release_sha }}
 
+      - name: Prefetch BuildKit image with bounded retry
+        if: ${{ matrix.build == true }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          buildkit_image='moby/buildkit:buildx-stable-1'
+          for attempt in 1 2 3; do
+            if timeout 120s docker pull "$buildkit_image"; then
+              exit 0
+            fi
+            if [ "$attempt" -eq 3 ]; then
+              echo "BuildKit image prefetch failed after ${attempt} attempts." >&2
+              exit 1
+            fi
+            sleep "$((attempt * 5))"
+          done
+
       - name: Setup Docker Buildx
         if: ${{ matrix.build == true }}
         uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f
