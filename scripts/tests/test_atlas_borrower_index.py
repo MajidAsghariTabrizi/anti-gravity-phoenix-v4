@@ -411,7 +411,7 @@ def current_state_checkpoint(market_value):
         binding.update(
             {
                 "verification_mode": (
-                    "primary_discovery_secondary_exact_receipts"
+                    "primary_discovery_secondary_exact_blocks"
                 ),
                 "range_completeness_claimed": False,
                 "grants_candidate_authority": False,

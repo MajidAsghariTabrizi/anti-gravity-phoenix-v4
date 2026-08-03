@@ -54,16 +54,16 @@ class HeaderProvider:
         }
 
 
-class ReceiptProvider:
-    label = "receipt"
+class ExactBlockProvider:
+    label = "exact-block"
 
-    def __init__(self, receipt):
-        self.receipt = receipt
+    def __init__(self, logs):
+        self.logs = logs
 
     def call(self, method, params):
-        assert method == "eth_getTransactionReceipt"
-        assert params == [self.receipt["transactionHash"]]
-        return self.receipt
+        assert method == "eth_getLogs"
+        assert params[0]["blockHash"] == self.logs[0]["blockHash"]
+        return self.logs
 
 
 class AaveCheckpointTests(unittest.TestCase):
@@ -286,7 +286,7 @@ class AaveCheckpointTests(unittest.TestCase):
             with self.assertRaisesRegex(MODULE.ExportError, "Borrow tail"):
                 MODULE.independently_agreed_tail_logs(providers, 100, 101)
 
-    def test_discovery_only_tail_is_reproduced_from_exact_receipt(self):
+    def test_discovery_only_tail_is_reproduced_from_exact_block(self):
         transaction_hash = "0x" + "c" * 64
         log = {
             "address": MODULE.POOL,
@@ -316,16 +316,18 @@ class AaveCheckpointTests(unittest.TestCase):
                 "data_sha256": MODULE.hashlib.sha256(b"0x1234").hexdigest(),
             }
         ]
-        provider = ReceiptProvider(
-            {"transactionHash": transaction_hash, "logs": [log]}
-        )
+        provider = ExactBlockProvider([log])
         self.assertEqual(
-            MODULE.receipt_verified_tail_borrow_logs(provider, expected, 100, 100),
+            MODULE.exact_block_verified_tail_borrow_logs(
+                provider, expected, 100, 100
+            ),
             expected,
         )
-        provider.receipt["logs"][0]["data"] = "0xabcd"
-        with self.assertRaisesRegex(MODULE.ExportError, "Borrow receipts"):
-            MODULE.receipt_verified_tail_borrow_logs(provider, expected, 100, 100)
+        provider.logs[0]["data"] = "0xabcd"
+        with self.assertRaisesRegex(MODULE.ExportError, "exact-block Borrow logs"):
+            MODULE.exact_block_verified_tail_borrow_logs(
+                provider, expected, 100, 100
+            )
 
 
 if __name__ == "__main__":
