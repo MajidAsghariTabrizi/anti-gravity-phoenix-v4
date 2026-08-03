@@ -1,8 +1,10 @@
 import importlib.util
+import io
 import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -21,6 +23,14 @@ VERIFY_SPEC = importlib.util.spec_from_file_location(
 VERIFY = importlib.util.module_from_spec(VERIFY_SPEC)
 assert VERIFY_SPEC.loader is not None
 VERIFY_SPEC.loader.exec_module(VERIFY)
+
+PROBE_PATH = ROOT / "scripts" / "probe_aave_archive_provider.py"
+PROBE_SPEC = importlib.util.spec_from_file_location(
+    "probe_aave_archive_provider", PROBE_PATH
+)
+PROBE = importlib.util.module_from_spec(PROBE_SPEC)
+assert PROBE_SPEC.loader is not None
+PROBE_SPEC.loader.exec_module(PROBE)
 
 
 def hash_value(byte):
@@ -42,6 +52,21 @@ def log(block, tx_byte, log_index, borrower_byte):
 
 
 class ArchiveVerifierTests(unittest.TestCase):
+    def test_capability_probe_allows_exact_boundary_code_reads(self):
+        response = io.StringIO('{"jsonrpc":"2.0","id":1,"result":"0x6000"}')
+        provider = PROBE.Provider("secondary", "https://archive.invalid")
+
+        with patch.object(PROBE.urllib.request, "urlopen", return_value=response) as request:
+            ok, value = provider.call("eth_getCode", [PROBE.POOL, hex(7_736_400)])
+
+        self.assertTrue(ok)
+        self.assertEqual(value, "0x6000")
+        payload = json.loads(request.call_args.args[0].data)
+        self.assertEqual(payload["method"], "eth_getCode")
+        self.assertEqual(payload["params"], [PROBE.POOL, hex(7_736_400)])
+        with self.assertRaisesRegex(ValueError, "outside read-only allowlist"):
+            provider.call("eth_sendRawTransaction", ["0x"])
+
     def test_exact_deployment_boundary_requires_code_transition(self):
         class BoundaryProvider:
             label = "boundary"
