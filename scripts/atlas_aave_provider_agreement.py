@@ -146,7 +146,7 @@ def build_agreement(
     if current_state and any(
         not isinstance(item, dict)
         or item.get("verification_mode")
-        != "primary_discovery_secondary_exact_receipts"
+        != "primary_discovery_secondary_exact_blocks"
         or item.get("range_completeness_claimed") is not False
         or item.get("grants_candidate_authority") is not False
         for item in tail_bindings

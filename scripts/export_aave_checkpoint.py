@@ -392,7 +392,6 @@ class Provider:
             "eth_getBlockByNumber",
             "eth_getCode",
             "eth_getStorageAt",
-            "eth_getTransactionReceipt",
             "eth_call",
             "eth_getLogs",
         }:
@@ -650,10 +649,10 @@ def sanitized_tail_borrow_logs(
     return output
 
 
-def receipt_verified_tail_borrow_logs(
+def exact_block_verified_tail_borrow_logs(
     provider: Provider, expected_logs: list[dict[str, Any]], start: int, end: int
 ) -> list[dict[str, Any]]:
-    """Reproduce discovered Borrow logs from exact transaction receipts.
+    """Reproduce discovered Borrow logs from exact canonical blocks.
 
     This proves each discovered identity through an independent provider while
     deliberately making no completeness claim for that provider's broad log
@@ -662,21 +661,24 @@ def receipt_verified_tail_borrow_logs(
 
     if not expected_logs:
         return []
-    expected_transactions = sorted(
-        {str(item["transaction_hash"]) for item in expected_logs}
-    )
+    expected_blocks = sorted({str(item["block_hash"]) for item in expected_logs})
     observed: list[dict[str, Any]] = []
-    for transaction_hash in expected_transactions:
-        receipt = provider.call("eth_getTransactionReceipt", [transaction_hash])
-        if (
-            not isinstance(receipt, dict)
-            or str(receipt.get("transactionHash", "")).lower() != transaction_hash
-            or not isinstance(receipt.get("logs"), list)
-        ):
-            raise ExportError("checkpoint Borrow receipt is invalid")
-        for log in receipt["logs"]:
+    for block_hash in expected_blocks:
+        logs = provider.call(
+            "eth_getLogs",
+            [
+                {
+                    "address": POOL,
+                    "blockHash": block_hash,
+                    "topics": [BORROW_TOPIC],
+                }
+            ],
+        )
+        if not isinstance(logs, list):
+            raise ExportError("checkpoint exact-block Borrow logs are invalid")
+        for log in logs:
             if not isinstance(log, dict):
-                raise ExportError("checkpoint Borrow receipt log is invalid")
+                raise ExportError("checkpoint exact-block Borrow log is invalid")
             topics = log.get("topics")
             if (
                 str(log.get("address", "")).lower() != POOL
@@ -686,7 +688,7 @@ def receipt_verified_tail_borrow_logs(
             ):
                 continue
             if len(topics) != 4 or log.get("removed") is True:
-                raise ExportError("checkpoint Borrow receipt topic shape is invalid")
+                raise ExportError("checkpoint exact-block Borrow topic shape is invalid")
             observed.append(
                 {
                     "block_number": int(str(log.get("blockNumber")), 16),
@@ -714,9 +716,9 @@ def receipt_verified_tail_borrow_logs(
         )
     )
     if any(not start <= item["block_number"] <= end for item in observed):
-        raise ExportError("checkpoint Borrow receipt log is out of range")
+        raise ExportError("checkpoint exact-block Borrow log is out of range")
     if observed != expected_logs:
-        raise ExportError("independent provider disagreement: Borrow receipts")
+        raise ExportError("independent provider disagreement: exact-block Borrow logs")
     return observed
 
 
@@ -726,7 +728,7 @@ def independently_agreed_tail_logs(
     if discovery_only:
         primary_logs = sanitized_tail_borrow_logs(providers[0], start, end)
         provider_logs = [primary_logs] + [
-            receipt_verified_tail_borrow_logs(
+            exact_block_verified_tail_borrow_logs(
                 provider, primary_logs, start, end
             )
             for provider in providers[1:]
@@ -745,7 +747,7 @@ def independently_agreed_tail_logs(
             "log_count": len(logs),
             "logs_content_sha256": content_hash,
             "verification_mode": (
-                "primary_discovery_secondary_exact_receipts"
+                "primary_discovery_secondary_exact_blocks"
                 if discovery_only
                 else "complete_range_eth_getLogs"
             ),
@@ -1443,7 +1445,6 @@ def main() -> int:
                 "eth_getBlockByNumber",
                 "eth_getCode",
                 "eth_getStorageAt",
-                "eth_getTransactionReceipt",
                 "eth_call",
                 "eth_getLogs",
             ],
