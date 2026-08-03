@@ -45,6 +45,7 @@ class AaveCheckpointTests(unittest.TestCase):
             "chain_id": MODULE.CHAIN_ID,
             "pool": MODULE.POOL,
             "archive_complete": True,
+            "start_block": 1,
             "checkpoint_block": 100,
             "borrower_count": 1,
             "borrowers": ["0x" + "1" * 40],
@@ -58,6 +59,13 @@ class AaveCheckpointTests(unittest.TestCase):
             "archive_complete": True,
             "independent_validation": True,
             "coverage_gaps": [],
+            "deployment_boundary": {
+                "status": "verified_exact_creation",
+                "prior_block": {"number": 0, "hash": "0x" + "a" * 64},
+                "deployment_block": {"number": 1, "hash": "0x" + "b" * 64},
+                "prior_code": "0x",
+                "deployment_code_sha256": "c" * 64,
+            },
             "final_archive_sha256": discovery["content_sha256"],
         }
         manifest["content_sha256"] = MODULE.canonical_hash(manifest)
@@ -67,6 +75,14 @@ class AaveCheckpointTests(unittest.TestCase):
             ],
             discovery["content_sha256"],
         )
+        without_boundary = {
+            key: value
+            for key, value in manifest.items()
+            if key not in {"content_sha256", "deployment_boundary"}
+        }
+        without_boundary["content_sha256"] = MODULE.canonical_hash(without_boundary)
+        with self.assertRaisesRegex(MODULE.ExportError, "deployment boundary"):
+            MODULE.validate_archive_manifest(without_boundary, discovery)
         manifest["independent_validation"] = False
         manifest["content_sha256"] = MODULE.canonical_hash(
             {
@@ -84,6 +100,7 @@ class AaveCheckpointTests(unittest.TestCase):
             "chain_id": MODULE.CHAIN_ID,
             "pool": MODULE.POOL,
             "archive_complete": True,
+            "start_block": 1,
             "checkpoint_block": 100,
             "borrower_count": 1,
             "borrowers": ["0x" + "1" * 40],

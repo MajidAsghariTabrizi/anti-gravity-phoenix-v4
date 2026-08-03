@@ -94,6 +94,17 @@ def validate_discovery(value: Any) -> dict[str, Any]:
         raise ExportError("discovery identity mismatch")
     if value.get("archive_complete") is not True:
         raise ExportError("discovery archive is incomplete")
+    start_block = value.get("start_block")
+    checkpoint_block = value.get("checkpoint_block")
+    if (
+        not isinstance(start_block, int)
+        or isinstance(start_block, bool)
+        or start_block < 1
+        or not isinstance(checkpoint_block, int)
+        or isinstance(checkpoint_block, bool)
+        or checkpoint_block < start_block
+    ):
+        raise ExportError("discovery block interval is invalid")
     borrowers = value.get("borrowers")
     if not isinstance(borrowers, list) or not (0 < len(borrowers) <= MAX_BORROWERS):
         raise ExportError("discovery borrower set is invalid")
@@ -126,6 +137,21 @@ def validate_archive_manifest(
         raise ExportError("archive manifest lacks independent validation")
     if value.get("coverage_gaps") != []:
         raise ExportError("archive manifest contains coverage gaps")
+    boundary = value.get("deployment_boundary")
+    deployment_header = (
+        boundary.get("deployment_block") if isinstance(boundary, dict) else None
+    )
+    prior_header = boundary.get("prior_block") if isinstance(boundary, dict) else None
+    if (
+        not isinstance(boundary, dict)
+        or boundary.get("status") != "verified_exact_creation"
+        or boundary.get("prior_code") != "0x"
+        or not isinstance(deployment_header, dict)
+        or deployment_header.get("number") != discovery["start_block"]
+        or not isinstance(prior_header, dict)
+        or prior_header.get("number") != discovery["start_block"] - 1
+    ):
+        raise ExportError("archive manifest lacks exact deployment boundary proof")
     if value.get("final_archive_sha256") != discovery["content_sha256"]:
         raise ExportError("archive manifest/discovery hash mismatch")
     return value
