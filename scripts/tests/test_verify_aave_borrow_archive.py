@@ -65,7 +65,7 @@ class ArchiveVerifierTests(unittest.TestCase):
         self.assertEqual(payload["method"], "eth_getCode")
         self.assertEqual(payload["params"], [PROBE.POOL, hex(7_736_400)])
         with self.assertRaisesRegex(ValueError, "outside read-only allowlist"):
-            provider.call("eth_sendRawTransaction", ["0x"])
+            provider.call("eth_getBalance", [PROBE.POOL, "latest"])
 
     def test_exact_deployment_boundary_requires_code_transition(self):
         class BoundaryProvider:
