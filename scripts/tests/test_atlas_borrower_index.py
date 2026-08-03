@@ -399,6 +399,24 @@ def current_state_checkpoint(market_value):
         "historical_archive_required": False,
         "execution_authority": False,
     }
+    value["tail_discovery"].update(
+        {
+            "independent_log_verification": False,
+            "exact_discovered_log_verification": True,
+            "range_completeness_claimed": False,
+            "grants_candidate_authority": False,
+        }
+    )
+    for binding in value["tail_discovery"]["provider_bindings"]:
+        binding.update(
+            {
+                "verification_mode": (
+                    "primary_discovery_secondary_exact_receipts"
+                ),
+                "range_completeness_claimed": False,
+                "grants_candidate_authority": False,
+            }
+        )
     value["screen_scope"] = {
         "mode": "bounded_resumable_exact_batch",
         "batch_address_count": 1,

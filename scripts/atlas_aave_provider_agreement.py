@@ -73,6 +73,7 @@ def verify_checkpoint(checkpoint: dict[str, Any]) -> None:
     if current_state:
         seed = checkpoint.get("seed_provenance")
         candidate = checkpoint.get("candidate_authority")
+        tail = checkpoint.get("tail_discovery")
         if (
             not isinstance(seed, dict)
             or seed.get("role") != "discovery_only"
@@ -84,6 +85,10 @@ def verify_checkpoint(checkpoint: dict[str, Any]) -> None:
             or candidate.get("requires_two_independent_provider_agreement") is not True
             or candidate.get("historical_archive_required") is not False
             or candidate.get("execution_authority") is not False
+            or not isinstance(tail, dict)
+            or tail.get("exact_discovered_log_verification") is not True
+            or tail.get("range_completeness_claimed") is not False
+            or tail.get("grants_candidate_authority") is not False
         ):
             raise EvidenceError("checkpoint current-state authority contract is invalid")
     authority = checkpoint.get("execution_authority")
@@ -138,6 +143,15 @@ def build_agreement(
     tail_bindings = tail.get("provider_bindings") if isinstance(tail, dict) else None
     if not isinstance(tail_bindings, list):
         raise EvidenceError("checkpoint tail provider bindings are missing")
+    if current_state and any(
+        not isinstance(item, dict)
+        or item.get("verification_mode")
+        != "primary_discovery_secondary_exact_receipts"
+        or item.get("range_completeness_claimed") is not False
+        or item.get("grants_candidate_authority") is not False
+        for item in tail_bindings
+    ):
+        raise EvidenceError("checkpoint discovery-only tail bindings are invalid")
 
     provider_evidence = []
     for provider in providers:

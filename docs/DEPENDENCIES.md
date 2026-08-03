@@ -139,10 +139,13 @@ batches. A primary provider performs only the cheap current-debt bitmap screen;
 two independently configured providers must then agree at one exact finalized
 block on the block hash, Pool implementation and code, reserve and isolation
 configuration, oracle source code, prices and round timestamps, retained user
-configuration, balances, debt, protocol Health Factor, eMode state, and the
-incremental post-archive Borrow tail. The SSH bridge binds distinct protected
-provider references without emitting provider URLs. Each batch and cursor is
-root-only, immutable, and hash-bound.
+configuration, balances, debt, protocol Health Factor, and eMode state. The
+incremental post-archive Borrow tail remains discovery-only: the primary slot
+collects the bounded range and every discovered Borrow identity must be
+reproduced by the second slot from its exact transaction receipt. This does not
+claim independent tail completeness and grants no candidate authority. The SSH
+bridge binds distinct protected provider references without emitting provider
+URLs. Each batch and cursor is root-only, immutable, and hash-bound.
 
 scripts/atlas_borrower_index.py independently derives Health Factor from the
 agreed integer state and rejects disagreement with the Pool's exact

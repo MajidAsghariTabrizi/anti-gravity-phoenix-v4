@@ -190,7 +190,7 @@ class SSHContainerProvider:
 import hashlib,json,subprocess,sys,urllib.request
 container={container!r}
 provider_index={provider_index}
-allowed={{"eth_chainId","eth_blockNumber","eth_getBlockByNumber","eth_getCode","eth_getStorageAt","eth_call","eth_getLogs"}}
+allowed={{"eth_chainId","eth_blockNumber","eth_getBlockByNumber","eth_getCode","eth_getStorageAt","eth_getTransactionReceipt","eth_call","eth_getLogs"}}
 try:
     result=subprocess.run(
         ["sudo","-n","docker","inspect","--format","{{{{json .Config.Env}}}}",container],
@@ -316,6 +316,7 @@ for line in sys.stdin:
             "eth_getBlockByNumber",
             "eth_getCode",
             "eth_getStorageAt",
+            "eth_getTransactionReceipt",
             "eth_getLogs",
         }:
             raise ExportError("RPC method outside read-only allowlist")

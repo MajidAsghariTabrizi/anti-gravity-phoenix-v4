@@ -392,6 +392,7 @@ class Provider:
             "eth_getBlockByNumber",
             "eth_getCode",
             "eth_getStorageAt",
+            "eth_getTransactionReceipt",
             "eth_call",
             "eth_getLogs",
         }:
@@ -649,12 +650,92 @@ def sanitized_tail_borrow_logs(
     return output
 
 
+def receipt_verified_tail_borrow_logs(
+    provider: Provider, expected_logs: list[dict[str, Any]], start: int, end: int
+) -> list[dict[str, Any]]:
+    """Reproduce discovered Borrow logs from exact transaction receipts.
+
+    This proves each discovered identity through an independent provider while
+    deliberately making no completeness claim for that provider's broad log
+    range. The tail remains discovery-only and grants no candidate authority.
+    """
+
+    if not expected_logs:
+        return []
+    expected_transactions = sorted(
+        {str(item["transaction_hash"]) for item in expected_logs}
+    )
+    observed: list[dict[str, Any]] = []
+    for transaction_hash in expected_transactions:
+        receipt = provider.call("eth_getTransactionReceipt", [transaction_hash])
+        if (
+            not isinstance(receipt, dict)
+            or str(receipt.get("transactionHash", "")).lower() != transaction_hash
+            or not isinstance(receipt.get("logs"), list)
+        ):
+            raise ExportError("checkpoint Borrow receipt is invalid")
+        for log in receipt["logs"]:
+            if not isinstance(log, dict):
+                raise ExportError("checkpoint Borrow receipt log is invalid")
+            topics = log.get("topics")
+            if (
+                str(log.get("address", "")).lower() != POOL
+                or not isinstance(topics, list)
+                or not topics
+                or str(topics[0]).lower() != BORROW_TOPIC
+            ):
+                continue
+            if len(topics) != 4 or log.get("removed") is True:
+                raise ExportError("checkpoint Borrow receipt topic shape is invalid")
+            observed.append(
+                {
+                    "block_number": int(str(log.get("blockNumber")), 16),
+                    "block_hash": str(log.get("blockHash", "")).lower(),
+                    "transaction_hash": str(
+                        log.get("transactionHash", "")
+                    ).lower(),
+                    "transaction_index": int(
+                        str(log.get("transactionIndex")), 16
+                    ),
+                    "log_index": int(str(log.get("logIndex")), 16),
+                    "reserve": "0x" + str(topics[1]).lower()[-40:],
+                    "borrower": "0x" + str(topics[2]).lower()[-40:],
+                    "referral_code": int(str(topics[3]), 16),
+                    "data_sha256": hashlib.sha256(
+                        str(log.get("data", "")).lower().encode()
+                    ).hexdigest(),
+                }
+            )
+    observed.sort(
+        key=lambda item: (
+            item["block_number"],
+            item["transaction_index"],
+            item["log_index"],
+        )
+    )
+    if any(not start <= item["block_number"] <= end for item in observed):
+        raise ExportError("checkpoint Borrow receipt log is out of range")
+    if observed != expected_logs:
+        raise ExportError("independent provider disagreement: Borrow receipts")
+    return observed
+
+
 def independently_agreed_tail_logs(
-    providers: list[Provider], start: int, end: int
+    providers: list[Provider], start: int, end: int, discovery_only: bool = False
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    provider_logs = [
-        sanitized_tail_borrow_logs(provider, start, end) for provider in providers
-    ]
+    if discovery_only:
+        primary_logs = sanitized_tail_borrow_logs(providers[0], start, end)
+        provider_logs = [primary_logs] + [
+            receipt_verified_tail_borrow_logs(
+                provider, primary_logs, start, end
+            )
+            for provider in providers[1:]
+        ]
+    else:
+        provider_logs = [
+            sanitized_tail_borrow_logs(provider, start, end)
+            for provider in providers
+        ]
     hashes = [canonical_hash(logs) for logs in provider_logs]
     if len(set(hashes)) != 1:
         raise ExportError("independent provider disagreement: Borrow tail")
@@ -663,6 +744,13 @@ def independently_agreed_tail_logs(
             "provider_id": provider.label,
             "log_count": len(logs),
             "logs_content_sha256": content_hash,
+            "verification_mode": (
+                "primary_discovery_secondary_exact_receipts"
+                if discovery_only
+                else "complete_range_eth_getLogs"
+            ),
+            "range_completeness_claimed": not discovery_only,
+            "grants_candidate_authority": False,
         }
         for provider, logs, content_hash in zip(providers, provider_logs, hashes)
     ]
@@ -1177,7 +1265,10 @@ def main() -> int:
         else:
             tail_start = archive_checkpoint + 1
         tail_logs, tail_bindings = independently_agreed_tail_logs(
-            providers, tail_start, block
+            providers,
+            tail_start,
+            block,
+            discovery_only=args.authority_mode == AUTHORITY_CURRENT_STATE,
         )
         print(
             f"checkpoint_tail_collection_complete={providers[0].label} "
@@ -1301,7 +1392,14 @@ def main() -> int:
             "finalized_heads": finalized_heads,
             "tail_discovery": {
                 "collection_provider_id": providers[0].label,
-                "independent_log_verification": True,
+                "independent_log_verification": (
+                    args.authority_mode == AUTHORITY_HISTORICAL
+                ),
+                "exact_discovered_log_verification": True,
+                "range_completeness_claimed": (
+                    args.authority_mode == AUTHORITY_HISTORICAL
+                ),
+                "grants_candidate_authority": False,
                 "provider_bindings": tail_bindings,
                 "start_block": tail_start,
                 "end_block": block,
@@ -1345,6 +1443,7 @@ def main() -> int:
                 "eth_getBlockByNumber",
                 "eth_getCode",
                 "eth_getStorageAt",
+                "eth_getTransactionReceipt",
                 "eth_call",
                 "eth_getLogs",
             ],

@@ -54,6 +54,18 @@ class HeaderProvider:
         }
 
 
+class ReceiptProvider:
+    label = "receipt"
+
+    def __init__(self, receipt):
+        self.receipt = receipt
+
+    def call(self, method, params):
+        assert method == "eth_getTransactionReceipt"
+        assert params == [self.receipt["transactionHash"]]
+        return self.receipt
+
+
 class AaveCheckpointTests(unittest.TestCase):
     def test_finalized_checkpoint_preserves_redacted_provider_references(self):
         providers = [
@@ -273,6 +285,47 @@ class AaveCheckpointTests(unittest.TestCase):
         ):
             with self.assertRaisesRegex(MODULE.ExportError, "Borrow tail"):
                 MODULE.independently_agreed_tail_logs(providers, 100, 101)
+
+    def test_discovery_only_tail_is_reproduced_from_exact_receipt(self):
+        transaction_hash = "0x" + "c" * 64
+        log = {
+            "address": MODULE.POOL,
+            "blockNumber": hex(100),
+            "blockHash": "0x" + "a" * 64,
+            "transactionHash": transaction_hash,
+            "transactionIndex": hex(2),
+            "logIndex": hex(3),
+            "topics": [
+                MODULE.BORROW_TOPIC,
+                "0x" + "0" * 24 + "1" * 40,
+                "0x" + "0" * 24 + "2" * 40,
+                "0x" + "0" * 63 + "4",
+            ],
+            "data": "0x1234",
+        }
+        expected = [
+            {
+                "block_number": 100,
+                "block_hash": log["blockHash"],
+                "transaction_hash": transaction_hash,
+                "transaction_index": 2,
+                "log_index": 3,
+                "reserve": "0x" + "1" * 40,
+                "borrower": "0x" + "2" * 40,
+                "referral_code": 4,
+                "data_sha256": MODULE.hashlib.sha256(b"0x1234").hexdigest(),
+            }
+        ]
+        provider = ReceiptProvider(
+            {"transactionHash": transaction_hash, "logs": [log]}
+        )
+        self.assertEqual(
+            MODULE.receipt_verified_tail_borrow_logs(provider, expected, 100, 100),
+            expected,
+        )
+        provider.receipt["logs"][0]["data"] = "0xabcd"
+        with self.assertRaisesRegex(MODULE.ExportError, "Borrow receipts"):
+            MODULE.receipt_verified_tail_borrow_logs(provider, expected, 100, 100)
 
 
 if __name__ == "__main__":
