@@ -131,6 +131,18 @@ chunks. scripts/verify_aave_borrow_archive.py rejects gaps, duplicate
 canonical identities, range/header disagreement, and provider log
 disagreement.
 
+After a complete independently validated archive exists,
+scripts/export_aave_checkpoint.py requires two independently identified
+providers to agree on the current finalized block, the post-archive Borrow
+tail, Pool implementation and protocol code, reserve state, retained borrower
+configuration/state, and eMode state. scripts/atlas_borrower_index.py imports
+that hash-bound checkpoint and performs integer-only health-factor,
+close-factor, repay, seize, protocol-fee, flash-premium, unwind, and full-cost
+scenario economics. scripts/atlas_aave_provider_agreement.py binds every
+provider scope to the exact inventory. scripts/atlas_aave_fork_package.py may
+then emit only a READY_FOR_EXTERNAL_FORK evidence package; it creates no Fork
+request and grants no signer, bond, bid, submission, or capital authority.
+
 Credential-bearing endpoints are referenced only by environment-variable
 name. The canonical owner-supplied secondary authority reference is
 PHOENIX_ATLAS_ARCHIVE_SECONDARY_RPC_URL. The value must be a protected GitHub
