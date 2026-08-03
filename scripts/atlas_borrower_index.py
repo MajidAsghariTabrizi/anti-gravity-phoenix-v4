@@ -834,10 +834,16 @@ def build_inventory_from_checkpoint(
     collection_provider_id = (
         tail.get("collection_provider_id") if isinstance(tail, dict) else None
     )
-    if (
-        collection_provider_id not in provider_ids
-        or tail.get("independent_log_verification") is not True
-    ):
+    if collection_provider_id not in provider_ids:
+        raise EvidenceError("checkpoint Borrow continuity evidence is missing")
+    if current_state_authority:
+        if (
+            tail.get("exact_discovered_log_verification") is not True
+            or tail.get("range_completeness_claimed") is not False
+            or tail.get("grants_candidate_authority") is not False
+        ):
+            raise EvidenceError("checkpoint discovery-only Borrow tail is invalid")
+    elif tail.get("independent_log_verification") is not True:
         raise EvidenceError("checkpoint Borrow continuity evidence is missing")
     expected_agreement_scope = {
         "checkpoint_block_hash",
