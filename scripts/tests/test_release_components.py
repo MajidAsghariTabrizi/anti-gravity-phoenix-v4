@@ -230,6 +230,17 @@ class ReleaseComponentRegistryTests(unittest.TestCase):
         )
         self.assertNotEqual(named_jobs, release_components.REQUIRED_CI_JOBS)
 
+    def test_buildkit_bootstrap_has_bounded_registry_retry(self) -> None:
+        build = (ROOT / ".github/workflows/build-images.yml").read_text(encoding="utf-8")
+        prefetch = "      - name: Prefetch BuildKit image with bounded retry"
+        setup = "      - name: Setup Docker Buildx"
+
+        self.assertIn(prefetch, build)
+        self.assertIn("for attempt in 1 2 3; do", build)
+        self.assertIn('timeout 120s docker pull "$buildkit_image"', build)
+        self.assertIn('sleep "$((attempt * 5))"', build)
+        self.assertLess(build.index(prefetch), build.index(setup))
+
     def test_current_and_legacy_manifest_environment_contracts(self) -> None:
         def write_manifest(path: Path, image_names: tuple[str, ...]) -> None:
             images = {}
