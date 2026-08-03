@@ -187,7 +187,7 @@ class SSHContainerProvider:
         self._request_id = 0
         self.retry_count = 0
         remote_source = f"""
-import json,subprocess,sys,urllib.request
+import hashlib,json,subprocess,sys,urllib.request
 container={container!r}
 provider_index={provider_index}
 allowed={{"eth_chainId","eth_blockNumber","eth_getBlockByNumber","eth_getCode","eth_getStorageAt","eth_call","eth_getLogs"}}
@@ -210,7 +210,10 @@ try:
 except Exception:
     sys.stdout.write(json.dumps({{"bridge_status":"startup_failed"}})+"\\n"); sys.stdout.flush()
     raise SystemExit(1)
-sys.stdout.write(json.dumps({{"bridge_status":"ready"}})+"\\n"); sys.stdout.flush()
+sys.stdout.write(json.dumps({{
+    "bridge_status":"ready",
+    "provider_reference_sha256":hashlib.sha256(provider.encode()).hexdigest(),
+}})+"\\n"); sys.stdout.flush()
 for line in sys.stdin:
     try:
         body=json.loads(line)
@@ -294,6 +297,15 @@ for line in sys.stdin:
                     diagnostic = observed[:200]
             self.close()
             raise ExportError(f"SSH provider bridge startup failed:{diagnostic}")
+        provider_reference = ready.get("provider_reference_sha256")
+        if (
+            not isinstance(provider_reference, str)
+            or len(provider_reference) != 64
+            or any(character not in "0123456789abcdef" for character in provider_reference)
+        ):
+            self.close()
+            raise ExportError("SSH provider bridge identity is invalid")
+        self.provider_reference_sha256 = provider_reference
 
     def call(
         self, method: str, params: list[object], attempts: int = MAX_RPC_ATTEMPTS
@@ -303,6 +315,7 @@ for line in sys.stdin:
             "eth_blockNumber",
             "eth_getBlockByNumber",
             "eth_getCode",
+            "eth_getStorageAt",
             "eth_getLogs",
         }:
             raise ExportError("RPC method outside read-only allowlist")

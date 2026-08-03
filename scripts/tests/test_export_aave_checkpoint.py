@@ -38,7 +38,82 @@ class EmptyLogProvider:
         return []
 
 
+class HeaderProvider:
+    def __init__(self, label, reference):
+        self.label = label
+        self.provider_reference_sha256 = reference
+
+    def call(self, method, params):
+        assert method == "eth_getBlockByNumber"
+        block = 100 if params[0] == "finalized" else int(params[0], 16)
+        return {
+            "number": hex(block),
+            "hash": "0x" + "a" * 64,
+            "parentHash": "0x" + "b" * 64,
+            "timestamp": hex(1_700_000_000),
+        }
+
+
 class AaveCheckpointTests(unittest.TestCase):
+    def test_finalized_checkpoint_preserves_redacted_provider_references(self):
+        providers = [
+            HeaderProvider("one", "8" * 64),
+            HeaderProvider("two", "9" * 64),
+        ]
+        block, heads, headers = MODULE.finalized_checkpoint(providers)
+        self.assertEqual(block, 100)
+        self.assertEqual(
+            [item["provider_reference_sha256"] for item in heads],
+            ["8" * 64, "9" * 64],
+        )
+        self.assertEqual(
+            [item["provider_reference_sha256"] for item in headers],
+            ["8" * 64, "9" * 64],
+        )
+
+    def test_discovery_only_manifest_has_zero_historical_authority(self):
+        discovery = {
+            "schema": "phoenix.atlas.aave-borrow-discovery.v1",
+            "chain_id": MODULE.CHAIN_ID,
+            "pool": MODULE.POOL,
+            "archive_complete": True,
+            "start_block": 1,
+            "checkpoint_block": 100,
+            "log_count": 1,
+            "borrower_count": 1,
+            "borrowers": ["0x" + "1" * 40],
+        }
+        discovery["content_sha256"] = MODULE.canonical_hash(discovery)
+        manifest = {
+            "schema": MODULE.ARCHIVE_MANIFEST_SCHEMA,
+            "chain_id": MODULE.CHAIN_ID,
+            "contract_address": MODULE.POOL,
+            "event_topic0": MODULE.BORROW_TOPIC,
+            "archive_complete": True,
+            "independent_validation": False,
+            "coverage_gaps": [],
+            "deployment_boundary": None,
+            "final_archive_sha256": discovery["content_sha256"],
+        }
+        manifest["content_sha256"] = MODULE.canonical_hash(manifest)
+        validated_discovery = MODULE.validate_discovery(
+            discovery, MODULE.AUTHORITY_CURRENT_STATE
+        )
+        validated_manifest = MODULE.validate_archive_manifest(
+            manifest, validated_discovery, MODULE.AUTHORITY_CURRENT_STATE
+        )
+        state = MODULE.initial_screen_state(validated_discovery, validated_manifest)
+        self.assertEqual(state["next_address_index"], 0)
+        self.assertEqual(state["addresses"], discovery["borrowers"])
+        self.assertEqual(
+            MODULE.validate_screen_state(
+                state, validated_discovery, validated_manifest
+            )["content_sha256"],
+            state["content_sha256"],
+        )
+        with self.assertRaisesRegex(MODULE.ExportError, "independent"):
+            MODULE.validate_archive_manifest(manifest, validated_discovery)
+
     def test_checkpoint_requires_complete_independently_validated_archive_manifest(self):
         discovery = {
             "schema": "phoenix.atlas.aave-borrow-discovery.v1",
@@ -47,6 +122,7 @@ class AaveCheckpointTests(unittest.TestCase):
             "archive_complete": True,
             "start_block": 1,
             "checkpoint_block": 100,
+            "log_count": 1,
             "borrower_count": 1,
             "borrowers": ["0x" + "1" * 40],
         }
@@ -102,6 +178,7 @@ class AaveCheckpointTests(unittest.TestCase):
             "archive_complete": True,
             "start_block": 1,
             "checkpoint_block": 100,
+            "log_count": 1,
             "borrower_count": 1,
             "borrowers": ["0x" + "1" * 40],
         }
@@ -168,6 +245,7 @@ class AaveCheckpointTests(unittest.TestCase):
             MODULE.uint_word(2**256)
         with self.assertRaisesRegex(MODULE.ExportError, "canonical address"):
             MODULE.encode_address("0x1234")
+        self.assertEqual(MODULE.word_int("f" * 64), -1)
 
     def test_tail_log_export_is_contiguous_and_bounded(self):
         provider = EmptyLogProvider()

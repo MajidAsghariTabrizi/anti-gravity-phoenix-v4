@@ -12,6 +12,7 @@ from scripts.atlas_borrower_index import (
     build_inventory_from_checkpoint,
     calculate_account,
     evaluate_auction,
+    summarize_current_state,
     validate_transcript,
     verify_inventory,
 )
@@ -376,13 +377,86 @@ def checkpoint(market_value):
     return bind_hash(value)
 
 
+def current_state_checkpoint(market_value):
+    value = checkpoint(market_value)
+    value.pop("content_sha256")
+    value["schema"] = "phoenix.atlas.aave-checkpoint.v2"
+    value.pop("archive_complete")
+    value["checkpoint_timestamp"] = 1_700_000_000
+    for provider_index, provider_header in enumerate(value["provider_headers"]):
+        provider_header["provider_reference_sha256"] = str(8 + provider_index) * 64
+        provider_header["checkpoint"]["timestamp"] = 1_700_000_000
+    value["seed_provenance"] = {
+        "role": "discovery_only",
+        "grants_candidate_authority": False,
+        "grants_execution_authority": False,
+        "archive_complete_claimed": True,
+        "historical_independent_validation_claimed": False,
+    }
+    value["candidate_authority"] = {
+        "source": "exact_finalized_current_state",
+        "requires_two_independent_provider_agreement": True,
+        "historical_archive_required": False,
+        "execution_authority": False,
+    }
+    value["screen_scope"] = {
+        "mode": "bounded_resumable_exact_batch",
+        "batch_address_count": 1,
+        "seed_scan_complete_after_batch": False,
+    }
+    value["independent_state_agreement_scope"].extend(
+        ["protocol_implementation_and_code", "oracle_round_state"]
+    )
+    providers = ("reviewed-provider-1", "reviewed-provider-2")
+    value["state_bindings"].extend(
+        {
+            "provider_id": provider,
+            "context": "oracle_round_state",
+            "call_count": 4,
+            "result_sha256": "6" * 64,
+        }
+        for provider in providers
+    )
+    feeds = {reserve["price_feed"] for reserve in value["reserves"]}
+    for binding in value["protocol_code_bindings"]:
+        for feed in feeds:
+            binding["code_sha256"][f"price_feed:{feed}"] = "7" * 64
+    for reserve in value["reserves"]:
+        reserve.update(
+            {
+                "borrowable_in_isolation": False,
+                "siloed_borrowing": False,
+                "isolation_mode_debt_ceiling": 0,
+                "price_feed_decimals": 8,
+                "price_feed_round_id": 10,
+                "price_feed_answer": 10**8,
+                "price_feed_started_at": 1_699_999_900,
+                "price_feed_updated_at": 1_699_999_950,
+                "price_feed_answered_in_round": 10,
+            }
+        )
+    value["borrowers"][0]["protocol_account_data"] = {
+        "total_collateral_base": 100 * 10**8,
+        "total_debt_base": 80 * 10**8,
+        "available_borrows_base": 0,
+        "current_liquidation_threshold_bps": 8_000,
+        "ltv_bps": 7_500,
+        "health_factor_wad": WAD,
+    }
+    return bind_hash(value)
+
+
 def scenario_costs():
     zero = {
         "dex_fee_base": 0,
         "price_impact_base": 0,
-        "gas_and_l1_data_base": 0,
+        "gas_base": 0,
+        "arbitrum_l1_fee_base": 0,
+        "atlas_bid_base": 0,
         "ordering_cost_base": 0,
         "failure_reserve_base": 0,
+        "latency_reserve_base": 0,
+        "state_drift_reserve_base": 0,
     }
     return {
         "expected": dict(zero),
@@ -409,6 +483,34 @@ def auction(price_before=100 * 10**8, price_after=90 * 10**8):
 
 
 class AtlasBorrowerIndexTests(unittest.TestCase):
+    def test_discovery_only_seed_builds_exact_current_state_batch(self):
+        market_value = market()
+        checkpoint_value = current_state_checkpoint(market_value)
+        inventory = build_inventory_from_checkpoint(market_value, checkpoint_value)
+        self.assertEqual(
+            inventory["bootstrap_mode"],
+            "discovery_seed_current_state_exact_batch",
+        )
+        self.assertFalse(inventory["seed_provenance"]["grants_candidate_authority"])
+        self.assertEqual(
+            inventory["borrowers"][0]["protocol_account_data"]["health_factor_wad"],
+            WAD,
+        )
+        summary = summarize_current_state(inventory)
+        self.assertEqual(summary["bucket_counts"]["hf_1_00_to_1_01"], 1)
+        self.assertEqual(summary["liquidatable_pair_count"], 0)
+        self.assertFalse(summary["candidate_authority"])
+
+    def test_current_state_protocol_health_factor_disagreement_fails_closed(self):
+        market_value = market()
+        checkpoint_value = current_state_checkpoint(market_value)
+        checkpoint_value["borrowers"][0]["protocol_account_data"][
+            "health_factor_wad"
+        ] -= 1
+        checkpoint_value = bind_hash(checkpoint_value)
+        with self.assertRaisesRegex(EvidenceError, "protocol/derived account"):
+            build_inventory_from_checkpoint(market_value, checkpoint_value)
+
     def test_index_is_idempotent_and_hash_bound(self):
         market_value = market()
         transcript_value = transcript(market_value)
@@ -484,6 +586,7 @@ class AtlasBorrowerIndexTests(unittest.TestCase):
                     "conservative": 82 * 10**18,
                     "severe": 79 * 10**18,
                 },
+                "unwind_outputs_are_net_of_dex_fee_and_price_impact": True,
                 "scenario_costs_base": scenario_costs(),
                 "retained_profit_floor_base": 0,
             }
@@ -500,6 +603,39 @@ class AtlasBorrowerIndexTests(unittest.TestCase):
         self.assertGreaterEqual(pair["liquidation_protocol_fee_bps"], 0)
         self.assertEqual(pair["economics_status"], "EXACT_FULL_COST")
         self.assertGreater(pair["pnl_base"]["conservative"], 0)
+        costed = copy.deepcopy(exact_auction)
+        costed.pop("content_sha256")
+        explicit_costs = {
+            "dex_fee_base": 11,
+            "price_impact_base": 13,
+            "gas_base": 17,
+            "arbitrum_l1_fee_base": 19,
+            "atlas_bid_base": 23,
+            "ordering_cost_base": 29,
+            "failure_reserve_base": 31,
+            "latency_reserve_base": 37,
+            "state_drift_reserve_base": 41,
+        }
+        for scenario in ("expected", "conservative", "severe"):
+            costed["pair_quotes"][0]["scenario_costs_base"][scenario] = dict(
+                explicit_costs
+            )
+        costed_result = evaluate_auction(inventory, bind_hash(costed))
+        costed_pair = costed_result["pairs"][0]
+        self.assertEqual(
+            pair["pnl_base"]["conservative"]
+            - costed_pair["pnl_base"]["conservative"],
+            sum(
+                value
+                for name, value in explicit_costs.items()
+                if name not in {"dex_fee_base", "price_impact_base"}
+            ),
+        )
+        self.assertEqual(costed_pair["atlas_bid_base"], 23)
+        self.assertEqual(
+            costed_pair["margin_to_gate_base"],
+            costed_pair["pnl_base"]["conservative"],
+        )
 
     def test_zero_delta_fast_path_needs_no_borrower_scan(self):
         market_value = market(complete=False)

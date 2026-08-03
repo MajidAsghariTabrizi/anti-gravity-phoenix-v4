@@ -113,7 +113,7 @@ Required next verification:
 
 Phoenix includes Aave V3 `flashLoanSimple` interfaces only. No Arbitrum provider address is hardcoded. The flash provider is a registry value validated through the cold RPC gateway before LIVE mode can be enabled.
 
-## Atlas/Aave Archive Authority
+## Atlas/Aave Candidate-Level Current-State Authority
 
 The read-only borrower archive is bound to Arbitrum One chain ID 42161, the
 official Aave V3 Arbitrum Pool
@@ -126,33 +126,47 @@ a1770e87fd61db02a7725cd9eed3b1d07c3980af. Liquidation math source is
 aave-dao/aave-v3-origin commit
 fd1fbd9150426ca8ace9cee45b4acf912ae84f5b.
 
-scripts/export_aave_borrow_discovery.py builds hash-bound, resumable primary
-chunks. scripts/verify_aave_borrow_archive.py rejects gaps, duplicate
-canonical identities, range/header disagreement, and provider log
-disagreement.
+scripts/export_aave_borrow_discovery.py builds hash-bound, resumable discovery
+chunks. The resulting archive and borrower addresses are discovery-only input.
+They grant no candidate, signer, bond, bid, submission, capital, or execution
+authority. Historical completeness and independent historical replay are not
+candidate gates, and Phoenix does not claim that a primary-only archive is
+independently complete.
 
-After a complete independently validated archive exists,
-scripts/export_aave_checkpoint.py requires two independently identified
-providers to agree on the current finalized block, the post-archive Borrow
-tail, Pool implementation and protocol code, reserve state, retained borrower
-configuration/state, and eMode state. scripts/atlas_borrower_index.py imports
-that hash-bound checkpoint and performs integer-only health-factor,
-close-factor, repay, seize, protocol-fee, flash-premium, unwind, and full-cost
-scenario economics. scripts/atlas_aave_provider_agreement.py binds every
+In explicit `discovery-only-current-state` mode,
+scripts/export_aave_checkpoint.py processes the seed in hash-bound resumable
+batches. A primary provider performs only the cheap current-debt bitmap screen;
+two independently configured providers must then agree at one exact finalized
+block on the block hash, Pool implementation and code, reserve and isolation
+configuration, oracle source code, prices and round timestamps, retained user
+configuration, balances, debt, protocol Health Factor, eMode state, and the
+incremental post-archive Borrow tail. The SSH bridge binds distinct protected
+provider references without emitting provider URLs. Each batch and cursor is
+root-only, immutable, and hash-bound.
+
+scripts/atlas_borrower_index.py independently derives Health Factor from the
+agreed integer state and rejects disagreement with the Pool's exact
+`getUserAccountData` result. It retains liquidatable and bounded near-threshold
+buckets, then performs integer-only health-factor, close-factor, repay, seize,
+protocol-fee, flash-premium, unwind, and full-cost scenario economics.
+scripts/atlas_aave_provider_agreement.py binds every
 provider scope to the exact inventory. scripts/atlas_aave_fork_package.py may
 then emit only a READY_FOR_EXTERNAL_FORK evidence package; it creates no Fork
 request and grants no signer, bond, bid, submission, or capital authority.
 
-Credential-bearing endpoints are referenced only by environment-variable
-name. The canonical owner-supplied secondary authority reference is
-PHOENIX_ATLAS_ARCHIVE_SECONDARY_RPC_URL. The value must be a protected GitHub
-Environment/repository secret or an equivalently protected operator secret;
-it must never be committed, printed, included in a CLI argument, or written
-to an evidence artifact. The endpoint must independently provide archive
-eth_getLogs, finalized headers, exact-block eth_call, eth_getCode,
-eth_getStorageAt, and JSON-RPC batches for Arbitrum One.
+Candidate-level authority does not require
+`PHOENIX_ATLAS_ARCHIVE_SECONDARY_RPC_URL`. It uses the two already configured,
+distinct Production gateway provider slots for current finalized state only.
+Provider URL values remain protected and must never be committed, printed,
+included in evidence, or exposed through the SSH bridge.
 
-Capability preflight:
+The legacy `historical-authority` mode remains fail-closed for an operator who
+separately chooses to prove the full historical archive. That optional mode
+still requires an independently validated archive, exact deployment boundary,
+and a protected secondary archive provider; its evidence is not substituted
+for candidate-level current-state reconstruction.
+
+Optional historical capability preflight:
 
     python scripts/probe_aave_archive_provider.py \
       --provider-env PHOENIX_ATLAS_ARCHIVE_SECONDARY_RPC_URL \

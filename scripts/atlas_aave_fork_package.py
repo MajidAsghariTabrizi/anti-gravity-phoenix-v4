@@ -149,15 +149,35 @@ def verify_plan(
         raise EvidenceError("execution plan identity mismatch")
     if integer(plan.get("repay"), "plan repay", 1) != pair["repay"]:
         raise EvidenceError("execution plan repay mismatch")
+    if integer(plan.get("max_repay"), "plan max repay", 1) != pair["repay"]:
+        raise EvidenceError("execution plan max repay mismatch")
     if (
         integer(plan.get("seized_collateral"), "plan seized collateral", 1)
         != pair["liquidator_collateral"]
     ):
         raise EvidenceError("execution plan seize mismatch")
-    if integer(plan.get("atlas_bid_base"), "plan Atlas bid") > pair[
-        "max_rational_atlas_bid_base"
-    ]:
+    atlas_bid = integer(plan.get("atlas_bid_base"), "plan Atlas bid")
+    max_atlas_bid = integer(plan.get("max_atlas_bid_base"), "plan max Atlas bid")
+    if (
+        atlas_bid != integer(pair.get("atlas_bid_base"), "pair Atlas bid")
+        or max_atlas_bid > pair["max_rational_atlas_bid_base"]
+        or atlas_bid > max_atlas_bid
+    ):
         raise EvidenceError("execution plan Atlas bid exceeds rational maximum")
+    minimum_profit_base = integer(
+        plan.get("minimum_final_realized_profit_base"),
+        "plan minimum final realized profit base",
+        1,
+    )
+    if minimum_profit_base < pair["retained_profit_floor_base"]:
+        raise EvidenceError("execution plan minimum profit is below the retained floor")
+    integer(
+        plan.get("minimum_final_realized_profit"),
+        "plan minimum final realized profit",
+        1,
+    )
+    if plan.get("atomic_bounds_enforced") is not True:
+        raise EvidenceError("execution plan atomic bounds are not enforced")
     calldata = plan.get("calldata")
     if (
         not isinstance(calldata, str)
@@ -243,6 +263,8 @@ def build_package(
         not isinstance(pnl, dict)
         or integer(pnl.get("expected"), "expected PnL") <= floor
         or integer(pnl.get("conservative"), "conservative PnL") <= floor
+        or integer(pair.get("margin_to_gate_base"), "margin to gate", 1)
+        != integer(pnl.get("conservative"), "conservative PnL") - floor
     ):
         raise EvidenceError("expected and conservative PnL do not clear the floor")
 
