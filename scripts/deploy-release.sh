@@ -366,6 +366,23 @@ wait_service_healthy() {
   wait_service_healthy_with_env "$release_env" "$1"
 }
 
+capture_service_failure_evidence() {
+  failure_service=$1
+  failure_id=$(compose ps -a -q "$failure_service" |
+    awk 'NF { print; exit }')
+  if [ -z "$failure_id" ]; then
+    echo "SERVICE_STARTUP_EVIDENCE: service=$failure_service state=missing"
+    return 0
+  fi
+  failure_state=$(docker inspect --format \
+    '{{.State.Status}}|{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}|{{.RestartCount}}|{{.State.OOMKilled}}|{{.State.ExitCode}}|{{.State.Error}}' \
+    "$failure_id" 2>/dev/null || true)
+  echo "SERVICE_STARTUP_EVIDENCE: service=$failure_service state=$failure_state"
+  echo "SERVICE_STARTUP_LOG_TAIL_BEGIN: service=$failure_service lines=80"
+  docker logs --timestamps --tail 80 "$failure_id" 2>&1 || true
+  echo "SERVICE_STARTUP_LOG_TAIL_END: service=$failure_service"
+}
+
 remove_source_only_services() {
   for service in $remove_services; do
     compose_with_release_env "$rollback_release_env" stop -t 30 "$service" \
@@ -731,6 +748,7 @@ rollback_on_failure() {
         PHOENIX_ENV_FILE="$env_file" \
         PHOENIX_CURRENT_LIVE_RELEASE_ENV="$release_env" \
         PHOENIX_CONTEXT_INSTALLER="$rollback_context_installer" \
+        PHOENIX_HEALTH_ALLOW_LEGACY_ATLAS_BINARY=true \
           /bin/sh "$rollback_script"
       } 2>&1
     )
@@ -808,7 +826,10 @@ for service in $start_services; do
       compose up -d --no-deps "$service"
       ;;
   esac
-  wait_service_healthy "$service" || fail "optional service did not become healthy: $service"
+  if ! wait_service_healthy "$service"; then
+    capture_service_failure_evidence "$service"
+    fail "optional service did not become healthy: $service"
+  fi
 done
 compose up -d --no-deps rpc-gateway
 wait_service_healthy rpc-gateway ||
