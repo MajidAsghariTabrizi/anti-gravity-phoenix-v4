@@ -10,7 +10,11 @@ import time
 from pathlib import Path
 from typing import Any
 
-from scripts.export_aave_borrow_discovery import SSHContainerProvider
+from scripts.export_aave_borrow_discovery import (
+    BridgeRequestError,
+    ProviderDiagnosticError,
+    SSHContainerProvider,
+)
 from scripts.export_aave_checkpoint import (
     CHAIN_ID,
     POOL,
@@ -90,6 +94,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         )
         providers.append(peer)
         for provider in providers:
+            provider.set_diagnostic_context("chain_identity")
             if int(str(provider.call("eth_chainId", [], attempts=1)), 16) != CHAIN_ID:
                 raise ExportError("provider chain identity disagreement")
         block, finalized_heads, headers = finalized_checkpoint(providers)
@@ -97,11 +102,15 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             raise ExportError("preflight exact block hash disagreement")
         if len({item["provider_reference_sha256"] for item in headers}) != 2:
             raise ExportError("preflight provider independence is absent")
+        peer.set_diagnostic_context("peer_state_sample")
         peer_sample = _state_sample(peer, block)
         round_hashes: list[str] = []
         round_durations_ms: list[int] = []
         primary_words: list[str] = []
-        for _ in range(10):
+        for stability_round in range(1, 11):
+            primary.set_diagnostic_context(
+                f"nownodes_stability_round_{stability_round}", stability_round
+            )
             started = time.monotonic_ns()
             exact_header = primary.call(
                 "eth_getBlockByNumber", [hex(block), False], attempts=1
@@ -149,6 +158,20 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             provider.close()
 
 
+def failure_artifact(error: Exception) -> dict[str, Any]:
+    artifact: dict[str, Any] = {
+        "schema": "phoenix.atlas.aave-provider-preflight-error.v1",
+        "status": "failed_closed",
+        "error_class": type(error).__name__,
+        "execution_authority": False,
+    }
+    if isinstance(error, ProviderDiagnosticError):
+        artifact.update(error.sanitized_evidence())
+    else:
+        artifact["failure_class"] = "preflight_invariant_failed"
+    return artifact
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--ssh-executable", default="ssh")
@@ -164,11 +187,7 @@ def main() -> int:
     except Exception as error:
         print(
             json.dumps(
-                {
-                    "schema": "phoenix.atlas.aave-provider-preflight-error.v1",
-                    "status": "failed_closed",
-                    "error_class": type(error).__name__,
-                },
+                failure_artifact(error),
                 sort_keys=True,
                 separators=(",", ":"),
             )

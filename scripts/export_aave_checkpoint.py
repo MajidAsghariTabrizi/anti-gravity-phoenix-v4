@@ -571,6 +571,9 @@ def finalized_checkpoint(
 ) -> tuple[int, list[dict[str, Any]], list[dict[str, Any]]]:
     finalized_heads = []
     for provider in providers:
+        set_context = getattr(provider, "set_diagnostic_context", None)
+        if callable(set_context):
+            set_context("finalized_header")
         value = provider.call("eth_getBlockByNumber", ["finalized", False])
         if not isinstance(value, dict):
             raise ExportError(f"{provider.label}:finalized_header_invalid")
@@ -590,17 +593,21 @@ def finalized_checkpoint(
             }
         )
     selected = min(int(item["number"]) for item in finalized_heads)
-    selected_headers = [
-        {
-            "provider_id": provider.label,
-            "provider_reference_sha256": provider.provider_reference_sha256,
-            "endpoint_identity": provider.endpoint_identity,
-            "header_name": provider.header_name,
-            "authenticated": provider.authenticated,
-            "checkpoint": header(provider, selected),
-        }
-        for provider in providers
-    ]
+    selected_headers = []
+    for provider in providers:
+        set_context = getattr(provider, "set_diagnostic_context", None)
+        if callable(set_context):
+            set_context("exact_header")
+        selected_headers.append(
+            {
+                "provider_id": provider.label,
+                "provider_reference_sha256": provider.provider_reference_sha256,
+                "endpoint_identity": provider.endpoint_identity,
+                "header_name": provider.header_name,
+                "authenticated": provider.authenticated,
+                "checkpoint": header(provider, selected),
+            }
+        )
     if len({item["checkpoint"]["hash"] for item in selected_headers}) != 1:
         raise ExportError("independent finalized checkpoint hash disagreement")
     return selected, finalized_heads, selected_headers
@@ -631,6 +638,9 @@ def current_state_proof_policy(
     }
     if len(state_roots) != 1 or len(next(iter(state_roots), "")) != 66:
         raise ExportError("independent finalized state root agreement is absent")
+    set_context = getattr(providers[0], "set_diagnostic_context", None)
+    if callable(set_context):
+        set_context("proof_policy")
     nownodes = providers[0].proof_capability(
         POOL, [POOL_IMPLEMENTATION_SLOT], block
     )
@@ -640,6 +650,9 @@ def current_state_proof_policy(
         "http_status": 405,
     }:
         raise ExportError("NOWNodes proof capability changed from the reviewed 405")
+    set_context = getattr(providers[1], "set_diagnostic_context", None)
+    if callable(set_context):
+        set_context("proof_policy")
     peer = providers[1].proof_capability(
         POOL, [POOL_IMPLEMENTATION_SLOT], block
     )

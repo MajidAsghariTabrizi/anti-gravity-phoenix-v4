@@ -33,6 +33,54 @@ class AtlasAaveProviderPreflightTests(unittest.TestCase):
         with self.assertRaisesRegex(module.ExportError, "protocol state"):
             module._state_sample(SampleProvider("0x" + "1" * 40), 123)
 
+    def test_bridge_failure_artifact_is_sanitized_and_stage_bound(self):
+        error = module.BridgeRequestError(
+            failure_class="bridge_invalid_json",
+            provider_id="production-nownodes-arbitrum",
+            method="eth_getCode",
+            request_id=9,
+            stage="nownodes_stability_round_2",
+            stability_round=2,
+            process_returncode=None,
+            stderr_class="unavailable",
+            json_rpc_item_count=9,
+            transport_request_count=8,
+            retry_count=0,
+        )
+        artifact = module.failure_artifact(error)
+        self.assertEqual(artifact["status"], "failed_closed")
+        self.assertEqual(artifact["failure_class"], "bridge_invalid_json")
+        self.assertEqual(artifact["stage"], "nownodes_stability_round_2")
+        self.assertEqual(artifact["stability_round"], 2)
+        self.assertFalse(artifact["execution_authority"])
+        self.assertNotIn("endpoint", artifact)
+        self.assertNotIn("stderr", artifact)
+
+    def test_non_bridge_failure_artifact_remains_fail_closed(self):
+        artifact = module.failure_artifact(module.ExportError("sensitive detail"))
+        self.assertEqual(artifact["failure_class"], "preflight_invariant_failed")
+        self.assertNotIn("sensitive detail", str(artifact))
+
+    def test_valid_rpc_failure_artifact_retains_sanitized_operation_identity(self):
+        error = module.ProviderDiagnosticError(
+            failure_class="rpc_error:-32000",
+            provider_id="production-slot-0",
+            method="eth_getProof",
+            request_id=7,
+            stage="proof_policy",
+            stability_round=None,
+            process_returncode=None,
+            stderr_class="unavailable",
+            json_rpc_item_count=7,
+            transport_request_count=7,
+            retry_count=0,
+        )
+        artifact = module.failure_artifact(error)
+        self.assertEqual(artifact["failure_class"], "rpc_error:-32000")
+        self.assertEqual(artifact["provider_id"], "production-slot-0")
+        self.assertEqual(artifact["method"], "eth_getProof")
+        self.assertEqual(artifact["stage"], "proof_policy")
+
 
 if __name__ == "__main__":
     unittest.main()
