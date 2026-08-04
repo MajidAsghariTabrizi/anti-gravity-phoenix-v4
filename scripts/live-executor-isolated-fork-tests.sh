@@ -1,7 +1,7 @@
 #!/usr/bin/env sh
 set -eu
 
-for command in forge cast anvil cargo python3 psql; do
+for command in forge cast anvil cargo go python3 psql; do
   if ! command -v "$command" >/dev/null 2>&1; then
     printf 'required isolated-fork command is unavailable: %s\n' "$command" >&2
     exit 1
@@ -73,7 +73,11 @@ deployment_json="$tmp_dir/deployment.json"
     --private-key "$test_key" \
     --broadcast \
     --json \
-    --constructor-args "$test_wallet" "$test_wallet" \
+    --constructor-args \
+      "$test_wallet" \
+      "$test_wallet" \
+      0x8ad1aE9D97C79aA68A0a151E83ff3942f68F86C1 \
+      0x82aF49447D8a07e3bd95BD0d56f35241523fBab1 \
     >"$deployment_json"
 )
 executor_address="$(
@@ -149,6 +153,11 @@ test_dsn="${PHOENIX_TEST_POSTGRES_DSN:-}"
   printf 'PHOENIX_TEST_POSTGRES_DSN is required for autonomous E2E\n' >&2
   exit 1
 }
+(
+  cd migration-runner
+  PGSSLMODE=disable POSTGRES_DSN="$test_dsn" \
+    go run ./cmd/migration-runner --migrations ../migrations
+)
 POSTGRES_DSN="$test_dsn" \
   cargo run --locked --quiet --manifest-path live-executor/Cargo.toml \
     --bin autonomous-live-control -- migrate
