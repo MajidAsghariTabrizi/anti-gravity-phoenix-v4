@@ -148,6 +148,7 @@ jobs:
             scripts/release_platform.py \
             scripts/release_provenance.py \
             scripts/atlas_aave_fork_package.py \
+            scripts/atlas_aave_economic_prefilter.py \
             scripts/atlas_aave_provider_preflight.py \
             scripts/atlas_aave_provider_agreement.py \
             scripts/atlas_borrower_index.py \
@@ -165,6 +166,7 @@ jobs:
             scripts.tests.test_release_provenance \
             scripts.tests.test_phoenix_release \
             scripts.tests.test_atlas_aave_fork_package \
+            scripts.tests.test_atlas_aave_economic_prefilter \
             scripts.tests.test_atlas_aave_provider_preflight \
             scripts.tests.test_atlas_aave_provider_agreement \
             scripts.tests.test_atlas_borrower_index \
@@ -230,6 +232,7 @@ jobs:
           python3 -m unittest scripts.tests.test_live_executor_safety -v
           python3 -m py_compile \
             scripts/atlas_aave_fork_package.py \
+            scripts/atlas_aave_economic_prefilter.py \
             scripts/atlas_aave_provider_agreement.py \
             scripts/atlas_borrower_index.py \
             scripts/export_aave_borrow_discovery.py \
@@ -238,6 +241,7 @@ jobs:
             scripts/verify_aave_borrow_archive.py
           python3 -m unittest \
             scripts.tests.test_atlas_aave_fork_package \
+            scripts.tests.test_atlas_aave_economic_prefilter \
             scripts.tests.test_atlas_aave_provider_agreement \
             scripts.tests.test_atlas_borrower_index \
             scripts.tests.test_export_aave_borrow_discovery \

@@ -1,4 +1,5 @@
 import importlib.util
+import io
 import json
 import tempfile
 import unittest
@@ -40,6 +41,21 @@ class SplitProvider:
 
 
 class AaveBorrowDiscoveryTests(unittest.TestCase):
+    def _bridge_provider(self, stdout, returncode=None, stderr=""):
+        provider = object.__new__(MODULE.SSHContainerProvider)
+        provider.label = "production-nownodes-arbitrum"
+        provider._request_id = 0
+        provider.transport_request_count = 0
+        provider.retry_count = 0
+        provider._diagnostic_stage = "test_stage"
+        provider._diagnostic_stability_round = None
+        provider._process = mock.Mock()
+        provider._process.poll.return_value = returncode
+        provider._process.stdin = io.StringIO()
+        provider._process.stdout = io.StringIO(stdout)
+        provider._process.stderr = io.StringIO(stderr)
+        return provider
+
     def test_current_state_bridge_allows_calls_and_disables_redirects(self):
         provider = object.__new__(MODULE.SSHContainerProvider)
         provider.label = "production-nownodes-arbitrum"
@@ -59,6 +75,138 @@ class AaveBorrowDiscoveryTests(unittest.TestCase):
         self.assertIn("class NoRedirect", source)
         self.assertIn("opener.open(request", source)
         self.assertNotIn("urllib.request.urlopen(request", source)
+
+    def test_bridge_startup_failure_is_sanitized_and_keepalive_is_configured(self):
+        process = mock.Mock()
+        process.poll.return_value = 255
+        process.stdin = io.StringIO()
+        process.stdout = io.StringIO("")
+        process.stderr = io.StringIO("Connection timed out")
+        process.wait.return_value = 255
+        with mock.patch.object(MODULE.subprocess, "Popen", return_value=process) as popen:
+            with self.assertRaises(MODULE.BridgeRequestError) as raised:
+                MODULE.SSHContainerProvider(
+                    "production-nownodes-arbitrum",
+                    "ssh.exe",
+                    "example.invalid",
+                    9011,
+                    Path("unused"),
+                    None,
+                    "app-rpc-gateway-1",
+                    0,
+                    authenticated=True,
+                )
+        evidence = raised.exception.sanitized_evidence()
+        self.assertEqual(evidence["failure_class"], "bridge_transport_timeout")
+        self.assertEqual(evidence["stage"], "bridge_startup")
+        command = popen.call_args.args[0]
+        self.assertIn("ConnectTimeout=20", command)
+        self.assertIn("ServerAliveInterval=15", command)
+        self.assertIn("ServerAliveCountMax=6", command)
+        self.assertNotIn("Connection timed out", json.dumps(evidence))
+
+    def test_bridge_empty_eof_is_explicit(self):
+        provider = self._bridge_provider("")
+        with self.assertRaises(MODULE.BridgeRequestError) as raised:
+            provider._request(
+                {"jsonrpc": "2.0", "id": 1, "method": "eth_chainId", "params": []}
+            )
+        self.assertEqual(raised.exception.failure_class, "bridge_eof")
+        self.assertEqual(raised.exception.transport_request_count, 1)
+
+    def test_bridge_process_death_is_explicit(self):
+        provider = self._bridge_provider("", returncode=255, stderr="broken pipe")
+        with self.assertRaises(MODULE.BridgeRequestError) as raised:
+            provider._request(
+                {"jsonrpc": "2.0", "id": 1, "method": "eth_chainId", "params": []}
+            )
+        self.assertEqual(raised.exception.failure_class, "bridge_process_exited")
+        self.assertEqual(raised.exception.stderr_class, "broken_pipe")
+        self.assertEqual(raised.exception.process_returncode, 255)
+
+    def test_bridge_malformed_json_is_explicit(self):
+        provider = self._bridge_provider("not-json\n")
+        with self.assertRaises(MODULE.BridgeRequestError) as raised:
+            provider._request(
+                {"jsonrpc": "2.0", "id": 7, "method": "eth_chainId", "params": []}
+            )
+        self.assertEqual(raised.exception.failure_class, "bridge_invalid_json")
+        self.assertEqual(raised.exception.request_id, 7)
+
+    def test_bridge_valid_rpc_error_json_preserves_rpc_classification(self):
+        provider = self._bridge_provider(
+            '{"jsonrpc":"2.0","id":1,"error":{"code":-32000}}\n'
+        )
+        with self.assertRaisesRegex(MODULE.ExportError, "rpc_error:-32000"):
+            provider.call("eth_chainId", [], attempts=1)
+        self.assertEqual(provider.transport_request_count, 1)
+
+    def test_bridge_valid_successful_response_is_returned(self):
+        provider = self._bridge_provider(
+            '{"jsonrpc":"2.0","id":1,"result":"0xa4b1"}\n'
+        )
+        self.assertEqual(provider.call("eth_chainId", [], attempts=1), "0xa4b1")
+        self.assertEqual(provider.transport_request_count, 1)
+
+    def test_reviewed_nownodes_405_proof_classification_is_unchanged(self):
+        provider = self._bridge_provider("")
+        provider.authenticated = True
+        provider._request = mock.Mock(
+            return_value={
+                "jsonrpc": "2.0",
+                "id": 1,
+                "error": {
+                    "code": -32601,
+                    "data": {
+                        "failure_class": "http_method_not_allowed",
+                        "http_status": 405,
+                    },
+                },
+            }
+        )
+        self.assertEqual(
+            provider.proof_capability("0x" + "1" * 40, ["0x0"], 123),
+            {
+                "supported": False,
+                "failure_class": "http_method_not_allowed",
+                "http_status": 405,
+            },
+        )
+
+    def test_peer_proof_failure_remains_fail_closed(self):
+        provider = self._bridge_provider("")
+        provider.authenticated = False
+        provider._request = mock.Mock(
+            return_value={
+                "jsonrpc": "2.0",
+                "id": 1,
+                "error": {"code": -32000, "message": "upstream rpc error"},
+            }
+        )
+        with self.assertRaises(MODULE.ProviderDiagnosticError) as raised:
+            provider.proof_capability("0x" + "1" * 40, ["0x0"], 123)
+        self.assertEqual(raised.exception.failure_class, "rpc_error:-32000")
+        self.assertEqual(raised.exception.method, "eth_getProof")
+
+    def test_usage_counters_are_preserved_after_mid_run_failure(self):
+        provider = self._bridge_provider("")
+        provider._request_id = 3
+        provider.transport_request_count = 2
+        provider.set_diagnostic_context("nownodes_stability_round_4", 4)
+        with self.assertRaises(MODULE.BridgeRequestError) as raised:
+            provider.call("eth_getCode", ["0x" + "1" * 40, "0x1"], attempts=1)
+        evidence = raised.exception.sanitized_evidence()
+        self.assertEqual(evidence["request_id"], 4)
+        self.assertEqual(evidence["stability_round"], 4)
+        self.assertEqual(
+            evidence["provider_request_usage"],
+            {
+                "provider_id": "production-nownodes-arbitrum",
+                "json_rpc_item_count": 4,
+                "transport_request_count": 3,
+                "retry_count": 0,
+            },
+        )
 
     def test_provider_environment_reference_is_protected_and_single_provider_safe(self):
         with mock.patch.dict(

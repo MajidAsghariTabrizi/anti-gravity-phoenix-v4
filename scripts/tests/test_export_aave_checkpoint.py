@@ -204,6 +204,56 @@ class AaveCheckpointTests(unittest.TestCase):
         with self.assertRaisesRegex(MODULE.ExportError, "hash mismatch"):
             MODULE.validate_discovery(value)
 
+    def test_retained_prefilter_cohort_is_hash_bound_and_current_state_only(self):
+        discovery = {
+            "schema": "phoenix.atlas.aave-borrow-discovery.v1",
+            "chain_id": MODULE.CHAIN_ID,
+            "pool": MODULE.POOL,
+            "archive_complete": True,
+            "start_block": 1,
+            "checkpoint_block": 100,
+            "log_count": 2,
+            "borrower_count": 2,
+            "borrowers": ["0x" + "1" * 40, "0x" + "2" * 40],
+        }
+        discovery["content_sha256"] = MODULE.canonical_hash(discovery)
+        cohort = {
+            "schema": MODULE.SCREEN_COHORT_SCHEMA,
+            "chain_id": MODULE.CHAIN_ID,
+            "pool": MODULE.POOL,
+            "source_discovery_content_sha256": discovery["content_sha256"],
+            "addresses": ["0x" + "1" * 40],
+            "address_count": 1,
+            "cohort_reason": "primary_prefilter_liquidatable_or_urgent",
+            "source_prefilter_content_sha256": "a" * 64,
+            "finalized_prefilter_block": {
+                "number": 101,
+                "hash": "0x" + "b" * 64,
+                "state_root": "0x" + "c" * 64,
+            },
+            "candidate_authority": False,
+            "execution_authority": False,
+        }
+        cohort["content_sha256"] = MODULE.canonical_hash(cohort)
+        self.assertEqual(
+            MODULE.validate_screen_cohort(
+                cohort, discovery, MODULE.AUTHORITY_CURRENT_STATE
+            )["addresses"],
+            cohort["addresses"],
+        )
+        with self.assertRaisesRegex(MODULE.ExportError, "current-state"):
+            MODULE.validate_screen_cohort(
+                cohort, discovery, MODULE.AUTHORITY_HISTORICAL
+            )
+        cohort["addresses"] = ["0x" + "3" * 40]
+        cohort["content_sha256"] = MODULE.canonical_hash(
+            {key: value for key, value in cohort.items() if key != "content_sha256"}
+        )
+        with self.assertRaisesRegex(MODULE.ExportError, "exact discovery subset"):
+            MODULE.validate_screen_cohort(
+                cohort, discovery, MODULE.AUTHORITY_CURRENT_STATE
+            )
+
     def test_address_array_and_symbol_decoding(self):
         address = "0x" + "a" * 40
         encoded = "0x" + abi_word(32) + abi_word(1) + "0" * 24 + address[2:]

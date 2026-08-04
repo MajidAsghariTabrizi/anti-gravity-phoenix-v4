@@ -38,6 +38,84 @@ class ExportError(RuntimeError):
     pass
 
 
+class ProviderDiagnosticError(ExportError):
+    """Sanitized evidence for a failed reviewed-provider operation."""
+
+    def __init__(
+        self,
+        failure_class: str,
+        provider_id: str,
+        method: str,
+        request_id: int | None,
+        stage: str,
+        stability_round: int | None,
+        process_returncode: int | None,
+        stderr_class: str,
+        json_rpc_item_count: int,
+        transport_request_count: int,
+        retry_count: int,
+    ) -> None:
+        self.failure_class = failure_class
+        self.provider_id = provider_id
+        self.method = method
+        self.request_id = request_id
+        self.stage = stage
+        self.stability_round = stability_round
+        self.process_returncode = process_returncode
+        self.stderr_class = stderr_class
+        self.json_rpc_item_count = json_rpc_item_count
+        self.transport_request_count = transport_request_count
+        self.retry_count = retry_count
+        super().__init__(f"{provider_id}:{method}:{failure_class}")
+
+    def sanitized_evidence(self) -> dict[str, object]:
+        return {
+            "failure_class": self.failure_class,
+            "provider_id": self.provider_id,
+            "method": self.method,
+            "request_id": self.request_id,
+            "stage": self.stage,
+            "stability_round": self.stability_round,
+            "process_returncode": self.process_returncode,
+            "stderr_class": self.stderr_class,
+            "provider_request_usage": {
+                "provider_id": self.provider_id,
+                "json_rpc_item_count": self.json_rpc_item_count,
+                "transport_request_count": self.transport_request_count,
+                "retry_count": self.retry_count,
+            },
+        }
+
+
+class BridgeRequestError(ProviderDiagnosticError):
+    """Sanitized evidence for a failed persistent SSH bridge operation."""
+
+
+def _bridge_stderr_class(process: subprocess.Popen[str]) -> str:
+    if process.poll() is None or process.stderr is None:
+        return "unavailable"
+    try:
+        observed = process.stderr.read(512)
+    except (OSError, ValueError):
+        return "read_failed"
+    if not isinstance(observed, str) or not observed.strip():
+        return "empty"
+    normalized = observed.lower()
+    classifications = (
+        (("timed out", "timeout"), "timeout"),
+        (("connection reset",), "connection_reset"),
+        (("broken pipe",), "broken_pipe"),
+        (("connection refused",), "connection_refused"),
+        (("host key verification failed",), "host_key_verification_failed"),
+        (("permission denied",), "authentication_failed"),
+        (("no route to host",), "network_unreachable"),
+    )
+    for needles, classification in classifications:
+        if any(needle in normalized for needle in needles):
+            return classification
+    return "redacted_present"
+
+
 def canonical_hash(value: Any) -> str:
     return hashlib.sha256(
         json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
@@ -188,6 +266,8 @@ class SSHContainerProvider:
         self._request_id = 0
         self.transport_request_count = 0
         self.retry_count = 0
+        self._diagnostic_stage = "bridge_startup"
+        self._diagnostic_stability_round: int | None = None
         remote_source = f"""
 import hashlib,io,json,subprocess,sys,tarfile,urllib.error,urllib.request
 container={container!r}
@@ -339,6 +419,12 @@ for line in sys.stdin:
                 "IdentitiesOnly=yes",
                 "-o",
                 "StrictHostKeyChecking=yes",
+                "-o",
+                "ConnectTimeout=20",
+                "-o",
+                "ServerAliveInterval=15",
+                "-o",
+                "ServerAliveCountMax=6",
         ]
         if known_hosts is not None:
             ssh_command.extend(["-o", f"UserKnownHostsFile={known_hosts}"])
@@ -352,27 +438,34 @@ for line in sys.stdin:
             bufsize=1,
         )
         if self._process.stdout is None:
-            raise ExportError("SSH provider bridge stdout unavailable")
+            raise self._bridge_error(
+                "bridge_pipe_unavailable", "bridge_startup", None
+            )
+        ready_line = self._process.stdout.readline()
+        if not ready_line:
+            error = self._bridge_error(
+                self._stopped_failure_class("bridge_eof"),
+                "bridge_startup",
+                None,
+            )
+            self.close()
+            raise error
         try:
-            ready = json.loads(self._process.stdout.readline())
-        except Exception as error:
-            diagnostic = "unavailable"
-            if self._process.stderr is not None:
-                diagnostic = self._process.stderr.read(512).strip().replace("\n", " ")
-                if "http://" in diagnostic or "https://" in diagnostic:
-                    diagnostic = "redacted"
+            ready = json.loads(ready_line)
+        except json.JSONDecodeError as error:
+            diagnostic = self._bridge_error(
+                "bridge_invalid_json", "bridge_startup", None
+            )
             self.close()
-            raise ExportError(
-                f"SSH provider bridge startup failed:{diagnostic[:200]}"
-            ) from error
-        if ready.get("bridge_status") != "ready":
-            diagnostic = "remote_startup_failed"
-            if self._process.stderr is not None and self._process.poll() is not None:
-                observed = self._process.stderr.read(512).strip().replace("\n", " ")
-                if observed and "http://" not in observed and "https://" not in observed:
-                    diagnostic = observed[:200]
+            raise diagnostic from error
+        if not isinstance(ready, dict) or ready.get("bridge_status") != "ready":
+            diagnostic = self._bridge_error(
+                self._stopped_failure_class("bridge_startup_failed"),
+                "bridge_startup",
+                None,
+            )
             self.close()
-            raise ExportError(f"SSH provider bridge startup failed:{diagnostic}")
+            raise diagnostic
         provider_reference = ready.get("provider_reference_sha256")
         if (
             not isinstance(provider_reference, str)
@@ -399,6 +492,61 @@ for line in sys.stdin:
         self.endpoint_identity = endpoint_identity
         self.header_name = header_name
         self.authenticated = authenticated
+
+    def set_diagnostic_context(
+        self, stage: str, stability_round: int | None = None
+    ) -> None:
+        if not stage or len(stage) > 80:
+            raise ExportError("provider diagnostic stage is invalid")
+        if stability_round is not None and not 1 <= stability_round <= 10_000:
+            raise ExportError("provider diagnostic stability round is invalid")
+        self._diagnostic_stage = stage
+        self._diagnostic_stability_round = stability_round
+
+    def _bridge_error(
+        self, failure_class: str, method: str, request_id: int | None
+    ) -> BridgeRequestError:
+        process = self._process
+        process_returncode = process.poll()
+        stderr_class = _bridge_stderr_class(process)
+        if process_returncode is not None and stderr_class == "timeout":
+            failure_class = "bridge_transport_timeout"
+        return BridgeRequestError(
+            failure_class=failure_class,
+            provider_id=self.label,
+            method=method,
+            request_id=request_id,
+            stage=self._diagnostic_stage,
+            stability_round=self._diagnostic_stability_round,
+            process_returncode=process_returncode,
+            stderr_class=stderr_class,
+            json_rpc_item_count=self._request_id,
+            transport_request_count=self.transport_request_count,
+            retry_count=self.retry_count,
+        )
+
+    def _provider_error(
+        self, failure_class: str, method: str, request_id: int | None
+    ) -> ProviderDiagnosticError:
+        process_returncode = self._process.poll()
+        return ProviderDiagnosticError(
+            failure_class=failure_class,
+            provider_id=self.label,
+            method=method,
+            request_id=request_id,
+            stage=self._diagnostic_stage,
+            stability_round=self._diagnostic_stability_round,
+            process_returncode=process_returncode,
+            stderr_class=_bridge_stderr_class(self._process),
+            json_rpc_item_count=self._request_id,
+            transport_request_count=self.transport_request_count,
+            retry_count=self.retry_count,
+        )
+
+    def _stopped_failure_class(self, fallback: str) -> str:
+        if self._process.poll() is None:
+            return fallback
+        return "bridge_process_exited"
 
     def call(
         self, method: str, params: list[object], attempts: int = MAX_RPC_ATTEMPTS
@@ -444,17 +592,52 @@ for line in sys.stdin:
             if attempt + 1 < attempts:
                 self.retry_count += 1
                 time.sleep(min(2**attempt, 30))
-        raise ExportError(f"{self.label}:{method}:{failure}")
+        raise self._provider_error(failure, method, self._request_id)
 
     def _request(self, payload: object) -> object:
+        method = "batch"
+        request_id: int | None = None
+        if isinstance(payload, dict):
+            if isinstance(payload.get("method"), str):
+                method = str(payload["method"])
+            if isinstance(payload.get("id"), int):
+                request_id = int(payload["id"])
+        elif isinstance(payload, list) and payload:
+            first = payload[0]
+            if isinstance(first, dict) and isinstance(first.get("id"), int):
+                request_id = int(first["id"])
         if self._process.poll() is not None:
-            raise ExportError(f"{self.label}:bridge_stopped")
+            raise self._bridge_error(
+                self._stopped_failure_class("bridge_process_exited"),
+                method,
+                request_id,
+            )
         if self._process.stdin is None or self._process.stdout is None:
-            raise ExportError(f"{self.label}:bridge_pipe_unavailable")
-        self._process.stdin.write(json.dumps(payload, separators=(",", ":")) + "\n")
-        self._process.stdin.flush()
+            raise self._bridge_error("bridge_pipe_unavailable", method, request_id)
+        try:
+            self._process.stdin.write(
+                json.dumps(payload, separators=(",", ":")) + "\n"
+            )
+            self._process.stdin.flush()
+        except (BrokenPipeError, OSError, ValueError) as error:
+            failure_class = self._stopped_failure_class("bridge_write_failed")
+            raise self._bridge_error(failure_class, method, request_id) from error
         self.transport_request_count += 1
-        return json.loads(self._process.stdout.readline())
+        response_line = self._process.stdout.readline()
+        if not response_line:
+            failure_class = self._stopped_failure_class("bridge_eof")
+            raise self._bridge_error(failure_class, method, request_id)
+        try:
+            response = json.loads(response_line)
+        except json.JSONDecodeError as error:
+            raise self._bridge_error(
+                "bridge_invalid_json", method, request_id
+            ) from error
+        if not isinstance(response, (dict, list)):
+            raise self._bridge_error(
+                "bridge_response_shape_invalid", method, request_id
+            )
+        return response
 
     def proof_capability(
         self, address: str, storage_slots: list[str], block: int
@@ -491,7 +674,13 @@ for line in sys.stdin:
                 "failure_class": "http_method_not_allowed",
                 "http_status": 405,
             }
-        raise ExportError(f"{self.label}:eth_getProof:unexpected_failure")
+        code = error.get("code") if isinstance(error, dict) else None
+        failure_class = (
+            f"rpc_error:{code}" if isinstance(code, int) else "rpc_error"
+        )
+        raise self._provider_error(
+            failure_class, "eth_getProof", self._request_id
+        )
 
     def eth_calls(
         self, calls: list[tuple[str, str]], block: int, batch_size: int = 80
@@ -537,7 +726,10 @@ for line in sys.stdin:
         if process is None:
             return
         if process.stdin is not None:
-            process.stdin.close()
+            try:
+                process.stdin.close()
+            except (BrokenPipeError, OSError, ValueError):
+                pass
         try:
             process.wait(timeout=5)
         except subprocess.TimeoutExpired:
