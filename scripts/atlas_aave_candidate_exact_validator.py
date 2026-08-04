@@ -89,6 +89,21 @@ REFRESH_MAX_ITEMS_PER_PROVIDER = 10
 SCHEMA = "phoenix.atlas.aave-candidate-exact-validation.v1"
 MATRIX_SCHEMA = "phoenix.atlas.aave-reserve-configuration-matrix.v1"
 COHORT_SCHEMA = "phoenix.atlas.aave-screen-cohort.v1"
+ORACLE_CAPABILITY_SCHEMA = "phoenix.atlas.aave-oracle-capability-matrix.v1"
+ORACLE_CAPABILITY_MAX_RUNTIME_SECONDS = 90
+ORACLE_CAPABILITY_MAX_ITEMS_PER_PROVIDER = 30
+ORACLE_CAPABILITY_ASSETS = (
+    "0xff970a61a04b1ca14834a43f5de4533ebddb5cc8",  # USDC.e
+    "0x82af49447d8a07e3bd95bd0d56f35241523fbab1",  # WETH
+    "0xaf88d065e77c8cc2239327c5edb3a432268e5831",  # USDC
+)
+
+ORACLE_SELECTORS = {
+    "latest_answer": "50d25bcd",
+    "latest_timestamp": "8205bf6a",
+}
+
+ROUND_CAPABILITY_FAILURES = {"rpc_error:3"}
 
 # AaveProtocolDataProvider selectors from the source-bound V3 Origin ABI.
 DATA_PROVIDER_SELECTORS = {
@@ -97,6 +112,22 @@ DATA_PROVIDER_SELECTORS = {
     "get_debt_ceiling": "3c798109",
     "get_siloed_borrowing": "fcf40a62",
 }
+
+
+class CandidateEvidenceError(ExportError):
+    """Fail-closed Candidate error carrying sanitized partial evidence."""
+
+    def __init__(
+        self,
+        message: str,
+        evidence: dict[str, Any] | None = None,
+        stage: str | None = None,
+        method: str | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.evidence = evidence or {}
+        self.stage = stage
+        self.method = method
 
 
 def _address(value: Any, name: str) -> str:
@@ -226,10 +257,225 @@ def _provider_binding(provider: Any) -> dict[str, Any]:
     return {
         "provider_id": provider.label,
         "provider_reference_sha256": provider.provider_reference_sha256,
-        "endpoint_identity": provider.endpoint_identity,
         "header_name": provider.header_name,
         "authenticated": provider.authenticated,
     }
+
+
+def _sanitized_request_usage(providers: list[Any]) -> list[dict[str, Any]]:
+    return [
+        {
+            key: value
+            for key, value in item.items()
+            if key != "endpoint_identity"
+        }
+        for item in provider_request_usage(providers)
+    ]
+
+
+def _capability_probe(
+    provider: Any,
+    method: str,
+    params: list[object],
+    semantic: str,
+    asset: str,
+    source: str | None,
+) -> tuple[Any | None, dict[str, Any]]:
+    started = time.monotonic_ns()
+    try:
+        result = _call(provider, method, params, f"oracle_capability_{semantic}")
+        if not isinstance(result, str) or not result.startswith("0x"):
+            raise ExportError("oracle capability result is invalid")
+        response_sha256 = _result_hash(result.lower())
+        evidence = {
+            "asset": asset,
+            "source": source,
+            "provider_id": provider.label,
+            "provider_reference_sha256": provider.provider_reference_sha256,
+            "semantic_method_name": semantic,
+            "success": True,
+            "failure_class": None,
+            "return_length_bytes": (len(result) - 2) // 2,
+            "response_sha256": response_sha256,
+            "elapsed_ms": (time.monotonic_ns() - started) // 1_000_000,
+        }
+        return result.lower(), evidence
+    except ProviderDiagnosticError as error:
+        failure = error.failure_class
+    except ExportError:
+        failure = "invalid_result"
+    return None, {
+        "asset": asset,
+        "source": source,
+        "provider_id": provider.label,
+        "provider_reference_sha256": provider.provider_reference_sha256,
+        "semantic_method_name": semantic,
+        "success": False,
+        "failure_class": failure,
+        "return_length_bytes": None,
+        "response_sha256": None,
+        "elapsed_ms": (time.monotonic_ns() - started) // 1_000_000,
+    }
+
+
+def oracle_capability_matrix(providers: list[Any], started_ns: int) -> dict[str, Any]:
+    if len(providers) != 2:
+        raise ExportError("oracle capability matrix requires exactly two providers")
+    chains: list[int] = []
+    finalized: list[dict[str, Any]] = []
+    for provider in providers:
+        chains.append(
+            int(str(_call(provider, "eth_chainId", [], "oracle_capability_chain")), 16)
+        )
+        finalized.append(
+            _header(
+                _call(
+                    provider,
+                    "eth_getBlockByNumber",
+                    ["finalized", False],
+                    "oracle_capability_finalized",
+                )
+            )
+        )
+    if set(chains) != {CHAIN_ID}:
+        raise ExportError("oracle capability provider chain identity disagreement")
+    block = min(item["number"] for item in finalized)
+    exact_headers = [
+        _header(
+            _call(
+                provider,
+                "eth_getBlockByNumber",
+                [hex(block), False],
+                "oracle_capability_exact_header",
+            ),
+            block,
+        )
+        for provider in providers
+    ]
+    if (
+        len({item["hash"] for item in exact_headers}) != 1
+        or len({item["state_root"] for item in exact_headers}) != 1
+    ):
+        raise ExportError("oracle capability exact header disagreement")
+
+    calls: list[dict[str, Any]] = []
+    for asset in ORACLE_CAPABILITY_ASSETS:
+        asset_word = encode_address(asset)
+        for provider in providers:
+            source_result, source_evidence = _capability_probe(
+                provider,
+                "eth_call",
+                [
+                    {"to": ORACLE, "data": call_data(SELECTORS["get_source_of_asset"], asset_word)},
+                    hex(block),
+                ],
+                "get_source_of_asset",
+                asset,
+                None,
+            )
+            source = None
+            if source_result is not None:
+                try:
+                    source = word_address(words(source_result)[0])
+                    source_evidence["source"] = source
+                except ExportError:
+                    source_evidence["success"] = False
+                    source_evidence["failure_class"] = "invalid_source_address"
+            calls.append(source_evidence)
+            target = source or "0x" + "0" * 40
+            methods = (
+                ("source_code", "eth_getCode", [target, hex(block)]),
+                (
+                    "get_asset_price",
+                    "eth_call",
+                    [
+                        {"to": ORACLE, "data": call_data(SELECTORS["get_asset_price"], asset_word)},
+                        hex(block),
+                    ],
+                ),
+                (
+                    "latest_answer",
+                    "eth_call",
+                    [{"to": target, "data": call_data(ORACLE_SELECTORS["latest_answer"])}, hex(block)],
+                ),
+                (
+                    "latest_round_data",
+                    "eth_call",
+                    [{"to": target, "data": call_data(SELECTORS["latest_round_data"])}, hex(block)],
+                ),
+                (
+                    "latest_timestamp",
+                    "eth_call",
+                    [{"to": target, "data": call_data(ORACLE_SELECTORS["latest_timestamp"])}, hex(block)],
+                ),
+                (
+                    "decimals",
+                    "eth_call",
+                    [{"to": target, "data": call_data(SELECTORS["decimals"])}, hex(block)],
+                ),
+            )
+            for semantic, method, params in methods:
+                result, evidence = _capability_probe(
+                    provider, method, params, semantic, asset, source
+                )
+                if result is not None and semantic in {
+                    "get_asset_price",
+                    "latest_answer",
+                    "latest_timestamp",
+                    "decimals",
+                }:
+                    try:
+                        value = (
+                            word_int(words(result)[0])
+                            if semantic == "latest_answer"
+                            else word_uint(words(result)[0])
+                        )
+                        evidence["integer_value"] = value
+                    except ExportError:
+                        evidence["success"] = False
+                        evidence["failure_class"] = "invalid_integer_result"
+                if result is not None and semantic == "source_code":
+                    evidence["source_code_sha256"] = _result_hash(result)
+                calls.append(evidence)
+
+    usage = _sanitized_request_usage(providers)
+    runtime_ms = (time.monotonic_ns() - started_ns) // 1_000_000
+    if (
+        runtime_ms > ORACLE_CAPABILITY_MAX_RUNTIME_SECONDS * 1_000
+        or any(
+            item["json_rpc_item_count"] > ORACLE_CAPABILITY_MAX_ITEMS_PER_PROVIDER
+            or item["retry_count"] != 0
+            for item in usage
+        )
+    ):
+        raise ExportError("oracle capability matrix exceeded a hard bound")
+    return bind_hash(
+        {
+            "schema": ORACLE_CAPABILITY_SCHEMA,
+            "status": "oracle_capability_matrix",
+            "chain_id": CHAIN_ID,
+            "checkpoint_block": block,
+            "checkpoint_hash": exact_headers[0]["hash"],
+            "checkpoint_state_root": exact_headers[0]["state_root"],
+            "checkpoint_timestamp": exact_headers[0]["timestamp"],
+            "provider_headers": [
+                {
+                    **_provider_binding(provider),
+                    "checkpoint": header,
+                }
+                for provider, header in zip(providers, exact_headers)
+            ],
+            "assets": list(ORACLE_CAPABILITY_ASSETS),
+            "calls": calls,
+            "provider_request_usage": usage,
+            "individual_json_rpc_calls_only": True,
+            "automatic_retries": 0,
+            "raw_rpc_responses_persisted": False,
+            "candidate_authority": False,
+            "execution_authority": False,
+            "runtime_ms": runtime_ms,
+        }
+    )
 
 
 def refresh_signals(
@@ -357,7 +603,7 @@ def refresh_signals(
         )
 
     elapsed_ms = (time.monotonic_ns() - started_ns) // 1_000_000
-    usage = provider_request_usage(providers)
+    usage = _sanitized_request_usage(providers)
     if (
         elapsed_ms > REFRESH_MAX_SECONDS * 1_000
         or any(
@@ -753,6 +999,279 @@ def _relevant_reserves(
     return assets, configurations
 
 
+def _oracle_provider_record(
+    provider: Any, asset: str, block: int
+) -> dict[str, Any]:
+    asset_word = encode_address(asset)
+    source_result, source_call = _capability_probe(
+        provider,
+        "eth_call",
+        [
+            {
+                "to": ORACLE,
+                "data": call_data(SELECTORS["get_source_of_asset"], asset_word),
+            },
+            hex(block),
+        ],
+        "get_source_of_asset",
+        asset,
+        None,
+    )
+    source = None
+    if source_result is not None:
+        try:
+            source = word_address(words(source_result)[0])
+            source_call["source"] = source
+        except ExportError:
+            source_call["success"] = False
+            source_call["failure_class"] = "invalid_source_address"
+    target = source or "0x" + "0" * 40
+    probes = {
+        "source_code": _capability_probe(
+            provider,
+            "eth_getCode",
+            [target, hex(block)],
+            "source_code",
+            asset,
+            source,
+        ),
+        "get_asset_price": _capability_probe(
+            provider,
+            "eth_call",
+            [
+                {
+                    "to": ORACLE,
+                    "data": call_data(SELECTORS["get_asset_price"], asset_word),
+                },
+                hex(block),
+            ],
+            "get_asset_price",
+            asset,
+            source,
+        ),
+        "latest_answer": _capability_probe(
+            provider,
+            "eth_call",
+            [
+                {
+                    "to": target,
+                    "data": call_data(ORACLE_SELECTORS["latest_answer"]),
+                },
+                hex(block),
+            ],
+            "latest_answer",
+            asset,
+            source,
+        ),
+        "latest_round_data": _capability_probe(
+            provider,
+            "eth_call",
+            [
+                {
+                    "to": target,
+                    "data": call_data(SELECTORS["latest_round_data"]),
+                },
+                hex(block),
+            ],
+            "latest_round_data",
+            asset,
+            source,
+        ),
+        "decimals": _capability_probe(
+            provider,
+            "eth_call",
+            [
+                {"to": target, "data": call_data(SELECTORS["decimals"])},
+                hex(block),
+            ],
+            "decimals",
+            asset,
+            source,
+        ),
+    }
+    record: dict[str, Any] = {
+        "asset": asset,
+        "source": source,
+        "provider_id": provider.label,
+        "provider_reference_sha256": provider.provider_reference_sha256,
+        "calls": {
+            "get_source_of_asset": source_call,
+            **{name: evidence for name, (_result, evidence) in probes.items()},
+        },
+    }
+    code_result = probes["source_code"][0]
+    if code_result is not None:
+        record["source_code_sha256"] = _result_hash(code_result)
+        record["source_code_length_bytes"] = (len(code_result) - 2) // 2
+    price_result = probes["get_asset_price"][0]
+    answer_result = probes["latest_answer"][0]
+    decimals_result = probes["decimals"][0]
+    if price_result is not None:
+        try:
+            record["aave_oracle_price"] = word_uint(words(price_result)[0])
+        except ExportError:
+            record["calls"]["get_asset_price"]["success"] = False
+            record["calls"]["get_asset_price"]["failure_class"] = (
+                "invalid_integer_result"
+            )
+    if answer_result is not None:
+        try:
+            record["source_latest_answer"] = word_int(words(answer_result)[0])
+        except ExportError:
+            record["calls"]["latest_answer"]["success"] = False
+            record["calls"]["latest_answer"]["failure_class"] = (
+                "invalid_integer_result"
+            )
+    if decimals_result is not None:
+        try:
+            record["source_decimals"] = word_uint(words(decimals_result)[0])
+        except ExportError:
+            record["calls"]["decimals"]["success"] = False
+            record["calls"]["decimals"]["failure_class"] = (
+                "invalid_integer_result"
+            )
+    round_result = probes["latest_round_data"][0]
+    if round_result is None:
+        record["round_metadata"] = {
+            "supported": False,
+            "failure_class": probes["latest_round_data"][1]["failure_class"],
+        }
+    else:
+        try:
+            values = words(round_result, 5)
+            if len(values) != 5:
+                raise ExportError("oracle round result length is invalid")
+            record["round_metadata"] = {
+                "supported": True,
+                "round_id": word_uint(values[0]),
+                "answer": word_int(values[1]),
+                "started_at": word_uint(values[2]),
+                "updated_at": word_uint(values[3]),
+                "answered_in_round": word_uint(values[4]),
+                "response_sha256": _result_hash(round_result),
+            }
+        except ExportError:
+            record["round_metadata"] = {
+                "supported": False,
+                "failure_class": "invalid_round_result",
+            }
+    return record
+
+
+def _oracle_failure(message: str, records: list[dict[str, Any]]) -> None:
+    raise CandidateEvidenceError(
+        message,
+        {"oracle_provider_evidence": records},
+        stage="candidate_oracle_semantics",
+        method="eth_call",
+    )
+
+
+def _select_oracle_policy(
+    asset: str, records: list[dict[str, Any]]
+) -> dict[str, Any]:
+    if len(records) != 2:
+        _oracle_failure("candidate oracle requires exactly two Providers", records)
+    required_calls = (
+        "get_source_of_asset",
+        "source_code",
+        "get_asset_price",
+        "latest_answer",
+    )
+    if any(
+        not record["calls"][method]["success"]
+        for record in records
+        for method in required_calls
+    ):
+        _oracle_failure("candidate oracle required capability failed", records)
+    sources = {record.get("source") for record in records}
+    code_hashes = {record.get("source_code_sha256") for record in records}
+    prices = {record.get("aave_oracle_price") for record in records}
+    answers = {record.get("source_latest_answer") for record in records}
+    if sources == {None} or "0x" + "0" * 40 in sources:
+        _oracle_failure("candidate oracle hidden fallback source rejected", records)
+    if len(sources) != 1:
+        _oracle_failure("candidate oracle source disagreement", records)
+    if len(code_hashes) != 1 or None in code_hashes:
+        _oracle_failure("candidate oracle source code disagreement", records)
+    if any(record.get("source_code_length_bytes", 0) <= 0 for record in records):
+        _oracle_failure("candidate oracle source code is missing", records)
+    if len(prices) != 1:
+        _oracle_failure("candidate AaveOracle price disagreement", records)
+    if len(answers) != 1:
+        _oracle_failure("candidate oracle latestAnswer disagreement", records)
+    price = next(iter(prices))
+    answer = next(iter(answers))
+    if not isinstance(price, int) or not isinstance(answer, int) or price <= 0 or answer <= 0:
+        _oracle_failure("candidate oracle price is nonpositive", records)
+    if answer != price:
+        _oracle_failure("candidate latestAnswer/AaveOracle price mismatch", records)
+
+    rounds = [record["round_metadata"] for record in records]
+    successful_rounds = [item for item in rounds if item.get("supported") is True]
+    for item in successful_rounds:
+        if (
+            item["round_id"] == 0
+            or item["answer"] <= 0
+            or item["updated_at"] == 0
+            or item["answered_in_round"] < item["round_id"]
+            or item["answer"] != answer
+        ):
+            _oracle_failure("candidate oracle round metadata is invalid", records)
+    if len(successful_rounds) == 2:
+        comparable = [
+            {
+                key: item[key]
+                for key in (
+                    "round_id",
+                    "answer",
+                    "started_at",
+                    "updated_at",
+                    "answered_in_round",
+                )
+            }
+            for item in successful_rounds
+        ]
+        if comparable[0] != comparable[1]:
+            _oracle_failure("candidate oracle round metadata disagreement", records)
+        semantics = "aggregator_v3_round_data"
+        round_metadata_supported = True
+        round_metadata = comparable[0]
+    else:
+        failures = [
+            item.get("failure_class")
+            for item in rounds
+            if item.get("supported") is not True
+        ]
+        if any(failure not in ROUND_CAPABILITY_FAILURES for failure in failures):
+            _oracle_failure("candidate oracle unexpected Provider error", records)
+        semantics = "aave_v3_latest_answer"
+        round_metadata_supported = False
+        round_metadata = None
+    return {
+        "asset": asset,
+        "source": next(iter(sources)),
+        "source_code_sha256": next(iter(code_hashes)),
+        "aave_oracle_price": price,
+        "source_latest_answer": answer,
+        "oracle_semantics": semantics,
+        "round_metadata_supported": round_metadata_supported,
+        "round_metadata": round_metadata,
+        "fallback_path_active": False,
+        "fallback_path_proof": (
+            "positive_source_latest_answer_equals_aave_oracle_price"
+        ),
+        "provider_evidence": records,
+    }
+
+
+def _oracle_state(providers: list[Any], block: int, asset: str) -> dict[str, Any]:
+    return _select_oracle_policy(
+        asset,
+        [_oracle_provider_record(provider, asset, block) for provider in providers],
+    )
+
+
 def _reserve_state(
     providers: list[Any],
     block: int,
@@ -774,71 +1293,7 @@ def _reserve_state(
         )
         if len(token_words) != 3:
             raise ExportError("candidate reserve token result is invalid")
-        price_feed = word_address(
-            words(
-                _agreed_eth_call(
-                    providers,
-                    ORACLE,
-                    call_data(SELECTORS["get_source_of_asset"], asset_word),
-                    block,
-                    "candidate_oracle_source",
-                )
-            )[0]
-        )
-        price = word_uint(
-            words(
-                _agreed_eth_call(
-                    providers,
-                    ORACLE,
-                    call_data(SELECTORS["get_asset_price"], asset_word),
-                    block,
-                    "candidate_oracle_price",
-                )
-            )[0]
-        )
-        feed_decimals = word_uint(
-            words(
-                _agreed_eth_call(
-                    providers,
-                    price_feed,
-                    call_data(SELECTORS["decimals"]),
-                    block,
-                    "candidate_oracle_decimals",
-                )
-            )[0]
-        )
-        round_values = words(
-            _agreed_eth_call(
-                providers,
-                price_feed,
-                call_data(SELECTORS["latest_round_data"]),
-                block,
-                "candidate_oracle_round",
-            ),
-            5,
-        )
-        if len(round_values) != 5:
-            raise ExportError("candidate oracle round result is invalid")
-        round_id = word_uint(round_values[0])
-        answer = word_int(round_values[1])
-        started_at = word_uint(round_values[2])
-        updated_at = word_uint(round_values[3])
-        answered_in_round = word_uint(round_values[4])
-        normalized = (
-            answer // (10 ** (feed_decimals - 8))
-            if feed_decimals >= 8
-            else answer * (10 ** (8 - feed_decimals))
-        )
-        if (
-            price <= 0
-            or round_id == 0
-            or answer <= 0
-            or started_at == 0
-            or updated_at == 0
-            or answered_in_round < round_id
-            or normalized != price
-        ):
-            raise ExportError("candidate oracle round/price validation failed")
+        oracle = _oracle_state(providers, block, asset)
         configuration = configurations[asset]
         reserves.append(
             {
@@ -885,15 +1340,17 @@ def _reserve_state(
                         )
                     )[0]
                 ),
-                "price_feed": price_feed,
-                "price_base_units": price,
+                "price_feed": oracle["source"],
+                "oracle_source_code_sha256": oracle["source_code_sha256"],
+                "oracle_semantics": oracle["oracle_semantics"],
+                "round_metadata_supported": oracle["round_metadata_supported"],
+                "round_metadata": oracle["round_metadata"],
+                "fallback_path_active": oracle["fallback_path_active"],
+                "fallback_path_proof": oracle["fallback_path_proof"],
+                "oracle_provider_evidence": oracle["provider_evidence"],
+                "price_base_units": oracle["aave_oracle_price"],
                 "price_base_decimals": 8,
-                "price_feed_decimals": feed_decimals,
-                "price_feed_round_id": round_id,
-                "price_feed_answer": answer,
-                "price_feed_started_at": started_at,
-                "price_feed_updated_at": updated_at,
-                "price_feed_answered_in_round": answered_in_round,
+                "price_feed_answer": oracle["source_latest_answer"],
             }
         )
     return reserves
@@ -1198,7 +1655,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                     "relevant_reserve_count": 0,
                     "candidate_count": 0,
                     "candidate_authority": False,
-                    "provider_request_usage": provider_request_usage(providers),
+                    "provider_request_usage": _sanitized_request_usage(providers),
                 }
             )
             write_private_json(_artifact_path(args.output_dir, "blocked", artifact), artifact)
@@ -1220,7 +1677,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                     "reserve_reconstruction_skipped": True,
                     "economics_skipped": True,
                     "fork_skipped": True,
-                    "provider_request_usage": provider_request_usage(providers),
+                    "provider_request_usage": _sanitized_request_usage(providers),
                     "runtime_ms": (time.monotonic_ns() - started_ns) // 1_000_000,
                 }
             )
@@ -1245,7 +1702,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 "relevant_reserve_count": len(asset_ids),
                 "selected_configuration_source": selected_source,
                 "calls": matrix_evidence,
-                "provider_request_usage": provider_request_usage(providers),
+                "provider_request_usage": _sanitized_request_usage(providers),
                 "raw_rpc_responses_persisted": False,
                 "candidate_authority": False,
                 "execution_authority": False,
@@ -1276,23 +1733,58 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             refresh["checkpoint_block"],
             refresh["implementation_words"],
         )
-        reserves = _reserve_state(
-            providers,
-            refresh["checkpoint_block"],
-            asset_ids,
-            configurations,
-        )
-        borrowers, emodes = _borrowers(
-            providers,
-            refresh["checkpoint_block"],
-            liquidatable_rows,
-            reserves,
-            user_configurations,
-        )
-        candidates = _eligible_pairs(
-            borrowers, reserves, refresh["checkpoint_timestamp"]
-        )
-        usage = provider_request_usage(providers)
+        try:
+            reserves = _reserve_state(
+                providers,
+                refresh["checkpoint_block"],
+                asset_ids,
+                configurations,
+            )
+            borrowers, emodes = _borrowers(
+                providers,
+                refresh["checkpoint_block"],
+                liquidatable_rows,
+                reserves,
+                user_configurations,
+            )
+            candidates = _eligible_pairs(
+                borrowers, reserves, refresh["checkpoint_timestamp"]
+            )
+        except Exception as error:
+            partial = {
+                **base,
+                "status": "failed_closed",
+                "terminal": "LIVE_PLATFORM_BLOCKER",
+                "relevant_reserve_count": len(asset_ids),
+                "relevant_reserves": [
+                    {"asset": asset, "reserve_id": reserve_id}
+                    for asset, reserve_id in sorted(
+                        asset_ids.items(), key=lambda item: item[1]
+                    )
+                ],
+                "configuration_matrix_content_sha256": matrix["content_sha256"],
+                "selected_reserve_configuration_source": selected_source,
+                "candidate_count": 0,
+                "candidate_authority": False,
+                "provider_request_usage": _sanitized_request_usage(providers),
+            }
+            stage = "candidate_exact_validation"
+            method = None
+            if isinstance(error, CandidateEvidenceError):
+                partial.update(error.evidence)
+                stage = error.stage or stage
+                method = error.method
+            elif isinstance(error, ProviderDiagnosticError):
+                partial["provider_failure"] = error.sanitized_evidence()
+                stage = error.stage
+                method = error.method
+            raise CandidateEvidenceError(
+                "candidate exact validation failed closed",
+                partial,
+                stage=stage,
+                method=method,
+            ) from error
+        usage = _sanitized_request_usage(providers)
         runtime_ms = (time.monotonic_ns() - started_ns) // 1_000_000
         if (
             runtime_ms > args.max_runtime_seconds * 1_000
@@ -1329,13 +1821,101 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         )
         write_private_json(_artifact_path(args.output_dir, "exact", artifact), artifact)
         return artifact
+    except Exception as error:
+        if (
+            isinstance(error, CandidateEvidenceError)
+            and "signal_rows" in error.evidence
+        ):
+            raise
+        if "base" not in locals():
+            raise
+        observed_assets = locals().get("asset_ids", {})
+        partial = {
+            **base,
+            "status": "failed_closed",
+            "terminal": "LIVE_PLATFORM_BLOCKER",
+            "relevant_reserve_count": len(observed_assets),
+            "relevant_reserves": [
+                {"asset": asset, "reserve_id": reserve_id}
+                for asset, reserve_id in sorted(
+                    observed_assets.items(), key=lambda item: item[1]
+                )
+            ],
+            "candidate_count": 0,
+            "candidate_authority": False,
+            "provider_request_usage": _sanitized_request_usage(providers),
+        }
+        observed_matrix = locals().get("matrix")
+        if isinstance(observed_matrix, dict):
+            partial["configuration_matrix_content_sha256"] = observed_matrix.get(
+                "content_sha256"
+            )
+        if "selected_source" in locals():
+            partial["selected_reserve_configuration_source"] = selected_source
+        stage = "candidate_exact_validation"
+        method = None
+        if isinstance(error, CandidateEvidenceError):
+            partial.update(error.evidence)
+            stage = error.stage or stage
+            method = error.method
+        elif isinstance(error, ProviderDiagnosticError):
+            partial["provider_failure"] = error.sanitized_evidence()
+            stage = error.stage
+            method = error.method
+        raise CandidateEvidenceError(
+            "candidate exact validation failed closed",
+            partial,
+            stage=stage,
+            method=method,
+        ) from error
+    finally:
+        for provider in providers:
+            provider.close()
+
+
+def run_oracle_capability(args: argparse.Namespace) -> dict[str, Any]:
+    providers: list[Any] = []
+    started_ns = time.monotonic_ns()
+    try:
+        providers = [
+            SSHContainerProvider(
+                "production-nownodes-arbitrum",
+                args.ssh_executable,
+                args.ssh_provider_host,
+                args.ssh_provider_port,
+                args.ssh_provider_identity,
+                args.ssh_provider_known_hosts,
+                args.ssh_provider_container,
+                0,
+                authenticated=True,
+            ),
+            SSHContainerProvider(
+                "production-slot-0",
+                args.ssh_executable,
+                args.ssh_provider_host,
+                args.ssh_provider_port,
+                args.ssh_provider_identity,
+                args.ssh_provider_known_hosts,
+                args.ssh_provider_container,
+                0,
+            ),
+        ]
+        if len({provider.provider_reference_sha256 for provider in providers}) != 2:
+            raise ExportError("oracle capability provider independence is absent")
+        artifact = oracle_capability_matrix(providers, started_ns)
+        write_private_json(
+            _artifact_path(args.output_dir, "oracle-capability", artifact), artifact
+        )
+        return artifact
     finally:
         for provider in providers:
             provider.close()
 
 
 def failure_artifact(error: Exception) -> dict[str, Any]:
+    evidence = error.evidence if isinstance(error, CandidateEvidenceError) else {}
     artifact: dict[str, Any] = {
+        **evidence,
         "schema": "phoenix.atlas.aave-candidate-exact-validation-error.v1",
         "status": "failed_closed",
         "terminal": "LIVE_PLATFORM_BLOCKER",
@@ -1343,7 +1923,11 @@ def failure_artifact(error: Exception) -> dict[str, Any]:
         "candidate_authority": False,
         "execution_authority": False,
     }
-    if isinstance(error, ProviderDiagnosticError):
+    if isinstance(error, CandidateEvidenceError):
+        artifact["failure_class"] = "candidate_exact_invariant_failed"
+        artifact["stage"] = error.stage
+        artifact["method"] = error.method
+    elif isinstance(error, ProviderDiagnosticError):
         artifact.update(error.sanitized_evidence())
     else:
         artifact["failure_class"] = "candidate_exact_invariant_failed"
@@ -1351,6 +1935,32 @@ def failure_artifact(error: Exception) -> dict[str, Any]:
 
 
 def _summary(artifact: dict[str, Any]) -> dict[str, Any]:
+    oracle_evidence = [
+        {
+            "asset": reserve.get("asset"),
+            "source": reserve.get("price_feed"),
+            "oracle_semantics": reserve.get("oracle_semantics"),
+            "round_metadata_supported": reserve.get(
+                "round_metadata_supported"
+            ),
+        }
+        for reserve in artifact.get("reserves", [])
+    ]
+    if not oracle_evidence:
+        seen: set[tuple[Any, Any]] = set()
+        for record in artifact.get("oracle_provider_evidence", []):
+            key = (record.get("asset"), record.get("source"))
+            if key in seen:
+                continue
+            seen.add(key)
+            oracle_evidence.append(
+                {
+                    "asset": key[0],
+                    "source": key[1],
+                    "oracle_semantics": None,
+                    "round_metadata_supported": None,
+                }
+            )
     return {
         "schema": artifact["schema"],
         "status": artifact.get("status"),
@@ -1372,6 +1982,7 @@ def _summary(artifact: dict[str, Any]) -> dict[str, Any]:
         "selected_reserve_configuration_source": artifact.get(
             "selected_reserve_configuration_source"
         ),
+        "oracle_evidence": oracle_evidence,
         "candidate_count": artifact.get("candidate_count", 0),
         "candidate_authority": artifact.get("candidate_authority", False),
         "execution_authority": False,
@@ -1396,6 +2007,7 @@ def main() -> int:
     parser.add_argument(
         "--max-items-per-provider", type=int, default=MAX_ITEMS_PER_PROVIDER
     )
+    parser.add_argument("--oracle-capability-only", action="store_true")
     args = parser.parse_args()
     if (
         not 1 <= args.max_relevant_reserves <= MAX_RELEVANT_RESERVES
@@ -1405,7 +2017,7 @@ def main() -> int:
         print(json.dumps(_summary(failure_artifact(ExportError("invalid bound"))), sort_keys=True))
         return 1
     try:
-        artifact = run(args)
+        artifact = run_oracle_capability(args) if args.oracle_capability_only else run(args)
     except Exception as error:
         artifact = failure_artifact(error)
         write_private_json(_artifact_path(args.output_dir, "error", artifact), artifact)

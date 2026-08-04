@@ -175,6 +175,18 @@ the compatibility getters return the reviewed disabled/zero values. Raw RPC
 results and provider URLs are never persisted. Complete state can grant only
 Candidate authority; execution authority is always false.
 
+Oracle validation follows the pinned Aave V3 `AaveOracle.getAssetPrice`
+semantics: both providers must agree on the configured source, source bytecode,
+the positive source `latestAnswer()`, and the exact AaveOracle price, and those
+two integers must match without decimal normalization. Full AggregatorV3 round
+metadata is validated when both providers expose it. A reviewed source-level
+revert of optional `latestRoundData()` selects the explicit
+`aave_v3_latest_answer` policy instead; zero sources, nonpositive answers,
+hidden fallback use, provider disagreement, or unexpected provider errors
+remain fail-closed. The bounded capability matrix and all Candidate artifacts
+retain public Oracle source addresses and provider-reference hashes, but never
+Provider endpoints, credentials, request headers, or raw responses.
+
 Current-state candidate reconstruction uses the fixed provider identities
 `production-nownodes-arbitrum` and `production-slot-0`. NOWNodes is the
 operational primary and is configured only with the public endpoint
