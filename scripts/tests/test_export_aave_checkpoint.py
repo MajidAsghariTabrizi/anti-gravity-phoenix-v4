@@ -42,6 +42,9 @@ class HeaderProvider:
     def __init__(self, label, reference):
         self.label = label
         self.provider_reference_sha256 = reference
+        self.endpoint_identity = label
+        self.header_name = None
+        self.authenticated = False
 
     def call(self, method, params):
         assert method == "eth_getBlockByNumber"
@@ -51,6 +54,7 @@ class HeaderProvider:
             "hash": "0x" + "a" * 64,
             "parentHash": "0x" + "b" * 64,
             "timestamp": hex(1_700_000_000),
+            "stateRoot": "0x" + "c" * 64,
         }
 
 

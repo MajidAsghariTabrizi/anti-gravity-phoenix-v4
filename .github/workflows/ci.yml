@@ -148,8 +148,10 @@ jobs:
             scripts/release_platform.py \
             scripts/release_provenance.py \
             scripts/atlas_aave_fork_package.py \
+            scripts/atlas_aave_provider_preflight.py \
             scripts/atlas_aave_provider_agreement.py \
             scripts/atlas_borrower_index.py \
+            scripts/ethereum_state_proof.py \
             scripts/export_aave_borrow_discovery.py \
             scripts/export_aave_checkpoint.py \
             scripts/probe_aave_archive_provider.py \
@@ -163,8 +165,10 @@ jobs:
             scripts.tests.test_release_provenance \
             scripts.tests.test_phoenix_release \
             scripts.tests.test_atlas_aave_fork_package \
+            scripts.tests.test_atlas_aave_provider_preflight \
             scripts.tests.test_atlas_aave_provider_agreement \
             scripts.tests.test_atlas_borrower_index \
+            scripts.tests.test_ethereum_state_proof \
             scripts.tests.test_export_aave_borrow_discovery \
             scripts.tests.test_export_aave_checkpoint \
             scripts.tests.test_verify_aave_borrow_archive

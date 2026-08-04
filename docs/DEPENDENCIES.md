@@ -147,6 +147,35 @@ does not claim independent tail completeness and grants no candidate authority.
 The SSH bridge binds distinct protected provider references without emitting
 provider URLs. Each batch and cursor is root-only, immutable, and hash-bound.
 
+Current-state candidate reconstruction uses the fixed provider identities
+`production-nownodes-arbitrum` and `production-slot-0`. NOWNodes is the
+operational primary and is configured only with the public endpoint
+`https://arbitrum.nownodes.io/`; its `api-key` credential is supplied as an
+HTTP header from the protected runtime file and is never placed in a URL,
+environment file, release package, manifest, log, or evidence artifact. The
+credential file is root-owned and group-readable only by the verified
+`65532:65532` rpc-gateway runtime. Provider Slot 0 remains the independently
+operated proof-capable peer.
+
+Both providers must agree on direct exact-block code, storage, and calls.
+Provider Slot 0 must additionally return a valid EIP-1186 account/storage proof
+whose account path is verified against the finalized block `stateRoot` and
+whose storage path is verified against the proved account storage root. The
+reviewed NOWNodes response to `eth_getProof` is an exact HTTP 405 capability
+limitation, represented as
+`secondary_proof_supported=false`,
+`secondary_cryptographic_proof=false`, and
+`direct_state_independent_agreement=true`; no other status or error class is
+accepted. This limitation grants no execution authority and never substitutes
+for direct independent agreement or the Slot 0 cryptographic proof.
+
+Bounded borrower scans hash-bind per-provider request and transport counts
+before advancing the cursor. The included NOWNodes request budget is 1,000,000
+requests, with a 250,000 reserve, a 500,000 warning threshold, and a 700,000
+broad-scan stop threshold. A batch that fails provider agreement, proof
+validation, budget validation, or any write-precondition leaves the committed
+cursor unchanged.
+
 scripts/atlas_borrower_index.py independently derives Health Factor from the
 agreed integer state and rejects disagreement with the Pool's exact
 `getUserAccountData` result. It retains liquidatable and bounded near-threshold

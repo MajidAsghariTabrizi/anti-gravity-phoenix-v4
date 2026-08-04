@@ -1,7 +1,9 @@
 use rpc_gateway::economic::MethodTimeouts;
 use rpc_gateway::hunter_state::{HunterStateRequest, HUNTER_STATE_REQUEST_SCHEMA};
 use rpc_gateway::metrics::RuntimeRpcMetrics;
-use rpc_gateway::providers::parse_provider_config;
+use rpc_gateway::providers::{
+    append_header_authenticated_provider, parse_provider_config_with_ids,
+};
 use rpc_gateway::runtime::{GatewayError, GatewayLimits, GatewayRuntime};
 use rpc_gateway::runtime_state::GatewayReadiness;
 use rpc_gateway::shadow_state::{
@@ -11,7 +13,8 @@ use rpc_gateway::source_state::SourceEvidenceRequest;
 use rpc_gateway::transport::ReqwestJsonRpcClient;
 use serde::Serialize;
 use std::error::Error;
-use std::io;
+use std::io::{self, Read};
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -35,8 +38,20 @@ impl Config {
     fn from_env() -> Result<Self, &'static str> {
         let urls = required_env("RPC_PROVIDER_URLS")?;
         let priorities = required_env("RPC_PROVIDER_WEIGHTS")?;
-        let providers = parse_provider_config(&urls, &priorities)
+        let identities = required_env("RPC_PROVIDER_IDS")?;
+        let mut providers = parse_provider_config_with_ids(&urls, &priorities, &identities)
             .map_err(|_| "invalid RPC provider configuration")?;
+        let authenticated_secret =
+            read_header_secret(required_env("RPC_AUTH_PROVIDER_HEADER_FILE")?)?;
+        append_header_authenticated_provider(
+            &mut providers,
+            &required_env("RPC_AUTH_PROVIDER_ID")?,
+            &required_env("RPC_AUTH_PROVIDER_URL")?,
+            positive_u32_from_env("RPC_AUTH_PROVIDER_PRIORITY", 100)?,
+            &required_env("RPC_AUTH_PROVIDER_HEADER_NAME")?,
+            &authenticated_secret,
+        )
+        .map_err(|_| "invalid authenticated RPC provider configuration")?;
         if std::env::var("AUTONOMOUS_EXECUTION")
             .map(|value| value.eq_ignore_ascii_case("true"))
             .unwrap_or(false)
@@ -70,6 +85,28 @@ impl Config {
             )?)),
         })
     }
+}
+
+fn read_header_secret(path: String) -> Result<String, &'static str> {
+    let path = Path::new(&path);
+    if !path.is_absolute() || path.is_symlink() {
+        return Err("authenticated RPC provider secret file is unsafe");
+    }
+    let file = std::fs::File::open(path)
+        .map_err(|_| "authenticated RPC provider secret file is unavailable")?;
+    let mut bytes = Vec::with_capacity(4097);
+    file.take(4097)
+        .read_to_end(&mut bytes)
+        .map_err(|_| "authenticated RPC provider secret file is unavailable")?;
+    if bytes.is_empty() || bytes.len() > 4096 {
+        return Err("authenticated RPC provider secret file is invalid");
+    }
+    let value = String::from_utf8(bytes)
+        .map_err(|_| "authenticated RPC provider secret file is invalid")?;
+    if value.contains(['\r', '\n']) {
+        return Err("authenticated RPC provider secret file is invalid");
+    }
+    Ok(value)
 }
 
 #[tokio::main]
@@ -512,6 +549,7 @@ async fn wait_for_shutdown_signal() {
 mod tests {
     use super::*;
     use rpc_gateway::metrics::REQUIRED_RPC_METRICS;
+    use std::fs;
 
     #[test]
     fn parser_finds_headers_and_rejects_invalid_request_lines() {
@@ -541,5 +579,23 @@ mod tests {
         ] {
             assert!(!source.to_ascii_lowercase().contains(&forbidden));
         }
+    }
+
+    #[test]
+    fn authenticated_provider_secret_read_is_bounded_and_single_line() {
+        let directory =
+            std::env::temp_dir().join(format!("phoenix-rpc-secret-test-{}", std::process::id()));
+        let path = directory.join("credential");
+        fs::create_dir_all(&directory).unwrap();
+        fs::write(&path, b"fake-sensitive-value").unwrap();
+        assert_eq!(
+            read_header_secret(path.to_string_lossy().into_owned()).unwrap(),
+            "fake-sensitive-value"
+        );
+        fs::write(&path, b"fake-sensitive-value\nsecond-line").unwrap();
+        assert!(read_header_secret(path.to_string_lossy().into_owned()).is_err());
+        fs::write(&path, vec![b'x'; 4097]).unwrap();
+        assert!(read_header_secret(path.to_string_lossy().into_owned()).is_err());
+        fs::remove_dir_all(directory).unwrap();
     }
 }

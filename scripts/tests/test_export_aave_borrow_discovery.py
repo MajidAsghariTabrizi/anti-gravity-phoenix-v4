@@ -40,6 +40,26 @@ class SplitProvider:
 
 
 class AaveBorrowDiscoveryTests(unittest.TestCase):
+    def test_current_state_bridge_allows_calls_and_disables_redirects(self):
+        provider = object.__new__(MODULE.SSHContainerProvider)
+        provider.label = "production-nownodes-arbitrum"
+        provider._request_id = 0
+        provider.retry_count = 0
+        provider._process = mock.Mock()
+        provider._process.poll.return_value = None
+        provider._request = mock.Mock(return_value={"result": "0x1234"})
+        self.assertEqual(
+            provider.call("eth_call", [{"to": "0x" + "1" * 40}, "0x1"]),
+            "0x1234",
+        )
+        module_source = MODULE_PATH.read_text(encoding="utf-8")
+        source = module_source.split("class SSHContainerProvider", 1)[1].split(
+            "\ndef header", 1
+        )[0]
+        self.assertIn("class NoRedirect", source)
+        self.assertIn("opener.open(request", source)
+        self.assertNotIn("urllib.request.urlopen(request", source)
+
     def test_provider_environment_reference_is_protected_and_single_provider_safe(self):
         with mock.patch.dict(
             MODULE.os.environ,

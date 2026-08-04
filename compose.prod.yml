@@ -83,10 +83,23 @@ services:
       RPC_GATEWAY_ADDR: 0.0.0.0:9300
       RPC_PROVIDER_URLS: ${RPC_PROVIDER_URLS:?RPC_PROVIDER_URLS is required}
       RPC_PROVIDER_WEIGHTS: ${RPC_PROVIDER_WEIGHTS:-1}
+      RPC_PROVIDER_IDS: ${RPC_PROVIDER_IDS:-production-slot-0,availability-slot-1}
+      RPC_AUTH_PROVIDER_ID: production-nownodes-arbitrum
+      RPC_AUTH_PROVIDER_URL: https://arbitrum.nownodes.io/
+      RPC_AUTH_PROVIDER_PRIORITY: "100"
+      RPC_AUTH_PROVIDER_HEADER_NAME: api-key
+      RPC_AUTH_PROVIDER_HEADER_FILE: /run/secrets/phoenix-rpc-provider-slot-1-api-key
       RPC_UPSTREAM_CALLS_PER_SECOND: ${RPC_UPSTREAM_CALLS_PER_SECOND:-1}
       RPC_UPSTREAM_CALL_BURST: ${RPC_UPSTREAM_CALL_BURST:-4}
       RPC_STATE_REQUESTS_PER_MINUTE: ${RPC_STATE_REQUESTS_PER_MINUTE:-12}
       RPC_PROVIDER_PROBE_INTERVAL_SECONDS: ${RPC_PROVIDER_PROBE_INTERVAL_SECONDS:-60}
+    volumes:
+      - type: bind
+        source: /etc/phoenix/secrets/phoenix-rpc-provider-slot-1-api-key
+        target: /run/secrets/phoenix-rpc-provider-slot-1-api-key
+        read_only: true
+        bind:
+          create_host_path: false
     networks: [phoenix-internal]
     restart: unless-stopped
     logging: *bounded-logging

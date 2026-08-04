@@ -1121,6 +1121,34 @@ class BoundedTransportTests(unittest.TestCase):
         self.assertIn("PermitUserRC no", installer)
         self.assertNotIn("NOPASSWD: ALL", installer)
 
+    def test_authenticated_rpc_secret_is_stdin_only_and_gateway_scoped(self) -> None:
+        installer = (ROOT / "scripts/install-phoenix-release-platform.sh").read_text()
+        workflow = (
+            ROOT / ".github/workflows/phoenix-release-controller.yml"
+        ).read_text()
+        compose = (ROOT / "compose.prod.yml").read_text()
+
+        self.assertIn('install -d -m 0750 -o root -g 65532 "$rpc_secret_dir"', installer)
+        self.assertIn('chown root:65532 "$rpc_secret_candidate"', installer)
+        self.assertIn('chmod 0640 "$rpc_secret_candidate"', installer)
+        self.assertIn("dd iflag=fullblock bs=4097 count=1", installer)
+        self.assertNotIn("PHOENIX_RPC_PROVIDER_SLOT_1_API_KEY", installer)
+        self.assertIn(
+            "PHOENIX_RPC_PROVIDER_SLOT_1_API_KEY: ${{ secrets.PHOENIX_RPC_PROVIDER_SLOT_1_API_KEY }}",
+            workflow,
+        )
+        self.assertIn(
+            'printf \'%s\' "$PHOENIX_RPC_PROVIDER_SLOT_1_API_KEY" |', workflow
+        )
+
+        secret_path = "/run/secrets/phoenix-rpc-provider-slot-1-api-key"
+        self.assertEqual(compose.count(f"target: {secret_path}"), 1)
+        self.assertEqual(
+            compose.count(f"RPC_AUTH_PROVIDER_HEADER_FILE: {secret_path}"), 1
+        )
+        self.assertIn("RPC_AUTH_PROVIDER_ID: production-nownodes-arbitrum", compose)
+        self.assertIn("RPC_AUTH_PROVIDER_HEADER_NAME: api-key", compose)
+
     def test_platform_installs_every_context_safety_dependency(self) -> None:
         context_installer = (
             ROOT / "scripts/install-production-release-context.sh"

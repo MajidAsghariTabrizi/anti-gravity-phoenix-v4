@@ -562,8 +562,10 @@ jobs:
           ROLLBACK_BUILD_RUN_ID: ${{ steps.active.outputs.rollback_build_run_id }}
           EXISTING_PACKAGE: ${{ steps.received.outputs.found }}
           EXISTING_PACKAGE_DIGEST: ${{ steps.received.outputs.package_digest }}
+          PHOENIX_RPC_PROVIDER_SLOT_1_API_KEY: ${{ secrets.PHOENIX_RPC_PROVIDER_SLOT_1_API_KEY }}
         run: |
           set -euo pipefail
+          [ -n "$PHOENIX_RPC_PROVIDER_SLOT_1_API_KEY" ]
           ssh_opts=(
             -i "$HOME/.ssh/id_ed25519"
             -p "$PROD_PORT"
@@ -689,7 +691,8 @@ jobs:
               ;;
           esac
           set +e
-          ssh "${ssh_opts[@]}" "${PROD_USER}@${PROD_HOST}" "resume ${RELEASE_SHA}" \
+          printf '%s' "$PHOENIX_RPC_PROVIDER_SLOT_1_API_KEY" |
+            ssh "${ssh_opts[@]}" "${PROD_USER}@${PROD_HOST}" "resume ${RELEASE_SHA}" \
             >release-evidence.json
           resume_code=$?
           set -e

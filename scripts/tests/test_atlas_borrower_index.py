@@ -380,12 +380,96 @@ def checkpoint(market_value):
 def current_state_checkpoint(market_value):
     value = checkpoint(market_value)
     value.pop("content_sha256")
+    def replace_provider_ids(item):
+        if isinstance(item, dict):
+            return {
+                key: replace_provider_ids(child)
+                for key, child in item.items()
+            }
+        if isinstance(item, list):
+            return [replace_provider_ids(child) for child in item]
+        if item == "reviewed-provider-1":
+            return "production-nownodes-arbitrum"
+        if item == "reviewed-provider-2":
+            return "production-slot-0"
+        return item
+
+    value = replace_provider_ids(value)
     value["schema"] = "phoenix.atlas.aave-checkpoint.v2"
     value.pop("archive_complete")
     value["checkpoint_timestamp"] = 1_700_000_000
     for provider_index, provider_header in enumerate(value["provider_headers"]):
         provider_header["provider_reference_sha256"] = str(8 + provider_index) * 64
         provider_header["checkpoint"]["timestamp"] = 1_700_000_000
+        provider_header["checkpoint"]["state_root"] = "0x" + "6" * 64
+        if provider_index == 0:
+            provider_header.update(
+                endpoint_identity="https://arbitrum.nownodes.io/",
+                header_name="api-key",
+                authenticated=True,
+            )
+        else:
+            provider_header.update(
+                endpoint_identity="rpc-provider-slot-0",
+                header_name=None,
+                authenticated=False,
+            )
+    for provider_index, finalized in enumerate(value["finalized_heads"]):
+        header = value["provider_headers"][provider_index]
+        finalized.update(
+            provider_reference_sha256=header["provider_reference_sha256"],
+            endpoint_identity=header["endpoint_identity"],
+            header_name=header["header_name"],
+            authenticated=header["authenticated"],
+        )
+    value["proof_policy"] = {
+        "schema": "phoenix.atlas.aave-current-state-proof-policy.v1",
+        "checkpoint_block": 100,
+        "operational_primary_provider_id": "production-nownodes-arbitrum",
+        "proof_peer_provider_id": "production-slot-0",
+        "secondary_proof_supported": False,
+        "secondary_cryptographic_proof": False,
+        "direct_state_independent_agreement": True,
+        "nownodes_reviewed_failure": {
+            "method": "eth_getProof",
+            "failure_class": "http_method_not_allowed",
+            "http_status": 405,
+        },
+        "proof_peer": {
+            "cryptographic_proof_valid": True,
+            "proof_response_sha256": "a" * 64,
+            "account_proof_node_count": 2,
+            "storage_proof_node_count": 2,
+        },
+        "checkpoint_grants_execution_authority": False,
+    }
+    value["provider_request_usage"] = [
+        {
+            "provider_id": header["provider_id"],
+            "provider_reference_sha256": header["provider_reference_sha256"],
+            "endpoint_identity": header["endpoint_identity"],
+            "header_name": header["header_name"],
+            "authenticated": header["authenticated"],
+            "json_rpc_item_count": 100 + index,
+            "transport_request_count": 10 + index,
+            "retry_count": 0,
+        }
+        for index, header in enumerate(value["provider_headers"])
+    ]
+    value["request_budget"] = {
+        "included_monthly_requests": 1_000_000,
+        "normal_reserve_requests": 250_000,
+        "warning_threshold_requests": 500_000,
+        "broad_usage_stop_threshold_requests": 700_000,
+        "current_batch_nownodes_json_rpc_items": 100,
+        "current_batch_nownodes_transport_requests": 10,
+        "screened_addresses": 1,
+        "json_rpc_items_per_screened_address_micros": 100_000_000,
+        "projected_seed_total_requests": 1_000,
+        "projected_broad_usage_above_stop_threshold": False,
+        "paid_overage_authorized": False,
+    }
+    value["source_methods"].append("eth_getProof")
     value["seed_provenance"] = {
         "role": "discovery_only",
         "grants_candidate_authority": False,
@@ -420,12 +504,13 @@ def current_state_checkpoint(market_value):
     value["screen_scope"] = {
         "mode": "bounded_resumable_exact_batch",
         "batch_address_count": 1,
+        "queued_address_count": 10,
         "seed_scan_complete_after_batch": False,
     }
     value["independent_state_agreement_scope"].extend(
         ["protocol_implementation_and_code", "oracle_round_state"]
     )
-    providers = ("reviewed-provider-1", "reviewed-provider-2")
+    providers = ("production-nownodes-arbitrum", "production-slot-0")
     value["state_bindings"].extend(
         {
             "provider_id": provider,
@@ -527,6 +612,68 @@ class AtlasBorrowerIndexTests(unittest.TestCase):
         ] -= 1
         checkpoint_value = bind_hash(checkpoint_value)
         with self.assertRaisesRegex(EvidenceError, "protocol/derived account"):
+            build_inventory_from_checkpoint(market_value, checkpoint_value)
+
+    def test_current_state_nownodes_header_binding_is_required(self):
+        market_value = market()
+        checkpoint_value = current_state_checkpoint(market_value)
+        checkpoint_value.pop("content_sha256")
+        checkpoint_value["provider_headers"][0]["header_name"] = "authorization"
+        checkpoint_value = bind_hash(checkpoint_value)
+        with self.assertRaisesRegex(EvidenceError, "NOWNodes provider identity"):
+            build_inventory_from_checkpoint(market_value, checkpoint_value)
+
+    def test_current_state_finalized_state_roots_must_agree(self):
+        market_value = market()
+        checkpoint_value = current_state_checkpoint(market_value)
+        checkpoint_value.pop("content_sha256")
+        checkpoint_value["provider_headers"][1]["checkpoint"]["state_root"] = (
+            "0x" + "7" * 64
+        )
+        checkpoint_value = bind_hash(checkpoint_value)
+        with self.assertRaisesRegex(EvidenceError, "state root disagreement"):
+            build_inventory_from_checkpoint(market_value, checkpoint_value)
+
+    def test_current_state_reviewed_405_is_exact(self):
+        market_value = market()
+        checkpoint_value = current_state_checkpoint(market_value)
+        checkpoint_value.pop("content_sha256")
+        checkpoint_value["proof_policy"]["nownodes_reviewed_failure"][
+            "http_status"
+        ] = 403
+        checkpoint_value = bind_hash(checkpoint_value)
+        with self.assertRaisesRegex(EvidenceError, "proof policy"):
+            build_inventory_from_checkpoint(market_value, checkpoint_value)
+
+    def test_current_state_peer_cryptographic_proof_is_required(self):
+        market_value = market()
+        checkpoint_value = current_state_checkpoint(market_value)
+        checkpoint_value.pop("content_sha256")
+        checkpoint_value["proof_policy"]["proof_peer"][
+            "cryptographic_proof_valid"
+        ] = False
+        checkpoint_value = bind_hash(checkpoint_value)
+        with self.assertRaisesRegex(EvidenceError, "proof policy"):
+            build_inventory_from_checkpoint(market_value, checkpoint_value)
+
+    def test_current_state_direct_agreement_cannot_be_replaced_by_proof(self):
+        market_value = market()
+        checkpoint_value = current_state_checkpoint(market_value)
+        checkpoint_value.pop("content_sha256")
+        checkpoint_value["proof_policy"][
+            "direct_state_independent_agreement"
+        ] = False
+        checkpoint_value = bind_hash(checkpoint_value)
+        with self.assertRaisesRegex(EvidenceError, "proof policy"):
+            build_inventory_from_checkpoint(market_value, checkpoint_value)
+
+    def test_current_state_request_projection_is_exact(self):
+        market_value = market()
+        checkpoint_value = current_state_checkpoint(market_value)
+        checkpoint_value.pop("content_sha256")
+        checkpoint_value["request_budget"]["projected_seed_total_requests"] += 1
+        checkpoint_value = bind_hash(checkpoint_value)
+        with self.assertRaisesRegex(EvidenceError, "request budget"):
             build_inventory_from_checkpoint(market_value, checkpoint_value)
 
     def test_index_is_idempotent_and_hash_bound(self):

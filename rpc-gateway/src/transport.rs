@@ -118,9 +118,11 @@ impl JsonRpcClient for ReqwestJsonRpcClient {
         timeout: Duration,
     ) -> Result<RpcCallResult, TransportError> {
         let started = Instant::now();
-        let response = self
-            .client
-            .post(provider.url())
+        let mut request = self.client.post(provider.url());
+        if let Some((name, value)) = provider.header() {
+            request = request.header(name, value);
+        }
+        let response = request
             .timeout(timeout)
             .json(&json!({
                 "jsonrpc": "2.0",
@@ -237,7 +239,7 @@ fn parse_retry_after(value: Option<&reqwest::header::HeaderValue>, now: SystemTi
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::providers::parse_provider_config;
+    use crate::providers::{append_header_authenticated_provider, parse_provider_config};
     use std::collections::HashSet;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
@@ -337,6 +339,68 @@ mod tests {
         let config = parse_provider_config(&format!("http://{address}"), "1").unwrap();
         let mut pool = config.into_pool(Instant::now());
         let provider = pool.reserve_best(Instant::now(), &HashSet::new()).unwrap();
+        let result = ReqwestJsonRpcClient::new()
+            .unwrap()
+            .call(
+                &provider,
+                RpcMethod::EthChainId,
+                json!([]),
+                Duration::from_secs(2),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.value, json!("0xa4b1"));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn authenticated_provider_sends_header_without_exposing_it_in_debug() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut chunk = [0_u8; 1024];
+            loop {
+                let read = stream.read(&mut chunk).await.unwrap();
+                assert!(read > 0);
+                request.extend_from_slice(&chunk[..read]);
+                if request
+                    .windows(b"eth_chainId".len())
+                    .any(|window| window == b"eth_chainId")
+                {
+                    break;
+                }
+            }
+            let headers = String::from_utf8_lossy(&request).to_ascii_lowercase();
+            assert!(headers.contains("api-key: fake-sensitive-value"));
+            let body = r#"{"jsonrpc":"2.0","id":1,"result":"0xa4b1"}"#;
+            stream
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+        });
+        let mut config = parse_provider_config("https://unused.example", "1").unwrap();
+        append_header_authenticated_provider(
+            &mut config,
+            "production-nownodes-arbitrum",
+            &format!("http://{address}"),
+            100,
+            "api-key",
+            "fake-sensitive-value",
+        )
+        .unwrap();
+        let mut pool = config.into_pool(Instant::now());
+        let provider = pool
+            .reserve_named(Instant::now(), "production-nownodes-arbitrum")
+            .unwrap();
+        assert!(!format!("{provider:?}").contains("fake-sensitive-value"));
         let result = ReqwestJsonRpcClient::new()
             .unwrap()
             .call(

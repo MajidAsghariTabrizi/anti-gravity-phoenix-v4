@@ -1,6 +1,9 @@
 use std::collections::HashSet;
 use std::fmt;
+use std::str::FromStr;
 use std::time::{Duration, Instant};
+
+use reqwest::header::{HeaderName, HeaderValue};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CircuitState {
@@ -12,6 +15,7 @@ pub enum CircuitState {
 pub struct Provider {
     pub name: String,
     pub url: String,
+    header: Option<ProviderHeader>,
     pub weight: u32,
     pub health_score: i32,
     pub circuit: CircuitState,
@@ -37,6 +41,7 @@ impl fmt::Debug for Provider {
 pub struct ProviderLease {
     provider_id: String,
     url: String,
+    header: Option<ProviderHeader>,
 }
 
 impl ProviderLease {
@@ -46,6 +51,12 @@ impl ProviderLease {
 
     pub(crate) fn url(&self) -> &str {
         &self.url
+    }
+
+    pub(crate) fn header(&self) -> Option<(&str, &str)> {
+        self.header
+            .as_ref()
+            .map(|header| (header.name.as_str(), header.value.as_str()))
     }
 }
 
@@ -59,10 +70,21 @@ impl fmt::Debug for ProviderLease {
 }
 
 impl Provider {
-    pub fn new(name: String, url: String, weight: u32, _now: Instant) -> Self {
+    pub fn new(name: String, url: String, weight: u32, now: Instant) -> Self {
+        Self::with_header(name, url, None, weight, now)
+    }
+
+    fn with_header(
+        name: String,
+        url: String,
+        header: Option<ProviderHeader>,
+        weight: u32,
+        _now: Instant,
+    ) -> Self {
         Self {
             name,
             url,
+            header,
             weight,
             health_score: 100,
             circuit: CircuitState::Closed,
@@ -173,6 +195,7 @@ impl ProviderPool {
         Some(ProviderLease {
             provider_id: self.providers[idx].name.clone(),
             url: self.providers[idx].url.clone(),
+            header: self.providers[idx].header.clone(),
         })
     }
 
@@ -187,6 +210,7 @@ impl ProviderPool {
         Some(ProviderLease {
             provider_id: provider.name.clone(),
             url: provider.url.clone(),
+            header: provider.header.clone(),
         })
     }
 
@@ -257,7 +281,15 @@ impl ProviderConfig {
         ProviderPool::new(
             self.providers
                 .into_iter()
-                .map(|provider| Provider::new(provider.name, provider.url, provider.priority, now))
+                .map(|provider| {
+                    Provider::with_header(
+                        provider.name,
+                        provider.url,
+                        provider.header,
+                        provider.priority,
+                        now,
+                    )
+                })
                 .collect(),
         )
     }
@@ -268,6 +300,7 @@ pub struct ProviderSpec {
     pub name: String,
     pub url: String,
     pub priority: u32,
+    header: Option<ProviderHeader>,
 }
 
 impl fmt::Debug for ProviderSpec {
@@ -280,6 +313,22 @@ impl fmt::Debug for ProviderSpec {
     }
 }
 
+#[derive(Clone, PartialEq, Eq)]
+pub struct ProviderHeader {
+    name: String,
+    value: String,
+}
+
+impl fmt::Debug for ProviderHeader {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ProviderHeader")
+            .field("name", &self.name)
+            .field("value_present", &true)
+            .finish()
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ProviderConfigError {
     EmptyProviderList,
@@ -289,6 +338,11 @@ pub enum ProviderConfigError {
     CountMismatch { urls: usize, priorities: usize },
     InvalidPriority { index: usize },
     ZeroPriority { index: usize },
+    EmptyProviderId { index: usize },
+    InvalidProviderId { index: usize },
+    DuplicateProviderId,
+    InvalidHeaderName,
+    InvalidHeaderValue,
 }
 
 impl fmt::Display for ProviderConfigError {
@@ -315,6 +369,15 @@ impl fmt::Display for ProviderConfigError {
                     "RPC provider priority at index {index} must be greater than zero"
                 )
             }
+            Self::EmptyProviderId { index } => {
+                write!(f, "RPC provider identity at index {index} is empty")
+            }
+            Self::InvalidProviderId { index } => {
+                write!(f, "RPC provider identity at index {index} is invalid")
+            }
+            Self::DuplicateProviderId => write!(f, "RPC provider identities must be unique"),
+            Self::InvalidHeaderName => write!(f, "RPC provider header name is invalid"),
+            Self::InvalidHeaderValue => write!(f, "RPC provider header value is invalid"),
         }
     }
 }
@@ -360,12 +423,94 @@ pub fn parse_provider_config(
             name,
             url: url.to_string(),
             priority,
+            header: None,
         });
     }
     if providers.is_empty() {
         return Err(ProviderConfigError::EmptyProviderList);
     }
     Ok(ProviderConfig { providers })
+}
+
+pub fn parse_provider_config_with_ids(
+    urls: &str,
+    priorities: &str,
+    identities: &str,
+) -> Result<ProviderConfig, ProviderConfigError> {
+    let mut config = parse_provider_config(urls, priorities)?;
+    let identities: Vec<&str> = identities.split(',').map(str::trim).collect();
+    if identities.len() != config.providers.len() {
+        return Err(ProviderConfigError::CountMismatch {
+            urls: config.providers.len(),
+            priorities: identities.len(),
+        });
+    }
+    let mut unique = HashSet::with_capacity(identities.len());
+    for (index, (provider, identity)) in config.providers.iter_mut().zip(identities).enumerate() {
+        if identity.is_empty() {
+            return Err(ProviderConfigError::EmptyProviderId { index });
+        }
+        if !valid_provider_id(identity) {
+            return Err(ProviderConfigError::InvalidProviderId { index });
+        }
+        if !unique.insert(identity) {
+            return Err(ProviderConfigError::DuplicateProviderId);
+        }
+        provider.name = identity.to_string();
+    }
+    Ok(config)
+}
+
+pub fn append_header_authenticated_provider(
+    config: &mut ProviderConfig,
+    identity: &str,
+    url: &str,
+    priority: u32,
+    header_name: &str,
+    header_value: &str,
+) -> Result<(), ProviderConfigError> {
+    if identity.is_empty() || !valid_provider_id(identity) {
+        return Err(ProviderConfigError::InvalidProviderId {
+            index: config.providers.len(),
+        });
+    }
+    if config
+        .providers
+        .iter()
+        .any(|provider| provider.name == identity)
+    {
+        return Err(ProviderConfigError::DuplicateProviderId);
+    }
+    if !is_http_url(url) {
+        return Err(ProviderConfigError::InvalidProviderUrl {
+            index: config.providers.len(),
+        });
+    }
+    if priority == 0 {
+        return Err(ProviderConfigError::ZeroPriority {
+            index: config.providers.len(),
+        });
+    }
+    HeaderName::from_str(header_name).map_err(|_| ProviderConfigError::InvalidHeaderName)?;
+    HeaderValue::from_str(header_value).map_err(|_| ProviderConfigError::InvalidHeaderValue)?;
+    config.providers.push(ProviderSpec {
+        name: identity.to_string(),
+        url: url.to_string(),
+        priority,
+        header: Some(ProviderHeader {
+            name: header_name.to_string(),
+            value: header_value.to_string(),
+        }),
+    });
+    Ok(())
+}
+
+fn valid_provider_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
 }
 
 fn parse_priority(index: usize, value: &str) -> Result<u32, ProviderConfigError> {
