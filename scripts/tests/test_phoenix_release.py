@@ -2213,6 +2213,43 @@ class WorkflowAndDeploymentContractTests(unittest.TestCase):
             'compose up -d --no-deps --force-recreate "$service"', self.deploy
         )
 
+    def test_deploy_installs_the_exact_canonical_aave_seed_after_mutation(self) -> None:
+        digest = "3d8513bb05607d9a91fece589872db3f5782953d13e24fc418ea2b4b0aa0239c"
+        compose = (ROOT / "compose.prod.yml").read_text(encoding="utf-8")
+        self.assertIn(
+            "/var/lib/phoenix-atlas-hunter/evidence/"
+            "aave-borrow-archive-7736400-489813224-0f204e03/"
+            "aave-borrow-discovery.json",
+            self.deploy,
+        )
+        self.assertIn(
+            "/opt/phoenix/evidence/aave-discovery/aave-borrow-discovery.json",
+            self.deploy,
+        )
+        self.assertIn(f"aave_discovery_sha256={digest}", self.deploy)
+        self.assertIn(f"AAVE_BORROW_DISCOVERY_SHA256:-{digest}", compose)
+        self.assertIn('[ ! -L "$aave_discovery_source" ]', self.deploy)
+        self.assertIn('[ "$source_identity" = "0:0:600" ]', self.deploy)
+        self.assertIn('rmdir "$aave_discovery_target"', self.deploy)
+        self.assertIn('install -m 0444 -o root -g root', self.deploy)
+        self.assertIn('mv -f "$seed_candidate" "$aave_discovery_target"', self.deploy)
+        mutation = self.deploy.index("state_update mutation mutation_started")
+        disarmed = self.deploy.index("mark_phase DISARMED_CONTROL_INSTALLED")
+        install_seed = self.deploy.index("install_aave_discovery_seed", disarmed)
+        start_services = self.deploy.index("for service in $start_services", install_seed)
+        self.assertLess(mutation, install_seed)
+        self.assertLess(disarmed, install_seed)
+        self.assertLess(install_seed, start_services)
+
+    def test_rollback_accepts_only_the_reviewed_legacy_atlas_binary(self) -> None:
+        rollback_health = self.rollback.split(
+            'PHOENIX_HEALTH_EXPECTED_MODE=SHADOW', maxsplit=1
+        )[1].split('"$deploy_dir/production-healthcheck.sh"', maxsplit=1)[0]
+        self.assertIn(
+            "PHOENIX_HEALTH_ALLOW_LEGACY_ATLAS_BINARY=true",
+            rollback_health,
+        )
+
     def test_burn_in_preserves_the_disarmed_owner_boundary(self) -> None:
         burn_start = self.deploy.index("mark_engine_burn_in_started \\")
         burn_pass = self.deploy.index("mark_phase ENGINE_BURN_IN_PASSED")
