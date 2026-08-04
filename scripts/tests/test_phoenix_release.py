@@ -2383,6 +2383,26 @@ class WorkflowAndDeploymentContractTests(unittest.TestCase):
         )[1].split("compose up -d --no-deps rpc-gateway", maxsplit=1)[0]
         self.assertIn('capture_service_failure_evidence "$service"', start_loop)
 
+    def test_candidate_rpc_gateway_is_healthy_before_atlas_starts(self) -> None:
+        start_loop = self.deploy.index("for service in $start_services")
+        defer_atlas = self.deploy.index("atlas-observer)", start_loop)
+        rpc_start = self.deploy.index(
+            "compose up -d --no-deps rpc-gateway", start_loop
+        )
+        deferred_gate = self.deploy.index(
+            'if [ "$atlas_start_deferred" = true ]', rpc_start
+        )
+        atlas_start = self.deploy.index(
+            "compose up -d --no-deps atlas-observer", deferred_gate
+        )
+        engine_start = self.deploy.index(
+            "compose up -d --no-deps phoenix-engine", atlas_start
+        )
+        self.assertLess(defer_atlas, rpc_start)
+        self.assertLess(rpc_start, deferred_gate)
+        self.assertLess(deferred_gate, atlas_start)
+        self.assertLess(atlas_start, engine_start)
+
     def test_candidate_failure_allows_version_matched_legacy_atlas_rollback(self) -> None:
         rollback_invocation = self.deploy.split(
             'PHOENIX_CURRENT_LIVE_RELEASE_ENV="$release_env"', maxsplit=1

@@ -816,9 +816,14 @@ mark_phase DISARMED_CONTROL_INSTALLED
 install_aave_discovery_seed
 remove_source_only_services ||
   fail "source-only services could not be removed before target activation"
+atlas_start_deferred=false
 for service in $start_services; do
   case "$service" in
     rpc-gateway|phoenix-engine) continue ;;
+    atlas-observer)
+      atlas_start_deferred=true
+      continue
+      ;;
     economic-monitor)
       compose up -d --no-deps --force-recreate "$service"
       ;;
@@ -835,6 +840,13 @@ compose up -d --no-deps rpc-gateway
 wait_service_healthy rpc-gateway ||
   fail "rpc-gateway did not become healthy before Engine burn-in"
 mark_phase RPC_GATEWAY_HEALTHY
+if [ "$atlas_start_deferred" = true ]; then
+  compose up -d --no-deps atlas-observer
+  if ! wait_service_healthy atlas-observer; then
+    capture_service_failure_evidence atlas-observer
+    fail "optional service did not become healthy: atlas-observer"
+  fi
+fi
 compose up -d --no-deps phoenix-engine
 wait_service_healthy phoenix-engine ||
   fail "phoenix-engine did not become healthy before Engine burn-in"
