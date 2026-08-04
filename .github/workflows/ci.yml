@@ -608,6 +608,8 @@ jobs:
         shell: bash
         env:
           PHOENIX_TEST_POSTGRES_DSN: postgres://phoenix_fork_test:phoenix_fork_test_password@127.0.0.1:5432/phoenix_fork_test
+          PHOENIX_AUTONOMOUS_E2E_POSTGRES_DSN: postgres://phoenix_fork_test:phoenix_fork_test_password@127.0.0.1:5432/phoenix_autonomous_e2e_test
+          PGPASSWORD: phoenix_fork_test_password
         run: |
           set -euo pipefail
           cargo fmt --check --manifest-path fork-sandbox/Cargo.toml
@@ -620,7 +622,11 @@ jobs:
           PHOENIX_TEST_POSTGRES_DSN="$PHOENIX_TEST_POSTGRES_DSN" \
             cargo +1.79.0 test --locked --manifest-path live-executor/Cargo.toml \
               --test postgres_nonce_recovery -- --nocapture --test-threads=1
-          sh ./scripts/live-executor-isolated-fork-tests.sh
+          psql -X -v ON_ERROR_STOP=1 \
+            --host 127.0.0.1 --username phoenix_fork_test --dbname postgres \
+            --command 'CREATE DATABASE phoenix_autonomous_e2e_test'
+          PHOENIX_TEST_POSTGRES_DSN="$PHOENIX_AUTONOMOUS_E2E_POSTGRES_DSN" \
+            sh ./scripts/live-executor-isolated-fork-tests.sh
 
   solidity:
     name: solidity
