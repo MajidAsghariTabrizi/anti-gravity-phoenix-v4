@@ -482,6 +482,7 @@ cmp "$protected_before" "$protected_after" >/dev/null || fail "protected service
 PHOENIX_ENV_FILE="$env_file" \
 PHOENIX_RELEASE_ENV="$release_env" \
 PHOENIX_HEALTH_EXPECTED_MODE=SHADOW \
+PHOENIX_HEALTH_ALLOW_LEGACY_ATLAS_BINARY=true \
   "$deploy_dir/production-healthcheck.sh"
 
 printf '%s\n' "$release_sha" >"$pointer_candidate"

@@ -262,7 +262,7 @@ services:
     command:
       - --ledger-dir=/var/lib/phoenix-atlas-observer
       - --aave-discovery=/var/lib/phoenix-atlas-discovery/aave-borrow-discovery.json
-      - --aave-discovery-sha256=${AAVE_BORROW_DISCOVERY_SHA256:-e21964b0cedcbe2578e2ad18d7551f78255ee96ffac58ae6caf73c85ffc5334a}
+      - --aave-discovery-sha256=${AAVE_BORROW_DISCOVERY_SHA256:-3d8513bb05607d9a91fece589872db3f5782953d13e24fc418ea2b4b0aa0239c}
       - --aave-starting-cursor=1100
       - --aave-batch-size=100
       - --aave-pace=60s

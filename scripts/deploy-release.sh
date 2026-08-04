@@ -24,6 +24,9 @@ service_wait_seconds=${PHOENIX_DEPLOY_SERVICE_WAIT_SECONDS:-300}
 recorder_drain_seconds=${PHOENIX_RECORDER_DRAIN_SECONDS:-180}
 engine_burn_in_seconds=${PHOENIX_ENGINE_BURN_IN_SECONDS:-120}
 release_state_updater=${PHOENIX_RELEASE_STATE_UPDATER:-}
+aave_discovery_source=${PHOENIX_AAVE_DISCOVERY_SOURCE:-/var/lib/phoenix-atlas-hunter/evidence/aave-borrow-archive-7736400-489813224-0f204e03/aave-borrow-discovery.json}
+aave_discovery_target=${PHOENIX_AAVE_DISCOVERY_TARGET:-/opt/phoenix/evidence/aave-discovery/aave-borrow-discovery.json}
+aave_discovery_sha256=3d8513bb05607d9a91fece589872db3f5782953d13e24fc418ea2b4b0aa0239c
 
 fail() {
   echo "DEPLOY_FAILED: $1"
@@ -43,6 +46,61 @@ state_update() {
 
 mark_phase() {
   state_update phase "$1"
+}
+
+install_aave_discovery_seed() {
+  [ -f "$aave_discovery_source" ] && [ ! -L "$aave_discovery_source" ] ||
+    fail "canonical Aave discovery seed is missing or unsafe"
+  source_identity=$(stat -c '%u:%g:%a' "$aave_discovery_source") ||
+    fail "canonical Aave discovery seed identity could not be read"
+  [ "$source_identity" = "0:0:600" ] ||
+    fail "canonical Aave discovery seed identity is invalid"
+  source_sha256=$(sha256sum "$aave_discovery_source" | awk '{print $1}') ||
+    fail "canonical Aave discovery seed hash could not be read"
+  [ "$source_sha256" = "$aave_discovery_sha256" ] ||
+    fail "canonical Aave discovery seed hash is invalid"
+
+  aave_discovery_parent=$(dirname "$aave_discovery_target")
+  install -d -m 0755 -o root -g root "$aave_discovery_parent" ||
+    fail "Aave discovery target directory could not be installed"
+  if [ -d "$aave_discovery_target" ] && [ ! -L "$aave_discovery_target" ]; then
+    rmdir "$aave_discovery_target" ||
+      fail "unsafe nonempty Aave discovery target directory"
+  elif [ -e "$aave_discovery_target" ] || [ -L "$aave_discovery_target" ]; then
+    [ -f "$aave_discovery_target" ] && [ ! -L "$aave_discovery_target" ] ||
+      fail "existing Aave discovery target is unsafe"
+    target_identity=$(stat -c '%u:%g:%a' "$aave_discovery_target") ||
+      fail "existing Aave discovery target identity could not be read"
+    target_sha256=$(sha256sum "$aave_discovery_target" | awk '{print $1}') ||
+      fail "existing Aave discovery target hash could not be read"
+    if [ "$target_identity" = "0:0:444" ] &&
+       [ "$target_sha256" = "$aave_discovery_sha256" ]; then
+      return 0
+    fi
+  fi
+
+  seed_candidate="$aave_discovery_parent/.aave-borrow-discovery.$$.candidate"
+  rm -f "$seed_candidate"
+  install -m 0444 -o root -g root "$aave_discovery_source" "$seed_candidate" || {
+    rm -f "$seed_candidate"
+    fail "canonical Aave discovery seed could not be staged"
+  }
+  candidate_sha256=$(sha256sum "$seed_candidate" | awk '{print $1}') || {
+    rm -f "$seed_candidate"
+    fail "staged Aave discovery seed hash could not be read"
+  }
+  [ "$candidate_sha256" = "$aave_discovery_sha256" ] || {
+    rm -f "$seed_candidate"
+    fail "staged Aave discovery seed hash is invalid"
+  }
+  mv -f "$seed_candidate" "$aave_discovery_target" || {
+    rm -f "$seed_candidate"
+    fail "canonical Aave discovery seed could not be activated"
+  }
+  [ "$(stat -c '%u:%g:%a' "$aave_discovery_target")" = "0:0:444" ] ||
+    fail "installed Aave discovery seed identity is invalid"
+  [ "$(sha256sum "$aave_discovery_target" | awk '{print $1}')" = "$aave_discovery_sha256" ] ||
+    fail "installed Aave discovery seed hash is invalid"
 }
 
 verify_runtime_control_phase() {
@@ -737,6 +795,7 @@ compose run --rm --no-deps \
   -e PHOENIX_DISARMED_DEPLOY_ACK=INSTALL_DISARMED_EVIDENCE_RELEASE_42161 \
   autonomous-control disarmed-deploy
 mark_phase DISARMED_CONTROL_INSTALLED
+install_aave_discovery_seed
 remove_source_only_services ||
   fail "source-only services could not be removed before target activation"
 for service in $start_services; do
