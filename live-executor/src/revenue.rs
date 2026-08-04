@@ -336,16 +336,16 @@ impl AtlasRevenueExecutor {
         if realized_net <= active.retained_profit_floor || realized_net > i128::MAX as u128 {
             return Err(RevenueError::Data);
         }
-        let evidence_hash = outcome_evidence_hash(
-            &transaction_hash,
-            receipt.block_number,
+        let evidence_hash = outcome_evidence_hash(&AtlasOutcomeEvidence {
+            transaction_hash: &transaction_hash,
+            block_number: receipt.block_number,
             settled_bid,
-            executor_balance_before,
-            executor_balance_after,
-            solver_bond_before,
-            solver_bond_after,
+            executor_before: executor_balance_before,
+            executor_after: executor_balance_after,
+            bond_before: solver_bond_before,
+            bond_after: solver_bond_after,
             realized_net,
-        );
+        });
         Ok(AtlasOutcome::Reconciled {
             transaction_hash,
             block_number: receipt.block_number,
@@ -825,8 +825,8 @@ fn token_bytes32(token: &Token) -> Result<[u8; 32], RevenueError> {
     value.as_slice().try_into().map_err(|_| RevenueError::Data)
 }
 
-fn outcome_evidence_hash(
-    transaction_hash: &str,
+struct AtlasOutcomeEvidence<'a> {
+    transaction_hash: &'a str,
     block_number: u64,
     settled_bid: u128,
     executor_before: u128,
@@ -834,7 +834,19 @@ fn outcome_evidence_hash(
     bond_before: u128,
     bond_after: u128,
     realized_net: u128,
-) -> String {
+}
+
+fn outcome_evidence_hash(evidence: &AtlasOutcomeEvidence<'_>) -> String {
+    let AtlasOutcomeEvidence {
+        transaction_hash,
+        block_number,
+        settled_bid,
+        executor_before,
+        executor_after,
+        bond_before,
+        bond_after,
+        realized_net,
+    } = evidence;
     hex::encode(Sha256::digest(format!(
         "phoenix.atlas-outcome.v1|{transaction_hash}|{block_number}|{settled_bid}|{executor_before}|{executor_after}|{bond_before}|{bond_after}|{realized_net}"
     )))
