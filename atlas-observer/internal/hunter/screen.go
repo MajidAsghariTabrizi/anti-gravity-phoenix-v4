@@ -42,6 +42,7 @@ const (
 )
 
 var addressPattern = regexp.MustCompile(`^0x[0-9a-f]{40}$`)
+var releaseSHAPattern = regexp.MustCompile(`^[0-9a-f]{40}$`)
 
 type Config struct {
 	DiscoveryPath          string
@@ -396,7 +397,7 @@ func New(config Config) (*Screener, error) {
 	if value, ok := newBigUint(config.MaximumFeePerGasWei); !ok || value.Sign() <= 0 || config.MaximumGasLimit == 0 || config.FlashPremiumBPS == 0 || config.FlashPremiumBPS > 100 || config.EconomicReserveBPS == 0 || config.EconomicReserveBPS > 5_000 {
 		return nil, errors.New("hunter economic limits are invalid")
 	}
-	if !addressPattern.MatchString(config.ExecutorAddress) || !addressPattern.MatchString(config.CallerAddress) || len(config.ExecutorCodeHash) != 64 || len(config.ReleaseSHA) != 64 {
+	if !addressPattern.MatchString(config.ExecutorAddress) || !addressPattern.MatchString(config.CallerAddress) || len(config.ExecutorCodeHash) != 64 || !releaseSHAPattern.MatchString(config.ReleaseSHA) {
 		return nil, errors.New("hunter execution identity is invalid")
 	}
 	if value, ok := newBigUint(config.MaximumPriorityFeeWei); !ok || value.Sign() <= 0 {
