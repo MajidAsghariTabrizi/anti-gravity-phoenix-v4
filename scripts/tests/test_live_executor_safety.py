@@ -242,7 +242,9 @@ class LiveExecutorSafetyTests(unittest.TestCase):
             encoding="utf-8"
         )
         active_context = gateway.index("_host_preflight(paths, request)")
-        immutable_install = gateway.index("_install_candidate(paths, request)")
+        immutable_install = gateway.index(
+            "_install_candidate(paths, request, rpc_provider_secret)"
+        )
         candidate_installed = gateway.index(
             'state["current_phase"] == "CANDIDATE_INSTALLED"'
         )
