@@ -1271,7 +1271,12 @@ def validate_canonical_run(
 
 
 def validate_github_run(
-    value: object, expected_sha: str, expected_run_id: str
+    value: object,
+    expected_sha: str,
+    expected_run_id: str,
+    *,
+    jobs_value: object | None = None,
+    allow_failed_controller_deploy: bool = False,
 ) -> None:
     _validate_sha(expected_sha, "expected build run SHA")
     _validate_run_id(expected_run_id, "expected build run ID")
@@ -1288,16 +1293,68 @@ def validate_github_run(
         and value.get("path") == CONTROLLER_WORKFLOW_PATH
         and value.get("event") in CONTROLLER_EVENTS
     )
-    if (
+    identity_invalid = (
         str(value.get("id")) != expected_run_id
         or not (direct_build or controller_build)
         or value.get("head_sha") != expected_sha
         or value.get("status") != "completed"
-        or value.get("conclusion") != "success"
         or not isinstance(repository, dict)
         or repository.get("full_name") != REPOSITORY
+    )
+    if identity_invalid:
+        raise ReleaseProvenanceError("GitHub build run identity or result is invalid")
+    if value.get("conclusion") == "success":
+        return
+    if (
+        not allow_failed_controller_deploy
+        or not controller_build
+        or value.get("conclusion") != "failure"
+        or not isinstance(jobs_value, dict)
     ):
         raise ReleaseProvenanceError("GitHub build run identity or result is invalid")
+
+    jobs = jobs_value.get("jobs")
+    if not isinstance(jobs, list) or jobs_value.get("total_count") != len(jobs):
+        raise ReleaseProvenanceError("GitHub build run jobs evidence is invalid")
+    by_name: dict[str, dict[str, Any]] = {}
+    for raw_job in jobs:
+        if not isinstance(raw_job, dict):
+            raise ReleaseProvenanceError("GitHub build run jobs evidence is invalid")
+        name = raw_job.get("name")
+        if not isinstance(name, str) or not name or name in by_name:
+            raise ReleaseProvenanceError("GitHub build run jobs evidence is invalid")
+        by_name[name] = raw_job
+
+    required_build_jobs = {
+        "immutable-build / publication-preflight",
+        "immutable-build / release-assets",
+        "immutable-build / release-manifest",
+        *(f"immutable-build / build-{name}" for name in EXPECTED_IMAGES),
+    }
+    for name in required_build_jobs:
+        job = by_name.get(name)
+        if (
+            job is None
+            or job.get("status") != "completed"
+            or job.get("conclusion") != "success"
+        ):
+            raise ReleaseProvenanceError(
+                f"protected base immutable build job did not succeed: {name}"
+            )
+    failed_jobs = {
+        name
+        for name, job in by_name.items()
+        if job.get("conclusion") == "failure"
+    }
+    deploy_job = by_name.get("deploy-through-release-gateway")
+    if (
+        failed_jobs != {"deploy-through-release-gateway"}
+        or deploy_job is None
+        or deploy_job.get("status") != "completed"
+    ):
+        raise ReleaseProvenanceError(
+            "protected base run did not fail exclusively during deployment"
+        )
 
 
 def validate_deploy_pair(
@@ -1416,8 +1473,12 @@ def _parser() -> argparse.ArgumentParser:
 
     github_run = subparsers.add_parser("validate-github-run")
     github_run.add_argument("--run-evidence", type=Path, required=True)
+    github_run.add_argument("--jobs-evidence", type=Path)
     github_run.add_argument("--expected-sha", required=True)
     github_run.add_argument("--expected-run-id", required=True)
+    github_run.add_argument(
+        "--allow-failed-controller-deploy", action="store_true"
+    )
 
     inherit = subparsers.add_parser("inherit-protected")
     inherit.add_argument("--output-dir", type=Path, required=True)
@@ -1498,6 +1559,14 @@ def main() -> None:
                 _read_json(args.run_evidence, "GitHub build run evidence"),
                 args.expected_sha,
                 args.expected_run_id,
+                jobs_value=(
+                    _read_json(args.jobs_evidence, "GitHub build jobs evidence")
+                    if args.jobs_evidence is not None
+                    else None
+                ),
+                allow_failed_controller_deploy=(
+                    args.allow_failed_controller_deploy
+                ),
             )
         elif args.command == "inherit-protected":
             write_inherited_fragments(

@@ -207,10 +207,15 @@ jobs:
           gh api \
             "repos/${GITHUB_REPOSITORY}/actions/runs/${PROTECTED_BASE_BUILD_RUN_ID}" \
             > protected-base/build-run.json
+          gh api \
+            "repos/${GITHUB_REPOSITORY}/actions/runs/${PROTECTED_BASE_BUILD_RUN_ID}/jobs?per_page=100" \
+            > protected-base/build-jobs.json
           python3 scripts/release_provenance.py validate-github-run \
             --run-evidence protected-base/build-run.json \
+            --jobs-evidence protected-base/build-jobs.json \
             --expected-sha "$PROTECTED_BASE_SHA" \
-            --expected-run-id "$PROTECTED_BASE_BUILD_RUN_ID"
+            --expected-run-id "$PROTECTED_BASE_BUILD_RUN_ID" \
+            --allow-failed-controller-deploy
 
       - name: Download exact protected base release manifest
         if: ${{ inputs.protected_base_sha != '' }}
