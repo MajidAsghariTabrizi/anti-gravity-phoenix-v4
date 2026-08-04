@@ -15,6 +15,7 @@ if str(PACKAGE_PARENT) not in sys.path:
 
 from phoenix_release.gateway import (  # noqa: E402
     GatewayError,
+    buffer_rpc_provider_secret,
     evidence,
     emergency_pause,
     history,
@@ -102,7 +103,8 @@ def main(argv: list[str] | None = None) -> int:
         elif arguments.command == "plan":
             result = evidence(paths, arguments.release_sha)
         elif arguments.command == "resume":
-            result = resume(paths, arguments.release_sha)
+            rpc_provider_secret = buffer_rpc_provider_secret(sys.stdin.buffer)
+            result = resume(paths, arguments.release_sha, rpc_provider_secret)
         elif arguments.command == "retry-pre-mutation":
             result = retry_pre_mutation(paths, arguments.release_sha)
         elif arguments.command == "retry-rolled-back":

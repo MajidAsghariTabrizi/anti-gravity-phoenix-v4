@@ -2,6 +2,11 @@
 set -eu
 umask 077
 
+# The protected release credential belongs to the parent gateway.  Rehearsal
+# has no secret-bearing operation, so neither it nor any Docker/Compose child
+# may consume the one-shot upstream stream used by the legacy recovery hop.
+exec </dev/null
+
 release_sha=${1:-}
 candidate_root=${2:-}
 release_manifest=${3:-}

@@ -52,6 +52,7 @@ PLATFORM_FILES = (
     ("scripts/phoenix_release/gateway.py", "/usr/local/libexec/phoenix-release/phoenix_release/gateway.py", 0o644),
     ("scripts/phoenix_release/model.py", "/usr/local/libexec/phoenix-release/phoenix_release/model.py", 0o644),
     ("scripts/phoenix_release/phase_update.py", "/usr/local/libexec/phoenix-release/phoenix_release/phase_update.py", 0o644),
+    ("scripts/phoenix_release/rpc_provider_secret.py", "/usr/local/libexec/phoenix-release/phoenix_release/rpc_provider_secret.py", 0o644),
     ("deploy/phoenix-economic-activation.path", "/etc/systemd/system/phoenix-economic-activation.path", 0o644),
     ("deploy/phoenix-economic-activation.service", "/etc/systemd/system/phoenix-economic-activation.service", 0o644),
     ("release-components.json", "/usr/local/libexec/phoenix-release/release-components.json", 0o644),

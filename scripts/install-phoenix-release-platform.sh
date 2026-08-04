@@ -10,6 +10,7 @@ source_root=$(CDPATH='' cd -- "$script_dir/.." && pwd)
 public_key_file=
 release_sha=
 reuse_existing_key=0
+rpc_secret_mode=
 deploy_user=phoenix-deploy
 libexec=/usr/local/libexec/phoenix-release
 gateway=/usr/local/sbin/phoenix-release-gateway
@@ -19,7 +20,6 @@ sudoers=/etc/sudoers.d/phoenix-release
 authorized_keys=/home/$deploy_user/.ssh/authorized_keys
 sshd_dropin=/etc/ssh/sshd_config.d/89-phoenix-deploy.conf
 rpc_secret_dir=/etc/phoenix/secrets
-rpc_secret_file=$rpc_secret_dir/phoenix-rpc-provider-slot-1-api-key
 
 fail() {
   printf 'PHOENIX_RELEASE_PLATFORM_INSTALL_FAILED: %s\n' "$1" >&2
@@ -35,6 +35,22 @@ while [ "$#" -gt 0 ]; do
       ;;
     --reuse-existing-key)
       reuse_existing_key=1
+      [ -z "$rpc_secret_mode" ] || fail key_source_ambiguous
+      rpc_secret_mode=legacy-recovery
+      shift
+      ;;
+    --reuse-existing-deploy-key)
+      reuse_existing_key=1
+      shift
+      ;;
+    --rpc-provider-secret-stdin)
+      [ -z "$rpc_secret_mode" ] || fail key_source_ambiguous
+      rpc_secret_mode=install-stdin
+      shift
+      ;;
+    --reuse-existing-rpc-provider-secret)
+      [ -z "$rpc_secret_mode" ] || fail key_source_ambiguous
+      rpc_secret_mode=reuse
       shift
       ;;
     --public-key-file)
@@ -62,6 +78,7 @@ esac
 [ "${#release_sha}" -eq 40 ] || fail release_sha_invalid
 [ "$reuse_existing_key" -eq 0 ] || [ -z "$public_key_file" ] ||
   fail key_source_ambiguous
+[ -n "$rpc_secret_mode" ] || fail rpc_provider_secret_mode_missing
 for command in chown chmod dd find getent install mkdir mktemp mv python3 sha256sum \
   sshd stat systemctl tr useradd usermod visudo wc
 do
@@ -125,48 +142,18 @@ install -d -m 0700 -o root -g root /var/lib/phoenix-economic-activation/consumed
 install -d -m 0700 -o root -g root /var/lib/phoenix-economic-activation/processed
 install -d -m 0700 -o root -g root /var/lib/phoenix-economic-activation/results
 
-if [ "$reuse_existing_key" -eq 1 ]; then
-  # The protected controller supplies the provider credential only on stdin.
-  # It is intentionally excluded from command arguments, environment files,
-  # release packages, manifests, hashes, logs, and evidence.
-  rpc_secret_candidate=$(mktemp "$rpc_secret_dir/.rpc-provider-slot-1.XXXXXX") ||
-    fail rpc_provider_secret_stage_failed
-  trap 'rm -f "$rpc_secret_candidate"' EXIT HUP INT TERM
-  dd iflag=fullblock bs=4097 count=1 of="$rpc_secret_candidate" 2>/dev/null ||
-    fail rpc_provider_secret_read_failed
-  rpc_secret_size=$(stat -c '%s' "$rpc_secret_candidate")
-  if [ "$rpc_secret_size" -gt 0 ]; then
-    [ "$rpc_secret_size" -le 4096 ] || fail rpc_provider_secret_too_large
-    rpc_secret_without_newlines=$(tr -d '\r\n' <"$rpc_secret_candidate" | wc -c | tr -d ' ')
-    [ "$rpc_secret_without_newlines" = "$rpc_secret_size" ] ||
-      fail rpc_provider_secret_invalid
-    chown root:65532 "$rpc_secret_candidate"
-    chmod 0640 "$rpc_secret_candidate"
-    mv "$rpc_secret_candidate" "$rpc_secret_file"
-  else
-    # A later rollback installation sees EOF because the candidate installer
-    # already consumed the protected stdin. Reuse only the exact credential
-    # file that the candidate just staged; a first installation still fails.
-    rm -f "$rpc_secret_candidate"
-    [ -f "$rpc_secret_file" ] && [ ! -L "$rpc_secret_file" ] ||
-      fail rpc_provider_secret_missing
-    rpc_secret_size=$(stat -c '%s' "$rpc_secret_file")
-    [ "$rpc_secret_size" -gt 0 ] && [ "$rpc_secret_size" -le 4096 ] ||
-      fail rpc_provider_secret_metadata_invalid
-    rpc_secret_without_newlines=$(tr -d '\r\n' <"$rpc_secret_file" | wc -c | tr -d ' ')
-    [ "$rpc_secret_without_newlines" = "$rpc_secret_size" ] ||
-      fail rpc_provider_secret_metadata_invalid
-  fi
-  unset rpc_secret_size rpc_secret_without_newlines
-  trap - EXIT HUP INT TERM
-  [ "$(stat -c '%u:%g:%a:%h' "$rpc_secret_file")" = 0:65532:640:1 ] ||
-    fail rpc_provider_secret_metadata_invalid
-fi
+# The active pre-fix gateway invokes --reuse-existing-key and leaves the
+# protected stdin attached.  legacy-recovery is intentionally limited to this
+# one compatibility contract: it stages missing input, compares supplied input
+# with an existing file, or reuses a verified file after upstream EOF.  The new
+# gateway selects the explicit install-stdin/reuse modes below.
+python3 -I -B "$script_dir/phoenix_release/rpc_provider_secret.py" "$rpc_secret_mode" ||
+  fail rpc_provider_secret_install_failed
 
 install -m 0755 -o root -g root "$script_dir/phoenix-release-gateway.sh" "$gateway"
 install -m 0755 -o root -g root "$script_dir/phoenix-release-transport.sh" "$transport"
 install -m 0755 -o root -g root "$script_dir/phoenix-observer.sh" "$observer"
-for name in __init__.py chain_reconciliation.py model.py controller.py gateway.py cli.py phase_update.py; do
+for name in __init__.py chain_reconciliation.py model.py controller.py gateway.py cli.py phase_update.py rpc_provider_secret.py; do
   install -m 0644 -o root -g root \
     "$script_dir/phoenix_release/$name" "$libexec/phoenix_release/$name"
 done
