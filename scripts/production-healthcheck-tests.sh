@@ -46,7 +46,7 @@ printf 'PHOENIX_RELEASE_SHA=%s\n' "$release_sha" >"$release_env"
 cp "$repo_root/release-components.json" "$deploy_dir/release-components.json"
 cp "$script_dir/release_components.py" "$deploy_dir/release_components.py"
 cat >"$deploy_dir/manifests/$release_sha.json" <<EOF
-{"images":{"dashboard":{},"feed-ingestor":{},"fork-sandbox":{},"live-executor":{},"phoenix-engine":{},"recorder":{},"rpc-gateway":{}}}
+{"images":{"atlas-observer":{},"dashboard":{},"feed-ingestor":{},"fork-sandbox":{},"live-executor":{},"phoenix-engine":{},"recorder":{},"rpc-gateway":{}}}
 EOF
 
 cat >"$fake_bin/docker" <<'SH'
@@ -84,6 +84,8 @@ grep -Fx 'PRODUCTION_HEALTH_OK' "$output" >/dev/null ||
   fail 'production healthcheck did not complete'
 [ "$(grep -c '<nitro-feed-relay>' "$docker_log")" -eq 1 ] ||
   fail 'Nitro relay healthcheck invocation count differs'
+grep -F '<atlas-health><false>' "$docker_log" >/dev/null ||
+  fail 'Production health did not default to the exact Atlas/Aave binary'
 relay_call=$(grep '<nitro-feed-relay>' "$docker_log")
 printf '%s\n' "$relay_call" | grep -F "$listener_contract" >/dev/null ||
   fail 'Nitro relay listener contract did not reach Compose execution'
@@ -201,5 +203,19 @@ then
 fi
 grep -Fx 'HEALTH_FAIL: invalid expected mode' "$output" >/dev/null ||
   fail 'invalid explicit health mode did not fail explicitly'
+
+if PATH="$fake_bin:$PATH" \
+  PHOENIX_DEPLOY_ROOT="$deploy_root" \
+  PHOENIX_ENV_FILE="$env_file" \
+  PHOENIX_RELEASE_ENV="$release_env" \
+  PHOENIX_RELEASE_MANIFEST="$candidate_manifest" \
+  PHOENIX_HEALTH_ALLOW_LEGACY_ATLAS_BINARY=invalid \
+  PHOENIX_HEALTHCHECK_DOCKER_LOG="$docker_log" \
+    /bin/sh "$healthcheck" >"$output" 2>&1
+then
+  fail 'invalid legacy Atlas allowance passed'
+fi
+grep -Fx 'HEALTH_FAIL: invalid legacy Atlas allowance' "$output" >/dev/null ||
+  fail 'invalid legacy Atlas allowance did not fail explicitly'
 
 echo 'production-healthcheck-tests: ok'

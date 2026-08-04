@@ -14,6 +14,7 @@ sleep_seconds="${PHOENIX_HEALTH_SLEEP_SECONDS:-3}"
 command_timeout_seconds="${PHOENIX_HEALTH_COMMAND_TIMEOUT_SECONDS:-15}"
 expected_mode="${PHOENIX_HEALTH_EXPECTED_MODE:-}"
 allow_stopped_standby="${PHOENIX_HEALTH_ALLOW_STOPPED_STANDBY:-false}"
+allow_legacy_atlas_binary="${PHOENIX_HEALTH_ALLOW_LEGACY_ATLAS_BINARY:-false}"
 compose_runner=${PHOENIX_COMPOSE_RUNNER:-$deploy_dir/production_compose.py}
 if [ ! -f "$compose_runner" ] && [ -f "$script_dir/production_compose.py" ]; then
   compose_runner=$script_dir/production_compose.py
@@ -34,6 +35,10 @@ esac
 case "$allow_stopped_standby" in
   true|false) ;;
   *) echo "HEALTH_FAIL: invalid stopped-standby allowance"; exit 1 ;;
+esac
+case "$allow_legacy_atlas_binary" in
+  true|false) ;;
+  *) echo "HEALTH_FAIL: invalid legacy Atlas allowance"; exit 1 ;;
 esac
 
 [ -f "$release_env" ] ||
@@ -137,7 +142,8 @@ for service in $health_services; do
       ;;
     atlas-observer)
       check atlas-observer compose exec -T atlas-observer /bin/sh -c \
-        '[ "$(readlink /proc/1/exe)" = /usr/local/bin/atlas-aave-hunter ] && wget -q -O - http://127.0.0.1:9700/readyz'
+        'actual=$(readlink /proc/1/exe) && { [ "$actual" = /usr/local/bin/atlas-aave-hunter ] || { [ "$1" = true ] && [ "$actual" = /usr/local/bin/atlas-observer ]; }; } && wget -q -O - http://127.0.0.1:9700/readyz' \
+        atlas-health "$allow_legacy_atlas_binary"
       ;;
     prometheus)
       check prometheus compose exec -T prometheus wget -q -O - http://127.0.0.1:9090/-/ready

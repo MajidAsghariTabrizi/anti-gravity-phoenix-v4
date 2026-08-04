@@ -1851,6 +1851,9 @@ class WorkflowAndDeploymentContractTests(unittest.TestCase):
         self.rehearsal = (
             ROOT / "scripts/rehearse-production-release.sh"
         ).read_text()
+        self.healthcheck = (
+            ROOT / "scripts/production-healthcheck.sh"
+        ).read_text()
         self.autonomous_schema = (
             ROOT / "live-executor/schema/003_autonomous_hunter_contracts.sql"
         ).read_text()
@@ -2092,6 +2095,22 @@ class WorkflowAndDeploymentContractTests(unittest.TestCase):
         self.assertIn(
             'PHOENIX_HEALTH_EXPECTED_MODE="$active_health_mode"',
             health_rehearsal,
+        )
+        self.assertIn(
+            "PHOENIX_HEALTH_ALLOW_LEGACY_ATLAS_BINARY=true",
+            health_rehearsal,
+        )
+        self.assertIn(
+            'allow_legacy_atlas_binary="${PHOENIX_HEALTH_ALLOW_LEGACY_ATLAS_BINARY:-false}"',
+            self.healthcheck,
+        )
+        self.assertIn(
+            '[ "$actual" = /usr/local/bin/atlas-aave-hunter ]',
+            self.healthcheck,
+        )
+        self.assertIn(
+            '[ "$actual" = /usr/local/bin/atlas-observer ]',
+            self.healthcheck,
         )
         self.assertIn("SHADOW) ;;", health_rehearsal)
         self.assertIn(
