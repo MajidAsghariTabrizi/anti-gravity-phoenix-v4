@@ -3,6 +3,7 @@ use phoenix_live_executor::autonomous::{
 };
 use phoenix_live_executor::config::{Bootstrap, DisabledReason};
 use phoenix_live_executor::engine::LiveExecutor;
+use phoenix_live_executor::revenue::{AtlasExecutionState, AtlasRevenueExecutor};
 use phoenix_live_executor::rpc::HttpExecutionRpc;
 use phoenix_live_executor::store::{ExecutorStore, PostgresExecutorStore};
 use tracing::{error, info};
@@ -24,16 +25,17 @@ async fn main() {
             std::process::exit(1);
         }
     };
-    let Bootstrap::Armed(armed) = bootstrap else {
-        let Bootstrap::Disabled(reason) = bootstrap else {
-            unreachable!("bootstrap variants are exhaustive");
-        };
-        info!(
-            state = "disabled",
-            reason = disabled_reason_code(reason),
-            "live executor is disabled"
-        );
-        return;
+    let (armed, standby) = match bootstrap {
+        Bootstrap::Armed(armed) => (armed, false),
+        Bootstrap::Standby(armed) => (armed, true),
+        Bootstrap::Disabled(reason) => {
+            info!(
+                state = "disabled",
+                reason = disabled_reason_code(reason),
+                "live executor is disabled"
+            );
+            return;
+        }
     };
     let config = armed.config;
     let signer = armed.signer;
@@ -75,9 +77,19 @@ async fn main() {
             std::process::exit(1);
         }
     };
+    let atlas_executor = AtlasRevenueExecutor::new(
+        store.pool(),
+        signer.clone(),
+        config.executor_address,
+        rpc.clone(),
+    );
     let executor = LiveExecutor::new(config, signer, store.clone(), rpc);
     info!(
-        state = "started_disarmed_until_db_gate",
+        state = if standby {
+            "hunting_standby_disarmed_until_db_gate"
+        } else {
+            "started_disarmed_until_db_gate"
+        },
         "live executor started"
     );
 
@@ -128,6 +140,16 @@ async fn main() {
                     "live executor failed closed"
                 );
                 std::process::exit(1);
+            }
+        }
+        match atlas_executor.step(now).await {
+            Ok(AtlasExecutionState::Disarmed | AtlasExecutionState::Idle) => {}
+            Ok(state) => info!(state = ?state, "Atlas revenue lane state transition"),
+            Err(error) => {
+                error!(
+                    error_code = error.code(),
+                    "Atlas revenue lane rejected work"
+                );
             }
         }
         tokio::select! {

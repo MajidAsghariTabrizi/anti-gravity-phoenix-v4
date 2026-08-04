@@ -14,7 +14,7 @@ use sqlx::{PgPool, Postgres, Row, Transaction};
 use thiserror::Error;
 use uuid::Uuid;
 
-const SCHEMA_VERSION: &str = "phoenix.live-canary-schema.v5";
+const SCHEMA_VERSION: &str = "phoenix.live-canary-schema.v6";
 const ACTIVE_STATUSES: &str =
     "'claimed', 'nonce_allocated', 'submission_unknown', 'pending', 'timed_out'";
 
@@ -101,6 +101,10 @@ impl PostgresExecutorStore {
     pub fn from_pool(pool: PgPool) -> Self {
         Self { pool }
     }
+
+    pub fn pool(&self) -> PgPool {
+        self.pool.clone()
+    }
 }
 
 #[async_trait]
@@ -128,19 +132,38 @@ impl ExecutorStore for PostgresExecutorStore {
         if controls != 3 {
             return Err(StoreError::Schema);
         }
+        let lanes: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM live_canary.revenue_lane_controls
+             WHERE lane IN ('phoenix_dex', 'atlas_solver', 'aave_liquidation')",
+        )
+        .fetch_one(&self.pool)
+        .await
+        .map_err(StoreError::from)?;
+        if lanes != 3 {
+            return Err(StoreError::Schema);
+        }
         Ok(())
     }
 
     async fn control_state(&self) -> Result<ControlState, StoreError> {
         let row = sqlx::query(
-            "SELECT c.armed AND a.armed AND a.execution_mode = 'live'
-                    AND e.phase LIKE 'LIVE_%' AS armed,
-                    c.kill_switch OR a.kill_switch
-                    OR e.phase NOT LIKE 'LIVE_%' AS kill_switch
+            "SELECT
+                    (c.armed AND NOT c.kill_switch AND a.armed
+                     AND NOT a.kill_switch AND a.execution_mode = 'live'
+                     AND e.phase LIKE 'LIVE_%')
+                    OR (lane.armed AND NOT lane.kill_switch) AS armed,
+                    NOT (
+                        (c.armed AND NOT c.kill_switch AND a.armed
+                         AND NOT a.kill_switch AND a.execution_mode = 'live'
+                         AND e.phase LIKE 'LIVE_%')
+                        OR (lane.armed AND NOT lane.kill_switch)
+                    ) AS kill_switch
              FROM live_canary.control c
              CROSS JOIN live_canary.autonomous_global_control a
              CROSS JOIN live_canary.economic_control e
-             WHERE c.singleton AND a.singleton AND e.singleton",
+             CROSS JOIN live_canary.revenue_lane_controls lane
+             WHERE c.singleton AND a.singleton AND e.singleton
+               AND lane.lane = 'aave_liquidation'",
         )
         .fetch_one(&self.pool)
         .await
@@ -173,27 +196,56 @@ impl ExecutorStore for PostgresExecutorStore {
         now: DateTime<Utc>,
     ) -> Result<Option<ExecutionRequest>, StoreError> {
         let mut transaction = self.pool.begin().await.map_err(StoreError::from)?;
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended('phoenix-global-revenue-submission', 0))")
+            .execute(&mut *transaction)
+            .await
+            .map_err(StoreError::from)?;
         let control = sqlx::query(
             "SELECT c.armed AND a.armed AND a.execution_mode = 'live'
-                    AND e.phase LIKE 'LIVE_%' AS armed,
+                    AND e.phase LIKE 'LIVE_%' AS dex_armed,
                     c.kill_switch OR a.kill_switch
-                    OR e.phase NOT LIKE 'LIVE_%' AS kill_switch,
+                    OR e.phase NOT LIKE 'LIVE_%' AS dex_kill_switch,
+                    lane.armed AS aave_armed, lane.kill_switch AS aave_kill_switch,
+                    lane.maximum_input_amount::text AS aave_maximum_input,
                     e.current_input_wei::text AS current_input_wei
              FROM live_canary.control c
              CROSS JOIN live_canary.autonomous_global_control a
              CROSS JOIN live_canary.economic_control e
+             CROSS JOIN live_canary.revenue_lane_controls lane
              WHERE c.singleton AND a.singleton AND e.singleton
-             FOR UPDATE OF c, a, e",
+               AND lane.lane = 'aave_liquidation'
+             FOR UPDATE OF c, a, e, lane",
         )
         .fetch_one(&mut *transaction)
         .await
         .map_err(StoreError::from)?;
-        let armed: bool = control.try_get("armed").map_err(StoreError::from)?;
-        let kill_switch: bool = control.try_get("kill_switch").map_err(StoreError::from)?;
+        let dex_armed: bool = control.try_get("dex_armed").map_err(StoreError::from)?;
+        let dex_kill_switch: bool = control
+            .try_get("dex_kill_switch")
+            .map_err(StoreError::from)?;
+        let aave_armed: bool = control.try_get("aave_armed").map_err(StoreError::from)?;
+        let aave_kill_switch: bool = control
+            .try_get("aave_kill_switch")
+            .map_err(StoreError::from)?;
+        let aave_maximum_input: String = control
+            .try_get("aave_maximum_input")
+            .map_err(StoreError::from)?;
         let current_input_wei: String = control
             .try_get("current_input_wei")
             .map_err(StoreError::from)?;
-        if !armed || kill_switch {
+        if (!dex_armed || dex_kill_switch) && (!aave_armed || aave_kill_switch) {
+            transaction.commit().await.map_err(StoreError::from)?;
+            return Ok(None);
+        }
+
+        let submission_lock: Option<String> = sqlx::query_scalar(
+            "SELECT active_lane FROM live_canary.global_revenue_submission_lock
+             WHERE singleton FOR UPDATE",
+        )
+        .fetch_one(&mut *transaction)
+        .await
+        .map_err(StoreError::from)?;
+        if submission_lock.is_some() {
             transaction.commit().await.map_err(StoreError::from)?;
             return Ok(None);
         }
@@ -219,7 +271,13 @@ impl ExecutorStore for PostgresExecutorStore {
                  AND r.approval_digest IS NOT NULL
                  AND r.deadline > $1
                  AND r.approval_deadline > $1
-                 AND r.selected_size = $3::numeric
+                 AND (
+                    (r.route_type = 'PHOENIX_DEX_V1' AND $4 AND NOT $5
+                     AND r.selected_size = $3::numeric)
+                    OR
+                    (r.route_type = 'AAVE_LIQUIDATION_V1' AND $6 AND NOT $7
+                     AND r.selected_size <= $8::numeric)
+                 )
              ORDER BY r.approved_at, r.id
              FOR UPDATE OF r SKIP LOCKED
              LIMIT 1",
@@ -228,6 +286,11 @@ impl ExecutorStore for PostgresExecutorStore {
         .bind(now)
         .bind(crate::REQUEST_SCHEMA_VERSION)
         .bind(&current_input_wei)
+        .bind(dex_armed)
+        .bind(dex_kill_switch)
+        .bind(aave_armed)
+        .bind(aave_kill_switch)
+        .bind(&aave_maximum_input)
         .fetch_optional(&mut *transaction)
         .await
         .map_err(StoreError::from)?;
@@ -270,6 +333,26 @@ impl ExecutorStore for PostgresExecutorStore {
             "claimed",
         )
         .await?;
+        let lane = if request.route_type == crate::model::ExecutionRouteType::AaveLiquidationV1 {
+            "aave_liquidation"
+        } else {
+            "phoenix_dex"
+        };
+        let locked = sqlx::query(
+            "UPDATE live_canary.global_revenue_submission_lock
+             SET active_lane = $1, active_identity = $2, acquired_at = $3,
+                 control_epoch = control_epoch + 1
+             WHERE singleton AND active_lane IS NULL",
+        )
+        .bind(lane)
+        .bind(request.id.to_string())
+        .bind(now)
+        .execute(&mut *transaction)
+        .await
+        .map_err(StoreError::from)?;
+        if locked.rows_affected() != 1 {
+            return Err(StoreError::Invariant);
+        }
         transaction.commit().await.map_err(StoreError::from)?;
         Ok(Some(request))
     }
@@ -516,6 +599,7 @@ impl ExecutorStore for PostgresExecutorStore {
         if candidate_updated.rows_affected() > 1 {
             return Err(StoreError::Invariant);
         }
+        release_revenue_submission_lock(&mut transaction, request_id).await?;
         transaction.commit().await.map_err(StoreError::from)
     }
 
@@ -726,6 +810,12 @@ impl ExecutorStore for PostgresExecutorStore {
             return Err(StoreError::Invariant);
         }
         apply_autonomous_risk_feedback(&mut transaction, request_id, terminal_at).await?;
+        if matches!(
+            status,
+            AttemptStatus::Confirmed | AttemptStatus::Reverted | AttemptStatus::Failed
+        ) {
+            release_revenue_submission_lock(&mut transaction, request_id).await?;
+        }
         transaction.commit().await.map_err(StoreError::from)
     }
 
@@ -822,6 +912,16 @@ impl ExecutorStore for PostgresExecutorStore {
         if autonomous.rows_affected() != 1 {
             return Err(StoreError::Invariant);
         }
+        sqlx::query(
+            "UPDATE live_canary.revenue_lane_controls
+             SET armed = false, kill_switch = true, disarm_reason = $1,
+                 control_epoch = control_epoch + 1, updated_at = now()
+             WHERE lane = 'aave_liquidation'",
+        )
+        .bind(reason)
+        .execute(&mut *transaction)
+        .await
+        .map_err(StoreError::from)?;
         sqlx::query(
             "UPDATE live_canary.autonomous_route_controls
              SET enabled = false, kill_switch = true, disarm_reason = $1,
@@ -1267,6 +1367,9 @@ async fn apply_autonomous_risk_feedback(
     .fetch_one(&mut **transaction)
     .await
     .map_err(StoreError::from)?;
+    if route_fingerprint == crate::AAVE_LIQUIDATION_ROUTE_FINGERPRINT {
+        return Ok(());
+    }
     let global: (String, String) = sqlx::query_as(
         "WITH bounds AS (
             SELECT (
@@ -1555,6 +1658,26 @@ async fn update_candidate_status_for_request(
     Ok(())
 }
 
+async fn release_revenue_submission_lock(
+    transaction: &mut Transaction<'_, Postgres>,
+    request_id: Uuid,
+) -> Result<(), StoreError> {
+    let updated = sqlx::query(
+        "UPDATE live_canary.global_revenue_submission_lock
+         SET active_lane = NULL, active_identity = NULL, acquired_at = NULL,
+             control_epoch = control_epoch + 1
+         WHERE singleton AND active_identity = $1",
+    )
+    .bind(request_id.to_string())
+    .execute(&mut **transaction)
+    .await
+    .map_err(StoreError::from)?;
+    if updated.rows_affected() > 1 {
+        return Err(StoreError::Invariant);
+    }
+    Ok(())
+}
+
 pub(crate) fn request_select() -> &'static str {
     "SELECT
         r.id,
@@ -1563,6 +1686,8 @@ pub(crate) fn request_select() -> &'static str {
         r.chain_id,
         r.route_id,
         r.route_fingerprint,
+        r.route_type,
+        r.route_payload,
         r.selected_size::text AS selected_size,
         r.token_path,
         r.origin_router,
@@ -1613,6 +1738,8 @@ pub(crate) fn decode_request(row: &sqlx::postgres::PgRow) -> Result<ExecutionReq
         chain_id: row.try_get("chain_id").map_err(StoreError::from)?,
         route_id: row.try_get("route_id").map_err(StoreError::from)?,
         route_fingerprint: row.try_get("route_fingerprint").map_err(StoreError::from)?,
+        route_type: row.try_get("route_type").map_err(StoreError::from)?,
+        route_payload: row.try_get("route_payload").map_err(StoreError::from)?,
         selected_size: row.try_get("selected_size").map_err(StoreError::from)?,
         token_path: token_path.0,
         origin_router: row.try_get("origin_router").map_err(StoreError::from)?,

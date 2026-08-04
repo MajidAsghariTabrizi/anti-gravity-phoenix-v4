@@ -20,6 +20,7 @@ const ENVIRONMENT_NAMES: &[&str] = &[
     "AUTONOMOUS_EXECUTION",
     "LIVE_EXECUTOR_ARMED",
     "LIVE_EXECUTOR_KILL_SWITCH",
+    "LIVE_EXECUTOR_HUNTING_STANDBY",
     "CHAIN_ID",
     WALLET_ADDRESS_ENV,
     EXECUTOR_ADDRESS_ENV,
@@ -75,6 +76,7 @@ pub struct ExecutorConfig {
 
 pub enum Bootstrap {
     Disabled(DisabledReason),
+    Standby(Box<ArmedBootstrap>),
     Armed(Box<ArmedBootstrap>),
 }
 
@@ -111,14 +113,21 @@ impl Bootstrap {
         let live_execution = parse_bool(get_or(&values, "LIVE_EXECUTION", "false"))?;
         let autonomous_execution = parse_bool(get_or(&values, "AUTONOMOUS_EXECUTION", "false"))?;
         let armed = parse_bool(get_or(&values, "LIVE_EXECUTOR_ARMED", "false"))?;
+        let standby = parse_bool(get_or(&values, "LIVE_EXECUTOR_HUNTING_STANDBY", "false"))?;
+        let kill_switch = parse_bool(get_or(&values, "LIVE_EXECUTOR_KILL_SWITCH", "true"))?;
 
-        if mode == "SHADOW" && !live_execution && !autonomous_execution && !armed {
+        if mode == "SHADOW" && !live_execution && !autonomous_execution && !armed && !standby {
             return Ok(Self::Disabled(DisabledReason::SafeDefaults));
         }
-        if mode != "LIVE" || !live_execution || !autonomous_execution || !armed {
+        if mode != "LIVE"
+            || !live_execution
+            || !autonomous_execution
+            || (standby && (armed || !kill_switch))
+            || (!standby && !armed)
+        {
             return Err(ConfigError::IncompleteArming);
         }
-        if parse_bool(get_or(&values, "LIVE_EXECUTOR_KILL_SWITCH", "true"))? {
+        if !standby && kill_switch {
             return Ok(Self::Disabled(DisabledReason::EnvironmentKillSwitch));
         }
         if environment_key_material.is_some() && signer_file_path.is_some() {
@@ -218,7 +227,7 @@ impl Bootstrap {
             return Err(ConfigError::WalletMismatch);
         }
 
-        Ok(Self::Armed(Box::new(ArmedBootstrap {
+        let bootstrap = Box::new(ArmedBootstrap {
             config: ExecutorConfig {
                 postgres_dsn,
                 rpc_url,
@@ -234,7 +243,12 @@ impl Bootstrap {
                 one_transaction_at_a_time,
             },
             signer,
-        })))
+        });
+        Ok(if standby {
+            Self::Standby(bootstrap)
+        } else {
+            Self::Armed(bootstrap)
+        })
     }
 }
 
@@ -615,6 +629,26 @@ mod tests {
         assert!(matches!(
             Bootstrap::from_values(fully_armed_values()),
             Ok(Bootstrap::Armed(_))
+        ));
+    }
+
+    #[test]
+    fn hunting_standby_loads_signer_but_requires_environment_kill_switch() {
+        let mut values = fully_armed_values();
+        values.insert("LIVE_EXECUTOR_ARMED".to_string(), "false".to_string());
+        values.insert("LIVE_EXECUTOR_KILL_SWITCH".to_string(), "true".to_string());
+        values.insert(
+            "LIVE_EXECUTOR_HUNTING_STANDBY".to_string(),
+            "true".to_string(),
+        );
+        assert!(matches!(
+            Bootstrap::from_values(values.clone()),
+            Ok(Bootstrap::Standby(_))
+        ));
+        values.insert("LIVE_EXECUTOR_KILL_SWITCH".to_string(), "false".to_string());
+        assert!(matches!(
+            Bootstrap::from_values(values),
+            Err(ConfigError::IncompleteArming)
         ));
     }
 

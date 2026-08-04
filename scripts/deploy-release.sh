@@ -55,6 +55,7 @@ expected_phase, expected_release = sys.argv[1:]
 status = json.load(sys.stdin)
 global_control = status["global"]
 route_control = status["route"]
+revenue_lanes = status["revenue_lanes"]
 economic = status["economic"]
 valid = (
     global_control["armed"] is False
@@ -63,6 +64,10 @@ valid = (
     and route_control is not None
     and route_control["enabled"] is False
     and route_control["kill_switch"] is True
+    and len(revenue_lanes) == 2
+    and {lane["lane"] for lane in revenue_lanes} == {"atlas_solver", "aave_liquidation"}
+    and all(lane["armed"] is False for lane in revenue_lanes)
+    and all(lane["kill_switch"] is True for lane in revenue_lanes)
     and economic["phase"] == expected_phase
     and economic["release_sha"] == expected_release
 )
@@ -776,6 +781,7 @@ assert_live_environment
   PHOENIX_ENV_FILE="$env_file" \
   PHOENIX_RELEASE_ENV="$release_env" \
   PHOENIX_HEALTH_EXPECTED_MODE=DISARMED_EVIDENCE \
+  PHOENIX_HEALTH_ALLOW_STOPPED_STANDBY=true \
     "$deploy_dir/production-healthcheck.sh"
 )
 mark_phase POST_DISARMED_VERIFIED
@@ -797,6 +803,18 @@ printf '%s\n' "$evidence_status" |
   fail "live-executor started during evidence-start"
 mark_phase DISARMED_EVIDENCE_STARTED
 
+# Keep the signer-isolated process continuously connected. Durable per-lane
+# controls are still disarmed, all lane kill switches remain engaged, and the
+# on-chain executor remains paused at this release phase.
+compose up -d --no-deps live-executor
+wait_service_healthy live-executor ||
+  fail "live-executor hunting standby did not become healthy"
+control_status=$(compose run --rm --no-deps autonomous-control status)
+printf '%s\n' "$control_status" |
+  verify_runtime_control_phase DISARMED_EVIDENCE ||
+  fail "hunting standby changed fail-closed runtime controls"
+mark_phase HUNTING_STANDBY_STARTED
+
 printf '%s\n' "$release_sha" >"$pointer_candidate"
 printf '%s\n' "$release_sha" >"$assets_pointer_candidate"
 python3 "$deploy_dir/production_context.py" write-state \
@@ -817,7 +835,6 @@ context_validation_output=$(
     --current-release "$pointer_candidate" \
     --release-state "$state_candidate" \
     --inspect-running \
-    --allow-stopped-live-executor \
     --rendered-output "$context_rendered" \
     --metadata-output "$context_metadata" \
     --output "$context_candidate" 2>&1

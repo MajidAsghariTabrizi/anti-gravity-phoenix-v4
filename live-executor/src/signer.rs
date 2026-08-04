@@ -1,7 +1,7 @@
 use crate::model::{CanonicalAddress, TransactionHash};
 use alloy_consensus::{SignableTransaction, TxEip1559};
 use alloy_eips::eip2930::AccessList;
-use alloy_primitives::{Address, Bytes, TxKind, U256};
+use alloy_primitives::{Address, Bytes, TxKind, B256, U256};
 use alloy_signer::SignerSync;
 use alloy_signer_local::PrivateKeySigner;
 use std::fmt;
@@ -9,6 +9,7 @@ use std::str::FromStr;
 use thiserror::Error;
 use zeroize::Zeroizing;
 
+#[derive(Clone)]
 pub struct TransactionSigner {
     signer: PrivateKeySigner,
     address: CanonicalAddress,
@@ -64,6 +65,26 @@ impl TransactionSigner {
             tx_hash,
             raw: protected,
         })
+    }
+
+    /// Signs an already domain-separated 32-byte operation digest. Atlas v1.6.4
+    /// expects the canonical 65-byte `r || s || v` representation with v=27/28.
+    pub fn sign_digest(&self, digest: [u8; 32]) -> Result<Zeroizing<Vec<u8>>, SignerError> {
+        let signature = self
+            .signer
+            .sign_hash_sync(&B256::from(digest))
+            .map_err(|_| SignerError::Signing)?;
+        let mut bytes = signature.as_bytes().to_vec();
+        if bytes.len() != 65 {
+            return Err(SignerError::Signing);
+        }
+        if bytes[64] <= 1 {
+            bytes[64] += 27;
+        }
+        if bytes[64] != 27 && bytes[64] != 28 {
+            return Err(SignerError::Signing);
+        }
+        Ok(Zeroizing::new(bytes))
     }
 }
 

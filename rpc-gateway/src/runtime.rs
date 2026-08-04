@@ -1,3 +1,10 @@
+use crate::aave_state::{
+    AaveAccountData, AaveExactLiquidationState, AaveExactProviderState, AaveExactRequest,
+    AaveExactReserveState, AaveExactResponse, AaveProviderScreen, AaveScreenRequest,
+    AaveScreenResponse, AaveSimulateRequest, AaveSimulateResponse, AaveTailRequest,
+    AaveTailResponse, AAVE_EXACT_RESPONSE_SCHEMA, AAVE_SCREEN_RESPONSE_SCHEMA,
+    AAVE_SIMULATE_RESPONSE_SCHEMA, AAVE_TAIL_RESPONSE_SCHEMA, AAVE_V3_POOL_ARBITRUM,
+};
 use crate::budget::GlobalBudget;
 use crate::cache::TtlCache;
 use crate::economic::{
@@ -32,6 +39,31 @@ use thiserror::Error;
 use tokio::sync::{watch, Mutex};
 
 const ARBITRUM_CHAIN_ID_HEX: &str = "0xa4b1";
+const AAVE_GET_USER_ACCOUNT_DATA_SELECTOR: &str = "0xbf92857c";
+const AAVE_GET_USER_CONFIGURATION_SELECTOR: &str = "0x4417a583";
+const AAVE_GET_CONFIGURATION_SELECTOR: &str = "0xc44b11f7";
+const AAVE_GET_USER_RESERVE_DATA_SELECTOR: &str = "0x28dd2d01";
+const AAVE_GET_RESERVE_TOKENS_SELECTOR: &str = "0xd2493b6c";
+const AAVE_ORACLE_GET_ASSET_PRICE_SELECTOR: &str = "0xb3596f07";
+const AAVE_BORROW_TOPIC: &str =
+    "0xb3d084820fb1a9decffb176436bd02558d15fac9b0ddfed8c465bc7359d7dce0";
+const AAVE_REPAY_TOPIC: &str = "0xa534c8dbe71f871f9f3530e97a74601fea17b426cae02e1c5aee42c96c784051";
+const AAVE_LIQUIDATION_TOPIC: &str =
+    "0xe413a321e8681d831f4dbccbca790d2952b56f977908e45be37335533e005286";
+const AAVE_DATA_PROVIDER_ARBITRUM: &str = "0x243aa95cac2a25651eda86e80bee66114413c43b";
+const AAVE_ORACLE_ARBITRUM: &str = "0xb56c2f0b653b2e0b10c9b928c8580ac5df02c7c7";
+const AAVE_POOL_IMPLEMENTATION_ARBITRUM: &str = "0xf05fd3cc911b4c5e36e53c00354f645e22922c9a";
+const EIP1967_IMPLEMENTATION_SLOT: &str =
+    "0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc";
+const ARBITRUM_WETH: &str = "0x82af49447d8a07e3bd95bd0d56f35241523fbab1";
+const ARBITRUM_NATIVE_USDC: &str = "0xaf88d065e77c8cc2239327c5edb3a432268e5831";
+const UNISWAP_V3_QUOTER_V2_ARBITRUM: &str = "0x61ffe014ba17989e743c5f6cb21bf9697530b21e";
+const UNISWAP_V3_FACTORY_ARBITRUM: &str = "0x1f98431c8ad98523631ae4a59f267346ea31f984";
+const UNISWAP_WETH_USDC_POOL_500_ARBITRUM: &str = "0xc6962004f452be9203591991d15f6b388e09e8d0";
+const UNISWAP_WETH_USDC_POOL_3000_ARBITRUM: &str = "0xc473e2aee3441bf9240be85eb122abb059a3b57c";
+const PHOENIX_EXECUTOR_PACKED_CONFIG_SLOT: &str =
+    "0x0000000000000000000000000000000000000000000000000000000000000002";
+const UNISWAP_QUOTE_EXACT_INPUT_SINGLE_SELECTOR: &str = "0xc6a5026a";
 const SLOT0_SELECTOR: &str = "0x3850c7bd";
 const LIQUIDITY_SELECTOR: &str = "0x1a686502";
 const TOKEN0_SELECTOR: &str = "0x0dfe1681";
@@ -606,6 +638,803 @@ impl GatewayRuntime {
             .validate(&request)
             .map_err(map_hunter_contract_error)?;
         Ok(response)
+    }
+
+    pub async fn resolve_aave_screen(
+        &self,
+        request: AaveScreenRequest,
+    ) -> Result<AaveScreenResponse, GatewayError> {
+        request
+            .validate()
+            .map_err(|_| GatewayError::InvalidRequest)?;
+        if !self.request_budget.lock().await.admit(Instant::now()) {
+            return Err(GatewayError::RequestBudgetExhausted);
+        }
+        let _operation_guard = self.upstream_operation_lock.lock().await;
+        if self.provider_count().await < 2 {
+            return Err(GatewayError::ProviderUnavailable);
+        }
+        let primary = self
+            .reserve_provider(&HashSet::new())
+            .await
+            .ok_or(GatewayError::ProviderUnavailable)?;
+        self.ensure_provider_verified(&primary)
+            .await
+            .map_err(map_call_failure)?;
+        let secondary = self
+            .reserve_provider(&HashSet::from([primary.provider_id().to_string()]))
+            .await
+            .ok_or(GatewayError::ProviderUnavailable)?;
+        self.ensure_provider_verified(&secondary)
+            .await
+            .map_err(map_call_failure)?;
+        let block = self.common_finalized_block(&primary, &secondary).await?;
+        let (primary_accounts, primary_weth_price) = self
+            .perform_aave_screen(&primary, &request, &block, ProviderSlot::Primary)
+            .await?;
+        let (secondary_accounts, secondary_weth_price) = self
+            .perform_aave_screen(&secondary, &request, &block, ProviderSlot::Secondary)
+            .await?;
+        self.mark_provider_success(primary.provider_id()).await;
+        self.mark_provider_success(secondary.provider_id()).await;
+        let response = AaveScreenResponse {
+            schema_version: AAVE_SCREEN_RESPONSE_SCHEMA.to_string(),
+            chain_id: ARBITRUM_ONE_CHAIN_ID,
+            request_id: request.request_id.clone(),
+            block_number: block.number,
+            block_hash: block.hash,
+            primary: AaveProviderScreen {
+                provider_id: primary.provider_id().to_string(),
+                weth_price_base: primary_weth_price,
+                accounts: primary_accounts,
+            },
+            secondary: AaveProviderScreen {
+                provider_id: secondary.provider_id().to_string(),
+                weth_price_base: secondary_weth_price,
+                accounts: secondary_accounts,
+            },
+            resolved_at_unix_ms: unix_time_ms(),
+        };
+        response
+            .validate(&request)
+            .map_err(|_| GatewayError::ProviderDisagreement)?;
+        Ok(response)
+    }
+
+    pub async fn resolve_aave_exact(
+        &self,
+        request: AaveExactRequest,
+    ) -> Result<AaveExactResponse, GatewayError> {
+        request
+            .validate()
+            .map_err(|_| GatewayError::InvalidRequest)?;
+        if !self.request_budget.lock().await.admit(Instant::now()) {
+            return Err(GatewayError::RequestBudgetExhausted);
+        }
+        let _operation_guard = self.upstream_operation_lock.lock().await;
+        if self.provider_count().await < 2 {
+            return Err(GatewayError::ProviderUnavailable);
+        }
+        let primary = self
+            .reserve_provider(&HashSet::new())
+            .await
+            .ok_or(GatewayError::ProviderUnavailable)?;
+        self.ensure_provider_verified(&primary)
+            .await
+            .map_err(map_call_failure)?;
+        let secondary = self
+            .reserve_provider(&HashSet::from([primary.provider_id().to_string()]))
+            .await
+            .ok_or(GatewayError::ProviderUnavailable)?;
+        self.ensure_provider_verified(&secondary)
+            .await
+            .map_err(map_call_failure)?;
+        let block = self.common_finalized_block(&primary, &secondary).await?;
+        let (primary_state, primary_root) = self
+            .perform_aave_exact(&primary, &request, &block, ProviderSlot::Primary)
+            .await?;
+        let (secondary_state, secondary_root) = self
+            .perform_aave_exact(&secondary, &request, &block, ProviderSlot::Secondary)
+            .await?;
+        if primary_root != secondary_root {
+            return Err(GatewayError::ProviderDisagreement);
+        }
+        self.mark_provider_success(primary.provider_id()).await;
+        self.mark_provider_success(secondary.provider_id()).await;
+        let response = AaveExactResponse {
+            schema_version: AAVE_EXACT_RESPONSE_SCHEMA.to_string(),
+            chain_id: ARBITRUM_ONE_CHAIN_ID,
+            request_id: request.request_id.clone(),
+            block_number: block.number,
+            block_hash: block.hash,
+            state_root: primary_root,
+            primary: primary_state,
+            secondary: secondary_state,
+            resolved_at_unix_ms: unix_time_ms(),
+        };
+        response
+            .validate(&request)
+            .map_err(|_| GatewayError::ProviderDisagreement)?;
+        Ok(response)
+    }
+
+    pub async fn resolve_aave_tail(
+        &self,
+        request: AaveTailRequest,
+    ) -> Result<AaveTailResponse, GatewayError> {
+        request
+            .validate()
+            .map_err(|_| GatewayError::InvalidRequest)?;
+        if !self.request_budget.lock().await.admit(Instant::now()) {
+            return Err(GatewayError::RequestBudgetExhausted);
+        }
+        let _operation_guard = self.upstream_operation_lock.lock().await;
+        if self.provider_count().await < 2 {
+            return Err(GatewayError::ProviderUnavailable);
+        }
+        let primary = self
+            .reserve_provider(&HashSet::new())
+            .await
+            .ok_or(GatewayError::ProviderUnavailable)?;
+        self.ensure_provider_verified(&primary)
+            .await
+            .map_err(map_call_failure)?;
+        let secondary = self
+            .reserve_provider(&HashSet::from([primary.provider_id().to_string()]))
+            .await
+            .ok_or(GatewayError::ProviderUnavailable)?;
+        self.ensure_provider_verified(&secondary)
+            .await
+            .map_err(map_call_failure)?;
+        let finalized = self.common_finalized_block(&primary, &secondary).await?;
+        let (from_block, to_block, borrowers) = if request.from_block == 0
+            || request.from_block == finalized.number.saturating_add(1)
+        {
+            (
+                finalized.number.saturating_add(1),
+                finalized.number,
+                Vec::new(),
+            )
+        } else {
+            if request.from_block > finalized.number {
+                return Err(GatewayError::InvalidRequest);
+            }
+            let to_block = request.from_block.saturating_add(255).min(finalized.number);
+            let primary_logs = self
+                .aave_tail_logs(
+                    &primary,
+                    request.from_block,
+                    to_block,
+                    ProviderSlot::Primary,
+                )
+                .await?;
+            let secondary_logs = self
+                .aave_tail_logs(
+                    &secondary,
+                    request.from_block,
+                    to_block,
+                    ProviderSlot::Secondary,
+                )
+                .await?;
+            if primary_logs != secondary_logs {
+                return Err(GatewayError::ProviderDisagreement);
+            }
+            let mut borrowers = primary_logs
+                .into_iter()
+                .map(|event| event.borrower)
+                .collect::<Vec<_>>();
+            borrowers.sort();
+            borrowers.dedup();
+            (request.from_block, to_block, borrowers)
+        };
+        self.mark_provider_success(primary.provider_id()).await;
+        self.mark_provider_success(secondary.provider_id()).await;
+        let response = AaveTailResponse {
+            schema_version: AAVE_TAIL_RESPONSE_SCHEMA.to_string(),
+            chain_id: ARBITRUM_ONE_CHAIN_ID,
+            request_id: request.request_id.clone(),
+            finalized_block_number: finalized.number,
+            finalized_block_hash: finalized.hash,
+            from_block,
+            to_block,
+            next_block: to_block.saturating_add(1),
+            primary_provider_id: primary.provider_id().to_string(),
+            secondary_provider_id: secondary.provider_id().to_string(),
+            borrowers,
+            resolved_at_unix_ms: unix_time_ms(),
+        };
+        response
+            .validate(&request)
+            .map_err(|_| GatewayError::ProviderDisagreement)?;
+        Ok(response)
+    }
+
+    pub async fn simulate_aave_liquidation(
+        &self,
+        request: AaveSimulateRequest,
+    ) -> Result<AaveSimulateResponse, GatewayError> {
+        request
+            .validate()
+            .map_err(|_| GatewayError::InvalidRequest)?;
+        validate_aave_simulation_identity(&request)?;
+        if !self.request_budget.lock().await.admit(Instant::now()) {
+            return Err(GatewayError::RequestBudgetExhausted);
+        }
+        let _operation_guard = self.upstream_operation_lock.lock().await;
+        if self.provider_count().await < 2 {
+            return Err(GatewayError::ProviderUnavailable);
+        }
+        let expected_block = PinnedBlock {
+            number: request.block_number,
+            hash: request.block_hash.clone(),
+        };
+        let primary = self
+            .reserve_provider(&HashSet::new())
+            .await
+            .ok_or(GatewayError::ProviderUnavailable)?;
+        self.ensure_provider_verified(&primary)
+            .await
+            .map_err(map_call_failure)?;
+        let secondary = self
+            .reserve_provider(&HashSet::from([primary.provider_id().to_string()]))
+            .await
+            .ok_or(GatewayError::ProviderUnavailable)?;
+        self.ensure_provider_verified(&secondary)
+            .await
+            .map_err(map_call_failure)?;
+
+        let route_id = aave_simulation_route_id(&request)?;
+        let calldata = encode_aave_liquidation_call(&request, &route_id)?;
+        let primary_profit = self
+            .perform_aave_simulation(
+                &primary,
+                &request,
+                &expected_block,
+                &calldata,
+                ProviderSlot::Primary,
+            )
+            .await?;
+        let secondary_profit = self
+            .perform_aave_simulation(
+                &secondary,
+                &request,
+                &expected_block,
+                &calldata,
+                ProviderSlot::Secondary,
+            )
+            .await?;
+        if primary_profit != secondary_profit {
+            return Err(GatewayError::ProviderDisagreement);
+        }
+        let maximum_gas_cost = U256::from(request.gas_limit)
+            .checked_mul(decimal_u256(&request.max_fee_per_gas)?)
+            .ok_or(GatewayError::ProviderIntegrity)?;
+        let floor = decimal_u256(&request.retained_profit_floor)?;
+        let conservative_net = primary_profit
+            .checked_sub(maximum_gas_cost)
+            .and_then(|value| value.checked_sub(decimal_u256(&request.atlas_bid).ok()?))
+            .filter(|value| *value > floor)
+            .ok_or(GatewayError::StateIncomplete)?;
+        if primary_profit < decimal_u256(&request.minimum_profit)? {
+            return Err(GatewayError::StateIncomplete);
+        }
+        self.mark_provider_success(primary.provider_id()).await;
+        self.mark_provider_success(secondary.provider_id()).await;
+        let calldata_hex = format!("0x{}", hex::encode(&calldata));
+        let calldata_hash = canonical_hash_bytes(&calldata);
+        let simulation_result_hash = canonical_hash_bytes(
+            &serde_json::to_vec(&json!({
+                "request": request,
+                "route_id": route_id,
+                "calldata_hash": calldata_hash,
+                "realized_profit": primary_profit.to_string(),
+                "conservative_net_pnl": conservative_net.to_string(),
+                "atlas_mode": request.atlas_mode,
+                "atlas_bid": request.atlas_bid,
+                "providers": [primary.provider_id(), secondary.provider_id()]
+            }))
+            .map_err(|_| GatewayError::ProviderIntegrity)?,
+        );
+        let response = AaveSimulateResponse {
+            schema_version: AAVE_SIMULATE_RESPONSE_SCHEMA.to_string(),
+            chain_id: ARBITRUM_ONE_CHAIN_ID,
+            request_id: request.request_id.clone(),
+            block_number: request.block_number,
+            block_hash: request.block_hash.clone(),
+            state_root: request.state_root.clone(),
+            primary_provider_id: primary.provider_id().to_string(),
+            secondary_provider_id: secondary.provider_id().to_string(),
+            evidence_mode: "DUAL_PROVIDER_FORK_VERIFIED".to_string(),
+            route_id,
+            calldata_hex,
+            calldata_hash,
+            simulation_result_hash,
+            realized_profit: primary_profit.to_string(),
+            conservative_net_pnl: conservative_net.to_string(),
+            deadline_unix_seconds: request.deadline_unix_seconds,
+            resolved_at_unix_ms: unix_time_ms(),
+        };
+        response
+            .validate(&request)
+            .map_err(|_| GatewayError::ProviderDisagreement)?;
+        Ok(response)
+    }
+
+    async fn common_finalized_block(
+        &self,
+        primary: &ProviderLease,
+        secondary: &ProviderLease,
+    ) -> Result<PinnedBlock, GatewayError> {
+        let primary_head = self
+            .provider_block(primary, "finalized", ProviderSlot::Primary)
+            .await?;
+        let secondary_head = self
+            .provider_block(secondary, "finalized", ProviderSlot::Secondary)
+            .await?;
+        if primary_head == secondary_head {
+            return Ok(primary_head);
+        }
+        let common_number = primary_head.number.min(secondary_head.number);
+        if common_number == 0 {
+            return Err(GatewayError::ProviderDisagreement);
+        }
+        let block_tag = format_quantity(common_number);
+        let primary_common = self
+            .provider_block(primary, &block_tag, ProviderSlot::Primary)
+            .await?;
+        let secondary_common = self
+            .provider_block(secondary, &block_tag, ProviderSlot::Secondary)
+            .await?;
+        if primary_common != secondary_common {
+            return Err(GatewayError::ProviderDisagreement);
+        }
+        Ok(primary_common)
+    }
+
+    async fn provider_block(
+        &self,
+        provider: &ProviderLease,
+        tag: &str,
+        slot: ProviderSlot,
+    ) -> Result<PinnedBlock, GatewayError> {
+        let result = self
+            .recorded_call(
+                provider,
+                RpcMethod::EthGetBlockByNumber,
+                json!([tag, false]),
+                None,
+                0,
+                slot,
+                None,
+                false,
+            )
+            .await
+            .map_err(|failure| map_call_failure(failure.cause))?;
+        parse_block(&result.value).ok_or(GatewayError::ProviderIntegrity)
+    }
+
+    async fn aave_tail_logs(
+        &self,
+        provider: &ProviderLease,
+        from_block: u64,
+        to_block: u64,
+        slot: ProviderSlot,
+    ) -> Result<Vec<NormalizedAaveTailLog>, GatewayError> {
+        let result = self
+            .recorded_call(
+                provider,
+                RpcMethod::EthGetLogs,
+                json!([{
+                    "address": AAVE_V3_POOL_ARBITRUM,
+                    "fromBlock": format_quantity(from_block),
+                    "toBlock": format_quantity(to_block),
+                    "topics": [[AAVE_BORROW_TOPIC, AAVE_REPAY_TOPIC, AAVE_LIQUIDATION_TOPIC]]
+                }]),
+                None,
+                0,
+                slot,
+                None,
+                false,
+            )
+            .await
+            .map_err(|failure| map_call_failure(failure.cause))?;
+        normalize_aave_tail_logs(&result.value, from_block, to_block)
+    }
+
+    async fn perform_aave_simulation(
+        &self,
+        provider: &ProviderLease,
+        request: &AaveSimulateRequest,
+        block: &PinnedBlock,
+        calldata: &[u8],
+        slot: ProviderSlot,
+    ) -> Result<U256, GatewayError> {
+        let block_quantity = format_quantity(block.number);
+        let block_evidence = self
+            .recorded_call(
+                provider,
+                RpcMethod::EthGetBlockByNumber,
+                json!([block_quantity.clone(), false]),
+                Some(block),
+                0,
+                slot,
+                None,
+                false,
+            )
+            .await
+            .map_err(|failure| map_call_failure(failure.cause))?;
+        if parse_block(&block_evidence.value).as_ref() != Some(block)
+            || block_evidence
+                .value
+                .get("stateRoot")
+                .and_then(Value::as_str)
+                .map(str::to_ascii_lowercase)
+                .as_deref()
+                != Some(request.state_root.as_str())
+        {
+            return Err(GatewayError::ProviderDisagreement);
+        }
+        if self
+            .exact_code_hash(provider, &request.executor_address, block, slot)
+            .await?
+            != request.executor_code_hash
+        {
+            return Err(GatewayError::ProviderIntegrity);
+        }
+        let packed = self
+            .recorded_call(
+                provider,
+                RpcMethod::EthGetStorageAt,
+                json!([
+                    request.executor_address,
+                    PHOENIX_EXECUTOR_PACKED_CONFIG_SLOT,
+                    block_quantity.clone()
+                ]),
+                Some(block),
+                0,
+                slot,
+                None,
+                false,
+            )
+            .await
+            .map_err(|failure| map_call_failure(failure.cause))?
+            .value
+            .as_str()
+            .and_then(decode_executor_packed_config)
+            .ok_or(GatewayError::ProviderIntegrity)?;
+        let result = self
+            .recorded_call(
+                provider,
+                RpcMethod::EthCall,
+                json!([
+                    {
+                        "from": request.caller_address,
+                        "to": request.executor_address,
+                        "gas": format_quantity(request.gas_limit),
+                        "data": format!("0x{}", hex::encode(calldata))
+                    },
+                    block_quantity,
+                    {
+                        request.executor_address.clone(): {
+                            "stateDiff": {
+                                PHOENIX_EXECUTOR_PACKED_CONFIG_SLOT: packed
+                            }
+                        }
+                    }
+                ]),
+                Some(block),
+                0,
+                slot,
+                None,
+                false,
+            )
+            .await
+            .map_err(|failure| map_call_failure(failure.cause))?
+            .value
+            .as_str()
+            .and_then(parse_hex_u256_word)
+            .ok_or(GatewayError::ProviderIntegrity)?;
+        Ok(result)
+    }
+
+    async fn perform_aave_exact(
+        &self,
+        provider: &ProviderLease,
+        request: &AaveExactRequest,
+        block: &PinnedBlock,
+        slot: ProviderSlot,
+    ) -> Result<(AaveExactProviderState, String), GatewayError> {
+        let block_quantity = format_quantity(block.number);
+        let pool_code_hash = self
+            .exact_code_hash(provider, AAVE_V3_POOL_ARBITRUM, block, slot)
+            .await?;
+        let implementation_word = self
+            .recorded_call(
+                provider,
+                RpcMethod::EthGetStorageAt,
+                json!([
+                    AAVE_V3_POOL_ARBITRUM,
+                    EIP1967_IMPLEMENTATION_SLOT,
+                    block_quantity.clone()
+                ]),
+                Some(block),
+                0,
+                slot,
+                None,
+                false,
+            )
+            .await
+            .map_err(|failure| map_call_failure(failure.cause))?
+            .value
+            .as_str()
+            .and_then(parse_storage_address)
+            .filter(|value| value == AAVE_POOL_IMPLEMENTATION_ARBITRUM)
+            .ok_or(GatewayError::ProviderIntegrity)?;
+        let implementation_code_hash = self
+            .exact_code_hash(provider, &implementation_word, block, slot)
+            .await?;
+
+        let account_call =
+            encode_one_address(AAVE_GET_USER_ACCOUNT_DATA_SELECTOR, &request.borrower);
+        let user_configuration_call =
+            encode_one_address(AAVE_GET_USER_CONFIGURATION_SELECTOR, &request.borrower);
+        let mut calls = vec![
+            EthCall {
+                target: AAVE_V3_POOL_ARBITRUM.to_string(),
+                calldata: account_call,
+            },
+            EthCall {
+                target: AAVE_V3_POOL_ARBITRUM.to_string(),
+                calldata: user_configuration_call,
+            },
+        ];
+        for asset in [ARBITRUM_WETH, ARBITRUM_NATIVE_USDC] {
+            calls.push(EthCall {
+                target: AAVE_DATA_PROVIDER_ARBITRUM.to_string(),
+                calldata: encode_two_addresses(
+                    AAVE_GET_USER_RESERVE_DATA_SELECTOR,
+                    asset,
+                    &request.borrower,
+                ),
+            });
+            calls.push(EthCall {
+                target: AAVE_V3_POOL_ARBITRUM.to_string(),
+                calldata: encode_one_address(AAVE_GET_CONFIGURATION_SELECTOR, asset),
+            });
+            calls.push(EthCall {
+                target: AAVE_DATA_PROVIDER_ARBITRUM.to_string(),
+                calldata: encode_one_address(AAVE_GET_RESERVE_TOKENS_SELECTOR, asset),
+            });
+            calls.push(EthCall {
+                target: AAVE_ORACLE_ARBITRUM.to_string(),
+                calldata: encode_one_address(AAVE_ORACLE_GET_ASSET_PRICE_SELECTOR, asset),
+            });
+        }
+        let results = self.hunter_multicall(provider, block, slot, &calls).await?;
+        if results.len() != 10 || results[0].len() != 32 * 6 || results[1].len() != 32 {
+            return Err(GatewayError::ProviderIntegrity);
+        }
+        let account_words = results[0]
+            .chunks_exact(32)
+            .map(U256::from_big_endian)
+            .collect::<Vec<_>>();
+        let account = AaveAccountData {
+            borrower: request.borrower.clone(),
+            total_collateral_base: account_words[0].to_string(),
+            total_debt_base: account_words[1].to_string(),
+            available_borrows_base: account_words[2].to_string(),
+            current_liquidation_threshold_bps: account_words[3].to_string(),
+            loan_to_value_bps: account_words[4].to_string(),
+            health_factor_wad: account_words[5].to_string(),
+        };
+        let user_configuration = U256::from_big_endian(&results[1]).to_string();
+        let mut reserves = Vec::with_capacity(2);
+        for (index, asset) in [ARBITRUM_WETH, ARBITRUM_NATIVE_USDC].iter().enumerate() {
+            let offset = 2 + index * 4;
+            if results[offset].len() != 32 * 9
+                || results[offset + 1].len() != 32
+                || results[offset + 2].len() != 32 * 3
+                || results[offset + 3].len() != 32
+            {
+                return Err(GatewayError::ProviderIntegrity);
+            }
+            let user_words = results[offset]
+                .chunks_exact(32)
+                .map(U256::from_big_endian)
+                .collect::<Vec<_>>();
+            let token_words = results[offset + 2]
+                .chunks_exact(32)
+                .map(|word| parse_address_bytes(word).ok_or(GatewayError::ProviderIntegrity))
+                .collect::<Result<Vec<_>, _>>()?;
+            let oracle_price = U256::from_big_endian(&results[offset + 3]);
+            if oracle_price.is_zero() {
+                return Err(GatewayError::ProviderIntegrity);
+            }
+            reserves.push(AaveExactReserveState {
+                asset: (*asset).to_string(),
+                current_a_token_balance: user_words[0].to_string(),
+                current_stable_debt: user_words[1].to_string(),
+                current_variable_debt: user_words[2].to_string(),
+                usage_as_collateral_enabled: !user_words[8].is_zero(),
+                configuration_data: U256::from_big_endian(&results[offset + 1]).to_string(),
+                a_token: token_words[0].clone(),
+                stable_debt_token: token_words[1].clone(),
+                variable_debt_token: token_words[2].clone(),
+                oracle_price_base: oracle_price.to_string(),
+            });
+        }
+        let mut liquidation = supported_aave_liquidation(&account, &reserves)?;
+        if let Some(ref mut opportunity) = liquidation {
+            let amount = U256::from_dec_str(&opportunity.liquidator_collateral)
+                .map_err(|_| GatewayError::ProviderIntegrity)?;
+            let quote_calls = [500_u32, 3_000_u32]
+                .into_iter()
+                .map(|fee| EthCall {
+                    target: UNISWAP_V3_QUOTER_V2_ARBITRUM.to_string(),
+                    calldata: encode_uniswap_quote(
+                        ARBITRUM_NATIVE_USDC,
+                        ARBITRUM_WETH,
+                        amount,
+                        fee,
+                    ),
+                })
+                .collect::<Vec<_>>();
+            let quotes = self
+                .hunter_multicall(provider, block, slot, &quote_calls)
+                .await?;
+            if quotes.len() != 2 || quotes.iter().any(|value| value.len() < 32) {
+                return Err(GatewayError::ProviderIntegrity);
+            }
+            opportunity.uniswap_v3_fee_500_output_weth =
+                U256::from_big_endian(&quotes[0][..32]).to_string();
+            opportunity.uniswap_v3_fee_3000_output_weth =
+                U256::from_big_endian(&quotes[1][..32]).to_string();
+        }
+        let verify = self
+            .recorded_call(
+                provider,
+                RpcMethod::EthGetBlockByNumber,
+                json!([block_quantity, false]),
+                Some(block),
+                0,
+                slot,
+                None,
+                false,
+            )
+            .await
+            .map_err(|failure| map_call_failure(failure.cause))?;
+        if parse_block(&verify.value).as_ref() != Some(block) {
+            return Err(GatewayError::ProviderIntegrity);
+        }
+        let state_root = verify
+            .value
+            .get("stateRoot")
+            .and_then(Value::as_str)
+            .map(str::to_ascii_lowercase)
+            .filter(|value| canonical_block_hash(value))
+            .ok_or(GatewayError::ProviderIntegrity)?;
+        Ok((
+            AaveExactProviderState {
+                provider_id: provider.provider_id().to_string(),
+                pool_code_hash,
+                pool_implementation: implementation_word,
+                pool_implementation_code_hash: implementation_code_hash,
+                user_configuration,
+                account,
+                reserves,
+                liquidation,
+            },
+            state_root,
+        ))
+    }
+
+    async fn exact_code_hash(
+        &self,
+        provider: &ProviderLease,
+        address: &str,
+        block: &PinnedBlock,
+        slot: ProviderSlot,
+    ) -> Result<String, GatewayError> {
+        let code = self
+            .recorded_call(
+                provider,
+                RpcMethod::EthGetCode,
+                json!([address, format_quantity(block.number)]),
+                Some(block),
+                0,
+                slot,
+                None,
+                false,
+            )
+            .await
+            .map_err(|failure| map_call_failure(failure.cause))?
+            .value
+            .as_str()
+            .map(str::to_ascii_lowercase)
+            .filter(|value| value != "0x" && canonical_data(value, MAX_MULTICALL_CODE_BYTES))
+            .ok_or(GatewayError::ProviderIntegrity)?;
+        let bytes = hex::decode(&code[2..]).map_err(|_| GatewayError::ProviderIntegrity)?;
+        Ok(canonical_hash_bytes(&bytes))
+    }
+
+    async fn perform_aave_screen(
+        &self,
+        provider: &ProviderLease,
+        request: &AaveScreenRequest,
+        block: &PinnedBlock,
+        slot: ProviderSlot,
+    ) -> Result<(Vec<AaveAccountData>, String), GatewayError> {
+        let mut calls = request
+            .borrowers
+            .iter()
+            .map(|borrower| EthCall {
+                target: AAVE_V3_POOL_ARBITRUM.to_string(),
+                calldata: format!(
+                    "{}{}{}",
+                    AAVE_GET_USER_ACCOUNT_DATA_SELECTOR,
+                    "0".repeat(24),
+                    &borrower[2..]
+                ),
+            })
+            .collect::<Vec<_>>();
+        calls.push(EthCall {
+            target: "0xb56c2f0b653b2e0b10c9b928c8580ac5df02c7c7".to_string(),
+            calldata: format!(
+                "0xb3596f07{}{}",
+                "0".repeat(24),
+                &"0x82af49447d8a07e3bd95bd0d56f35241523fbab1"[2..]
+            ),
+        });
+        let results = self.hunter_multicall(provider, block, slot, &calls).await?;
+        if results.len() != request.borrowers.len() + 1 {
+            return Err(GatewayError::ProviderIntegrity);
+        }
+        let weth_price = results
+            .last()
+            .filter(|value| value.len() == 32)
+            .map(|value| U256::from_big_endian(value).to_string())
+            .filter(|value| value != "0")
+            .ok_or(GatewayError::ProviderIntegrity)?;
+        let accounts = request
+            .borrowers
+            .iter()
+            .zip(results.into_iter().take(request.borrowers.len()))
+            .map(|(borrower, bytes)| {
+                if bytes.len() != 32 * 6 {
+                    return Err(GatewayError::ProviderIntegrity);
+                }
+                let words = bytes
+                    .chunks_exact(32)
+                    .map(U256::from_big_endian)
+                    .collect::<Vec<_>>();
+                Ok(AaveAccountData {
+                    borrower: borrower.clone(),
+                    total_collateral_base: words[0].to_string(),
+                    total_debt_base: words[1].to_string(),
+                    available_borrows_base: words[2].to_string(),
+                    current_liquidation_threshold_bps: words[3].to_string(),
+                    loan_to_value_bps: words[4].to_string(),
+                    health_factor_wad: words[5].to_string(),
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let verify = self
+            .recorded_call(
+                provider,
+                RpcMethod::EthGetBlockByNumber,
+                json!([format_quantity(block.number), false]),
+                Some(block),
+                0,
+                slot,
+                None,
+                false,
+            )
+            .await
+            .map_err(|failure| map_call_failure(failure.cause))?;
+        if parse_block(&verify.value).as_ref() != Some(block) {
+            return Err(GatewayError::ProviderIntegrity);
+        }
+        Ok((accounts, weth_price))
     }
 
     async fn perform_hunter_state_bundle(
@@ -1824,6 +2653,18 @@ struct HeadSnapshot {
     observed_at: Instant,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct NormalizedAaveTailLog {
+    block_number: u64,
+    transaction_index: u64,
+    log_index: u64,
+    block_hash: String,
+    transaction_hash: String,
+    topic: String,
+    data_hash: String,
+    borrower: String,
+}
+
 #[derive(Clone, Debug)]
 struct HunterPoolInterim {
     sqrt_price_x96: U256,
@@ -1986,6 +2827,307 @@ fn parse_address_bytes(value: &[u8]) -> Option<String> {
     Some(format!("0x{}", hex::encode(&value[12..])))
 }
 
+fn encode_one_address(selector: &str, address: &str) -> String {
+    format!("{}{}{}", selector, "0".repeat(24), &address[2..])
+}
+
+fn encode_two_addresses(selector: &str, first: &str, second: &str) -> String {
+    format!(
+        "{}{}{}{}{}",
+        selector,
+        "0".repeat(24),
+        &first[2..],
+        "0".repeat(24),
+        &second[2..]
+    )
+}
+
+fn validate_aave_simulation_identity(request: &AaveSimulateRequest) -> Result<(), GatewayError> {
+    let selected_pool = match request.selected_fee {
+        500 => UNISWAP_WETH_USDC_POOL_500_ARBITRUM,
+        3_000 => UNISWAP_WETH_USDC_POOL_3000_ARBITRUM,
+        _ => return Err(GatewayError::InvalidRequest),
+    };
+    let gas_cost = U256::from(request.gas_limit)
+        .checked_mul(decimal_u256(&request.max_fee_per_gas)?)
+        .ok_or(GatewayError::InvalidRequest)?;
+    let floor = decimal_u256(&request.retained_profit_floor)?;
+    let minimum_profit = decimal_u256(&request.minimum_profit)?;
+    let expected_profit = decimal_u256(&request.expected_profit)?;
+    let atlas_bid = decimal_u256(&request.atlas_bid)?;
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| GatewayError::InvalidRequest)?
+        .as_secs();
+    if request.debt_asset != ARBITRUM_WETH
+        || request.collateral_asset != ARBITRUM_NATIVE_USDC
+        || request.selected_factory != UNISWAP_V3_FACTORY_ARBITRUM
+        || request.selected_pool != selected_pool
+        || request.zero_for_one
+        || minimum_profit
+            != floor
+                .checked_add(gas_cost)
+                .ok_or(GatewayError::InvalidRequest)?
+        || expected_profit <= floor
+        || request.atlas_mode != !atlas_bid.is_zero()
+        || request.deadline_unix_seconds <= now
+        || request.deadline_unix_seconds > now.saturating_add(120)
+    {
+        return Err(GatewayError::InvalidRequest);
+    }
+    Ok(())
+}
+
+fn aave_simulation_route_id(request: &AaveSimulateRequest) -> Result<String, GatewayError> {
+    let encoded = serde_json::to_vec(&json!({
+        "schema": "phoenix.aave-liquidation-route-identity.v1",
+        "block_number": request.block_number,
+        "block_hash": request.block_hash,
+        "state_root": request.state_root,
+        "executor_address": request.executor_address,
+        "executor_code_hash": request.executor_code_hash,
+        "borrower": request.borrower,
+        "debt_asset": request.debt_asset,
+        "collateral_asset": request.collateral_asset,
+        "repay_amount": request.repay_amount,
+        "minimum_collateral_received": request.minimum_collateral_received,
+        "minimum_unwind_output": request.minimum_unwind_output,
+        "minimum_profit": request.minimum_profit,
+        "selected_pool": request.selected_pool,
+        "selected_factory": request.selected_factory,
+        "selected_fee": request.selected_fee,
+        "deadline": request.deadline_unix_seconds,
+        "atlas_mode": request.atlas_mode,
+        "atlas_bid": request.atlas_bid,
+        "release_sha": request.release_sha
+    }))
+    .map_err(|_| GatewayError::ProviderIntegrity)?;
+    Ok(format!("0x{}", canonical_hash_bytes(&encoded)))
+}
+
+fn encode_aave_liquidation_call(
+    request: &AaveSimulateRequest,
+    route_id: &str,
+) -> Result<Vec<u8>, GatewayError> {
+    let address = |value: &str| -> Result<ethabi::Address, GatewayError> {
+        let bytes = hex::decode(&value[2..]).map_err(|_| GatewayError::InvalidRequest)?;
+        Ok(ethabi::Address::from_slice(&bytes))
+    };
+    let uint = |value: &str| decimal_u256(value);
+    let route = hex::decode(&route_id[2..]).map_err(|_| GatewayError::ProviderIntegrity)?;
+    let leg = Token::Tuple(vec![
+        Token::Address(address(&request.selected_pool)?),
+        Token::Address(address(&request.collateral_asset)?),
+        Token::Address(address(&request.debt_asset)?),
+        Token::Uint(U256::from(request.selected_fee)),
+        Token::Bool(request.zero_for_one),
+        Token::Uint(uint(&request.minimum_unwind_output)?),
+    ]);
+    let liquidation = Token::Tuple(vec![
+        Token::FixedBytes(route),
+        Token::Address(address(&request.borrower)?),
+        Token::Address(address(&request.debt_asset)?),
+        Token::Address(address(&request.collateral_asset)?),
+        Token::Uint(uint(&request.repay_amount)?),
+        Token::Bool(false),
+        Token::Uint(uint(&request.repay_amount)?),
+        Token::Uint(uint(&request.minimum_collateral_received)?),
+        Token::Uint(uint(&request.minimum_unwind_output)?),
+        Token::Uint(uint(&request.minimum_profit)?),
+        Token::Uint(uint(&request.atlas_bid)?),
+        Token::Uint(U256::from(request.deadline_unix_seconds)),
+        Token::Array(vec![leg]),
+    ]);
+    let request_type = ParamType::Tuple(vec![
+        ParamType::FixedBytes(32),
+        ParamType::Address,
+        ParamType::Address,
+        ParamType::Address,
+        ParamType::Uint(256),
+        ParamType::Bool,
+        ParamType::Uint(256),
+        ParamType::Uint(256),
+        ParamType::Uint(256),
+        ParamType::Uint(256),
+        ParamType::Uint(256),
+        ParamType::Uint(256),
+        ParamType::Array(Box::new(ParamType::Tuple(vec![
+            ParamType::Address,
+            ParamType::Address,
+            ParamType::Address,
+            ParamType::Uint(24),
+            ParamType::Bool,
+            ParamType::Uint(256),
+        ]))),
+    ]);
+    let mut encoded = ethabi::short_signature("executeAaveLiquidation", &[request_type]).to_vec();
+    encoded.extend_from_slice(&ethabi::encode(&[liquidation]));
+    Ok(encoded)
+}
+
+fn decode_executor_packed_config(value: &str) -> Option<String> {
+    if value.len() != 66 || !value.starts_with("0x") {
+        return None;
+    }
+    let mut bytes = hex::decode(&value[2..]).ok()?;
+    if bytes.len() != 32
+        || bytes[..10].iter().any(|byte| *byte != 0)
+        || bytes[10] != 0
+        || bytes[11] > 1
+        || format!("0x{}", hex::encode(&bytes[12..])) != AAVE_V3_POOL_ARBITRUM
+    {
+        return None;
+    }
+    bytes[11] = 0;
+    Some(format!("0x{}", hex::encode(bytes)))
+}
+
+fn parse_hex_u256_word(value: &str) -> Option<U256> {
+    if value.len() != 66 || !value.starts_with("0x") {
+        return None;
+    }
+    let bytes = hex::decode(&value[2..]).ok()?;
+    Some(U256::from_big_endian(&bytes))
+}
+
+fn parse_storage_address(value: &str) -> Option<String> {
+    let value = value.strip_prefix("0x")?;
+    if value.len() != 64 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return None;
+    }
+    let address = value[24..].to_ascii_lowercase();
+    if address.bytes().all(|byte| byte == b'0') {
+        return None;
+    }
+    Some(format!("0x{address}"))
+}
+
+fn supported_aave_liquidation(
+    account: &AaveAccountData,
+    reserves: &[AaveExactReserveState],
+) -> Result<Option<AaveExactLiquidationState>, GatewayError> {
+    let health_factor = U256::from_dec_str(&account.health_factor_wad)
+        .map_err(|_| GatewayError::ProviderIntegrity)?;
+    if health_factor >= U256::exp10(18) || reserves.len() != 2 {
+        return Ok(None);
+    }
+    let debt = &reserves[0];
+    let collateral = &reserves[1];
+    if debt.asset != ARBITRUM_WETH
+        || collateral.asset != ARBITRUM_NATIVE_USDC
+        || !collateral.usage_as_collateral_enabled
+    {
+        return Ok(None);
+    }
+    let debt_configuration = U256::from_dec_str(&debt.configuration_data)
+        .map_err(|_| GatewayError::ProviderIntegrity)?;
+    let collateral_configuration = U256::from_dec_str(&collateral.configuration_data)
+        .map_err(|_| GatewayError::ProviderIntegrity)?;
+    let debt_active = debt_configuration.bit(56);
+    let debt_borrowing = debt_configuration.bit(58);
+    let debt_paused = debt_configuration.bit(60);
+    let collateral_active = collateral_configuration.bit(56);
+    let collateral_paused = collateral_configuration.bit(60);
+    if !debt_active || !debt_borrowing || debt_paused || !collateral_active || collateral_paused {
+        return Ok(None);
+    }
+    let total_debt = decimal_u256(&debt.current_stable_debt)?
+        .checked_add(decimal_u256(&debt.current_variable_debt)?)
+        .ok_or(GatewayError::ProviderIntegrity)?;
+    let collateral_balance = decimal_u256(&collateral.current_a_token_balance)?;
+    if total_debt.is_zero() || collateral_balance.is_zero() {
+        return Ok(None);
+    }
+    let close_factor = if health_factor < U256::from(950_000_000_000_000_000_u128) {
+        U256::from(10_000_u64)
+    } else {
+        U256::from(5_000_u64)
+    };
+    let mut repay = checked_mul(total_debt, close_factor)? / U256::from(10_000_u64);
+    let debt_price = decimal_u256(&debt.oracle_price_base)?;
+    let collateral_price = decimal_u256(&collateral.oracle_price_base)?;
+    let liquidation_bonus = (collateral_configuration >> 32).low_u32() & 0xffff;
+    let protocol_fee = (collateral_configuration >> 152).low_u32() & 0xffff;
+    if debt_price.is_zero()
+        || collateral_price.is_zero()
+        || liquidation_bonus < 10_000
+        || liquidation_bonus > 20_000
+        || protocol_fee > 10_000
+    {
+        return Err(GatewayError::ProviderIntegrity);
+    }
+    let debt_value_base = checked_mul(repay, debt_price)? / U256::exp10(18);
+    let base_collateral = checked_mul(debt_value_base, U256::exp10(6))? / collateral_price;
+    let mut seized =
+        checked_mul(base_collateral, U256::from(liquidation_bonus))? / U256::from(10_000_u64);
+    let base_for_fee;
+    if seized > collateral_balance {
+        seized = collateral_balance;
+        let numerator = checked_mul(
+            checked_mul(
+                checked_mul(collateral_price, seized)?,
+                U256::from(10_000_u64),
+            )?,
+            U256::exp10(18),
+        )?;
+        let denominator = checked_mul(
+            checked_mul(debt_price, U256::from(liquidation_bonus))?,
+            U256::exp10(6),
+        )?;
+        repay = numerator / denominator;
+        base_for_fee = checked_mul(seized, U256::from(10_000_u64))? / U256::from(liquidation_bonus);
+    } else {
+        base_for_fee = base_collateral;
+    }
+    if repay.is_zero() || seized <= base_for_fee {
+        return Ok(None);
+    }
+    let fee_collateral =
+        checked_mul(seized - base_for_fee, U256::from(protocol_fee))? / U256::from(10_000_u64);
+    let liquidator_collateral = seized
+        .checked_sub(fee_collateral)
+        .ok_or(GatewayError::ProviderIntegrity)?;
+    Ok(Some(AaveExactLiquidationState {
+        debt_asset: ARBITRUM_WETH.to_string(),
+        collateral_asset: ARBITRUM_NATIVE_USDC.to_string(),
+        repay_amount: repay.to_string(),
+        seized_collateral: seized.to_string(),
+        protocol_fee_collateral: fee_collateral.to_string(),
+        liquidator_collateral: liquidator_collateral.to_string(),
+        uniswap_v3_fee_500_output_weth: "0".to_string(),
+        uniswap_v3_fee_3000_output_weth: "0".to_string(),
+    }))
+}
+
+fn decimal_u256(value: &str) -> Result<U256, GatewayError> {
+    U256::from_dec_str(value).map_err(|_| GatewayError::ProviderIntegrity)
+}
+
+fn checked_mul(left: U256, right: U256) -> Result<U256, GatewayError> {
+    left.checked_mul(right)
+        .ok_or(GatewayError::ProviderIntegrity)
+}
+
+fn encode_uniswap_quote(token_in: &str, token_out: &str, amount: U256, fee: u32) -> String {
+    let mut encoded = Vec::with_capacity(32 * 5);
+    encoded.extend_from_slice(&[0_u8; 12]);
+    encoded.extend_from_slice(&hex::decode(&token_in[2..]).expect("pinned token address"));
+    encoded.extend_from_slice(&[0_u8; 12]);
+    encoded.extend_from_slice(&hex::decode(&token_out[2..]).expect("pinned token address"));
+    let mut amount_word = [0_u8; 32];
+    amount.to_big_endian(&mut amount_word);
+    encoded.extend_from_slice(&amount_word);
+    let mut fee_word = [0_u8; 32];
+    fee_word[28..].copy_from_slice(&fee.to_be_bytes());
+    encoded.extend_from_slice(&fee_word);
+    encoded.extend_from_slice(&[0_u8; 32]);
+    format!(
+        "{}{}",
+        UNISWAP_QUOTE_EXACT_INPUT_SINGLE_SELECTOR,
+        hex::encode(encoded)
+    )
+}
+
 fn parse_u32_bytes(value: &[u8]) -> Option<u32> {
     if value.len() != 32 || value[..28].iter().any(|byte| *byte != 0) {
         return None;
@@ -2131,6 +3273,89 @@ fn canonical_quantity(value: &str) -> bool {
 
 fn format_quantity(value: u64) -> String {
     format!("0x{value:x}")
+}
+
+fn normalize_aave_tail_logs(
+    value: &Value,
+    from_block: u64,
+    to_block: u64,
+) -> Result<Vec<NormalizedAaveTailLog>, GatewayError> {
+    let logs = value.as_array().ok_or(GatewayError::ProviderIntegrity)?;
+    if logs.len() > 4_096 {
+        return Err(GatewayError::ResponseOversized);
+    }
+    let mut normalized = Vec::with_capacity(logs.len());
+    for log in logs {
+        if log.get("removed").and_then(Value::as_bool) != Some(false)
+            || log
+                .get("address")
+                .and_then(Value::as_str)
+                .map(str::to_ascii_lowercase)
+                .as_deref()
+                != Some(AAVE_V3_POOL_ARBITRUM)
+        {
+            return Err(GatewayError::ProviderIntegrity);
+        }
+        let block_number = required_quantity(log, "blockNumber")?;
+        if block_number < from_block || block_number > to_block {
+            return Err(GatewayError::ProviderIntegrity);
+        }
+        let transaction_index = required_quantity(log, "transactionIndex")?;
+        let log_index = required_quantity(log, "logIndex")?;
+        let block_hash = required_lower_hex(log, "blockHash", 32)?;
+        let transaction_hash = required_lower_hex(log, "transactionHash", 32)?;
+        let topics = log
+            .get("topics")
+            .and_then(Value::as_array)
+            .filter(|topics| topics.len() == 4)
+            .ok_or(GatewayError::ProviderIntegrity)?;
+        let topic = topics[0]
+            .as_str()
+            .map(str::to_ascii_lowercase)
+            .ok_or(GatewayError::ProviderIntegrity)?;
+        let borrower_index = match topic.as_str() {
+            AAVE_BORROW_TOPIC | AAVE_REPAY_TOPIC => 2,
+            AAVE_LIQUIDATION_TOPIC => 3,
+            _ => return Err(GatewayError::ProviderIntegrity),
+        };
+        let borrower_topic = topics[borrower_index]
+            .as_str()
+            .map(str::to_ascii_lowercase)
+            .filter(|value| {
+                value.len() == 66
+                    && value.starts_with("0x000000000000000000000000")
+                    && value[26..].bytes().all(|byte| byte.is_ascii_hexdigit())
+            })
+            .ok_or(GatewayError::ProviderIntegrity)?;
+        let borrower = format!("0x{}", &borrower_topic[26..]);
+        if borrower == "0x0000000000000000000000000000000000000000" {
+            return Err(GatewayError::ProviderIntegrity);
+        }
+        let data = log
+            .get("data")
+            .and_then(Value::as_str)
+            .map(str::to_ascii_lowercase)
+            .filter(|value| canonical_data(value, MAX_STATE_RESPONSE_DATA_BYTES))
+            .ok_or(GatewayError::ProviderIntegrity)?;
+        normalized.push(NormalizedAaveTailLog {
+            block_number,
+            transaction_index,
+            log_index,
+            block_hash,
+            transaction_hash,
+            topic,
+            data_hash: canonical_hash_bytes(data.as_bytes()),
+            borrower,
+        });
+    }
+    normalized.sort();
+    if normalized.windows(2).any(|events| {
+        events[0].block_number == events[1].block_number
+            && events[0].log_index == events[1].log_index
+    }) {
+        return Err(GatewayError::ProviderIntegrity);
+    }
+    Ok(normalized)
 }
 
 fn required_quantity(value: &Value, field: &str) -> Result<u64, GatewayError> {
@@ -3858,6 +5083,82 @@ mod tests {
     }
 
     #[test]
+    fn aave_simulation_calldata_and_pause_override_are_exactly_bound() {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let request = AaveSimulateRequest {
+            schema_version: crate::aave_state::AAVE_SIMULATE_REQUEST_SCHEMA.to_string(),
+            chain_id: ARBITRUM_ONE_CHAIN_ID,
+            request_id: "aave-sim-1".to_string(),
+            block_number: 100,
+            block_hash: BLOCK_HASH.to_string(),
+            state_root: REORG_HASH.to_string(),
+            executor_address: "0x1111111111111111111111111111111111111111".to_string(),
+            executor_code_hash: "1".repeat(64),
+            caller_address: "0x2222222222222222222222222222222222222222".to_string(),
+            release_sha: "2".repeat(64),
+            borrower: "0x3333333333333333333333333333333333333333".to_string(),
+            debt_asset: ARBITRUM_WETH.to_string(),
+            collateral_asset: ARBITRUM_NATIVE_USDC.to_string(),
+            repay_amount: "1000000".to_string(),
+            minimum_collateral_received: "2000000".to_string(),
+            minimum_unwind_output: "1100000".to_string(),
+            minimum_profit: "50001000".to_string(),
+            expected_profit: "100000000".to_string(),
+            retained_profit_floor: "1000".to_string(),
+            selected_pool: UNISWAP_WETH_USDC_POOL_500_ARBITRUM.to_string(),
+            selected_factory: UNISWAP_V3_FACTORY_ARBITRUM.to_string(),
+            selected_fee: 500,
+            zero_for_one: false,
+            gas_limit: 500_000,
+            max_fee_per_gas: "100".to_string(),
+            max_priority_fee_per_gas: "10".to_string(),
+            deadline_unix_seconds: now + 60,
+            atlas_mode: false,
+            atlas_bid: "0".to_string(),
+        };
+        validate_aave_simulation_identity(&request).unwrap();
+        let route_id = aave_simulation_route_id(&request).unwrap();
+        let calldata = encode_aave_liquidation_call(&request, &route_id).unwrap();
+        assert_eq!(
+            &calldata[..4],
+            &ethabi::short_signature(
+                "executeAaveLiquidation",
+                &[ParamType::Tuple(vec![
+                    ParamType::FixedBytes(32),
+                    ParamType::Address,
+                    ParamType::Address,
+                    ParamType::Address,
+                    ParamType::Uint(256),
+                    ParamType::Bool,
+                    ParamType::Uint(256),
+                    ParamType::Uint(256),
+                    ParamType::Uint(256),
+                    ParamType::Uint(256),
+                    ParamType::Uint(256),
+                    ParamType::Uint(256),
+                    ParamType::Array(Box::new(ParamType::Tuple(vec![
+                        ParamType::Address,
+                        ParamType::Address,
+                        ParamType::Address,
+                        ParamType::Uint(24),
+                        ParamType::Bool,
+                        ParamType::Uint(256),
+                    ]))),
+                ])]
+            )
+        );
+        let packed = format!("0x{}0001{}", "00".repeat(10), &AAVE_V3_POOL_ARBITRUM[2..]);
+        let unpaused = decode_executor_packed_config(&packed).unwrap();
+        assert_eq!(
+            unpaused,
+            format!("0x{}0000{}", "00".repeat(10), &AAVE_V3_POOL_ARBITRUM[2..])
+        );
+    }
+
+    #[test]
     fn gateway_errors_are_sanitized_and_retryability_is_bounded() {
         for error in [
             GatewayError::InvalidRequest,
@@ -3871,5 +5172,35 @@ mod tests {
             assert!(error.class().len() <= 64);
             assert_eq!(error.response().error_class, error.class());
         }
+    }
+
+    #[test]
+    fn aave_tail_decodes_only_exact_pool_event_borrowers() {
+        let borrower = "3333333333333333333333333333333333333333";
+        let logs = json!([{
+            "address": AAVE_V3_POOL_ARBITRUM,
+            "blockNumber": "0x64",
+            "blockHash": BLOCK_HASH,
+            "transactionIndex": "0x1",
+            "transactionHash": REORG_HASH,
+            "logIndex": "0x2",
+            "removed": false,
+            "topics": [
+                AAVE_BORROW_TOPIC,
+                format!("0x{}", "0".repeat(64)),
+                format!("0x{}{}", "0".repeat(24), borrower),
+                format!("0x{}", "0".repeat(64))
+            ],
+            "data": "0x01"
+        }]);
+        let normalized = normalize_aave_tail_logs(&logs, 100, 100).unwrap();
+        assert_eq!(normalized.len(), 1);
+        assert_eq!(normalized[0].borrower, format!("0x{borrower}"));
+        let mut removed = logs;
+        removed[0]["removed"] = json!(true);
+        assert_eq!(
+            normalize_aave_tail_logs(&removed, 100, 100),
+            Err(GatewayError::ProviderIntegrity)
+        );
     }
 }

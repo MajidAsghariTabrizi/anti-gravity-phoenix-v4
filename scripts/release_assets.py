@@ -52,6 +52,7 @@ STATIC_PATHS = (
     "live-executor/schema/003_autonomous_hunter_contracts.sql",
     "live-executor/schema/004_autonomous_live_runtime.sql",
     "live-executor/schema/005_closed_loop_economic_control.sql",
+    "live-executor/schema/006_atlas_aave_revenue_lanes.sql",
     "phoenix-engine/examples/hunter_a1_replay.rs",
     "prometheus/prometheus.yml",
     "scripts/bootstrap-production.sh",

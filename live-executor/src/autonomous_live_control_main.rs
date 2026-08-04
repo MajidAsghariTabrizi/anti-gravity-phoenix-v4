@@ -42,7 +42,7 @@ use uuid::Uuid;
 
 const POLICY: &str = include_str!("../../config/phoenix-route-policy-v1.json");
 const UNIVERSE: &str = include_str!("../../config/phoenix-route-universe-v1.json");
-const MIGRATIONS: [(&str, &str); 5] = [
+const MIGRATIONS: [(&str, &str); 6] = [
     (
         "phoenix.live-canary-schema.v1",
         include_str!("../schema/001_live_canary.sql"),
@@ -63,8 +63,13 @@ const MIGRATIONS: [(&str, &str); 5] = [
         "phoenix.live-canary-schema.v5",
         include_str!("../schema/005_closed_loop_economic_control.sql"),
     ),
+    (
+        "phoenix.live-canary-schema.v6",
+        include_str!("../schema/006_atlas_aave_revenue_lanes.sql"),
+    ),
 ];
 const ACTIVATE_ACK: &str = "ACTIVATE_READY_MIN_CANARY_42161";
+const ARM_REVENUE_LANES_ACK: &str = "ARM_ATLAS_AAVE_LIVE_42161";
 const DISARM_ACK: &str = "DISARM_AUTONOMOUS_LIVE_42161";
 const DISARMED_DEPLOY_ACK: &str = "INSTALL_DISARMED_EVIDENCE_RELEASE_42161";
 const EVIDENCE_START_ACK: &str = "START_DISARMED_EVIDENCE_42161";
@@ -175,6 +180,7 @@ async fn run() -> ControlResult<()> {
         "install-authorization" => install_authorization(&database_pool().await?).await?,
         "materialize-activation-contracts" => materialize_activation_contracts().await?,
         "activate-ready-canary" => activate(&database_pool().await?).await?,
+        "arm-revenue-lanes" => arm_revenue_lanes().await?,
         "activate" => return Err("direct activation is disabled; use activate-ready-canary".into()),
         "evaluate-economic-control" => evaluate_economic_control(&database_pool().await?).await?,
         "supervise-economic-control" => supervise_economic_control().await?,
@@ -404,6 +410,8 @@ fn preflight_request(
         chain_id: 42_161,
         route_id: [0; 32],
         route_fingerprint: CURRENT_ROUTE_FINGERPRINT.to_string(),
+        route_type: phoenix_live_executor::model::ExecutionRouteType::PhoenixDexV1,
+        aave_liquidation: None,
         selected_size: maximum_input,
         token_path,
         origin_router: router,
@@ -615,6 +623,16 @@ async fn disarmed_deploy(pool: &PgPool) -> ControlResult<()> {
     }
     let route_epoch = route_epoch.ok_or("default route control was not installed")?;
     sqlx::query(
+        "UPDATE live_canary.revenue_lane_controls
+         SET armed = false, kill_switch = true,
+             disarm_reason = 'disarmed_deploy',
+             control_epoch = control_epoch + 1, updated_at = now()
+         WHERE lane IN ('atlas_solver', 'aave_liquidation')",
+    )
+    .execute(&mut *transaction)
+    .await
+    .map_err(|_| "revenue lane disarmed deployment failed")?;
+    sqlx::query(
         "UPDATE live_canary.autonomous_candidates
          SET status = 'disarmed', updated_at = now()
          WHERE status IN (
@@ -674,6 +692,28 @@ async fn disarmed_deploy(pool: &PgPool) -> ControlResult<()> {
     .map_err(|_| "active-attempt inspection failed")?;
     if active_attempts != 0 {
         return Err("disarmed deployment is blocked by an active attempt".into());
+    }
+    let active_revenue_lane: Option<String> = sqlx::query_scalar(
+        "SELECT active_lane
+         FROM live_canary.global_revenue_submission_lock
+         WHERE singleton
+         FOR UPDATE",
+    )
+    .fetch_one(&mut *transaction)
+    .await
+    .map_err(|_| "global revenue submission lock is unavailable")?;
+    if active_revenue_lane.is_some() {
+        return Err("disarmed deployment is blocked by an active revenue submission".into());
+    }
+    let active_atlas_requests: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM live_canary.atlas_solver_requests
+         WHERE status IN ('claimed', 'signed', 'submitted', 'submission_unknown')",
+    )
+    .fetch_one(&mut *transaction)
+    .await
+    .map_err(|_| "active Atlas request inspection failed")?;
+    if active_atlas_requests != 0 {
+        return Err("disarmed deployment is blocked by an active Atlas request".into());
     }
     transaction
         .commit()
@@ -2907,6 +2947,16 @@ async fn disarm(pool: &PgPool) -> ControlResult<()> {
     .await
     .map_err(|_| "route autonomous control disarm failed")?;
     sqlx::query(
+        "UPDATE live_canary.revenue_lane_controls
+         SET armed = false, kill_switch = true, disarm_reason = $1,
+             control_epoch = control_epoch + 1, updated_at = now()
+         WHERE lane IN ('atlas_solver', 'aave_liquidation')",
+    )
+    .bind(&reason)
+    .execute(&mut *transaction)
+    .await
+    .map_err(|_| "revenue lane control disarm failed")?;
+    sqlx::query(
         "UPDATE live_canary.autonomous_candidates
          SET status = 'disarmed', updated_at = now()
          WHERE status IN (
@@ -2949,6 +2999,111 @@ async fn disarm(pool: &PgPool) -> ControlResult<()> {
     Ok(())
 }
 
+async fn arm_revenue_lanes() -> ControlResult<()> {
+    if required("PHOENIX_REVENUE_LANES_ACK")? != ARM_REVENUE_LANES_ACK {
+        return Err("revenue lane acknowledgement is invalid".into());
+    }
+    require_signerless_control()?;
+    let pool = database_pool().await?;
+    arm_revenue_lanes_in_pool(&pool).await
+}
+
+async fn arm_revenue_lanes_in_pool(pool: &PgPool) -> ControlResult<()> {
+    require_schema(pool).await?;
+
+    let maximum_input_amount = required_u128("LIVE_EXECUTOR_MAX_INPUT_AMOUNT")?;
+    let maximum_gas_limit = required_u128("LIVE_EXECUTOR_MAX_GAS_LIMIT")?;
+    let maximum_gas_limit: i64 = maximum_gas_limit
+        .try_into()
+        .ok()
+        .filter(|value| *value > 0)
+        .ok_or("maximum gas limit exceeds the database bound")?;
+    let maximum_fee_per_gas = required_u128("LIVE_EXECUTOR_MAX_MAX_FEE_PER_GAS_WEI")?;
+    let maximum_atlas_bid = required_u128("LIVE_EXECUTOR_MAX_ATLAS_BID_WEI")?;
+    let daily_loss_limit = required_u128("LIVE_EXECUTOR_MAX_DAILY_LOSS_WEI")?;
+    let retained_profit_floor = required_u128("LIVE_EXECUTOR_MIN_EXPECTED_PROFIT")?;
+
+    let mut transaction = pool
+        .begin()
+        .await
+        .map_err(|_| "database transaction failed")?;
+    let active_lane: Option<String> = sqlx::query_scalar(
+        "SELECT active_lane
+         FROM live_canary.global_revenue_submission_lock
+         WHERE singleton
+         FOR UPDATE",
+    )
+    .fetch_one(&mut *transaction)
+    .await
+    .map_err(|_| "global revenue submission lock is unavailable")?;
+    if active_lane.is_some() {
+        return Err("revenue lane activation is blocked by an active submission".into());
+    }
+    let active_attempts: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM live_canary.execution_attempts
+         WHERE status IN (
+            'claimed', 'nonce_allocated', 'submission_unknown', 'pending', 'timed_out'
+         )",
+    )
+    .fetch_one(&mut *transaction)
+    .await
+    .map_err(|_| "active-attempt inspection failed")?;
+    if active_attempts != 0 {
+        return Err("revenue lane activation is blocked by an active attempt".into());
+    }
+    let active_atlas_requests: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM live_canary.atlas_solver_requests
+         WHERE status IN ('claimed', 'signed', 'submitted', 'submission_unknown')",
+    )
+    .fetch_one(&mut *transaction)
+    .await
+    .map_err(|_| "active Atlas request inspection failed")?;
+    if active_atlas_requests != 0 {
+        return Err("revenue lane activation is blocked by an active Atlas request".into());
+    }
+
+    let result = sqlx::query(
+        "UPDATE live_canary.revenue_lane_controls
+         SET armed = true, kill_switch = false,
+             maximum_input_amount = $1::numeric,
+             maximum_gas_limit = $2,
+             maximum_fee_per_gas = $3::numeric,
+             maximum_atlas_bid = $4::numeric,
+             daily_loss_limit = $5::numeric,
+             retained_profit_floor = $6::numeric,
+             disarm_reason = 'owner_accepted_live_hunter',
+             control_epoch = control_epoch + 1,
+             updated_at = now()
+         WHERE lane IN ('atlas_solver', 'aave_liquidation')",
+    )
+    .bind(maximum_input_amount.to_string())
+    .bind(maximum_gas_limit)
+    .bind(maximum_fee_per_gas.to_string())
+    .bind(maximum_atlas_bid.to_string())
+    .bind(daily_loss_limit.to_string())
+    .bind(retained_profit_floor.to_string())
+    .execute(&mut *transaction)
+    .await
+    .map_err(|_| "revenue lane activation failed")?;
+    if result.rows_affected() != 2 {
+        return Err("the exact revenue lane set is unavailable".into());
+    }
+    transaction
+        .commit()
+        .await
+        .map_err(|_| "revenue lane activation commit failed")?;
+    println!(
+        "REVENUE_LANES_ARMED_OK: lanes=atlas_solver,aave_liquidation armed=true kill_switch=false maximum_input_amount={} maximum_gas_limit={} maximum_fee_per_gas={} maximum_atlas_bid={} daily_loss_limit={} retained_profit_floor={}",
+        maximum_input_amount,
+        maximum_gas_limit,
+        maximum_fee_per_gas,
+        maximum_atlas_bid,
+        daily_loss_limit,
+        retained_profit_floor
+    );
+    Ok(())
+}
+
 async fn status(pool: &PgPool) -> Result<(), &'static str> {
     require_schema(pool).await?;
     let row = sqlx::query(
@@ -2970,6 +3125,25 @@ async fn status(pool: &PgPool) -> Result<(), &'static str> {
     .fetch_optional(pool)
     .await
     .map_err(|_| "route control is unavailable")?;
+    let revenue_lanes = sqlx::query(
+        "SELECT lane, armed, kill_switch,
+                maximum_input_amount::text AS maximum_input_amount,
+                maximum_gas_limit,
+                maximum_fee_per_gas::text AS maximum_fee_per_gas,
+                maximum_atlas_bid::text AS maximum_atlas_bid,
+                daily_loss_limit::text AS daily_loss_limit,
+                retained_profit_floor::text AS retained_profit_floor,
+                disarm_reason, control_epoch, updated_at
+         FROM live_canary.revenue_lane_controls
+         WHERE lane IN ('atlas_solver', 'aave_liquidation')
+         ORDER BY lane",
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(|_| "revenue lane controls are unavailable")?;
+    if revenue_lanes.len() != 2 {
+        return Err("the exact revenue lane set is unavailable");
+    }
     let economic = sqlx::query(
         "SELECT phase, current_size_level, current_input_wei::text AS current_input_wei,
                 maximum_reviewed_input_wei::text AS maximum_reviewed_input_wei,
@@ -2999,6 +3173,20 @@ async fn status(pool: &PgPool) -> Result<(), &'static str> {
             "control_epoch": route.try_get::<i64, _>("control_epoch").ok(),
             "hash_present": route.try_get::<bool, _>("hash_present").ok()
         })),
+        "revenue_lanes": revenue_lanes.into_iter().map(|lane| json!({
+            "lane": lane.try_get::<String, _>("lane").ok(),
+            "armed": lane.try_get::<bool, _>("armed").ok(),
+            "kill_switch": lane.try_get::<bool, _>("kill_switch").ok(),
+            "maximum_input_amount": lane.try_get::<String, _>("maximum_input_amount").ok(),
+            "maximum_gas_limit": lane.try_get::<i64, _>("maximum_gas_limit").ok(),
+            "maximum_fee_per_gas": lane.try_get::<String, _>("maximum_fee_per_gas").ok(),
+            "maximum_atlas_bid": lane.try_get::<String, _>("maximum_atlas_bid").ok(),
+            "daily_loss_limit": lane.try_get::<String, _>("daily_loss_limit").ok(),
+            "retained_profit_floor": lane.try_get::<String, _>("retained_profit_floor").ok(),
+            "disarm_reason": lane.try_get::<String, _>("disarm_reason").ok(),
+            "control_epoch": lane.try_get::<i64, _>("control_epoch").ok(),
+            "updated_at": lane.try_get::<chrono::DateTime<Utc>, _>("updated_at").ok()
+        })).collect::<Vec<_>>(),
         "economic": {
             "phase": economic.try_get::<String, _>("phase").map_err(|_| "economic control is invalid")?,
             "current_size_level": economic.try_get::<String, _>("current_size_level").map_err(|_| "economic control is invalid")?,
@@ -3045,14 +3233,14 @@ async fn require_schema(pool: &PgPool) -> Result<(), &'static str> {
     let installed: bool = sqlx::query_scalar(
         "SELECT EXISTS(
              SELECT 1 FROM live_canary.schema_contract
-             WHERE version = 'phoenix.live-canary-schema.v5'
+             WHERE version = 'phoenix.live-canary-schema.v6'
          )",
     )
     .fetch_one(pool)
     .await
     .map_err(|_| "schema inspection failed")?;
     if !installed {
-        return Err("phoenix.live-canary-schema.v5 is not installed");
+        return Err("phoenix.live-canary-schema.v6 is not installed");
     }
     Ok(())
 }

@@ -467,6 +467,8 @@ fn valid_request(now: DateTime<Utc>, flash_asset: CanonicalAddress) -> Execution
         chain_id: ARBITRUM_ONE_CHAIN_ID,
         route_id: [4_u8; 32],
         route_fingerprint: CURRENT_ROUTE_FINGERPRINT.to_string(),
+        route_type: phoenix_live_executor::model::ExecutionRouteType::PhoenixDexV1,
+        aave_liquidation: None,
         selected_size: 1_000,
         token_path: vec![flash_asset, token_b, flash_asset],
         origin_router: CanonicalAddress::parse("0x4444444444444444444444444444444444444444")

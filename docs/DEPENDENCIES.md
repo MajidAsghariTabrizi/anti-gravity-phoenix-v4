@@ -232,6 +232,33 @@ distinct Production gateway provider slots for current finalized state only.
 Provider URL values remain protected and must never be committed, printed,
 included in evidence, or exposed through the SSH bridge.
 
+## Atlas v1.6.4 Solver Interface
+
+The active solver implementation is bound to the official Arbitrum Atlas
+v1.6.4 deployment and does not infer signatures or bid semantics from auction
+payloads. The reviewed sources are:
+
+- Chainlink SVR Atlas searcher onboarding at commit
+  `064e168227f40d98069163d0c9c11cab243cfacb`;
+- FastLane Atlas tag `atlas-v1.6.4`, commit
+  `083dccd05a2c92e0e9cae90ac404504f741bc493`;
+- Atlas Go SDK commit `25e48369da286cf80f966a72411268a66527c101`;
+- Atlas deployment configuration commit
+  `8f3c6871485503cf4867c880f5a069d45ed59804`;
+- Atlas operations relay commit
+  `f99339726acba7c0272e1525583c3988bc2c9b03`.
+
+The exact Arbitrum bindings are Atlas
+`0x8ad1aE9D97C79aA68A0a151E83ff3942f68F86C1`, DappControl
+`0xe15BBa987C002ecc3586e81244517877D294d291`, and AtlasVerification
+`0xAC116AbB948E26B023c9C4815ab001845Fbf54fF`. Solver operations use the
+`AtlasVerification` / `1.6.4` EIP-712 domain on chain 42161. The Searcher
+Gateway subscription is `solver_subscribe(["userOperations"])` and submission
+is `solver_submitSolverOperation`. Oracle gas, auction deadline, solver gas
+limit, exact user-operation hash, solver contract, bid token, and maximum bid
+are all request bindings. Solver registration or bonding never grants route
+authority and cannot relax the retained-profit floor.
+
 The legacy `historical-authority` mode remains fail-closed for an operator who
 separately chooses to prove the full historical archive. That optional mode
 still requires an independently validated archive, exact deployment boundary,

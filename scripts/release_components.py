@@ -310,14 +310,14 @@ HEALTH_CONTRACTS = {
     "phoenix-engine": "http://127.0.0.1:9200/readyz",
     "shadow-dispatcher": "http://127.0.0.1:9500/readyz",
     "recorder": "http://127.0.0.1:9400/readyz",
-    "atlas-observer": "binary:/usr/local/bin/atlas-observer;http://127.0.0.1:9700/readyz",
+    "atlas-observer": "binary:/usr/local/bin/atlas-aave-hunter;http://127.0.0.1:9700/readyz",
     "prometheus": "http://127.0.0.1:9090/-/ready",
     "dashboard": "http://127.0.0.1:8501/_stcore/health",
     "live-executor": "process:pid-1;autonomous-control:status",
 }
 CURSOR_CONTRACTS = {
     "recorder": "durable-money-path-outbox",
-    "atlas-observer": "monotonic-auction-ledger",
+    "atlas-observer": "monotonic-auction-ledger;monotonic-aave-cursor",
 }
 
 

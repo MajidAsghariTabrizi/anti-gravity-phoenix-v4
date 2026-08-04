@@ -426,6 +426,8 @@ fn build_request(
         chain_id: plan.chain_id,
         route_id,
         route_fingerprint: plan.route.route_fingerprint.clone(),
+        route_type: crate::model::ExecutionRouteType::PhoenixDexV1,
+        aave_liquidation: None,
         selected_size,
         token_path,
         origin_router: CanonicalAddress::parse(&plan.origin_router)
@@ -492,7 +494,7 @@ pub(crate) async fn insert_approved_request(
     sqlx::query(
         "INSERT INTO live_canary.execution_requests(
             id, opportunity_id, schema_version, chain_id, route_id,
-            route_fingerprint, selected_size, token_path, origin_router,
+            route_fingerprint, route_type, route_payload, selected_size, token_path, origin_router,
             executor_address, executor_code_hash, calldata_hash,
             simulation_result_hash, plan_hash, pinned_block_number,
             pinned_block_hash, flash_asset, flash_amount, maximum_input_amount,
@@ -501,10 +503,10 @@ pub(crate) async fn insert_approved_request(
             approval_deadline, policy_version, approval_digest, status
          )
          VALUES (
-            $1, $2, $3, $4, $5, $6, $7::numeric, $8, $9, $10, $11, $12,
-            $13, $14, $15::numeric, $16, $17, $18::numeric, $19::numeric,
-            $20::numeric, $21::numeric, $22, $23, $24, $25::numeric,
-            $26::numeric, $27, $28, $29, $30, $31, 'approved'
+            $1, $2, $3, $4, $5, $6, $7, $8, $9::numeric, $10, $11, $12, $13, $14,
+            $15, $16, $17::numeric, $18, $19, $20::numeric, $21::numeric,
+            $22::numeric, $23::numeric, $24, $25, $26, $27::numeric,
+            $28::numeric, $29, $30, $31, $32, $33, 'approved'
          )",
     )
     .bind(request.id)
@@ -513,6 +515,21 @@ pub(crate) async fn insert_approved_request(
     .bind(i64::try_from(request.chain_id).map_err(|_| ApprovalError::InvalidCandidate)?)
     .bind(format!("0x{}", hex::encode(request.route_id)))
     .bind(&request.route_fingerprint)
+    .bind(request.route_type.as_str())
+    .bind(request.aave_liquidation.as_ref().map(|route| {
+        Json(serde_json::json!({
+            "borrower": route.borrower.to_string(),
+            "debt_asset": route.debt_asset.to_string(),
+            "collateral_asset": route.collateral_asset.to_string(),
+            "receive_a_token": route.receive_a_token,
+            "minimum_collateral_received": route.minimum_collateral_received.to_string(),
+            "minimum_unwind_output": route.minimum_unwind_output.to_string(),
+            "maximum_atlas_bid": route.maximum_atlas_bid.to_string(),
+            "evidence_mode": route.evidence_mode,
+            "state_root": route.state_root,
+            "release_sha": route.release_sha,
+        }))
+    }))
     .bind(request.selected_size.to_string())
     .bind(Json(
         request
@@ -1060,6 +1077,8 @@ mod tests {
             chain_id: ARBITRUM_ONE_CHAIN_ID,
             route_id: [4_u8; 32],
             route_fingerprint: plan.route.route_fingerprint.clone(),
+            route_type: crate::model::ExecutionRouteType::PhoenixDexV1,
+            aave_liquidation: None,
             selected_size: 1_000_000_000_000_000,
             token_path: vec![weth, usdc, weth],
             origin_router: CanonicalAddress::parse(&plan.origin_router).expect("router"),

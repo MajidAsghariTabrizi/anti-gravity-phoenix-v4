@@ -418,8 +418,8 @@ class ReleaseComponentRegistryTests(unittest.TestCase):
                 "image_binding": "atlas-observer",
                 "lifecycle": "persistent",
                 "protection": "ordinary",
-                "health": "binary:/usr/local/bin/atlas-observer;http://127.0.0.1:9700/readyz",
-                "cursor": "monotonic-auction-ledger",
+                "health": "binary:/usr/local/bin/atlas-aave-hunter;http://127.0.0.1:9700/readyz",
+                "cursor": "monotonic-auction-ledger;monotonic-aave-cursor",
                 "expected_modes": ["SHADOW", "DISARMED_EVIDENCE", "LIVE"],
             },
         )
@@ -479,7 +479,7 @@ class ReleaseComponentRegistryTests(unittest.TestCase):
         self.assertIn('--field remove_services', rollback)
         self.assertIn('rm -f "$service"', deploy)
         self.assertIn('rm -f "$service"', rollback)
-        self.assertIn("/usr/local/bin/atlas-observer", health)
+        self.assertIn("/usr/local/bin/atlas-aave-hunter", health)
 
     def test_legacy_inherited_bridge_manifest_is_schema_valid(self) -> None:
         schema = json.loads(

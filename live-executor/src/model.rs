@@ -1,4 +1,5 @@
 use crate::{
+    AAVE_LIQUIDATION_ROUTE_FINGERPRINT, ARBITRUM_AAVE_V3_POOL_ADDRESS,
     ARBITRUM_NATIVE_USDC_ADDRESS, ARBITRUM_ONE_CHAIN_ID, ARBITRUM_WETH_ADDRESS,
     CURRENT_ROUTE_FINGERPRINT, CURRENT_ROUTE_POOL_3000_ADDRESS, CURRENT_ROUTE_POOL_500_ADDRESS,
     REQUEST_SCHEMA_VERSION, REVERSE_ROUTE_FINGERPRINT,
@@ -113,6 +114,51 @@ pub struct ValidatedLeg {
     pub min_amount_out: u128,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum ExecutionRouteType {
+    PhoenixDexV1,
+    AaveLiquidationV1,
+}
+
+impl ExecutionRouteType {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::PhoenixDexV1 => "PHOENIX_DEX_V1",
+            Self::AaveLiquidationV1 => AAVE_LIQUIDATION_ROUTE_FINGERPRINT,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RawAaveLiquidationRoute {
+    pub borrower: String,
+    pub debt_asset: String,
+    pub collateral_asset: String,
+    pub receive_a_token: bool,
+    pub minimum_collateral_received: String,
+    pub minimum_unwind_output: String,
+    pub maximum_atlas_bid: String,
+    pub evidence_mode: String,
+    pub state_root: String,
+    pub release_sha: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AaveLiquidationRoute {
+    pub borrower: CanonicalAddress,
+    pub debt_asset: CanonicalAddress,
+    pub collateral_asset: CanonicalAddress,
+    pub receive_a_token: bool,
+    pub minimum_collateral_received: u128,
+    pub minimum_unwind_output: u128,
+    pub maximum_atlas_bid: u128,
+    pub evidence_mode: String,
+    pub state_root: String,
+    pub release_sha: String,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ExecutionRequest {
     pub id: Uuid,
@@ -121,6 +167,8 @@ pub struct ExecutionRequest {
     pub chain_id: u64,
     pub route_id: [u8; 32],
     pub route_fingerprint: String,
+    pub route_type: ExecutionRouteType,
+    pub aave_liquidation: Option<AaveLiquidationRoute>,
     pub selected_size: u128,
     pub token_path: Vec<CanonicalAddress>,
     pub origin_router: CanonicalAddress,
@@ -156,6 +204,8 @@ pub struct RawExecutionRequest {
     pub chain_id: i64,
     pub route_id: String,
     pub route_fingerprint: String,
+    pub route_type: String,
+    pub route_payload: Option<serde_json::Value>,
     pub selected_size: String,
     pub token_path: Vec<String>,
     pub origin_router: String,
@@ -191,6 +241,8 @@ struct ApprovalBody<'a> {
     chain_id: u64,
     route_id: String,
     route_fingerprint: &'a str,
+    route_type: &'a str,
+    route_payload: Option<RawAaveLiquidationRoute>,
     selected_size: String,
     token_path: Vec<String>,
     origin_router: String,
@@ -263,7 +315,7 @@ impl RawExecutionRequest {
         if max_priority_fee_per_gas > max_fee_per_gas {
             return Err(ModelError::InvalidGas);
         }
-        if self.legs.is_empty() || self.legs.len() > MAX_ROUTE_LEGS {
+        if self.legs.len() > MAX_ROUTE_LEGS {
             return Err(ModelError::InvalidLegs);
         }
         let legs = self
@@ -272,13 +324,55 @@ impl RawExecutionRequest {
             .map(ValidatedLeg::try_from)
             .collect::<Result<Vec<_>, _>>()?;
         let flash_asset = CanonicalAddress::parse(&self.flash_asset)?;
-        validate_route(&legs, flash_asset)?;
         let token_path = self
             .token_path
             .iter()
             .map(|address| CanonicalAddress::parse(address))
             .collect::<Result<Vec<_>, _>>()?;
-        validate_token_path(&token_path, &legs, flash_asset)?;
+        let (route_type, aave_liquidation) = match self.route_type.as_str() {
+            "PHOENIX_DEX_V1" => {
+                if self.route_payload.is_some() || legs.is_empty() {
+                    return Err(ModelError::InvalidLegs);
+                }
+                validate_route(&legs, flash_asset)?;
+                validate_token_path(&token_path, &legs, flash_asset)?;
+                (ExecutionRouteType::PhoenixDexV1, None)
+            }
+            AAVE_LIQUIDATION_ROUTE_FINGERPRINT => {
+                let raw: RawAaveLiquidationRoute = serde_json::from_value(
+                    self.route_payload.clone().ok_or(ModelError::InvalidLegs)?,
+                )
+                .map_err(|_| ModelError::InvalidLegs)?;
+                if raw.receive_a_token
+                    || raw.evidence_mode != "EIP1186_VERIFIED"
+                        && raw.evidence_mode != "DUAL_PROVIDER_FORK_VERIFIED"
+                    || !canonical_block_hash(&raw.state_root)
+                    || !canonical_digest(&raw.release_sha)
+                {
+                    return Err(ModelError::InvalidApproval);
+                }
+                let route = AaveLiquidationRoute {
+                    borrower: CanonicalAddress::parse(&raw.borrower)?,
+                    debt_asset: CanonicalAddress::parse(&raw.debt_asset)?,
+                    collateral_asset: CanonicalAddress::parse(&raw.collateral_asset)?,
+                    receive_a_token: raw.receive_a_token,
+                    minimum_collateral_received: parse_positive_u128(
+                        &raw.minimum_collateral_received,
+                    )?,
+                    minimum_unwind_output: parse_positive_u128(&raw.minimum_unwind_output)?,
+                    maximum_atlas_bid: raw
+                        .maximum_atlas_bid
+                        .parse::<u128>()
+                        .map_err(|_| ModelError::InvalidAmount)?,
+                    evidence_mode: raw.evidence_mode,
+                    state_root: raw.state_root,
+                    release_sha: raw.release_sha,
+                };
+                validate_aave_route(&route, &legs, &token_path, flash_asset)?;
+                (ExecutionRouteType::AaveLiquidationV1, Some(route))
+            }
+            _ => return Err(ModelError::InvalidRoute),
+        };
         if self.approved_by.trim().is_empty()
             || self.approved_by.len() > MAX_APPROVER_BYTES
             || self.policy_version.trim().is_empty()
@@ -306,6 +400,8 @@ impl RawExecutionRequest {
             chain_id,
             route_id,
             route_fingerprint: self.route_fingerprint,
+            route_type,
+            aave_liquidation,
             selected_size,
             token_path,
             origin_router: CanonicalAddress::parse(&self.origin_router)?,
@@ -342,6 +438,24 @@ impl RawExecutionRequest {
 
 impl ExecutionRequest {
     pub fn validate_current_route(&self) -> Result<(), ModelError> {
+        if self.route_type == ExecutionRouteType::AaveLiquidationV1 {
+            let route = self
+                .aave_liquidation
+                .as_ref()
+                .ok_or(ModelError::InvalidLegs)?;
+            if self.route_fingerprint != AAVE_LIQUIDATION_ROUTE_FINGERPRINT
+                || self.origin_router != CanonicalAddress::parse(ARBITRUM_AAVE_V3_POOL_ADDRESS)?
+                || route.debt_asset != self.flash_asset
+                || self.selected_size != self.flash_amount
+                || route.maximum_atlas_bid != 0
+            {
+                return Err(ModelError::InvalidLegs);
+            }
+            return validate_aave_route(route, &self.legs, &self.token_path, self.flash_asset);
+        }
+        if self.route_type != ExecutionRouteType::PhoenixDexV1 || self.aave_liquidation.is_some() {
+            return Err(ModelError::InvalidRoute);
+        }
         let weth = CanonicalAddress::parse(ARBITRUM_WETH_ADDRESS)?;
         let usdc = CanonicalAddress::parse(ARBITRUM_NATIVE_USDC_ADDRESS)?;
         let pool_500 = CanonicalAddress::parse(CURRENT_ROUTE_POOL_500_ADDRESS)?;
@@ -381,6 +495,22 @@ impl ExecutionRequest {
             chain_id: self.chain_id,
             route_id: format!("0x{}", hex::encode(self.route_id)),
             route_fingerprint: &self.route_fingerprint,
+            route_type: self.route_type.as_str(),
+            route_payload: self
+                .aave_liquidation
+                .as_ref()
+                .map(|route| RawAaveLiquidationRoute {
+                    borrower: route.borrower.to_string(),
+                    debt_asset: route.debt_asset.to_string(),
+                    collateral_asset: route.collateral_asset.to_string(),
+                    receive_a_token: route.receive_a_token,
+                    minimum_collateral_received: route.minimum_collateral_received.to_string(),
+                    minimum_unwind_output: route.minimum_unwind_output.to_string(),
+                    maximum_atlas_bid: route.maximum_atlas_bid.to_string(),
+                    evidence_mode: route.evidence_mode.clone(),
+                    state_root: route.state_root.clone(),
+                    release_sha: route.release_sha.clone(),
+                }),
             selected_size: self.selected_size.to_string(),
             token_path: self.token_path.iter().map(ToString::to_string).collect(),
             origin_router: self.origin_router.to_string(),
@@ -413,6 +543,41 @@ impl ExecutionRequest {
         let encoded = serde_json::to_vec(&body).map_err(|_| ModelError::InvalidApproval)?;
         Ok(hex::encode(Sha256::digest(encoded)))
     }
+}
+
+fn validate_aave_route(
+    route: &AaveLiquidationRoute,
+    legs: &[ValidatedLeg],
+    token_path: &[CanonicalAddress],
+    flash_asset: CanonicalAddress,
+) -> Result<(), ModelError> {
+    if route.receive_a_token || route.debt_asset != flash_asset {
+        return Err(ModelError::InvalidLegs);
+    }
+    if route.collateral_asset == route.debt_asset {
+        if !legs.is_empty() || token_path != [route.debt_asset] {
+            return Err(ModelError::InvalidLegs);
+        }
+        return Ok(());
+    }
+    if legs.is_empty()
+        || token_path.len() != legs.len() + 1
+        || token_path.first() != Some(&route.collateral_asset)
+        || token_path.last() != Some(&route.debt_asset)
+    {
+        return Err(ModelError::InvalidLegs);
+    }
+    for (index, leg) in legs.iter().enumerate() {
+        if leg.factory.is_none()
+            || leg.token_in != token_path[index]
+            || leg.token_out != token_path[index + 1]
+            || leg.token_in == leg.token_out
+            || leg.zero_for_one != (leg.token_in.as_bytes() < leg.token_out.as_bytes())
+        {
+            return Err(ModelError::InvalidLegs);
+        }
+    }
+    Ok(())
 }
 
 impl TryFrom<ExecutionLeg> for ValidatedLeg {

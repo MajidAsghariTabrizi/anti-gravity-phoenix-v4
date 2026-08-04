@@ -1,7 +1,9 @@
+use crate::aave::AaveLiquidationRequest;
 use crate::abi::{decode_settlement, encode_execute_opportunity, AbiError};
 use crate::config::ExecutorConfig;
 use crate::model::{
-    ActiveAttempt, AttemptStatus, ExecutionRequest, ReceiptOutcome, Settlement, TransactionHash,
+    ActiveAttempt, AttemptStatus, ExecutionRequest, ExecutionRouteType, ReceiptOutcome, Settlement,
+    TransactionHash,
 };
 use crate::rpc::{ExecutionRpc, RpcError, RpcErrorKind, TransactionReceipt};
 use crate::signer::{SignerError, TransactionDraft, TransactionSigner};
@@ -435,7 +437,7 @@ where
             });
         }
         let settlement =
-            match decode_settlement(&request, self.config.executor_address, &receipt.logs) {
+            match decode_route_settlement(&request, self.config.executor_address, &receipt.logs) {
                 Ok(settlement) => settlement,
                 Err(_) => {
                     self.store
@@ -586,12 +588,42 @@ fn validate_and_encode(
     if !config.one_transaction_at_a_time {
         return Err(PolicyError::Concurrency);
     }
-    let calldata = encode_execute_opportunity(request, request.executor_address)
-        .map_err(|_| PolicyError::Calldata)?;
+    let calldata = match request.route_type {
+        ExecutionRouteType::PhoenixDexV1 => {
+            encode_execute_opportunity(request, request.executor_address)
+                .map_err(|_| PolicyError::Calldata)?
+        }
+        ExecutionRouteType::AaveLiquidationV1 => AaveLiquidationRequest::from_execution(request)
+            .and_then(|route| route.encode_direct_call())
+            .map_err(|_| PolicyError::Calldata)?,
+    };
     if hex::encode(Sha256::digest(&calldata)) != request.calldata_hash {
         return Err(PolicyError::Calldata);
     }
     Ok(calldata)
+}
+
+fn decode_route_settlement(
+    request: &ExecutionRequest,
+    executor_address: crate::model::CanonicalAddress,
+    logs: &[crate::abi::RpcLog],
+) -> Result<Settlement, AbiError> {
+    match request.route_type {
+        ExecutionRouteType::PhoenixDexV1 => decode_settlement(request, executor_address, logs),
+        ExecutionRouteType::AaveLiquidationV1 => {
+            let route = AaveLiquidationRequest::from_execution(request)
+                .map_err(|_| AbiError::InvalidSettlement)?;
+            let settlement = route
+                .decode_settlement(executor_address, logs)
+                .map_err(|_| AbiError::InvalidSettlement)?;
+            Ok(Settlement {
+                asset: settlement.debt_asset,
+                flash_amount: settlement.repay_amount,
+                premium: settlement.premium,
+                realized_profit: settlement.realized_profit,
+            })
+        }
+    }
 }
 
 fn rpc_error_code(kind: RpcErrorKind) -> &'static str {

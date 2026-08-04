@@ -256,12 +256,38 @@ services:
     # removes Atlas before reconciling a seven-image rollback, and this reference
     # deliberately cannot be confused with or pulled as another Phoenix service.
     image: ${ATLAS_OBSERVER_IMAGE:-phoenix.invalid/atlas-observer:legacy-disabled}
+    entrypoint: ["/usr/local/bin/atlas-aave-hunter"]
+    environment:
+      POSTGRES_DSN: ${POSTGRES_DSN:?POSTGRES_DSN is required}
     command:
-      - --continuous
       - --ledger-dir=/var/lib/phoenix-atlas-observer
+      - --aave-discovery=/var/lib/phoenix-atlas-discovery/aave-borrow-discovery.json
+      - --aave-discovery-sha256=${AAVE_BORROW_DISCOVERY_SHA256:-e21964b0cedcbe2578e2ad18d7551f78255ee96ffac58ae6caf73c85ffc5334a}
+      - --aave-starting-cursor=1100
+      - --aave-batch-size=100
+      - --aave-pace=60s
+      - --retained-profit-floor-wei=${LIVE_EXECUTOR_MIN_EXPECTED_PROFIT:?LIVE_EXECUTOR_MIN_EXPECTED_PROFIT is required}
+      - --maximum-gas-limit=${LIVE_EXECUTOR_MAX_GAS_LIMIT:?LIVE_EXECUTOR_MAX_GAS_LIMIT is required}
+      - --maximum-fee-per-gas-wei=${LIVE_EXECUTOR_MAX_MAX_FEE_PER_GAS_WEI:?LIVE_EXECUTOR_MAX_MAX_FEE_PER_GAS_WEI is required}
+      - --maximum-priority-fee-per-gas-wei=${LIVE_EXECUTOR_MAX_PRIORITY_FEE_PER_GAS_WEI:?LIVE_EXECUTOR_MAX_PRIORITY_FEE_PER_GAS_WEI is required}
+      - --executor-address=${LIVE_EXECUTOR_EXECUTOR_ADDRESS:?LIVE_EXECUTOR_EXECUTOR_ADDRESS is required}
+      - --executor-code-hash=${LIVE_EXECUTOR_EXECUTOR_CODE_HASH:?LIVE_EXECUTOR_EXECUTOR_CODE_HASH is required}
+      - --caller-address=${LIVE_EXECUTOR_WALLET_ADDRESS:?LIVE_EXECUTOR_WALLET_ADDRESS is required}
+      - --release-sha=${PHOENIX_RELEASE_SHA:?PHOENIX_RELEASE_SHA is required}
+      - --flash-premium-bps=9
+      - --economic-reserve-bps=500
+      - --rpc-gateway-url=http://rpc-gateway:9300
       - --health-addr=0.0.0.0:9700
     volumes:
       - /opt/phoenix/evidence/atlas-live:/var/lib/phoenix-atlas-observer
+      - /opt/phoenix/evidence/aave-discovery/aave-borrow-discovery.json:/var/lib/phoenix-atlas-discovery/aave-borrow-discovery.json:ro
+    depends_on:
+      rpc-gateway:
+        condition: service_healthy
+      migration-runner:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
     networks: [phoenix-internal]
     read_only: true
     tmpfs:

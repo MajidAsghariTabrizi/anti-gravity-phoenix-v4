@@ -301,12 +301,20 @@ for required in (
     'compose stop -t 30 live-executor',
     '--field intentional_absence',
     'assert_intentional_absence ||',
+    'LIVE_EXECUTOR_HUNTING_STANDBY: "false"',
+    'LIVE_EXECUTOR_ARMED: "true"',
+    'LIVE_EXECUTOR_KILL_SWITCH: "false"',
+    'LIVE_EXECUTOR_MAX_ATLAS_BID_WEI',
+    'mark_phase HUNTING_STANDBY_STARTED',
+    'hunting standby changed fail-closed runtime controls',
+    'revenue_lanes = status["revenue_lanes"]',
+    'and all(lane["armed"] is False for lane in revenue_lanes)',
+    'and all(lane["kill_switch"] is True for lane in revenue_lanes)',
 ):
-    require(required in deploy, f"disarmed_deploy_contract_missing:{required}")
+    require(required in deploy or required in compose, f"disarmed_deploy_contract_missing:{required}")
 for forbidden in (
     "live-executor activate",
     "live-executor owner-unpause",
-    "compose up -d --no-deps live-executor",
     "LIVE_EXECUTOR_SIGNER_FILE",
     "AUTONOMOUS_ACTIVATED",
     "EXECUTOR_UNPAUSED",
@@ -327,6 +335,10 @@ evidence_verified = deploy.index(
     "runtime did not enter fail-closed DISARMED_EVIDENCE", evidence_start
 )
 external_evidence = deploy.index("mark_phase DISARMED_EVIDENCE_STARTED", evidence_verified)
+standby = deploy.index("compose up -d --no-deps live-executor", external_evidence)
+standby_controls = deploy.index(
+    "hunting standby changed fail-closed runtime controls", standby
+)
 require(
     migrate
     < disarmed
@@ -336,7 +348,9 @@ require(
     < fail_closed
     < evidence_start
     < evidence_verified
-    < external_evidence,
+    < external_evidence
+    < standby
+    < standby_controls,
     "disarmed_release_sequence_invalid",
 )
 
@@ -360,6 +374,7 @@ for command in (
     '"create-readiness"',
     '"install-authorization"',
     '"activate-ready-canary"',
+    '"arm-revenue-lanes"',
     '"evaluate-economic-control"',
     '"supervise-economic-control"',
 ):
@@ -368,7 +383,17 @@ require(
     '"activate" => return Err(' in control,
     "legacy_direct_activation_not_disabled",
 )
-require("phoenix.live-canary-schema.v5" in control, "schema_v5_not_required")
+require("phoenix.live-canary-schema.v6" in control, "schema_v6_not_required")
+for required in (
+    "ARM_ATLAS_AAVE_LIVE_42161",
+    "WHERE lane IN ('atlas_solver', 'aave_liquidation')",
+    "revenue lane activation is blocked by an active submission",
+    "revenue lane activation is blocked by an active attempt",
+    "revenue lane activation is blocked by an active Atlas request",
+    "disarmed deployment is blocked by an active revenue submission",
+    "disarmed deployment is blocked by an active Atlas request",
+):
+    require(required in control, f"revenue_lane_activation_contract_missing:{required}")
 require(
     "previous.phase != EconomicPhase::DisarmedEvidence" in control,
     "readiness_does_not_require_durable_evidence_phase",

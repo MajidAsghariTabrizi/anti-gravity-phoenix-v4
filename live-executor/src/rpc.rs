@@ -42,6 +42,14 @@ pub struct TransactionQuote {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IndexedRpcLog {
+    pub transaction_hash: TransactionHash,
+    pub block_number: u64,
+    pub log_index: u64,
+    pub log: RpcLog,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ExecutorConfigurationSnapshot {
     pub runtime_code_hash: String,
     pub owner: Option<CanonicalAddress>,
@@ -247,6 +255,106 @@ impl HttpExecutionRpc {
             .as_str()
             .ok_or_else(malformed)
             .and_then(parse_hex_u128)
+    }
+
+    pub async fn latest_block_number(&self) -> Result<u64, RpcError> {
+        self.call("eth_blockNumber", json!([]))
+            .await?
+            .as_str()
+            .ok_or_else(malformed)
+            .and_then(parse_hex_u64)
+    }
+
+    pub async fn contract_uint_at(
+        &self,
+        contract: CanonicalAddress,
+        name: &str,
+        account: CanonicalAddress,
+        block_number: u64,
+    ) -> Result<u128, RpcError> {
+        let mut data = ethabi::short_signature(name, &[ethabi::ParamType::Address]).to_vec();
+        data.extend(ethabi::encode(&[address_token(account)]));
+        let value = self
+            .call(
+                "eth_call",
+                json!([{
+                    "to": contract.to_string(),
+                    "data": format!("0x{}", hex::encode(data))
+                }, format!("0x{block_number:x}")]),
+            )
+            .await?;
+        let bytes = value
+            .as_str()
+            .and_then(parse_hex_bytes)
+            .ok_or_else(malformed)?;
+        ethabi::decode(&[ethabi::ParamType::Uint(256)], &bytes)
+            .map_err(|_| malformed())?
+            .into_iter()
+            .next()
+            .and_then(ethabi::Token::into_uint)
+            .and_then(|value| u128::try_from(value).ok())
+            .ok_or_else(malformed)
+    }
+
+    pub async fn exact_logs(
+        &self,
+        address: CanonicalAddress,
+        topics: &[[u8; 32]],
+        from_block: u64,
+        to_block: u64,
+    ) -> Result<Vec<IndexedRpcLog>, RpcError> {
+        if topics.is_empty()
+            || topics.len() > 4
+            || from_block > to_block
+            || to_block - from_block > 512
+        {
+            return Err(malformed());
+        }
+        let value = self
+            .call(
+                "eth_getLogs",
+                json!([{
+                    "address": address.to_string(),
+                    "fromBlock": format!("0x{from_block:x}"),
+                    "toBlock": format!("0x{to_block:x}"),
+                    "topics": topics.iter().map(|topic| format!("0x{}", hex::encode(topic))).collect::<Vec<_>>()
+                }]),
+            )
+            .await?;
+        let logs = value.as_array().ok_or_else(malformed)?;
+        if logs.len() > 128 {
+            return Err(malformed());
+        }
+        logs.iter().map(parse_indexed_log).collect()
+    }
+
+    pub async fn transaction_input(
+        &self,
+        tx_hash: TransactionHash,
+        expected_to: CanonicalAddress,
+    ) -> Result<Option<Vec<u8>>, RpcError> {
+        let value = self
+            .call("eth_getTransactionByHash", json!([tx_hash.to_string()]))
+            .await?;
+        if value.is_null() {
+            return Ok(None);
+        }
+        let object = value.as_object().ok_or_else(malformed)?;
+        let returned_hash = parse_hash_field(object, "hash")?;
+        let to = object
+            .get("to")
+            .and_then(Value::as_str)
+            .ok_or_else(malformed)
+            .and_then(|value| CanonicalAddress::parse(value).map_err(|_| malformed()))?;
+        let input = object
+            .get("input")
+            .and_then(Value::as_str)
+            .and_then(parse_hex_bytes)
+            .ok_or_else(malformed)?;
+        if returned_hash != tx_hash || to != expected_to || input.len() > 512 * 1024 {
+            return Err(malformed());
+        }
+        Ok(Some(input))
     }
 
     pub async fn executor_owner_and_flash_provider(
@@ -571,6 +679,19 @@ fn parse_log(value: &Value) -> Result<RpcLog, RpcError> {
         address,
         topics,
         data,
+    })
+}
+
+fn parse_indexed_log(value: &Value) -> Result<IndexedRpcLog, RpcError> {
+    let object = value.as_object().ok_or_else(malformed)?;
+    if object.get("removed").and_then(Value::as_bool) != Some(false) {
+        return Err(malformed());
+    }
+    Ok(IndexedRpcLog {
+        transaction_hash: parse_hash_field(object, "transactionHash")?,
+        block_number: parse_u64_field(object, "blockNumber")?,
+        log_index: parse_u64_field(object, "logIndex")?,
+        log: parse_log(value)?,
     })
 }
 

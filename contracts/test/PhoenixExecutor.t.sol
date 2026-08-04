@@ -104,6 +104,8 @@ contract MockERC20 is IERC20 {
             uint256 public premium;
             PhoenixExecutor public withdrawalTarget;
             bytes4 public withdrawalError;
+            address public liquidationCollateral;
+            uint256 public liquidationCollateralAmount;
 
             constructor(uint256 p) {
                 premium = p;
@@ -112,6 +114,24 @@ contract MockERC20 is IERC20 {
             function acceptExecutorOwnership(PhoenixExecutor target) external {
                 withdrawalTarget = target;
                 target.acceptOwnership();
+            }
+
+            function setLiquidationResult(address collateral, uint256 amount) external {
+                liquidationCollateral = collateral;
+                liquidationCollateralAmount = amount;
+            }
+
+            function liquidationCall(
+                address collateralAsset,
+                address debtAsset,
+                address,
+                uint256 debtToCover,
+                bool receiveAToken
+            ) external override {
+                require(!receiveAToken, "aToken");
+                require(collateralAsset == liquidationCollateral, "collateral");
+                require(IERC20(debtAsset).transferFrom(msg.sender, address(this), debtToCover), "cover");
+                MockERC20(collateralAsset).mint(msg.sender, liquidationCollateralAmount);
             }
 
             function flashLoanSimple(
@@ -143,12 +163,34 @@ contract MockERC20 is IERC20 {
             }
         }
 
+        contract MockAtlas {
+            function shortfall() external pure returns (uint256 gasLiability, uint256 borrowLiability) {
+                return (0, 0);
+            }
+
+            function reconcile(uint256) external payable returns (uint256 owed) {
+                return 0;
+            }
+
+            function run(
+                PhoenixExecutor target,
+                address solverOpFrom,
+                address executionEnvironment,
+                address bidToken,
+                uint256 bidAmount,
+                bytes calldata solverOpData
+            ) external {
+                target.atlasSolverCall(solverOpFrom, executionEnvironment, bidToken, bidAmount, solverOpData, bytes(""));
+            }
+        }
+
         contract PhoenixExecutorTest {
             Vm private constant vm = Vm(address(uint160(uint256(keccak256("hevm cheat code")))));
 
             MockERC20 usdc;
             MockERC20 weth;
             MockAavePool aave;
+            MockAtlas atlas;
             MockFactory factory1;
             MockFactory factory2;
             MockPool pool1;
@@ -160,13 +202,14 @@ contract MockERC20 is IERC20 {
                 usdc = new MockERC20("USDC");
                 weth = new MockERC20("WETH");
                 aave = new MockAavePool(1);
+                atlas = new MockAtlas();
                 factory1 = new MockFactory();
                 factory2 = new MockFactory();
                 pool1 = new MockPool(address(factory1), address(usdc), address(weth), 500, 105);
                 pool2 = new MockPool(address(factory2), address(weth), address(usdc), 500, 117);
                 factory1.setPool(address(usdc), address(weth), 500, address(pool1));
                 factory2.setPool(address(weth), address(usdc), 500, address(pool2));
-                executor = new PhoenixExecutor(address(this), address(aave));
+                executor = new PhoenixExecutor(address(this), address(aave), address(atlas), address(weth));
                 executor.setAsset(address(usdc), true);
                 executor.setAsset(address(weth), true);
                 executor.setRouter(originRouter, true);
@@ -176,6 +219,62 @@ contract MockERC20 is IERC20 {
                 executor.approvePool(address(pool1), address(factory1), address(usdc), address(weth), 500, true);
                 executor.approvePool(address(pool2), address(factory2), address(weth), address(usdc), 500, true);
                 executor.setPaused(false);
+                aave.setLiquidationResult(address(weth), 105);
+            }
+
+            function liquidationRequest(uint256 minProfit, uint256 maxBid)
+                internal
+                view
+                returns (PhoenixExecutor.AaveLiquidationRequest memory request)
+            {
+                PhoenixExecutor.Leg[] memory legs = new PhoenixExecutor.Leg[](1);
+                legs[0] = PhoenixExecutor.Leg({
+                    pool: address(pool2),
+                    tokenIn: address(weth),
+                    tokenOut: address(usdc),
+                    fee: 500,
+                    zeroForOne: true,
+                    minAmountOut: 110
+                });
+                request = PhoenixExecutor.AaveLiquidationRequest({
+                    routeId: bytes32("aave-route-1"),
+                    borrower: address(0xB0B),
+                    debtAsset: address(usdc),
+                    collateralAsset: address(weth),
+                    repayAmount: 100,
+                    receiveAToken: false,
+                    maxInputAmount: 1_000,
+                    minCollateralReceived: 100,
+                    minUnwindOutput: 110,
+                    minProfit: minProfit,
+                    maxAtlasBid: maxBid,
+                    deadline: block.timestamp + 1,
+                    unwindLegs: legs
+                });
+            }
+
+            function testDirectAaveLiquidationHappyPath() public {
+                setUp();
+                executor.executeAaveLiquidation(liquidationRequest(5, 0));
+                require(usdc.balanceOf(address(executor)) == 16, "liquidation profit retained");
+            }
+
+            function testAtlasAaveLiquidationPaysBoundedBidAndRetainsMinimumProfit() public {
+                setUp();
+                uint256 beforeBid = usdc.balanceOf(address(this));
+                PhoenixExecutor.AaveLiquidationRequest memory request = liquidationRequest(5, 5);
+                atlas.run(executor, address(this), address(this), address(usdc), 5, abi.encode(request));
+                require(usdc.balanceOf(address(this)) == beforeBid + 5, "atlas bid not paid");
+                require(usdc.balanceOf(address(executor)) == 11, "post-bid profit retained");
+            }
+
+            function testAtlasBidAboveRequestMaximumReverts() public {
+                setUp();
+                PhoenixExecutor.AaveLiquidationRequest memory request = liquidationRequest(5, 4);
+                try atlas.run(executor, address(this), address(this), address(usdc), 5, abi.encode(request)) {
+                    revert("excessive bid accepted");
+                } catch {}
+                require(usdc.balanceOf(address(executor)) == 0, "state changed after rejected bid");
             }
 
             receive() external payable {}
@@ -224,7 +323,9 @@ contract MockERC20 is IERC20 {
 
             function testStartsPausedWithNoInputOrApprovals() public {
                 MockAavePool freshAave = new MockAavePool(1);
-                PhoenixExecutor fresh = new PhoenixExecutor(address(this), address(freshAave));
+                PhoenixExecutor fresh = new PhoenixExecutor(
+                    address(this), address(freshAave), address(0xA71A5), address(weth)
+                );
                 require(fresh.paused(), "executor did not start paused");
                 require(fresh.maximumInputAmount() == 0, "maximum input was initialized");
                 require(!fresh.authorizedSearchers(address(this)), "searcher was approved");

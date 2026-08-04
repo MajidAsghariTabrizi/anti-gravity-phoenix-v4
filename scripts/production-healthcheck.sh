@@ -13,6 +13,7 @@ retries="${PHOENIX_HEALTH_RETRIES:-20}"
 sleep_seconds="${PHOENIX_HEALTH_SLEEP_SECONDS:-3}"
 command_timeout_seconds="${PHOENIX_HEALTH_COMMAND_TIMEOUT_SECONDS:-15}"
 expected_mode="${PHOENIX_HEALTH_EXPECTED_MODE:-}"
+allow_stopped_standby="${PHOENIX_HEALTH_ALLOW_STOPPED_STANDBY:-false}"
 compose_runner=${PHOENIX_COMPOSE_RUNNER:-$deploy_dir/production_compose.py}
 if [ ! -f "$compose_runner" ] && [ -f "$script_dir/production_compose.py" ]; then
   compose_runner=$script_dir/production_compose.py
@@ -29,6 +30,10 @@ fi
 case "$expected_mode" in
   ""|LIVE|SHADOW|DISARMED_EVIDENCE) ;;
   *) echo "HEALTH_FAIL: invalid expected mode"; exit 1 ;;
+esac
+case "$allow_stopped_standby" in
+  true|false) ;;
+  *) echo "HEALTH_FAIL: invalid stopped-standby allowance"; exit 1 ;;
 esac
 
 [ -f "$release_env" ] ||
@@ -132,7 +137,7 @@ for service in $health_services; do
       ;;
     atlas-observer)
       check atlas-observer compose exec -T atlas-observer /bin/sh -c \
-        '[ "$(readlink /proc/1/exe)" = /usr/local/bin/atlas-observer ] && wget -q -O - http://127.0.0.1:9700/readyz'
+        '[ "$(readlink /proc/1/exe)" = /usr/local/bin/atlas-aave-hunter ] && wget -q -O - http://127.0.0.1:9700/readyz'
       ;;
     prometheus)
       check prometheus compose exec -T prometheus wget -q -O - http://127.0.0.1:9090/-/ready
@@ -162,8 +167,13 @@ if [ "$health_mode" = LIVE ]; then
   check event-metrics compose exec -T phoenix-engine wget -q -O - \
     http://127.0.0.1:9200/metrics
 elif [ "$health_mode" = DISARMED_EVIDENCE ]; then
-  [ -z "$(compose ps -q live-executor | awk 'NF { print; exit }')" ] ||
-    { echo "HEALTH_FAIL: live-executor-running-while-disarmed"; exit 1; }
+  if [ "$allow_stopped_standby" = true ]; then
+    [ -z "$(compose ps -q live-executor | awk 'NF { print; exit }')" ] ||
+      { echo "HEALTH_FAIL: live-executor-started-before-standby-phase"; exit 1; }
+  else
+    check live-executor-hunting-standby compose exec -T live-executor /bin/sh -c \
+      '[ "$LIVE_EXECUTOR_HUNTING_STANDBY" = true ] && [ "$LIVE_EXECUTOR_ARMED" = false ] && [ "$LIVE_EXECUTOR_KILL_SWITCH" = true ] && kill -0 1'
+  fi
   check disarmed-evidence-mode compose exec -T phoenix-engine /bin/sh -c \
     '[ "$PHOENIX_MODE" = LIVE ] && [ "$LIVE_EXECUTION" = true ] && [ "$AUTONOMOUS_EXECUTION" = true ]'
   check disarmed-controls compose run --rm --no-deps autonomous-control status

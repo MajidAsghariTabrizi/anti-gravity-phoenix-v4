@@ -78,6 +78,10 @@ async fn nonce_allocation_and_pending_state_survive_restart() {
     .execute(&pool)
     .await
     .expect("apply closed-loop economic control schema");
+    sqlx::raw_sql(include_str!("../schema/006_atlas_aave_revenue_lanes.sql"))
+        .execute(&pool)
+        .await
+        .expect("apply Atlas/Aave revenue lane schema");
 
     let signer = TransactionSigner::from_secret(&hex::encode([13_u8; 32]), ARBITRUM_ONE_CHAIN_ID)
         .expect("signer");
@@ -823,6 +827,8 @@ fn request(
         chain_id: ARBITRUM_ONE_CHAIN_ID,
         route_id: [17_u8; 32],
         route_fingerprint: CURRENT_ROUTE_FINGERPRINT.to_string(),
+        route_type: phoenix_live_executor::model::ExecutionRouteType::PhoenixDexV1,
+        aave_liquidation: None,
         selected_size: SizeLevel::Min.amount_wei(),
         token_path: vec![flash_asset, token_b, flash_asset],
         origin_router: CanonicalAddress::parse("0x4444444444444444444444444444444444444444")
