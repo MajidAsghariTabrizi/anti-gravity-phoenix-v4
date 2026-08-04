@@ -25,6 +25,7 @@ ARBITRUM_RPC_URL=https://arbitrum.drpc.org
 PARENT_CHAIN_RPC_URL=https://eth.drpc.org
 RPC_PROVIDER_URLS=https://credential-bearing-rpc.example/private-token,https://arbitrum.drpc.org
 RPC_PROVIDER_WEIGHTS=4,3
+RPC_PROVIDER_IDS=production-slot-0,availability-slot-1
 RPC_UPSTREAM_CALLS_PER_SECOND=1
 RPC_UPSTREAM_CALL_BURST=4
 RPC_STATE_REQUESTS_PER_MINUTE=12
@@ -50,6 +51,22 @@ assert_redacted() {
 output=$("$validator" "$valid_env" 2>&1)
 assert_redacted "$output"
 printf '%s' "$output" | grep -q 'ENV_VALID'
+
+legacy_ids="$tmp_dir/legacy-provider-ids.env"
+sed '/^RPC_PROVIDER_IDS=/d' "$valid_env" >"$legacy_ids"
+output=$("$validator" "$legacy_ids" 2>&1)
+assert_redacted "$output"
+printf '%s' "$output" | grep -q 'ENV_VALID'
+
+duplicate_ids="$tmp_dir/duplicate-provider-ids.env"
+sed 's/RPC_PROVIDER_IDS=production-slot-0,availability-slot-1/RPC_PROVIDER_IDS=duplicate,duplicate/' \
+  "$valid_env" >"$duplicate_ids"
+if output=$("$validator" "$duplicate_ids" 2>&1); then
+  echo "expected duplicate RPC provider identities to fail"
+  exit 1
+fi
+assert_redacted "$output"
+printf '%s' "$output" | grep -q 'RPC provider identities must be unique'
 
 bad_rpc="$tmp_dir/bad-rpc.env"
 sed 's/RPC_PROVIDER_WEIGHTS=4,3/RPC_PROVIDER_WEIGHTS=4/' "$valid_env" >"$bad_rpc"

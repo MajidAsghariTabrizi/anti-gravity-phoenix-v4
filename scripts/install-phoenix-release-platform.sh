@@ -18,6 +18,8 @@ observer=/usr/local/sbin/phoenix-observer
 sudoers=/etc/sudoers.d/phoenix-release
 authorized_keys=/home/$deploy_user/.ssh/authorized_keys
 sshd_dropin=/etc/ssh/sshd_config.d/89-phoenix-deploy.conf
+rpc_secret_dir=/etc/phoenix/secrets
+rpc_secret_file=$rpc_secret_dir/phoenix-rpc-provider-slot-1-api-key
 
 fail() {
   printf 'PHOENIX_RELEASE_PLATFORM_INSTALL_FAILED: %s\n' "$1" >&2
@@ -60,8 +62,8 @@ esac
 [ "${#release_sha}" -eq 40 ] || fail release_sha_invalid
 [ "$reuse_existing_key" -eq 0 ] || [ -z "$public_key_file" ] ||
   fail key_source_ambiguous
-for command in chown chmod find getent install mkdir mktemp mv python3 sha256sum \
-  sshd systemctl useradd usermod visudo
+for command in chown chmod dd find getent install mkdir mktemp mv python3 sha256sum \
+  sshd stat systemctl tr useradd usermod visudo wc
 do
   command -v "$command" >/dev/null 2>&1 || fail "command_missing_$command"
 done
@@ -112,12 +114,54 @@ install -d -m 0755 -o root -g root "$libexec/phoenix_release"
 install -d -m 0700 -o root -g root /var/lib/phoenix-release
 install -d -m 0700 -o root -g root /var/lib/phoenix-release/incoming
 install -d -m 0700 -o root -g root /var/lib/phoenix-release/releases
+# The rpc-gateway image runs as 65532:65532.  Keep the credential root-owned,
+# group-readable only by that runtime identity, and mount it into no other
+# Production service.
+install -d -m 0750 -o root -g 65532 "$rpc_secret_dir"
 install -d -m 0700 -o 65532 -g 65532 /opt/phoenix/evidence/activation-requests
 install -d -m 0700 -o root -g root /root/phoenix-authorization
 install -d -m 0700 -o root -g root /var/lib/phoenix-economic-activation
 install -d -m 0700 -o root -g root /var/lib/phoenix-economic-activation/consumed
 install -d -m 0700 -o root -g root /var/lib/phoenix-economic-activation/processed
 install -d -m 0700 -o root -g root /var/lib/phoenix-economic-activation/results
+
+if [ "$reuse_existing_key" -eq 1 ]; then
+  # The protected controller supplies the provider credential only on stdin.
+  # It is intentionally excluded from command arguments, environment files,
+  # release packages, manifests, hashes, logs, and evidence.
+  rpc_secret_candidate=$(mktemp "$rpc_secret_dir/.rpc-provider-slot-1.XXXXXX") ||
+    fail rpc_provider_secret_stage_failed
+  trap 'rm -f "$rpc_secret_candidate"' EXIT HUP INT TERM
+  dd iflag=fullblock bs=4097 count=1 of="$rpc_secret_candidate" 2>/dev/null ||
+    fail rpc_provider_secret_read_failed
+  rpc_secret_size=$(stat -c '%s' "$rpc_secret_candidate")
+  if [ "$rpc_secret_size" -gt 0 ]; then
+    [ "$rpc_secret_size" -le 4096 ] || fail rpc_provider_secret_too_large
+    rpc_secret_without_newlines=$(tr -d '\r\n' <"$rpc_secret_candidate" | wc -c | tr -d ' ')
+    [ "$rpc_secret_without_newlines" = "$rpc_secret_size" ] ||
+      fail rpc_provider_secret_invalid
+    chown root:65532 "$rpc_secret_candidate"
+    chmod 0640 "$rpc_secret_candidate"
+    mv "$rpc_secret_candidate" "$rpc_secret_file"
+  else
+    # A later rollback installation sees EOF because the candidate installer
+    # already consumed the protected stdin. Reuse only the exact credential
+    # file that the candidate just staged; a first installation still fails.
+    rm -f "$rpc_secret_candidate"
+    [ -f "$rpc_secret_file" ] && [ ! -L "$rpc_secret_file" ] ||
+      fail rpc_provider_secret_missing
+    rpc_secret_size=$(stat -c '%s' "$rpc_secret_file")
+    [ "$rpc_secret_size" -gt 0 ] && [ "$rpc_secret_size" -le 4096 ] ||
+      fail rpc_provider_secret_metadata_invalid
+    rpc_secret_without_newlines=$(tr -d '\r\n' <"$rpc_secret_file" | wc -c | tr -d ' ')
+    [ "$rpc_secret_without_newlines" = "$rpc_secret_size" ] ||
+      fail rpc_provider_secret_metadata_invalid
+  fi
+  unset rpc_secret_size rpc_secret_without_newlines
+  trap - EXIT HUP INT TERM
+  [ "$(stat -c '%u:%g:%a:%h' "$rpc_secret_file")" = 0:65532:640:1 ] ||
+    fail rpc_provider_secret_metadata_invalid
+fi
 
 install -m 0755 -o root -g root "$script_dir/phoenix-release-gateway.sh" "$gateway"
 install -m 0755 -o root -g root "$script_dir/phoenix-release-transport.sh" "$transport"

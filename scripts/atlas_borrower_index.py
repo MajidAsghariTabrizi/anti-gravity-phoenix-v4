@@ -756,6 +756,8 @@ def build_inventory_from_checkpoint(
         "eth_call",
         "eth_getLogs",
     }
+    if current_state_authority:
+        required_methods.add("eth_getProof")
     if not required_methods.issubset(set(checkpoint.get("source_methods", []))):
         raise EvidenceError("checkpoint source methods are incomplete")
     authority = checkpoint.get("execution_authority")
@@ -788,6 +790,7 @@ def build_inventory_from_checkpoint(
         raise EvidenceError("checkpoint needs two independent provider headers")
     provider_ids = set()
     provider_references = set()
+    provider_state_roots = set()
     for item in headers:
         if not isinstance(item, dict) or not isinstance(item.get("provider_id"), str):
             raise EvidenceError("checkpoint provider header is malformed")
@@ -798,6 +801,23 @@ def build_inventory_from_checkpoint(
                     item.get("provider_reference_sha256"), "provider reference"
                 )
             )
+            if item.get("provider_id") == "production-nownodes-arbitrum":
+                if (
+                    item.get("endpoint_identity")
+                    != "https://arbitrum.nownodes.io/"
+                    or item.get("header_name") != "api-key"
+                    or item.get("authenticated") is not True
+                ):
+                    raise EvidenceError("NOWNodes provider identity binding is invalid")
+            elif item.get("provider_id") == "production-slot-0":
+                if (
+                    item.get("endpoint_identity") != "rpc-provider-slot-0"
+                    or item.get("header_name") is not None
+                    or item.get("authenticated") is not False
+                ):
+                    raise EvidenceError("proof peer provider identity binding is invalid")
+            else:
+                raise EvidenceError("checkpoint contains an unreviewed authority provider")
         header = item.get("checkpoint")
         if not isinstance(header, dict):
             raise EvidenceError("checkpoint provider block is missing")
@@ -809,10 +829,23 @@ def build_inventory_from_checkpoint(
             header.get("timestamp"), "provider checkpoint timestamp", 1
         ) != checkpoint_timestamp:
             raise EvidenceError("provider checkpoint timestamp disagreement")
+        if current_state_authority:
+            provider_state_roots.add(
+                _require_hash(
+                    header.get("state_root"), "provider checkpoint state root"
+                )
+            )
     if len(provider_ids) != len(headers):
         raise EvidenceError("checkpoint provider identities are duplicated")
     if current_state_authority and len(provider_references) != len(headers):
         raise EvidenceError("checkpoint provider references are duplicated")
+    if current_state_authority and provider_ids != {
+        "production-nownodes-arbitrum",
+        "production-slot-0",
+    }:
+        raise EvidenceError("checkpoint current-state provider pair is invalid")
+    if current_state_authority and len(provider_state_roots) != 1:
+        raise EvidenceError("checkpoint provider state root disagreement")
     finalized_heads = checkpoint.get("finalized_heads")
     if not isinstance(finalized_heads, list) or len(finalized_heads) != len(headers):
         raise EvidenceError("checkpoint finalized-head evidence is incomplete")
@@ -824,6 +857,90 @@ def build_inventory_from_checkpoint(
         if _require_int(item.get("number"), "finalized head number", 1) < checkpoint_block:
             raise EvidenceError("checkpoint is newer than a provider finalized head")
         _require_hash(item.get("hash"), "finalized head hash")
+        if current_state_authority:
+            matching = next(
+                header
+                for header in headers
+                if header["provider_id"] == item.get("provider_id")
+            )
+            for field in (
+                "provider_reference_sha256",
+                "endpoint_identity",
+                "header_name",
+                "authenticated",
+            ):
+                if item.get(field) != matching.get(field):
+                    raise EvidenceError("finalized provider identity binding mismatch")
+
+    if current_state_authority:
+        proof_policy = checkpoint.get("proof_policy")
+        peer = proof_policy.get("proof_peer") if isinstance(proof_policy, dict) else None
+        if (
+            not isinstance(proof_policy, dict)
+            or proof_policy.get("schema")
+            != "phoenix.atlas.aave-current-state-proof-policy.v1"
+            or proof_policy.get("checkpoint_block") != checkpoint_block
+            or proof_policy.get("operational_primary_provider_id")
+            != "production-nownodes-arbitrum"
+            or proof_policy.get("proof_peer_provider_id") != "production-slot-0"
+            or proof_policy.get("secondary_proof_supported") is not False
+            or proof_policy.get("secondary_cryptographic_proof") is not False
+            or proof_policy.get("direct_state_independent_agreement") is not True
+            or proof_policy.get("checkpoint_grants_execution_authority") is not False
+            or proof_policy.get("nownodes_reviewed_failure")
+            != {
+                "method": "eth_getProof",
+                "failure_class": "http_method_not_allowed",
+                "http_status": 405,
+            }
+            or not isinstance(peer, dict)
+            or peer.get("cryptographic_proof_valid") is not True
+            or not isinstance(peer.get("proof_response_sha256"), str)
+            or re.fullmatch(r"[0-9a-f]{64}", peer["proof_response_sha256"])
+            is None
+            or _require_int(
+                peer.get("account_proof_node_count"),
+                "account proof node count",
+                1,
+            )
+            < 1
+            or _require_int(
+                peer.get("storage_proof_node_count"),
+                "storage proof node count",
+                1,
+            )
+            < 1
+        ):
+            raise EvidenceError("checkpoint proof policy is incomplete")
+
+        request_usage = checkpoint.get("provider_request_usage")
+        if (
+            not isinstance(request_usage, list)
+            or len(request_usage) != 2
+            or {item.get("provider_id") for item in request_usage if isinstance(item, dict)}
+            != provider_ids
+        ):
+            raise EvidenceError("checkpoint provider request usage is incomplete")
+        for item in request_usage:
+            if not isinstance(item, dict):
+                raise EvidenceError("checkpoint provider request usage is malformed")
+            matching = next(
+                header for header in headers if header["provider_id"] == item["provider_id"]
+            )
+            for field in (
+                "provider_reference_sha256",
+                "endpoint_identity",
+                "header_name",
+                "authenticated",
+            ):
+                if item.get(field) != matching.get(field):
+                    raise EvidenceError("checkpoint provider request identity mismatch")
+            for field in (
+                "json_rpc_item_count",
+                "transport_request_count",
+                "retry_count",
+            ):
+                _require_int(item.get(field), f"provider usage {field}")
 
     archive_checkpoint = _require_int(
         checkpoint.get("archive_checkpoint_block"), "archive_checkpoint_block", 1
@@ -1166,6 +1283,51 @@ def build_inventory_from_checkpoint(
             )
         ):
             raise EvidenceError("checkpoint bounded screen scope is invalid")
+        if screen_scope.get("mode") == "bounded_resumable_exact_batch":
+            budget = checkpoint.get("request_budget")
+            nownodes_usage = next(
+                item
+                for item in checkpoint["provider_request_usage"]
+                if item["provider_id"] == "production-nownodes-arbitrum"
+            )
+            queued_address_count = _require_int(
+                screen_scope.get("queued_address_count"),
+                "checkpoint queued address count",
+                screened_borrower_count,
+            )
+            projected_batches = (
+                queued_address_count + screened_borrower_count - 1
+            ) // screened_borrower_count
+            expected_projected_requests = (
+                nownodes_usage["json_rpc_item_count"] * projected_batches
+            )
+            expected_items_per_address_micros = (
+                nownodes_usage["json_rpc_item_count"] * 1_000_000
+                // screened_borrower_count
+            )
+            if (
+                not isinstance(budget, dict)
+                or budget.get("included_monthly_requests") != 1_000_000
+                or budget.get("normal_reserve_requests") != 250_000
+                or budget.get("warning_threshold_requests") != 500_000
+                or budget.get("broad_usage_stop_threshold_requests") != 700_000
+                or budget.get("paid_overage_authorized") is not False
+                or budget.get("current_batch_nownodes_json_rpc_items")
+                != nownodes_usage["json_rpc_item_count"]
+                or budget.get("current_batch_nownodes_transport_requests")
+                != nownodes_usage["transport_request_count"]
+                or budget.get("screened_addresses") != screened_borrower_count
+                or budget.get("json_rpc_items_per_screened_address_micros")
+                != expected_items_per_address_micros
+                or _require_int(
+                    budget.get("projected_seed_total_requests"),
+                    "checkpoint projected request usage",
+                )
+                != expected_projected_requests
+                or budget.get("projected_broad_usage_above_stop_threshold")
+                is not (expected_projected_requests >= 700_000)
+            ):
+                raise EvidenceError("checkpoint request budget evidence is invalid")
     checkpoint_emodes = {
         int(category["category_id"]): category for category in raw_emodes
     }

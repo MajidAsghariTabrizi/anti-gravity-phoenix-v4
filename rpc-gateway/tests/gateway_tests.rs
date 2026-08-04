@@ -4,7 +4,8 @@ use rpc_gateway::budget::GlobalBudget;
 use rpc_gateway::cache::TtlCache;
 use rpc_gateway::coalescer::{CoalesceDecision, Coalescer};
 use rpc_gateway::providers::{
-    parse_provider_config, CircuitState, Provider, ProviderConfigError, ProviderPool,
+    append_header_authenticated_provider, parse_provider_config, parse_provider_config_with_ids,
+    CircuitState, Provider, ProviderConfigError, ProviderPool,
 };
 
 #[test]
@@ -227,6 +228,46 @@ fn provider_names_and_errors_do_not_expose_credential_bearing_urls() {
     let rendered = format!("{cfg:?}");
     assert!(!rendered.contains("secret-token"));
     assert!(!rendered.contains("api_key"));
+}
+
+#[test]
+fn explicit_provider_identities_are_required_unique_and_bounded() {
+    let config = parse_provider_config_with_ids(
+        "https://first.example,https://second.example",
+        "2,1",
+        "production-slot-0,availability-slot-1",
+    )
+    .unwrap();
+    assert_eq!(config.providers[0].name, "production-slot-0");
+    assert_eq!(config.providers[1].name, "availability-slot-1");
+    assert_eq!(
+        parse_provider_config_with_ids(
+            "https://first.example,https://second.example",
+            "2,1",
+            "duplicate,duplicate",
+        )
+        .unwrap_err(),
+        ProviderConfigError::DuplicateProviderId
+    );
+}
+
+#[test]
+fn authenticated_provider_debug_and_errors_never_expose_header_value() {
+    let mut config =
+        parse_provider_config_with_ids("https://first.example", "2", "production-slot-0").unwrap();
+    append_header_authenticated_provider(
+        &mut config,
+        "production-nownodes-arbitrum",
+        "https://arbitrum.nownodes.io/",
+        100,
+        "api-key",
+        "fake-sensitive-value",
+    )
+    .unwrap();
+    let rendered = format!("{config:?}");
+    assert!(!rendered.contains("fake-sensitive-value"));
+    assert!(!rendered.contains("arbitrum.nownodes.io"));
+    assert!(rendered.contains("provider_count"));
 }
 
 fn priority_pool(now: Instant) -> ProviderPool {

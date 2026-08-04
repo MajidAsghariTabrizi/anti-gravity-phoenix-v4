@@ -105,6 +105,7 @@ validate_positive_integer() {
 validate_rpc_providers() {
   url_count=$(csv_count "${RPC_PROVIDER_URLS:-}")
   priority_count=$(csv_count "${RPC_PROVIDER_WEIGHTS:-}")
+  identity_count=$(csv_count "${RPC_PROVIDER_IDS:-}")
   if [ "$url_count" -eq 0 ]; then
     fail "RPC_PROVIDER_URLS must contain at least one provider"
     return
@@ -113,10 +114,16 @@ validate_rpc_providers() {
     fail "RPC_PROVIDER_URLS count must match RPC_PROVIDER_WEIGHTS count"
     return
   fi
+  if [ "$url_count" -ne "$identity_count" ]; then
+    fail "RPC_PROVIDER_URLS count must match RPC_PROVIDER_IDS count"
+    return
+  fi
 
   index=0
   rest_urls="${RPC_PROVIDER_URLS:-}"
   rest_priorities="${RPC_PROVIDER_WEIGHTS:-}"
+  rest_identities="${RPC_PROVIDER_IDS:-}"
+  seen_identities='|'
   while :; do
     case "$rest_urls" in
       *,*)
@@ -138,6 +145,16 @@ validate_rpc_providers() {
         rest_priorities=
         ;;
     esac
+    case "$rest_identities" in
+      *,*)
+        identity=$(trim_value "${rest_identities%%,*}")
+        rest_identities=${rest_identities#*,}
+        ;;
+      *)
+        identity=$(trim_value "$rest_identities")
+        rest_identities=
+        ;;
+    esac
 
     if [ -z "$url" ]; then
       fail "RPC provider URL at index $index is empty"
@@ -147,9 +164,18 @@ validate_rpc_providers() {
       *) fail "RPC provider URL at index $index must be http(s)" ;;
     esac
     validate_positive_integer "RPC provider priority at index $index" "$priority"
+    case "$identity" in
+      ''|*[!a-z0-9-]*) fail "RPC provider identity at index $index is invalid" ;;
+    esac
+    [ "${#identity}" -le 64 ] ||
+      fail "RPC provider identity at index $index is invalid"
+    case "$seen_identities" in
+      *"|$identity|"*) fail "RPC provider identities must be unique" ;;
+      *) seen_identities="${seen_identities}${identity}|" ;;
+    esac
 
     index=$((index + 1))
-    if [ -z "$rest_urls" ] && [ -z "$rest_priorities" ]; then
+    if [ -z "$rest_urls" ] && [ -z "$rest_priorities" ] && [ -z "$rest_identities" ]; then
       break
     fi
   done
@@ -219,6 +245,29 @@ validate_postgres_consistency() {
   fi
 }
 
+# Preserve compatibility with the protected two-slot environment while making
+# every runtime provider identity explicit. New environments should set this
+# value directly; an existing environment receives deterministic slot names.
+if [ -z "${RPC_PROVIDER_IDS:-}" ]; then
+  provider_identity_count=$(csv_count "${RPC_PROVIDER_URLS:-}")
+  RPC_PROVIDER_IDS=
+  provider_identity_index=0
+  while [ "$provider_identity_index" -lt "$provider_identity_count" ]; do
+    if [ "$provider_identity_index" -eq 0 ]; then
+      provider_identity=production-slot-0
+    else
+      provider_identity="availability-slot-$provider_identity_index"
+    fi
+    if [ -z "$RPC_PROVIDER_IDS" ]; then
+      RPC_PROVIDER_IDS=$provider_identity
+    else
+      RPC_PROVIDER_IDS="$RPC_PROVIDER_IDS,$provider_identity"
+    fi
+    provider_identity_index=$((provider_identity_index + 1))
+  done
+  export RPC_PROVIDER_IDS
+fi
+
 for name in \
   PHOENIX_ENV \
   PHOENIX_MODE \
@@ -236,6 +285,7 @@ for name in \
   PARENT_CHAIN_RPC_URL \
   RPC_PROVIDER_URLS \
   RPC_PROVIDER_WEIGHTS \
+  RPC_PROVIDER_IDS \
   RPC_UPSTREAM_CALLS_PER_SECOND \
   RPC_UPSTREAM_CALL_BURST \
   RPC_STATE_REQUESTS_PER_MINUTE \
@@ -320,6 +370,8 @@ if [ "${PHOENIX_MODE:-}" = LIVE ]; then
     fail "autonomous LIVE requires exactly two RPC providers"
   [ "$(csv_count "${RPC_PROVIDER_WEIGHTS:-}")" -eq 2 ] ||
     fail "autonomous LIVE requires exactly two RPC provider priorities"
+  [ "$(csv_count "${RPC_PROVIDER_IDS:-}")" -eq 2 ] ||
+    fail "autonomous LIVE requires exactly two explicit RPC provider identities"
   [ "${PRODUCTION_RPC_URL:-}" != "${SECONDARY_RPC_URL:-}" ] ||
     fail "primary and secondary RPC URLs must be independent"
   csv_contains_exact "$PRODUCTION_RPC_URL" "$RPC_PROVIDER_URLS" ||

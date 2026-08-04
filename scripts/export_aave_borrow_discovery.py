@@ -167,6 +167,7 @@ class SSHContainerProvider:
         known_hosts: Path | None,
         container: str,
         provider_index: int,
+        authenticated: bool = False,
     ) -> None:
         windows_client = ssh_executable.lower().endswith(".exe")
         if (
@@ -185,12 +186,14 @@ class SSHContainerProvider:
             raise ExportError("SSH provider bridge configuration is invalid")
         self.label = label
         self._request_id = 0
+        self.transport_request_count = 0
         self.retry_count = 0
         remote_source = f"""
-import hashlib,json,subprocess,sys,urllib.request
+import hashlib,io,json,subprocess,sys,tarfile,urllib.error,urllib.request
 container={container!r}
 provider_index={provider_index}
-allowed={{"eth_chainId","eth_blockNumber","eth_getBlockByNumber","eth_getCode","eth_getStorageAt","eth_call","eth_getLogs"}}
+authenticated={authenticated!r}
+allowed={{"eth_chainId","eth_blockNumber","eth_getBlockByNumber","eth_getCode","eth_getStorageAt","eth_call","eth_getLogs","eth_getProof"}}
 try:
     result=subprocess.run(
         ["sudo","-n","docker","inspect","--format","{{{{json .Config.Env}}}}",container],
@@ -200,19 +203,70 @@ try:
     for item in json.loads(result.stdout):
         if "=" in item:
             key,value=item.split("=",1); values[key]=value
-    raw=values.get("RPC_PROVIDER_URLS","")
-    providers=json.loads(raw) if raw.startswith("[") else [part.strip() for part in raw.split(",") if part.strip()]
-    if not isinstance(providers,list) or provider_index >= len(providers):
-        raise RuntimeError("provider unavailable")
-    provider=providers[provider_index]
+    headers={{"Content-Type":"application/json","User-Agent":"phoenix-atlas-current-state-bridge/2"}}
+    if authenticated:
+        provider_id=values.get("RPC_AUTH_PROVIDER_ID","")
+        provider=values.get("RPC_AUTH_PROVIDER_URL","")
+        header_name=values.get("RPC_AUTH_PROVIDER_HEADER_NAME","")
+        header_file=values.get("RPC_AUTH_PROVIDER_HEADER_FILE","")
+        if (
+            provider_id != "production-nownodes-arbitrum"
+            or provider != "https://arbitrum.nownodes.io/"
+            or header_name != "api-key"
+            or header_file != "/run/secrets/phoenix-rpc-provider-slot-1-api-key"
+        ):
+            raise RuntimeError("authenticated provider identity invalid")
+        copied=subprocess.run(
+            ["sudo","-n","docker","cp",f"{{container}}:{{header_file}}","-"],
+            check=True,capture_output=True,
+        )
+        with tarfile.open(fileobj=io.BytesIO(copied.stdout),mode="r:*") as archive:
+            members=[member for member in archive.getmembers() if member.isfile()]
+            if len(members) != 1 or not 0 < members[0].size <= 4096:
+                raise RuntimeError("authenticated provider secret invalid")
+            handle=archive.extractfile(members[0])
+            if handle is None:
+                raise RuntimeError("authenticated provider secret unavailable")
+            header_value=handle.read(4097).decode("ascii")
+        if not header_value or "\\n" in header_value or "\\r" in header_value:
+            raise RuntimeError("authenticated provider secret invalid")
+        headers[header_name]=header_value
+        endpoint_identity=provider
+        reference_body={{"provider_id":provider_id,"endpoint":provider,"header_name":header_name}}
+    else:
+        raw=values.get("RPC_PROVIDER_URLS","")
+        providers=json.loads(raw) if raw.startswith("[") else [part.strip() for part in raw.split(",") if part.strip()]
+        raw_ids=values.get("RPC_PROVIDER_IDS","")
+        provider_ids=json.loads(raw_ids) if raw_ids.startswith("[") else [part.strip() for part in raw_ids.split(",") if part.strip()]
+        if (
+            not isinstance(providers,list)
+            or not isinstance(provider_ids,list)
+            or len(providers) != len(provider_ids)
+            or provider_index >= len(providers)
+        ):
+            raise RuntimeError("provider unavailable")
+        provider=providers[provider_index]
+        provider_id=provider_ids[provider_index]
+        header_name=None
+        endpoint_identity=f"rpc-provider-slot-{{provider_index}}"
+        reference_body={{"provider_id":provider_id,"endpoint":provider}}
     if not isinstance(provider,str) or not provider.startswith(("http://","https://")):
         raise RuntimeError("provider invalid")
+    reference=hashlib.sha256(json.dumps(reference_body,sort_keys=True,separators=(",",":")).encode()).hexdigest()
 except Exception:
     sys.stdout.write(json.dumps({{"bridge_status":"startup_failed"}})+"\\n"); sys.stdout.flush()
     raise SystemExit(1)
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self,req,fp,code,msg,headers,newurl):
+        return None
+opener=urllib.request.build_opener(NoRedirect)
 sys.stdout.write(json.dumps({{
     "bridge_status":"ready",
-    "provider_reference_sha256":hashlib.sha256(provider.encode()).hexdigest(),
+    "provider_id":provider_id,
+    "provider_reference_sha256":reference,
+    "endpoint_identity":endpoint_identity,
+    "header_name":header_name,
+    "authenticated":authenticated,
 }})+"\\n"); sys.stdout.flush()
 for line in sys.stdin:
     try:
@@ -223,18 +277,40 @@ for line in sys.stdin:
         request=urllib.request.Request(
             provider,
             data=json.dumps(body,separators=(",",":")).encode(),
-            headers={{"Content-Type":"application/json","User-Agent":"phoenix-atlas-archive-bridge/1"}},
+            headers=headers,
             method="POST",
         )
         timeout=120 if any(item.get("method")=="eth_getLogs" for item in items) else 90
-        with urllib.request.urlopen(request,timeout=timeout) as response:
-            payload=json.load(response)
+        try:
+            with opener.open(request,timeout=timeout) as response:
+                payload=json.load(response)
+        except urllib.error.HTTPError as error:
+            if len(items) == 1 and items[0].get("method") == "eth_getProof" and error.code == 405:
+                payload={{
+                    "jsonrpc":"2.0",
+                    "id":items[0].get("id"),
+                    "error":{{
+                        "code":-32601,
+                        "message":"reviewed method unsupported",
+                        "data":{{"failure_class":"http_method_not_allowed","http_status":405}},
+                    }},
+                }}
+            else:
+                raise
         def sanitize(item):
             safe={{"jsonrpc":"2.0","id":item.get("id") if isinstance(item,dict) else None}}
             if isinstance(item,dict) and item.get("error") is not None:
                 error=item["error"]
                 code=error.get("code") if isinstance(error,dict) else None
                 safe["error"]={{"code":code if isinstance(code,int) else -32097,"message":"upstream rpc error"}}
+                data=error.get("data") if isinstance(error,dict) else None
+                if (
+                    code == -32601
+                    and isinstance(data,dict)
+                    and data.get("failure_class") == "http_method_not_allowed"
+                    and data.get("http_status") == 405
+                ):
+                    safe["error"]["data"]={{"failure_class":"http_method_not_allowed","http_status":405}}
             elif isinstance(item,dict) and "result" in item:
                 safe["result"]=item["result"]
             else:
@@ -306,6 +382,23 @@ for line in sys.stdin:
             self.close()
             raise ExportError("SSH provider bridge identity is invalid")
         self.provider_reference_sha256 = provider_reference
+        if ready.get("provider_id") != label:
+            self.close()
+            raise ExportError("SSH provider bridge logical identity mismatch")
+        endpoint_identity = ready.get("endpoint_identity")
+        header_name = ready.get("header_name")
+        if not isinstance(endpoint_identity, str) or not endpoint_identity:
+            self.close()
+            raise ExportError("SSH provider bridge endpoint identity is invalid")
+        if authenticated and header_name != "api-key":
+            self.close()
+            raise ExportError("SSH authenticated provider header identity is invalid")
+        if not authenticated and header_name is not None:
+            self.close()
+            raise ExportError("SSH provider bridge header identity is invalid")
+        self.endpoint_identity = endpoint_identity
+        self.header_name = header_name
+        self.authenticated = authenticated
 
     def call(
         self, method: str, params: list[object], attempts: int = MAX_RPC_ATTEMPTS
@@ -316,7 +409,9 @@ for line in sys.stdin:
             "eth_getBlockByNumber",
             "eth_getCode",
             "eth_getStorageAt",
+            "eth_call",
             "eth_getLogs",
+            "eth_getProof",
         }:
             raise ExportError("RPC method outside read-only allowlist")
         failure = "unavailable"
@@ -358,7 +453,45 @@ for line in sys.stdin:
             raise ExportError(f"{self.label}:bridge_pipe_unavailable")
         self._process.stdin.write(json.dumps(payload, separators=(",", ":")) + "\n")
         self._process.stdin.flush()
+        self.transport_request_count += 1
         return json.loads(self._process.stdout.readline())
+
+    def proof_capability(
+        self, address: str, storage_slots: list[str], block: int
+    ) -> dict[str, object]:
+        self._request_id += 1
+        payload = self._request(
+            {
+                "jsonrpc": "2.0",
+                "id": self._request_id,
+                "method": "eth_getProof",
+                "params": [address, storage_slots, hex(block)],
+            }
+        )
+        if not isinstance(payload, dict):
+            raise ExportError(f"{self.label}:eth_getProof:response_invalid")
+        error = payload.get("error")
+        if error is None:
+            result = payload.get("result")
+            if not isinstance(result, dict):
+                raise ExportError(f"{self.label}:eth_getProof:result_missing")
+            return {"supported": True, "result": result}
+        if (
+            self.authenticated
+            and isinstance(error, dict)
+            and error.get("code") == -32601
+            and error.get("data")
+            == {
+                "failure_class": "http_method_not_allowed",
+                "http_status": 405,
+            }
+        ):
+            return {
+                "supported": False,
+                "failure_class": "http_method_not_allowed",
+                "http_status": 405,
+            }
+        raise ExportError(f"{self.label}:eth_getProof:unexpected_failure")
 
     def eth_calls(
         self, calls: list[tuple[str, str]], block: int, batch_size: int = 80

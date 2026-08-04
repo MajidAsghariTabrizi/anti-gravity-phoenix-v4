@@ -23,8 +23,10 @@ from typing import Any
 
 try:
     from scripts.export_aave_borrow_discovery import SSHContainerProvider
+    from scripts.ethereum_state_proof import ProofError, verify_eip1186_proof
 except ModuleNotFoundError:
     from export_aave_borrow_discovery import SSHContainerProvider
+    from ethereum_state_proof import ProofError, verify_eip1186_proof
 
 
 CHAIN_ID = 42161
@@ -361,11 +363,17 @@ class Provider:
         self.label = label
         self._url = url
         self.provider_reference_sha256 = hashlib.sha256(url.encode()).hexdigest()
+        self.endpoint_identity = label
+        self.header_name = None
+        self.authenticated = False
         self._request_id = 0
+        self.transport_request_count = 0
+        self.retry_count = 0
 
     def _request(self, payload: Any, attempts: int = MAX_RPC_ATTEMPTS) -> Any:
         failure = "unavailable"
         for attempt in range(attempts):
+            self.transport_request_count += 1
             request = urllib.request.Request(
                 self._url,
                 data=json.dumps(payload, separators=(",", ":")).encode(),
@@ -383,6 +391,7 @@ class Provider:
             except Exception:
                 failure = "transport_error"
             if attempt + 1 < attempts:
+                self.retry_count += 1
                 time.sleep(min(2**attempt, 16))
         raise ExportError(f"{self.label}:{failure}")
 
@@ -394,6 +403,7 @@ class Provider:
             "eth_getStorageAt",
             "eth_call",
             "eth_getLogs",
+            "eth_getProof",
         }:
             raise ExportError("RPC method outside read-only allowlist")
         self._request_id += 1
@@ -410,6 +420,14 @@ class Provider:
         if "result" not in response:
             raise ExportError(f"{self.label}:{method}:result_missing")
         return response["result"]
+
+    def proof_capability(
+        self, address: str, storage_slots: list[str], block: int
+    ) -> dict[str, object]:
+        result = self.call("eth_getProof", [address, storage_slots, hex(block)])
+        if not isinstance(result, dict):
+            raise ExportError(f"{self.label}:eth_getProof:result_missing")
+        return {"supported": True, "result": result}
 
     def eth_calls(self, calls: list[tuple[str, str]], block: int) -> list[str]:
         results: list[str] = []
@@ -536,13 +554,15 @@ def header(provider: Provider, block: int) -> dict[str, Any]:
     if len(block_hash) != 66 or len(parent_hash) != 66:
         raise ExportError(f"{provider.label}:checkpoint_hash_invalid")
     timestamp = int(str(value.get("timestamp")), 16)
-    if timestamp < 1:
+    state_root = str(value.get("stateRoot", "")).lower()
+    if timestamp < 1 or len(state_root) != 66:
         raise ExportError(f"{provider.label}:checkpoint_timestamp_invalid")
     return {
         "number": block,
         "hash": block_hash,
         "parent_hash": parent_hash,
         "timestamp": timestamp,
+        "state_root": state_root,
     }
 
 
@@ -562,6 +582,9 @@ def finalized_checkpoint(
             {
                 "provider_id": provider.label,
                 "provider_reference_sha256": provider.provider_reference_sha256,
+                "endpoint_identity": provider.endpoint_identity,
+                "header_name": provider.header_name,
+                "authenticated": provider.authenticated,
                 "number": number,
                 "hash": block_hash,
             }
@@ -571,6 +594,9 @@ def finalized_checkpoint(
         {
             "provider_id": provider.label,
             "provider_reference_sha256": provider.provider_reference_sha256,
+            "endpoint_identity": provider.endpoint_identity,
+            "header_name": provider.header_name,
+            "authenticated": provider.authenticated,
             "checkpoint": header(provider, selected),
         }
         for provider in providers
@@ -578,6 +604,103 @@ def finalized_checkpoint(
     if len({item["checkpoint"]["hash"] for item in selected_headers}) != 1:
         raise ExportError("independent finalized checkpoint hash disagreement")
     return selected, finalized_heads, selected_headers
+
+
+def current_state_proof_policy(
+    providers: list[Provider],
+    provider_headers: list[dict[str, Any]],
+    block: int,
+    implementation_words: list[str],
+) -> dict[str, Any]:
+    if (
+        len(providers) != 2
+        or providers[0].label != "production-nownodes-arbitrum"
+        or providers[0].authenticated is not True
+        or providers[0].endpoint_identity != "https://arbitrum.nownodes.io/"
+        or providers[0].header_name != "api-key"
+        or providers[1].label != "production-slot-0"
+        or providers[1].authenticated is not False
+    ):
+        raise ExportError("current-state provider role binding is invalid")
+    if len(implementation_words) != 2 or len(set(implementation_words)) != 1:
+        raise ExportError("direct implementation storage agreement is absent")
+    state_roots = {
+        str(item.get("checkpoint", {}).get("state_root", "")).lower()
+        for item in provider_headers
+        if isinstance(item, dict) and isinstance(item.get("checkpoint"), dict)
+    }
+    if len(state_roots) != 1 or len(next(iter(state_roots), "")) != 66:
+        raise ExportError("independent finalized state root agreement is absent")
+    nownodes = providers[0].proof_capability(
+        POOL, [POOL_IMPLEMENTATION_SLOT], block
+    )
+    if nownodes != {
+        "supported": False,
+        "failure_class": "http_method_not_allowed",
+        "http_status": 405,
+    }:
+        raise ExportError("NOWNodes proof capability changed from the reviewed 405")
+    peer = providers[1].proof_capability(
+        POOL, [POOL_IMPLEMENTATION_SLOT], block
+    )
+    if peer.get("supported") is not True:
+        raise ExportError("proof-capable peer did not return eth_getProof")
+    peer_header = next(
+        (
+            item
+            for item in provider_headers
+            if item.get("provider_id") == providers[1].label
+        ),
+        None,
+    )
+    checkpoint_header = (
+        peer_header.get("checkpoint") if isinstance(peer_header, dict) else None
+    )
+    if not isinstance(checkpoint_header, dict):
+        raise ExportError("proof-capable peer header is unavailable")
+    try:
+        proof_evidence = verify_eip1186_proof(
+            peer["result"],
+            address=POOL,
+            block_state_root=str(checkpoint_header.get("state_root", "")),
+            expected_storage={
+                POOL_IMPLEMENTATION_SLOT: implementation_words[1]
+            },
+        )
+    except ProofError as error:
+        raise ExportError("proof-capable peer returned an invalid state proof") from error
+    return {
+        "schema": "phoenix.atlas.aave-current-state-proof-policy.v1",
+        "checkpoint_block": block,
+        "operational_primary_provider_id": providers[0].label,
+        "proof_peer_provider_id": providers[1].label,
+        "secondary_proof_supported": False,
+        "secondary_cryptographic_proof": False,
+        "direct_state_independent_agreement": True,
+        "nownodes_reviewed_failure": {
+            "method": "eth_getProof",
+            "failure_class": "http_method_not_allowed",
+            "http_status": 405,
+        },
+        "proof_peer": proof_evidence,
+        "checkpoint_grants_execution_authority": False,
+    }
+
+
+def provider_request_usage(providers: list[Provider]) -> list[dict[str, Any]]:
+    return [
+        {
+            "provider_id": provider.label,
+            "provider_reference_sha256": provider.provider_reference_sha256,
+            "endpoint_identity": provider.endpoint_identity,
+            "header_name": provider.header_name,
+            "authenticated": provider.authenticated,
+            "json_rpc_item_count": int(provider._request_id),
+            "transport_request_count": int(provider.transport_request_count),
+            "retry_count": int(provider.retry_count),
+        }
+        for provider in providers
+    ]
 
 
 def sanitized_tail_borrow_logs(
@@ -1125,6 +1248,7 @@ def main() -> int:
     parser.add_argument("--ssh-provider-container")
     parser.add_argument("--ssh-provider-index", type=int, action="append", default=[])
     parser.add_argument("--ssh-provider-id", action="append", default=[])
+    parser.add_argument("--ssh-authenticated-provider", action="store_true")
     parser.add_argument("--discovery", required=True)
     parser.add_argument("--archive-manifest", required=True)
     parser.add_argument("--market", type=Path)
@@ -1199,18 +1323,38 @@ def main() -> int:
                 ):
                     raise ExportError("SSH provider arguments are incomplete")
                 ssh_indices = args.ssh_provider_index or [0]
-                if args.ssh_provider_id and len(args.ssh_provider_id) != len(
-                    ssh_indices
-                ):
+                provider_count = len(ssh_indices) + int(
+                    args.ssh_authenticated_provider
+                )
+                if args.ssh_provider_id and len(args.ssh_provider_id) != provider_count:
                     raise ExportError("SSH provider identity count mismatch")
-                ssh_ids = args.ssh_provider_id or [
-                    f"phoenix-reviewed-provider-{index + 1}"
-                    for index in range(len(ssh_indices))
-                ]
-                for provider_id, provider_index in zip(ssh_ids, ssh_indices):
+                ssh_ids = args.ssh_provider_id or (
+                    (["production-nownodes-arbitrum"] if args.ssh_authenticated_provider else [])
+                    + [
+                        f"phoenix-reviewed-provider-{index + 1}"
+                        for index in range(len(ssh_indices))
+                    ]
+                )
+                id_cursor = 0
+                if args.ssh_authenticated_provider:
                     providers.append(
                         SSHContainerProvider(
-                            provider_id,
+                            ssh_ids[id_cursor],
+                            args.ssh_executable,
+                            args.ssh_provider_host,
+                            args.ssh_provider_port,
+                            args.ssh_provider_identity,
+                            args.ssh_provider_known_hosts,
+                            args.ssh_provider_container,
+                            0,
+                            authenticated=True,
+                        )
+                    )
+                    id_cursor += 1
+                for provider_index in ssh_indices:
+                    providers.append(
+                        SSHContainerProvider(
+                            ssh_ids[id_cursor],
                             args.ssh_executable,
                             args.ssh_provider_host,
                             args.ssh_provider_port,
@@ -1220,6 +1364,7 @@ def main() -> int:
                             provider_index,
                         )
                     )
+                    id_cursor += 1
             urls = environment_provider_urls(args.provider_env) if args.provider_env else []
             if args.provider_id and len(args.provider_id) != len(urls):
                 raise ExportError("provider identity count mismatch")
@@ -1231,6 +1376,14 @@ def main() -> int:
             )
         if len(providers) < 2:
             raise ExportError("two independent reviewed providers are required")
+        if args.authority_mode == AUTHORITY_CURRENT_STATE and (
+            len(providers) != 2
+            or providers[0].label != "production-nownodes-arbitrum"
+            or providers[1].label != "production-slot-0"
+        ):
+            raise ExportError(
+                "current-state screening requires the exact NOWNodes/Slot 0 pair"
+            )
         labels = [provider.label for provider in providers]
         if len(set(labels)) != len(labels):
             raise ExportError("provider identities contain duplicates")
@@ -1311,12 +1464,15 @@ def main() -> int:
         if len(screened_borrowers) > MAX_BORROWERS:
             raise ExportError("current borrower screen exceeds bound")
         code_bindings = []
+        implementation_words: list[str] = []
         for provider in providers:
             implementation_word = provider.call(
                 "eth_getStorageAt", [POOL, POOL_IMPLEMENTATION_SLOT, hex(block)]
             )
-            if not isinstance(implementation_word, str):
+            if not isinstance(implementation_word, str) or len(implementation_word) != 66:
                 raise ExportError(f"{provider.label}:pool implementation unavailable")
+            implementation_word = implementation_word.lower()
+            implementation_words.append(implementation_word)
             implementation = word_address(words(implementation_word)[0])
             if implementation != POOL_IMPLEMENTATION:
                 raise ExportError(f"{provider.label}:pool implementation source binding mismatch")
@@ -1345,6 +1501,11 @@ def main() -> int:
             raise ExportError("independent provider disagreement: Pool implementation")
         if len({canonical_hash(item["code_sha256"]) for item in code_bindings}) != 1:
             raise ExportError("independent provider disagreement: protocol code")
+        proof_policy = None
+        if args.authority_mode == AUTHORITY_CURRENT_STATE:
+            proof_policy = current_state_proof_policy(
+                providers, headers, block, implementation_words
+            )
         reserves, reserve_bindings = reserve_state(providers, block)
         for provider, binding in zip(providers, code_bindings):
             for reserve in reserves:
@@ -1378,6 +1539,41 @@ def main() -> int:
         ]
         if len(active_borrowers) != len(borrowers):
             raise ExportError("borrower debt flag/state disagreement")
+        request_usage = provider_request_usage(providers)
+        request_budget = None
+        if screen_scope is not None:
+            nownodes_usage = next(
+                item
+                for item in request_usage
+                if item["provider_id"] == "production-nownodes-arbitrum"
+            )
+            batch_count = int(screen_scope["batch_address_count"])
+            queued_count = int(screen_scope["queued_address_count"])
+            projected_batches = (queued_count + batch_count - 1) // batch_count
+            projected_total = (
+                int(nownodes_usage["json_rpc_item_count"]) * projected_batches
+            )
+            request_budget = {
+                "included_monthly_requests": 1_000_000,
+                "normal_reserve_requests": 250_000,
+                "warning_threshold_requests": 500_000,
+                "broad_usage_stop_threshold_requests": 700_000,
+                "current_batch_nownodes_json_rpc_items": int(
+                    nownodes_usage["json_rpc_item_count"]
+                ),
+                "current_batch_nownodes_transport_requests": int(
+                    nownodes_usage["transport_request_count"]
+                ),
+                "screened_addresses": batch_count,
+                "json_rpc_items_per_screened_address_micros": (
+                    int(nownodes_usage["json_rpc_item_count"]) * 1_000_000
+                    // batch_count
+                ),
+                "projected_seed_total_requests": projected_total,
+                "projected_broad_usage_above_stop_threshold": projected_total
+                >= 700_000,
+                "paid_overage_authorized": False,
+            }
         output = {
             "schema": (
                 CHECKPOINT_SCHEMA_V2
@@ -1436,6 +1632,7 @@ def main() -> int:
             "provider_headers": headers,
             "protocol_code_bindings": code_bindings,
             "protocol_code_independent_agreement": True,
+            "proof_policy": proof_policy,
             "state_bindings": reserve_bindings
             + activity_bindings
             + borrower_bindings
@@ -1447,6 +1644,7 @@ def main() -> int:
                 "eth_getStorageAt",
                 "eth_call",
                 "eth_getLogs",
+                "eth_getProof",
             ],
             "independent_state_agreement": True,
             "independent_state_agreement_scope": [
@@ -1485,6 +1683,8 @@ def main() -> int:
                 "submission": False,
                 "production_write": False,
             },
+            "provider_request_usage": request_usage,
+            "request_budget": request_budget,
         }
         if args.authority_mode == AUTHORITY_HISTORICAL:
             output["archive_complete"] = True
@@ -1589,6 +1789,11 @@ def main() -> int:
                                 "content_sha256"
                             ],
                             "checkpoint_block": block,
+                            "provider_request_usage": request_usage,
+                            "provider_request_usage_sha256": canonical_hash(
+                                request_usage
+                            ),
+                            "request_budget": request_budget,
                             "inventory_file": f"batches/{inventory_name}",
                             "inventory_snapshot_sha256": inventory[
                                 "snapshot_sha256"
@@ -1651,6 +1856,14 @@ def main() -> int:
                         "state_content_sha256": next_state[
                             "content_sha256"
                         ],
+                        "provider_request_usage": request_usage,
+                        "projected_seed_total_requests": (
+                            request_budget[
+                                "projected_seed_total_requests"
+                            ]
+                            if request_budget is not None
+                            else None
+                        ),
                     },
                     sort_keys=True,
                 )
