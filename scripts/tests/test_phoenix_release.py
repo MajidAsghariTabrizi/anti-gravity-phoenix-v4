@@ -2101,6 +2101,10 @@ class WorkflowAndDeploymentContractTests(unittest.TestCase):
             health_rehearsal,
         )
         self.assertIn(
+            "PHOENIX_HEALTH_ALLOW_STOPPED_STANDBY=true",
+            health_rehearsal,
+        )
+        self.assertIn(
             'allow_legacy_atlas_binary="${PHOENIX_HEALTH_ALLOW_LEGACY_ATLAS_BINARY:-false}"',
             self.healthcheck,
         )
