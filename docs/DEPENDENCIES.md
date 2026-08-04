@@ -158,6 +158,23 @@ urgent or liquidatable survivors may be passed through the hash-bound
 narrow current-state input never relaxes historical archive validation and
 does not claim post-archive tail completeness.
 
+`scripts/atlas_aave_candidate_exact_validator.py` is the bounded next gate for
+that retained cohort. It first refreshes at most two borrowers through
+individual, one-attempt calls on both reviewed providers at one exact finalized
+block. Stale rows stop before any reserve query. For an exact HF below one, the
+validator resolves only reserve IDs set in the agreed user bitmap (maximum 20)
+and records a sanitized `Pool.getConfiguration`/
+`AaveProtocolDataProvider` compatibility matrix. The direct Pool bitmap is the
+normal configuration source. The source-bound ProtocolDataProvider field set
+may be selected only for the reviewed NOWNodes `rpc_error:3` case when Slot 0's
+direct bitmap succeeds and both providers agree on the complete configuration,
+pause, liquidation-fee, silo and debt-ceiling fields. The V3 Origin binding is
+`fd1fbd9150426ca8ace9cee45b4acf912ae84f5b`; at that revision the legacy
+borrowable-in-isolation, silo and debt-ceiling bitmap fields are removed, while
+the compatibility getters return the reviewed disabled/zero values. Raw RPC
+results and provider URLs are never persisted. Complete state can grant only
+Candidate authority; execution authority is always false.
+
 Current-state candidate reconstruction uses the fixed provider identities
 `production-nownodes-arbitrum` and `production-slot-0`. NOWNodes is the
 operational primary and is configured only with the public endpoint
