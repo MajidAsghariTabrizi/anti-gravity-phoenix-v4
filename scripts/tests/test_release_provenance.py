@@ -734,6 +734,29 @@ class ReleaseProvenanceTests(unittest.TestCase):
             "repository": {"full_name": release_provenance.REPOSITORY},
         }
 
+    def _github_controller_jobs(self) -> dict:
+        names = (
+            "immutable-build / publication-preflight",
+            "immutable-build / release-assets",
+            "immutable-build / release-manifest",
+            *(
+                f"immutable-build / build-{name}"
+                for name in release_provenance.EXPECTED_IMAGES
+            ),
+        )
+        jobs = [
+            {"name": name, "status": "completed", "conclusion": "success"}
+            for name in names
+        ]
+        jobs.append(
+            {
+                "name": "deploy-through-release-gateway",
+                "status": "completed",
+                "conclusion": "failure",
+            }
+        )
+        return {"total_count": len(jobs), "jobs": jobs}
+
     def test_github_base_run_accepts_direct_build(self) -> None:
         run = self._github_build_run()
         release_provenance.validate_github_run(run, BASE_SHA, BASE_RUN_ID)
@@ -779,6 +802,41 @@ class ReleaseProvenanceTests(unittest.TestCase):
                     release_provenance.validate_github_run(
                         changed, BASE_SHA, BASE_RUN_ID
                     )
+
+    def test_github_base_run_accepts_resumed_failed_controller_build(self) -> None:
+        run = self._github_build_run()
+        run.update(
+            name=release_provenance.CONTROLLER_WORKFLOW,
+            path=release_provenance.CONTROLLER_WORKFLOW_PATH,
+            event="workflow_run",
+            conclusion="failure",
+        )
+        release_provenance.validate_github_run(
+            run,
+            BASE_SHA,
+            BASE_RUN_ID,
+            jobs_value=self._github_controller_jobs(),
+            allow_failed_controller_deploy=True,
+        )
+
+    def test_github_base_run_rejects_incomplete_failed_controller_build(self) -> None:
+        run = self._github_build_run()
+        run.update(
+            name=release_provenance.CONTROLLER_WORKFLOW,
+            path=release_provenance.CONTROLLER_WORKFLOW_PATH,
+            event="workflow_run",
+            conclusion="failure",
+        )
+        jobs = self._github_controller_jobs()
+        jobs["jobs"][0]["conclusion"] = "failure"
+        with self.assertRaises(release_provenance.ReleaseProvenanceError):
+            release_provenance.validate_github_run(
+                run,
+                BASE_SHA,
+                BASE_RUN_ID,
+                jobs_value=jobs,
+                allow_failed_controller_deploy=True,
+            )
 
     def test_github_base_run_rejects_wrong_sha_or_run_id(self) -> None:
         for field, value in (
