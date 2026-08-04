@@ -2372,6 +2372,26 @@ class WorkflowAndDeploymentContractTests(unittest.TestCase):
         self.assertIn("state_update rollback ROLLED_BACK", self.deploy)
         self.assertIn("state_update rollback ROLLBACK_FAILED", self.deploy)
 
+    def test_candidate_startup_failure_preserves_bounded_log_evidence(self) -> None:
+        self.assertIn("capture_service_failure_evidence()", self.deploy)
+        self.assertIn(
+            'docker logs --timestamps --tail 80 "$failure_id"',
+            self.deploy,
+        )
+        start_loop = self.deploy.split(
+            "for service in $start_services", maxsplit=1
+        )[1].split("compose up -d --no-deps rpc-gateway", maxsplit=1)[0]
+        self.assertIn('capture_service_failure_evidence "$service"', start_loop)
+
+    def test_candidate_failure_allows_version_matched_legacy_atlas_rollback(self) -> None:
+        rollback_invocation = self.deploy.split(
+            'PHOENIX_CURRENT_LIVE_RELEASE_ENV="$release_env"', maxsplit=1
+        )[1].split('/bin/sh "$rollback_script"', maxsplit=1)[0]
+        self.assertIn(
+            "PHOENIX_HEALTH_ALLOW_LEGACY_ATLAS_BINARY=true",
+            rollback_invocation,
+        )
+
     def test_isolated_python_entrypoint_works_without_executable_bits(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
