@@ -19,8 +19,15 @@ administrator may install the gateway once from that verified release tree:
 
 ```text
 sudo /bin/sh scripts/install-phoenix-release-platform.sh \
-  --release-sha <exact-merged-sha> --reuse-existing-key
+  --release-sha <exact-merged-sha> \
+  --reuse-existing-deploy-key --reuse-existing-rpc-provider-secret
 ```
+
+The explicit RPC reuse mode succeeds only when the approved root-owned
+credential file already passes its path, type, owner, group, mode, link-count,
+size, and content-shape checks. The protected controller supplies first-install
+credential bytes once on stdin; they never belong in this command or an
+environment file.
 
 The `phoenix-deploy` account receives permission to invoke only that exact gateway
 digest. It does not receive a general root shell, SCP, PTY, forwarding, or arbitrary

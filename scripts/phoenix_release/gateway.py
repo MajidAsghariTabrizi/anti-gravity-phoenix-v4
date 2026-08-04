@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import hmac
 import io
 import json
 import os
@@ -45,6 +46,12 @@ from .model import (
     retry_rolled_back_release,
     set_mutation_started,
     sha256_file,
+)
+from .rpc_provider_secret import (
+    APPROVED_PATH as RPC_PROVIDER_SECRET_PATH,
+    SecretError as RpcProviderSecretError,
+    read_existing_secret,
+    read_secret_once,
 )
 
 
@@ -478,10 +485,16 @@ def _run(
     *,
     env: dict[str, str] | None = None,
     capture: bool = True,
+    input_text: str | None = None,
 ) -> subprocess.CompletedProcess[str]:
     merged = os.environ.copy()
     if env:
         merged.update(env)
+    input_options = (
+        {"input": input_text}
+        if input_text is not None
+        else {"stdin": subprocess.DEVNULL}
+    )
     return subprocess.run(
         arguments,
         check=False,
@@ -490,6 +503,7 @@ def _run(
         stderr=subprocess.PIPE if capture else None,
         env=merged,
         timeout=3600,
+        **input_options,
     )
 
 
@@ -498,8 +512,9 @@ def _require_success(
     code: str,
     *,
     env: dict[str, str] | None = None,
+    input_text: str | None = None,
 ) -> str:
-    result = _run(arguments, env=env)
+    result = _run(arguments, env=env, input_text=input_text)
     if result.returncode != 0:
         raise GatewayError(
             code,
@@ -525,6 +540,41 @@ def _require_success(
             },
         )
     return result.stdout or ""
+
+
+def buffer_rpc_provider_secret(stream: BinaryIO) -> bytes | None:
+    """Consume the protected release input once, before any child is started."""
+
+    try:
+        return read_secret_once(stream)
+    except RpcProviderSecretError as exc:
+        raise GatewayError("RPC_PROVIDER_SECRET_INPUT_INVALID") from exc
+
+
+def _rpc_provider_installer_contract(
+    rpc_provider_secret: bytes | None,
+) -> tuple[list[str], str | None]:
+    """Select an explicit first-install or verified-reuse contract."""
+
+    try:
+        staged = read_existing_secret(RPC_PROVIDER_SECRET_PATH)
+    except RpcProviderSecretError as exc:
+        raise GatewayError("RPC_PROVIDER_SECRET_STAGED_INVALID") from exc
+    if staged is None:
+        if rpc_provider_secret is None:
+            raise GatewayError("RPC_PROVIDER_SECRET_MISSING")
+        return [
+            "--reuse-existing-deploy-key",
+            "--rpc-provider-secret-stdin",
+        ], rpc_provider_secret.decode("ascii")
+    if rpc_provider_secret is not None and not hmac.compare_digest(
+        staged, rpc_provider_secret
+    ):
+        raise GatewayError("RPC_PROVIDER_SECRET_MISMATCH")
+    return [
+        "--reuse-existing-deploy-key",
+        "--reuse-existing-rpc-provider-secret",
+    ], None
 
 
 def _pointer(path: Path) -> str:
@@ -1796,7 +1846,11 @@ def _rehearse_candidate(paths: HostPaths, request: dict[str, Any]) -> None:
         )
 
 
-def _install_candidate(paths: HostPaths, request: dict[str, Any]) -> None:
+def _install_candidate(
+    paths: HostPaths,
+    request: dict[str, Any],
+    rpc_provider_secret: bytes | None,
+) -> None:
     root = paths.incoming / request["release_sha"]
     release_sha = request["release_sha"]
     rollback_sha = request["rollback_sha"]
@@ -1865,15 +1919,20 @@ def _install_candidate(paths: HostPaths, request: dict[str, Any]) -> None:
     if not authorized_keys.is_file() or authorized_keys.is_symlink():
         raise GatewayError("DEPLOY_PUBLIC_KEY_INVALID")
     key_digest_before = sha256_file(authorized_keys)
+    provider_arguments, installer_input = _rpc_provider_installer_contract(
+        rpc_provider_secret
+    )
+    installer = [
+        "/bin/sh",
+        str(release_root / "scripts" / "install-phoenix-release-platform.sh"),
+        "--release-sha",
+        release_sha,
+    ]
+    installer.extend(provider_arguments)
     _require_success(
-        [
-            "/bin/sh",
-            str(release_root / "scripts" / "install-phoenix-release-platform.sh"),
-            "--release-sha",
-            release_sha,
-            "--reuse-existing-key",
-        ],
+        installer,
         "RELEASE_PLATFORM_INSTALL_FAILED",
+        input_text=installer_input,
     )
     if sha256_file(authorized_keys) != key_digest_before:
         raise GatewayError("DEPLOY_PUBLIC_KEY_CHANGED")
@@ -2046,7 +2105,11 @@ def _rollback_failed_state(
     return state
 
 
-def resume(paths: HostPaths, release_sha: str) -> dict[str, Any]:
+def resume(
+    paths: HostPaths,
+    release_sha: str,
+    rpc_provider_secret: bytes | None = None,
+) -> dict[str, Any]:
     state_path = state_file(paths, release_sha)
     state = load_state(state_path)
     request = validate_request(_read_json(request_file(paths, release_sha), 64 * 1024))
@@ -2148,7 +2211,7 @@ def resume(paths: HostPaths, release_sha: str) -> dict[str, Any]:
         if state["current_phase"] == "CANDIDATE_REHEARSED":
             state = set_mutation_started(state)
             _write_state(paths, state)
-            _install_candidate(paths, request)
+            _install_candidate(paths, request, rpc_provider_secret)
             state = advance(state, "CANDIDATE_INSTALLED")
             _write_state(paths, state)
         if state["current_phase"] == "CANDIDATE_INSTALLED":

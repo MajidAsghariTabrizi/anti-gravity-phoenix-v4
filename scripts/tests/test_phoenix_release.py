@@ -7,6 +7,7 @@ import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tarfile
@@ -30,6 +31,7 @@ from scripts.phoenix_release.gateway import (
     _is_stopped_live_executor,
     _live_executor_absence_is_fail_closed,
     _require_success,
+    _rpc_provider_installer_contract,
     _rollback_failed_state,
     _runtime_may_have_changed,
     _service_absence_allowed,
@@ -45,6 +47,15 @@ from scripts.phoenix_release.gateway import (
     resume,
     state_file,
     validate_request,
+    buffer_rpc_provider_secret,
+)
+from scripts.phoenix_release.rpc_provider_secret import (
+    SecretError as RpcProviderSecretError,
+    install_from_stream,
+    legacy_recovery_stream,
+    persist_secret,
+    read_existing_secret,
+    read_secret_once,
 )
 from scripts.production_context import (
     ContextError,
@@ -170,6 +181,202 @@ def package_bytes(
             member.size = len(payload)
             archive.addfile(member, io.BytesIO(payload))
     return output.getvalue()
+
+
+class ProviderSecretStreamTests(unittest.TestCase):
+    class CountingStream(io.BytesIO):
+        def __init__(self, value: bytes):
+            super().__init__(value)
+            self.read_calls = 0
+
+        def read(self, size: int = -1) -> bytes:
+            self.read_calls += 1
+            return super().read(size)
+
+    def test_release_input_is_consumed_exactly_once(self) -> None:
+        stream = self.CountingStream(b"fixture-secret-value")
+        self.assertEqual(
+            buffer_rpc_provider_secret(stream), b"fixture-secret-value"
+        )
+        self.assertEqual(stream.read_calls, 1)
+
+    def test_empty_input_is_bounded_missing_input(self) -> None:
+        stream = self.CountingStream(b"")
+        self.assertIsNone(read_secret_once(stream))
+        self.assertEqual(stream.read_calls, 1)
+
+    def test_malformed_or_oversized_input_is_rejected(self) -> None:
+        for value in (b"invalid\nvalue", b"x" * 4097):
+            with self.subTest(size=len(value)):
+                with self.assertRaises(RpcProviderSecretError):
+                    read_secret_once(io.BytesIO(value))
+
+    def test_first_install_contract_uses_explicit_stdin_only(self) -> None:
+        secret = b"fixture-secret-value"
+        with patch(
+            "scripts.phoenix_release.gateway.read_existing_secret",
+            return_value=None,
+        ):
+            arguments, installer_input = _rpc_provider_installer_contract(secret)
+        self.assertEqual(
+            arguments,
+            ["--reuse-existing-deploy-key", "--rpc-provider-secret-stdin"],
+        )
+        self.assertEqual(installer_input, secret.decode("ascii"))
+        self.assertNotIn(secret.decode("ascii"), arguments)
+
+    def test_valid_staged_secret_uses_reuse_and_requires_identity(self) -> None:
+        secret = b"fixture-secret-value"
+        with patch(
+            "scripts.phoenix_release.gateway.read_existing_secret",
+            return_value=secret,
+        ):
+            arguments, installer_input = _rpc_provider_installer_contract(secret)
+        self.assertEqual(
+            arguments,
+            [
+                "--reuse-existing-deploy-key",
+                "--reuse-existing-rpc-provider-secret",
+            ],
+        )
+        self.assertIsNone(installer_input)
+        with (
+            patch(
+                "scripts.phoenix_release.gateway.read_existing_secret",
+                return_value=secret,
+            ),
+            self.assertRaisesRegex(GatewayError, "RPC_PROVIDER_SECRET_MISMATCH"),
+        ):
+            _rpc_provider_installer_contract(b"different-fixture-value")
+
+    def test_missing_input_and_missing_staged_secret_reject(self) -> None:
+        with (
+            patch(
+                "scripts.phoenix_release.gateway.read_existing_secret",
+                return_value=None,
+            ),
+            self.assertRaisesRegex(GatewayError, "RPC_PROVIDER_SECRET_MISSING"),
+        ):
+            _rpc_provider_installer_contract(None)
+
+    def test_invalid_staged_metadata_rejects_before_install(self) -> None:
+        with (
+            patch(
+                "scripts.phoenix_release.gateway.read_existing_secret",
+                side_effect=RpcProviderSecretError("metadata_invalid"),
+            ),
+            self.assertRaisesRegex(
+                GatewayError, "RPC_PROVIDER_SECRET_STAGED_INVALID"
+            ),
+        ):
+            _rpc_provider_installer_contract(b"fixture-secret-value")
+
+    def test_rehearsal_closes_its_stdin_and_installer_receives_explicit_copy(
+        self,
+    ) -> None:
+        rehearsal = (ROOT / "scripts/rehearse-production-release.sh").read_text()
+        gateway = (ROOT / "scripts/phoenix_release/gateway.py").read_text()
+        self.assertIn("exec </dev/null", rehearsal)
+        self.assertIn("input_text=installer_input", gateway)
+        self.assertIn('{"stdin": subprocess.DEVNULL}', gateway)
+
+
+@unittest.skipUnless(os.name == "posix", "requires POSIX ownership semantics")
+class ProviderSecretFilesystemTests(unittest.TestCase):
+    secret = b"fixture-secret-value"
+
+    def kwargs(self) -> dict[str, int]:
+        return {
+            "expected_uid": os.getuid(),
+            "expected_gid": os.getgid(),
+            "expected_mode": 0o640,
+        }
+
+    def test_first_install_is_atomic_and_verified(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            path = root / "provider-key"
+            install_from_stream(io.BytesIO(self.secret), path, **self.kwargs())
+            self.assertEqual(
+                read_existing_secret(path, **self.kwargs()), self.secret
+            )
+            self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o640)
+            self.assertEqual(list(root.glob(".rpc-provider-slot-1.*")), [])
+
+    def test_empty_first_install_and_unexpected_existing_reject(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "provider-key"
+            with self.assertRaisesRegex(
+                RpcProviderSecretError, "rpc_provider_secret_missing"
+            ):
+                install_from_stream(io.BytesIO(b""), path, **self.kwargs())
+            persist_secret(self.secret, path, **self.kwargs())
+            with self.assertRaisesRegex(
+                RpcProviderSecretError, "unexpected_existing"
+            ):
+                install_from_stream(
+                    io.BytesIO(self.secret), path, **self.kwargs()
+                )
+
+    def test_invalid_mode_and_symlink_reject(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            path = root / "provider-key"
+            persist_secret(self.secret, path, **self.kwargs())
+            path.chmod(0o600)
+            with self.assertRaisesRegex(
+                RpcProviderSecretError, "metadata_invalid"
+            ):
+                read_existing_secret(path, **self.kwargs())
+            path.unlink()
+            target = root / "target"
+            target.write_bytes(self.secret)
+            target.chmod(0o640)
+            path.symlink_to(target)
+            with self.assertRaisesRegex(
+                RpcProviderSecretError, "metadata_invalid"
+            ):
+                read_existing_secret(path, **self.kwargs())
+
+    def test_legacy_recovery_bridges_once_then_reuses_verified_file(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "provider-key"
+            legacy_recovery_stream(
+                io.BytesIO(self.secret), path, **self.kwargs()
+            )
+            legacy_recovery_stream(io.BytesIO(b""), path, **self.kwargs())
+            legacy_recovery_stream(
+                io.BytesIO(self.secret), path, **self.kwargs()
+            )
+            with self.assertRaisesRegex(
+                RpcProviderSecretError, "rpc_provider_secret_mismatch"
+            ):
+                legacy_recovery_stream(
+                    io.BytesIO(b"different-fixture-value"),
+                    path,
+                    **self.kwargs(),
+                )
+
+    def test_old_rehearsal_exhaustion_case_is_rejected_then_fixed(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            exhausted_path = root / "exhausted"
+            exhausted = io.BytesIO(self.secret)
+            exhausted.read()
+            with self.assertRaisesRegex(
+                RpcProviderSecretError, "rpc_provider_secret_missing"
+            ):
+                legacy_recovery_stream(
+                    exhausted, exhausted_path, **self.kwargs()
+                )
+            preserved_path = root / "preserved"
+            preserved = io.BytesIO(self.secret)
+            legacy_recovery_stream(
+                preserved, preserved_path, **self.kwargs()
+            )
+            self.assertEqual(
+                read_existing_secret(preserved_path, **self.kwargs()), self.secret
+            )
 
 
 class ReleaseStateTests(unittest.TestCase):
@@ -1123,16 +1330,24 @@ class BoundedTransportTests(unittest.TestCase):
 
     def test_authenticated_rpc_secret_is_stdin_only_and_gateway_scoped(self) -> None:
         installer = (ROOT / "scripts/install-phoenix-release-platform.sh").read_text()
+        secret_helper = (
+            ROOT / "scripts/phoenix_release/rpc_provider_secret.py"
+        ).read_text()
         workflow = (
             ROOT / ".github/workflows/phoenix-release-controller.yml"
         ).read_text()
         compose = (ROOT / "compose.prod.yml").read_text()
 
         self.assertIn('install -d -m 0750 -o root -g 65532 "$rpc_secret_dir"', installer)
-        self.assertIn('chown root:65532 "$rpc_secret_candidate"', installer)
-        self.assertIn('chmod 0640 "$rpc_secret_candidate"', installer)
-        self.assertIn("dd iflag=fullblock bs=4097 count=1", installer)
+        self.assertIn("--rpc-provider-secret-stdin", installer)
+        self.assertIn("--reuse-existing-rpc-provider-secret", installer)
+        self.assertIn("os.fchown(descriptor, expected_uid, expected_gid)", secret_helper)
+        self.assertIn("os.fchmod(descriptor, expected_mode)", secret_helper)
+        self.assertIn("os.fsync(descriptor)", secret_helper)
+        self.assertIn("os.replace(temporary, path)", secret_helper)
+        self.assertIn('getattr(os, "O_NOFOLLOW", 0)', secret_helper)
         self.assertNotIn("PHOENIX_RPC_PROVIDER_SLOT_1_API_KEY", installer)
+        self.assertNotIn("PHOENIX_RPC_PROVIDER_SLOT_1_API_KEY", secret_helper)
         self.assertIn(
             "PHOENIX_RPC_PROVIDER_SLOT_1_API_KEY: ${{ secrets.PHOENIX_RPC_PROVIDER_SLOT_1_API_KEY }}",
             workflow,

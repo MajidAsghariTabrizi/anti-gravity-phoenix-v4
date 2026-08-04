@@ -82,8 +82,14 @@ while preserving the existing deploy key:
 
 ```text
 sudo /bin/sh scripts/install-phoenix-release-platform.sh \
-  --release-sha <exact-merged-sha> --reuse-existing-key
+  --release-sha <exact-merged-sha> \
+  --reuse-existing-deploy-key --reuse-existing-rpc-provider-secret
 ```
+
+RPC credential reuse is valid only after the approved persistent file passes
+the complete metadata and bounded-content contract. A missing file requires
+the controller's explicit stdin first-install mode; the credential is never an
+argument, URL, environment-file entry, manifest field, or evidence field.
 
 The installer writes
 `/usr/local/libexec/phoenix-release/platform-manifest.json`. Every root platform
