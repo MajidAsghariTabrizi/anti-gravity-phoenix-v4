@@ -283,6 +283,21 @@ async fn nonce_allocation_and_pending_state_survive_restart() {
     .execute(&pool)
     .await
     .expect("fixture operator resolves unknown request");
+    let released = sqlx::query(
+        "UPDATE live_canary.global_revenue_submission_lock
+         SET active_lane = NULL, active_identity = NULL, acquired_at = NULL,
+             control_epoch = control_epoch + 1
+         WHERE singleton AND active_identity = $1",
+    )
+    .bind(first.id.to_string())
+    .execute(&pool)
+    .await
+    .expect("fixture operator releases reconciled revenue lock");
+    assert_eq!(
+        released.rows_affected(),
+        1,
+        "matching revenue lock required"
+    );
 
     let second = request(Uuid::from_u128(11), now, config.pnl_asset_address);
     insert_approved(&pool, &second).await;
