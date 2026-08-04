@@ -1,11 +1,59 @@
 package hunter
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
+	"time"
 )
+
+func TestNewRequiresCanonicalGitReleaseSHA(t *testing.T) {
+	directory := t.TempDir()
+	discovery := filepath.Join(directory, "discovery.json")
+	content := []byte(`{"borrowers":[]}`)
+	if err := os.WriteFile(discovery, content, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	digest := sha256.Sum256(content)
+	config := Config{
+		DiscoveryPath:          discovery,
+		DiscoverySHA256:        hex.EncodeToString(digest[:]),
+		StateDir:               filepath.Join(directory, "state"),
+		GatewayURL:             "http://rpc-gateway:9300",
+		StartingCursor:         1100,
+		BatchSize:              1,
+		Pace:                   time.Second,
+		RetainedProfitFloorWei: "1",
+		MaximumGasLimit:        1,
+		MaximumFeePerGasWei:    "1",
+		FlashPremiumBPS:        9,
+		EconomicReserveBPS:     500,
+		ExecutorAddress:        "0x1111111111111111111111111111111111111111",
+		ExecutorCodeHash:       strings.Repeat("a", 64),
+		CallerAddress:          "0x2222222222222222222222222222222222222222",
+		ReleaseSHA:             strings.Repeat("b", 40),
+		MaximumPriorityFeeWei:  "1",
+	}
+	if _, err := New(config); err != nil {
+		t.Fatalf("canonical Git release SHA was rejected: %v", err)
+	}
+	for name, releaseSHA := range map[string]string{
+		"legacy 64-character digest": strings.Repeat("b", 64),
+		"uppercase Git SHA":          strings.Repeat("B", 40),
+	} {
+		t.Run(name, func(t *testing.T) {
+			invalid := config
+			invalid.ReleaseSHA = releaseSHA
+			if _, err := New(invalid); err == nil || err.Error() != "hunter execution identity is invalid" {
+				t.Fatalf("unexpected error: %v", err)
+			}
+		})
+	}
+}
 
 func TestClassificationIsIntegerAndFailClosed(t *testing.T) {
 	tests := map[string]struct{ debt, hf, want string }{
