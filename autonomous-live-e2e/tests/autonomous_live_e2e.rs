@@ -1438,6 +1438,18 @@ async fn reset_history(pool: &PgPool) -> TestResult {
     )
     .execute(pool)
     .await?;
+    let released = sqlx::query(
+        "UPDATE live_canary.global_revenue_submission_lock
+         SET active_lane = NULL, active_identity = NULL, acquired_at = NULL,
+             control_epoch = control_epoch + 1
+         WHERE singleton",
+    )
+    .execute(pool)
+    .await?;
+    require(
+        released.rows_affected() == 1,
+        "global revenue submission lock fixture row is missing",
+    )?;
     Ok(())
 }
 
@@ -1866,7 +1878,8 @@ async fn validate_control_budgets(pool: &PgPool, route_fingerprint: &str) -> Tes
 async fn load_request(pool: &PgPool, request_id: Uuid) -> TestResult<ExecutionRequest> {
     let row = sqlx::query(
         "SELECT id, opportunity_id, schema_version, chain_id, route_id,
-                route_fingerprint, selected_size::text AS selected_size,
+                route_fingerprint, route_type, route_payload,
+                selected_size::text AS selected_size,
                 token_path, origin_router, executor_address, executor_code_hash,
                 calldata_hash, simulation_result_hash, plan_hash,
                 pinned_block_number::text AS pinned_block_number,
@@ -1892,6 +1905,8 @@ async fn load_request(pool: &PgPool, request_id: Uuid) -> TestResult<ExecutionRe
         chain_id: row.try_get("chain_id")?,
         route_id: row.try_get("route_id")?,
         route_fingerprint: row.try_get("route_fingerprint")?,
+        route_type: row.try_get("route_type")?,
+        route_payload: row.try_get("route_payload")?,
         selected_size: row.try_get("selected_size")?,
         token_path: token_path.0,
         origin_router: row.try_get("origin_router")?,
