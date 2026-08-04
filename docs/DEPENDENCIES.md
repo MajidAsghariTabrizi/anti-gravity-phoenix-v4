@@ -147,6 +147,17 @@ does not claim independent tail completeness and grants no candidate authority.
 The SSH bridge binds distinct protected provider references without emitting
 provider URLs. Each batch and cursor is root-only, immutable, and hash-bound.
 
+For broad economic triage, scripts/atlas_aave_economic_prefilter.py performs
+one batched, exact-finalized-block `getUserAccountData` call per discovery
+address through the authenticated NOWNodes primary. It persists only derived
+account values and classifies no-debt, debt-safe, watch, urgent, liquidatable,
+and incomplete rows. Its atomic cursor, monitoring queue, and retained cohort
+are discovery-only and grant neither candidate nor execution authority. Only
+urgent or liquidatable survivors may be passed through the hash-bound
+`--screen-cohort-file` input to the existing two-provider exact validator. That
+narrow current-state input never relaxes historical archive validation and
+does not claim post-archive tail completeness.
+
 Current-state candidate reconstruction uses the fixed provider identities
 `production-nownodes-arbitrum` and `production-slot-0`. NOWNodes is the
 operational primary and is configured only with the public endpoint

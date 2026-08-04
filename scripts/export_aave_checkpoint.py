@@ -57,6 +57,7 @@ AUTHORITY_HISTORICAL = "historical-authority"
 AUTHORITY_CURRENT_STATE = "discovery-only-current-state"
 CHECKPOINT_SCHEMA_V1 = "phoenix.atlas.aave-checkpoint.v1"
 CHECKPOINT_SCHEMA_V2 = "phoenix.atlas.aave-checkpoint.v2"
+SCREEN_COHORT_SCHEMA = "phoenix.atlas.aave-screen-cohort.v1"
 
 SELECTORS = {
     "get_reserves_list": "d1946dbc",
@@ -312,6 +313,59 @@ def validate_archive_manifest(
             raise ExportError("archive manifest lacks exact deployment boundary proof")
     elif authority_mode != AUTHORITY_CURRENT_STATE:
         raise ExportError("unsupported candidate authority mode")
+    return value
+
+
+def validate_screen_cohort(
+    value: Any, discovery: dict[str, Any], authority_mode: str
+) -> dict[str, Any]:
+    if authority_mode != AUTHORITY_CURRENT_STATE:
+        raise ExportError("screen cohort requires current-state authority mode")
+    if not isinstance(value, dict):
+        raise ExportError("screen cohort must be an object")
+    observed = value.get("content_sha256")
+    body = {key: item for key, item in value.items() if key != "content_sha256"}
+    if observed != canonical_hash(body):
+        raise ExportError("screen cohort content hash mismatch")
+    if (
+        value.get("schema") != SCREEN_COHORT_SCHEMA
+        or value.get("chain_id") != CHAIN_ID
+        or str(value.get("pool", "")).lower() != POOL
+        or value.get("source_discovery_content_sha256")
+        != discovery["content_sha256"]
+        or value.get("candidate_authority") is not False
+        or value.get("execution_authority") is not False
+    ):
+        raise ExportError("screen cohort identity mismatch")
+    addresses = value.get("addresses")
+    if (
+        not isinstance(addresses, list)
+        or not 0 < len(addresses) <= MAX_SCREEN_BATCH_SIZE
+        or value.get("address_count") != len(addresses)
+    ):
+        raise ExportError("screen cohort address set is invalid")
+    canonical = sorted({_address(item, "screen cohort address") for item in addresses})
+    if canonical != addresses or not set(canonical).issubset(discovery["borrowers"]):
+        raise ExportError("screen cohort is not an exact discovery subset")
+    if value.get("cohort_reason") != "primary_prefilter_liquidatable_or_urgent":
+        raise ExportError("screen cohort reason is invalid")
+    _digest = value.get("source_prefilter_content_sha256")
+    if (
+        not isinstance(_digest, str)
+        or len(_digest) != 64
+        or any(character not in "0123456789abcdef" for character in _digest)
+    ):
+        raise ExportError("screen cohort prefilter binding is invalid")
+    finalized = value.get("finalized_prefilter_block")
+    if (
+        not isinstance(finalized, dict)
+        or not isinstance(finalized.get("number"), int)
+        or isinstance(finalized.get("number"), bool)
+        or finalized["number"] < 1
+        or len(str(finalized.get("hash", ""))) != 66
+        or len(str(finalized.get("state_root", ""))) != 66
+    ):
+        raise ExportError("screen cohort finalized block binding is invalid")
     return value
 
 
@@ -1266,6 +1320,7 @@ def main() -> int:
     parser.add_argument("--archive-manifest", required=True)
     parser.add_argument("--market", type=Path)
     parser.add_argument("--resume-dir", type=Path)
+    parser.add_argument("--screen-cohort-file", type=Path)
     parser.add_argument(
         "--screen-batch-size", type=int, default=DEFAULT_SCREEN_BATCH_SIZE
     )
@@ -1274,6 +1329,8 @@ def main() -> int:
     try:
         if args.resume_dir is not None and args.authority_mode != AUTHORITY_CURRENT_STATE:
             raise ExportError("resumable screening requires current-state authority mode")
+        if args.screen_cohort_file is not None and args.resume_dir is not None:
+            raise ExportError("screen cohort cannot be combined with the full-seed cursor")
         if args.resume_dir is not None and args.market is None:
             raise ExportError("resumable screening requires the reviewed market fixture")
         if not 1 <= args.screen_batch_size <= MAX_SCREEN_BATCH_SIZE:
@@ -1310,6 +1367,12 @@ def main() -> int:
         if existing_state is not None:
             validate_screen_state(existing_state, discovery, archive_manifest)
         discovery.pop("logs", None)
+        screen_cohort: dict[str, Any] | None = None
+        if args.screen_cohort_file is not None:
+            with args.screen_cohort_file.open(encoding="utf-8") as handle:
+                screen_cohort = validate_screen_cohort(
+                    json.load(handle), discovery, args.authority_mode
+                )
         archive_checkpoint = int(discovery["checkpoint_block"])
         ssh_selected = any(
             value is not None
@@ -1416,6 +1479,11 @@ def main() -> int:
         block, finalized_heads, headers = finalized_checkpoint(providers)
         if block < archive_checkpoint:
             raise ExportError("finalized checkpoint regressed behind archive")
+        if (
+            screen_cohort is not None
+            and block < screen_cohort["finalized_prefilter_block"]["number"]
+        ):
+            raise ExportError("finalized checkpoint regressed behind prefilter cohort")
         screen_state_before: dict[str, Any] | None = None
         screen_state_path: Path | None = None
         if args.resume_dir is not None:
@@ -1432,21 +1500,63 @@ def main() -> int:
             tail_start = int(screen_state_before["tail_cursor_block"]) + 1
         else:
             tail_start = archive_checkpoint + 1
-        tail_logs, tail_bindings = independently_agreed_tail_logs(
-            providers,
-            tail_start,
-            block,
-            discovery_only=args.authority_mode == AUTHORITY_CURRENT_STATE,
-        )
+        tail_collection_skipped = screen_cohort is not None
+        if tail_collection_skipped:
+            tail_start = block + 1
+            tail_logs = []
+            empty_hash = canonical_hash(tail_logs)
+            tail_bindings = [
+                {
+                    "provider_id": provider.label,
+                    "log_count": 0,
+                    "logs_content_sha256": empty_hash,
+                    "verification_mode": "primary_discovery_secondary_exact_blocks",
+                    "range_completeness_claimed": False,
+                    "grants_candidate_authority": False,
+                }
+                for provider in providers
+            ]
+        else:
+            tail_logs, tail_bindings = independently_agreed_tail_logs(
+                providers,
+                tail_start,
+                block,
+                discovery_only=args.authority_mode == AUTHORITY_CURRENT_STATE,
+            )
         print(
-            f"checkpoint_tail_collection_complete={providers[0].label} "
-            f"log_count={len(tail_logs)}",
+            (
+                "checkpoint_tail_collection_skipped=retained_current_state_cohort"
+                if tail_collection_skipped
+                else f"checkpoint_tail_collection_complete={providers[0].label} "
+                f"log_count={len(tail_logs)}"
+            ),
             file=sys.stderr,
         )
         historical_borrowers = list(discovery["borrowers"])
         tail_borrowers = sorted({_address(item["borrower"], "tail borrower") for item in tail_logs})
         screen_scope: dict[str, Any] | None = None
-        if screen_state_before is not None:
+        if screen_cohort is not None:
+            cohort = list(screen_cohort["addresses"])
+            screened_borrowers = cohort
+            screen_scope = {
+                "mode": "retained_prefilter_cohort",
+                "cohort_content_sha256": screen_cohort["content_sha256"],
+                "source_prefilter_content_sha256": screen_cohort[
+                    "source_prefilter_content_sha256"
+                ],
+                "cohort_reason": screen_cohort["cohort_reason"],
+                "finalized_prefilter_block": screen_cohort[
+                    "finalized_prefilter_block"
+                ],
+                "batch_address_count": len(cohort),
+                "queued_address_count": len(cohort),
+                "historical_seed_count": len(historical_borrowers),
+                "seed_scan_complete_after_batch": True,
+                "tail_collection_skipped": True,
+                "candidate_authority": False,
+                "execution_authority": False,
+            }
+        elif screen_state_before is not None:
             cohort = list(screen_state_before["addresses"])
             cohort_set = set(cohort)
             for borrower in tail_borrowers:
@@ -1611,6 +1721,12 @@ def main() -> int:
                     args.authority_mode == AUTHORITY_HISTORICAL
                 ),
                 "grants_candidate_authority": False,
+                "collection_skipped": tail_collection_skipped,
+                "collection_skip_reason": (
+                    "retained_current_state_cohort_does_not_require_tail_authority"
+                    if tail_collection_skipped
+                    else None
+                ),
                 "provider_bindings": tail_bindings,
                 "start_block": tail_start,
                 "end_block": block,
