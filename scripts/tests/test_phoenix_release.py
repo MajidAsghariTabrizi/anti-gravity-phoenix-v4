@@ -2215,7 +2215,14 @@ class WorkflowAndDeploymentContractTests(unittest.TestCase):
         self.assertIn("engine_process_fatal_integrity_total", self.deploy)
         self.assertNotIn("live-executor activate", self.deploy)
         self.assertNotIn("live-executor owner-unpause", self.deploy)
-        self.assertNotIn("compose up -d --no-deps live-executor", self.deploy)
+        standby = self.deploy.index(
+            "compose up -d --no-deps live-executor", evidence
+        )
+        standby_controls = self.deploy.index(
+            "hunting standby changed fail-closed runtime controls", standby
+        )
+        self.assertLess(evidence, standby)
+        self.assertLess(standby, standby_controls)
         self.assertNotIn("LIVE_EXECUTOR_SIGNER_FILE", self.deploy)
 
     def test_owner_bootstrap_is_separate_from_normal_deployment(self) -> None:
@@ -2253,7 +2260,7 @@ class WorkflowAndDeploymentContractTests(unittest.TestCase):
         self.assertLess(evidence_phase, context_validation)
         self.assertLess(stopped_executor, evidence_phase)
         self.assertIn(
-            "--allow-stopped-live-executor",
+            "mark_phase HUNTING_STANDBY_STARTED",
             self.deploy[evidence_phase:context_validation + 500],
         )
 

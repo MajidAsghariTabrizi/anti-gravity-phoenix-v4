@@ -5,6 +5,15 @@ import "./interfaces/IERC20.sol";
 import "./interfaces/IAaveV3Pool.sol";
 import "./interfaces/IV3Pool.sol";
 
+interface IAtlasAccounting {
+    function shortfall() external view returns (uint256 gasLiability, uint256 borrowLiability);
+    function reconcile(uint256 maxApprovedGasSpend) external payable returns (uint256 owed);
+}
+
+interface IWETH {
+    function withdraw(uint256 amount) external;
+}
+
 contract PhoenixExecutor is IAaveFlashBorrower {
     error Unauthorized();
     error Paused();
@@ -26,6 +35,11 @@ contract PhoenixExecutor is IAaveFlashBorrower {
     error NoActiveExecution();
     error MalformedLegs();
     error TransferFailed();
+    error InvalidAtlas(address atlas);
+    error InvalidSolver(address solver);
+    error InvalidBid(address token, uint256 amount, uint256 maximum);
+    error InvalidLiquidation();
+    error InsufficientCollateral(uint256 received, uint256 minimum);
 
     event OwnershipTransferStarted(address indexed previousOwner, address indexed newOwner);
     event OwnershipTransferred(address indexed previousOwner, address indexed newOwner);
@@ -42,6 +56,23 @@ contract PhoenixExecutor is IAaveFlashBorrower {
     event OpportunityStarted(bytes32 indexed routeId, address indexed asset, uint256 flashAmount);
     event OpportunitySettled(
         bytes32 indexed routeId, address indexed asset, uint256 flashAmount, uint256 premium, uint256 realizedProfit
+    );
+    event AaveLiquidationStarted(
+        bytes32 indexed routeId,
+        address indexed borrower,
+        address indexed debtAsset,
+        address collateralAsset,
+        uint256 repayAmount,
+        bool atlas
+    );
+    event AaveLiquidationSettled(
+        bytes32 indexed routeId,
+        address indexed borrower,
+        address indexed debtAsset,
+        uint256 repayAmount,
+        uint256 premium,
+        uint256 atlasBid,
+        uint256 realizedProfit
     );
 
     struct Leg {
@@ -65,6 +96,22 @@ contract PhoenixExecutor is IAaveFlashBorrower {
         Leg[] legs;
     }
 
+    struct AaveLiquidationRequest {
+        bytes32 routeId;
+        address borrower;
+        address debtAsset;
+        address collateralAsset;
+        uint256 repayAmount;
+        bool receiveAToken;
+        uint256 maxInputAmount;
+        uint256 minCollateralReceived;
+        uint256 minUnwindOutput;
+        uint256 minProfit;
+        uint256 maxAtlasBid;
+        uint256 deadline;
+        Leg[] unwindLegs;
+    }
+
     struct PoolConfig {
         address factory;
         address token0;
@@ -75,10 +122,14 @@ contract PhoenixExecutor is IAaveFlashBorrower {
 
     struct ActiveExecution {
         bool active;
+        uint8 kind;
+        bool atlas;
         bytes32 routeId;
         address asset;
         uint256 amount;
         uint256 baselineBalance;
+        uint256 requiredProfit;
+        uint256 premium;
     }
 
     struct SwapCallbackData {
@@ -90,6 +141,8 @@ contract PhoenixExecutor is IAaveFlashBorrower {
     address public owner;
     address public pendingOwner;
     address public flashProvider;
+    address public immutable atlas;
+    address public immutable weth;
     bool public paused;
     bool private entered;
 
@@ -134,10 +187,15 @@ contract PhoenixExecutor is IAaveFlashBorrower {
         entered = false;
     }
 
-    constructor(address initialOwner, address initialFlashProvider) {
-        if (initialOwner == address(0) || initialFlashProvider == address(0)) revert ZeroAddress();
+    constructor(address initialOwner, address initialFlashProvider, address initialAtlas, address initialWeth) {
+        if (
+            initialOwner == address(0) || initialFlashProvider == address(0) || initialAtlas == address(0)
+                || initialWeth == address(0)
+        ) revert ZeroAddress();
         owner = initialOwner;
         flashProvider = initialFlashProvider;
+        atlas = initialAtlas;
+        weth = initialWeth;
         paused = true;
         emit OwnershipTransferred(address(0), initialOwner);
         emit FlashProviderUpdated(initialFlashProvider);
@@ -259,15 +317,119 @@ contract PhoenixExecutor is IAaveFlashBorrower {
 
         activeExecution = ActiveExecution({
             active: true,
+            kind: 1,
+            atlas: false,
             routeId: op.routeId,
             asset: op.flashAsset,
             amount: op.flashAmount,
-            baselineBalance: IERC20(op.flashAsset).balanceOf(address(this))
+            baselineBalance: IERC20(op.flashAsset).balanceOf(address(this)),
+            requiredProfit: op.minProfit,
+            premium: 0
         });
 
         emit OpportunityStarted(op.routeId, op.flashAsset, op.flashAmount);
         IAaveV3Pool(flashProvider).flashLoanSimple(address(this), op.flashAsset, op.flashAmount, abi.encode(op), 0);
         delete activeExecution;
+    }
+
+    function executeAaveLiquidation(AaveLiquidationRequest calldata request)
+        external
+        onlySearcher
+        whenNotPaused
+        nonReentrant
+        returns (uint256 realizedProfit)
+    {
+        _startAaveLiquidation(request, false, 0);
+        realizedProfit = _finishAaveLiquidation(request, 0);
+        delete activeExecution;
+    }
+
+    /// @notice Atlas v1.6.4 solver callback. `solverOpData` is abi.encode(AaveLiquidationRequest).
+    function atlasSolverCall(
+        address solverOpFrom,
+        address executionEnvironment,
+        address bidToken,
+        uint256 bidAmount,
+        bytes calldata solverOpData,
+        bytes calldata
+    ) external payable whenNotPaused nonReentrant {
+        if (msg.sender != atlas) revert InvalidAtlas(msg.sender);
+        if (solverOpFrom != owner) revert InvalidSolver(solverOpFrom);
+        AaveLiquidationRequest memory request = abi.decode(solverOpData, (AaveLiquidationRequest));
+        if (
+            bidAmount == 0 || bidAmount > request.maxAtlasBid
+                || (bidToken != address(0) && bidToken != request.debtAsset)
+                || (bidToken == address(0) && request.debtAsset != weth)
+        ) revert InvalidBid(bidToken, bidAmount, request.maxAtlasBid);
+
+        _startAaveLiquidation(request, true, bidAmount);
+        _payAtlasBid(executionEnvironment, bidToken, bidAmount);
+        _reconcileAtlas(msg.value);
+        _finishAaveLiquidation(request, bidAmount);
+        delete activeExecution;
+    }
+
+    function _payAtlasBid(address executionEnvironment, address bidToken, uint256 bidAmount) internal {
+        if (bidToken == address(0)) {
+            IWETH(weth).withdraw(bidAmount);
+            (bool sent,) = payable(executionEnvironment).call{value: bidAmount}("");
+            if (!sent) revert TransferFailed();
+        } else {
+            _safeTransfer(bidToken, executionEnvironment, bidAmount);
+        }
+    }
+
+    function _reconcileAtlas(uint256 suppliedValue) internal {
+        (uint256 gasLiability, uint256 borrowLiability) = IAtlasAccounting(atlas).shortfall();
+        uint256 nativeRepayment = borrowLiability < suppliedValue ? borrowLiability : suppliedValue;
+        IAtlasAccounting(atlas).reconcile{value: nativeRepayment}(gasLiability);
+    }
+
+    function _finishAaveLiquidation(AaveLiquidationRequest memory request, uint256 bidAmount)
+        internal
+        returns (uint256 realizedProfit)
+    {
+        uint256 finalBalance = IERC20(request.debtAsset).balanceOf(address(this));
+        realizedProfit = finalBalance - activeExecution.baselineBalance;
+        if (realizedProfit < request.minProfit) revert MinProfit(realizedProfit, request.minProfit);
+        emit AaveLiquidationSettled(
+            request.routeId,
+            request.borrower,
+            request.debtAsset,
+            request.repayAmount,
+            activeExecution.premium,
+            bidAmount,
+            realizedProfit
+        );
+    }
+
+    function _startAaveLiquidation(AaveLiquidationRequest memory request, bool isAtlas, uint256 bidAmount) internal {
+        if (
+            request.borrower == address(0) || request.debtAsset == address(0) || request.collateralAsset == address(0)
+                || request.repayAmount == 0 || request.receiveAToken || request.minCollateralReceived == 0
+                || request.minUnwindOutput == 0 || request.minProfit == 0 || request.maxInputAmount == 0
+                || maximumInputAmount == 0 || request.maxInputAmount > maximumInputAmount
+                || request.repayAmount > request.maxInputAmount || block.timestamp > request.deadline
+                || !approvedAssets[request.debtAsset] || !approvedAssets[request.collateralAsset]
+        ) revert InvalidLiquidation();
+        _validateUnwindLegs(request);
+        uint256 requiredProfit = request.minProfit + bidAmount;
+        activeExecution = ActiveExecution({
+            active: true,
+            kind: 2,
+            atlas: isAtlas,
+            routeId: request.routeId,
+            asset: request.debtAsset,
+            amount: request.repayAmount,
+            baselineBalance: IERC20(request.debtAsset).balanceOf(address(this)),
+            requiredProfit: requiredProfit,
+            premium: 0
+        });
+        emit AaveLiquidationStarted(
+            request.routeId, request.borrower, request.debtAsset, request.collateralAsset, request.repayAmount, isAtlas
+        );
+        IAaveV3Pool(flashProvider)
+            .flashLoanSimple(address(this), request.debtAsset, request.repayAmount, abi.encode(request), 0);
     }
 
     function executeOperation(address asset, uint256 amount, uint256 premium, address initiator, bytes calldata params)
@@ -280,36 +442,49 @@ contract PhoenixExecutor is IAaveFlashBorrower {
         if (!ctx.active) revert NoActiveExecution();
         if (asset != ctx.asset || amount != ctx.amount) revert CallbackSpoof();
 
-        Opportunity memory op = abi.decode(params, (Opportunity));
-        if (op.flashAsset != asset || op.flashAmount != amount || op.routeId != ctx.routeId) revert CallbackSpoof();
-
-        uint256 amountIn = amount;
-        for (uint256 i = 0; i < op.legs.length; i++) {
-            Leg memory leg = op.legs[i];
-            uint256 beforeOut = IERC20(leg.tokenOut).balanceOf(address(this));
-            IV3Pool(leg.pool)
-                .swap(
-                    address(this),
-                    leg.zeroForOne,
-                    int256(amountIn),
-                    leg.zeroForOne ? uint160(4_295_128_739) + 1 : type(uint160).max - 1,
-                    abi.encode(SwapCallbackData({tokenIn: leg.tokenIn, tokenOut: leg.tokenOut, pool: leg.pool}))
-                );
-            uint256 received = IERC20(leg.tokenOut).balanceOf(address(this)) - beforeOut;
-            if (received < leg.minAmountOut) revert InvalidLeg();
-            amountIn = received;
+        uint256 minimumProfit;
+        if (ctx.kind == 1) {
+            Opportunity memory op = abi.decode(params, (Opportunity));
+            if (op.flashAsset != asset || op.flashAmount != amount || op.routeId != ctx.routeId) {
+                revert CallbackSpoof();
+            }
+            _executeSwapLegs(op.legs, amount);
+            minimumProfit = op.minProfit;
+        } else if (ctx.kind == 2) {
+            AaveLiquidationRequest memory request = abi.decode(params, (AaveLiquidationRequest));
+            if (
+                request.debtAsset != asset || request.repayAmount != amount || request.routeId != ctx.routeId
+                    || request.receiveAToken
+            ) revert CallbackSpoof();
+            uint256 beforeCollateral = IERC20(request.collateralAsset).balanceOf(address(this));
+            _safeApprove(asset, flashProvider, 0);
+            _safeApprove(asset, flashProvider, amount);
+            IAaveV3Pool(flashProvider).liquidationCall(request.collateralAsset, asset, request.borrower, amount, false);
+            _safeApprove(asset, flashProvider, 0);
+            uint256 collateralReceived = IERC20(request.collateralAsset).balanceOf(address(this)) - beforeCollateral;
+            if (collateralReceived < request.minCollateralReceived) {
+                revert InsufficientCollateral(collateralReceived, request.minCollateralReceived);
+            }
+            uint256 unwindOutput = _executeSwapLegs(request.unwindLegs, collateralReceived);
+            if (unwindOutput < request.minUnwindOutput) revert InvalidLeg();
+            minimumProfit = ctx.requiredProfit;
+        } else {
+            revert CallbackSpoof();
         }
 
         uint256 repay = amount + premium;
         uint256 finalBalance = IERC20(asset).balanceOf(address(this));
-        if (finalBalance < ctx.baselineBalance + repay) revert MinProfit(0, op.minProfit);
+        if (finalBalance < ctx.baselineBalance + repay) revert MinProfit(0, minimumProfit);
         uint256 realizedProfit = finalBalance - ctx.baselineBalance - repay;
-        if (realizedProfit < op.minProfit) revert MinProfit(realizedProfit, op.minProfit);
+        if (realizedProfit < minimumProfit) revert MinProfit(realizedProfit, minimumProfit);
 
         _safeApprove(asset, flashProvider, 0);
         _safeApprove(asset, flashProvider, repay);
+        activeExecution.premium = premium;
 
-        emit OpportunitySettled(op.routeId, asset, amount, premium, realizedProfit);
+        if (ctx.kind == 1) {
+            emit OpportunitySettled(ctx.routeId, asset, amount, premium, realizedProfit);
+        }
         return true;
     }
 
@@ -352,6 +527,50 @@ contract PhoenixExecutor is IAaveFlashBorrower {
             expectedInput = leg.tokenOut;
         }
         if (expectedInput != op.flashAsset) revert InvalidLeg();
+    }
+
+    function _validateUnwindLegs(AaveLiquidationRequest memory request) internal view {
+        if (request.collateralAsset == request.debtAsset) {
+            if (request.unwindLegs.length != 0) revert MalformedLegs();
+            return;
+        }
+        if (request.unwindLegs.length == 0 || request.unwindLegs.length > 4) revert MalformedLegs();
+        address expectedInput = request.collateralAsset;
+        for (uint256 i = 0; i < request.unwindLegs.length; i++) {
+            Leg memory leg = request.unwindLegs[i];
+            PoolConfig memory cfg = approvedPools[leg.pool];
+            if (!cfg.approved || !approvedFactories[cfg.factory]) revert InvalidPool(leg.pool);
+            if (
+                !approvedAssets[leg.tokenIn] || !approvedAssets[leg.tokenOut] || leg.tokenIn != expectedInput
+                    || leg.fee != cfg.fee || leg.minAmountOut == 0
+            ) revert InvalidLeg();
+            if (leg.zeroForOne) {
+                if (leg.tokenIn != cfg.token0 || leg.tokenOut != cfg.token1) revert InvalidLeg();
+            } else if (leg.tokenIn != cfg.token1 || leg.tokenOut != cfg.token0) {
+                revert InvalidLeg();
+            }
+            expectedInput = leg.tokenOut;
+        }
+        if (expectedInput != request.debtAsset) revert InvalidLeg();
+    }
+
+    function _executeSwapLegs(Leg[] memory legs, uint256 amountIn) internal returns (uint256 amountOut) {
+        amountOut = amountIn;
+        for (uint256 i = 0; i < legs.length; i++) {
+            Leg memory leg = legs[i];
+            uint256 beforeOut = IERC20(leg.tokenOut).balanceOf(address(this));
+            IV3Pool(leg.pool)
+                .swap(
+                    address(this),
+                    leg.zeroForOne,
+                    int256(amountOut),
+                    leg.zeroForOne ? uint160(4_295_128_739) + 1 : type(uint160).max - 1,
+                    abi.encode(SwapCallbackData({tokenIn: leg.tokenIn, tokenOut: leg.tokenOut, pool: leg.pool}))
+                );
+            uint256 received = IERC20(leg.tokenOut).balanceOf(address(this)) - beforeOut;
+            if (received < leg.minAmountOut) revert InvalidLeg();
+            amountOut = received;
+        }
     }
 
     function _safeTransfer(address token, address to, uint256 amount) internal {

@@ -9,6 +9,14 @@ interface IAaveV3Pool {
         bytes calldata params,
         uint16 referralCode
     ) external;
+
+    function liquidationCall(
+        address collateralAsset,
+        address debtAsset,
+        address user,
+        uint256 debtToCover,
+        bool receiveAToken
+    ) external;
 }
 
 interface IAaveFlashBorrower {

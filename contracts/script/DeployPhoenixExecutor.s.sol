@@ -16,19 +16,21 @@ contract DeployPhoenixExecutorScript {
     uint256 public constant ARBITRUM_ONE_CHAIN_ID = 42161;
     address public constant INITIAL_OWNER = 0x9F30c00B68F7C0eDb4b4117B9f04E0cA2EB2C17a;
     address public constant FLASH_PROVIDER = 0x794a61358D6845594F94dc1DB02A252b5b4814aD;
+    address public constant ATLAS = 0x8ad1aE9D97C79aA68A0a151E83ff3942f68F86C1;
+    address public constant WETH = 0x82aF49447D8a07e3bd95BD0d56f35241523fBab1;
     FoundryVm private constant vm = FoundryVm(address(uint160(uint256(keccak256("hevm cheat code")))));
 
     function run() external returns (PhoenixExecutor executor) {
         _requireArbitrumOne();
         vm.startBroadcast();
-        executor = new PhoenixExecutor(INITIAL_OWNER, FLASH_PROVIDER);
+        executor = new PhoenixExecutor(INITIAL_OWNER, FLASH_PROVIDER, ATLAS, WETH);
         vm.stopBroadcast();
         _assertDeployment(executor);
     }
 
     function deploy() external returns (PhoenixExecutor executor) {
         _requireArbitrumOne();
-        executor = new PhoenixExecutor(INITIAL_OWNER, FLASH_PROVIDER);
+        executor = new PhoenixExecutor(INITIAL_OWNER, FLASH_PROVIDER, ATLAS, WETH);
         _assertDeployment(executor);
     }
 
@@ -39,6 +41,8 @@ contract DeployPhoenixExecutorScript {
     function _assertDeployment(PhoenixExecutor executor) private view {
         _require(executor.owner() == INITIAL_OWNER, "owner");
         _require(executor.flashProvider() == FLASH_PROVIDER, "flash-provider");
+        _require(executor.atlas() == ATLAS, "atlas");
+        _require(executor.weth() == WETH, "weth");
         _require(executor.paused(), "paused");
         _require(executor.maximumInputAmount() == 0, "maximum-input");
 

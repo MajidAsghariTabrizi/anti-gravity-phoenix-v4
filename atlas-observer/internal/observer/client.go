@@ -19,6 +19,13 @@ type Client struct {
 	ledger *Ledger
 	logger *log.Logger
 	dialer websocket.Dialer
+	sink   AuctionSink
+}
+
+// AuctionSink receives only fully decoded, identity-bound auctions after the
+// immutable ledger append succeeds. Implementations must be idempotent.
+type AuctionSink interface {
+	RecordAtlasAuction(context.Context, *LedgerRecord) error
 }
 
 type subscriptionRequest struct {
@@ -39,9 +46,14 @@ type subscriptionResponse struct {
 }
 
 func NewClient(ledger *Ledger, logger *log.Logger) *Client {
+	return NewClientWithSink(ledger, logger, nil)
+}
+
+func NewClientWithSink(ledger *Ledger, logger *log.Logger, sink AuctionSink) *Client {
 	return &Client{
 		ledger: ledger,
 		logger: logger,
+		sink:   sink,
 		dialer: websocket.Dialer{
 			HandshakeTimeout: 15 * time.Second,
 			ReadBufferSize:   WebSocketBufferBytes,
@@ -190,6 +202,11 @@ func (c *Client) runConnection(ctx context.Context) (returnErr error) {
 			return err
 		}
 		if added {
+			if c.sink != nil {
+				if err := c.sink.RecordAtlasAuction(ctx, record); err != nil {
+					return fmt.Errorf("persist Atlas auction identity: %w", err)
+				}
+			}
 			asset := "unknown"
 			if record.OracleUpdate != nil && record.OracleUpdate.Asset != nil {
 				asset = *record.OracleUpdate.Asset

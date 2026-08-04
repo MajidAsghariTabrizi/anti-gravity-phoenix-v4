@@ -231,6 +231,11 @@ if [ -f "$source_root/live-executor/schema/005_closed_loop_economic_control.sql"
     "$source_root/live-executor/schema/005_closed_loop_economic_control.sql" \
     "$deploy_dir/live-executor/schema/005_closed_loop_economic_control.sql" 0640
 fi
+if [ -f "$source_root/live-executor/schema/006_atlas_aave_revenue_lanes.sql" ]; then
+  install_source \
+    "$source_root/live-executor/schema/006_atlas_aave_revenue_lanes.sql" \
+    "$deploy_dir/live-executor/schema/006_atlas_aave_revenue_lanes.sql" 0640
+fi
 
 for sql_name in \
   shadow-profitability-report.sql \

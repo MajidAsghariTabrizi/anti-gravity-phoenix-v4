@@ -1400,6 +1400,8 @@ fn build_execution_request(
         chain_id: candidate.chain_id,
         route_id,
         route_fingerprint: candidate.route_fingerprint.clone(),
+        route_type: crate::model::ExecutionRouteType::PhoenixDexV1,
+        aave_liquidation: None,
         selected_size: candidate.selected_size,
         token_path,
         origin_router: CanonicalAddress::parse(

@@ -93,6 +93,8 @@ fn deliberately_reverting_request(executor_address: CanonicalAddress) -> Executi
         chain_id: ARBITRUM_ONE_CHAIN_ID,
         route_id: [33_u8; 32],
         route_fingerprint: "isolated-weth-token-weth".to_string(),
+        route_type: phoenix_live_executor::model::ExecutionRouteType::PhoenixDexV1,
+        aave_liquidation: None,
         selected_size: 1,
         token_path: vec![flash_asset, token_b, flash_asset],
         origin_router: CanonicalAddress::parse("0x4444444444444444444444444444444444444444")

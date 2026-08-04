@@ -1167,8 +1167,11 @@ def production_readiness(
                         or health not in {None, "healthy"}
                     ):
                         failed("READINESS_SERVICE_UNHEALTHY", observed)
-                    if service == "live-executor":
-                        failed("READINESS_LIVE_EXECUTOR_ACTIVE", observed)
+                    # A running live-executor is permitted only as part of the
+                    # immutable target service set.  The fail-closed control
+                    # evidence below remains authoritative for execution
+                    # authority; readiness never infers authority from process
+                    # liveness.
                 except GatewayError as exc:
                     failed(exc.code, exc.evidence)
                 except (json.JSONDecodeError, TypeError):

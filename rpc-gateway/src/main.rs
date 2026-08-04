@@ -1,3 +1,6 @@
+use rpc_gateway::aave_state::{
+    AaveExactRequest, AaveScreenRequest, AaveSimulateRequest, AaveTailRequest,
+};
 use rpc_gateway::economic::MethodTimeouts;
 use rpc_gateway::hunter_state::{HunterStateRequest, HUNTER_STATE_REQUEST_SCHEMA};
 use rpc_gateway::metrics::RuntimeRpcMetrics;
@@ -295,6 +298,93 @@ async fn handle_request(
                 }
             };
             match tokio::time::timeout(STATE_REQUEST_TIMEOUT, runtime.resolve_hunter_state(parsed))
+                .await
+            {
+                Ok(Ok(response)) => write_json(&mut stream, 200, &response).await,
+                Ok(Err(error)) => {
+                    write_json(&mut stream, error.http_status(), &error.response()).await
+                }
+                Err(_) => {
+                    let error = GatewayError::ProviderUnavailable;
+                    write_json(&mut stream, error.http_status(), &error.response()).await
+                }
+            }
+        }
+        ("POST", "/v1/aave/screen") => {
+            let parsed: AaveScreenRequest = match serde_json::from_slice(&request.body) {
+                Ok(parsed) => parsed,
+                Err(_) => {
+                    return write_json(&mut stream, 400, &GatewayError::InvalidRequest.response())
+                        .await;
+                }
+            };
+            match tokio::time::timeout(STATE_REQUEST_TIMEOUT, runtime.resolve_aave_screen(parsed))
+                .await
+            {
+                Ok(Ok(response)) => write_json(&mut stream, 200, &response).await,
+                Ok(Err(error)) => {
+                    write_json(&mut stream, error.http_status(), &error.response()).await
+                }
+                Err(_) => {
+                    let error = GatewayError::ProviderUnavailable;
+                    write_json(&mut stream, error.http_status(), &error.response()).await
+                }
+            }
+        }
+        ("POST", "/v1/aave/exact") => {
+            let parsed: AaveExactRequest = match serde_json::from_slice(&request.body) {
+                Ok(parsed) => parsed,
+                Err(_) => {
+                    return write_json(&mut stream, 400, &GatewayError::InvalidRequest.response())
+                        .await;
+                }
+            };
+            match tokio::time::timeout(STATE_REQUEST_TIMEOUT, runtime.resolve_aave_exact(parsed))
+                .await
+            {
+                Ok(Ok(response)) => write_json(&mut stream, 200, &response).await,
+                Ok(Err(error)) => {
+                    write_json(&mut stream, error.http_status(), &error.response()).await
+                }
+                Err(_) => {
+                    let error = GatewayError::ProviderUnavailable;
+                    write_json(&mut stream, error.http_status(), &error.response()).await
+                }
+            }
+        }
+        ("POST", "/v1/aave/simulate") => {
+            let parsed: AaveSimulateRequest = match serde_json::from_slice(&request.body) {
+                Ok(parsed) => parsed,
+                Err(_) => {
+                    return write_json(&mut stream, 400, &GatewayError::InvalidRequest.response())
+                        .await;
+                }
+            };
+            match tokio::time::timeout(
+                STATE_REQUEST_TIMEOUT,
+                runtime.simulate_aave_liquidation(parsed),
+            )
+            .await
+            {
+                Ok(Ok(response)) => write_json(&mut stream, 200, &response).await,
+                Ok(Err(error)) => {
+                    write_json(&mut stream, error.http_status(), &error.response()).await
+                }
+                Err(_) => {
+                    let error = GatewayError::ProviderUnavailable;
+                    write_json(&mut stream, error.http_status(), &error.response()).await
+                }
+            }
+        }
+        ("POST", "/v1/aave/tail") => {
+            let parsed: AaveTailRequest = match serde_json::from_slice(&request.body) {
+                Ok(parsed) => parsed,
+                Err(_) => {
+                    return write_json(&mut stream, 400, &GatewayError::InvalidRequest.response())
+                        .await;
+                }
+            };
+            match tokio::time::timeout(STATE_REQUEST_TIMEOUT, runtime.resolve_aave_tail(parsed))
                 .await
             {
                 Ok(Ok(response)) => write_json(&mut stream, 200, &response).await,

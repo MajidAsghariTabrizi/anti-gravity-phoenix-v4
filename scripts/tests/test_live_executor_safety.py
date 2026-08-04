@@ -280,7 +280,9 @@ class LiveExecutorSafetyTests(unittest.TestCase):
         self.assertLess(disarmed_control, burn_in)
         self.assertNotIn("live-executor activate", deployment)
         self.assertNotIn("live-executor owner-unpause", deployment)
-        self.assertNotIn("compose up -d --no-deps live-executor", deployment)
+        executor_start = deployment.index("compose up -d --no-deps live-executor")
+        self.assertGreater(executor_start, disarmed_control)
+        self.assertIn("verify_runtime_control_phase DISARMED_EVIDENCE", deployment)
         self.assertNotIn("LIVE_EXECUTOR_SIGNER_FILE", deployment)
         self.assertIn("PHOENIX_HEALTH_EXPECTED_MODE=DISARMED_EVIDENCE", deployment)
         self.assertIn(
