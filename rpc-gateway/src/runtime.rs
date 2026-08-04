@@ -3050,8 +3050,7 @@ fn supported_aave_liquidation(
     let protocol_fee = (collateral_configuration >> 152).low_u32() & 0xffff;
     if debt_price.is_zero()
         || collateral_price.is_zero()
-        || liquidation_bonus < 10_000
-        || liquidation_bonus > 20_000
+        || !(10_000..=20_000).contains(&liquidation_bonus)
         || protocol_fee > 10_000
     {
         return Err(GatewayError::ProviderIntegrity);
