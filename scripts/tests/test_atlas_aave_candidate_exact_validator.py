@@ -144,6 +144,58 @@ def data_provider_result(selector):
     return values[selector]
 
 
+def oracle_record(
+    provider_id,
+    *,
+    source="0x" + "4" * 40,
+    code_hash="c" * 64,
+    price=100_000_000,
+    answer=100_000_000,
+    round_supported=False,
+    round_failure="rpc_error:3",
+    round_id=10,
+    round_answer=100_000_000,
+    updated_at=1_700_000_000,
+    answered_in_round=10,
+):
+    return {
+        "asset": "0x" + "3" * 40,
+        "source": source,
+        "provider_id": provider_id,
+        "provider_reference_sha256": (
+            "a" * 64 if provider_id == "production-nownodes-arbitrum" else "b" * 64
+        ),
+        "source_code_sha256": code_hash,
+        "source_code_length_bytes": 100,
+        "aave_oracle_price": price,
+        "source_latest_answer": answer,
+        "round_metadata": (
+            {
+                "supported": True,
+                "round_id": round_id,
+                "answer": round_answer,
+                "started_at": updated_at - 1,
+                "updated_at": updated_at,
+                "answered_in_round": answered_in_round,
+                "response_sha256": "d" * 64,
+            }
+            if round_supported
+            else {"supported": False, "failure_class": round_failure}
+        ),
+        "calls": {
+            "get_source_of_asset": {"success": True},
+            "source_code": {"success": True},
+            "get_asset_price": {"success": True},
+            "latest_answer": {"success": True},
+            "latest_round_data": {
+                "success": round_supported,
+                "failure_class": None if round_supported else round_failure,
+            },
+            "decimals": {"success": True},
+        },
+    }
+
+
 class CandidateExactValidatorTests(unittest.TestCase):
     def setUp(self):
         RefreshProvider.instances = []
@@ -378,6 +430,122 @@ class CandidateExactValidatorTests(unittest.TestCase):
                 [first, second], module.ORACLE, "0x12345678", 100, "oracle"
             )
 
+    def test_aave_v3_latest_answer_only_source_is_accepted(self):
+        records = [
+            oracle_record("production-nownodes-arbitrum"),
+            oracle_record("production-slot-0"),
+        ]
+        result = module._select_oracle_policy("0x" + "3" * 40, records)
+        self.assertEqual(result["oracle_semantics"], "aave_v3_latest_answer")
+        self.assertFalse(result["round_metadata_supported"])
+        self.assertEqual(result["source_latest_answer"], result["aave_oracle_price"])
+        self.assertFalse(result["fallback_path_active"])
+
+    def test_latest_round_data_revert_does_not_reject_latest_answer_adapter(self):
+        records = [
+            oracle_record("production-nownodes-arbitrum", round_failure="rpc_error:3"),
+            oracle_record("production-slot-0", round_failure="rpc_error:3"),
+        ]
+        self.assertEqual(
+            module._select_oracle_policy("0x" + "3" * 40, records)[
+                "oracle_semantics"
+            ],
+            "aave_v3_latest_answer",
+        )
+
+    def test_aggregator_v3_round_data_receives_full_validation(self):
+        records = [
+            oracle_record("production-nownodes-arbitrum", round_supported=True),
+            oracle_record("production-slot-0", round_supported=True),
+        ]
+        result = module._select_oracle_policy("0x" + "3" * 40, records)
+        self.assertEqual(result["oracle_semantics"], "aggregator_v3_round_data")
+        self.assertTrue(result["round_metadata_supported"])
+        self.assertEqual(result["round_metadata"]["answer"], 100_000_000)
+
+    def test_latest_answer_disagreement_rejects(self):
+        records = [
+            oracle_record("production-nownodes-arbitrum"),
+            oracle_record("production-slot-0", answer=99_999_999),
+        ]
+        with self.assertRaisesRegex(module.CandidateEvidenceError, "latestAnswer"):
+            module._select_oracle_policy("0x" + "3" * 40, records)
+
+    def test_latest_answer_aave_price_mismatch_rejects(self):
+        records = [
+            oracle_record("production-nownodes-arbitrum", answer=99_999_999),
+            oracle_record("production-slot-0", answer=99_999_999),
+        ]
+        with self.assertRaisesRegex(module.CandidateEvidenceError, "price mismatch"):
+            module._select_oracle_policy("0x" + "3" * 40, records)
+
+    def test_hidden_fallback_oracle_usage_rejects(self):
+        records = [
+            oracle_record("production-nownodes-arbitrum", source="0x" + "0" * 40),
+            oracle_record("production-slot-0", source="0x" + "0" * 40),
+        ]
+        with self.assertRaisesRegex(module.CandidateEvidenceError, "fallback"):
+            module._select_oracle_policy("0x" + "3" * 40, records)
+
+    def test_oracle_source_address_disagreement_rejects(self):
+        records = [
+            oracle_record("production-nownodes-arbitrum"),
+            oracle_record("production-slot-0", source="0x" + "5" * 40),
+        ]
+        with self.assertRaisesRegex(module.CandidateEvidenceError, "source disagreement"):
+            module._select_oracle_policy("0x" + "3" * 40, records)
+
+    def test_oracle_source_code_disagreement_rejects(self):
+        records = [
+            oracle_record("production-nownodes-arbitrum"),
+            oracle_record("production-slot-0", code_hash="e" * 64),
+        ]
+        with self.assertRaisesRegex(module.CandidateEvidenceError, "code disagreement"):
+            module._select_oracle_policy("0x" + "3" * 40, records)
+
+    def test_unexpected_optional_provider_error_rejects(self):
+        records = [
+            oracle_record("production-nownodes-arbitrum", round_failure="transport_error"),
+            oracle_record("production-slot-0", round_failure="rpc_error:3"),
+        ]
+        with self.assertRaisesRegex(module.CandidateEvidenceError, "unexpected"):
+            module._select_oracle_policy("0x" + "3" * 40, records)
+
+    def test_oracle_source_and_numeric_health_factors_survive_failure(self):
+        records = [
+            oracle_record("production-nownodes-arbitrum"),
+            oracle_record("production-slot-0", answer=99_999_999),
+        ]
+        partial = {
+            "signal_rows": [
+                {
+                    "borrower": "0x" + "1" * 40,
+                    "classification": "exact_liquidatable_signal",
+                    "agreed_account_data": {"health_factor_wad": module.WAD - 7},
+                }
+            ],
+            "oracle_provider_evidence": records,
+            "provider_request_usage": [
+                {
+                    "provider_id": "production-nownodes-arbitrum",
+                    "json_rpc_item_count": 27,
+                    "transport_request_count": 27,
+                    "retry_count": 0,
+                }
+            ],
+        }
+        artifact = module.failure_artifact(
+            module.CandidateEvidenceError(
+                "oracle mismatch", partial, "candidate_oracle_semantics", "eth_call"
+            )
+        )
+        summary = module._summary(artifact)
+        self.assertEqual(summary["hf_classifications"][0]["health_factor_wad"], module.WAD - 7)
+        self.assertEqual(
+            summary["oracle_evidence"][0]["source"], "0x" + "4" * 40
+        )
+        self.assertEqual(summary["provider_request_usage"][0]["json_rpc_item_count"], 27)
+
     def test_health_factor_disagreement_rejects(self):
         protocol = {
             "total_collateral_base": 100,
@@ -408,6 +576,15 @@ class CandidateExactValidatorTests(unittest.TestCase):
         self.assertNotIn(encoded_words(42), serialized)
         self.assertNotIn("url", serialized.lower())
         self.assertNotIn("credential", serialized.lower())
+
+    def test_provider_urls_are_absent_from_persisted_bindings_and_usage(self):
+        provider = RefreshProvider("production-nownodes-arbitrum", authenticated=True)
+        binding = module._provider_binding(provider)
+        usage = module._sanitized_request_usage([provider])
+        serialized = json.dumps({"binding": binding, "usage": usage})
+        self.assertNotIn("https://", serialized)
+        self.assertNotIn("endpoint_identity", serialized)
+        self.assertNotIn("raw_rpc_response", serialized)
 
     def test_request_bound_fails_closed(self):
         cohort = cohort_fixture(["0x" + "1" * 40])
