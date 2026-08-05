@@ -29,6 +29,7 @@ from scripts.phoenix_release.phase_update import main as phase_update_main
 from scripts.phoenix_release.gateway import (
     _active_runtime_services,
     _bounded_output,
+    _historical_contract_evidence,
     _is_stopped_live_executor,
     _live_executor_absence_is_fail_closed,
     _require_success,
@@ -36,12 +37,14 @@ from scripts.phoenix_release.gateway import (
     _rollback_failed_state,
     _runtime_may_have_changed,
     _service_absence_allowed,
+    _validate_reconstruction_readiness_evidence,
     GatewayError,
     HostPaths,
     expected_members,
     production_readiness,
     receive_package,
     reconcile_snapshot,
+    reconstruct_active_historical_state,
     request_file,
     retry_rolled_back,
     retry_pre_mutation,
@@ -1127,6 +1130,240 @@ class BoundedTransportTests(unittest.TestCase):
         )
         self.assertEqual(arguments.command, "retry-pre-mutation")
         self.assertEqual(arguments.release_sha, RELEASE_SHA)
+
+
+@unittest.skipUnless(os.name == "posix", "requires POSIX release-state metadata")
+class ActiveHistoricalStateReconstructionTests(unittest.TestCase):
+    images = {
+        "phoenix-engine": "ghcr.io/example/phoenix-engine@sha256:" + "1" * 64,
+        "live-executor": "ghcr.io/example/live-executor@sha256:" + "2" * 64,
+    }
+    manifest_digest = "sha256:" + "3" * 64
+
+    def paths(self, root: Path) -> HostPaths:
+        return HostPaths(
+            state_root=root / "state",
+            deploy_root=root / "deploy-root",
+            env_file=root / "phoenix.env",
+            libexec=root / "libexec",
+        )
+
+    def completed_state(self) -> dict[str, object]:
+        value = state()
+        for phase in PHASES[1:]:
+            updates = None
+            if phase == "SOURCE_CI_VERIFIED":
+                updates = {"expected_images": dict(self.images)}
+            elif phase == "BUILD_VERIFIED":
+                updates = {
+                    "release_manifest_digest": self.manifest_digest,
+                    "release_assets_digest": "sha256:" + "4" * 64,
+                }
+            elif phase == "HOST_PREFLIGHT_OK":
+                updates = {
+                    "contract_paused": True,
+                    "autonomous_armed": False,
+                    "kill_switch": True,
+                }
+            elif phase == "CANDIDATE_INSTALLED":
+                value = set_mutation_started(value)
+            elif phase == "COMPLETED":
+                updates = {
+                    "active_release_pointer": RELEASE_SHA,
+                    "actual_images": dict(self.images),
+                    "autonomous_armed": False,
+                    "candidate_pointer": None,
+                    "contract_paused": True,
+                    "kill_switch": True,
+                }
+            value = advance(value, phase, updates=updates)
+            if phase == "ENGINE_BURN_IN_STARTED":
+                value = record_engine_baseline(
+                    value,
+                    container_id="5" * 64,
+                    restart_count=0,
+                    terminal_integrity=0,
+                    process_fatal_integrity=0,
+                )
+        return value
+
+    def runtime(self) -> dict[str, object]:
+        return {
+            "build_run_id": 202,
+            "expected_images": dict(self.images),
+            "manifest_digest": self.manifest_digest,
+            "source_ci_run_attempt": 1,
+            "source_ci_run_id": 101,
+        }
+
+    def evidence_file(self, root: Path, value: dict[str, object] | None = None) -> Path:
+        path = root / "release-evidence.json"
+        atomic_write(path, value or self.completed_state())
+        return path
+
+    def readiness_evidence(self) -> dict[str, object]:
+        return {
+            "schema": "phoenix.production-readiness.v1",
+            "status": "failed",
+            "failure_count": 1,
+            "failures": [
+                {
+                    "code": "READINESS_ACTIVE_STATE_INVALID",
+                    "evidence": {
+                        "message": "ACTIVE_RELEASE_HISTORICAL_STATE_INVALID"
+                    },
+                }
+            ],
+            "checks": {
+                "active_release": {
+                    "active_release": RELEASE_SHA,
+                    "release_assets_sha": RELEASE_SHA,
+                },
+                "expected_services": ["postgres", "phoenix-engine"],
+                "services": [
+                    {
+                        "container_id": "6" * 64,
+                        "health": "healthy",
+                        "running": True,
+                        "service": "postgres",
+                    },
+                    {
+                        "container_id": "7" * 64,
+                        "health": "healthy",
+                        "running": True,
+                        "service": "phoenix-engine",
+                    },
+                ],
+                "controls": {
+                    "active_attempts": 0,
+                    "unresolved_submissions": 0,
+                },
+            },
+        }
+
+    def test_valid_missing_active_state_is_reconstructed_and_normally_validated(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            paths = self.paths(root)
+            evidence = self.evidence_file(root)
+            with patch(
+                "scripts.phoenix_release.gateway._active_reconstruction_runtime",
+                return_value=self.runtime(),
+            ):
+                result = reconstruct_active_historical_state(
+                    paths, RELEASE_SHA, io.BytesIO(evidence.read_bytes())
+                )
+            restored = load_state(state_file(paths, RELEASE_SHA))
+            self.assertEqual(result["status"], "reconstructed")
+            self.assertEqual(restored, self.completed_state())
+            metadata = state_file(paths, RELEASE_SHA).stat()
+            self.assertEqual(
+                _historical_contract_evidence(
+                    paths,
+                    RELEASE_SHA,
+                    expected_uid=metadata.st_uid,
+                    expected_gid=metadata.st_gid,
+                ),
+                {"contract_paused": True, "owner_transaction_hash": None},
+            )
+
+    def test_existing_state_is_never_overwritten(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            paths = self.paths(root)
+            existing = state_file(paths, RELEASE_SHA)
+            atomic_write(existing, self.completed_state())
+            before = existing.read_bytes()
+            evidence = self.evidence_file(root)
+            with self.assertRaisesRegex(
+                GatewayError, "ACTIVE_RECONSTRUCTION_STATE_EXISTS"
+            ):
+                reconstruct_active_historical_state(
+                    paths, RELEASE_SHA, io.BytesIO(evidence.read_bytes())
+                )
+            self.assertEqual(existing.read_bytes(), before)
+
+    def test_sha_manifest_and_image_mismatches_are_rejected(self) -> None:
+        mismatches = []
+        wrong_sha = self.completed_state()
+        wrong_sha["release_sha"] = "c" * 40
+        wrong_sha["active_release_pointer"] = "c" * 40
+        mismatches.append((wrong_sha, self.runtime()))
+        wrong_manifest = self.runtime()
+        wrong_manifest["manifest_digest"] = "sha256:" + "8" * 64
+        mismatches.append((self.completed_state(), wrong_manifest))
+        wrong_images = self.runtime()
+        wrong_images["expected_images"] = {"phoenix-engine": "wrong-image"}
+        mismatches.append((self.completed_state(), wrong_images))
+        for evidence_value, runtime_value in mismatches:
+            with self.subTest(runtime=runtime_value), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                paths = self.paths(root)
+                evidence = self.evidence_file(root, evidence_value)
+                with (
+                    patch(
+                        "scripts.phoenix_release.gateway._active_reconstruction_runtime",
+                        return_value=runtime_value,
+                    ),
+                    self.assertRaisesRegex(
+                        GatewayError, "ACTIVE_RECONSTRUCTION_EVIDENCE_MISMATCH"
+                    ),
+                ):
+                    reconstruct_active_historical_state(
+                        paths, RELEASE_SHA, io.BytesIO(evidence.read_bytes())
+                    )
+
+    def test_unhealthy_service_and_active_attempts_are_rejected(self) -> None:
+        unhealthy = self.readiness_evidence()
+        unhealthy["checks"]["services"][0]["health"] = "unhealthy"  # type: ignore[index]
+        with self.assertRaisesRegex(
+            GatewayError, "ACTIVE_RECONSTRUCTION_SERVICE_UNHEALTHY"
+        ):
+            _validate_reconstruction_readiness_evidence(unhealthy, RELEASE_SHA)
+        attempts = self.readiness_evidence()
+        attempts["checks"]["controls"]["active_attempts"] = 1  # type: ignore[index]
+        with self.assertRaisesRegex(
+            GatewayError, "ACTIVE_RECONSTRUCTION_ATTEMPTS_ACTIVE"
+        ):
+            _validate_reconstruction_readiness_evidence(attempts, RELEASE_SHA)
+
+    def test_invalid_schema_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            paths = self.paths(root)
+            value = self.completed_state()
+            value["schema_version"] = "invalid"
+            evidence = root / "release-evidence.json"
+            evidence.write_text(json.dumps(value), encoding="utf-8")
+            evidence.chmod(0o600)
+            with (
+                patch(
+                    "scripts.phoenix_release.gateway._active_reconstruction_runtime",
+                    return_value=self.runtime(),
+                ),
+                self.assertRaisesRegex(
+                    GatewayError, "ACTIVE_RECONSTRUCTION_EVIDENCE_INVALID"
+                ),
+            ):
+                reconstruct_active_historical_state(
+                    paths, RELEASE_SHA, io.BytesIO(evidence.read_bytes())
+                )
+
+    def test_cli_binds_release_and_evidence_identity(self) -> None:
+        arguments = release_parser().parse_args(
+            [
+                "reconstruct-active-historical-state",
+                RELEASE_SHA,
+            ]
+        )
+        self.assertEqual(arguments.release_sha, RELEASE_SHA)
+
+
+class BoundedTransportContinuationTests(unittest.TestCase):
+    paths = BoundedTransportTests.paths
+    failed_pre_mutation_fixture = BoundedTransportTests.failed_pre_mutation_fixture
 
     def test_rolled_back_gateway_retry_reuses_unchanged_package(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

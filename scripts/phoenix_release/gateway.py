@@ -1262,6 +1262,344 @@ def production_readiness(
     return result
 
 
+def _validate_reconstruction_readiness_evidence(
+    evidence_value: dict[str, Any], active_release: str
+) -> dict[str, Any]:
+    failures = evidence_value.get("failures")
+    if (
+        evidence_value.get("schema") != "phoenix.production-readiness.v1"
+        or evidence_value.get("status") != "failed"
+        or evidence_value.get("failure_count") != 1
+        or not isinstance(failures, list)
+        or len(failures) != 1
+        or failures[0].get("code") != "READINESS_ACTIVE_STATE_INVALID"
+        or failures[0].get("evidence", {}).get("message")
+        != "ACTIVE_RELEASE_HISTORICAL_STATE_INVALID"
+    ):
+        raise GatewayError("ACTIVE_RECONSTRUCTION_READINESS_INVALID")
+    checks = evidence_value.get("checks")
+    if not isinstance(checks, dict):
+        raise GatewayError("ACTIVE_RECONSTRUCTION_READINESS_INVALID")
+    active = checks.get("active_release")
+    expected_services = checks.get("expected_services")
+    services = checks.get("services")
+    controls = checks.get("controls")
+    if (
+        not isinstance(active, dict)
+        or active.get("active_release") != active_release
+        or active.get("release_assets_sha") != active_release
+        or not isinstance(expected_services, list)
+        or not expected_services
+        or len(expected_services) != len(set(expected_services))
+        or not isinstance(services, list)
+        or not isinstance(controls, dict)
+    ):
+        raise GatewayError("ACTIVE_RECONSTRUCTION_IDENTITY_MISMATCH")
+    observed = {
+        item.get("service"): item
+        for item in services
+        if isinstance(item, dict) and isinstance(item.get("service"), str)
+    }
+    if set(observed) != set(expected_services) or len(observed) != len(services):
+        raise GatewayError("ACTIVE_RECONSTRUCTION_TOPOLOGY_INVALID")
+    if any(
+        item.get("running") is not True
+        or item.get("health") != "healthy"
+        or not isinstance(item.get("container_id"), str)
+        for item in observed.values()
+    ):
+        raise GatewayError("ACTIVE_RECONSTRUCTION_SERVICE_UNHEALTHY")
+    if (
+        controls.get("active_attempts") != 0
+        or controls.get("unresolved_submissions") != 0
+    ):
+        raise GatewayError("ACTIVE_RECONSTRUCTION_ATTEMPTS_ACTIVE")
+    return {
+        "container_ids": sorted(item["container_id"] for item in observed.values()),
+        "controls": controls,
+        "expected_services": expected_services,
+    }
+
+
+def _active_reconstruction_runtime(
+    paths: HostPaths, active_release: str
+) -> dict[str, Any]:
+    active = status(paths)
+    if (
+        active.get("active_release") != active_release
+        or active.get("release_assets_sha") != active_release
+        or active.get("phoenix_mode") != "LIVE"
+        or active.get("live_execution") is not True
+        or active.get("autonomous_execution") is not True
+    ):
+        raise GatewayError("ACTIVE_RECONSTRUCTION_IDENTITY_MISMATCH")
+
+    manifest_path = paths.deploy_dir / "manifests" / f"{active_release}.json"
+    provenance_path = (
+        paths.deploy_dir / "manifests" / f"{active_release}.provenance.json"
+    )
+    context_path = paths.deploy_dir / "current-release-context.json"
+    manifest = _read_json(manifest_path, 256 * 1024)
+    provenance = _read_json(provenance_path, 256 * 1024)
+    context = _read_json(context_path, 256 * 1024)
+    if (
+        not isinstance(manifest, dict)
+        or manifest.get("release_sha") != active_release
+        or not isinstance(provenance, dict)
+        or provenance.get("release_sha") != active_release
+        or not isinstance(context, dict)
+        or context.get("schema") != "phoenix.release-context.v1"
+        or context.get("status") != "ok"
+        or context.get("release_sha") != active_release
+        or context.get("mode") != "LIVE"
+    ):
+        raise GatewayError("ACTIVE_RECONSTRUCTION_IDENTITY_MISMATCH")
+    images = manifest.get("images")
+    if not isinstance(images, dict) or len(images) not in {7, 8}:
+        raise GatewayError("ACTIVE_RECONSTRUCTION_MANIFEST_INVALID")
+    expected_images: dict[str, str] = {}
+    for name, image in images.items():
+        if (
+            not isinstance(name, str)
+            or not isinstance(image, dict)
+            or not isinstance(image.get("repository"), str)
+            or not isinstance(image.get("digest"), str)
+            or not re.fullmatch(r"sha256:[0-9a-f]{64}", image["digest"])
+        ):
+            raise GatewayError("ACTIVE_RECONSTRUCTION_MANIFEST_INVALID")
+        expected_images[name] = f"{image['repository']}@{image['digest']}"
+
+    paths.state_root.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(
+        prefix=f".active-reconstruction-{active_release}.",
+        dir=paths.state_root,
+    ) as temporary:
+        staging = Path(temporary)
+        validator = paths.deploy_dir / "validate-production-release-context.sh"
+        _require_success(
+            [
+                "/bin/sh",
+                str(validator),
+                "--compose-file",
+                str(paths.deploy_dir / "compose.prod.yml"),
+                "--overlay-file",
+                str(paths.deploy_dir / "compose.live-autonomous.yml"),
+                "--env-file",
+                str(paths.env_file),
+                "--release-env",
+                str(paths.deploy_dir / "current-release.env"),
+                "--release-manifest",
+                str(manifest_path),
+                "--current-release",
+                str(paths.deploy_dir / "current-release"),
+                "--release-state",
+                str(paths.deploy_dir / "current-release.json"),
+                "--inspect-running",
+                "--rendered-output",
+                str(staging / "rendered.json"),
+                "--metadata-output",
+                str(staging / "metadata.json"),
+                "--output",
+                str(staging / "context.json"),
+            ],
+            "ACTIVE_RECONSTRUCTION_CONTEXT_INVALID",
+        )
+        if _read_json(staging / "context.json") != context:
+            raise GatewayError("ACTIVE_RECONSTRUCTION_CONTEXT_INVALID")
+
+    try:
+        production_readiness(paths, active_release)
+    except GatewayError as exc:
+        if exc.code != "PRODUCTION_READINESS_FAILED":
+            raise GatewayError("ACTIVE_RECONSTRUCTION_READINESS_INVALID") from exc
+        readiness = _validate_reconstruction_readiness_evidence(
+            exc.evidence, active_release
+        )
+    else:
+        raise GatewayError("ACTIVE_RECONSTRUCTION_STATE_EXISTS")
+
+    compose = production_compose_command(
+        paths,
+        mode="LIVE",
+        release_env=paths.deploy_dir / "current-release.env",
+    )
+    lane_output = _require_success(
+        compose
+        + [
+            "exec",
+            "-T",
+            "postgres",
+            "/bin/sh",
+            "-c",
+            (
+                "exec psql -X -qAt -v ON_ERROR_STOP=1 "
+                '-U "$POSTGRES_USER" -d "$POSTGRES_DB" -c '
+                '"BEGIN READ ONLY; SELECT json_build_object('
+                "'revenue_lanes', (SELECT json_agg(json_build_object("
+                "'lane', lane, 'armed', armed, 'kill_switch', kill_switch) "
+                "ORDER BY lane) FROM live_canary.revenue_lane_controls "
+                "WHERE lane IN ('atlas_solver','aave_liquidation')), "
+                "'submission_lock_free', (SELECT active_lane IS NULL "
+                "AND active_identity IS NULL AND acquired_at IS NULL FROM "
+                "live_canary.global_revenue_submission_lock WHERE singleton)"
+                ")::text; COMMIT;\""
+            ),
+        ],
+        "ACTIVE_RECONSTRUCTION_CONTROL_INVALID",
+    )
+    try:
+        lane_evidence = json.loads(lane_output)
+    except json.JSONDecodeError as exc:
+        raise GatewayError("ACTIVE_RECONSTRUCTION_CONTROL_INVALID") from exc
+    lanes = lane_evidence.get("revenue_lanes") if isinstance(lane_evidence, dict) else None
+    if (
+        not isinstance(lanes, list)
+        or {item.get("lane") for item in lanes if isinstance(item, dict)}
+        != {"atlas_solver", "aave_liquidation"}
+        or any(
+            not isinstance(item, dict)
+            or item.get("armed") is not True
+            or item.get("kill_switch") is not False
+            for item in lanes
+        )
+        or lane_evidence.get("submission_lock_free") is not True
+    ):
+        raise GatewayError("ACTIVE_RECONSTRUCTION_CONTROL_INVALID")
+
+    composed_ids = _require_success(
+        [
+            "/usr/bin/docker",
+            "ps",
+            "-a",
+            "-q",
+            "--filter",
+            "label=com.docker.compose.service",
+        ],
+        "ACTIVE_RECONSTRUCTION_TOPOLOGY_INVALID",
+    ).split()
+    if sorted(composed_ids) != readiness["container_ids"]:
+        raise GatewayError("ACTIVE_RECONSTRUCTION_TOPOLOGY_INVALID")
+
+    source_ci = provenance.get("source_ci")
+    if not isinstance(source_ci, dict):
+        raise GatewayError("ACTIVE_RECONSTRUCTION_PROVENANCE_INVALID")
+    return {
+        "build_run_id": provenance.get("build_run_id"),
+        "expected_images": expected_images,
+        "manifest_digest": sha256_file(manifest_path),
+        "source_ci_run_attempt": source_ci.get("run_attempt"),
+        "source_ci_run_id": source_ci.get("run_id"),
+    }
+
+
+def reconstruct_active_historical_state(
+    paths: HostPaths,
+    active_release: str,
+    evidence_stream: BinaryIO,
+) -> dict[str, Any]:
+    target = state_file(paths, active_release)
+    try:
+        target.lstat()
+    except FileNotFoundError:
+        pass
+    else:
+        raise GatewayError("ACTIVE_RECONSTRUCTION_STATE_EXISTS")
+    evidence_payload = evidence_stream.read(256 * 1024 + 1)
+    if not evidence_payload or len(evidence_payload) > 256 * 1024:
+        raise GatewayError("ACTIVE_RECONSTRUCTION_EVIDENCE_INVALID")
+    evidence_sha256 = f"sha256:{hashlib.sha256(evidence_payload).hexdigest()}"
+
+    runtime = _active_reconstruction_runtime(paths, active_release)
+    paths.state_root.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(
+        prefix=f".active-state-{active_release}.",
+        dir=paths.state_root,
+    ) as temporary:
+        try:
+            evidence_path = Path(temporary) / "immutable-release-evidence.json"
+            _atomic_bytes(evidence_path, evidence_payload)
+            metadata = evidence_path.lstat()
+            evidence_state = _read_json(evidence_path, 256 * 1024)
+            if not isinstance(evidence_state, dict):
+                raise StateError("release state is not an object")
+            if (
+                evidence_state.get("release_sha") != active_release
+                or evidence_state.get("active_release_pointer") != active_release
+            ):
+                raise GatewayError("ACTIVE_RECONSTRUCTION_EVIDENCE_MISMATCH")
+            temporary_paths = HostPaths(
+                state_root=Path(temporary) / "validated",
+                deploy_root=paths.deploy_root,
+                env_file=paths.env_file,
+                libexec=paths.libexec,
+            )
+            temporary_state = state_file(temporary_paths, active_release)
+            atomic_write(temporary_state, evidence_state)
+            evidence_state = load_state(temporary_state)
+            _historical_contract_evidence(
+                temporary_paths,
+                active_release,
+                expected_uid=metadata.st_uid,
+                expected_gid=metadata.st_gid,
+            )
+        except GatewayError:
+            raise
+        except (OSError, StateError) as exc:
+            raise GatewayError("ACTIVE_RECONSTRUCTION_EVIDENCE_INVALID") from exc
+
+    if (
+        evidence_state.get("release_sha") != active_release
+        or evidence_state.get("active_release_pointer") != active_release
+        or evidence_state.get("current_phase") != "COMPLETED"
+        or evidence_state.get("completed_phases") != list(PHASES)
+        or evidence_state.get("candidate_pointer") is not None
+        or evidence_state.get("rollback_result") is not None
+        or evidence_state.get("failure_phase") is not None
+        or evidence_state.get("failure_code") is not None
+        or evidence_state.get("failure_evidence") is not None
+        or evidence_state.get("owner_transaction_hash") is not None
+        or evidence_state.get("contract_paused") is not True
+        or evidence_state.get("expected_images") != runtime["expected_images"]
+        or evidence_state.get("actual_images") != runtime["expected_images"]
+        or evidence_state.get("release_manifest_digest")
+        != runtime["manifest_digest"]
+        or str(evidence_state.get("build_run_id"))
+        != str(runtime["build_run_id"])
+        or str(evidence_state.get("source_ci_run_id"))
+        != str(runtime["source_ci_run_id"])
+        or str(evidence_state.get("source_ci_run_attempt"))
+        != str(runtime["source_ci_run_attempt"])
+    ):
+        raise GatewayError("ACTIVE_RECONSTRUCTION_EVIDENCE_MISMATCH")
+
+    try:
+        target.lstat()
+    except FileNotFoundError:
+        pass
+    else:
+        raise GatewayError("ACTIVE_RECONSTRUCTION_STATE_EXISTS")
+    atomic_write(target, evidence_state)
+    descriptor = os.open(target.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+    final_metadata = target.lstat()
+    _historical_contract_evidence(
+        paths,
+        active_release,
+        expected_uid=final_metadata.st_uid,
+        expected_gid=final_metadata.st_gid,
+    )
+    return {
+        "active_release": active_release,
+        "evidence_sha256": evidence_sha256,
+        "schema": "phoenix.active-historical-state-reconstruction.v1",
+        "state_sha256": sha256_file(target),
+        "status": "reconstructed",
+    }
+
+
 def reconcile_chain_evidence(
     paths: HostPaths,
     protected_main_sha: str,
