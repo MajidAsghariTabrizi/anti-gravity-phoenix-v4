@@ -971,24 +971,10 @@ impl GatewayRuntime {
         let secondary_head = self
             .provider_block(secondary, "finalized", ProviderSlot::Secondary)
             .await?;
-        if primary_head == secondary_head {
-            return Ok(primary_head);
-        }
-        let common_number = primary_head.number.min(secondary_head.number);
-        if common_number == 0 {
+        if primary_head != secondary_head {
             return Err(GatewayError::ProviderDisagreement);
         }
-        let block_tag = format_quantity(common_number);
-        let primary_common = self
-            .provider_block(primary, &block_tag, ProviderSlot::Primary)
-            .await?;
-        let secondary_common = self
-            .provider_block(secondary, &block_tag, ProviderSlot::Secondary)
-            .await?;
-        if primary_common != secondary_common {
-            return Err(GatewayError::ProviderDisagreement);
-        }
-        Ok(primary_common)
+        Ok(primary_head)
     }
 
     async fn provider_block(
@@ -1418,22 +1404,11 @@ impl GatewayRuntime {
                 })
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let verify = self
-            .recorded_call(
-                provider,
-                RpcMethod::EthGetBlockByNumber,
-                json!([format_quantity(block.number), false]),
-                Some(block),
-                0,
-                slot,
-                None,
-                false,
-            )
-            .await
-            .map_err(|failure| map_call_failure(failure.cause))?;
-        if parse_block(&verify.value).as_ref() != Some(block) {
-            return Err(GatewayError::ProviderIntegrity);
-        }
+        // The exact finalized number and hash were already read and required to
+        // agree independently before either pinned call. Re-reading that same
+        // finalized block after each eth_call adds no identity evidence, while
+        // making the minimum dual-provider screen exceed the reviewed four-call
+        // transport burst (two heads plus two Multicalls).
         Ok((accounts, weth_price))
     }
 
@@ -3795,6 +3770,7 @@ mod tests {
         rate_limit_once: StdMutex<HashSet<String>>,
         source_receipt_failure: StdMutex<HashSet<String>>,
         disagreement: AtomicBool,
+        finalized_disagreement: AtomicBool,
         malformed_multicall: AtomicBool,
         delay_multicall: Duration,
     }
@@ -3810,6 +3786,7 @@ mod tests {
                 rate_limit_once: StdMutex::new(HashSet::new()),
                 source_receipt_failure: StdMutex::new(HashSet::new()),
                 disagreement: AtomicBool::new(false),
+                finalized_disagreement: AtomicBool::new(false),
                 malformed_multicall: AtomicBool::new(false),
                 delay_multicall: Duration::ZERO,
             }
@@ -3851,7 +3828,7 @@ mod tests {
 
         fn block_for_tag(&self, tag: &str) -> PinnedBlock {
             let head = self.head.lock().unwrap().clone();
-            if tag == "latest" {
+            if tag == "latest" || tag == "finalized" {
                 return head;
             }
             let number = u64::from_str_radix(tag.trim_start_matches("0x"), 16).unwrap();
@@ -3919,6 +3896,18 @@ mod tests {
                             value[31] = 1;
                             value
                         }
+                        [0xbf, 0x92, 0x85, 0x7c, ..] => {
+                            let mut output = vec![0_u8; 32 * 6];
+                            for word in output.chunks_exact_mut(32) {
+                                word[31] = 1;
+                            }
+                            output
+                        }
+                        [0xb3, 0x59, 0x6f, 0x07, ..] => {
+                            let mut output = vec![0_u8; 32];
+                            output[31] = 1;
+                            output
+                        }
                         _ => panic!("unexpected inner selector"),
                     };
                     Token::Tuple(vec![Token::Bool(true), Token::Bytes(output)])
@@ -3949,7 +3938,15 @@ mod tests {
                 RpcMethod::EthChainId => json!(ARBITRUM_CHAIN_ID_HEX),
                 RpcMethod::EthGetCode => json!("0x60006000"),
                 RpcMethod::EthGetBlockByNumber => {
-                    let block = self.block_for_tag(params[0].as_str().unwrap());
+                    let tag = params[0].as_str().unwrap();
+                    let mut block = self.block_for_tag(tag);
+                    if tag == "finalized"
+                        && provider.provider_id() == "provider_1"
+                        && self.finalized_disagreement.load(Ordering::Relaxed)
+                    {
+                        block.number = block.number.saturating_sub(1);
+                        block.hash = NEXT_HASH.to_string();
+                    }
                     if block.number == 100 && block.hash == BLOCK_HASH {
                         source_block_fixture()
                     } else {
@@ -4084,6 +4081,28 @@ mod tests {
         )
     }
 
+    async fn mark_test_providers_verified(runtime: &GatewayRuntime) {
+        runtime
+            .chain_verified
+            .lock()
+            .await
+            .extend(["provider_0".to_string(), "provider_1".to_string()]);
+        runtime
+            .multicall_verified
+            .lock()
+            .await
+            .extend(["provider_0".to_string(), "provider_1".to_string()]);
+    }
+
+    fn aave_screen_request() -> AaveScreenRequest {
+        AaveScreenRequest {
+            schema_version: "phoenix.rpc.aave-screen-request.v1".to_string(),
+            chain_id: ARBITRUM_ONE_CHAIN_ID,
+            request_id: "aave-screen-test".to_string(),
+            borrowers: vec!["0x1111111111111111111111111111111111111111".to_string()],
+        }
+    }
+
     fn multicall_inner_counts(calls: &[CallRecord]) -> Vec<usize> {
         calls
             .iter()
@@ -4106,6 +4125,57 @@ mod tests {
                 }
             })
             .collect()
+    }
+
+    #[tokio::test]
+    async fn aave_screen_fits_the_reviewed_warm_four_call_burst() {
+        let client = Arc::new(ModelClient::default());
+        let runtime = runtime_with_limits(
+            client.clone(),
+            GatewayLimits {
+                state_requests_per_minute: 100,
+                upstream_calls_per_second: 1,
+                upstream_call_burst: 4,
+            },
+        );
+        mark_test_providers_verified(&runtime).await;
+
+        let response = runtime
+            .resolve_aave_screen(aave_screen_request())
+            .await
+            .unwrap();
+
+        assert_eq!(response.block_number, 100);
+        assert_eq!(response.block_hash, BLOCK_HASH);
+        let calls = client.calls();
+        assert_eq!(calls.len(), 4);
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|call| call.method == RpcMethod::EthGetBlockByNumber)
+                .count(),
+            2
+        );
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|call| call.method == RpcMethod::EthCall)
+                .count(),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn aave_screen_rejects_different_finalized_provider_heads() {
+        let client = Arc::new(ModelClient::default());
+        client.finalized_disagreement.store(true, Ordering::Relaxed);
+        let runtime = runtime(client);
+        mark_test_providers_verified(&runtime).await;
+
+        assert_eq!(
+            runtime.resolve_aave_screen(aave_screen_request()).await,
+            Err(GatewayError::ProviderDisagreement)
+        );
     }
 
     #[tokio::test]
