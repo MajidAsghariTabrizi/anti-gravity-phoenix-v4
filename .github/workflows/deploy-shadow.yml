@@ -62,7 +62,7 @@ jobs:
           [ "$ACKNOWLEDGEMENT" = DEPLOY_PRELIVE_SHADOW ] || { echo "deployment acknowledgement is invalid"; exit 1; }
 
       - name: Checkout exact release
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           ref: ${{ inputs.release_sha }}
           fetch-depth: 1
