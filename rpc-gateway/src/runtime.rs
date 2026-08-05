@@ -658,13 +658,21 @@ impl GatewayRuntime {
             .reserve_provider(&HashSet::new())
             .await
             .ok_or(GatewayError::ProviderUnavailable)?;
-        self.ensure_provider_verified(&primary)
-            .await
-            .map_err(map_call_failure)?;
         let secondary = self
             .reserve_provider(&HashSet::from([primary.provider_id().to_string()]))
             .await
             .ok_or(GatewayError::ProviderUnavailable)?;
+        let required_calls = self.provider_setup_call_count(primary.provider_id()).await
+            + self
+                .provider_setup_call_count(secondary.provider_id())
+                .await
+            + 4;
+        if !self.admit_upstream_sequence(required_calls).await {
+            return Err(GatewayError::UpstreamBudgetExhausted);
+        }
+        self.ensure_provider_verified(&primary)
+            .await
+            .map_err(map_call_failure)?;
         self.ensure_provider_verified(&secondary)
             .await
             .map_err(map_call_failure)?;
@@ -4163,6 +4171,76 @@ mod tests {
                 .count(),
             2
         );
+    }
+
+    #[tokio::test]
+    async fn cold_aave_screen_atomically_admits_the_reviewed_eight_call_burst() {
+        let client = Arc::new(ModelClient::default());
+        let runtime = runtime_with_limits(
+            client.clone(),
+            GatewayLimits {
+                state_requests_per_minute: 100,
+                upstream_calls_per_second: 1,
+                upstream_call_burst: 8,
+            },
+        );
+
+        let response = runtime
+            .resolve_aave_screen(aave_screen_request())
+            .await
+            .unwrap();
+
+        assert_eq!(response.block_number, 100);
+        assert_eq!(response.block_hash, BLOCK_HASH);
+        let calls = client.calls();
+        assert_eq!(calls.len(), 8);
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|call| call.method == RpcMethod::EthChainId)
+                .count(),
+            2
+        );
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|call| call.method == RpcMethod::EthGetCode)
+                .count(),
+            2
+        );
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|call| call.method == RpcMethod::EthGetBlockByNumber)
+                .count(),
+            2
+        );
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|call| call.method == RpcMethod::EthCall)
+                .count(),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn aave_screen_budget_rejection_does_not_consume_a_partial_sequence() {
+        let client = Arc::new(ModelClient::default());
+        let runtime = runtime_with_limits(
+            client.clone(),
+            GatewayLimits {
+                state_requests_per_minute: 100,
+                upstream_calls_per_second: 1,
+                upstream_call_burst: 7,
+            },
+        );
+
+        assert_eq!(
+            runtime.resolve_aave_screen(aave_screen_request()).await,
+            Err(GatewayError::UpstreamBudgetExhausted)
+        );
+        assert!(client.calls().is_empty());
     }
 
     #[tokio::test]
