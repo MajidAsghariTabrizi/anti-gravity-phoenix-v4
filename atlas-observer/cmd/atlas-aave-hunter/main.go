@@ -88,24 +88,7 @@ func main() {
 	atlasCandidateErrors := make(chan error, 1)
 	go func() { atlasErrors <- observer.NewClientWithSink(ledger, logger, sink).Run(ctx) }()
 	go func() { aaveErrors <- screener.Run(ctx) }()
-	go func() {
-		for {
-			select {
-			case <-ctx.Done():
-				atlasCandidateErrors <- nil
-				return
-			case auction := <-sink.AtlasAuctions():
-				if err := screener.HandleAtlasAuction(ctx, auction); err != nil {
-					if screener.RecordRetryableGatewayError(err) {
-						logger.Printf("Atlas candidate deferred error_class=%s exact_execution_ready=false", screener.Snapshot().LastErrorClass)
-						continue
-					}
-					atlasCandidateErrors <- err
-					return
-				}
-			}
-		}
-	}()
+	go func() { atlasCandidateErrors <- runAtlasCandidateLoop(ctx, sink.AtlasAuctions(), screener, logger) }()
 
 	listener, err := net.Listen("tcp", healthAddr)
 	if err != nil {
@@ -132,6 +115,39 @@ func main() {
 	shutdownCancel()
 	if runErr != nil {
 		logger.Fatalf("hunter failed: %v", runErr)
+	}
+}
+
+type atlasCandidateScreener interface {
+	HandleAtlasAuction(context.Context, *observer.LedgerRecord) error
+	RecordRetryableGatewayError(error) (bool, error)
+	Snapshot() hunter.State
+}
+
+func runAtlasCandidateLoop(ctx context.Context, auctions <-chan *observer.LedgerRecord, screener atlasCandidateScreener, logger *log.Logger) error {
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		case auction, open := <-auctions:
+			if !open {
+				return fmt.Errorf("Atlas auction stream closed")
+			}
+			if err := screener.HandleAtlasAuction(ctx, auction); err != nil {
+				if ctx.Err() != nil {
+					return nil
+				}
+				retryable, recordErr := screener.RecordRetryableGatewayError(err)
+				if recordErr != nil {
+					return recordErr
+				}
+				if retryable {
+					logger.Printf("Atlas candidate deferred error_class=%s exact_execution_ready=false", screener.Snapshot().LastErrorClass)
+					continue
+				}
+				return err
+			}
+		}
 	}
 }
 
@@ -220,20 +236,27 @@ func timestampFresh(now time.Time, observed *time.Time) bool {
 
 func healthPayload(health laneHealth, state hunter.State, atlasConnected bool) map[string]any {
 	return map[string]any{
-		"service_health":            health.ServiceHealthy,
-		"hunting_health":            health.HuntingHealthy,
-		"exact_execution_readiness": health.ExactExecutionReady,
-		"degraded_reason":           health.DegradedReason,
-		"provider_recovery_state":   health.RecoveryState,
-		"atlas_connected":           atlasConnected,
-		"aave_cursor":               state.Cursor,
-		"aave_tail_next_block":      state.TailNextBlock,
-		"aave_debt_bearing":         state.DebtBearingCount,
-		"aave_exact_queue":          state.ExactQueueCount,
-		"primary_provider_id":       state.LastProviderPrimary,
-		"secondary_provider_id":     state.LastProviderSecond,
-		"last_dual_agreement_at":    state.LastDualAgreementAt,
-		"last_recovery_attempt_at":  state.LastAttemptAt,
-		"signer_present":            false,
+		"service_health":                         health.ServiceHealthy,
+		"hunting_health":                         health.HuntingHealthy,
+		"exact_execution_readiness":              health.ExactExecutionReady,
+		"degraded_reason":                        health.DegradedReason,
+		"provider_recovery_state":                health.RecoveryState,
+		"atlas_connected":                        atlasConnected,
+		"aave_cursor":                            state.Cursor,
+		"aave_tail_next_block":                   state.TailNextBlock,
+		"aave_debt_bearing":                      state.DebtBearingCount,
+		"aave_exact_queue":                       state.ExactQueueCount,
+		"primary_provider_id":                    state.LastProviderPrimary,
+		"secondary_provider_id":                  state.LastProviderSecond,
+		"last_dual_agreement_at":                 state.LastDualAgreementAt,
+		"last_recovery_attempt_at":               state.LastAttemptAt,
+		"provider_retryable_degradation_total":   state.Counts["provider_retryable_degradation_total"],
+		"provider_recovery_attempt_total":        state.Counts["provider_recovery_attempt_total"],
+		"provider_recovery_success_total":        state.Counts["provider_recovery_success_total"],
+		"provider_degraded_since_unix_millis":    state.Counts["provider_degraded_since_unix_millis"],
+		"provider_last_degraded_unix_millis":     state.Counts["provider_last_degraded_at_unix_millis"],
+		"provider_last_recovery_unix_millis":     state.Counts["provider_last_recovery_at_unix_millis"],
+		"provider_last_degraded_duration_millis": state.Counts["provider_last_degraded_duration_millis"],
+		"signer_present":                         false,
 	}
 }

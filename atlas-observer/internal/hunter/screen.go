@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"math/big"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -24,26 +25,33 @@ import (
 )
 
 const (
-	StateSchema            = "phoenix.atlas-aave-hunter-state.v1"
-	RequestSchema          = "phoenix.rpc.aave-screen-request.v1"
-	ResponseSchema         = "phoenix.rpc.aave-screen-response.v1"
-	DefaultBatch           = 100
-	MaximumBatch           = 100
-	watchHF                = uint64(1_100_000_000_000_000_000)
-	urgentHF               = uint64(1_020_000_000_000_000_000)
-	liquidatableHF         = uint64(1_000_000_000_000_000_000)
-	maximumResponse        = 2 << 20
-	gatewayReadyTimeout    = 90 * time.Second
-	gatewayReadyPoll       = 5 * time.Second
-	initialScreenOffset    = 10 * time.Second
-	startupRetryTimeout    = 90 * time.Second
-	maximumStartupRetries  = 3
-	aavePoolAddress        = "0x794a61358d6845594f94dc1db02a252b5b4814ad"
-	wethAddress            = "0x82af49447d8a07e3bd95bd0d56f35241523fbab1"
-	nativeUSDCAddress      = "0xaf88d065e77c8cc2239327c5edb3a432268e5831"
-	uniswapFactoryAddress  = "0x1f98431c8ad98523631ae4a59f267346ea31f984"
-	uniswapPool500Address  = "0xc6962004f452be9203591991d15f6b388e09e8d0"
-	uniswapPool3000Address = "0xc473e2aee3441bf9240be85eb122abb059a3b57c"
+	StateSchema                     = "phoenix.atlas-aave-hunter-state.v1"
+	RequestSchema                   = "phoenix.rpc.aave-screen-request.v1"
+	ResponseSchema                  = "phoenix.rpc.aave-screen-response.v1"
+	DefaultBatch                    = 100
+	MaximumBatch                    = 100
+	watchHF                         = uint64(1_100_000_000_000_000_000)
+	urgentHF                        = uint64(1_020_000_000_000_000_000)
+	liquidatableHF                  = uint64(1_000_000_000_000_000_000)
+	maximumResponse                 = 2 << 20
+	gatewayReadyTimeout             = 90 * time.Second
+	gatewayReadyPoll                = 5 * time.Second
+	initialScreenOffset             = 10 * time.Second
+	startupRetryTimeout             = 90 * time.Second
+	maximumStartupRetries           = 3
+	providerDegradationTotalKey     = "provider_retryable_degradation_total"
+	providerRecoveryAttemptTotalKey = "provider_recovery_attempt_total"
+	providerRecoverySuccessTotalKey = "provider_recovery_success_total"
+	providerDegradedSinceMillisKey  = "provider_degraded_since_unix_millis"
+	providerLastDegradedAtMillisKey = "provider_last_degraded_at_unix_millis"
+	providerLastRecoveryAtMillisKey = "provider_last_recovery_at_unix_millis"
+	providerLastDegradedDurationKey = "provider_last_degraded_duration_millis"
+	aavePoolAddress                 = "0x794a61358d6845594f94dc1db02a252b5b4814ad"
+	wethAddress                     = "0x82af49447d8a07e3bd95bd0d56f35241523fbab1"
+	nativeUSDCAddress               = "0xaf88d065e77c8cc2239327c5edb3a432268e5831"
+	uniswapFactoryAddress           = "0x1f98431c8ad98523631ae4a59f267346ea31f984"
+	uniswapPool500Address           = "0xc6962004f452be9203591991d15f6b388e09e8d0"
+	uniswapPool3000Address          = "0xc473e2aee3441bf9240be85eb122abb059a3b57c"
 )
 
 var addressPattern = regexp.MustCompile(`^0x[0-9a-f]{40}$`)
@@ -501,7 +509,17 @@ func (s *Screener) Run(ctx context.Context) error {
 				screenErr = attempt()
 			}
 			if screenErr != nil {
-				s.recordError(gatewayErrorClass(screenErr, "rpc_gateway_screen_failure"))
+				if ctx.Err() != nil {
+					return nil
+				}
+				retryable, recordErr := s.RecordRetryableGatewayError(screenErr)
+				if recordErr != nil {
+					return recordErr
+				}
+				if !retryable {
+					s.recordError(gatewayErrorClass(screenErr, "rpc_gateway_screen_failure"))
+					return screenErr
+				}
 				if !s.waitDuration(ctx, s.config.Pace) {
 					return nil
 				}
@@ -510,7 +528,17 @@ func (s *Screener) Run(ctx context.Context) error {
 		}
 		tailBorrowers, err := s.pollTail(ctx)
 		if err != nil {
-			s.recordError(gatewayErrorClass(err, "rpc_gateway_tail_failure"))
+			if ctx.Err() != nil {
+				return nil
+			}
+			retryable, recordErr := s.RecordRetryableGatewayError(err)
+			if recordErr != nil {
+				return recordErr
+			}
+			if !retryable {
+				s.recordError(gatewayErrorClass(err, "rpc_gateway_tail_failure"))
+				return err
+			}
 			if !s.waitDuration(ctx, s.config.Pace) {
 				return nil
 			}
@@ -522,7 +550,17 @@ func (s *Screener) Run(ctx context.Context) error {
 				end = len(tailBorrowers)
 			}
 			if err := s.screen(ctx, tailBorrowers[offset:end], false, nil); err != nil {
-				s.recordError("rpc_gateway_tail_screen_failure")
+				if ctx.Err() != nil {
+					return nil
+				}
+				retryable, recordErr := s.RecordRetryableGatewayError(err)
+				if recordErr != nil {
+					return recordErr
+				}
+				if !retryable {
+					s.recordError(gatewayErrorClass(err, "rpc_gateway_tail_screen_failure"))
+					return err
+				}
 				break
 			}
 		}
@@ -631,13 +669,42 @@ func retryableStartupError(err error) (*gatewayResponseError, bool) {
 }
 
 // RecordRetryableGatewayError keeps broad hunting alive while a bounded
-// provider or Gateway budget recovers. It never grants exact authority.
-func (s *Screener) RecordRetryableGatewayError(err error) bool {
-	if _, retryable := retryableStartupError(err); !retryable {
-		return false
+// provider or Gateway budget recovers. It never grants exact authority and
+// propagates durable-state failures so they still terminate fail-closed.
+func (s *Screener) RecordRetryableGatewayError(err error) (bool, error) {
+	class, retryable := retryableProviderError(err)
+	if !retryable {
+		return false, nil
 	}
-	s.recordError(gatewayErrorClass(err, "rpc_gateway_provider_recovery"))
-	return true
+	return true, s.recordProviderDegradation(class)
+}
+
+func retryableProviderError(err error) (string, bool) {
+	if errors.Is(err, context.Canceled) {
+		return "", false
+	}
+	var gatewayErr *gatewayResponseError
+	if errors.As(err, &gatewayErr) {
+		switch gatewayErr.class {
+		case "provider_disagreement":
+			return "provider_disagreement", gatewayErr.statusCode == http.StatusConflict || gatewayErr.statusCode == http.StatusBadGateway
+		case "provider_unavailable":
+			return "provider_unavailable", gatewayErr.statusCode == http.StatusServiceUnavailable
+		case "provider_timeout", "secondary_timeout":
+			return "provider_timeout", gatewayErr.statusCode == http.StatusRequestTimeout || gatewayErr.statusCode == http.StatusBadGateway || gatewayErr.statusCode == http.StatusServiceUnavailable || gatewayErr.statusCode == http.StatusGatewayTimeout
+		case "provider_rate_limited", "secondary_rate_limited":
+			return "provider_rate_limited", gatewayErr.statusCode == http.StatusTooManyRequests || gatewayErr.statusCode == http.StatusServiceUnavailable
+		case "state_request_budget_exhausted", "upstream_call_budget_exhausted":
+			return "provider_rate_limited", gatewayErr.statusCode == http.StatusTooManyRequests && gatewayErr.retryable
+		default:
+			return "", false
+		}
+	}
+	var networkErr net.Error
+	if errors.As(err, &networkErr) && networkErr.Timeout() {
+		return "provider_timeout", true
+	}
+	return "", false
 }
 
 func gatewayErrorClass(err error, fallback string) string {
@@ -741,7 +808,6 @@ func (s *Screener) pollTail(ctx context.Context) ([]string, error) {
 	now := time.Now().UTC()
 	s.state.TailNextBlock = result.NextBlock
 	s.state.LastTailAt = &now
-	s.state.LastErrorClass = ""
 	if err := s.persistStateLocked(); err != nil {
 		return nil, err
 	}
@@ -750,6 +816,9 @@ func (s *Screener) pollTail(ctx context.Context) ([]string, error) {
 
 func (s *Screener) HandleAtlasAuction(ctx context.Context, auction *observer.LedgerRecord) error {
 	if auction == nil || !auction.RelevantAaveAuction || auction.ChainID != 42161 {
+		return nil
+	}
+	if s.Snapshot().LastErrorClass != "" {
 		return nil
 	}
 	borrowers := s.nextHotBatch()
@@ -806,11 +875,12 @@ func (s *Screener) screen(ctx context.Context, borrowers []string, advanceSeed b
 	if err := json.NewDecoder(io.LimitReader(response.Body, maximumResponse)).Decode(&result); err != nil {
 		return err
 	}
-	if result.SchemaVersion != ResponseSchema || result.ChainID != 42161 || result.RequestID != requestID || result.Primary.ProviderID == result.Secondary.ProviderID || result.Primary.WETHPriceBase != result.Secondary.WETHPriceBase || len(result.Primary.Accounts) != len(borrowers) || len(result.Secondary.Accounts) != len(borrowers) {
+	if result.SchemaVersion != ResponseSchema || result.ChainID != 42161 || result.RequestID != requestID || result.BlockNumber == 0 || len(result.BlockHash) != 66 || result.Primary.ProviderID == result.Secondary.ProviderID || result.Primary.WETHPriceBase != result.Secondary.WETHPriceBase || len(result.Primary.Accounts) != len(borrowers) || len(result.Secondary.Accounts) != len(borrowers) {
 		return errors.New("gateway Aave evidence is incomplete")
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	exactAuthorityWasDegraded := s.state.LastErrorClass != ""
 	for index, primary := range result.Primary.Accounts {
 		if primary != result.Secondary.Accounts[index] || primary.Borrower != borrowers[index] {
 			return errors.New("gateway Aave providers disagree")
@@ -841,15 +911,12 @@ func (s *Screener) screen(ctx context.Context, borrowers []string, advanceSeed b
 				}
 			}
 		}
-		if record.TerminalOutcome == "exact_pending" {
+		if record.TerminalOutcome == "exact_pending" && !exactAuthorityWasDegraded {
 			exactRecord, exactErr := s.resolveExact(ctx, record, auction)
 			if exactErr != nil {
-				record.TerminalOutcome = "incomplete"
-				bucket = "incomplete"
-				record.Bucket = bucket
-			} else {
-				record = exactRecord
+				return exactErr
 			}
+			record = exactRecord
 		}
 		if err := appendJSON(filepath.Join(s.config.StateDir, "signals.ndjson"), record); err != nil {
 			return err
@@ -877,7 +944,7 @@ func (s *Screener) screen(ctx context.Context, borrowers []string, advanceSeed b
 	s.state.LastProviderSecond = result.Secondary.ProviderID
 	s.state.LastBatchAt = &now
 	s.state.LastDualAgreementAt = &now
-	s.state.LastErrorClass = ""
+	s.recordProviderRecoveryLocked(now)
 	return s.persistStateLocked()
 }
 
@@ -895,7 +962,7 @@ func (s *Screener) resolveExact(ctx context.Context, record signal, auction *obs
 	}
 	defer response.Body.Close()
 	if response.StatusCode != http.StatusOK {
-		return record, fmt.Errorf("exact gateway status %d", response.StatusCode)
+		return record, decodeGatewayError(response)
 	}
 	var result exactResponse
 	if err := json.NewDecoder(io.LimitReader(response.Body, maximumResponse)).Decode(&result); err != nil {
@@ -1270,6 +1337,45 @@ func (s *Screener) recordError(class string) {
 	s.state.LastErrorClass = class
 	s.state.LastAttemptAt = &now
 	_ = s.persistStateLocked()
+}
+
+func (s *Screener) recordProviderDegradation(class string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	now := time.Now().UTC()
+	if s.state.Counts == nil {
+		s.state.Counts = make(map[string]uint64)
+	}
+	if s.state.Counts[providerDegradedSinceMillisKey] == 0 {
+		s.state.Counts[providerDegradationTotalKey]++
+		s.state.Counts[providerDegradedSinceMillisKey] = uint64(now.UnixMilli())
+	}
+	s.state.Counts[providerRecoveryAttemptTotalKey]++
+	s.state.Counts[providerLastDegradedAtMillisKey] = uint64(now.UnixMilli())
+	s.state.IncompleteCount++
+	s.state.LastErrorClass = class
+	s.state.LastAttemptAt = &now
+	return s.persistStateLocked()
+}
+
+func (s *Screener) recordProviderRecoveryLocked(now time.Time) {
+	if s.state.Counts == nil {
+		s.state.Counts = make(map[string]uint64)
+	}
+	degradedSince := s.state.Counts[providerDegradedSinceMillisKey]
+	if degradedSince > 0 {
+		s.state.Counts[providerRecoverySuccessTotalKey]++
+		s.state.Counts[providerLastRecoveryAtMillisKey] = uint64(now.UnixMilli())
+		if uint64(now.UnixMilli()) >= degradedSince {
+			duration := uint64(now.UnixMilli()) - degradedSince
+			if duration == 0 {
+				duration = 1
+			}
+			s.state.Counts[providerLastDegradedDurationKey] = duration
+		}
+		delete(s.state.Counts, providerDegradedSinceMillisKey)
+	}
+	s.state.LastErrorClass = ""
 }
 
 func (s *Screener) recordStartupAttempt(retry uint64, class string) {
