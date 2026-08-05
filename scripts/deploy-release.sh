@@ -33,14 +33,19 @@ fail() {
   exit 1
 }
 
-state_update() {
+state_update_raw() {
   operation=$1
   value=$2
+  shift 2
   [ -n "$release_state_updater" ] || return 0
   [ -f "$release_state_updater" ] && [ ! -L "$release_state_updater" ] ||
-    fail "release state updater is missing or unsafe"
+    return 1
   /usr/bin/python3 -I -B "$release_state_updater" \
-    "$release_sha" "$operation" "$value" >/dev/null ||
+    "$release_sha" "$operation" "$value" "$@" >/dev/null
+}
+
+state_update() {
+  state_update_raw "$@" ||
     fail "durable release state update failed"
 }
 
@@ -714,10 +719,10 @@ rollback_on_failure() {
   code=$?
   trap - EXIT
   if [ "$code" -ne 0 ]; then
-    state_update failure deployment_failed >/dev/null 2>&1 || true
+    state_update_raw failure deployment_failed >/dev/null 2>&1 || true
   fi
   if [ "$code" -ne 0 ] && [ "$mutation_started" -eq 1 ]; then
-    state_update rollback ROLLBACK_STARTED >/dev/null 2>&1 || true
+    state_update_raw rollback ROLLBACK_STARTED >/dev/null 2>&1 || true
     repause_ok=1
     compose stop -t 30 live-executor >/dev/null 2>&1 || true
     set +e
@@ -757,18 +762,21 @@ rollback_on_failure() {
     if [ "$rollback_code" -eq 0 ]; then
       if ! verify_active_release_coherence "$rollback_sha" "$rollback_sha"; then
         echo "ROLLBACK_INCOMPLETE: active release pointers are incoherent"
-        state_update rollback ROLLBACK_FAILED --result failed >/dev/null 2>&1 || true
+        state_update_raw rollback ROLLBACK_FAILED --result failed \
+          --code ROLLBACK_COHERENCE_FAILED >/dev/null 2>&1 || true
       elif [ "$repause_ok" -eq 1 ]; then
         printf '%s\n' "$rollback_output"
-        state_update rollback ROLLED_BACK --result ok >/dev/null 2>&1 || true
+        state_update_raw rollback ROLLED_BACK --result ok >/dev/null 2>&1 || true
       else
         echo "ROLLBACK_INCOMPLETE: executor re-pause was not proven"
-        state_update rollback ROLLBACK_FAILED --result failed >/dev/null 2>&1 || true
+        state_update_raw rollback ROLLBACK_FAILED --result failed \
+          --code ROLLBACK_REPAUSE_FAILED >/dev/null 2>&1 || true
       fi
     else
       printf '%s\n' "$rollback_output"
       echo "ROLLBACK_FAILED"
-      state_update rollback ROLLBACK_FAILED --result failed >/dev/null 2>&1 || true
+      state_update_raw rollback ROLLBACK_FAILED --result failed \
+        --code ROLLBACK_SCRIPT_FAILED >/dev/null 2>&1 || true
     fi
   fi
   rm -rf "$state_dir"
