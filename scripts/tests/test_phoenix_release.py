@@ -35,8 +35,10 @@ from scripts.phoenix_release.gateway import (
     _require_success,
     _rpc_provider_installer_contract,
     _rollback_failed_state,
+    _require_exact_reconstruction_topology,
     _runtime_may_have_changed,
     _service_absence_allowed,
+    _snapshot_reconstruction_container_ids,
     _validate_reconstruction_readiness_evidence,
     GatewayError,
     HostPaths,
@@ -1284,6 +1286,101 @@ class ActiveHistoricalStateReconstructionTests(unittest.TestCase):
                     paths, RELEASE_SHA, io.BytesIO(evidence.read_bytes())
                 )
             self.assertEqual(existing.read_bytes(), before)
+
+    def test_full_container_ids_are_canonicalized_and_match(self) -> None:
+        first = "A" * 64
+        second = "b" * 64
+        self.assertEqual(
+            _require_exact_reconstruction_topology(
+                [first, second],
+                [second.upper(), first.lower()],
+            ),
+            [first.lower(), second],
+        )
+
+    def test_production_snapshot_requires_untruncated_container_ids(self) -> None:
+        container_id = "a" * 64
+        with patch(
+            "scripts.phoenix_release.gateway._require_success",
+            return_value=container_id,
+        ) as require_success:
+            self.assertEqual(
+                _snapshot_reconstruction_container_ids(),
+                [container_id],
+            )
+        command = require_success.call_args.args[0]
+        self.assertEqual(
+            command,
+            [
+                "/usr/bin/docker",
+                "ps",
+                "-a",
+                "--no-trunc",
+                "-q",
+                "--filter",
+                "label=com.docker.compose.service",
+            ],
+        )
+        with (
+            patch(
+                "scripts.phoenix_release.gateway._require_success",
+                return_value="a" * 12,
+            ),
+            self.assertRaisesRegex(
+                GatewayError, "ACTIVE_RECONSTRUCTION_TOPOLOGY_INVALID"
+            ),
+        ):
+            _snapshot_reconstruction_container_ids()
+
+    def test_missing_extra_malformed_and_duplicate_ids_fail_closed(self) -> None:
+        first = "1" * 64
+        second = "2" * 64
+        invalid_cases = [
+            ([first, second], [first]),
+            ([first], [first, second]),
+            ([first], ["not-a-container-id"]),
+            ([first, second], [first, first]),
+        ]
+        for expected, observed in invalid_cases:
+            with self.subTest(
+                expected=expected, observed=observed
+            ), self.assertRaisesRegex(
+                GatewayError,
+                "ACTIVE_RECONSTRUCTION_TOPOLOGY_INVALID",
+            ):
+                _require_exact_reconstruction_topology(expected, observed)
+
+    def test_readiness_rejects_duplicate_container_identity(self) -> None:
+        readiness = self.readiness_evidence()
+        duplicate = readiness["checks"]["services"][0][  # type: ignore[index]
+            "container_id"
+        ]
+        readiness["checks"]["services"][1]["container_id"] = duplicate  # type: ignore[index]
+        with self.assertRaisesRegex(
+            GatewayError, "ACTIVE_RECONSTRUCTION_TOPOLOGY_INVALID"
+        ):
+            _validate_reconstruction_readiness_evidence(readiness, RELEASE_SHA)
+
+    def test_cross_sha_evidence_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            paths = self.paths(root)
+            value = self.completed_state()
+            value["release_sha"] = "c" * 40
+            value["active_release_pointer"] = "c" * 40
+            evidence = self.evidence_file(root, value)
+            with (
+                patch(
+                    "scripts.phoenix_release.gateway._active_reconstruction_runtime",
+                    return_value=self.runtime(),
+                ),
+                self.assertRaisesRegex(
+                    GatewayError, "ACTIVE_RECONSTRUCTION_EVIDENCE_MISMATCH"
+                ),
+            ):
+                reconstruct_active_historical_state(
+                    paths, RELEASE_SHA, io.BytesIO(evidence.read_bytes())
+                )
 
     def test_sha_manifest_and_image_mismatches_are_rejected(self) -> None:
         mismatches = []

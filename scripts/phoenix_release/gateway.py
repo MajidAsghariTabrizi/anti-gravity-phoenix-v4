@@ -1262,6 +1262,48 @@ def production_readiness(
     return result
 
 
+def _canonical_reconstruction_container_ids(
+    container_ids: Iterable[Any],
+) -> list[str]:
+    canonical: list[str] = []
+    for container_id in container_ids:
+        if not isinstance(container_id, str):
+            raise GatewayError("ACTIVE_RECONSTRUCTION_TOPOLOGY_INVALID")
+        normalized = container_id.strip().lower()
+        if not re.fullmatch(r"[0-9a-f]{64}", normalized):
+            raise GatewayError("ACTIVE_RECONSTRUCTION_TOPOLOGY_INVALID")
+        canonical.append(normalized)
+    if len(canonical) != len(set(canonical)):
+        raise GatewayError("ACTIVE_RECONSTRUCTION_TOPOLOGY_INVALID")
+    return sorted(canonical)
+
+
+def _snapshot_reconstruction_container_ids() -> list[str]:
+    output = _require_success(
+        [
+            "/usr/bin/docker",
+            "ps",
+            "-a",
+            "--no-trunc",
+            "-q",
+            "--filter",
+            "label=com.docker.compose.service",
+        ],
+        "ACTIVE_RECONSTRUCTION_TOPOLOGY_INVALID",
+    )
+    return _canonical_reconstruction_container_ids(output.split())
+
+
+def _require_exact_reconstruction_topology(
+    expected_ids: Iterable[Any], observed_ids: Iterable[Any]
+) -> list[str]:
+    expected = _canonical_reconstruction_container_ids(expected_ids)
+    observed = _canonical_reconstruction_container_ids(observed_ids)
+    if observed != expected:
+        raise GatewayError("ACTIVE_RECONSTRUCTION_TOPOLOGY_INVALID")
+    return observed
+
+
 def _validate_reconstruction_readiness_evidence(
     evidence_value: dict[str, Any], active_release: str
 ) -> dict[str, Any]:
@@ -1314,8 +1356,11 @@ def _validate_reconstruction_readiness_evidence(
         or controls.get("unresolved_submissions") != 0
     ):
         raise GatewayError("ACTIVE_RECONSTRUCTION_ATTEMPTS_ACTIVE")
+    container_ids = _canonical_reconstruction_container_ids(
+        item["container_id"] for item in observed.values()
+    )
     return {
-        "container_ids": sorted(item["container_id"] for item in observed.values()),
+        "container_ids": container_ids,
         "controls": controls,
         "expected_services": expected_services,
     }
@@ -1466,19 +1511,10 @@ def _active_reconstruction_runtime(
     ):
         raise GatewayError("ACTIVE_RECONSTRUCTION_CONTROL_INVALID")
 
-    composed_ids = _require_success(
-        [
-            "/usr/bin/docker",
-            "ps",
-            "-a",
-            "-q",
-            "--filter",
-            "label=com.docker.compose.service",
-        ],
-        "ACTIVE_RECONSTRUCTION_TOPOLOGY_INVALID",
-    ).split()
-    if sorted(composed_ids) != readiness["container_ids"]:
-        raise GatewayError("ACTIVE_RECONSTRUCTION_TOPOLOGY_INVALID")
+    _require_exact_reconstruction_topology(
+        readiness["container_ids"],
+        _snapshot_reconstruction_container_ids(),
+    )
 
     source_ci = provenance.get("source_ci")
     if not isinstance(source_ci, dict):
