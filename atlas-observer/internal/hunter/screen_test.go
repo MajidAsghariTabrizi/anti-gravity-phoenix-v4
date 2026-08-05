@@ -1,15 +1,173 @@
 package hunter
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
+	"errors"
 	"io"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 )
+
+func TestStartupWaitsForGatewayReadinessAndOffsetsFirstScreen(t *testing.T) {
+	readyCalls := 0
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if request.URL.Path != "/readyz" {
+			t.Fatalf("unexpected path: %s", request.URL.Path)
+		}
+		readyCalls++
+		if readyCalls == 1 {
+			writer.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		writer.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+	waits := make([]time.Duration, 0, 2)
+	screener := &Screener{
+		config: Config{GatewayURL: server.URL},
+		client: server.Client(),
+		wait: func(_ context.Context, delay time.Duration) bool {
+			waits = append(waits, delay)
+			return true
+		},
+	}
+	if err := screener.waitForGatewayStartup(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if readyCalls != 2 || len(waits) != 2 || waits[0] != gatewayReadyPoll || waits[1] != initialScreenOffset {
+		t.Fatalf("ready_calls=%d waits=%v", readyCalls, waits)
+	}
+}
+
+func TestStartupRetriesOnlySanitizedTransientGatewayFailures(t *testing.T) {
+	for name, first := range map[string]*gatewayResponseError{
+		"cold budget":        {statusCode: http.StatusTooManyRequests, class: "upstream_call_budget_exhausted", retryable: true},
+		"temporary provider": {statusCode: http.StatusServiceUnavailable, class: "provider_unavailable", retryable: true},
+	} {
+		t.Run(name, func(t *testing.T) {
+			directory := t.TempDir()
+			waits := make([]time.Duration, 0, 1)
+			attempts := 0
+			screener := &Screener{
+				config: Config{StateDir: directory},
+				state:  State{Schema: StateSchema, Counts: map[string]uint64{}},
+				wait: func(_ context.Context, delay time.Duration) bool {
+					waits = append(waits, delay)
+					return true
+				},
+			}
+			err := screener.screenWithStartupRetry(context.Background(), func() error {
+				attempts++
+				if attempts == 1 {
+					return first
+				}
+				now := time.Now().UTC()
+				screener.mu.Lock()
+				screener.state.LastBatchAt = &now
+				screener.mu.Unlock()
+				return nil
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			state := screener.Snapshot()
+			if attempts != 2 || len(waits) != 1 || waits[0] != 10*time.Second {
+				t.Fatalf("attempts=%d waits=%v", attempts, waits)
+			}
+			if state.LastBatchAt == nil || state.LastAttemptAt == nil || state.StartupRetryCount != 1 || state.LastErrorClass != "" {
+				t.Fatalf("unexpected state: %+v", state)
+			}
+			if state.ExactQueueCount != 0 {
+				t.Fatal("startup retry granted Candidate authority")
+			}
+			var durable State
+			data, readErr := os.ReadFile(filepath.Join(directory, "state.json"))
+			if readErr != nil || json.Unmarshal(data, &durable) != nil || durable.StartupRetryCount != 1 || durable.LastAttemptAt == nil {
+				t.Fatalf("durable retry evidence is incomplete: read=%v state=%+v", readErr, durable)
+			}
+		})
+	}
+}
+
+func TestStartupProviderDisagreementFailsClosedWithoutRetry(t *testing.T) {
+	directory := t.TempDir()
+	attempts := 0
+	waits := 0
+	screener := &Screener{
+		config: Config{StateDir: directory},
+		state:  State{Schema: StateSchema, Counts: map[string]uint64{}},
+		wait:   func(_ context.Context, _ time.Duration) bool { waits++; return true },
+	}
+	err := screener.screenWithStartupRetry(context.Background(), func() error {
+		attempts++
+		return &gatewayResponseError{statusCode: http.StatusConflict, class: "provider_disagreement", retryable: false}
+	})
+	if err == nil || attempts != 1 || waits != 0 {
+		t.Fatalf("err=%v attempts=%d waits=%d", err, attempts, waits)
+	}
+	state := screener.Snapshot()
+	if state.LastBatchAt != nil || state.LastErrorClass != "provider_disagreement" || state.ExactQueueCount != 0 {
+		t.Fatalf("non-retryable disagreement was not fail-closed: %+v", state)
+	}
+}
+
+func TestGatewayErrorContractIsBoundedAndSanitized(t *testing.T) {
+	response := &http.Response{
+		StatusCode: http.StatusTooManyRequests,
+		Body:       io.NopCloser(strings.NewReader(`{"error_class":"upstream_call_budget_exhausted","retryable":true,"retry_after_seconds":10,"secret":"must-not-escape"}`)),
+	}
+	err := decodeGatewayError(response)
+	var gatewayErr *gatewayResponseError
+	if !errors.As(err, &gatewayErr) || gatewayErr.retryAfter != 10*time.Second || !gatewayErr.retryable {
+		t.Fatalf("unexpected gateway error: %v", err)
+	}
+	if strings.Contains(err.Error(), "must-not-escape") || strings.Contains(err.Error(), "secret") {
+		t.Fatalf("raw gateway body escaped: %v", err)
+	}
+}
+
+func TestSuccessfulEmptyTailPersistsReadinessEvidence(t *testing.T) {
+	directory := t.TempDir()
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		var input tailRequest
+		if err := json.NewDecoder(request.Body).Decode(&input); err != nil {
+			t.Fatal(err)
+		}
+		_ = json.NewEncoder(writer).Encode(tailResponse{
+			SchemaVersion: "phoenix.rpc.aave-tail-response.v1",
+			ChainID:       42161, RequestID: input.RequestID,
+			FinalizedBlockNumber: 491218648,
+			FinalizedBlockHash:   "0x" + strings.Repeat("a", 64),
+			PrimaryProviderID:    "production-nownodes-arbitrum",
+			SecondaryProviderID:  "production-slot-0",
+			FromBlock:            491218649, ToBlock: 491218648, NextBlock: 491218649,
+			Borrowers: []string{},
+		})
+	}))
+	defer server.Close()
+	screener := &Screener{
+		config:      Config{GatewayURL: server.URL, StateDir: directory},
+		client:      server.Client(),
+		state:       State{Schema: StateSchema, Counts: map[string]uint64{}},
+		debtBearing: make(map[string]bool), refreshKnown: make(map[string]bool),
+	}
+	borrowers, err := screener.pollTail(context.Background())
+	if err != nil || len(borrowers) != 0 {
+		t.Fatalf("borrowers=%v err=%v", borrowers, err)
+	}
+	state := screener.Snapshot()
+	if state.LastTailAt == nil || state.TailNextBlock != 491218649 || state.LastErrorClass != "" {
+		t.Fatalf("empty tail did not establish readiness: %+v", state)
+	}
+}
 
 func TestNewRequiresCanonicalGitReleaseSHA(t *testing.T) {
 	directory := t.TempDir()
