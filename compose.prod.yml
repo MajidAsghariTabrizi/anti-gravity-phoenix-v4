@@ -82,7 +82,9 @@ services:
       PHOENIX_ENV: production
       RPC_GATEWAY_ADDR: 0.0.0.0:9300
       RPC_PROVIDER_URLS: ${RPC_PROVIDER_URLS:?RPC_PROVIDER_URLS is required}
-      RPC_PROVIDER_WEIGHTS: ${RPC_PROVIDER_WEIGHTS:-1}
+      # Keep the independently operated production-slot-0 ahead of the
+      # availability-only peer for exact finalized-state eth_call evidence.
+      RPC_PROVIDER_WEIGHTS: "2,1"
       RPC_PROVIDER_IDS: ${RPC_PROVIDER_IDS:-production-slot-0,availability-slot-1}
       RPC_AUTH_PROVIDER_ID: production-nownodes-arbitrum
       RPC_AUTH_PROVIDER_URL: https://arbitrum.nownodes.io/
