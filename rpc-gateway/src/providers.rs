@@ -129,10 +129,11 @@ impl Provider {
         self.consecutive_failures += 1;
         self.health_score = (self.health_score - 20).max(0);
         let backoff_secs = (1_u64 << self.consecutive_failures.saturating_sub(1).min(5)).min(30);
-        self.cooldown_until = Some(now + Duration::from_secs(backoff_secs));
+        let jitter = recovery_jitter(&self.name, self.consecutive_failures);
+        self.cooldown_until = Some(now + Duration::from_secs(backoff_secs) + jitter);
         if self.consecutive_failures >= 3 {
             self.circuit = CircuitState::Open {
-                until: now + Duration::from_secs(30),
+                until: now + Duration::from_secs(30) + jitter,
             };
         }
     }
@@ -140,6 +141,15 @@ impl Provider {
     pub fn record_cooldown(&mut self, now: Instant, duration: Duration) {
         self.cooldown_until = Some(now + duration);
     }
+}
+
+fn recovery_jitter(provider_id: &str, failure_count: u32) -> Duration {
+    let folded = provider_id
+        .bytes()
+        .fold(failure_count as u64, |value, byte| {
+            value.wrapping_mul(131).wrapping_add(u64::from(byte))
+        });
+    Duration::from_millis(folded % 1_000)
 }
 
 #[derive(Clone, Debug, Default)]

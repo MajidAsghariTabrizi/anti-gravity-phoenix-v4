@@ -169,6 +169,32 @@ fn recovered_preferred_provider_becomes_selectable_again() {
 }
 
 #[test]
+fn provider_recovery_backoff_is_bounded_and_identity_jittered() {
+    let now = Instant::now();
+    let mut first = Provider::new(
+        "production-nownodes-arbitrum".to_string(),
+        "https://first.example".to_string(),
+        4,
+        now,
+    );
+    let mut second = Provider::new(
+        "production-slot-0".to_string(),
+        "https://second.example".to_string(),
+        3,
+        now,
+    );
+    first.record_failure(now);
+    second.record_failure(now);
+    let first_until = first.cooldown_until.expect("first cooldown");
+    let second_until = second.cooldown_until.expect("second cooldown");
+    assert!(first_until > now + Duration::from_secs(1));
+    assert!(first_until < now + Duration::from_secs(2));
+    assert!(second_until > now + Duration::from_secs(1));
+    assert!(second_until < now + Duration::from_secs(2));
+    assert_ne!(first_until, second_until);
+}
+
+#[test]
 fn equal_priorities_preserve_configured_order() {
     let now = Instant::now();
     let cfg = parse_provider_config("https://first.example,https://second.example", "1,1").unwrap();

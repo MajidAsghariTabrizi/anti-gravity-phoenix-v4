@@ -134,6 +134,30 @@ func TestGatewayErrorContractIsBoundedAndSanitized(t *testing.T) {
 	}
 }
 
+func TestRetryableProviderFailureIsRecordedWithoutCandidateAuthority(t *testing.T) {
+	directory := t.TempDir()
+	screener := &Screener{
+		config: Config{StateDir: directory},
+		state:  State{Schema: StateSchema, Counts: map[string]uint64{}},
+	}
+	accepted := screener.RecordRetryableGatewayError(&gatewayResponseError{
+		statusCode: http.StatusServiceUnavailable,
+		class:      "provider_unavailable",
+		retryable:  true,
+	})
+	state := screener.Snapshot()
+	if !accepted || state.LastErrorClass != "provider_unavailable" || state.LastAttemptAt == nil || state.ExactQueueCount != 0 {
+		t.Fatalf("retryable provider recovery crossed an authority boundary: accepted=%t state=%+v", accepted, state)
+	}
+	if screener.RecordRetryableGatewayError(&gatewayResponseError{
+		statusCode: http.StatusConflict,
+		class:      "provider_disagreement",
+		retryable:  false,
+	}) {
+		t.Fatal("provider disagreement was incorrectly treated as retryable")
+	}
+}
+
 func TestSuccessfulEmptyTailPersistsReadinessEvidence(t *testing.T) {
 	directory := t.TempDir()
 	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {

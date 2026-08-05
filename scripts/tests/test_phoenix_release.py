@@ -2371,8 +2371,12 @@ class WorkflowAndDeploymentContractTests(unittest.TestCase):
     def test_failure_path_persists_rollback_phases(self) -> None:
         self.assertIn("state_update failure deployment_failed", self.deploy)
         self.assertIn("state_update rollback ROLLBACK_STARTED", self.deploy)
-        self.assertIn("state_update rollback ROLLED_BACK", self.deploy)
-        self.assertIn("state_update rollback ROLLBACK_FAILED", self.deploy)
+        self.assertIn(
+            "state_update rollback ROLLED_BACK --result ok", self.deploy
+        )
+        self.assertIn(
+            "state_update rollback ROLLBACK_FAILED --result failed", self.deploy
+        )
 
     def test_candidate_startup_failure_preserves_bounded_log_evidence(self) -> None:
         self.assertIn("capture_service_failure_evidence()", self.deploy)

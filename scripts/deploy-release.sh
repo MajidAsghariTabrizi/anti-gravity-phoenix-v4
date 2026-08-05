@@ -757,18 +757,18 @@ rollback_on_failure() {
     if [ "$rollback_code" -eq 0 ]; then
       if ! verify_active_release_coherence "$rollback_sha" "$rollback_sha"; then
         echo "ROLLBACK_INCOMPLETE: active release pointers are incoherent"
-        state_update rollback ROLLBACK_FAILED >/dev/null 2>&1 || true
+        state_update rollback ROLLBACK_FAILED --result failed >/dev/null 2>&1 || true
       elif [ "$repause_ok" -eq 1 ]; then
         printf '%s\n' "$rollback_output"
-        state_update rollback ROLLED_BACK >/dev/null 2>&1 || true
+        state_update rollback ROLLED_BACK --result ok >/dev/null 2>&1 || true
       else
         echo "ROLLBACK_INCOMPLETE: executor re-pause was not proven"
-        state_update rollback ROLLBACK_FAILED >/dev/null 2>&1 || true
+        state_update rollback ROLLBACK_FAILED --result failed >/dev/null 2>&1 || true
       fi
     else
       printf '%s\n' "$rollback_output"
       echo "ROLLBACK_FAILED"
-      state_update rollback ROLLBACK_FAILED >/dev/null 2>&1 || true
+      state_update rollback ROLLBACK_FAILED --result failed >/dev/null 2>&1 || true
     fi
   fi
   rm -rf "$state_dir"
