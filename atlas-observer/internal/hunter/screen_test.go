@@ -14,6 +14,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"anti-gravity-phoenix-v4/atlas-observer/internal/observer"
 )
 
 func TestStartupWaitsForGatewayReadinessAndOffsetsFirstScreen(t *testing.T) {
@@ -135,30 +137,195 @@ func TestGatewayErrorContractIsBoundedAndSanitized(t *testing.T) {
 }
 
 func TestRetryableProviderFailureIsRecordedWithoutCandidateAuthority(t *testing.T) {
-	directory := t.TempDir()
-	screener := &Screener{
-		config: Config{StateDir: directory},
-		state:  State{Schema: StateSchema, Counts: map[string]uint64{}},
+	tests := map[string]struct {
+		errorClass string
+		status     int
+		retryable  bool
+		wantClass  string
+	}{
+		"provider disagreement": {"provider_disagreement", http.StatusBadGateway, false, "provider_disagreement"},
+		"provider unavailable":  {"provider_unavailable", http.StatusServiceUnavailable, true, "provider_unavailable"},
+		"secondary timeout":     {"secondary_timeout", http.StatusGatewayTimeout, true, "provider_timeout"},
+		"secondary rate limit":  {"secondary_rate_limited", http.StatusTooManyRequests, true, "provider_rate_limited"},
 	}
-	accepted := screener.RecordRetryableGatewayError(&gatewayResponseError{
-		statusCode: http.StatusServiceUnavailable,
-		class:      "provider_unavailable",
-		retryable:  true,
-	})
-	state := screener.Snapshot()
-	if !accepted || state.LastErrorClass != "provider_unavailable" || state.LastAttemptAt == nil || state.ExactQueueCount != 0 {
-		t.Fatalf("retryable provider recovery crossed an authority boundary: accepted=%t state=%+v", accepted, state)
+	for name, test := range tests {
+		t.Run(name, func(t *testing.T) {
+			directory := t.TempDir()
+			screener := &Screener{
+				config: Config{StateDir: directory},
+				state:  State{Schema: StateSchema, Counts: map[string]uint64{}},
+			}
+			providerErr := &gatewayResponseError{statusCode: test.status, class: test.errorClass, retryable: test.retryable}
+			accepted, err := screener.RecordRetryableGatewayError(providerErr)
+			if err != nil {
+				t.Fatal(err)
+			}
+			acceptedAgain, err := screener.RecordRetryableGatewayError(providerErr)
+			if err != nil {
+				t.Fatal(err)
+			}
+			state := screener.Snapshot()
+			if !accepted || !acceptedAgain || state.LastErrorClass != test.wantClass || state.LastAttemptAt == nil || state.ExactQueueCount != 0 {
+				t.Fatalf("retryable provider recovery crossed an authority boundary: accepted=%t/%t state=%+v", accepted, acceptedAgain, state)
+			}
+			if state.Counts[providerDegradationTotalKey] != 1 || state.Counts[providerRecoveryAttemptTotalKey] != 2 || state.Counts[providerDegradedSinceMillisKey] == 0 {
+				t.Fatalf("retryable recovery counters are invalid: %+v", state.Counts)
+			}
+		})
 	}
-	if screener.RecordRetryableGatewayError(&gatewayResponseError{
-		statusCode: http.StatusConflict,
-		class:      "provider_disagreement",
+
+	screener := &Screener{config: Config{StateDir: t.TempDir()}, state: State{Schema: StateSchema, Counts: map[string]uint64{}}}
+	accepted, err := screener.RecordRetryableGatewayError(&gatewayResponseError{
+		statusCode: http.StatusBadGateway,
+		class:      "provider_integrity_failure",
 		retryable:  false,
-	}) {
-		t.Fatal("provider disagreement was incorrectly treated as retryable")
+	})
+	if err != nil || accepted {
+		t.Fatalf("fatal integrity error was swallowed: accepted=%t err=%v", accepted, err)
 	}
 }
 
-func TestSuccessfulEmptyTailPersistsReadinessEvidence(t *testing.T) {
+type recordingSignalSink struct {
+	records []signal
+}
+
+func (s *recordingSignalSink) RecordAaveSignal(_ context.Context, record signal) error {
+	s.records = append(s.records, record)
+	return nil
+}
+
+func TestFreshAgreementRecoversAfterOneAuthorityFreeScreen(t *testing.T) {
+	directory := t.TempDir()
+	borrowerAccount := account{
+		Borrower:                    "0x1111111111111111111111111111111111111111",
+		TotalCollateralBase:         "2000000000000",
+		TotalDebtBase:               "1000000000000",
+		AvailableBorrowsBase:        "0",
+		CurrentLiquidationThreshold: "8000",
+		LoanToValueBPS:              "7500",
+		HealthFactorWAD:             "900000000000000000",
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if request.URL.Path != "/v1/aave/screen" {
+			t.Fatalf("degraded recovery emitted an exact request: %s", request.URL.Path)
+		}
+		var input screenRequest
+		if err := json.NewDecoder(request.Body).Decode(&input); err != nil {
+			t.Fatal(err)
+		}
+		_ = json.NewEncoder(writer).Encode(screenResponse{
+			SchemaVersion: ResponseSchema,
+			ChainID:       42161,
+			RequestID:     input.RequestID,
+			BlockNumber:   491300000,
+			BlockHash:     "0x" + strings.Repeat("a", 64),
+			Primary: providerScreen{
+				ProviderID: "production-nownodes-arbitrum", WETHPriceBase: "300000000000", Accounts: []account{borrowerAccount},
+			},
+			Secondary: providerScreen{
+				ProviderID: "production-slot-0", WETHPriceBase: "300000000000", Accounts: []account{borrowerAccount},
+			},
+		})
+	}))
+	defer server.Close()
+	sink := &recordingSignalSink{}
+	screener := &Screener{
+		config:      Config{StateDir: directory, GatewayURL: server.URL, RetainedProfitFloorWei: "1", SignalSink: sink},
+		client:      server.Client(),
+		state:       State{Schema: StateSchema, Counts: map[string]uint64{}},
+		debtBearing: make(map[string]bool), refreshKnown: make(map[string]bool), hotBorrowers: make(map[string]string),
+	}
+	accepted, err := screener.RecordRetryableGatewayError(&gatewayResponseError{
+		statusCode: http.StatusServiceUnavailable, class: "provider_unavailable", retryable: true,
+	})
+	if err != nil || !accepted {
+		t.Fatalf("degradation was not recorded: accepted=%t err=%v", accepted, err)
+	}
+	if err := screener.screen(context.Background(), []string{borrowerAccount.Borrower}, false, nil); err != nil {
+		t.Fatal(err)
+	}
+	if len(sink.records) != 1 || sink.records[0].Authority || sink.records[0].ExecutionCandidate != nil || sink.records[0].TerminalOutcome != "exact_pending" {
+		t.Fatalf("degraded screen emitted authority: %+v", sink.records)
+	}
+	state := screener.Snapshot()
+	if state.LastErrorClass != "" || state.LastDualAgreementAt == nil || state.ExactQueueCount != 0 {
+		t.Fatalf("fresh dual agreement did not recover cleanly: %+v", state)
+	}
+	if state.Counts[providerRecoverySuccessTotalKey] != 1 || state.Counts[providerLastRecoveryAtMillisKey] == 0 || state.Counts[providerLastDegradedDurationKey] == 0 || state.Counts[providerDegradedSinceMillisKey] != 0 {
+		t.Fatalf("recovery evidence is incomplete: %+v", state.Counts)
+	}
+}
+
+func TestExactProviderFailureBubblesToRecoveryBoundary(t *testing.T) {
+	directory := t.TempDir()
+	borrowerAccount := account{
+		Borrower:                    "0x1111111111111111111111111111111111111111",
+		TotalCollateralBase:         "2000000000000",
+		TotalDebtBase:               "1000000000000",
+		AvailableBorrowsBase:        "0",
+		CurrentLiquidationThreshold: "8000",
+		LoanToValueBPS:              "7500",
+		HealthFactorWAD:             "900000000000000000",
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		switch request.URL.Path {
+		case "/v1/aave/screen":
+			var input screenRequest
+			if err := json.NewDecoder(request.Body).Decode(&input); err != nil {
+				t.Fatal(err)
+			}
+			_ = json.NewEncoder(writer).Encode(screenResponse{
+				SchemaVersion: ResponseSchema, ChainID: 42161, RequestID: input.RequestID,
+				BlockNumber: 491300000, BlockHash: "0x" + strings.Repeat("a", 64),
+				Primary:   providerScreen{ProviderID: "production-nownodes-arbitrum", WETHPriceBase: "300000000000", Accounts: []account{borrowerAccount}},
+				Secondary: providerScreen{ProviderID: "production-slot-0", WETHPriceBase: "300000000000", Accounts: []account{borrowerAccount}},
+			})
+		case "/v1/aave/exact":
+			writer.WriteHeader(http.StatusBadGateway)
+			_, _ = writer.Write([]byte(`{"error_class":"provider_disagreement","retryable":false}`))
+		default:
+			t.Fatalf("unexpected path: %s", request.URL.Path)
+		}
+	}))
+	defer server.Close()
+	sink := &recordingSignalSink{}
+	screener := &Screener{
+		config: Config{StateDir: directory, GatewayURL: server.URL, RetainedProfitFloorWei: "1", SignalSink: sink},
+		client: server.Client(), state: State{Schema: StateSchema, Counts: map[string]uint64{}},
+		debtBearing: make(map[string]bool), refreshKnown: make(map[string]bool), hotBorrowers: make(map[string]string),
+	}
+	err := screener.screen(context.Background(), []string{borrowerAccount.Borrower}, false, nil)
+	accepted, recordErr := screener.RecordRetryableGatewayError(err)
+	if recordErr != nil || !accepted {
+		t.Fatalf("exact provider error did not enter recovery: accepted=%t err=%v record_err=%v", accepted, err, recordErr)
+	}
+	state := screener.Snapshot()
+	if state.LastErrorClass != "provider_disagreement" || state.LastAttemptAt == nil || state.ExactQueueCount != 0 || len(sink.records) != 0 {
+		t.Fatalf("exact failure crossed authority or queue boundaries: state=%+v records=%+v", state, sink.records)
+	}
+}
+
+func TestDegradedAtlasAuctionDoesNotStartCompetingRecovery(t *testing.T) {
+	requests := 0
+	server := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		requests++
+	}))
+	defer server.Close()
+	screener := &Screener{
+		config:       Config{GatewayURL: server.URL},
+		client:       server.Client(),
+		state:        State{Schema: StateSchema, Counts: map[string]uint64{}, LastErrorClass: "provider_unavailable"},
+		hotBorrowers: map[string]string{"0x1111111111111111111111111111111111111111": "900000000000000000"},
+	}
+	if err := screener.HandleAtlasAuction(context.Background(), &observer.LedgerRecord{ChainID: 42161, RelevantAaveAuction: true}); err != nil {
+		t.Fatal(err)
+	}
+	if requests != 0 || screener.Snapshot().ExactQueueCount != 0 {
+		t.Fatalf("Atlas started a competing recovery path: requests=%d state=%+v", requests, screener.Snapshot())
+	}
+}
+
+func TestSuccessfulEmptyTailPersistsProgressWithoutClearingDegradation(t *testing.T) {
 	directory := t.TempDir()
 	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		var input tailRequest
@@ -180,7 +347,7 @@ func TestSuccessfulEmptyTailPersistsReadinessEvidence(t *testing.T) {
 	screener := &Screener{
 		config:      Config{GatewayURL: server.URL, StateDir: directory},
 		client:      server.Client(),
-		state:       State{Schema: StateSchema, Counts: map[string]uint64{}},
+		state:       State{Schema: StateSchema, Counts: map[string]uint64{}, LastErrorClass: "provider_unavailable"},
 		debtBearing: make(map[string]bool), refreshKnown: make(map[string]bool),
 	}
 	borrowers, err := screener.pollTail(context.Background())
@@ -188,8 +355,8 @@ func TestSuccessfulEmptyTailPersistsReadinessEvidence(t *testing.T) {
 		t.Fatalf("borrowers=%v err=%v", borrowers, err)
 	}
 	state := screener.Snapshot()
-	if state.LastTailAt == nil || state.TailNextBlock != 491218649 || state.LastErrorClass != "" {
-		t.Fatalf("empty tail did not establish readiness: %+v", state)
+	if state.LastTailAt == nil || state.TailNextBlock != 491218649 || state.LastErrorClass != "provider_unavailable" {
+		t.Fatalf("empty tail did not preserve fail-closed recovery state: %+v", state)
 	}
 }
 
