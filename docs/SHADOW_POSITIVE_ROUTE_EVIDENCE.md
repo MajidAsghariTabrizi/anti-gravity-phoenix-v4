@@ -76,7 +76,7 @@ Every success query requires `classified_at` or `completed_at` to be at or after
 
 The first matching current-run candidate is replayed through the production decoder in the running Engine container. Its persisted report selects the newest attempt for the same source-event identity and final classification with `ORDER BY completed_at DESC, id DESC`. The report names the classification table's primary key `source_event_identity`. It does not emit `classification_id` or `classification_record_id`, because `shadow_engine_classifications` has no separate numeric record ID. The attempt row is reported separately as `processing_attempt_id`, `delivery_attempt`, and `processing_attempt_completed_at`.
 
-Before either optional service starts, the workflow reads effective `RPC_STATE_REQUESTS_PER_MINUTE` from the rendered Compose JSON. Values below `12` fail with a dedicated marker. The workflow only validates this budget; it never edits the supplied environment files or changes the controlled upstream call rate of `1` call per second and burst of `4`.
+Before either optional service starts, the workflow reads effective `RPC_STATE_REQUESTS_PER_MINUTE` from the rendered Compose JSON. Values below `12` fail with a dedicated marker. The workflow only validates this budget; it never edits the supplied environment files or changes the controlled upstream call rate of `1` call per second and base burst of `8`.
 
 ACK-pending and replayable pending counts are reported before and after without requiring zero and without changing the stream or durable consumer.
 
