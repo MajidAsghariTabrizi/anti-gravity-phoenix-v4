@@ -47,17 +47,17 @@ The first use of a provider adds its existing chain-ID and Multicall code
 checks, for a cold total of seven. The Engine examines at most one pending
 identity every 15 seconds and records at most three failed attempts; a complete
 or explicitly incomplete gateway response ends enrichment for that immutable
-identity. These calls use the existing request and transport budgets and do
-not change any configured limit. Consequently, the base burst of four rejects
-the five-call exact-state sequence before any upstream call, while the reviewed
-autonomous LIVE overlay burst of 64 can admit it. Budget rejection remains
+identity. These calls use the existing request and transport budgets. The base
+Production burst of eight admits this bounded sequence and the cold dual-provider
+Aave screen without changing the sustained call rate; the reviewed autonomous
+LIVE overlay burst remains 64. Budget rejection remains
 distinct incomplete/retry evidence; it never widens execution authority.
 
 ## Independent Limits
 
 - `RPC_STATE_REQUESTS_PER_MINUTE=12` limits incoming state HTTP requests.
 - `RPC_UPSTREAM_CALLS_PER_SECOND=1` sets the sustained real transport-call rate.
-- `RPC_UPSTREAM_CALL_BURST=4` sets the transport burst capacity.
+- `RPC_UPSTREAM_CALL_BURST=8` is the base Production transport burst capacity.
 - `RPC_PROVIDER_PROBE_INTERVAL_SECONDS=60` controls background provider probes.
 
 The transport token is acquired immediately before every real `JsonRpcClient::call`, including chain checks, code checks, head reads, Multicalls, block verification, retries, failover, and probes. Provider sequences are serialized and begin only when enough tokens are available for the complete setup or Multicall-plus-hash-check step, preventing a one-token retry loop from repeatedly issuing partial evidence calls. If no token is available, no transport call occurs, the current retry chain stops, and the caller receives a bounded retryable budget result. Request admission and transport admission are deliberately independent.

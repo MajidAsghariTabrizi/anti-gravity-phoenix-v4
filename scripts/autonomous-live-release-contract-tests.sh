@@ -10,6 +10,7 @@ fail() {
 }
 
 for path in \
+  compose.prod.yml \
   compose.live-autonomous.yml \
   migrations/012_live_economic_truth.sql \
   migrations/013_economic_loss_ledger.sql \
@@ -54,6 +55,7 @@ def require(condition: bool, message: str) -> None:
         raise SystemExit(f"AUTONOMOUS_LIVE_RELEASE_CONTRACT_INVALID:{message}")
 
 
+base_compose = read("compose.prod.yml")
 compose = read("compose.live-autonomous.yml")
 deploy = read("scripts/deploy-release.sh")
 rollback = read("scripts/rollback-release.sh")
@@ -81,6 +83,15 @@ rpc_service = re.search(
     compose,
 )
 require(rpc_service is not None, "rpc_gateway_service_missing")
+base_rpc_service = re.search(
+    r"(?ms)^  rpc-gateway:\s*\n(?P<body>.*?)(?=^  [a-zA-Z0-9_-]+:\s*\n|\Z)",
+    base_compose,
+)
+require(base_rpc_service is not None, "base_rpc_gateway_service_missing")
+require(
+    'RPC_UPSTREAM_CALL_BURST: "8"' in base_rpc_service.group("body"),
+    "base_rpc_burst_must_fit_cold_dual_provider_aave_screen",
+)
 for reviewed_budget in (
     'RPC_UPSTREAM_CALLS_PER_SECOND: "16"',
     'RPC_UPSTREAM_CALL_BURST: "64"',
