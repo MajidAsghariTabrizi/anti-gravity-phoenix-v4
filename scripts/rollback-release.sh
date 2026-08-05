@@ -295,6 +295,37 @@ current_live_compose() {
     -- "$@"
 }
 
+rollback_cleanup_safe() {
+  cleanup_sql="SELECT concat(
+    (SELECT count(*) FROM live_canary.execution_attempts
+      WHERE status IN ('claimed','nonce_allocated','submission_unknown','pending','timed_out')),
+    '|',
+    (SELECT count(*) FROM live_canary.execution_attempts
+      WHERE status IN ('submission_unknown','pending','timed_out')),
+    '|',
+    coalesce((SELECT active_lane
+      FROM live_canary.global_revenue_submission_lock WHERE singleton), '')
+  );"
+  # The container shell, not this host shell, expands the DB identity.
+  # shellcheck disable=SC2016
+  cleanup_state=$(
+    printf '%s\n' "$cleanup_sql" |
+      current_live_compose exec -T postgres /bin/sh -c \
+        'exec psql -X -qAt -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d "$POSTGRES_DB"'
+  ) || return 1
+  [ "$cleanup_state" = '0|0|' ]
+}
+
+remove_intentionally_absent_services() {
+  live_services=$(current_live_compose config --services) || return 1
+  for service in $absent_services; do
+    printf '%s\n' "$live_services" | grep -F -x "$service" >/dev/null ||
+      return 1
+    current_live_compose stop -t 30 "$service" >/dev/null 2>&1 || true
+    current_live_compose rm -f "$service" >/dev/null || return 1
+  done
+}
+
 if [ -f "$overlay_file" ] && [ -s "$live_release_env" ]; then
   live_executor_id=$(current_live_compose ps -a -q live-executor | awk 'NF { print; exit }')
   current_live_compose config --services |
@@ -305,6 +336,8 @@ if [ -f "$overlay_file" ] && [ -s "$live_release_env" ]; then
     -e PHOENIX_AUTONOMOUS_DISARM_REASON=operator_rollback \
     autonomous-control disarm ||
     fail "autonomous controls could not enter DISARMED_FAILURE"
+  rollback_cleanup_safe ||
+    fail "candidate-only service cleanup is blocked by execution state"
   if [ -n "$live_executor_id" ]; then
     reconciliation_deadline=$(( $(date +%s) + reconciliation_seconds ))
     reconciled=0
@@ -318,15 +351,13 @@ if [ -f "$overlay_file" ] && [ -s "$live_release_env" ]; then
       sleep 3
     done
     if [ "$reconciled" -eq 0 ]; then
-      echo "ROLLBACK_NOTICE: receipt reconciliation timeout elapsed"
+      fail "receipt reconciliation did not reach a safe terminal state"
     fi
     current_live_compose stop -t 30 live-executor ||
       fail "autonomous LIVE executor could not be stopped"
   fi
-  current_live_compose stop -t 30 economic-monitor >/dev/null 2>&1 || true
-  current_live_compose stop -t 30 economic-supervisor >/dev/null 2>&1 || true
-  current_live_compose rm -f economic-monitor >/dev/null 2>&1 || true
-  current_live_compose rm -f economic-supervisor >/dev/null 2>&1 || true
+  remove_intentionally_absent_services ||
+    fail "candidate-only services could not be removed"
 fi
 python3 "$deploy_dir/production_mode.py" shadow --env-file "$env_file" ||
   fail "SHADOW production mode could not be restored"

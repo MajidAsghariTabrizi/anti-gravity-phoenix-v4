@@ -98,6 +98,8 @@ def main(argv: list[str] | None = None) -> int:
             result = None
             if arguments.result:
                 result = {"status": arguments.result}
+                if arguments.code:
+                    result["code"] = arguments.code
             state = mark_rollback(
                 host_paths(), arguments.release_sha, arguments.value, result
             )

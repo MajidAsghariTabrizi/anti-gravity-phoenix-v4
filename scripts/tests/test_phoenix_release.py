@@ -25,6 +25,7 @@ from scripts.phoenix_release.controller import (
     validate_source_ci,
 )
 from scripts.phoenix_release.cli import parser as release_parser
+from scripts.phoenix_release.phase_update import main as phase_update_main
 from scripts.phoenix_release.gateway import (
     _active_runtime_services,
     _bounded_output,
@@ -404,8 +405,65 @@ class ReleaseStateTests(unittest.TestCase):
                 "POST_DISARMED_VERIFYING",
                 "POST_DISARMED_VERIFIED",
                 "DISARMED_EVIDENCE_STARTED",
+                "HUNTING_STANDBY_STARTED",
                 "COMPLETED",
             ),
+        )
+
+    def test_hunting_standby_is_an_explicit_successful_transition(self) -> None:
+        value = state()
+        for phase in PHASES[1 : PHASES.index("HUNTING_STANDBY_STARTED") + 1]:
+            value = advance(value, phase)
+        self.assertEqual(value["current_phase"], "HUNTING_STANDBY_STARTED")
+        self.assertEqual(advance(value, "COMPLETED")["current_phase"], "COMPLETED")
+
+    def test_hunting_standby_failure_rolls_back_and_enables_exact_retry(self) -> None:
+        value = state()
+        for phase in PHASES[1 : PHASES.index("HUNTING_STANDBY_STARTED") + 1]:
+            value = advance(value, phase)
+        value = set_mutation_started(value)
+        value = fail_state(value, code="DEPLOYMENT_FAILED", evidence={})
+        value = rollback_phase(value, "ROLLBACK_STARTED")
+        value = rollback_phase(value, "ROLLED_BACK", {"status": "ok"})
+        value.update(
+            {
+                "active_release_pointer": ROLLBACK_SHA,
+                "autonomous_armed": False,
+                "candidate_pointer": None,
+                "contract_paused": True,
+                "kill_switch": True,
+            }
+        )
+        retried = retry_rolled_back_release(value)
+        self.assertEqual(retried["current_phase"], "BUILD_VERIFIED")
+        self.assertEqual(retried["release_attempt"], 2)
+
+    def test_state_callback_persists_sanitized_rollback_result(self) -> None:
+        with (
+            patch("scripts.phoenix_release.phase_update.host_paths") as paths,
+            patch(
+                "scripts.phoenix_release.phase_update.mark_rollback",
+                return_value={"current_phase": "ROLLBACK_FAILED"},
+            ) as mark_rollback,
+            patch("builtins.print"),
+        ):
+            result = phase_update_main(
+                [
+                    RELEASE_SHA,
+                    "rollback",
+                    "ROLLBACK_FAILED",
+                    "--result",
+                    "failed",
+                    "--code",
+                    "ROLLBACK_SCRIPT_FAILED",
+                ]
+            )
+        self.assertEqual(result, 0)
+        mark_rollback.assert_called_once_with(
+            paths.return_value,
+            RELEASE_SHA,
+            "ROLLBACK_FAILED",
+            {"status": "failed", "code": "ROLLBACK_SCRIPT_FAILED"},
         )
 
     def test_state_contains_the_full_release_identity(self) -> None:
@@ -2361,21 +2419,75 @@ class WorkflowAndDeploymentContractTests(unittest.TestCase):
         )
         self.assertIn("compose pull $pull_services", self.rollback)
         self.assertNotIn("\ncompose pull\n", self.rollback)
-        self.assertIn(
-            "current_live_compose rm -f economic-monitor", self.rollback
+        cleanup = self.rollback.split(
+            "remove_intentionally_absent_services()", maxsplit=1
+        )[1].split("if [ -f \"$overlay_file\"", maxsplit=1)[0]
+        self.assertIn("for service in $absent_services", cleanup)
+        self.assertIn('grep -F -x "$service"', cleanup)
+        self.assertIn('current_live_compose rm -f "$service"', cleanup)
+        self.assertNotIn("docker rm", cleanup)
+        self.assertNotIn("remove-orphans", cleanup)
+        self.assertNotIn("prune", cleanup)
+
+    def test_rollback_cleanup_is_blocked_by_attempt_submission_or_lock(self) -> None:
+        safety = self.rollback.split(
+            "rollback_cleanup_safe()", maxsplit=1
+        )[1].split("remove_intentionally_absent_services()", maxsplit=1)[0]
+        self.assertIn("live_canary.execution_attempts", safety)
+        self.assertIn("'claimed'", safety)
+        self.assertIn("'submission_unknown'", safety)
+        self.assertIn("'pending'", safety)
+        self.assertIn("'timed_out'", safety)
+        self.assertIn("live_canary.global_revenue_submission_lock", safety)
+        self.assertIn("[ \"$cleanup_state\" = '0|0|' ]", safety)
+        gate = self.rollback.index("rollback_cleanup_safe ||")
+        reconciliation_failure = self.rollback.index(
+            "receipt reconciliation did not reach a safe terminal state"
         )
+        removal = self.rollback.index("remove_intentionally_absent_services ||")
+        self.assertLess(gate, removal)
+        self.assertLess(reconciliation_failure, removal)
+
+    def test_candidate_standby_failure_reaches_exact_rollback_cleanup(self) -> None:
+        start = self.deploy.index("compose up -d --no-deps live-executor")
+        standby_phase = self.deploy.index("mark_phase HUNTING_STANDBY_STARTED")
+        self.assertLess(start, standby_phase)
+        self.assertIn("state_update_raw failure deployment_failed", self.deploy)
+        self.assertIn("state_update_raw rollback ROLLBACK_STARTED", self.deploy)
         self.assertIn(
-            "current_live_compose rm -f economic-supervisor", self.rollback
+            'current_live_compose rm -f "$service"', self.rollback
         )
+        self.assertIn("for service in $absent_services", self.rollback)
+
+    def test_rollback_cleanup_preserves_transaction_and_nonce_evidence(self) -> None:
+        cleanup = self.rollback.split(
+            "rollback_cleanup_safe()", maxsplit=1
+        )[1].split('python3 "$deploy_dir/production_mode.py" shadow', maxsplit=1)[0]
+        self.assertNotRegex(cleanup, r"(?im)^\s*(DELETE|UPDATE|TRUNCATE)\b")
+        self.assertNotIn("nonce_state", cleanup.lower())
+        self.assertNotIn("transaction_receipts", cleanup.lower())
+
+    def test_state_callback_forwards_rollback_result_and_reason(self) -> None:
+        callback = self.deploy.split("state_update_raw()", maxsplit=1)[1].split(
+            "state_update()", maxsplit=1
+        )[0]
+        self.assertIn("shift 2", callback)
+        self.assertIn('"$release_sha" "$operation" "$value" "$@"', callback)
+        self.assertIn(
+            "state_update_raw rollback ROLLED_BACK --result ok", self.deploy
+        )
+        self.assertIn("--code ROLLBACK_COHERENCE_FAILED", self.deploy)
+        self.assertIn("--code ROLLBACK_REPAUSE_FAILED", self.deploy)
+        self.assertIn("--code ROLLBACK_SCRIPT_FAILED", self.deploy)
 
     def test_failure_path_persists_rollback_phases(self) -> None:
-        self.assertIn("state_update failure deployment_failed", self.deploy)
-        self.assertIn("state_update rollback ROLLBACK_STARTED", self.deploy)
+        self.assertIn("state_update_raw failure deployment_failed", self.deploy)
+        self.assertIn("state_update_raw rollback ROLLBACK_STARTED", self.deploy)
         self.assertIn(
-            "state_update rollback ROLLED_BACK --result ok", self.deploy
+            "state_update_raw rollback ROLLED_BACK --result ok", self.deploy
         )
         self.assertIn(
-            "state_update rollback ROLLBACK_FAILED --result failed", self.deploy
+            "state_update_raw rollback ROLLBACK_FAILED --result failed", self.deploy
         )
 
     def test_candidate_startup_failure_preserves_bounded_log_evidence(self) -> None:
