@@ -96,6 +96,10 @@ func main() {
 				return
 			case auction := <-sink.AtlasAuctions():
 				if err := screener.HandleAtlasAuction(ctx, auction); err != nil {
+					if screener.RecordRetryableGatewayError(err) {
+						logger.Printf("Atlas candidate deferred error_class=%s exact_execution_ready=false", screener.Snapshot().LastErrorClass)
+						continue
+					}
 					atlasCandidateErrors <- err
 					return
 				}
@@ -136,27 +140,100 @@ func healthHandler(ledger *observer.Ledger, screener *hunter.Screener) http.Hand
 	mux := http.NewServeMux()
 	mux.Handle("/metrics", atlasHandler)
 	mux.HandleFunc("/healthz", func(writer http.ResponseWriter, request *http.Request) {
+		now := time.Now().UTC()
 		state := screener.Snapshot()
+		health := evaluateLaneHealth(now, ledger.Snapshot(now), state)
 		status := http.StatusOK
-		if state.Cursor < 1100 || state.LastErrorClass != "" {
+		if !health.ServiceHealthy {
 			status = http.StatusServiceUnavailable
 		}
 		writer.Header().Set("Content-Type", "application/json")
 		writer.WriteHeader(status)
-		_ = json.NewEncoder(writer).Encode(map[string]any{"ok": status == http.StatusOK, "aave_cursor": state.Cursor, "aave_tail_next_block": state.TailNextBlock, "aave_debt_bearing": state.DebtBearingCount, "aave_exact_queue": state.ExactQueueCount})
+		payload := healthPayload(health, state, false)
+		payload["ok"] = status == http.StatusOK
+		_ = json.NewEncoder(writer).Encode(payload)
 	})
 	mux.HandleFunc("/readyz", func(writer http.ResponseWriter, request *http.Request) {
-		atlas := ledger.Snapshot(time.Now().UTC())
+		now := time.Now().UTC()
+		atlas := ledger.Snapshot(now)
 		aave := screener.Snapshot()
-		fresh := aave.LastBatchAt != nil && time.Since(*aave.LastBatchAt) < 10*time.Minute
-		tailFresh := aave.LastTailAt != nil && time.Since(*aave.LastTailAt) < 10*time.Minute
+		health := evaluateLaneHealth(now, atlas, aave)
 		status := http.StatusOK
-		if !atlas.Connected || atlas.LastSubscriptionAt == nil || atlas.InvalidCount > 0 || atlas.Completed || !fresh || !tailFresh || aave.LastErrorClass != "" {
+		if !health.HuntingHealthy {
 			status = http.StatusServiceUnavailable
 		}
 		writer.Header().Set("Content-Type", "application/json")
 		writer.WriteHeader(status)
-		_ = json.NewEncoder(writer).Encode(map[string]any{"ok": status == http.StatusOK, "atlas_connected": atlas.Connected, "aave_cursor": aave.Cursor, "aave_tail_next_block": aave.TailNextBlock, "aave_debt_bearing": aave.DebtBearingCount, "aave_exact_queue": aave.ExactQueueCount, "signer_present": false})
+		payload := healthPayload(health, aave, atlas.Connected)
+		payload["ok"] = status == http.StatusOK
+		_ = json.NewEncoder(writer).Encode(payload)
 	})
 	return mux
+}
+
+const laneFreshnessWindow = 10 * time.Minute
+
+type laneHealth struct {
+	ServiceHealthy      bool
+	HuntingHealthy      bool
+	ExactExecutionReady bool
+	DegradedReason      string
+	RecoveryState       string
+}
+
+func evaluateLaneHealth(now time.Time, atlas observer.LedgerState, aave hunter.State) laneHealth {
+	batchFresh := timestampFresh(now, aave.LastBatchAt)
+	tailFresh := timestampFresh(now, aave.LastTailAt)
+	attemptFresh := timestampFresh(now, aave.LastAttemptAt)
+	dualFresh := timestampFresh(now, aave.LastDualAgreementAt)
+	serviceHealthy := aave.Cursor >= 1100
+	atlasHealthy := atlas.Connected && atlas.LastSubscriptionAt != nil && atlas.InvalidCount == 0 && !atlas.Completed
+	huntingHealthy := serviceHealthy && atlasHealthy && (batchFresh || tailFresh || attemptFresh)
+	exactReady := huntingHealthy && batchFresh && tailFresh && dualFresh && aave.LastErrorClass == "" &&
+		aave.LastBlockNumber > 0 && len(aave.LastBlockHash) == 66 && aave.LastProviderPrimary != "" &&
+		aave.LastProviderSecond != "" && aave.LastProviderPrimary != aave.LastProviderSecond
+	reason := ""
+	recovery := "ready"
+	if aave.LastErrorClass != "" {
+		reason = aave.LastErrorClass
+		recovery = "recovering"
+	} else if !exactReady {
+		reason = "exact_state_stale_or_incomplete"
+		recovery = "initializing"
+	}
+	return laneHealth{
+		ServiceHealthy:      serviceHealthy,
+		HuntingHealthy:      huntingHealthy,
+		ExactExecutionReady: exactReady,
+		DegradedReason:      reason,
+		RecoveryState:       recovery,
+	}
+}
+
+func timestampFresh(now time.Time, observed *time.Time) bool {
+	if observed == nil {
+		return false
+	}
+	age := now.Sub(*observed)
+	return age >= 0 && age < laneFreshnessWindow
+}
+
+func healthPayload(health laneHealth, state hunter.State, atlasConnected bool) map[string]any {
+	return map[string]any{
+		"service_health":            health.ServiceHealthy,
+		"hunting_health":            health.HuntingHealthy,
+		"exact_execution_readiness": health.ExactExecutionReady,
+		"degraded_reason":           health.DegradedReason,
+		"provider_recovery_state":   health.RecoveryState,
+		"atlas_connected":           atlasConnected,
+		"aave_cursor":               state.Cursor,
+		"aave_tail_next_block":      state.TailNextBlock,
+		"aave_debt_bearing":         state.DebtBearingCount,
+		"aave_exact_queue":          state.ExactQueueCount,
+		"primary_provider_id":       state.LastProviderPrimary,
+		"secondary_provider_id":     state.LastProviderSecond,
+		"last_dual_agreement_at":    state.LastDualAgreementAt,
+		"last_recovery_attempt_at":  state.LastAttemptAt,
+		"signer_present":            false,
+	}
 }

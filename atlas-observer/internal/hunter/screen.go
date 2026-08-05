@@ -86,6 +86,7 @@ type State struct {
 	LastProviderSecond  string            `json:"last_provider_secondary"`
 	LastBatchAt         *time.Time        `json:"last_batch_at"`
 	LastTailAt          *time.Time        `json:"last_tail_at"`
+	LastDualAgreementAt *time.Time        `json:"last_dual_agreement_at,omitempty"`
 	TailNextBlock       uint64            `json:"tail_next_block"`
 	DebtBearingCount    uint64            `json:"debt_bearing_count"`
 	Counts              map[string]uint64 `json:"counts"`
@@ -629,6 +630,16 @@ func retryableStartupError(err error) (*gatewayResponseError, bool) {
 	return gatewayErr, retryable
 }
 
+// RecordRetryableGatewayError keeps broad hunting alive while a bounded
+// provider or Gateway budget recovers. It never grants exact authority.
+func (s *Screener) RecordRetryableGatewayError(err error) bool {
+	if _, retryable := retryableStartupError(err); !retryable {
+		return false
+	}
+	s.recordError(gatewayErrorClass(err, "rpc_gateway_provider_recovery"))
+	return true
+}
+
 func gatewayErrorClass(err error, fallback string) string {
 	var gatewayErr *gatewayResponseError
 	if errors.As(err, &gatewayErr) && errorClassPattern.MatchString(gatewayErr.class) {
@@ -865,6 +876,7 @@ func (s *Screener) screen(ctx context.Context, borrowers []string, advanceSeed b
 	s.state.LastProviderPrimary = result.Primary.ProviderID
 	s.state.LastProviderSecond = result.Secondary.ProviderID
 	s.state.LastBatchAt = &now
+	s.state.LastDualAgreementAt = &now
 	s.state.LastErrorClass = ""
 	return s.persistStateLocked()
 }
@@ -1253,8 +1265,10 @@ func newBigUint(value string) (*big.Int, bool) {
 func (s *Screener) recordError(class string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	now := time.Now().UTC()
 	s.state.IncompleteCount++
 	s.state.LastErrorClass = class
+	s.state.LastAttemptAt = &now
 	_ = s.persistStateLocked()
 }
 
