@@ -26,6 +26,7 @@ from phoenix_release.gateway import (  # noqa: E402
     receive_package,
     reconcile_active_context,
     reconcile_chain_evidence,
+    reconstruct_active_historical_state,
     retry_pre_mutation,
     retry_rolled_back,
     rollback_release,
@@ -67,6 +68,8 @@ def parser() -> argparse.ArgumentParser:
     subparsers.add_parser("reconcile-active-context")
     chain_evidence = subparsers.add_parser("reconcile-chain-evidence")
     chain_evidence.add_argument("protected_main_sha", type=_sha)
+    reconstruct = subparsers.add_parser("reconstruct-active-historical-state")
+    reconstruct.add_argument("release_sha", type=_sha)
     return value
 
 
@@ -117,6 +120,12 @@ def main(argv: list[str] | None = None) -> int:
             result = reconcile_chain_evidence(
                 paths,
                 arguments.protected_main_sha,
+            )
+        elif arguments.command == "reconstruct-active-historical-state":
+            result = reconstruct_active_historical_state(
+                paths,
+                arguments.release_sha,
+                sys.stdin.buffer,
             )
         elif arguments.command == "rollback":
             result = rollback_release(paths, arguments.release_sha)
