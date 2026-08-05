@@ -33,6 +33,11 @@ const (
 	urgentHF               = uint64(1_020_000_000_000_000_000)
 	liquidatableHF         = uint64(1_000_000_000_000_000_000)
 	maximumResponse        = 2 << 20
+	gatewayReadyTimeout    = 90 * time.Second
+	gatewayReadyPoll       = 5 * time.Second
+	initialScreenOffset    = 10 * time.Second
+	startupRetryTimeout    = 90 * time.Second
+	maximumStartupRetries  = 3
 	aavePoolAddress        = "0x794a61358d6845594f94dc1db02a252b5b4814ad"
 	wethAddress            = "0x82af49447d8a07e3bd95bd0d56f35241523fbab1"
 	nativeUSDCAddress      = "0xaf88d065e77c8cc2239327c5edb3a432268e5831"
@@ -43,6 +48,7 @@ const (
 
 var addressPattern = regexp.MustCompile(`^0x[0-9a-f]{40}$`)
 var releaseSHAPattern = regexp.MustCompile(`^[0-9a-f]{40}$`)
+var errorClassPattern = regexp.MustCompile(`^[a-z][a-z0-9_]{0,63}$`)
 
 type Config struct {
 	DiscoveryPath          string
@@ -86,6 +92,8 @@ type State struct {
 	ExactQueueCount     uint64            `json:"exact_queue_count"`
 	IncompleteCount     uint64            `json:"incomplete_count"`
 	LastErrorClass      string            `json:"last_error_class,omitempty"`
+	LastAttemptAt       *time.Time        `json:"last_attempt_at,omitempty"`
+	StartupRetryCount   uint64            `json:"startup_retry_count,omitempty"`
 }
 
 type Screener struct {
@@ -98,6 +106,24 @@ type Screener struct {
 	refreshOrder  []string
 	refreshCursor int
 	hotBorrowers  map[string]string
+	wait          func(context.Context, time.Duration) bool
+}
+
+type gatewayErrorContract struct {
+	ErrorClass       string  `json:"error_class"`
+	Retryable        bool    `json:"retryable"`
+	RetryAfterSecond *uint64 `json:"retry_after_seconds,omitempty"`
+}
+
+type gatewayResponseError struct {
+	statusCode int
+	class      string
+	retryable  bool
+	retryAfter time.Duration
+}
+
+func (e *gatewayResponseError) Error() string {
+	return fmt.Sprintf("RPC Gateway rejected request: %s", e.class)
 }
 
 type screenRequest struct {
@@ -416,7 +442,7 @@ func New(config Config) (*Screener, error) {
 	s := &Screener{
 		config: config, client: &http.Client{Timeout: 35 * time.Second}, state: state,
 		debtBearing: make(map[string]bool), refreshKnown: make(map[string]bool),
-		hotBorrowers: make(map[string]string),
+		hotBorrowers: make(map[string]string), wait: waitContext,
 	}
 	if err := s.loadState(); err != nil {
 		return nil, err
@@ -441,6 +467,12 @@ func (s *Screener) Run(ctx context.Context) error {
 			return fmt.Errorf("resume cursor exceeds discovery seed: %w", err)
 		}
 	}
+	if s.Snapshot().LastBatchAt == nil {
+		if err := s.waitForGatewayStartup(ctx); err != nil {
+			s.recordError("rpc_gateway_not_ready")
+			return err
+		}
+	}
 	seedComplete := false
 	for {
 		batch := make([]string, 0, s.config.BatchSize)
@@ -460,25 +492,28 @@ func (s *Screener) Run(ctx context.Context) error {
 			batch = s.nextRefreshBatch()
 		}
 		if len(batch) > 0 {
-			if err := s.screen(ctx, batch, advanceSeed, nil); err != nil {
-				s.recordError("rpc_gateway_screen_failure")
-				select {
-				case <-ctx.Done():
+			attempt := func() error { return s.screen(ctx, batch, advanceSeed, nil) }
+			var screenErr error
+			if s.Snapshot().LastBatchAt == nil {
+				screenErr = s.screenWithStartupRetry(ctx, attempt)
+			} else {
+				screenErr = attempt()
+			}
+			if screenErr != nil {
+				s.recordError(gatewayErrorClass(screenErr, "rpc_gateway_screen_failure"))
+				if !s.waitDuration(ctx, s.config.Pace) {
 					return nil
-				case <-time.After(s.config.Pace):
-					continue
 				}
+				continue
 			}
 		}
 		tailBorrowers, err := s.pollTail(ctx)
 		if err != nil {
-			s.recordError("rpc_gateway_screen_failure")
-			select {
-			case <-ctx.Done():
+			s.recordError(gatewayErrorClass(err, "rpc_gateway_tail_failure"))
+			if !s.waitDuration(ctx, s.config.Pace) {
 				return nil
-			case <-time.After(s.config.Pace):
-				continue
 			}
+			continue
 		}
 		for offset := 0; offset < len(tailBorrowers); offset += MaximumBatch {
 			end := offset + MaximumBatch
@@ -490,10 +525,8 @@ func (s *Screener) Run(ctx context.Context) error {
 				break
 			}
 		}
-		select {
-		case <-ctx.Done():
+		if !s.waitDuration(ctx, s.config.Pace) {
 			return nil
-		case <-time.After(s.config.Pace):
 		}
 	}
 }
@@ -507,6 +540,119 @@ func (s *Screener) Snapshot() State {
 		copy.Counts[key] = value
 	}
 	return copy
+}
+
+func waitContext(ctx context.Context, delay time.Duration) bool {
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		return true
+	}
+}
+
+func (s *Screener) waitDuration(ctx context.Context, delay time.Duration) bool {
+	if s.wait != nil {
+		return s.wait(ctx, delay)
+	}
+	return waitContext(ctx, delay)
+}
+
+func (s *Screener) waitForGatewayStartup(ctx context.Context) error {
+	startupCtx, cancel := context.WithTimeout(ctx, gatewayReadyTimeout)
+	defer cancel()
+	for {
+		req, err := http.NewRequestWithContext(startupCtx, http.MethodGet, s.config.GatewayURL+"/readyz", nil)
+		if err != nil {
+			return err
+		}
+		response, err := s.client.Do(req)
+		if err == nil {
+			response.Body.Close()
+			if response.StatusCode == http.StatusOK {
+				if !s.waitDuration(startupCtx, initialScreenOffset) {
+					return startupCtx.Err()
+				}
+				return nil
+			}
+		}
+		if !s.waitDuration(startupCtx, gatewayReadyPoll) {
+			return startupCtx.Err()
+		}
+	}
+}
+
+func (s *Screener) screenWithStartupRetry(ctx context.Context, attempt func() error) error {
+	retryCtx, cancel := context.WithTimeout(ctx, startupRetryTimeout)
+	defer cancel()
+	backoff := [...]time.Duration{10 * time.Second, 20 * time.Second, 30 * time.Second}
+	var lastErr error
+	for retry := 0; retry <= maximumStartupRetries; retry++ {
+		s.recordStartupAttempt(uint64(retry), "")
+		lastErr = attempt()
+		if lastErr == nil {
+			s.clearStartupError()
+			return nil
+		}
+		class := gatewayErrorClass(lastErr, "rpc_gateway_screen_failure")
+		s.recordStartupAttempt(uint64(retry), class)
+		gatewayErr, retryable := retryableStartupError(lastErr)
+		if !retryable || retry == maximumStartupRetries {
+			return lastErr
+		}
+		delay := backoff[retry]
+		if gatewayErr.retryAfter > delay {
+			delay = gatewayErr.retryAfter
+		}
+		if delay > 30*time.Second {
+			delay = 30 * time.Second
+		}
+		if !s.waitDuration(retryCtx, delay) {
+			if retryCtx.Err() != nil {
+				return retryCtx.Err()
+			}
+			return lastErr
+		}
+	}
+	return lastErr
+}
+
+func retryableStartupError(err error) (*gatewayResponseError, bool) {
+	var gatewayErr *gatewayResponseError
+	if !errors.As(err, &gatewayErr) || !gatewayErr.retryable {
+		return nil, false
+	}
+	retryable := gatewayErr.statusCode == http.StatusTooManyRequests && gatewayErr.class == "upstream_call_budget_exhausted" ||
+		gatewayErr.statusCode == http.StatusServiceUnavailable && gatewayErr.class == "provider_unavailable"
+	return gatewayErr, retryable
+}
+
+func gatewayErrorClass(err error, fallback string) string {
+	var gatewayErr *gatewayResponseError
+	if errors.As(err, &gatewayErr) && errorClassPattern.MatchString(gatewayErr.class) {
+		return gatewayErr.class
+	}
+	return fallback
+}
+
+func decodeGatewayError(response *http.Response) error {
+	var contract gatewayErrorContract
+	if err := json.NewDecoder(io.LimitReader(response.Body, maximumResponse)).Decode(&contract); err != nil ||
+		!errorClassPattern.MatchString(contract.ErrorClass) {
+		return fmt.Errorf("RPC Gateway status %d", response.StatusCode)
+	}
+	retryAfter := time.Duration(0)
+	if contract.RetryAfterSecond != nil && *contract.RetryAfterSecond <= 30 {
+		retryAfter = time.Duration(*contract.RetryAfterSecond) * time.Second
+	}
+	return &gatewayResponseError{
+		statusCode: response.StatusCode,
+		class:      contract.ErrorClass,
+		retryable:  contract.Retryable,
+		retryAfter: retryAfter,
+	}
 }
 
 func (s *Screener) nextRefreshBatch() []string {
@@ -553,7 +699,7 @@ func (s *Screener) pollTail(ctx context.Context) ([]string, error) {
 	}
 	defer response.Body.Close()
 	if response.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("tail gateway status %d", response.StatusCode)
+		return nil, decodeGatewayError(response)
 	}
 	var result tailResponse
 	if err := json.NewDecoder(io.LimitReader(response.Body, maximumResponse)).Decode(&result); err != nil {
@@ -643,7 +789,7 @@ func (s *Screener) screen(ctx context.Context, borrowers []string, advanceSeed b
 	}
 	defer response.Body.Close()
 	if response.StatusCode != http.StatusOK {
-		return fmt.Errorf("gateway status %d", response.StatusCode)
+		return decodeGatewayError(response)
 	}
 	var result screenResponse
 	if err := json.NewDecoder(io.LimitReader(response.Body, maximumResponse)).Decode(&result); err != nil {
@@ -1109,6 +1255,25 @@ func (s *Screener) recordError(class string) {
 	defer s.mu.Unlock()
 	s.state.IncompleteCount++
 	s.state.LastErrorClass = class
+	_ = s.persistStateLocked()
+}
+
+func (s *Screener) recordStartupAttempt(retry uint64, class string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	now := time.Now().UTC()
+	s.state.LastAttemptAt = &now
+	s.state.StartupRetryCount = retry
+	if class != "" {
+		s.state.LastErrorClass = class
+	}
+	_ = s.persistStateLocked()
+}
+
+func (s *Screener) clearStartupError() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.state.LastErrorClass = ""
 	_ = s.persistStateLocked()
 }
 
