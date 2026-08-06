@@ -46,6 +46,9 @@ const (
 	providerLastDegradedAtMillisKey = "provider_last_degraded_at_unix_millis"
 	providerLastRecoveryAtMillisKey = "provider_last_recovery_at_unix_millis"
 	providerLastDegradedDurationKey = "provider_last_degraded_duration_millis"
+	providerCircuitOpenTotalKey     = "provider_circuit_open_total"
+	providerCircuitSkippedTotalKey  = "provider_circuit_skipped_total"
+	providerCircuitCooldown         = 5 * time.Minute
 	aavePoolAddress                 = "0x794a61358d6845594f94dc1db02a252b5b4814ad"
 	wethAddress                     = "0x82af49447d8a07e3bd95bd0d56f35241523fbab1"
 	nativeUSDCAddress               = "0xaf88d065e77c8cc2239327c5edb3a432268e5831"
@@ -84,25 +87,28 @@ type SignalSink interface {
 }
 
 type State struct {
-	Schema              string            `json:"schema"`
-	DiscoverySHA256     string            `json:"discovery_sha256"`
-	SourceAddressCount  uint64            `json:"source_address_count"`
-	Cursor              uint64            `json:"cursor"`
-	LastBlockNumber     uint64            `json:"last_block_number"`
-	LastBlockHash       string            `json:"last_block_hash"`
-	LastProviderPrimary string            `json:"last_provider_primary"`
-	LastProviderSecond  string            `json:"last_provider_secondary"`
-	LastBatchAt         *time.Time        `json:"last_batch_at"`
-	LastTailAt          *time.Time        `json:"last_tail_at"`
-	LastDualAgreementAt *time.Time        `json:"last_dual_agreement_at,omitempty"`
-	TailNextBlock       uint64            `json:"tail_next_block"`
-	DebtBearingCount    uint64            `json:"debt_bearing_count"`
-	Counts              map[string]uint64 `json:"counts"`
-	ExactQueueCount     uint64            `json:"exact_queue_count"`
-	IncompleteCount     uint64            `json:"incomplete_count"`
-	LastErrorClass      string            `json:"last_error_class,omitempty"`
-	LastAttemptAt       *time.Time        `json:"last_attempt_at,omitempty"`
-	StartupRetryCount   uint64            `json:"startup_retry_count,omitempty"`
+	Schema                             string            `json:"schema"`
+	DiscoverySHA256                    string            `json:"discovery_sha256"`
+	SourceAddressCount                 uint64            `json:"source_address_count"`
+	Cursor                             uint64            `json:"cursor"`
+	LastBlockNumber                    uint64            `json:"last_block_number"`
+	LastBlockHash                      string            `json:"last_block_hash"`
+	LastProviderPrimary                string            `json:"last_provider_primary"`
+	LastProviderSecond                 string            `json:"last_provider_secondary"`
+	LastBatchAt                        *time.Time        `json:"last_batch_at"`
+	LastTailAt                         *time.Time        `json:"last_tail_at"`
+	LastDualAgreementAt                *time.Time        `json:"last_dual_agreement_at,omitempty"`
+	TailNextBlock                      uint64            `json:"tail_next_block"`
+	DebtBearingCount                   uint64            `json:"debt_bearing_count"`
+	Counts                             map[string]uint64 `json:"counts"`
+	ExactQueueCount                    uint64            `json:"exact_queue_count"`
+	IncompleteCount                    uint64            `json:"incomplete_count"`
+	LastErrorClass                     string            `json:"last_error_class,omitempty"`
+	LastAttemptAt                      *time.Time        `json:"last_attempt_at,omitempty"`
+	StartupRetryCount                  uint64            `json:"startup_retry_count,omitempty"`
+	ProviderCircuitOpenTotal           uint64            `json:"provider_circuit_open_total"`
+	ProviderCircuitSkippedTotal        uint64            `json:"provider_circuit_skipped_total"`
+	ProviderCircuitOpenUntilUnixMillis int64             `json:"provider_circuit_open_until_unix_millis"`
 }
 
 type Screener struct {
@@ -116,6 +122,7 @@ type Screener struct {
 	refreshCursor int
 	hotBorrowers  map[string]string
 	wait          func(context.Context, time.Duration) bool
+	now           func() time.Time
 }
 
 type gatewayErrorContract struct {
@@ -452,6 +459,7 @@ func New(config Config) (*Screener, error) {
 		config: config, client: &http.Client{Timeout: 35 * time.Second}, state: state,
 		debtBearing: make(map[string]bool), refreshKnown: make(map[string]bool),
 		hotBorrowers: make(map[string]string), wait: waitContext,
+		now: time.Now().UTC,
 	}
 	if err := s.loadState(); err != nil {
 		return nil, err
@@ -483,25 +491,39 @@ func (s *Screener) Run(ctx context.Context) error {
 		}
 	}
 	seedComplete := false
+	var pendingBatch []string
+	pendingAdvanceSeed := false
+runLoop:
 	for {
-		batch := make([]string, 0, s.config.BatchSize)
-		for !seedComplete && len(batch) < s.config.BatchSize {
-			address, nextErr := addresses.Next()
-			if errors.Is(nextErr, io.EOF) {
-				seedComplete = true
-				break
+		if wait := s.ProviderCircuitWaitDuration(); wait > 0 {
+			if err := s.recordProviderCircuitSkip(); err != nil {
+				return err
 			}
-			if nextErr != nil {
-				return nextErr
+			if !s.waitDuration(ctx, wait) {
+				return nil
 			}
-			batch = append(batch, address)
+			continue
 		}
-		advanceSeed := len(batch) > 0
-		if seedComplete && len(batch) == 0 {
-			batch = s.nextRefreshBatch()
+		if len(pendingBatch) == 0 {
+			pendingBatch = make([]string, 0, s.config.BatchSize)
+			for !seedComplete && len(pendingBatch) < s.config.BatchSize {
+				address, nextErr := addresses.Next()
+				if errors.Is(nextErr, io.EOF) {
+					seedComplete = true
+					break
+				}
+				if nextErr != nil {
+					return nextErr
+				}
+				pendingBatch = append(pendingBatch, address)
+			}
+			pendingAdvanceSeed = len(pendingBatch) > 0
+			if seedComplete && len(pendingBatch) == 0 {
+				pendingBatch = s.nextRefreshBatch()
+			}
 		}
-		if len(batch) > 0 {
-			attempt := func() error { return s.screen(ctx, batch, advanceSeed, nil) }
+		if len(pendingBatch) > 0 {
+			attempt := func() error { return s.screen(ctx, pendingBatch, pendingAdvanceSeed, nil) }
 			var screenErr error
 			if s.Snapshot().LastBatchAt == nil {
 				screenErr = s.screenWithStartupRetry(ctx, attempt)
@@ -520,11 +542,10 @@ func (s *Screener) Run(ctx context.Context) error {
 					s.recordError(gatewayErrorClass(screenErr, "rpc_gateway_screen_failure"))
 					return screenErr
 				}
-				if !s.waitDuration(ctx, s.config.Pace) {
-					return nil
-				}
 				continue
 			}
+			pendingBatch = nil
+			pendingAdvanceSeed = false
 		}
 		tailBorrowers, err := s.pollTail(ctx)
 		if err != nil {
@@ -538,9 +559,6 @@ func (s *Screener) Run(ctx context.Context) error {
 			if !retryable {
 				s.recordError(gatewayErrorClass(err, "rpc_gateway_tail_failure"))
 				return err
-			}
-			if !s.waitDuration(ctx, s.config.Pace) {
-				return nil
 			}
 			continue
 		}
@@ -561,7 +579,7 @@ func (s *Screener) Run(ctx context.Context) error {
 					s.recordError(gatewayErrorClass(err, "rpc_gateway_tail_screen_failure"))
 					return err
 				}
-				break
+				continue runLoop
 			}
 		}
 		if !s.waitDuration(ctx, s.config.Pace) {
@@ -668,6 +686,53 @@ func retryableStartupError(err error) (*gatewayResponseError, bool) {
 	return gatewayErr, retryable
 }
 
+func (s *Screener) nowUTC() time.Time {
+	if s.now != nil {
+		return s.now()
+	}
+	return time.Now().UTC()
+}
+
+func (s *Screener) providerCircuitIsOpenLocked(now time.Time) bool {
+	return s.state.ProviderCircuitOpenUntilUnixMillis > 0 && s.state.ProviderCircuitOpenUntilUnixMillis > now.UnixMilli()
+}
+
+func (s *Screener) ProviderCircuitWaitDuration() time.Duration {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	now := s.nowUTC()
+	if !s.providerCircuitIsOpenLocked(now) {
+		return 0
+	}
+	return time.Duration(s.state.ProviderCircuitOpenUntilUnixMillis-now.UnixMilli()) * time.Millisecond
+}
+
+func (s *Screener) IsProviderCircuitOpen() bool {
+	return s.ProviderCircuitWaitDuration() > 0
+}
+
+func (s *Screener) recordProviderCircuitSkip() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.state.ProviderCircuitSkippedTotal++
+	return s.persistStateLocked()
+}
+
+func (s *Screener) openProviderCircuit(class string) error {
+	now := s.nowUTC()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.openProviderCircuitLocked(now, class)
+}
+
+func (s *Screener) openProviderCircuitLocked(now time.Time, class string) error {
+	if !s.providerCircuitIsOpenLocked(now) {
+		s.state.ProviderCircuitOpenTotal++
+	}
+	s.state.ProviderCircuitOpenUntilUnixMillis = now.Add(providerCircuitCooldown).UnixMilli()
+	return s.recordProviderDegradationLocked(now, class)
+}
+
 // RecordRetryableGatewayError keeps broad hunting alive while a bounded
 // provider or Gateway budget recovers. It never grants exact authority and
 // propagates durable-state failures so they still terminate fail-closed.
@@ -676,7 +741,10 @@ func (s *Screener) RecordRetryableGatewayError(err error) (bool, error) {
 	if !retryable {
 		return false, nil
 	}
-	return true, s.recordProviderDegradation(class)
+	if err := s.openProviderCircuit(class); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 func retryableProviderError(err error) (string, bool) {
@@ -816,6 +884,12 @@ func (s *Screener) pollTail(ctx context.Context) ([]string, error) {
 
 func (s *Screener) HandleAtlasAuction(ctx context.Context, auction *observer.LedgerRecord) error {
 	if auction == nil || !auction.RelevantAaveAuction || auction.ChainID != 42161 {
+		return nil
+	}
+	if s.IsProviderCircuitOpen() {
+		if err := s.recordProviderCircuitSkip(); err != nil {
+			return err
+		}
 		return nil
 	}
 	if s.Snapshot().LastErrorClass != "" {
@@ -1332,7 +1406,8 @@ func newBigUint(value string) (*big.Int, bool) {
 func (s *Screener) recordError(class string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	now := time.Now().UTC()
+	now := s.nowUTC()
+	s.state.ProviderCircuitOpenUntilUnixMillis = 0
 	s.state.IncompleteCount++
 	s.state.LastErrorClass = class
 	s.state.LastAttemptAt = &now
@@ -1342,7 +1417,11 @@ func (s *Screener) recordError(class string) {
 func (s *Screener) recordProviderDegradation(class string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	now := time.Now().UTC()
+	now := s.nowUTC()
+	return s.recordProviderDegradationLocked(now, class)
+}
+
+func (s *Screener) recordProviderDegradationLocked(now time.Time, class string) error {
 	if s.state.Counts == nil {
 		s.state.Counts = make(map[string]uint64)
 	}
@@ -1362,6 +1441,7 @@ func (s *Screener) recordProviderRecoveryLocked(now time.Time) {
 	if s.state.Counts == nil {
 		s.state.Counts = make(map[string]uint64)
 	}
+	s.state.ProviderCircuitOpenUntilUnixMillis = 0
 	degradedSince := s.state.Counts[providerDegradedSinceMillisKey]
 	if degradedSince > 0 {
 		s.state.Counts[providerRecoverySuccessTotalKey]++

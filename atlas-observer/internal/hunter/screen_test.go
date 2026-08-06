@@ -185,6 +185,311 @@ func TestRetryableProviderFailureIsRecordedWithoutCandidateAuthority(t *testing.
 	}
 }
 
+func TestRetryableProviderErrorOpensCircuitForFiveMinutes(t *testing.T) {
+	now := time.Date(2026, 8, 6, 0, 0, 0, 0, time.UTC)
+	screener := &Screener{
+		config: Config{StateDir: t.TempDir()},
+		state:  State{Schema: StateSchema, Counts: map[string]uint64{}},
+		now:    func() time.Time { return now },
+	}
+	accepted, err := screener.RecordRetryableGatewayError(&gatewayResponseError{
+		statusCode: http.StatusServiceUnavailable,
+		class:      "provider_unavailable",
+		retryable:  true,
+	})
+	if err != nil || !accepted {
+		t.Fatalf("retryable class was not treated as circuit event: accepted=%t err=%v", accepted, err)
+	}
+	state := screener.Snapshot()
+	if state.ProviderCircuitOpenTotal != 1 || state.ProviderCircuitOpenUntilUnixMillis != now.Add(providerCircuitCooldown).UnixMilli() || !screener.IsProviderCircuitOpen() {
+		t.Fatalf("circuit did not open for expected duration: %+v", state)
+	}
+}
+
+func TestNonRetryableProviderErrorDoesNotOpenCircuit(t *testing.T) {
+	screener := &Screener{
+		config: Config{StateDir: t.TempDir()},
+		state:  State{Schema: StateSchema, Counts: map[string]uint64{}},
+		now:    time.Now().UTC,
+	}
+	accepted, err := screener.RecordRetryableGatewayError(&gatewayResponseError{
+		statusCode: http.StatusBadGateway,
+		class:      "provider_integrity_failure",
+		retryable:  false,
+	})
+	if err != nil || accepted {
+		t.Fatalf("non-retryable provider error should not open the circuit: accepted=%t err=%v", accepted, err)
+	}
+	state := screener.Snapshot()
+	if state.ProviderCircuitOpenTotal != 0 || state.ProviderCircuitOpenUntilUnixMillis != 0 {
+		t.Fatalf("non-retryable failure unexpectedly mutated circuit counters: %+v", state)
+	}
+}
+
+func TestProviderCircuitSkipsGatewayRequestsDuringCooldown(t *testing.T) {
+	directory := t.TempDir()
+	discovery := filepath.Join(directory, "discovery.json")
+	if err := os.WriteFile(discovery, []byte(`{"borrowers":["0x1111111111111111111111111111111111111111"]}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	current := time.Date(2026, 8, 6, 0, 0, 0, 0, time.UTC)
+	screenCalls := 0
+	tailCalls := 0
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if request.URL.Path == "/v1/aave/screen" {
+			screenCalls++
+		}
+		if request.URL.Path == "/v1/aave/tail" {
+			tailCalls++
+		}
+		t.Fatalf("request was sent during cooldown: %s", request.URL.Path)
+	}))
+	defer server.Close()
+	screener := &Screener{
+		config: Config{DiscoveryPath: discovery, GatewayURL: server.URL, StateDir: directory, BatchSize: 1, Pace: time.Second},
+		client: server.Client(),
+		wait: func(_ context.Context, _ time.Duration) bool {
+			return false
+		},
+		now: func() time.Time { return current },
+		state: State{
+			Schema:                             StateSchema,
+			Cursor:                             0,
+			Counts:                             map[string]uint64{},
+			LastBatchAt:                        &time.Time{},
+			ProviderCircuitOpenUntilUnixMillis: current.Add(providerCircuitCooldown).UnixMilli(),
+		},
+	}
+	if err := screener.Run(context.Background()); err != nil {
+		t.Fatalf("run should pause for provider circuit: %v", err)
+	}
+	if screenCalls != 0 || tailCalls != 0 || screener.Snapshot().ProviderCircuitSkippedTotal != 1 {
+		t.Fatalf("requests or skips were not counted correctly: screen=%d tail=%d state=%+v", screenCalls, tailCalls, screener.Snapshot())
+	}
+}
+
+func TestFailedNormalBatchIsRetriedOnceAfterCircuitCooldown(t *testing.T) {
+	directory := t.TempDir()
+	discovery := filepath.Join(directory, "discovery.json")
+	if err := os.WriteFile(discovery, []byte(`{"borrowers":["0x1111111111111111111111111111111111111111"]}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 8, 6, 0, 0, 0, 0, time.UTC)
+	clock := now
+	var waits []time.Duration
+	screenBatches := [][]string{}
+	lastBatchAt := now
+	screener := &Screener{
+		config: Config{
+			DiscoveryPath: discovery, StateDir: directory, GatewayURL: "unused",
+			BatchSize: 1, Pace: time.Second, StartingCursor: 0,
+		},
+		state: State{
+			Schema:      StateSchema,
+			Counts:      map[string]uint64{},
+			Cursor:      0,
+			LastBatchAt: &lastBatchAt,
+		},
+		hotBorrowers: make(map[string]string),
+		debtBearing:  make(map[string]bool),
+		refreshKnown: make(map[string]bool),
+		refreshOrder: nil,
+	}
+	screener.config.GatewayURL = ""
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		switch request.URL.Path {
+		case "/v1/aave/screen":
+			if len(screenBatches) >= 3 {
+				t.Fatalf("screen was retried too many times")
+			}
+			var input screenRequest
+			if err := json.NewDecoder(request.Body).Decode(&input); err != nil {
+				t.Fatal(err)
+			}
+			screenBatches = append(screenBatches, input.Borrowers)
+			switch len(screenBatches) {
+			case 1:
+				writer.WriteHeader(http.StatusServiceUnavailable)
+				_, _ = writer.Write([]byte(`{"error_class":"provider_unavailable","retryable":true}`))
+			case 2:
+				_ = json.NewEncoder(writer).Encode(screenResponse{
+					SchemaVersion: ResponseSchema,
+					ChainID:       42161,
+					RequestID:     input.RequestID,
+					BlockNumber:   491300000,
+					BlockHash:     "0x" + strings.Repeat("a", 64),
+					Primary: providerScreen{
+						ProviderID:    "production-nownodes-arbitrum",
+						WETHPriceBase: "300000000000",
+						Accounts:      []account{{Borrower: input.Borrowers[0], HealthFactorWAD: "1100000000000000000", TotalDebtBase: "1000000000000"}},
+					},
+					Secondary: providerScreen{
+						ProviderID:    "production-slot-0",
+						WETHPriceBase: "300000000000",
+						Accounts:      []account{{Borrower: input.Borrowers[0], HealthFactorWAD: "1100000000000000000", TotalDebtBase: "1000000000000"}},
+					},
+				})
+			default:
+				t.Fatalf("unexpected screen call: %d", len(screenBatches))
+			}
+		case "/v1/aave/tail":
+			var input tailRequest
+			if err := json.NewDecoder(request.Body).Decode(&input); err != nil {
+				t.Fatal(err)
+			}
+			_ = json.NewEncoder(writer).Encode(tailResponse{
+				SchemaVersion:        "phoenix.rpc.aave-tail-response.v1",
+				ChainID:              42161,
+				RequestID:            input.RequestID,
+				FinalizedBlockNumber: 491300000,
+				FinalizedBlockHash:   "0x" + strings.Repeat("a", 64),
+				PrimaryProviderID:    "production-nownodes-arbitrum",
+				SecondaryProviderID:  "production-slot-0",
+				FromBlock:            491300001,
+				ToBlock:              491300000,
+				NextBlock:            491300001,
+				Borrowers:            []string{},
+			})
+		default:
+			t.Fatalf("unexpected path: %s", request.URL.Path)
+		}
+	}))
+	defer server.Close()
+	screener.client = server.Client()
+	screener.config.GatewayURL = server.URL
+	screener.now = func() time.Time { return clock }
+	screener.wait = func(_ context.Context, delay time.Duration) bool {
+		waits = append(waits, delay)
+		if delay == providerCircuitCooldown {
+			clock = clock.Add(delay)
+			return true
+		}
+		return false
+	}
+	if err := screener.Run(context.Background()); err != nil {
+		t.Fatalf("run did not execute cooldown retry as expected: %v", err)
+	}
+	if len(screenBatches) != 2 {
+		t.Fatalf("expected one retry after cooldown: %v", screenBatches)
+	}
+	if screenBatches[0][0] != screenBatches[1][0] {
+		t.Fatalf("failed batch was not preserved: %v", screenBatches)
+	}
+	state := screener.Snapshot()
+	if state.Cursor != 1 || state.ProviderCircuitOpenUntilUnixMillis != 0 {
+		t.Fatalf("circuit did not recover correctly after retry: %+v", state)
+	}
+	cooldownWaits := 0
+	for _, delay := range waits {
+		if delay == providerCircuitCooldown {
+			cooldownWaits++
+		}
+	}
+	if cooldownWaits != 1 {
+		t.Fatalf("cooldown wait was not observed exactly once: %v", waits)
+	}
+	if state.ProviderCircuitOpenTotal != 1 || state.ProviderCircuitSkippedTotal != 1 {
+		t.Fatalf("circuit counters are inconsistent: %+v", state)
+	}
+}
+
+func TestSecondRetryableFailureReopensCircuitAfterCooldown(t *testing.T) {
+	directory := t.TempDir()
+	discovery := filepath.Join(directory, "discovery.json")
+	if err := os.WriteFile(discovery, []byte(`{"borrowers":["0x1111111111111111111111111111111111111111"]}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	clock := time.Date(2026, 8, 6, 0, 0, 0, 0, time.UTC)
+	screenAttempts := 0
+	var waits []time.Duration
+	screener := &Screener{
+		config: Config{
+			DiscoveryPath: discovery, StateDir: directory, GatewayURL: "unused",
+			BatchSize: 1, Pace: time.Second, StartingCursor: 0,
+		},
+		state: State{
+			Schema:      StateSchema,
+			Counts:      map[string]uint64{},
+			Cursor:      0,
+			LastBatchAt: &clock,
+		},
+		hotBorrowers: make(map[string]string),
+		debtBearing:  make(map[string]bool),
+		refreshKnown: make(map[string]bool),
+	}
+	screener.config.GatewayURL = ""
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if request.URL.Path != "/v1/aave/screen" {
+			t.Fatalf("unexpected path: %s", request.URL.Path)
+		}
+		screenAttempts++
+		writer.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = writer.Write([]byte(`{"error_class":"provider_unavailable","retryable":true}`))
+	}))
+	defer server.Close()
+	screener.client = server.Client()
+	screener.config.GatewayURL = server.URL
+	screener.now = func() time.Time { return clock }
+	waitCount := 0
+	screener.wait = func(_ context.Context, delay time.Duration) bool {
+		waits = append(waits, delay)
+		if delay != providerCircuitCooldown {
+			return false
+		}
+		waitCount++
+		if waitCount == 1 {
+			clock = clock.Add(delay)
+			return true
+		}
+		return false
+	}
+	if err := screener.Run(context.Background()); err != nil {
+		t.Fatalf("run did not stop after second cooldown start: %v", err)
+	}
+	if screenAttempts != 2 {
+		t.Fatalf("expected retryable failures to attempt exactly twice, got %d", screenAttempts)
+	}
+	state := screener.Snapshot()
+	if state.ProviderCircuitOpenTotal != 2 {
+		t.Fatalf("expected circuit reopen after second failure: %+v", state)
+	}
+	if len(waits) != 2 || waits[0] != providerCircuitCooldown || waits[1] != providerCircuitCooldown {
+		t.Fatalf("expected two cooldown waits: %v", waits)
+	}
+	if state.Cursor != 0 {
+		t.Fatalf("failed batch advanced during retry loop: %+v", state)
+	}
+}
+
+func TestAtlasHotScreensAreSkippedWhileCircuitIsOpen(t *testing.T) {
+	requests := 0
+	server := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		requests++
+	}))
+	defer server.Close()
+	now := time.Date(2026, 8, 6, 0, 0, 0, 0, time.UTC)
+	screener := &Screener{
+		config: Config{GatewayURL: server.URL, StateDir: t.TempDir()},
+		client: server.Client(),
+		state: State{
+			Schema:                             StateSchema,
+			Counts:                             map[string]uint64{},
+			ProviderCircuitOpenUntilUnixMillis: now.Add(providerCircuitCooldown).UnixMilli(),
+		},
+		hotBorrowers: map[string]string{"0x1111111111111111111111111111111111111111": "900000000000000000"},
+		now:          func() time.Time { return now },
+	}
+	if err := screener.HandleAtlasAuction(context.Background(), &observer.LedgerRecord{ChainID: 42161, RelevantAaveAuction: true}); err != nil {
+		t.Fatal(err)
+	}
+	if requests != 0 {
+		t.Fatalf("atlas hot screen bypassed circuit guardrail: requests=%d", requests)
+	}
+	if screener.Snapshot().ProviderCircuitSkippedTotal != 1 {
+		t.Fatalf("expected one skip, got %+v", screener.Snapshot())
+	}
+}
+
 type recordingSignalSink struct {
 	records []signal
 }
