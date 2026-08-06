@@ -459,7 +459,7 @@ func New(config Config) (*Screener, error) {
 		config: config, client: &http.Client{Timeout: 35 * time.Second}, state: state,
 		debtBearing: make(map[string]bool), refreshKnown: make(map[string]bool),
 		hotBorrowers: make(map[string]string), wait: waitContext,
-		now: time.Now().UTC,
+		now: func() time.Time { return time.Now().UTC() },
 	}
 	if err := s.loadState(); err != nil {
 		return nil, err
