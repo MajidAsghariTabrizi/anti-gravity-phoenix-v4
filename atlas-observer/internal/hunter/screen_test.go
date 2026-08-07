@@ -795,3 +795,50 @@ func TestBorrowerIndexIsDurableAndFailClosed(t *testing.T) {
 		t.Fatal("inactive borrower remained debt-bearing")
 	}
 }
+
+func TestGatewayBudgetExhaustionUsesShortCircuitCooldown(t *testing.T) {
+	now := time.Date(2026, 8, 7, 0, 0, 0, 0, time.UTC)
+	screener := &Screener{
+		config: Config{StateDir: t.TempDir()},
+		state:  State{Schema: StateSchema, Counts: map[string]uint64{}},
+		now:    func() time.Time { return now },
+	}
+	accepted, err := screener.RecordRetryableGatewayError(&gatewayResponseError{
+		statusCode: http.StatusTooManyRequests,
+		class:      "upstream_call_budget_exhausted",
+		retryable:  true,
+	})
+	if err != nil || !accepted {
+		t.Fatalf("local gateway budget exhaustion was not accepted: accepted=%t err=%v", accepted, err)
+	}
+	state := screener.Snapshot()
+	if gatewayBudgetCircuitCooldown >= providerCircuitCooldown {
+		t.Fatalf("local budget cooldown must remain shorter than provider cooldown")
+	}
+	if state.ProviderCircuitOpenTotal != 1 ||
+		state.ProviderCircuitOpenUntilUnixMillis != now.Add(gatewayBudgetCircuitCooldown).UnixMilli() ||
+		state.LastErrorClass != "provider_rate_limited" {
+		t.Fatalf("local gateway budget did not use bounded short cooldown: %+v", state)
+	}
+}
+
+func TestSecondaryRateLimitStillUsesFiveMinuteProviderCooldown(t *testing.T) {
+	now := time.Date(2026, 8, 7, 0, 0, 0, 0, time.UTC)
+	screener := &Screener{
+		config: Config{StateDir: t.TempDir()},
+		state:  State{Schema: StateSchema, Counts: map[string]uint64{}},
+		now:    func() time.Time { return now },
+	}
+	accepted, err := screener.RecordRetryableGatewayError(&gatewayResponseError{
+		statusCode: http.StatusTooManyRequests,
+		class:      "secondary_rate_limited",
+		retryable:  true,
+	})
+	if err != nil || !accepted {
+		t.Fatalf("secondary rate limit was not accepted: accepted=%t err=%v", accepted, err)
+	}
+	state := screener.Snapshot()
+	if state.ProviderCircuitOpenUntilUnixMillis != now.Add(providerCircuitCooldown).UnixMilli() {
+		t.Fatalf("external provider rate limit lost five-minute protection: %+v", state)
+	}
+}

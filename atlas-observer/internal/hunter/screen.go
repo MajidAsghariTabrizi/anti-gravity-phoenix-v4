@@ -49,6 +49,7 @@ const (
 	providerCircuitOpenTotalKey     = "provider_circuit_open_total"
 	providerCircuitSkippedTotalKey  = "provider_circuit_skipped_total"
 	providerCircuitCooldown         = 5 * time.Minute
+	gatewayBudgetCircuitCooldown    = 30 * time.Second
 	aavePoolAddress                 = "0x794a61358d6845594f94dc1db02a252b5b4814ad"
 	wethAddress                     = "0x82af49447d8a07e3bd95bd0d56f35241523fbab1"
 	nativeUSDCAddress               = "0xaf88d065e77c8cc2239327c5edb3a432268e5831"
@@ -718,63 +719,75 @@ func (s *Screener) recordProviderCircuitSkip() error {
 	return s.persistStateLocked()
 }
 
-func (s *Screener) openProviderCircuit(class string) error {
+func (s *Screener) openProviderCircuit(class string, cooldown time.Duration) error {
 	now := s.nowUTC()
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.openProviderCircuitLocked(now, class)
+	return s.openProviderCircuitLocked(now, class, cooldown)
 }
 
-func (s *Screener) openProviderCircuitLocked(now time.Time, class string) error {
+func (s *Screener) openProviderCircuitLocked(now time.Time, class string, cooldown time.Duration) error {
+	if cooldown <= 0 {
+		cooldown = providerCircuitCooldown
+	}
 	if !s.providerCircuitIsOpenLocked(now) {
 		s.state.ProviderCircuitOpenTotal++
 	}
-	s.state.ProviderCircuitOpenUntilUnixMillis = now.Add(providerCircuitCooldown).UnixMilli()
+	s.state.ProviderCircuitOpenUntilUnixMillis = now.Add(cooldown).UnixMilli()
 	return s.recordProviderDegradationLocked(now, class)
 }
 
-// RecordRetryableGatewayError keeps broad hunting alive while a bounded
-// provider or Gateway budget recovers. It never grants exact authority and
-// propagates durable-state failures so they still terminate fail-closed.
+// RecordRetryableGatewayError keeps exact authority fail-closed while applying
+// different recovery windows to external provider failures and local Gateway
+// budget pressure. Local token-bucket exhaustion is bounded by the Gateway
+// itself and must not turn a seconds-long refill into a five-minute outage.
 func (s *Screener) RecordRetryableGatewayError(err error) (bool, error) {
-	class, retryable := retryableProviderError(err)
+	class, cooldown, retryable := retryableProviderError(err)
 	if !retryable {
 		return false, nil
 	}
-	if err := s.openProviderCircuit(class); err != nil {
+	if err := s.openProviderCircuit(class, cooldown); err != nil {
 		return false, err
 	}
 	return true, nil
 }
 
-func retryableProviderError(err error) (string, bool) {
+func retryableProviderError(err error) (string, time.Duration, bool) {
 	if errors.Is(err, context.Canceled) {
-		return "", false
+		return "", 0, false
 	}
 	var gatewayErr *gatewayResponseError
 	if errors.As(err, &gatewayErr) {
 		switch gatewayErr.class {
 		case "provider_disagreement":
-			return "provider_disagreement", gatewayErr.statusCode == http.StatusConflict || gatewayErr.statusCode == http.StatusBadGateway
+			return "provider_disagreement", providerCircuitCooldown,
+				gatewayErr.statusCode == http.StatusConflict || gatewayErr.statusCode == http.StatusBadGateway
 		case "provider_unavailable":
-			return "provider_unavailable", gatewayErr.statusCode == http.StatusServiceUnavailable
+			return "provider_unavailable", providerCircuitCooldown,
+				gatewayErr.statusCode == http.StatusServiceUnavailable
 		case "provider_timeout", "secondary_timeout":
-			return "provider_timeout", gatewayErr.statusCode == http.StatusRequestTimeout || gatewayErr.statusCode == http.StatusBadGateway || gatewayErr.statusCode == http.StatusServiceUnavailable || gatewayErr.statusCode == http.StatusGatewayTimeout
+			return "provider_timeout", providerCircuitCooldown,
+				gatewayErr.statusCode == http.StatusRequestTimeout ||
+					gatewayErr.statusCode == http.StatusBadGateway ||
+					gatewayErr.statusCode == http.StatusServiceUnavailable ||
+					gatewayErr.statusCode == http.StatusGatewayTimeout
 		case "provider_rate_limited", "secondary_rate_limited":
-			return "provider_rate_limited", gatewayErr.statusCode == http.StatusTooManyRequests || gatewayErr.statusCode == http.StatusServiceUnavailable
+			return "provider_rate_limited", providerCircuitCooldown,
+				gatewayErr.statusCode == http.StatusTooManyRequests ||
+					gatewayErr.statusCode == http.StatusServiceUnavailable
 		case "state_request_budget_exhausted", "upstream_call_budget_exhausted":
-			return "provider_rate_limited", gatewayErr.statusCode == http.StatusTooManyRequests && gatewayErr.retryable
+			return "provider_rate_limited", gatewayBudgetCircuitCooldown,
+				gatewayErr.statusCode == http.StatusTooManyRequests && gatewayErr.retryable
 		default:
-			return "", false
+			return "", 0, false
 		}
 	}
 	var networkErr net.Error
 	if errors.As(err, &networkErr) && networkErr.Timeout() {
-		return "provider_timeout", true
+		return "provider_timeout", providerCircuitCooldown, true
 	}
-	return "", false
+	return "", 0, false
 }
-
 func gatewayErrorClass(err error, fallback string) string {
 	var gatewayErr *gatewayResponseError
 	if errors.As(err, &gatewayErr) && errorClassPattern.MatchString(gatewayErr.class) {
