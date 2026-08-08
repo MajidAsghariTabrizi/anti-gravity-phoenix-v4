@@ -996,3 +996,61 @@ func TestProfitEdgeReserveDoesNotAmplifyNegativeExpectedPnL(t *testing.T) {
 		)
 	}
 }
+func TestRouteAwareExactBudgetLearnsPairIneligibility(t *testing.T) {
+	eligible := []exactReserve{
+		{
+			Asset:               wethAddress,
+			CurrentStableDebt:   "0",
+			CurrentVariableDebt: "2500000000000000",
+		},
+		{
+			Asset:                    nativeUSDCAddress,
+			CurrentATokenBalance:     "1000000000",
+			UsageAsCollateralEnabled: true,
+		},
+	}
+	if got := exactRouteIneligibleReason(eligible); got != "" {
+		t.Fatalf("eligible pair unexpectedly rejected: %q", got)
+	}
+
+	noWETHDebt := append([]exactReserve(nil), eligible...)
+	noWETHDebt[0].CurrentVariableDebt = "0"
+	if got := exactRouteIneligibleReason(noWETHDebt); got != "no_weth_debt" {
+		t.Fatalf("unexpected no-WETH-debt diagnostic: %q", got)
+	}
+
+	noUSDC := append([]exactReserve(nil), eligible...)
+	noUSDC[1].CurrentATokenBalance = "0"
+	if got := exactRouteIneligibleReason(noUSDC); got != "no_native_usdc_collateral" {
+		t.Fatalf("unexpected no-USDC-collateral diagnostic: %q", got)
+	}
+
+	notCollateral := append([]exactReserve(nil), eligible...)
+	notCollateral[1].UsageAsCollateralEnabled = false
+	if got := exactRouteIneligibleReason(notCollateral); got != "native_usdc_not_collateral" {
+		t.Fatalf("unexpected collateral-disabled diagnostic: %q", got)
+	}
+}
+
+func TestRouteAwareExactBudgetDeprioritizesKnownIneligibleBorrower(t *testing.T) {
+	ineligible := "0x1111111111111111111111111111111111111111"
+	unknown := "0x2222222222222222222222222222222222222222"
+
+	screener := &Screener{
+		hotBorrowers: map[string]string{
+			ineligible: "900000000000000000",
+			unknown:    "990000000000000000",
+		},
+		hotDebtBase: map[string]string{
+			ineligible: "1000000000",
+			unknown:    "100",
+		},
+		routeIneligible: map[string]string{
+			ineligible: "no_weth_debt",
+		},
+	}
+	batch := screener.nextHotBatch()
+	if len(batch) != 2 || batch[0] != unknown || batch[1] != ineligible {
+		t.Fatalf("route-ineligible borrower was not deferred: %v", batch)
+	}
+}

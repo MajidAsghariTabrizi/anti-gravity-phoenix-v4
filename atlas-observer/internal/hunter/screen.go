@@ -52,6 +52,8 @@ const (
 	gatewayBudgetCircuitCooldown    = 30 * time.Second
 	exactBorrowerCooldown           = 2 * time.Minute
 	exactDeferredCooldownKey        = "exact_deferred_cooldown_total"
+	exactDeferredRouteIneligibleKey = "exact_deferred_route_ineligible_total"
+	exactRouteIneligibleObservedKey = "exact_route_ineligible_observed_total"
 	edgeReserveExpectedPositiveKey  = "edge_reserve_expected_positive_total"
 	edgeReserveLegacyPassKey        = "edge_reserve_legacy_pass_total"
 	edgeReserveCorrectedPassKey     = "edge_reserve_corrected_pass_total"
@@ -119,19 +121,20 @@ type State struct {
 }
 
 type Screener struct {
-	config        Config
-	client        *http.Client
-	mu            sync.Mutex
-	state         State
-	debtBearing   map[string]bool
-	refreshKnown  map[string]bool
-	refreshOrder  []string
-	refreshCursor int
-	hotBorrowers  map[string]string
-	hotDebtBase   map[string]string
-	lastExactAt   map[string]time.Time
-	wait          func(context.Context, time.Duration) bool
-	now           func() time.Time
+	config          Config
+	client          *http.Client
+	mu              sync.Mutex
+	state           State
+	debtBearing     map[string]bool
+	refreshKnown    map[string]bool
+	refreshOrder    []string
+	refreshCursor   int
+	hotBorrowers    map[string]string
+	hotDebtBase     map[string]string
+	lastExactAt     map[string]time.Time
+	routeIneligible map[string]string
+	wait            func(context.Context, time.Duration) bool
+	now             func() time.Time
 }
 
 type gatewayErrorContract struct {
@@ -228,9 +231,18 @@ type exactLiquidation struct {
 	UniswapFee3000OutputWETH string `json:"uniswap_v3_fee_3000_output_weth"`
 }
 
+type exactReserve struct {
+	Asset                    string `json:"asset"`
+	CurrentATokenBalance     string `json:"current_a_token_balance"`
+	CurrentStableDebt        string `json:"current_stable_debt"`
+	CurrentVariableDebt      string `json:"current_variable_debt"`
+	UsageAsCollateralEnabled bool   `json:"usage_as_collateral_enabled"`
+}
+
 type exactProvider struct {
 	ProviderID  string            `json:"provider_id"`
 	Account     account           `json:"account"`
+	Reserves    []exactReserve    `json:"reserves"`
 	Liquidation *exactLiquidation `json:"liquidation"`
 }
 
@@ -257,6 +269,7 @@ type signal struct {
 	Bucket                            string              `json:"bucket"`
 	Authority                         bool                `json:"candidate_authority"`
 	ExactDeferredReason               string              `json:"exact_deferred_reason,omitempty"`
+	ExactRouteIneligibleReason        string              `json:"exact_route_ineligible_reason,omitempty"`
 	ZeroCostProfitUpperBoundWei       string              `json:"zero_cost_profit_upper_bound_wei,omitempty"`
 	ExpectedNetPnLWei                 string              `json:"expected_net_pnl_wei,omitempty"`
 	ConservativeNetPnLWei             string              `json:"conservative_net_pnl_wei,omitempty"`
@@ -473,8 +486,9 @@ func New(config Config) (*Screener, error) {
 		config: config, client: &http.Client{Timeout: 35 * time.Second}, state: state,
 		debtBearing: make(map[string]bool), refreshKnown: make(map[string]bool),
 		hotBorrowers: make(map[string]string), hotDebtBase: make(map[string]string),
-		lastExactAt: make(map[string]time.Time), wait: waitContext,
-		now: func() time.Time { return time.Now().UTC() },
+		lastExactAt: make(map[string]time.Time), routeIneligible: make(map[string]string),
+		wait: waitContext,
+		now:  func() time.Time { return time.Now().UTC() },
 	}
 	if err := s.loadState(); err != nil {
 		return nil, err
@@ -901,8 +915,10 @@ func (s *Screener) pollTail(ctx context.Context) ([]string, error) {
 			return nil, err
 		}
 		// A new Borrow/Repay/Liquidation event is a material state change and
-		// immediately invalidates the borrower-level Exact cooldown.
+		// immediately invalidates both the short Exact cooldown and any
+		// route-ineligibility learned from a prior Exact reserve snapshot.
 		delete(s.lastExactAt, borrower)
+		delete(s.routeIneligible, borrower)
 	}
 	now := time.Now().UTC()
 	s.state.TailNextBlock = result.NextBlock
@@ -1024,16 +1040,25 @@ func prioritizedAccountOrder(accounts []account) []int {
 func (s *Screener) nextHotBatch() []string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	type entry struct{ borrower, hf, debt string }
+	type entry struct {
+		borrower        string
+		hf              string
+		debt            string
+		routeIneligible bool
+	}
 	entries := make([]entry, 0, len(s.hotBorrowers))
 	for borrower, hf := range s.hotBorrowers {
 		entries = append(entries, entry{
-			borrower: borrower,
-			hf:       hf,
-			debt:     s.hotDebtBase[borrower],
+			borrower:        borrower,
+			hf:              hf,
+			debt:            s.hotDebtBase[borrower],
+			routeIneligible: s.routeIneligible[borrower] != "",
 		})
 	}
 	sort.Slice(entries, func(i, j int) bool {
+		if entries[i].routeIneligible != entries[j].routeIneligible {
+			return !entries[i].routeIneligible
+		}
 		return liquidationPriorityLess(
 			entries[i].debt,
 			entries[i].hf,
@@ -1094,6 +1119,7 @@ func (s *Screener) screen(ctx context.Context, borrowers []string, advanceSeed b
 			delete(s.hotBorrowers, primary.Borrower)
 			delete(s.hotDebtBase, primary.Borrower)
 			delete(s.lastExactAt, primary.Borrower)
+			delete(s.routeIneligible, primary.Borrower)
 		}
 		if err := s.updateBorrowerActivityLocked(primary.Borrower, primary.TotalDebtBase != "0"); err != nil {
 			return err
@@ -1117,8 +1143,16 @@ func (s *Screener) screen(ctx context.Context, borrowers []string, advanceSeed b
 		}
 		if record.TerminalOutcome == "exact_pending" && !exactAuthorityWasDegraded {
 			now := s.nowUTC()
+			routeReason, knownRouteIneligible := s.routeIneligible[primary.Borrower]
 			lastExact, recentlyResolved := s.lastExactAt[primary.Borrower]
-			if recentlyResolved && !now.Before(lastExact) && now.Sub(lastExact) < exactBorrowerCooldown {
+			if knownRouteIneligible {
+				record.ExactDeferredReason = "route_ineligible_until_tail"
+				record.ExactRouteIneligibleReason = routeReason
+				if s.state.Counts == nil {
+					s.state.Counts = make(map[string]uint64)
+				}
+				s.state.Counts[exactDeferredRouteIneligibleKey]++
+			} else if recentlyResolved && !now.Before(lastExact) && now.Sub(lastExact) < exactBorrowerCooldown {
 				record.ExactDeferredReason = "borrower_cooldown"
 				if s.state.Counts == nil {
 					s.state.Counts = make(map[string]uint64)
@@ -1131,6 +1165,13 @@ func (s *Screener) screen(ctx context.Context, borrowers []string, advanceSeed b
 				}
 				record = exactRecord
 				s.lastExactAt[primary.Borrower] = now
+				if record.ExactRouteIneligibleReason != "" {
+					s.routeIneligible[primary.Borrower] = record.ExactRouteIneligibleReason
+					if s.state.Counts == nil {
+						s.state.Counts = make(map[string]uint64)
+					}
+					s.state.Counts[exactRouteIneligibleObservedKey]++
+				}
 			}
 		}
 		if err := appendJSON(filepath.Join(s.config.StateDir, "signals.ndjson"), record); err != nil {
@@ -1163,6 +1204,54 @@ func (s *Screener) screen(ctx context.Context, borrowers []string, advanceSeed b
 	return s.persistStateLocked()
 }
 
+func equalExactReserves(first, second []exactReserve) bool {
+	if len(first) != len(second) {
+		return false
+	}
+	for index := range first {
+		if first[index] != second[index] {
+			return false
+		}
+	}
+	return true
+}
+
+func exactRouteIneligibleReason(reserves []exactReserve) string {
+	var wethDebt *big.Int
+	var nativeUSDCCollateral *big.Int
+	nativeUSDCCollateralEnabled := false
+
+	for _, reserve := range reserves {
+		switch strings.ToLower(reserve.Asset) {
+		case wethAddress:
+			stable, stableOK := newBigUint(reserve.CurrentStableDebt)
+			variable, variableOK := newBigUint(reserve.CurrentVariableDebt)
+			if !stableOK || !variableOK {
+				return ""
+			}
+			wethDebt = new(big.Int).Add(stable, variable)
+		case nativeUSDCAddress:
+			balance, balanceOK := newBigUint(reserve.CurrentATokenBalance)
+			if !balanceOK {
+				return ""
+			}
+			nativeUSDCCollateral = balance
+			nativeUSDCCollateralEnabled = reserve.UsageAsCollateralEnabled
+		}
+	}
+
+	if wethDebt == nil || wethDebt.Sign() == 0 {
+		return "no_weth_debt"
+	}
+	if nativeUSDCCollateral == nil || nativeUSDCCollateral.Sign() == 0 {
+		return "no_native_usdc_collateral"
+	}
+	if !nativeUSDCCollateralEnabled {
+		return "native_usdc_not_collateral"
+	}
+	return ""
+}
+
 func (s *Screener) resolveExact(ctx context.Context, record signal, auction *observer.LedgerRecord) (signal, error) {
 	requestID := fmt.Sprintf("aave-exact-%d-%d", record.Cursor, time.Now().UnixMilli())
 	body, _ := json.Marshal(exactRequest{SchemaVersion: "phoenix.rpc.aave-exact-request.v1", ChainID: 42161, RequestID: requestID, Borrower: record.Borrower})
@@ -1183,7 +1272,7 @@ func (s *Screener) resolveExact(ctx context.Context, record signal, auction *obs
 	if err := json.NewDecoder(io.LimitReader(response.Body, maximumResponse)).Decode(&result); err != nil {
 		return record, err
 	}
-	if result.SchemaVersion != "phoenix.rpc.aave-exact-response.v1" || result.ChainID != 42161 || result.RequestID != requestID || result.BlockNumber == 0 || result.BlockHash == "" || result.StateRoot == "" || result.Primary.ProviderID == result.Secondary.ProviderID || result.Primary.Account != result.Secondary.Account || !equalLiquidation(result.Primary.Liquidation, result.Secondary.Liquidation) {
+	if result.SchemaVersion != "phoenix.rpc.aave-exact-response.v1" || result.ChainID != 42161 || result.RequestID != requestID || result.BlockNumber == 0 || result.BlockHash == "" || result.StateRoot == "" || result.Primary.ProviderID == result.Secondary.ProviderID || result.Primary.Account != result.Secondary.Account || !equalExactReserves(result.Primary.Reserves, result.Secondary.Reserves) || !equalLiquidation(result.Primary.Liquidation, result.Secondary.Liquidation) {
 		return record, errors.New("exact Aave provider evidence is incomplete")
 	}
 	record.Block = result.BlockNumber
@@ -1191,6 +1280,7 @@ func (s *Screener) resolveExact(ctx context.Context, record signal, auction *obs
 	record.StateRoot = result.StateRoot
 	liquidation := result.Primary.Liquidation
 	if liquidation == nil {
+		record.ExactRouteIneligibleReason = exactRouteIneligibleReason(result.Primary.Reserves)
 		record.TerminalOutcome = "economic_rejection"
 		return record, nil
 	}
@@ -1825,6 +1915,9 @@ func (s *Screener) ensureHotMapsLocked() {
 	if s.lastExactAt == nil {
 		s.lastExactAt = make(map[string]time.Time)
 	}
+	if s.routeIneligible == nil {
+		s.routeIneligible = make(map[string]string)
+	}
 }
 
 func (s *Screener) applyHotSignal(record signal) {
@@ -1842,6 +1935,7 @@ func (s *Screener) applyHotSignal(record signal) {
 		delete(s.hotBorrowers, record.Borrower)
 		delete(s.hotDebtBase, record.Borrower)
 		delete(s.lastExactAt, record.Borrower)
+		delete(s.routeIneligible, record.Borrower)
 	}
 }
 
