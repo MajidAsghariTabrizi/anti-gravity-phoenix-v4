@@ -94,9 +94,9 @@ services:
       RPC_UPSTREAM_CALLS_PER_SECOND: ${RPC_UPSTREAM_CALLS_PER_SECOND:-1}
       # Two cold provider identity checks, two finalized heads, and two Aave
       # Multicalls must fit atomically without increasing the sustained rate.
-      RPC_UPSTREAM_CALL_BURST: "8"
+      RPC_UPSTREAM_CALL_BURST: "${RPC_UPSTREAM_CALL_BURST:-16}"
       RPC_STATE_REQUESTS_PER_MINUTE: ${RPC_STATE_REQUESTS_PER_MINUTE:-12}
-      RPC_PROVIDER_PROBE_INTERVAL_SECONDS: ${RPC_PROVIDER_PROBE_INTERVAL_SECONDS:-60}
+      RPC_PROVIDER_PROBE_INTERVAL_SECONDS: "${RPC_PROVIDER_PROBE_INTERVAL_SECONDS:-300}"
     volumes:
       - type: bind
         source: /etc/phoenix/secrets/phoenix-rpc-provider-slot-1-api-key

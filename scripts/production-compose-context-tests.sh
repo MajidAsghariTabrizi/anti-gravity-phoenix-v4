@@ -46,6 +46,18 @@ if grep -F -- '--economic-reserve-bps=500' "$compose_file" >/dev/null; then
   fail "legacy Atlas gross-notional reserve resurfaced in release Compose"
 fi
 
+# The observed stable Production RPC tuning must survive immutable release rendering.
+grep -F -- 'RPC_UPSTREAM_CALL_BURST: "${RPC_UPSTREAM_CALL_BURST:-16}"' "$compose_file" >/dev/null ||
+  fail "RPC upstream burst default drifted from observed stable Production tuning"
+grep -F -- 'RPC_PROVIDER_PROBE_INTERVAL_SECONDS: "${RPC_PROVIDER_PROBE_INTERVAL_SECONDS:-300}"' "$compose_file" >/dev/null ||
+  fail "RPC provider probe default drifted from observed stable Production tuning"
+if grep -F -- 'RPC_UPSTREAM_CALL_BURST: "8"' "$compose_file" >/dev/null; then
+  fail "legacy RPC upstream burst resurfaced in release Compose"
+fi
+if grep -F -- 'RPC_PROVIDER_PROBE_INTERVAL_SECONDS: ${RPC_PROVIDER_PROBE_INTERVAL_SECONDS:-60}' "$compose_file" >/dev/null; then
+  fail "legacy RPC provider probe cadence resurfaced in release Compose"
+fi
+
 cat >"$manifest" <<EOF
 {
   "schema": "phoenix.release.v1",
