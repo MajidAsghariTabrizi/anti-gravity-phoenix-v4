@@ -50,6 +50,8 @@ const (
 	providerCircuitSkippedTotalKey  = "provider_circuit_skipped_total"
 	providerCircuitCooldown         = 5 * time.Minute
 	gatewayBudgetCircuitCooldown    = 30 * time.Second
+	exactBorrowerCooldown           = 2 * time.Minute
+	exactDeferredCooldownKey        = "exact_deferred_cooldown_total"
 	edgeReserveExpectedPositiveKey  = "edge_reserve_expected_positive_total"
 	edgeReserveLegacyPassKey        = "edge_reserve_legacy_pass_total"
 	edgeReserveCorrectedPassKey     = "edge_reserve_corrected_pass_total"
@@ -126,6 +128,8 @@ type Screener struct {
 	refreshOrder  []string
 	refreshCursor int
 	hotBorrowers  map[string]string
+	hotDebtBase   map[string]string
+	lastExactAt   map[string]time.Time
 	wait          func(context.Context, time.Duration) bool
 	now           func() time.Time
 }
@@ -252,6 +256,7 @@ type signal struct {
 	HF                                string              `json:"health_factor_wad"`
 	Bucket                            string              `json:"bucket"`
 	Authority                         bool                `json:"candidate_authority"`
+	ExactDeferredReason               string              `json:"exact_deferred_reason,omitempty"`
 	ZeroCostProfitUpperBoundWei       string              `json:"zero_cost_profit_upper_bound_wei,omitempty"`
 	ExpectedNetPnLWei                 string              `json:"expected_net_pnl_wei,omitempty"`
 	ConservativeNetPnLWei             string              `json:"conservative_net_pnl_wei,omitempty"`
@@ -467,7 +472,8 @@ func New(config Config) (*Screener, error) {
 	s := &Screener{
 		config: config, client: &http.Client{Timeout: 35 * time.Second}, state: state,
 		debtBearing: make(map[string]bool), refreshKnown: make(map[string]bool),
-		hotBorrowers: make(map[string]string), wait: waitContext,
+		hotBorrowers: make(map[string]string), hotDebtBase: make(map[string]string),
+		lastExactAt: make(map[string]time.Time), wait: waitContext,
 		now: func() time.Time { return time.Now().UTC() },
 	}
 	if err := s.loadState(); err != nil {
@@ -889,10 +895,14 @@ func (s *Screener) pollTail(ctx context.Context) ([]string, error) {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.ensureHotMapsLocked()
 	for _, borrower := range result.Borrowers {
 		if err := s.updateBorrowerActivityLocked(borrower, true); err != nil {
 			return nil, err
 		}
+		// A new Borrow/Repay/Liquidation event is a material state change and
+		// immediately invalidates the borrower-level Exact cooldown.
+		delete(s.lastExactAt, borrower)
 	}
 	now := time.Now().UTC()
 	s.state.TailNextBlock = result.NextBlock
@@ -923,21 +933,115 @@ func (s *Screener) HandleAtlasAuction(ctx context.Context, auction *observer.Led
 	return s.screen(ctx, borrowers, false, auction)
 }
 
+func liquidationPriorityRank(debt, hf string) int {
+	switch classify(debt, hf) {
+	case "liquidatable":
+		return 0
+	case "urgent":
+		return 1
+	case "watch":
+		return 2
+	default:
+		return 3
+	}
+}
+
+func liquidationPriorityLess(
+	leftDebt, leftHF, leftBorrower string,
+	rightDebt, rightHF, rightBorrower string,
+) bool {
+	leftRank := liquidationPriorityRank(leftDebt, leftHF)
+	rightRank := liquidationPriorityRank(rightDebt, rightHF)
+	if leftRank != rightRank {
+		return leftRank < rightRank
+	}
+
+	leftDebtValue, leftDebtOK := newBigUint(leftDebt)
+	rightDebtValue, rightDebtOK := newBigUint(rightDebt)
+	leftHFValue, leftHFOK := newBigUint(leftHF)
+	rightHFValue, rightHFOK := newBigUint(rightHF)
+
+	compareDebt := func() (bool, bool) {
+		if leftDebtOK != rightDebtOK {
+			return leftDebtOK, true
+		}
+		if leftDebtOK && rightDebtOK && leftDebtValue.Cmp(rightDebtValue) != 0 {
+			return leftDebtValue.Cmp(rightDebtValue) > 0, true
+		}
+		return false, false
+	}
+	compareHF := func() (bool, bool) {
+		if leftHFOK != rightHFOK {
+			return leftHFOK, true
+		}
+		if leftHFOK && rightHFOK && leftHFValue.Cmp(rightHFValue) != 0 {
+			return leftHFValue.Cmp(rightHFValue) < 0, true
+		}
+		return false, false
+	}
+
+	// Once a borrower is liquidatable, larger repay capacity is the first
+	// economic discriminator. For near-liquidation buckets, health factor
+	// remains the first urgency discriminator.
+	if leftRank == 0 {
+		if result, decided := compareDebt(); decided {
+			return result
+		}
+		if result, decided := compareHF(); decided {
+			return result
+		}
+	} else {
+		if result, decided := compareHF(); decided {
+			return result
+		}
+		if result, decided := compareDebt(); decided {
+			return result
+		}
+	}
+	return leftBorrower < rightBorrower
+}
+
+func prioritizedAccountOrder(accounts []account) []int {
+	order := make([]int, len(accounts))
+	for index := range accounts {
+		order[index] = index
+	}
+	sort.SliceStable(order, func(i, j int) bool {
+		left := accounts[order[i]]
+		right := accounts[order[j]]
+		return liquidationPriorityLess(
+			left.TotalDebtBase,
+			left.HealthFactorWAD,
+			left.Borrower,
+			right.TotalDebtBase,
+			right.HealthFactorWAD,
+			right.Borrower,
+		)
+	})
+	return order
+}
+
 func (s *Screener) nextHotBatch() []string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	type entry struct{ borrower, hf string }
+	type entry struct{ borrower, hf, debt string }
 	entries := make([]entry, 0, len(s.hotBorrowers))
 	for borrower, hf := range s.hotBorrowers {
-		entries = append(entries, entry{borrower, hf})
+		entries = append(entries, entry{
+			borrower: borrower,
+			hf:       hf,
+			debt:     s.hotDebtBase[borrower],
+		})
 	}
 	sort.Slice(entries, func(i, j int) bool {
-		first, firstOK := newBigUint(entries[i].hf)
-		second, secondOK := newBigUint(entries[j].hf)
-		if firstOK && secondOK && first.Cmp(second) != 0 {
-			return first.Cmp(second) < 0
-		}
-		return entries[i].borrower < entries[j].borrower
+		return liquidationPriorityLess(
+			entries[i].debt,
+			entries[i].hf,
+			entries[i].borrower,
+			entries[j].debt,
+			entries[j].hf,
+			entries[j].borrower,
+		)
 	})
 	if len(entries) > MaximumBatch {
 		entries = entries[:MaximumBatch]
@@ -975,16 +1079,21 @@ func (s *Screener) screen(ctx context.Context, borrowers []string, advanceSeed b
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.ensureHotMapsLocked()
 	exactAuthorityWasDegraded := s.state.LastErrorClass != ""
-	for index, primary := range result.Primary.Accounts {
+	for _, index := range prioritizedAccountOrder(result.Primary.Accounts) {
+		primary := result.Primary.Accounts[index]
 		if primary != result.Secondary.Accounts[index] || primary.Borrower != borrowers[index] {
 			return errors.New("gateway Aave providers disagree")
 		}
 		bucket := classify(primary.TotalDebtBase, primary.HealthFactorWAD)
 		if bucket == "liquidatable" || bucket == "urgent" || bucket == "watch" {
 			s.hotBorrowers[primary.Borrower] = primary.HealthFactorWAD
+			s.hotDebtBase[primary.Borrower] = primary.TotalDebtBase
 		} else {
 			delete(s.hotBorrowers, primary.Borrower)
+			delete(s.hotDebtBase, primary.Borrower)
+			delete(s.lastExactAt, primary.Borrower)
 		}
 		if err := s.updateBorrowerActivityLocked(primary.Borrower, primary.TotalDebtBase != "0"); err != nil {
 			return err
@@ -1007,11 +1116,22 @@ func (s *Screener) screen(ctx context.Context, borrowers []string, advanceSeed b
 			}
 		}
 		if record.TerminalOutcome == "exact_pending" && !exactAuthorityWasDegraded {
-			exactRecord, exactErr := s.resolveExact(ctx, record, auction)
-			if exactErr != nil {
-				return exactErr
+			now := s.nowUTC()
+			lastExact, recentlyResolved := s.lastExactAt[primary.Borrower]
+			if recentlyResolved && !now.Before(lastExact) && now.Sub(lastExact) < exactBorrowerCooldown {
+				record.ExactDeferredReason = "borrower_cooldown"
+				if s.state.Counts == nil {
+					s.state.Counts = make(map[string]uint64)
+				}
+				s.state.Counts[exactDeferredCooldownKey]++
+			} else {
+				exactRecord, exactErr := s.resolveExact(ctx, record, auction)
+				if exactErr != nil {
+					return exactErr
+				}
+				record = exactRecord
+				s.lastExactAt[primary.Borrower] = now
 			}
-			record = exactRecord
 		}
 		if err := appendJSON(filepath.Join(s.config.StateDir, "signals.ndjson"), record); err != nil {
 			return err
@@ -1695,11 +1815,33 @@ func (s *Screener) loadHotSignals() error {
 	}
 }
 
+func (s *Screener) ensureHotMapsLocked() {
+	if s.hotBorrowers == nil {
+		s.hotBorrowers = make(map[string]string)
+	}
+	if s.hotDebtBase == nil {
+		s.hotDebtBase = make(map[string]string)
+	}
+	if s.lastExactAt == nil {
+		s.lastExactAt = make(map[string]time.Time)
+	}
+}
+
 func (s *Screener) applyHotSignal(record signal) {
+	s.ensureHotMapsLocked()
 	if record.Bucket == "liquidatable" || record.Bucket == "urgent" || record.Bucket == "watch" {
 		s.hotBorrowers[record.Borrower] = record.HF
+		s.hotDebtBase[record.Borrower] = record.DebtBase
+		if record.StateRoot != "" {
+			previous, exists := s.lastExactAt[record.Borrower]
+			if !exists || record.ObservedAt.After(previous) {
+				s.lastExactAt[record.Borrower] = record.ObservedAt
+			}
+		}
 	} else {
 		delete(s.hotBorrowers, record.Borrower)
+		delete(s.hotDebtBase, record.Borrower)
+		delete(s.lastExactAt, record.Borrower)
 	}
 }
 

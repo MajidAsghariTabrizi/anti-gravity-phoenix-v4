@@ -710,6 +710,119 @@ func TestNewRequiresCanonicalGitReleaseSHA(t *testing.T) {
 	}
 }
 
+func TestLiquidatablePriorityPrefersLargerDebtBeforeLowerHealthFactor(t *testing.T) {
+	small := "0x1111111111111111111111111111111111111111"
+	large := "0x2222222222222222222222222222222222222222"
+	urgent := "0x3333333333333333333333333333333333333333"
+
+	screener := &Screener{
+		hotBorrowers: map[string]string{
+			small:  "800000000000000000",
+			large:  "990000000000000000",
+			urgent: "1001000000000000000",
+		},
+		hotDebtBase: map[string]string{
+			small:  "100",
+			large:  "100000",
+			urgent: "100000000",
+		},
+	}
+	batch := screener.nextHotBatch()
+	if len(batch) != 3 || batch[0] != large || batch[1] != small || batch[2] != urgent {
+		t.Fatalf("unexpected hot borrower priority: %v", batch)
+	}
+
+	accounts := []account{
+		{Borrower: small, TotalDebtBase: "100", HealthFactorWAD: "800000000000000000"},
+		{Borrower: urgent, TotalDebtBase: "100000000", HealthFactorWAD: "1001000000000000000"},
+		{Borrower: large, TotalDebtBase: "100000", HealthFactorWAD: "990000000000000000"},
+	}
+	order := prioritizedAccountOrder(accounts)
+	if len(order) != 3 || order[0] != 2 || order[1] != 0 || order[2] != 1 {
+		t.Fatalf("unexpected screen account priority: %v", order)
+	}
+}
+
+func TestRecentExactEvidenceDefersDuplicateBorrowerWithoutExactRPC(t *testing.T) {
+	directory := t.TempDir()
+	now := time.Date(2026, 8, 8, 8, 0, 0, 0, time.UTC)
+	borrower := "0x1111111111111111111111111111111111111111"
+	exactRequests := 0
+
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		switch request.URL.Path {
+		case "/v1/aave/screen":
+			var input screenRequest
+			if err := json.NewDecoder(request.Body).Decode(&input); err != nil {
+				t.Fatal(err)
+			}
+			borrowerAccount := account{
+				Borrower:        borrower,
+				TotalDebtBase:   "1000000000000",
+				HealthFactorWAD: "900000000000000000",
+			}
+			_ = json.NewEncoder(writer).Encode(screenResponse{
+				SchemaVersion: ResponseSchema,
+				ChainID:       42161,
+				RequestID:     input.RequestID,
+				BlockNumber:   491300000,
+				BlockHash:     "0x" + strings.Repeat("a", 64),
+				Primary: providerScreen{
+					ProviderID:    "production-nownodes-arbitrum",
+					WETHPriceBase: "300000000000",
+					Accounts:      []account{borrowerAccount},
+				},
+				Secondary: providerScreen{
+					ProviderID:    "production-slot-0",
+					WETHPriceBase: "300000000000",
+					Accounts:      []account{borrowerAccount},
+				},
+			})
+		case "/v1/aave/exact":
+			exactRequests++
+			t.Fatal("duplicate borrower crossed the Exact cooldown")
+		default:
+			t.Fatalf("unexpected path: %s", request.URL.Path)
+		}
+	}))
+	defer server.Close()
+
+	sink := &recordingSignalSink{}
+	screener := &Screener{
+		config: Config{
+			StateDir:               directory,
+			GatewayURL:             server.URL,
+			RetainedProfitFloorWei: "1",
+			SignalSink:             sink,
+		},
+		client:       server.Client(),
+		state:        State{Schema: StateSchema, Counts: map[string]uint64{}},
+		debtBearing:  make(map[string]bool),
+		refreshKnown: make(map[string]bool),
+		hotBorrowers: make(map[string]string),
+		hotDebtBase:  make(map[string]string),
+		lastExactAt: map[string]time.Time{
+			borrower: now.Add(-30 * time.Second),
+		},
+		now: func() time.Time { return now },
+	}
+
+	if err := screener.screen(context.Background(), []string{borrower}, false, nil); err != nil {
+		t.Fatal(err)
+	}
+	if exactRequests != 0 {
+		t.Fatalf("unexpected Exact requests: %d", exactRequests)
+	}
+	if len(sink.records) != 1 ||
+		sink.records[0].TerminalOutcome != "exact_pending" ||
+		sink.records[0].ExactDeferredReason != "borrower_cooldown" {
+		t.Fatalf("duplicate Exact deferral evidence is incomplete: %+v", sink.records)
+	}
+	if screener.Snapshot().Counts[exactDeferredCooldownKey] != 1 {
+		t.Fatalf("duplicate Exact deferral was not counted: %+v", screener.Snapshot().Counts)
+	}
+}
+
 func TestClassificationIsIntegerAndFailClosed(t *testing.T) {
 	tests := map[string]struct{ debt, hf, want string }{
 		"no debt":      {"0", "0", "no_debt"},
