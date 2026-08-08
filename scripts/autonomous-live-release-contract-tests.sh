@@ -89,8 +89,14 @@ base_rpc_service = re.search(
 )
 require(base_rpc_service is not None, "base_rpc_gateway_service_missing")
 require(
-    'RPC_UPSTREAM_CALL_BURST: "8"' in base_rpc_service.group("body"),
+    'RPC_UPSTREAM_CALL_BURST: "${RPC_UPSTREAM_CALL_BURST:-16}"'
+    in base_rpc_service.group("body"),
     "base_rpc_burst_must_fit_cold_dual_provider_aave_screen",
+)
+require(
+    'RPC_PROVIDER_PROBE_INTERVAL_SECONDS: "${RPC_PROVIDER_PROBE_INTERVAL_SECONDS:-300}"'
+    in base_rpc_service.group("body"),
+    "base_rpc_probe_must_preserve_stable_production_cadence",
 )
 for reviewed_budget in (
     'RPC_UPSTREAM_CALLS_PER_SECOND: "16"',
