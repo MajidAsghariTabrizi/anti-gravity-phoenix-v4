@@ -202,10 +202,11 @@ func evaluateLaneHealth(now time.Time, atlas observer.LedgerState, aave hunter.S
 	tailFresh := timestampFresh(now, aave.LastTailAt)
 	attemptFresh := timestampFresh(now, aave.LastAttemptAt)
 	dualFresh := timestampFresh(now, aave.LastDualAgreementAt)
+	circuitOpen := aave.ProviderCircuitOpenUntilUnixMillis > 0 && aave.ProviderCircuitOpenUntilUnixMillis > now.UnixMilli()
 	serviceHealthy := aave.Cursor >= 1100
 	atlasHealthy := atlas.Connected && atlas.LastSubscriptionAt != nil && atlas.InvalidCount == 0 && !atlas.Completed
 	huntingHealthy := serviceHealthy && atlasHealthy && (batchFresh || tailFresh || attemptFresh)
-	exactReady := huntingHealthy && batchFresh && tailFresh && dualFresh && aave.LastErrorClass == "" &&
+	exactReady := huntingHealthy && batchFresh && tailFresh && dualFresh && aave.LastErrorClass == "" && !circuitOpen &&
 		aave.LastBlockNumber > 0 && len(aave.LastBlockHash) == 66 && aave.LastProviderPrimary != "" &&
 		aave.LastProviderSecond != "" && aave.LastProviderPrimary != aave.LastProviderSecond
 	reason := ""
@@ -236,27 +237,30 @@ func timestampFresh(now time.Time, observed *time.Time) bool {
 
 func healthPayload(health laneHealth, state hunter.State, atlasConnected bool) map[string]any {
 	return map[string]any{
-		"service_health":                         health.ServiceHealthy,
-		"hunting_health":                         health.HuntingHealthy,
-		"exact_execution_readiness":              health.ExactExecutionReady,
-		"degraded_reason":                        health.DegradedReason,
-		"provider_recovery_state":                health.RecoveryState,
-		"atlas_connected":                        atlasConnected,
-		"aave_cursor":                            state.Cursor,
-		"aave_tail_next_block":                   state.TailNextBlock,
-		"aave_debt_bearing":                      state.DebtBearingCount,
-		"aave_exact_queue":                       state.ExactQueueCount,
-		"primary_provider_id":                    state.LastProviderPrimary,
-		"secondary_provider_id":                  state.LastProviderSecond,
-		"last_dual_agreement_at":                 state.LastDualAgreementAt,
-		"last_recovery_attempt_at":               state.LastAttemptAt,
-		"provider_retryable_degradation_total":   state.Counts["provider_retryable_degradation_total"],
-		"provider_recovery_attempt_total":        state.Counts["provider_recovery_attempt_total"],
-		"provider_recovery_success_total":        state.Counts["provider_recovery_success_total"],
-		"provider_degraded_since_unix_millis":    state.Counts["provider_degraded_since_unix_millis"],
-		"provider_last_degraded_unix_millis":     state.Counts["provider_last_degraded_at_unix_millis"],
-		"provider_last_recovery_unix_millis":     state.Counts["provider_last_recovery_at_unix_millis"],
-		"provider_last_degraded_duration_millis": state.Counts["provider_last_degraded_duration_millis"],
-		"signer_present":                         false,
+		"service_health":                          health.ServiceHealthy,
+		"hunting_health":                          health.HuntingHealthy,
+		"exact_execution_readiness":               health.ExactExecutionReady,
+		"degraded_reason":                         health.DegradedReason,
+		"provider_recovery_state":                 health.RecoveryState,
+		"atlas_connected":                         atlasConnected,
+		"aave_cursor":                             state.Cursor,
+		"aave_tail_next_block":                    state.TailNextBlock,
+		"aave_debt_bearing":                       state.DebtBearingCount,
+		"aave_exact_queue":                        state.ExactQueueCount,
+		"primary_provider_id":                     state.LastProviderPrimary,
+		"secondary_provider_id":                   state.LastProviderSecond,
+		"last_dual_agreement_at":                  state.LastDualAgreementAt,
+		"last_recovery_attempt_at":                state.LastAttemptAt,
+		"provider_retryable_degradation_total":    state.Counts["provider_retryable_degradation_total"],
+		"provider_recovery_attempt_total":         state.Counts["provider_recovery_attempt_total"],
+		"provider_recovery_success_total":         state.Counts["provider_recovery_success_total"],
+		"provider_circuit_open_total":             state.ProviderCircuitOpenTotal,
+		"provider_circuit_skipped_total":          state.ProviderCircuitSkippedTotal,
+		"provider_circuit_open_until_unix_millis": state.ProviderCircuitOpenUntilUnixMillis,
+		"provider_degraded_since_unix_millis":     state.Counts["provider_degraded_since_unix_millis"],
+		"provider_last_degraded_unix_millis":      state.Counts["provider_last_degraded_at_unix_millis"],
+		"provider_last_recovery_unix_millis":      state.Counts["provider_last_recovery_at_unix_millis"],
+		"provider_last_degraded_duration_millis":  state.Counts["provider_last_degraded_duration_millis"],
+		"signer_present":                          false,
 	}
 }

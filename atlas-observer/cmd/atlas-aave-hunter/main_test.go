@@ -144,6 +144,27 @@ func TestExactReadinessRequiresFreshDualAgreement(t *testing.T) {
 	}
 }
 
+func TestExactExecutionReadinessFalseWhileProviderCircuitIsOpen(t *testing.T) {
+	now := time.Now().UTC()
+	state := hunter.State{
+		Cursor:                             1200,
+		LastBatchAt:                        &now,
+		LastTailAt:                         &now,
+		LastDualAgreementAt:                &now,
+		LastBlockNumber:                    491273850,
+		LastBlockHash:                      "0x" + strings.Repeat("a", 64),
+		LastProviderPrimary:                "production-nownodes-arbitrum",
+		LastProviderSecond:                 "production-slot-0",
+		ProviderCircuitOpenUntilUnixMillis: now.Add(2 * time.Minute).UnixMilli(),
+	}
+	health := evaluateLaneHealth(now, observer.LedgerState{
+		Connected: true, LastSubscriptionAt: &now,
+	}, state)
+	if health.ExactExecutionReady {
+		t.Fatalf("circuit-open exact readiness was not blocked: %+v", health)
+	}
+}
+
 func TestStaleHuntingActivityFailsReadiness(t *testing.T) {
 	now := time.Now().UTC()
 	stale := now.Add(-laneFreshnessWindow)

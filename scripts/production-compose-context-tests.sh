@@ -34,6 +34,29 @@ rendered=$test_root/rendered.json
 metadata=$test_root/metadata.json
 
 cp "$repo_dir/compose.prod.yml" "$compose_file"
+# The live Aave economics calibration must survive immutable release rendering.
+grep -F -- '--flash-premium-bps=${ATLAS_AAVE_FLASH_PREMIUM_BPS:-5}' "$compose_file" >/dev/null ||
+  fail "Atlas flash premium default drifted from reviewed on-chain calibration"
+grep -F -- '--economic-reserve-bps=${ATLAS_AAVE_ECONOMIC_RESERVE_BPS:-25}' "$compose_file" >/dev/null ||
+  fail "Atlas economic reserve default drifted from reviewed legacy-equivalent calibration"
+if grep -F -- '--flash-premium-bps=9' "$compose_file" >/dev/null; then
+  fail "legacy Atlas flash premium resurfaced in release Compose"
+fi
+if grep -F -- '--economic-reserve-bps=500' "$compose_file" >/dev/null; then
+  fail "legacy Atlas gross-notional reserve resurfaced in release Compose"
+fi
+
+# The observed stable Production RPC tuning must survive immutable release rendering.
+grep -F -- 'RPC_UPSTREAM_CALL_BURST: "${RPC_UPSTREAM_CALL_BURST:-16}"' "$compose_file" >/dev/null ||
+  fail "RPC upstream burst default drifted from observed stable Production tuning"
+grep -F -- 'RPC_PROVIDER_PROBE_INTERVAL_SECONDS: "${RPC_PROVIDER_PROBE_INTERVAL_SECONDS:-300}"' "$compose_file" >/dev/null ||
+  fail "RPC provider probe default drifted from observed stable Production tuning"
+if grep -F -- 'RPC_UPSTREAM_CALL_BURST: "8"' "$compose_file" >/dev/null; then
+  fail "legacy RPC upstream burst resurfaced in release Compose"
+fi
+if grep -F -- 'RPC_PROVIDER_PROBE_INTERVAL_SECONDS: ${RPC_PROVIDER_PROBE_INTERVAL_SECONDS:-60}' "$compose_file" >/dev/null; then
+  fail "legacy RPC provider probe cadence resurfaced in release Compose"
+fi
 
 cat >"$manifest" <<EOF
 {

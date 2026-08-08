@@ -46,6 +46,18 @@ const (
 	providerLastDegradedAtMillisKey = "provider_last_degraded_at_unix_millis"
 	providerLastRecoveryAtMillisKey = "provider_last_recovery_at_unix_millis"
 	providerLastDegradedDurationKey = "provider_last_degraded_duration_millis"
+	providerCircuitOpenTotalKey     = "provider_circuit_open_total"
+	providerCircuitSkippedTotalKey  = "provider_circuit_skipped_total"
+	providerCircuitCooldown         = 5 * time.Minute
+	gatewayBudgetCircuitCooldown    = 30 * time.Second
+	exactBorrowerCooldown           = 2 * time.Minute
+	exactDeferredCooldownKey        = "exact_deferred_cooldown_total"
+	exactDeferredRouteIneligibleKey = "exact_deferred_route_ineligible_total"
+	exactRouteIneligibleObservedKey = "exact_route_ineligible_observed_total"
+	edgeReserveExpectedPositiveKey  = "edge_reserve_expected_positive_total"
+	edgeReserveLegacyPassKey        = "edge_reserve_legacy_pass_total"
+	edgeReserveCorrectedPassKey     = "edge_reserve_corrected_pass_total"
+	edgeReserveWouldPassKey         = "edge_reserve_would_pass_total"
 	aavePoolAddress                 = "0x794a61358d6845594f94dc1db02a252b5b4814ad"
 	wethAddress                     = "0x82af49447d8a07e3bd95bd0d56f35241523fbab1"
 	nativeUSDCAddress               = "0xaf88d065e77c8cc2239327c5edb3a432268e5831"
@@ -84,25 +96,29 @@ type SignalSink interface {
 }
 
 type State struct {
-	Schema              string            `json:"schema"`
-	DiscoverySHA256     string            `json:"discovery_sha256"`
-	SourceAddressCount  uint64            `json:"source_address_count"`
-	Cursor              uint64            `json:"cursor"`
-	LastBlockNumber     uint64            `json:"last_block_number"`
-	LastBlockHash       string            `json:"last_block_hash"`
-	LastProviderPrimary string            `json:"last_provider_primary"`
-	LastProviderSecond  string            `json:"last_provider_secondary"`
-	LastBatchAt         *time.Time        `json:"last_batch_at"`
-	LastTailAt          *time.Time        `json:"last_tail_at"`
-	LastDualAgreementAt *time.Time        `json:"last_dual_agreement_at,omitempty"`
-	TailNextBlock       uint64            `json:"tail_next_block"`
-	DebtBearingCount    uint64            `json:"debt_bearing_count"`
-	Counts              map[string]uint64 `json:"counts"`
-	ExactQueueCount     uint64            `json:"exact_queue_count"`
-	IncompleteCount     uint64            `json:"incomplete_count"`
-	LastErrorClass      string            `json:"last_error_class,omitempty"`
-	LastAttemptAt       *time.Time        `json:"last_attempt_at,omitempty"`
-	StartupRetryCount   uint64            `json:"startup_retry_count,omitempty"`
+	Schema                             string            `json:"schema"`
+	DiscoverySHA256                    string            `json:"discovery_sha256"`
+	SourceAddressCount                 uint64            `json:"source_address_count"`
+	Cursor                             uint64            `json:"cursor"`
+	LastBlockNumber                    uint64            `json:"last_block_number"`
+	LastBlockHash                      string            `json:"last_block_hash"`
+	LastProviderPrimary                string            `json:"last_provider_primary"`
+	LastProviderSecond                 string            `json:"last_provider_secondary"`
+	LastBatchAt                        *time.Time        `json:"last_batch_at"`
+	LastTailAt                         *time.Time        `json:"last_tail_at"`
+	LastDualAgreementAt                *time.Time        `json:"last_dual_agreement_at,omitempty"`
+	TailNextBlock                      uint64            `json:"tail_next_block"`
+	DebtBearingCount                   uint64            `json:"debt_bearing_count"`
+	Counts                             map[string]uint64 `json:"counts"`
+	RouteIneligible                    map[string]string `json:"route_ineligible,omitempty"`
+	ExactQueueCount                    uint64            `json:"exact_queue_count"`
+	IncompleteCount                    uint64            `json:"incomplete_count"`
+	LastErrorClass                     string            `json:"last_error_class,omitempty"`
+	LastAttemptAt                      *time.Time        `json:"last_attempt_at,omitempty"`
+	StartupRetryCount                  uint64            `json:"startup_retry_count,omitempty"`
+	ProviderCircuitOpenTotal           uint64            `json:"provider_circuit_open_total"`
+	ProviderCircuitSkippedTotal        uint64            `json:"provider_circuit_skipped_total"`
+	ProviderCircuitOpenUntilUnixMillis int64             `json:"provider_circuit_open_until_unix_millis"`
 }
 
 type Screener struct {
@@ -115,7 +131,10 @@ type Screener struct {
 	refreshOrder  []string
 	refreshCursor int
 	hotBorrowers  map[string]string
+	hotDebtBase   map[string]string
+	lastExactAt   map[string]time.Time
 	wait          func(context.Context, time.Duration) bool
+	now           func() time.Time
 }
 
 type gatewayErrorContract struct {
@@ -212,9 +231,18 @@ type exactLiquidation struct {
 	UniswapFee3000OutputWETH string `json:"uniswap_v3_fee_3000_output_weth"`
 }
 
+type exactReserve struct {
+	Asset                    string `json:"asset"`
+	CurrentATokenBalance     string `json:"current_a_token_balance"`
+	CurrentStableDebt        string `json:"current_stable_debt"`
+	CurrentVariableDebt      string `json:"current_variable_debt"`
+	UsageAsCollateralEnabled bool   `json:"usage_as_collateral_enabled"`
+}
+
 type exactProvider struct {
 	ProviderID  string            `json:"provider_id"`
 	Account     account           `json:"account"`
+	Reserves    []exactReserve    `json:"reserves"`
 	Liquidation *exactLiquidation `json:"liquidation"`
 }
 
@@ -230,24 +258,30 @@ type exactResponse struct {
 }
 
 type signal struct {
-	Schema                      string              `json:"schema"`
-	ObservedAt                  time.Time           `json:"observed_at"`
-	Cursor                      uint64              `json:"cursor"`
-	Block                       uint64              `json:"block_number"`
-	BlockHash                   string              `json:"block_hash"`
-	Borrower                    string              `json:"borrower"`
-	DebtBase                    string              `json:"total_debt_base"`
-	HF                          string              `json:"health_factor_wad"`
-	Bucket                      string              `json:"bucket"`
-	Authority                   bool                `json:"candidate_authority"`
-	ZeroCostProfitUpperBoundWei string              `json:"zero_cost_profit_upper_bound_wei,omitempty"`
-	ExpectedNetPnLWei           string              `json:"expected_net_pnl_wei,omitempty"`
-	ConservativeNetPnLWei       string              `json:"conservative_net_pnl_wei,omitempty"`
-	StateRoot                   string              `json:"state_root,omitempty"`
-	SelectedRoute               string              `json:"selected_route,omitempty"`
-	TerminalOutcome             string              `json:"terminal_outcome"`
-	ExecutionCandidate          *executionCandidate `json:"-"`
-	AtlasCandidate              *atlasCandidate     `json:"-"`
+	Schema                            string              `json:"schema"`
+	ObservedAt                        time.Time           `json:"observed_at"`
+	Cursor                            uint64              `json:"cursor"`
+	Block                             uint64              `json:"block_number"`
+	BlockHash                         string              `json:"block_hash"`
+	Borrower                          string              `json:"borrower"`
+	DebtBase                          string              `json:"total_debt_base"`
+	HF                                string              `json:"health_factor_wad"`
+	Bucket                            string              `json:"bucket"`
+	Authority                         bool                `json:"candidate_authority"`
+	ExactDeferredReason               string              `json:"exact_deferred_reason,omitempty"`
+	ExactRouteIneligibleReason        string              `json:"exact_route_ineligible_reason,omitempty"`
+	ZeroCostProfitUpperBoundWei       string              `json:"zero_cost_profit_upper_bound_wei,omitempty"`
+	ExpectedNetPnLWei                 string              `json:"expected_net_pnl_wei,omitempty"`
+	ConservativeNetPnLWei             string              `json:"conservative_net_pnl_wei,omitempty"`
+	EdgeReserveAmountWei              string              `json:"edge_reserve_amount_wei,omitempty"`
+	EdgeReserveConservativeNetPnLWei  string              `json:"edge_reserve_conservative_net_pnl_wei,omitempty"`
+	EdgeReserveMinimumUnwindOutputWei string              `json:"edge_reserve_minimum_unwind_output_wei,omitempty"`
+	EdgeReserveWouldPass              bool                `json:"edge_reserve_would_pass,omitempty"`
+	StateRoot                         string              `json:"state_root,omitempty"`
+	SelectedRoute                     string              `json:"selected_route,omitempty"`
+	TerminalOutcome                   string              `json:"terminal_outcome"`
+	ExecutionCandidate                *executionCandidate `json:"-"`
+	AtlasCandidate                    *atlasCandidate     `json:"-"`
 }
 
 type atlasPreparedOperation struct {
@@ -451,7 +485,10 @@ func New(config Config) (*Screener, error) {
 	s := &Screener{
 		config: config, client: &http.Client{Timeout: 35 * time.Second}, state: state,
 		debtBearing: make(map[string]bool), refreshKnown: make(map[string]bool),
-		hotBorrowers: make(map[string]string), wait: waitContext,
+		hotBorrowers: make(map[string]string), hotDebtBase: make(map[string]string),
+		lastExactAt: make(map[string]time.Time),
+		wait:        waitContext,
+		now:         func() time.Time { return time.Now().UTC() },
 	}
 	if err := s.loadState(); err != nil {
 		return nil, err
@@ -483,25 +520,39 @@ func (s *Screener) Run(ctx context.Context) error {
 		}
 	}
 	seedComplete := false
+	var pendingBatch []string
+	pendingAdvanceSeed := false
+runLoop:
 	for {
-		batch := make([]string, 0, s.config.BatchSize)
-		for !seedComplete && len(batch) < s.config.BatchSize {
-			address, nextErr := addresses.Next()
-			if errors.Is(nextErr, io.EOF) {
-				seedComplete = true
-				break
+		if wait := s.ProviderCircuitWaitDuration(); wait > 0 {
+			if err := s.recordProviderCircuitSkip(); err != nil {
+				return err
 			}
-			if nextErr != nil {
-				return nextErr
+			if !s.waitDuration(ctx, wait) {
+				return nil
 			}
-			batch = append(batch, address)
+			continue
 		}
-		advanceSeed := len(batch) > 0
-		if seedComplete && len(batch) == 0 {
-			batch = s.nextRefreshBatch()
+		if len(pendingBatch) == 0 {
+			pendingBatch = make([]string, 0, s.config.BatchSize)
+			for !seedComplete && len(pendingBatch) < s.config.BatchSize {
+				address, nextErr := addresses.Next()
+				if errors.Is(nextErr, io.EOF) {
+					seedComplete = true
+					break
+				}
+				if nextErr != nil {
+					return nextErr
+				}
+				pendingBatch = append(pendingBatch, address)
+			}
+			pendingAdvanceSeed = len(pendingBatch) > 0
+			if seedComplete && len(pendingBatch) == 0 {
+				pendingBatch = s.nextRefreshBatch()
+			}
 		}
-		if len(batch) > 0 {
-			attempt := func() error { return s.screen(ctx, batch, advanceSeed, nil) }
+		if len(pendingBatch) > 0 {
+			attempt := func() error { return s.screen(ctx, pendingBatch, pendingAdvanceSeed, nil) }
 			var screenErr error
 			if s.Snapshot().LastBatchAt == nil {
 				screenErr = s.screenWithStartupRetry(ctx, attempt)
@@ -520,11 +571,10 @@ func (s *Screener) Run(ctx context.Context) error {
 					s.recordError(gatewayErrorClass(screenErr, "rpc_gateway_screen_failure"))
 					return screenErr
 				}
-				if !s.waitDuration(ctx, s.config.Pace) {
-					return nil
-				}
 				continue
 			}
+			pendingBatch = nil
+			pendingAdvanceSeed = false
 		}
 		tailBorrowers, err := s.pollTail(ctx)
 		if err != nil {
@@ -538,9 +588,6 @@ func (s *Screener) Run(ctx context.Context) error {
 			if !retryable {
 				s.recordError(gatewayErrorClass(err, "rpc_gateway_tail_failure"))
 				return err
-			}
-			if !s.waitDuration(ctx, s.config.Pace) {
-				return nil
 			}
 			continue
 		}
@@ -561,7 +608,7 @@ func (s *Screener) Run(ctx context.Context) error {
 					s.recordError(gatewayErrorClass(err, "rpc_gateway_tail_screen_failure"))
 					return err
 				}
-				break
+				continue runLoop
 			}
 		}
 		if !s.waitDuration(ctx, s.config.Pace) {
@@ -577,6 +624,10 @@ func (s *Screener) Snapshot() State {
 	copy.Counts = make(map[string]uint64, len(s.state.Counts))
 	for key, value := range s.state.Counts {
 		copy.Counts[key] = value
+	}
+	copy.RouteIneligible = make(map[string]string, len(s.state.RouteIneligible))
+	for borrower, reason := range s.state.RouteIneligible {
+		copy.RouteIneligible[borrower] = reason
 	}
 	return copy
 }
@@ -668,45 +719,107 @@ func retryableStartupError(err error) (*gatewayResponseError, bool) {
 	return gatewayErr, retryable
 }
 
-// RecordRetryableGatewayError keeps broad hunting alive while a bounded
-// provider or Gateway budget recovers. It never grants exact authority and
-// propagates durable-state failures so they still terminate fail-closed.
+func (s *Screener) nowUTC() time.Time {
+	if s.now != nil {
+		return s.now()
+	}
+	return time.Now().UTC()
+}
+
+func (s *Screener) providerCircuitIsOpenLocked(now time.Time) bool {
+	return s.state.ProviderCircuitOpenUntilUnixMillis > 0 && s.state.ProviderCircuitOpenUntilUnixMillis > now.UnixMilli()
+}
+
+func (s *Screener) ProviderCircuitWaitDuration() time.Duration {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	now := s.nowUTC()
+	if !s.providerCircuitIsOpenLocked(now) {
+		return 0
+	}
+	return time.Duration(s.state.ProviderCircuitOpenUntilUnixMillis-now.UnixMilli()) * time.Millisecond
+}
+
+func (s *Screener) IsProviderCircuitOpen() bool {
+	return s.ProviderCircuitWaitDuration() > 0
+}
+
+func (s *Screener) recordProviderCircuitSkip() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.state.ProviderCircuitSkippedTotal++
+	return s.persistStateLocked()
+}
+
+func (s *Screener) openProviderCircuit(class string, cooldown time.Duration) error {
+	now := s.nowUTC()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.openProviderCircuitLocked(now, class, cooldown)
+}
+
+func (s *Screener) openProviderCircuitLocked(now time.Time, class string, cooldown time.Duration) error {
+	if cooldown <= 0 {
+		cooldown = providerCircuitCooldown
+	}
+	if !s.providerCircuitIsOpenLocked(now) {
+		s.state.ProviderCircuitOpenTotal++
+	}
+	s.state.ProviderCircuitOpenUntilUnixMillis = now.Add(cooldown).UnixMilli()
+	return s.recordProviderDegradationLocked(now, class)
+}
+
+// RecordRetryableGatewayError keeps exact authority fail-closed while applying
+// different recovery windows to external provider failures and local Gateway
+// budget pressure. Local token-bucket exhaustion is bounded by the Gateway
+// itself and must not turn a seconds-long refill into a five-minute outage.
 func (s *Screener) RecordRetryableGatewayError(err error) (bool, error) {
-	class, retryable := retryableProviderError(err)
+	class, cooldown, retryable := retryableProviderError(err)
 	if !retryable {
 		return false, nil
 	}
-	return true, s.recordProviderDegradation(class)
+	if err := s.openProviderCircuit(class, cooldown); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
-func retryableProviderError(err error) (string, bool) {
+func retryableProviderError(err error) (string, time.Duration, bool) {
 	if errors.Is(err, context.Canceled) {
-		return "", false
+		return "", 0, false
 	}
 	var gatewayErr *gatewayResponseError
 	if errors.As(err, &gatewayErr) {
 		switch gatewayErr.class {
 		case "provider_disagreement":
-			return "provider_disagreement", gatewayErr.statusCode == http.StatusConflict || gatewayErr.statusCode == http.StatusBadGateway
+			return "provider_disagreement", providerCircuitCooldown,
+				gatewayErr.statusCode == http.StatusConflict || gatewayErr.statusCode == http.StatusBadGateway
 		case "provider_unavailable":
-			return "provider_unavailable", gatewayErr.statusCode == http.StatusServiceUnavailable
+			return "provider_unavailable", providerCircuitCooldown,
+				gatewayErr.statusCode == http.StatusServiceUnavailable
 		case "provider_timeout", "secondary_timeout":
-			return "provider_timeout", gatewayErr.statusCode == http.StatusRequestTimeout || gatewayErr.statusCode == http.StatusBadGateway || gatewayErr.statusCode == http.StatusServiceUnavailable || gatewayErr.statusCode == http.StatusGatewayTimeout
+			return "provider_timeout", providerCircuitCooldown,
+				gatewayErr.statusCode == http.StatusRequestTimeout ||
+					gatewayErr.statusCode == http.StatusBadGateway ||
+					gatewayErr.statusCode == http.StatusServiceUnavailable ||
+					gatewayErr.statusCode == http.StatusGatewayTimeout
 		case "provider_rate_limited", "secondary_rate_limited":
-			return "provider_rate_limited", gatewayErr.statusCode == http.StatusTooManyRequests || gatewayErr.statusCode == http.StatusServiceUnavailable
+			return "provider_rate_limited", providerCircuitCooldown,
+				gatewayErr.statusCode == http.StatusTooManyRequests ||
+					gatewayErr.statusCode == http.StatusServiceUnavailable
 		case "state_request_budget_exhausted", "upstream_call_budget_exhausted":
-			return "provider_rate_limited", gatewayErr.statusCode == http.StatusTooManyRequests && gatewayErr.retryable
+			return "provider_rate_limited", gatewayBudgetCircuitCooldown,
+				gatewayErr.statusCode == http.StatusTooManyRequests && gatewayErr.retryable
 		default:
-			return "", false
+			return "", 0, false
 		}
 	}
 	var networkErr net.Error
 	if errors.As(err, &networkErr) && networkErr.Timeout() {
-		return "provider_timeout", true
+		return "provider_timeout", providerCircuitCooldown, true
 	}
-	return "", false
+	return "", 0, false
 }
-
 func gatewayErrorClass(err error, fallback string) string {
 	var gatewayErr *gatewayResponseError
 	if errors.As(err, &gatewayErr) && errorClassPattern.MatchString(gatewayErr.class) {
@@ -800,10 +913,16 @@ func (s *Screener) pollTail(ctx context.Context) ([]string, error) {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.ensureHotMapsLocked()
 	for _, borrower := range result.Borrowers {
 		if err := s.updateBorrowerActivityLocked(borrower, true); err != nil {
 			return nil, err
 		}
+		// A new Borrow/Repay/Liquidation event is a material state change and
+		// immediately invalidates both the short Exact cooldown and any
+		// route-ineligibility learned from a prior Exact reserve snapshot.
+		delete(s.lastExactAt, borrower)
+		delete(s.state.RouteIneligible, borrower)
 	}
 	now := time.Now().UTC()
 	s.state.TailNextBlock = result.NextBlock
@@ -818,6 +937,12 @@ func (s *Screener) HandleAtlasAuction(ctx context.Context, auction *observer.Led
 	if auction == nil || !auction.RelevantAaveAuction || auction.ChainID != 42161 {
 		return nil
 	}
+	if s.IsProviderCircuitOpen() {
+		if err := s.recordProviderCircuitSkip(); err != nil {
+			return err
+		}
+		return nil
+	}
 	if s.Snapshot().LastErrorClass != "" {
 		return nil
 	}
@@ -828,21 +953,124 @@ func (s *Screener) HandleAtlasAuction(ctx context.Context, auction *observer.Led
 	return s.screen(ctx, borrowers, false, auction)
 }
 
+func liquidationPriorityRank(debt, hf string) int {
+	switch classify(debt, hf) {
+	case "liquidatable":
+		return 0
+	case "urgent":
+		return 1
+	case "watch":
+		return 2
+	default:
+		return 3
+	}
+}
+
+func liquidationPriorityLess(
+	leftDebt, leftHF, leftBorrower string,
+	rightDebt, rightHF, rightBorrower string,
+) bool {
+	leftRank := liquidationPriorityRank(leftDebt, leftHF)
+	rightRank := liquidationPriorityRank(rightDebt, rightHF)
+	if leftRank != rightRank {
+		return leftRank < rightRank
+	}
+
+	leftDebtValue, leftDebtOK := newBigUint(leftDebt)
+	rightDebtValue, rightDebtOK := newBigUint(rightDebt)
+	leftHFValue, leftHFOK := newBigUint(leftHF)
+	rightHFValue, rightHFOK := newBigUint(rightHF)
+
+	compareDebt := func() (bool, bool) {
+		if leftDebtOK != rightDebtOK {
+			return leftDebtOK, true
+		}
+		if leftDebtOK && rightDebtOK && leftDebtValue.Cmp(rightDebtValue) != 0 {
+			return leftDebtValue.Cmp(rightDebtValue) > 0, true
+		}
+		return false, false
+	}
+	compareHF := func() (bool, bool) {
+		if leftHFOK != rightHFOK {
+			return leftHFOK, true
+		}
+		if leftHFOK && rightHFOK && leftHFValue.Cmp(rightHFValue) != 0 {
+			return leftHFValue.Cmp(rightHFValue) < 0, true
+		}
+		return false, false
+	}
+
+	// Once a borrower is liquidatable, larger repay capacity is the first
+	// economic discriminator. For near-liquidation buckets, health factor
+	// remains the first urgency discriminator.
+	if leftRank == 0 {
+		if result, decided := compareDebt(); decided {
+			return result
+		}
+		if result, decided := compareHF(); decided {
+			return result
+		}
+	} else {
+		if result, decided := compareHF(); decided {
+			return result
+		}
+		if result, decided := compareDebt(); decided {
+			return result
+		}
+	}
+	return leftBorrower < rightBorrower
+}
+
+func prioritizedAccountOrder(accounts []account) []int {
+	order := make([]int, len(accounts))
+	for index := range accounts {
+		order[index] = index
+	}
+	sort.SliceStable(order, func(i, j int) bool {
+		left := accounts[order[i]]
+		right := accounts[order[j]]
+		return liquidationPriorityLess(
+			left.TotalDebtBase,
+			left.HealthFactorWAD,
+			left.Borrower,
+			right.TotalDebtBase,
+			right.HealthFactorWAD,
+			right.Borrower,
+		)
+	})
+	return order
+}
+
 func (s *Screener) nextHotBatch() []string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	type entry struct{ borrower, hf string }
+	type entry struct {
+		borrower        string
+		hf              string
+		debt            string
+		routeIneligible bool
+	}
 	entries := make([]entry, 0, len(s.hotBorrowers))
 	for borrower, hf := range s.hotBorrowers {
-		entries = append(entries, entry{borrower, hf})
+		entries = append(entries, entry{
+			borrower:        borrower,
+			hf:              hf,
+			debt:            s.hotDebtBase[borrower],
+			routeIneligible: s.state.RouteIneligible[borrower] != "",
+		})
 	}
 	sort.Slice(entries, func(i, j int) bool {
-		first, firstOK := newBigUint(entries[i].hf)
-		second, secondOK := newBigUint(entries[j].hf)
-		if firstOK && secondOK && first.Cmp(second) != 0 {
-			return first.Cmp(second) < 0
+		if entries[i].routeIneligible != entries[j].routeIneligible {
+			return !entries[i].routeIneligible
 		}
-		return entries[i].borrower < entries[j].borrower
+		return liquidationPriorityLess(
+			entries[i].debt,
+			entries[i].hf,
+			entries[i].borrower,
+			entries[j].debt,
+			entries[j].hf,
+			entries[j].borrower,
+		)
 	})
 	if len(entries) > MaximumBatch {
 		entries = entries[:MaximumBatch]
@@ -880,16 +1108,22 @@ func (s *Screener) screen(ctx context.Context, borrowers []string, advanceSeed b
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.ensureHotMapsLocked()
 	exactAuthorityWasDegraded := s.state.LastErrorClass != ""
-	for index, primary := range result.Primary.Accounts {
+	for _, index := range prioritizedAccountOrder(result.Primary.Accounts) {
+		primary := result.Primary.Accounts[index]
 		if primary != result.Secondary.Accounts[index] || primary.Borrower != borrowers[index] {
 			return errors.New("gateway Aave providers disagree")
 		}
 		bucket := classify(primary.TotalDebtBase, primary.HealthFactorWAD)
 		if bucket == "liquidatable" || bucket == "urgent" || bucket == "watch" {
 			s.hotBorrowers[primary.Borrower] = primary.HealthFactorWAD
+			s.hotDebtBase[primary.Borrower] = primary.TotalDebtBase
 		} else {
 			delete(s.hotBorrowers, primary.Borrower)
+			delete(s.hotDebtBase, primary.Borrower)
+			delete(s.lastExactAt, primary.Borrower)
+			delete(s.state.RouteIneligible, primary.Borrower)
 		}
 		if err := s.updateBorrowerActivityLocked(primary.Borrower, primary.TotalDebtBase != "0"); err != nil {
 			return err
@@ -912,11 +1146,37 @@ func (s *Screener) screen(ctx context.Context, borrowers []string, advanceSeed b
 			}
 		}
 		if record.TerminalOutcome == "exact_pending" && !exactAuthorityWasDegraded {
-			exactRecord, exactErr := s.resolveExact(ctx, record, auction)
-			if exactErr != nil {
-				return exactErr
+			now := s.nowUTC()
+			routeReason, knownRouteIneligible := s.state.RouteIneligible[primary.Borrower]
+			lastExact, recentlyResolved := s.lastExactAt[primary.Borrower]
+			if knownRouteIneligible {
+				record.ExactDeferredReason = "route_ineligible_until_tail"
+				record.ExactRouteIneligibleReason = routeReason
+				if s.state.Counts == nil {
+					s.state.Counts = make(map[string]uint64)
+				}
+				s.state.Counts[exactDeferredRouteIneligibleKey]++
+			} else if recentlyResolved && !now.Before(lastExact) && now.Sub(lastExact) < exactBorrowerCooldown {
+				record.ExactDeferredReason = "borrower_cooldown"
+				if s.state.Counts == nil {
+					s.state.Counts = make(map[string]uint64)
+				}
+				s.state.Counts[exactDeferredCooldownKey]++
+			} else {
+				exactRecord, exactErr := s.resolveExact(ctx, record, auction)
+				if exactErr != nil {
+					return exactErr
+				}
+				record = exactRecord
+				s.lastExactAt[primary.Borrower] = now
+				if record.ExactRouteIneligibleReason != "" {
+					s.state.RouteIneligible[primary.Borrower] = record.ExactRouteIneligibleReason
+					if s.state.Counts == nil {
+						s.state.Counts = make(map[string]uint64)
+					}
+					s.state.Counts[exactRouteIneligibleObservedKey]++
+				}
 			}
-			record = exactRecord
 		}
 		if err := appendJSON(filepath.Join(s.config.StateDir, "signals.ndjson"), record); err != nil {
 			return err
@@ -948,6 +1208,54 @@ func (s *Screener) screen(ctx context.Context, borrowers []string, advanceSeed b
 	return s.persistStateLocked()
 }
 
+func equalExactReserves(first, second []exactReserve) bool {
+	if len(first) != len(second) {
+		return false
+	}
+	for index := range first {
+		if first[index] != second[index] {
+			return false
+		}
+	}
+	return true
+}
+
+func exactRouteIneligibleReason(reserves []exactReserve) string {
+	var wethDebt *big.Int
+	var nativeUSDCCollateral *big.Int
+	nativeUSDCCollateralEnabled := false
+
+	for _, reserve := range reserves {
+		switch strings.ToLower(reserve.Asset) {
+		case wethAddress:
+			stable, stableOK := newBigUint(reserve.CurrentStableDebt)
+			variable, variableOK := newBigUint(reserve.CurrentVariableDebt)
+			if !stableOK || !variableOK {
+				return ""
+			}
+			wethDebt = new(big.Int).Add(stable, variable)
+		case nativeUSDCAddress:
+			balance, balanceOK := newBigUint(reserve.CurrentATokenBalance)
+			if !balanceOK {
+				return ""
+			}
+			nativeUSDCCollateral = balance
+			nativeUSDCCollateralEnabled = reserve.UsageAsCollateralEnabled
+		}
+	}
+
+	if wethDebt == nil || wethDebt.Sign() == 0 {
+		return "no_weth_debt"
+	}
+	if nativeUSDCCollateral == nil || nativeUSDCCollateral.Sign() == 0 {
+		return "no_native_usdc_collateral"
+	}
+	if !nativeUSDCCollateralEnabled {
+		return "native_usdc_not_collateral"
+	}
+	return ""
+}
+
 func (s *Screener) resolveExact(ctx context.Context, record signal, auction *observer.LedgerRecord) (signal, error) {
 	requestID := fmt.Sprintf("aave-exact-%d-%d", record.Cursor, time.Now().UnixMilli())
 	body, _ := json.Marshal(exactRequest{SchemaVersion: "phoenix.rpc.aave-exact-request.v1", ChainID: 42161, RequestID: requestID, Borrower: record.Borrower})
@@ -968,7 +1276,7 @@ func (s *Screener) resolveExact(ctx context.Context, record signal, auction *obs
 	if err := json.NewDecoder(io.LimitReader(response.Body, maximumResponse)).Decode(&result); err != nil {
 		return record, err
 	}
-	if result.SchemaVersion != "phoenix.rpc.aave-exact-response.v1" || result.ChainID != 42161 || result.RequestID != requestID || result.BlockNumber == 0 || result.BlockHash == "" || result.StateRoot == "" || result.Primary.ProviderID == result.Secondary.ProviderID || result.Primary.Account != result.Secondary.Account || !equalLiquidation(result.Primary.Liquidation, result.Secondary.Liquidation) {
+	if result.SchemaVersion != "phoenix.rpc.aave-exact-response.v1" || result.ChainID != 42161 || result.RequestID != requestID || result.BlockNumber == 0 || result.BlockHash == "" || result.StateRoot == "" || result.Primary.ProviderID == result.Secondary.ProviderID || result.Primary.Account != result.Secondary.Account || !equalExactReserves(result.Primary.Reserves, result.Secondary.Reserves) || !equalLiquidation(result.Primary.Liquidation, result.Secondary.Liquidation) {
 		return record, errors.New("exact Aave provider evidence is incomplete")
 	}
 	record.Block = result.BlockNumber
@@ -976,6 +1284,7 @@ func (s *Screener) resolveExact(ctx context.Context, record signal, auction *obs
 	record.StateRoot = result.StateRoot
 	liquidation := result.Primary.Liquidation
 	if liquidation == nil {
+		record.ExactRouteIneligibleReason = exactRouteIneligibleReason(result.Primary.Reserves)
 		record.TerminalOutcome = "economic_rejection"
 		return record, nil
 	}
@@ -1000,13 +1309,44 @@ func (s *Screener) resolveExact(ctx context.Context, record signal, auction *obs
 	gas := new(big.Int).Mul(maxFee, new(big.Int).SetUint64(s.config.MaximumGasLimit))
 	expected := new(big.Int).Sub(new(big.Int).Set(output), repay)
 	expected.Sub(expected, flash).Sub(expected, gas)
+
+	// Legacy live gate: the configured reserve is applied to the whole unwind
+	// notional. Keep this unchanged while collecting shadow evidence.
 	conservativeOutput := new(big.Int).Mul(output, new(big.Int).SetUint64(10_000-s.config.EconomicReserveBPS))
 	conservativeOutput.Div(conservativeOutput, big.NewInt(10_000))
 	conservative := new(big.Int).Sub(conservativeOutput, repay)
 	conservative.Sub(conservative, flash).Sub(conservative, gas)
+
+	// Corrected shadow model: risk reserve is charged against positive edge,
+	// not principal/notional. It has no Candidate authority in this audit patch.
+	edgeReserve, edgeConservative, edgeMinimumUnwind := profitEdgeReserve(
+		expected,
+		output,
+		s.config.EconomicReserveBPS,
+	)
+
 	record.ExpectedNetPnLWei = expected.String()
 	record.ConservativeNetPnLWei = conservative.String()
+	record.EdgeReserveAmountWei = edgeReserve.String()
+	record.EdgeReserveConservativeNetPnLWei = edgeConservative.String()
+	record.EdgeReserveMinimumUnwindOutputWei = edgeMinimumUnwind.String()
 	floor, _ := newBigUint(s.config.RetainedProfitFloorWei)
+	if s.state.Counts == nil {
+		s.state.Counts = make(map[string]uint64)
+	}
+	if expected.Cmp(floor) > 0 {
+		s.state.Counts[edgeReserveExpectedPositiveKey]++
+	}
+	if conservative.Cmp(floor) > 0 {
+		s.state.Counts[edgeReserveLegacyPassKey]++
+	}
+	if edgeConservative.Cmp(floor) > 0 {
+		s.state.Counts[edgeReserveCorrectedPassKey]++
+	}
+	if expected.Cmp(floor) > 0 && conservative.Cmp(floor) <= 0 && edgeConservative.Cmp(floor) > 0 {
+		record.EdgeReserveWouldPass = true
+		s.state.Counts[edgeReserveWouldPassKey]++
+	}
 	if expected.Cmp(floor) <= 0 || conservative.Cmp(floor) <= 0 {
 		record.TerminalOutcome = "economic_rejection"
 	} else {
@@ -1051,6 +1391,20 @@ func (s *Screener) resolveExact(ctx context.Context, record signal, auction *obs
 		record.TerminalOutcome = "candidate"
 	}
 	return record, nil
+}
+
+func profitEdgeReserve(expected, grossOutput *big.Int, reserveBPS uint64) (*big.Int, *big.Int, *big.Int) {
+	reserve := new(big.Int)
+	if expected.Sign() > 0 && reserveBPS > 0 {
+		reserve.Mul(new(big.Int).Set(expected), new(big.Int).SetUint64(reserveBPS))
+		reserve.Add(reserve, big.NewInt(9_999)).Div(reserve, big.NewInt(10_000))
+	}
+	conservative := new(big.Int).Sub(new(big.Int).Set(expected), reserve)
+	minimumUnwind := new(big.Int).Sub(new(big.Int).Set(grossOutput), reserve)
+	if minimumUnwind.Sign() < 0 {
+		minimumUnwind.SetInt64(0)
+	}
+	return reserve, conservative, minimumUnwind
 }
 
 func (s *Screener) buildAtlasCandidate(
@@ -1332,7 +1686,8 @@ func newBigUint(value string) (*big.Int, bool) {
 func (s *Screener) recordError(class string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	now := time.Now().UTC()
+	now := s.nowUTC()
+	s.state.ProviderCircuitOpenUntilUnixMillis = 0
 	s.state.IncompleteCount++
 	s.state.LastErrorClass = class
 	s.state.LastAttemptAt = &now
@@ -1342,7 +1697,11 @@ func (s *Screener) recordError(class string) {
 func (s *Screener) recordProviderDegradation(class string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	now := time.Now().UTC()
+	now := s.nowUTC()
+	return s.recordProviderDegradationLocked(now, class)
+}
+
+func (s *Screener) recordProviderDegradationLocked(now time.Time, class string) error {
 	if s.state.Counts == nil {
 		s.state.Counts = make(map[string]uint64)
 	}
@@ -1362,6 +1721,7 @@ func (s *Screener) recordProviderRecoveryLocked(now time.Time) {
 	if s.state.Counts == nil {
 		s.state.Counts = make(map[string]uint64)
 	}
+	s.state.ProviderCircuitOpenUntilUnixMillis = 0
 	degradedSince := s.state.Counts[providerDegradedSinceMillisKey]
 	if degradedSince > 0 {
 		s.state.Counts[providerRecoverySuccessTotalKey]++
@@ -1446,6 +1806,17 @@ func (s *Screener) loadState() error {
 	}
 	if state.Schema != StateSchema || state.DiscoverySHA256 != s.config.DiscoverySHA256 || state.Cursor < s.config.StartingCursor || state.Counts == nil {
 		return errors.New("existing hunter state is incompatible")
+	}
+	if state.RouteIneligible == nil {
+		state.RouteIneligible = make(map[string]string)
+	}
+	for borrower, reason := range state.RouteIneligible {
+		if !addressPattern.MatchString(borrower) ||
+			reason != "no_weth_debt" &&
+				reason != "no_native_usdc_collateral" &&
+				reason != "native_usdc_not_collateral" {
+			return errors.New("existing route-ineligible state is invalid")
+		}
 	}
 	s.state = state
 	return nil
@@ -1549,11 +1920,36 @@ func (s *Screener) loadHotSignals() error {
 	}
 }
 
+func (s *Screener) ensureHotMapsLocked() {
+	if s.hotBorrowers == nil {
+		s.hotBorrowers = make(map[string]string)
+	}
+	if s.hotDebtBase == nil {
+		s.hotDebtBase = make(map[string]string)
+	}
+	if s.lastExactAt == nil {
+		s.lastExactAt = make(map[string]time.Time)
+	}
+	if s.state.RouteIneligible == nil {
+		s.state.RouteIneligible = make(map[string]string)
+	}
+}
+
 func (s *Screener) applyHotSignal(record signal) {
+	s.ensureHotMapsLocked()
 	if record.Bucket == "liquidatable" || record.Bucket == "urgent" || record.Bucket == "watch" {
 		s.hotBorrowers[record.Borrower] = record.HF
+		s.hotDebtBase[record.Borrower] = record.DebtBase
+		if record.StateRoot != "" {
+			previous, exists := s.lastExactAt[record.Borrower]
+			if !exists || record.ObservedAt.After(previous) {
+				s.lastExactAt[record.Borrower] = record.ObservedAt
+			}
+		}
 	} else {
 		delete(s.hotBorrowers, record.Borrower)
+		delete(s.hotDebtBase, record.Borrower)
+		delete(s.lastExactAt, record.Borrower)
 	}
 }
 

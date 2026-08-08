@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"math/big"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -182,6 +183,311 @@ func TestRetryableProviderFailureIsRecordedWithoutCandidateAuthority(t *testing.
 	})
 	if err != nil || accepted {
 		t.Fatalf("fatal integrity error was swallowed: accepted=%t err=%v", accepted, err)
+	}
+}
+
+func TestRetryableProviderErrorOpensCircuitForFiveMinutes(t *testing.T) {
+	now := time.Date(2026, 8, 6, 0, 0, 0, 0, time.UTC)
+	screener := &Screener{
+		config: Config{StateDir: t.TempDir()},
+		state:  State{Schema: StateSchema, Counts: map[string]uint64{}},
+		now:    func() time.Time { return now },
+	}
+	accepted, err := screener.RecordRetryableGatewayError(&gatewayResponseError{
+		statusCode: http.StatusServiceUnavailable,
+		class:      "provider_unavailable",
+		retryable:  true,
+	})
+	if err != nil || !accepted {
+		t.Fatalf("retryable class was not treated as circuit event: accepted=%t err=%v", accepted, err)
+	}
+	state := screener.Snapshot()
+	if state.ProviderCircuitOpenTotal != 1 || state.ProviderCircuitOpenUntilUnixMillis != now.Add(providerCircuitCooldown).UnixMilli() || !screener.IsProviderCircuitOpen() {
+		t.Fatalf("circuit did not open for expected duration: %+v", state)
+	}
+}
+
+func TestNonRetryableProviderErrorDoesNotOpenCircuit(t *testing.T) {
+	screener := &Screener{
+		config: Config{StateDir: t.TempDir()},
+		state:  State{Schema: StateSchema, Counts: map[string]uint64{}},
+		now:    time.Now().UTC,
+	}
+	accepted, err := screener.RecordRetryableGatewayError(&gatewayResponseError{
+		statusCode: http.StatusBadGateway,
+		class:      "provider_integrity_failure",
+		retryable:  false,
+	})
+	if err != nil || accepted {
+		t.Fatalf("non-retryable provider error should not open the circuit: accepted=%t err=%v", accepted, err)
+	}
+	state := screener.Snapshot()
+	if state.ProviderCircuitOpenTotal != 0 || state.ProviderCircuitOpenUntilUnixMillis != 0 {
+		t.Fatalf("non-retryable failure unexpectedly mutated circuit counters: %+v", state)
+	}
+}
+
+func TestProviderCircuitSkipsGatewayRequestsDuringCooldown(t *testing.T) {
+	directory := t.TempDir()
+	discovery := filepath.Join(directory, "discovery.json")
+	if err := os.WriteFile(discovery, []byte(`{"borrowers":["0x1111111111111111111111111111111111111111"]}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	current := time.Date(2026, 8, 6, 0, 0, 0, 0, time.UTC)
+	screenCalls := 0
+	tailCalls := 0
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if request.URL.Path == "/v1/aave/screen" {
+			screenCalls++
+		}
+		if request.URL.Path == "/v1/aave/tail" {
+			tailCalls++
+		}
+		t.Fatalf("request was sent during cooldown: %s", request.URL.Path)
+	}))
+	defer server.Close()
+	screener := &Screener{
+		config: Config{DiscoveryPath: discovery, GatewayURL: server.URL, StateDir: directory, BatchSize: 1, Pace: time.Second},
+		client: server.Client(),
+		wait: func(_ context.Context, _ time.Duration) bool {
+			return false
+		},
+		now: func() time.Time { return current },
+		state: State{
+			Schema:                             StateSchema,
+			Cursor:                             0,
+			Counts:                             map[string]uint64{},
+			LastBatchAt:                        &time.Time{},
+			ProviderCircuitOpenUntilUnixMillis: current.Add(providerCircuitCooldown).UnixMilli(),
+		},
+	}
+	if err := screener.Run(context.Background()); err != nil {
+		t.Fatalf("run should pause for provider circuit: %v", err)
+	}
+	if screenCalls != 0 || tailCalls != 0 || screener.Snapshot().ProviderCircuitSkippedTotal != 1 {
+		t.Fatalf("requests or skips were not counted correctly: screen=%d tail=%d state=%+v", screenCalls, tailCalls, screener.Snapshot())
+	}
+}
+
+func TestFailedNormalBatchIsRetriedOnceAfterCircuitCooldown(t *testing.T) {
+	directory := t.TempDir()
+	discovery := filepath.Join(directory, "discovery.json")
+	if err := os.WriteFile(discovery, []byte(`{"borrowers":["0x1111111111111111111111111111111111111111"]}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 8, 6, 0, 0, 0, 0, time.UTC)
+	clock := now
+	var waits []time.Duration
+	screenBatches := [][]string{}
+	lastBatchAt := now
+	screener := &Screener{
+		config: Config{
+			DiscoveryPath: discovery, StateDir: directory, GatewayURL: "unused",
+			BatchSize: 1, Pace: time.Second, StartingCursor: 0,
+		},
+		state: State{
+			Schema:      StateSchema,
+			Counts:      map[string]uint64{},
+			Cursor:      0,
+			LastBatchAt: &lastBatchAt,
+		},
+		hotBorrowers: make(map[string]string),
+		debtBearing:  make(map[string]bool),
+		refreshKnown: make(map[string]bool),
+		refreshOrder: nil,
+	}
+	screener.config.GatewayURL = ""
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		switch request.URL.Path {
+		case "/v1/aave/screen":
+			if len(screenBatches) >= 3 {
+				t.Fatalf("screen was retried too many times")
+			}
+			var input screenRequest
+			if err := json.NewDecoder(request.Body).Decode(&input); err != nil {
+				t.Fatal(err)
+			}
+			screenBatches = append(screenBatches, input.Borrowers)
+			switch len(screenBatches) {
+			case 1:
+				writer.WriteHeader(http.StatusServiceUnavailable)
+				_, _ = writer.Write([]byte(`{"error_class":"provider_unavailable","retryable":true}`))
+			case 2:
+				_ = json.NewEncoder(writer).Encode(screenResponse{
+					SchemaVersion: ResponseSchema,
+					ChainID:       42161,
+					RequestID:     input.RequestID,
+					BlockNumber:   491300000,
+					BlockHash:     "0x" + strings.Repeat("a", 64),
+					Primary: providerScreen{
+						ProviderID:    "production-nownodes-arbitrum",
+						WETHPriceBase: "300000000000",
+						Accounts:      []account{{Borrower: input.Borrowers[0], HealthFactorWAD: "1100000000000000000", TotalDebtBase: "1000000000000"}},
+					},
+					Secondary: providerScreen{
+						ProviderID:    "production-slot-0",
+						WETHPriceBase: "300000000000",
+						Accounts:      []account{{Borrower: input.Borrowers[0], HealthFactorWAD: "1100000000000000000", TotalDebtBase: "1000000000000"}},
+					},
+				})
+			default:
+				t.Fatalf("unexpected screen call: %d", len(screenBatches))
+			}
+		case "/v1/aave/tail":
+			var input tailRequest
+			if err := json.NewDecoder(request.Body).Decode(&input); err != nil {
+				t.Fatal(err)
+			}
+			_ = json.NewEncoder(writer).Encode(tailResponse{
+				SchemaVersion:        "phoenix.rpc.aave-tail-response.v1",
+				ChainID:              42161,
+				RequestID:            input.RequestID,
+				FinalizedBlockNumber: 491300000,
+				FinalizedBlockHash:   "0x" + strings.Repeat("a", 64),
+				PrimaryProviderID:    "production-nownodes-arbitrum",
+				SecondaryProviderID:  "production-slot-0",
+				FromBlock:            491300001,
+				ToBlock:              491300000,
+				NextBlock:            491300001,
+				Borrowers:            []string{},
+			})
+		default:
+			t.Fatalf("unexpected path: %s", request.URL.Path)
+		}
+	}))
+	defer server.Close()
+	screener.client = server.Client()
+	screener.config.GatewayURL = server.URL
+	screener.now = func() time.Time { return clock }
+	screener.wait = func(_ context.Context, delay time.Duration) bool {
+		waits = append(waits, delay)
+		if delay == providerCircuitCooldown {
+			clock = clock.Add(delay)
+			return true
+		}
+		return false
+	}
+	if err := screener.Run(context.Background()); err != nil {
+		t.Fatalf("run did not execute cooldown retry as expected: %v", err)
+	}
+	if len(screenBatches) != 2 {
+		t.Fatalf("expected one retry after cooldown: %v", screenBatches)
+	}
+	if screenBatches[0][0] != screenBatches[1][0] {
+		t.Fatalf("failed batch was not preserved: %v", screenBatches)
+	}
+	state := screener.Snapshot()
+	if state.Cursor != 1 || state.ProviderCircuitOpenUntilUnixMillis != 0 {
+		t.Fatalf("circuit did not recover correctly after retry: %+v", state)
+	}
+	cooldownWaits := 0
+	for _, delay := range waits {
+		if delay == providerCircuitCooldown {
+			cooldownWaits++
+		}
+	}
+	if cooldownWaits != 1 {
+		t.Fatalf("cooldown wait was not observed exactly once: %v", waits)
+	}
+	if state.ProviderCircuitOpenTotal != 1 || state.ProviderCircuitSkippedTotal != 1 {
+		t.Fatalf("circuit counters are inconsistent: %+v", state)
+	}
+}
+
+func TestSecondRetryableFailureReopensCircuitAfterCooldown(t *testing.T) {
+	directory := t.TempDir()
+	discovery := filepath.Join(directory, "discovery.json")
+	if err := os.WriteFile(discovery, []byte(`{"borrowers":["0x1111111111111111111111111111111111111111"]}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	clock := time.Date(2026, 8, 6, 0, 0, 0, 0, time.UTC)
+	screenAttempts := 0
+	var waits []time.Duration
+	screener := &Screener{
+		config: Config{
+			DiscoveryPath: discovery, StateDir: directory, GatewayURL: "unused",
+			BatchSize: 1, Pace: time.Second, StartingCursor: 0,
+		},
+		state: State{
+			Schema:      StateSchema,
+			Counts:      map[string]uint64{},
+			Cursor:      0,
+			LastBatchAt: &clock,
+		},
+		hotBorrowers: make(map[string]string),
+		debtBearing:  make(map[string]bool),
+		refreshKnown: make(map[string]bool),
+	}
+	screener.config.GatewayURL = ""
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if request.URL.Path != "/v1/aave/screen" {
+			t.Fatalf("unexpected path: %s", request.URL.Path)
+		}
+		screenAttempts++
+		writer.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = writer.Write([]byte(`{"error_class":"provider_unavailable","retryable":true}`))
+	}))
+	defer server.Close()
+	screener.client = server.Client()
+	screener.config.GatewayURL = server.URL
+	screener.now = func() time.Time { return clock }
+	waitCount := 0
+	screener.wait = func(_ context.Context, delay time.Duration) bool {
+		waits = append(waits, delay)
+		if delay != providerCircuitCooldown {
+			return false
+		}
+		waitCount++
+		if waitCount == 1 {
+			clock = clock.Add(delay)
+			return true
+		}
+		return false
+	}
+	if err := screener.Run(context.Background()); err != nil {
+		t.Fatalf("run did not stop after second cooldown start: %v", err)
+	}
+	if screenAttempts != 2 {
+		t.Fatalf("expected retryable failures to attempt exactly twice, got %d", screenAttempts)
+	}
+	state := screener.Snapshot()
+	if state.ProviderCircuitOpenTotal != 2 {
+		t.Fatalf("expected circuit reopen after second failure: %+v", state)
+	}
+	if len(waits) != 2 || waits[0] != providerCircuitCooldown || waits[1] != providerCircuitCooldown {
+		t.Fatalf("expected two cooldown waits: %v", waits)
+	}
+	if state.Cursor != 0 {
+		t.Fatalf("failed batch advanced during retry loop: %+v", state)
+	}
+}
+
+func TestAtlasHotScreensAreSkippedWhileCircuitIsOpen(t *testing.T) {
+	requests := 0
+	server := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		requests++
+	}))
+	defer server.Close()
+	now := time.Date(2026, 8, 6, 0, 0, 0, 0, time.UTC)
+	screener := &Screener{
+		config: Config{GatewayURL: server.URL, StateDir: t.TempDir()},
+		client: server.Client(),
+		state: State{
+			Schema:                             StateSchema,
+			Counts:                             map[string]uint64{},
+			ProviderCircuitOpenUntilUnixMillis: now.Add(providerCircuitCooldown).UnixMilli(),
+		},
+		hotBorrowers: map[string]string{"0x1111111111111111111111111111111111111111": "900000000000000000"},
+		now:          func() time.Time { return now },
+	}
+	if err := screener.HandleAtlasAuction(context.Background(), &observer.LedgerRecord{ChainID: 42161, RelevantAaveAuction: true}); err != nil {
+		t.Fatal(err)
+	}
+	if requests != 0 {
+		t.Fatalf("atlas hot screen bypassed circuit guardrail: requests=%d", requests)
+	}
+	if screener.Snapshot().ProviderCircuitSkippedTotal != 1 {
+		t.Fatalf("expected one skip, got %+v", screener.Snapshot())
 	}
 }
 
@@ -404,6 +710,119 @@ func TestNewRequiresCanonicalGitReleaseSHA(t *testing.T) {
 	}
 }
 
+func TestLiquidatablePriorityPrefersLargerDebtBeforeLowerHealthFactor(t *testing.T) {
+	small := "0x1111111111111111111111111111111111111111"
+	large := "0x2222222222222222222222222222222222222222"
+	urgent := "0x3333333333333333333333333333333333333333"
+
+	screener := &Screener{
+		hotBorrowers: map[string]string{
+			small:  "800000000000000000",
+			large:  "990000000000000000",
+			urgent: "1001000000000000000",
+		},
+		hotDebtBase: map[string]string{
+			small:  "100",
+			large:  "100000",
+			urgent: "100000000",
+		},
+	}
+	batch := screener.nextHotBatch()
+	if len(batch) != 3 || batch[0] != large || batch[1] != small || batch[2] != urgent {
+		t.Fatalf("unexpected hot borrower priority: %v", batch)
+	}
+
+	accounts := []account{
+		{Borrower: small, TotalDebtBase: "100", HealthFactorWAD: "800000000000000000"},
+		{Borrower: urgent, TotalDebtBase: "100000000", HealthFactorWAD: "1001000000000000000"},
+		{Borrower: large, TotalDebtBase: "100000", HealthFactorWAD: "990000000000000000"},
+	}
+	order := prioritizedAccountOrder(accounts)
+	if len(order) != 3 || order[0] != 2 || order[1] != 0 || order[2] != 1 {
+		t.Fatalf("unexpected screen account priority: %v", order)
+	}
+}
+
+func TestRecentExactEvidenceDefersDuplicateBorrowerWithoutExactRPC(t *testing.T) {
+	directory := t.TempDir()
+	now := time.Date(2026, 8, 8, 8, 0, 0, 0, time.UTC)
+	borrower := "0x1111111111111111111111111111111111111111"
+	exactRequests := 0
+
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		switch request.URL.Path {
+		case "/v1/aave/screen":
+			var input screenRequest
+			if err := json.NewDecoder(request.Body).Decode(&input); err != nil {
+				t.Fatal(err)
+			}
+			borrowerAccount := account{
+				Borrower:        borrower,
+				TotalDebtBase:   "1000000000000",
+				HealthFactorWAD: "900000000000000000",
+			}
+			_ = json.NewEncoder(writer).Encode(screenResponse{
+				SchemaVersion: ResponseSchema,
+				ChainID:       42161,
+				RequestID:     input.RequestID,
+				BlockNumber:   491300000,
+				BlockHash:     "0x" + strings.Repeat("a", 64),
+				Primary: providerScreen{
+					ProviderID:    "production-nownodes-arbitrum",
+					WETHPriceBase: "300000000000",
+					Accounts:      []account{borrowerAccount},
+				},
+				Secondary: providerScreen{
+					ProviderID:    "production-slot-0",
+					WETHPriceBase: "300000000000",
+					Accounts:      []account{borrowerAccount},
+				},
+			})
+		case "/v1/aave/exact":
+			exactRequests++
+			t.Fatal("duplicate borrower crossed the Exact cooldown")
+		default:
+			t.Fatalf("unexpected path: %s", request.URL.Path)
+		}
+	}))
+	defer server.Close()
+
+	sink := &recordingSignalSink{}
+	screener := &Screener{
+		config: Config{
+			StateDir:               directory,
+			GatewayURL:             server.URL,
+			RetainedProfitFloorWei: "1",
+			SignalSink:             sink,
+		},
+		client:       server.Client(),
+		state:        State{Schema: StateSchema, Counts: map[string]uint64{}},
+		debtBearing:  make(map[string]bool),
+		refreshKnown: make(map[string]bool),
+		hotBorrowers: make(map[string]string),
+		hotDebtBase:  make(map[string]string),
+		lastExactAt: map[string]time.Time{
+			borrower: now.Add(-30 * time.Second),
+		},
+		now: func() time.Time { return now },
+	}
+
+	if err := screener.screen(context.Background(), []string{borrower}, false, nil); err != nil {
+		t.Fatal(err)
+	}
+	if exactRequests != 0 {
+		t.Fatalf("unexpected Exact requests: %d", exactRequests)
+	}
+	if len(sink.records) != 1 ||
+		sink.records[0].TerminalOutcome != "exact_pending" ||
+		sink.records[0].ExactDeferredReason != "borrower_cooldown" {
+		t.Fatalf("duplicate Exact deferral evidence is incomplete: %+v", sink.records)
+	}
+	if screener.Snapshot().Counts[exactDeferredCooldownKey] != 1 {
+		t.Fatalf("duplicate Exact deferral was not counted: %+v", screener.Snapshot().Counts)
+	}
+}
+
 func TestClassificationIsIntegerAndFailClosed(t *testing.T) {
 	tests := map[string]struct{ debt, hf, want string }{
 		"no debt":      {"0", "0", "no_debt"},
@@ -488,5 +907,242 @@ func TestBorrowerIndexIsDurableAndFailClosed(t *testing.T) {
 	}
 	if third.debtBearing[borrower] || third.state.DebtBearingCount != 0 {
 		t.Fatal("inactive borrower remained debt-bearing")
+	}
+}
+
+func TestGatewayBudgetExhaustionUsesShortCircuitCooldown(t *testing.T) {
+	now := time.Date(2026, 8, 7, 0, 0, 0, 0, time.UTC)
+	screener := &Screener{
+		config: Config{StateDir: t.TempDir()},
+		state:  State{Schema: StateSchema, Counts: map[string]uint64{}},
+		now:    func() time.Time { return now },
+	}
+	accepted, err := screener.RecordRetryableGatewayError(&gatewayResponseError{
+		statusCode: http.StatusTooManyRequests,
+		class:      "upstream_call_budget_exhausted",
+		retryable:  true,
+	})
+	if err != nil || !accepted {
+		t.Fatalf("local gateway budget exhaustion was not accepted: accepted=%t err=%v", accepted, err)
+	}
+	state := screener.Snapshot()
+	if gatewayBudgetCircuitCooldown >= providerCircuitCooldown {
+		t.Fatalf("local budget cooldown must remain shorter than provider cooldown")
+	}
+	if state.ProviderCircuitOpenTotal != 1 ||
+		state.ProviderCircuitOpenUntilUnixMillis != now.Add(gatewayBudgetCircuitCooldown).UnixMilli() ||
+		state.LastErrorClass != "provider_rate_limited" {
+		t.Fatalf("local gateway budget did not use bounded short cooldown: %+v", state)
+	}
+}
+
+func TestSecondaryRateLimitStillUsesFiveMinuteProviderCooldown(t *testing.T) {
+	now := time.Date(2026, 8, 7, 0, 0, 0, 0, time.UTC)
+	screener := &Screener{
+		config: Config{StateDir: t.TempDir()},
+		state:  State{Schema: StateSchema, Counts: map[string]uint64{}},
+		now:    func() time.Time { return now },
+	}
+	accepted, err := screener.RecordRetryableGatewayError(&gatewayResponseError{
+		statusCode: http.StatusTooManyRequests,
+		class:      "secondary_rate_limited",
+		retryable:  true,
+	})
+	if err != nil || !accepted {
+		t.Fatalf("secondary rate limit was not accepted: accepted=%t err=%v", accepted, err)
+	}
+	state := screener.Snapshot()
+	if state.ProviderCircuitOpenUntilUnixMillis != now.Add(providerCircuitCooldown).UnixMilli() {
+		t.Fatalf("external provider rate limit lost five-minute protection: %+v", state)
+	}
+}
+
+func TestProfitEdgeReserveUsesPositiveEdgeInsteadOfGrossNotional(t *testing.T) {
+	output := big.NewInt(1_050_000)
+	repay := big.NewInt(1_000_000)
+	flash := big.NewInt(1_000)
+	gas := big.NewInt(9_000)
+	expected := new(big.Int).Sub(new(big.Int).Set(output), repay)
+	expected.Sub(expected, flash).Sub(expected, gas)
+
+	reserve, conservative, minimumUnwind := profitEdgeReserve(expected, output, 500)
+	if expected.String() != "40000" ||
+		reserve.String() != "2000" ||
+		conservative.String() != "38000" ||
+		minimumUnwind.String() != "1048000" {
+		t.Fatalf(
+			"unexpected edge reserve economics: expected=%s reserve=%s conservative=%s minimum_unwind=%s",
+			expected, reserve, conservative, minimumUnwind,
+		)
+	}
+
+	legacyOutput := new(big.Int).Mul(new(big.Int).Set(output), big.NewInt(9_500))
+	legacyOutput.Div(legacyOutput, big.NewInt(10_000))
+	legacy := new(big.Int).Sub(legacyOutput, repay)
+	legacy.Sub(legacy, flash).Sub(legacy, gas)
+	if legacy.Sign() >= 0 {
+		t.Fatalf("legacy notional haircut unexpectedly retained the positive edge: %s", legacy)
+	}
+}
+
+func TestProfitEdgeReserveDoesNotAmplifyNegativeExpectedPnL(t *testing.T) {
+	expected := big.NewInt(-7_000)
+	output := big.NewInt(1_000_000)
+	reserve, conservative, minimumUnwind := profitEdgeReserve(expected, output, 500)
+	if reserve.Sign() != 0 || conservative.Cmp(expected) != 0 || minimumUnwind.Cmp(output) != 0 {
+		t.Fatalf(
+			"negative edge was mutated: reserve=%s conservative=%s minimum_unwind=%s",
+			reserve, conservative, minimumUnwind,
+		)
+	}
+}
+func TestRouteAwareExactBudgetLearnsPairIneligibility(t *testing.T) {
+	eligible := []exactReserve{
+		{
+			Asset:               wethAddress,
+			CurrentStableDebt:   "0",
+			CurrentVariableDebt: "2500000000000000",
+		},
+		{
+			Asset:                    nativeUSDCAddress,
+			CurrentATokenBalance:     "1000000000",
+			UsageAsCollateralEnabled: true,
+		},
+	}
+	if got := exactRouteIneligibleReason(eligible); got != "" {
+		t.Fatalf("eligible pair unexpectedly rejected: %q", got)
+	}
+
+	noWETHDebt := append([]exactReserve(nil), eligible...)
+	noWETHDebt[0].CurrentVariableDebt = "0"
+	if got := exactRouteIneligibleReason(noWETHDebt); got != "no_weth_debt" {
+		t.Fatalf("unexpected no-WETH-debt diagnostic: %q", got)
+	}
+
+	noUSDC := append([]exactReserve(nil), eligible...)
+	noUSDC[1].CurrentATokenBalance = "0"
+	if got := exactRouteIneligibleReason(noUSDC); got != "no_native_usdc_collateral" {
+		t.Fatalf("unexpected no-USDC-collateral diagnostic: %q", got)
+	}
+
+	notCollateral := append([]exactReserve(nil), eligible...)
+	notCollateral[1].UsageAsCollateralEnabled = false
+	if got := exactRouteIneligibleReason(notCollateral); got != "native_usdc_not_collateral" {
+		t.Fatalf("unexpected collateral-disabled diagnostic: %q", got)
+	}
+}
+
+func TestRouteAwareExactBudgetDeprioritizesKnownIneligibleBorrower(t *testing.T) {
+	ineligible := "0x1111111111111111111111111111111111111111"
+	unknown := "0x2222222222222222222222222222222222222222"
+
+	screener := &Screener{
+		hotBorrowers: map[string]string{
+			ineligible: "900000000000000000",
+			unknown:    "990000000000000000",
+		},
+		hotDebtBase: map[string]string{
+			ineligible: "1000000000",
+			unknown:    "100",
+		},
+		state: State{
+			RouteIneligible: map[string]string{
+				ineligible: "no_weth_debt",
+			},
+		},
+	}
+	batch := screener.nextHotBatch()
+	if len(batch) != 2 || batch[0] != unknown || batch[1] != ineligible {
+		t.Fatalf("route-ineligible borrower was not deferred: %v", batch)
+	}
+}
+func TestRouteIneligibleStatePersistsAndTailInvalidatesDurably(t *testing.T) {
+	directory := t.TempDir()
+	borrower := "0x1111111111111111111111111111111111111111"
+	discoveryHash := strings.Repeat("a", 64)
+
+	first := &Screener{
+		config: Config{
+			StateDir:        directory,
+			DiscoverySHA256: discoveryHash,
+			StartingCursor:  0,
+		},
+		state: State{
+			Schema:          StateSchema,
+			DiscoverySHA256: discoveryHash,
+			Counts:          map[string]uint64{},
+			RouteIneligible: map[string]string{borrower: "no_weth_debt"},
+		},
+	}
+	if err := first.persistState(); err != nil {
+		t.Fatal(err)
+	}
+
+	second := &Screener{
+		config: Config{
+			StateDir:        directory,
+			DiscoverySHA256: discoveryHash,
+			StartingCursor:  0,
+		},
+		state: State{},
+	}
+	if err := second.loadState(); err != nil {
+		t.Fatal(err)
+	}
+	if second.state.RouteIneligible[borrower] != "no_weth_debt" {
+		t.Fatalf("route-ineligible state did not survive restart: %+v", second.state.RouteIneligible)
+	}
+
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if request.URL.Path != "/v1/aave/tail" {
+			t.Fatalf("unexpected path: %s", request.URL.Path)
+		}
+		var input tailRequest
+		if err := json.NewDecoder(request.Body).Decode(&input); err != nil {
+			t.Fatal(err)
+		}
+		_ = json.NewEncoder(writer).Encode(tailResponse{
+			SchemaVersion:        "phoenix.rpc.aave-tail-response.v1",
+			ChainID:              42161,
+			RequestID:            input.RequestID,
+			FinalizedBlockNumber: 100,
+			FinalizedBlockHash:   "0x" + strings.Repeat("b", 64),
+			FromBlock:            100,
+			ToBlock:              100,
+			NextBlock:            101,
+			PrimaryProviderID:    "production-nownodes-arbitrum",
+			SecondaryProviderID:  "production-slot-0",
+			Borrowers:            []string{borrower},
+		})
+	}))
+	defer server.Close()
+
+	second.config.GatewayURL = server.URL
+	second.client = server.Client()
+	second.state.TailNextBlock = 100
+	second.debtBearing = make(map[string]bool)
+	second.refreshKnown = make(map[string]bool)
+
+	borrowers, err := second.pollTail(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(borrowers) != 1 || borrowers[0] != borrower {
+		t.Fatalf("unexpected tail borrowers: %v", borrowers)
+	}
+	if _, exists := second.state.RouteIneligible[borrower]; exists {
+		t.Fatalf("tail event did not clear route-ineligible state: %+v", second.state.RouteIneligible)
+	}
+
+	var durable State
+	data, err := os.ReadFile(filepath.Join(directory, "state.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(data, &durable); err != nil {
+		t.Fatal(err)
+	}
+	if _, exists := durable.RouteIneligible[borrower]; exists {
+		t.Fatalf("tail invalidation was not persisted: %+v", durable.RouteIneligible)
 	}
 }
