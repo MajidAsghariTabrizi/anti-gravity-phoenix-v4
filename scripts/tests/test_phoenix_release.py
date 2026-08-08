@@ -2442,6 +2442,15 @@ class WorkflowAndDeploymentContractTests(unittest.TestCase):
         self.assertIn(
             "POSTGRES_DSN=postgres://phoenix_rehearsal:", self.rehearsal
         )
+        readiness = self.rehearsal.split(
+            "database_deadline=", maxsplit=1
+        )[1].split(
+            '[ "$database_ready" -eq 1 ]', maxsplit=1
+        )[0]
+        self.assertIn("psql -X -qAt -v ON_ERROR_STOP=1", readiness)
+        self.assertIn("-d phoenix_rehearsal", readiness)
+        self.assertIn("-c 'SELECT 1'", readiness)
+        self.assertNotIn("pg_isready", readiness)
         self.assertIn("PGCONNECT_TIMEOUT=5", self.rehearsal)
         self.assertIn("statement_timeout=60000", self.rehearsal)
         self.assertIn("deadline=$(( monitor_started_at + 180 ))", self.rehearsal)

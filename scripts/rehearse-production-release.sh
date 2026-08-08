@@ -230,8 +230,13 @@ database_container="phoenix-release-rehearsal-db-$short_sha-$$"
 database_deadline=$(( $(date +%s) + 60 ))
 database_ready=0
 while [ "$(date +%s)" -lt "$database_deadline" ]; do
+  # pg_isready can succeed against the temporary init server before
+  # POSTGRES_DB has been created. Require a real query against the exact
+  # rehearsal database before allowing candidate migrations to begin.
   if /usr/bin/docker exec "$database_container" \
-    pg_isready -U phoenix_rehearsal -d phoenix_rehearsal >/dev/null 2>&1
+    psql -X -qAt -v ON_ERROR_STOP=1 \
+      -U phoenix_rehearsal -d phoenix_rehearsal \
+      -c 'SELECT 1' 2>/dev/null | grep -qx '1'
   then
     database_ready=1
     break
