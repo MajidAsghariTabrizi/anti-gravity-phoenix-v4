@@ -110,6 +110,7 @@ type State struct {
 	TailNextBlock                      uint64            `json:"tail_next_block"`
 	DebtBearingCount                   uint64            `json:"debt_bearing_count"`
 	Counts                             map[string]uint64 `json:"counts"`
+	RouteIneligible                    map[string]string `json:"route_ineligible,omitempty"`
 	ExactQueueCount                    uint64            `json:"exact_queue_count"`
 	IncompleteCount                    uint64            `json:"incomplete_count"`
 	LastErrorClass                     string            `json:"last_error_class,omitempty"`
@@ -121,20 +122,19 @@ type State struct {
 }
 
 type Screener struct {
-	config          Config
-	client          *http.Client
-	mu              sync.Mutex
-	state           State
-	debtBearing     map[string]bool
-	refreshKnown    map[string]bool
-	refreshOrder    []string
-	refreshCursor   int
-	hotBorrowers    map[string]string
-	hotDebtBase     map[string]string
-	lastExactAt     map[string]time.Time
-	routeIneligible map[string]string
-	wait            func(context.Context, time.Duration) bool
-	now             func() time.Time
+	config        Config
+	client        *http.Client
+	mu            sync.Mutex
+	state         State
+	debtBearing   map[string]bool
+	refreshKnown  map[string]bool
+	refreshOrder  []string
+	refreshCursor int
+	hotBorrowers  map[string]string
+	hotDebtBase   map[string]string
+	lastExactAt   map[string]time.Time
+	wait          func(context.Context, time.Duration) bool
+	now           func() time.Time
 }
 
 type gatewayErrorContract struct {
@@ -486,9 +486,9 @@ func New(config Config) (*Screener, error) {
 		config: config, client: &http.Client{Timeout: 35 * time.Second}, state: state,
 		debtBearing: make(map[string]bool), refreshKnown: make(map[string]bool),
 		hotBorrowers: make(map[string]string), hotDebtBase: make(map[string]string),
-		lastExactAt: make(map[string]time.Time), routeIneligible: make(map[string]string),
-		wait: waitContext,
-		now:  func() time.Time { return time.Now().UTC() },
+		lastExactAt: make(map[string]time.Time),
+		wait:        waitContext,
+		now:         func() time.Time { return time.Now().UTC() },
 	}
 	if err := s.loadState(); err != nil {
 		return nil, err
@@ -624,6 +624,10 @@ func (s *Screener) Snapshot() State {
 	copy.Counts = make(map[string]uint64, len(s.state.Counts))
 	for key, value := range s.state.Counts {
 		copy.Counts[key] = value
+	}
+	copy.RouteIneligible = make(map[string]string, len(s.state.RouteIneligible))
+	for borrower, reason := range s.state.RouteIneligible {
+		copy.RouteIneligible[borrower] = reason
 	}
 	return copy
 }
@@ -918,7 +922,7 @@ func (s *Screener) pollTail(ctx context.Context) ([]string, error) {
 		// immediately invalidates both the short Exact cooldown and any
 		// route-ineligibility learned from a prior Exact reserve snapshot.
 		delete(s.lastExactAt, borrower)
-		delete(s.routeIneligible, borrower)
+		delete(s.state.RouteIneligible, borrower)
 	}
 	now := time.Now().UTC()
 	s.state.TailNextBlock = result.NextBlock
@@ -1052,7 +1056,7 @@ func (s *Screener) nextHotBatch() []string {
 			borrower:        borrower,
 			hf:              hf,
 			debt:            s.hotDebtBase[borrower],
-			routeIneligible: s.routeIneligible[borrower] != "",
+			routeIneligible: s.state.RouteIneligible[borrower] != "",
 		})
 	}
 	sort.Slice(entries, func(i, j int) bool {
@@ -1119,7 +1123,7 @@ func (s *Screener) screen(ctx context.Context, borrowers []string, advanceSeed b
 			delete(s.hotBorrowers, primary.Borrower)
 			delete(s.hotDebtBase, primary.Borrower)
 			delete(s.lastExactAt, primary.Borrower)
-			delete(s.routeIneligible, primary.Borrower)
+			delete(s.state.RouteIneligible, primary.Borrower)
 		}
 		if err := s.updateBorrowerActivityLocked(primary.Borrower, primary.TotalDebtBase != "0"); err != nil {
 			return err
@@ -1143,7 +1147,7 @@ func (s *Screener) screen(ctx context.Context, borrowers []string, advanceSeed b
 		}
 		if record.TerminalOutcome == "exact_pending" && !exactAuthorityWasDegraded {
 			now := s.nowUTC()
-			routeReason, knownRouteIneligible := s.routeIneligible[primary.Borrower]
+			routeReason, knownRouteIneligible := s.state.RouteIneligible[primary.Borrower]
 			lastExact, recentlyResolved := s.lastExactAt[primary.Borrower]
 			if knownRouteIneligible {
 				record.ExactDeferredReason = "route_ineligible_until_tail"
@@ -1166,7 +1170,7 @@ func (s *Screener) screen(ctx context.Context, borrowers []string, advanceSeed b
 				record = exactRecord
 				s.lastExactAt[primary.Borrower] = now
 				if record.ExactRouteIneligibleReason != "" {
-					s.routeIneligible[primary.Borrower] = record.ExactRouteIneligibleReason
+					s.state.RouteIneligible[primary.Borrower] = record.ExactRouteIneligibleReason
 					if s.state.Counts == nil {
 						s.state.Counts = make(map[string]uint64)
 					}
@@ -1803,6 +1807,17 @@ func (s *Screener) loadState() error {
 	if state.Schema != StateSchema || state.DiscoverySHA256 != s.config.DiscoverySHA256 || state.Cursor < s.config.StartingCursor || state.Counts == nil {
 		return errors.New("existing hunter state is incompatible")
 	}
+	if state.RouteIneligible == nil {
+		state.RouteIneligible = make(map[string]string)
+	}
+	for borrower, reason := range state.RouteIneligible {
+		if !addressPattern.MatchString(borrower) ||
+			reason != "no_weth_debt" &&
+				reason != "no_native_usdc_collateral" &&
+				reason != "native_usdc_not_collateral" {
+			return errors.New("existing route-ineligible state is invalid")
+		}
+	}
 	s.state = state
 	return nil
 }
@@ -1915,8 +1930,8 @@ func (s *Screener) ensureHotMapsLocked() {
 	if s.lastExactAt == nil {
 		s.lastExactAt = make(map[string]time.Time)
 	}
-	if s.routeIneligible == nil {
-		s.routeIneligible = make(map[string]string)
+	if s.state.RouteIneligible == nil {
+		s.state.RouteIneligible = make(map[string]string)
 	}
 }
 
@@ -1935,7 +1950,6 @@ func (s *Screener) applyHotSignal(record signal) {
 		delete(s.hotBorrowers, record.Borrower)
 		delete(s.hotDebtBase, record.Borrower)
 		delete(s.lastExactAt, record.Borrower)
-		delete(s.routeIneligible, record.Borrower)
 	}
 }
 

@@ -1045,12 +1045,104 @@ func TestRouteAwareExactBudgetDeprioritizesKnownIneligibleBorrower(t *testing.T)
 			ineligible: "1000000000",
 			unknown:    "100",
 		},
-		routeIneligible: map[string]string{
-			ineligible: "no_weth_debt",
+		state: State{
+			RouteIneligible: map[string]string{
+				ineligible: "no_weth_debt",
+			},
 		},
 	}
 	batch := screener.nextHotBatch()
 	if len(batch) != 2 || batch[0] != unknown || batch[1] != ineligible {
 		t.Fatalf("route-ineligible borrower was not deferred: %v", batch)
+	}
+}
+func TestRouteIneligibleStatePersistsAndTailInvalidatesDurably(t *testing.T) {
+	directory := t.TempDir()
+	borrower := "0x1111111111111111111111111111111111111111"
+	discoveryHash := strings.Repeat("a", 64)
+
+	first := &Screener{
+		config: Config{
+			StateDir:        directory,
+			DiscoverySHA256: discoveryHash,
+			StartingCursor:  0,
+		},
+		state: State{
+			Schema:          StateSchema,
+			DiscoverySHA256: discoveryHash,
+			Counts:          map[string]uint64{},
+			RouteIneligible: map[string]string{borrower: "no_weth_debt"},
+		},
+	}
+	if err := first.persistState(); err != nil {
+		t.Fatal(err)
+	}
+
+	second := &Screener{
+		config: Config{
+			StateDir:        directory,
+			DiscoverySHA256: discoveryHash,
+			StartingCursor:  0,
+		},
+		state: State{},
+	}
+	if err := second.loadState(); err != nil {
+		t.Fatal(err)
+	}
+	if second.state.RouteIneligible[borrower] != "no_weth_debt" {
+		t.Fatalf("route-ineligible state did not survive restart: %+v", second.state.RouteIneligible)
+	}
+
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if request.URL.Path != "/v1/aave/tail" {
+			t.Fatalf("unexpected path: %s", request.URL.Path)
+		}
+		var input tailRequest
+		if err := json.NewDecoder(request.Body).Decode(&input); err != nil {
+			t.Fatal(err)
+		}
+		_ = json.NewEncoder(writer).Encode(tailResponse{
+			SchemaVersion:        "phoenix.rpc.aave-tail-response.v1",
+			ChainID:              42161,
+			RequestID:            input.RequestID,
+			FinalizedBlockNumber: 100,
+			FinalizedBlockHash:   "0x" + strings.Repeat("b", 64),
+			FromBlock:            100,
+			ToBlock:              100,
+			NextBlock:            101,
+			PrimaryProviderID:    "production-nownodes-arbitrum",
+			SecondaryProviderID:  "production-slot-0",
+			Borrowers:            []string{borrower},
+		})
+	}))
+	defer server.Close()
+
+	second.config.GatewayURL = server.URL
+	second.client = server.Client()
+	second.state.TailNextBlock = 100
+	second.debtBearing = make(map[string]bool)
+	second.refreshKnown = make(map[string]bool)
+
+	borrowers, err := second.pollTail(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(borrowers) != 1 || borrowers[0] != borrower {
+		t.Fatalf("unexpected tail borrowers: %v", borrowers)
+	}
+	if _, exists := second.state.RouteIneligible[borrower]; exists {
+		t.Fatalf("tail event did not clear route-ineligible state: %+v", second.state.RouteIneligible)
+	}
+
+	var durable State
+	data, err := os.ReadFile(filepath.Join(directory, "state.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(data, &durable); err != nil {
+		t.Fatal(err)
+	}
+	if _, exists := durable.RouteIneligible[borrower]; exists {
+		t.Fatalf("tail invalidation was not persisted: %+v", durable.RouteIneligible)
 	}
 }
