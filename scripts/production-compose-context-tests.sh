@@ -34,6 +34,17 @@ rendered=$test_root/rendered.json
 metadata=$test_root/metadata.json
 
 cp "$repo_dir/compose.prod.yml" "$compose_file"
+# The live Aave economics calibration must survive immutable release rendering.
+grep -F -- '--flash-premium-bps=${ATLAS_AAVE_FLASH_PREMIUM_BPS:-5}' "$compose_file" >/dev/null ||
+  fail "Atlas flash premium default drifted from reviewed on-chain calibration"
+grep -F -- '--economic-reserve-bps=${ATLAS_AAVE_ECONOMIC_RESERVE_BPS:-25}' "$compose_file" >/dev/null ||
+  fail "Atlas economic reserve default drifted from reviewed legacy-equivalent calibration"
+if grep -F -- '--flash-premium-bps=9' "$compose_file" >/dev/null; then
+  fail "legacy Atlas flash premium resurfaced in release Compose"
+fi
+if grep -F -- '--economic-reserve-bps=500' "$compose_file" >/dev/null; then
+  fail "legacy Atlas gross-notional reserve resurfaced in release Compose"
+fi
 
 cat >"$manifest" <<EOF
 {

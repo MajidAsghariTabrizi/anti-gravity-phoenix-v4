@@ -278,8 +278,12 @@ services:
       - --executor-code-hash=${LIVE_EXECUTOR_EXECUTOR_CODE_HASH:?LIVE_EXECUTOR_EXECUTOR_CODE_HASH is required}
       - --caller-address=${LIVE_EXECUTOR_WALLET_ADDRESS:?LIVE_EXECUTOR_WALLET_ADDRESS is required}
       - --release-sha=${PHOENIX_RELEASE_SHA:?PHOENIX_RELEASE_SHA is required}
-      - --flash-premium-bps=9
-      - --economic-reserve-bps=500
+      # Aave premium is live-verified during financial calibration; keep a bounded
+      # env override while making the calibrated on-chain default release-durable.
+      - --flash-premium-bps=${ATLAS_AAVE_FLASH_PREMIUM_BPS:-5}
+      # Legacy live gate applies reserve to gross unwind notional. 25 bps is the
+      # reviewed equivalent until the positive-edge reserve model gains authority.
+      - --economic-reserve-bps=${ATLAS_AAVE_ECONOMIC_RESERVE_BPS:-25}
       - --rpc-gateway-url=http://rpc-gateway:9300
       - --health-addr=0.0.0.0:9700
     volumes:
