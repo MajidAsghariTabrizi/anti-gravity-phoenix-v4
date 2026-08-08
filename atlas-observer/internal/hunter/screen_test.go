@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"math/big"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -840,5 +841,45 @@ func TestSecondaryRateLimitStillUsesFiveMinuteProviderCooldown(t *testing.T) {
 	state := screener.Snapshot()
 	if state.ProviderCircuitOpenUntilUnixMillis != now.Add(providerCircuitCooldown).UnixMilli() {
 		t.Fatalf("external provider rate limit lost five-minute protection: %+v", state)
+	}
+}
+
+func TestProfitEdgeReserveUsesPositiveEdgeInsteadOfGrossNotional(t *testing.T) {
+	output := big.NewInt(1_050_000)
+	repay := big.NewInt(1_000_000)
+	flash := big.NewInt(1_000)
+	gas := big.NewInt(9_000)
+	expected := new(big.Int).Sub(new(big.Int).Set(output), repay)
+	expected.Sub(expected, flash).Sub(expected, gas)
+
+	reserve, conservative, minimumUnwind := profitEdgeReserve(expected, output, 500)
+	if expected.String() != "40000" ||
+		reserve.String() != "2000" ||
+		conservative.String() != "38000" ||
+		minimumUnwind.String() != "1048000" {
+		t.Fatalf(
+			"unexpected edge reserve economics: expected=%s reserve=%s conservative=%s minimum_unwind=%s",
+			expected, reserve, conservative, minimumUnwind,
+		)
+	}
+
+	legacyOutput := new(big.Int).Mul(new(big.Int).Set(output), big.NewInt(9_500))
+	legacyOutput.Div(legacyOutput, big.NewInt(10_000))
+	legacy := new(big.Int).Sub(legacyOutput, repay)
+	legacy.Sub(legacy, flash).Sub(legacy, gas)
+	if legacy.Sign() >= 0 {
+		t.Fatalf("legacy notional haircut unexpectedly retained the positive edge: %s", legacy)
+	}
+}
+
+func TestProfitEdgeReserveDoesNotAmplifyNegativeExpectedPnL(t *testing.T) {
+	expected := big.NewInt(-7_000)
+	output := big.NewInt(1_000_000)
+	reserve, conservative, minimumUnwind := profitEdgeReserve(expected, output, 500)
+	if reserve.Sign() != 0 || conservative.Cmp(expected) != 0 || minimumUnwind.Cmp(output) != 0 {
+		t.Fatalf(
+			"negative edge was mutated: reserve=%s conservative=%s minimum_unwind=%s",
+			reserve, conservative, minimumUnwind,
+		)
 	}
 }

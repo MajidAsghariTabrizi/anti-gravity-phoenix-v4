@@ -50,6 +50,10 @@ const (
 	providerCircuitSkippedTotalKey  = "provider_circuit_skipped_total"
 	providerCircuitCooldown         = 5 * time.Minute
 	gatewayBudgetCircuitCooldown    = 30 * time.Second
+	edgeReserveExpectedPositiveKey  = "edge_reserve_expected_positive_total"
+	edgeReserveLegacyPassKey        = "edge_reserve_legacy_pass_total"
+	edgeReserveCorrectedPassKey     = "edge_reserve_corrected_pass_total"
+	edgeReserveWouldPassKey         = "edge_reserve_would_pass_total"
 	aavePoolAddress                 = "0x794a61358d6845594f94dc1db02a252b5b4814ad"
 	wethAddress                     = "0x82af49447d8a07e3bd95bd0d56f35241523fbab1"
 	nativeUSDCAddress               = "0xaf88d065e77c8cc2239327c5edb3a432268e5831"
@@ -238,24 +242,28 @@ type exactResponse struct {
 }
 
 type signal struct {
-	Schema                      string              `json:"schema"`
-	ObservedAt                  time.Time           `json:"observed_at"`
-	Cursor                      uint64              `json:"cursor"`
-	Block                       uint64              `json:"block_number"`
-	BlockHash                   string              `json:"block_hash"`
-	Borrower                    string              `json:"borrower"`
-	DebtBase                    string              `json:"total_debt_base"`
-	HF                          string              `json:"health_factor_wad"`
-	Bucket                      string              `json:"bucket"`
-	Authority                   bool                `json:"candidate_authority"`
-	ZeroCostProfitUpperBoundWei string              `json:"zero_cost_profit_upper_bound_wei,omitempty"`
-	ExpectedNetPnLWei           string              `json:"expected_net_pnl_wei,omitempty"`
-	ConservativeNetPnLWei       string              `json:"conservative_net_pnl_wei,omitempty"`
-	StateRoot                   string              `json:"state_root,omitempty"`
-	SelectedRoute               string              `json:"selected_route,omitempty"`
-	TerminalOutcome             string              `json:"terminal_outcome"`
-	ExecutionCandidate          *executionCandidate `json:"-"`
-	AtlasCandidate              *atlasCandidate     `json:"-"`
+	Schema                            string              `json:"schema"`
+	ObservedAt                        time.Time           `json:"observed_at"`
+	Cursor                            uint64              `json:"cursor"`
+	Block                             uint64              `json:"block_number"`
+	BlockHash                         string              `json:"block_hash"`
+	Borrower                          string              `json:"borrower"`
+	DebtBase                          string              `json:"total_debt_base"`
+	HF                                string              `json:"health_factor_wad"`
+	Bucket                            string              `json:"bucket"`
+	Authority                         bool                `json:"candidate_authority"`
+	ZeroCostProfitUpperBoundWei       string              `json:"zero_cost_profit_upper_bound_wei,omitempty"`
+	ExpectedNetPnLWei                 string              `json:"expected_net_pnl_wei,omitempty"`
+	ConservativeNetPnLWei             string              `json:"conservative_net_pnl_wei,omitempty"`
+	EdgeReserveAmountWei              string              `json:"edge_reserve_amount_wei,omitempty"`
+	EdgeReserveConservativeNetPnLWei  string              `json:"edge_reserve_conservative_net_pnl_wei,omitempty"`
+	EdgeReserveMinimumUnwindOutputWei string              `json:"edge_reserve_minimum_unwind_output_wei,omitempty"`
+	EdgeReserveWouldPass              bool                `json:"edge_reserve_would_pass,omitempty"`
+	StateRoot                         string              `json:"state_root,omitempty"`
+	SelectedRoute                     string              `json:"selected_route,omitempty"`
+	TerminalOutcome                   string              `json:"terminal_outcome"`
+	ExecutionCandidate                *executionCandidate `json:"-"`
+	AtlasCandidate                    *atlasCandidate     `json:"-"`
 }
 
 type atlasPreparedOperation struct {
@@ -1087,13 +1095,44 @@ func (s *Screener) resolveExact(ctx context.Context, record signal, auction *obs
 	gas := new(big.Int).Mul(maxFee, new(big.Int).SetUint64(s.config.MaximumGasLimit))
 	expected := new(big.Int).Sub(new(big.Int).Set(output), repay)
 	expected.Sub(expected, flash).Sub(expected, gas)
+
+	// Legacy live gate: the configured reserve is applied to the whole unwind
+	// notional. Keep this unchanged while collecting shadow evidence.
 	conservativeOutput := new(big.Int).Mul(output, new(big.Int).SetUint64(10_000-s.config.EconomicReserveBPS))
 	conservativeOutput.Div(conservativeOutput, big.NewInt(10_000))
 	conservative := new(big.Int).Sub(conservativeOutput, repay)
 	conservative.Sub(conservative, flash).Sub(conservative, gas)
+
+	// Corrected shadow model: risk reserve is charged against positive edge,
+	// not principal/notional. It has no Candidate authority in this audit patch.
+	edgeReserve, edgeConservative, edgeMinimumUnwind := profitEdgeReserve(
+		expected,
+		output,
+		s.config.EconomicReserveBPS,
+	)
+
 	record.ExpectedNetPnLWei = expected.String()
 	record.ConservativeNetPnLWei = conservative.String()
+	record.EdgeReserveAmountWei = edgeReserve.String()
+	record.EdgeReserveConservativeNetPnLWei = edgeConservative.String()
+	record.EdgeReserveMinimumUnwindOutputWei = edgeMinimumUnwind.String()
 	floor, _ := newBigUint(s.config.RetainedProfitFloorWei)
+	if s.state.Counts == nil {
+		s.state.Counts = make(map[string]uint64)
+	}
+	if expected.Cmp(floor) > 0 {
+		s.state.Counts[edgeReserveExpectedPositiveKey]++
+	}
+	if conservative.Cmp(floor) > 0 {
+		s.state.Counts[edgeReserveLegacyPassKey]++
+	}
+	if edgeConservative.Cmp(floor) > 0 {
+		s.state.Counts[edgeReserveCorrectedPassKey]++
+	}
+	if expected.Cmp(floor) > 0 && conservative.Cmp(floor) <= 0 && edgeConservative.Cmp(floor) > 0 {
+		record.EdgeReserveWouldPass = true
+		s.state.Counts[edgeReserveWouldPassKey]++
+	}
 	if expected.Cmp(floor) <= 0 || conservative.Cmp(floor) <= 0 {
 		record.TerminalOutcome = "economic_rejection"
 	} else {
@@ -1138,6 +1177,20 @@ func (s *Screener) resolveExact(ctx context.Context, record signal, auction *obs
 		record.TerminalOutcome = "candidate"
 	}
 	return record, nil
+}
+
+func profitEdgeReserve(expected, grossOutput *big.Int, reserveBPS uint64) (*big.Int, *big.Int, *big.Int) {
+	reserve := new(big.Int)
+	if expected.Sign() > 0 && reserveBPS > 0 {
+		reserve.Mul(new(big.Int).Set(expected), new(big.Int).SetUint64(reserveBPS))
+		reserve.Add(reserve, big.NewInt(9_999)).Div(reserve, big.NewInt(10_000))
+	}
+	conservative := new(big.Int).Sub(new(big.Int).Set(expected), reserve)
+	minimumUnwind := new(big.Int).Sub(new(big.Int).Set(grossOutput), reserve)
+	if minimumUnwind.Sign() < 0 {
+		minimumUnwind.SetInt64(0)
+	}
+	return reserve, conservative, minimumUnwind
 }
 
 func (s *Screener) buildAtlasCandidate(
