@@ -1249,7 +1249,8 @@ class ActiveHistoricalStateReconstructionTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             paths = self.paths(root)
-            evidence = self.evidence_file(root)
+            expected = self.completed_state()
+            evidence = self.evidence_file(root, expected)
             with patch(
                 "scripts.phoenix_release.gateway._active_reconstruction_runtime",
                 return_value=self.runtime(),
@@ -1259,7 +1260,7 @@ class ActiveHistoricalStateReconstructionTests(unittest.TestCase):
                 )
             restored = load_state(state_file(paths, RELEASE_SHA))
             self.assertEqual(result["status"], "reconstructed")
-            self.assertEqual(restored, self.completed_state())
+            self.assertEqual(restored, expected)
             metadata = state_file(paths, RELEASE_SHA).stat()
             self.assertEqual(
                 _historical_contract_evidence(
