@@ -40,6 +40,8 @@ contract PhoenixExecutor is IAaveFlashBorrower {
     error InvalidBid(address token, uint256 amount, uint256 maximum);
     error InvalidLiquidation();
     error InsufficientCollateral(uint256 received, uint256 minimum);
+    error RepayAmountMismatch(uint256 consumed, uint256 expected);
+    error CollateralAmountMismatch(uint256 received, uint256 expected);
 
     event OwnershipTransferStarted(address indexed previousOwner, address indexed newOwner);
     event OwnershipTransferred(address indexed previousOwner, address indexed newOwner);
@@ -460,8 +462,22 @@ contract PhoenixExecutor is IAaveFlashBorrower {
             _safeApprove(asset, flashProvider, 0);
             _safeApprove(asset, flashProvider, amount);
             IAaveV3Pool(flashProvider).liquidationCall(request.collateralAsset, asset, request.borrower, amount, false);
+            uint256 remainingDebtAllowance = IERC20(asset).allowance(address(this), flashProvider);
+            if (remainingDebtAllowance > amount) revert RepayAmountMismatch(0, amount);
+            uint256 actualRepay = amount - remainingDebtAllowance;
             _safeApprove(asset, flashProvider, 0);
-            uint256 collateralReceived = IERC20(request.collateralAsset).balanceOf(address(this)) - beforeCollateral;
+            if (actualRepay != amount) revert RepayAmountMismatch(actualRepay, amount);
+            uint256 afterCollateral = IERC20(request.collateralAsset).balanceOf(address(this));
+            // When debt and collateral are both WETH, liquidationCall spends the
+            // debt and returns collateral in the same balance delta. Add back the
+            // exact requested/flash amount so the zero-leg route measures seized
+            // collateral rather than only its net liquidation edge.
+            uint256 collateralReceived = request.collateralAsset == asset
+                ? afterCollateral + actualRepay - beforeCollateral
+                : afterCollateral - beforeCollateral;
+            if (request.collateralAsset == asset && collateralReceived != request.minCollateralReceived) {
+                revert CollateralAmountMismatch(collateralReceived, request.minCollateralReceived);
+            }
             if (collateralReceived < request.minCollateralReceived) {
                 revert InsufficientCollateral(collateralReceived, request.minCollateralReceived);
             }

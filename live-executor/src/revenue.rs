@@ -1,10 +1,13 @@
-use crate::aave::AaveLiquidationRequest;
+use crate::aave::{AaveLiquidationIdentity, AaveLiquidationRequest};
 use crate::atlas::{AtlasError, AtlasGateway, AtlasSolution, AtlasSolverOperation};
-use crate::model::CanonicalAddress;
+use crate::config::SafetyLimits;
+use crate::model::{CanonicalAddress, ValidatedLeg};
 use crate::rpc::{ExecutionRpc, HttpExecutionRpc, IndexedRpcLog, RpcError};
 use crate::signer::TransactionSigner;
 use crate::{
-    ARBITRUM_ATLAS_DAPP_CONTROL_ADDRESS, ARBITRUM_ATLAS_V1_6_4_ADDRESS, ARBITRUM_WETH_ADDRESS,
+    ARBITRUM_ATLAS_DAPP_CONTROL_ADDRESS, ARBITRUM_ATLAS_V1_6_4_ADDRESS,
+    ARBITRUM_NATIVE_USDC_ADDRESS, ARBITRUM_UNISWAP_V3_FACTORY_ADDRESS, ARBITRUM_WETH_ADDRESS,
+    CURRENT_ROUTE_POOL_3000_ADDRESS, CURRENT_ROUTE_POOL_500_ADDRESS,
 };
 use chrono::{DateTime, Utc};
 use ethabi::{ParamType, Token};
@@ -18,6 +21,8 @@ use thiserror::Error;
 
 const ACTIVE_ATTEMPT_STATUSES: &str =
     "'claimed','nonce_allocated','submission_unknown','pending','timed_out'";
+const ATLAS_ACTUAL_PATH_EVIDENCE_MODE: &str = "DUAL_PROVIDER_ATLAS_CALLBACK_FORK_VERIFIED";
+const ATLAS_SUBMISSION_MARGIN_SECONDS: u64 = 15;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AtlasExecutionState {
@@ -35,7 +40,9 @@ pub struct AtlasRevenueExecutor {
     gateway: AtlasGateway,
     signer: TransactionSigner,
     expected_solver: CanonicalAddress,
+    expected_code_hash: String,
     rpc: HttpExecutionRpc,
+    safety_limits: SafetyLimits,
 }
 
 #[derive(Deserialize)]
@@ -55,13 +62,28 @@ struct PreparedOperation {
     data: String,
 }
 
+#[derive(Clone)]
 struct ClaimedAtlasRequest {
     auction_id: String,
     maximum_bid: u128,
     solver_gas_limit: u64,
     oracle_gas_price: u128,
     auction_deadline: u64,
+    signal_retained_profit_floor: u128,
+    daily_charged_exposure: u128,
+    evidence_mode: String,
+    lane_limits: AtlasLaneLimits,
     operation: AtlasSolverOperation,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct AtlasLaneLimits {
+    maximum_input_amount: u128,
+    maximum_gas_limit: u64,
+    maximum_fee_per_gas: u128,
+    maximum_atlas_bid: u128,
+    daily_loss_limit: u128,
+    retained_profit_floor: u128,
 }
 
 struct ActiveAtlasRequest {
@@ -94,14 +116,18 @@ impl AtlasRevenueExecutor {
         pool: PgPool,
         signer: TransactionSigner,
         expected_solver: CanonicalAddress,
+        expected_code_hash: String,
         rpc: HttpExecutionRpc,
+        safety_limits: SafetyLimits,
     ) -> Self {
         Self {
             pool,
             gateway: AtlasGateway,
             signer,
             expected_solver,
+            expected_code_hash,
             rpc,
+            safety_limits,
         }
     }
 
@@ -137,6 +163,31 @@ impl AtlasRevenueExecutor {
                 .await?;
             return Err(RevenueError::Atlas(error));
         }
+        let (identity, reviewed_legs) =
+            match validate_aave_atlas_safety(&claimed, &self.safety_limits, now) {
+                Ok(validated) => validated,
+                Err(error) => {
+                    self.reject_and_unlock(&claimed.auction_id, "aave_atlas_safety")
+                        .await?;
+                    return Err(error);
+                }
+            };
+        match self
+            .preflight_is_ready(&claimed, &identity, &reviewed_legs)
+            .await
+        {
+            Ok(true) => {}
+            Ok(false) => {
+                self.reject_and_unlock(&claimed.auction_id, "atlas_pre_sign_preflight")
+                    .await?;
+                return Err(RevenueError::Data);
+            }
+            Err(error) => {
+                self.reject_and_unlock(&claimed.auction_id, "atlas_pre_sign_preflight_error")
+                    .await?;
+                return Err(error);
+            }
+        }
         let solution = match AtlasSolution::new(
             claimed.auction_id.clone(),
             &claimed.operation,
@@ -161,6 +212,24 @@ impl AtlasRevenueExecutor {
             self.reject_and_unlock(&claimed.auction_id, "kill_switch_before_submission")
                 .await?;
             return Ok(AtlasExecutionState::Disarmed);
+        }
+        match self
+            .preflight_is_ready(&claimed, &identity, &reviewed_legs)
+            .await
+        {
+            Ok(true) => {}
+            Ok(false) => {
+                self.reject_and_unlock(&claimed.auction_id, "atlas_pre_submit_preflight")
+                    .await?;
+                return Ok(AtlasExecutionState::Rejected {
+                    auction_id: claimed.auction_id,
+                });
+            }
+            Err(error) => {
+                self.reject_and_unlock(&claimed.auction_id, "atlas_pre_submit_preflight_error")
+                    .await?;
+                return Err(error);
+            }
         }
         match self.gateway.submit(&solution).await {
             Ok(receipt) => {
@@ -438,6 +507,54 @@ impl AtlasRevenueExecutor {
         }
     }
 
+    async fn submission_is_fresh(
+        &self,
+        claimed: &ClaimedAtlasRequest,
+        identity: &AaveLiquidationIdentity,
+        now: DateTime<Utc>,
+    ) -> Result<bool, RevenueError> {
+        if !inner_deadline_is_fresh(identity.deadline, now) {
+            return Ok(false);
+        }
+        let latest_block = self.rpc.latest_block_number().await?;
+        Ok(latest_block < claimed.auction_deadline && latest_block < claimed.operation.deadline)
+    }
+
+    async fn preflight_is_ready(
+        &self,
+        claimed: &ClaimedAtlasRequest,
+        identity: &AaveLiquidationIdentity,
+        reviewed_legs: &[ValidatedLeg],
+    ) -> Result<bool, RevenueError> {
+        if !self.executor_is_ready(identity, reviewed_legs).await? {
+            return Ok(false);
+        }
+        // Freshness is deliberately the final network-backed check. Contract
+        // readiness performs several RPC reads and must not consume the inner
+        // Unix or auction-block deadline margin unnoticed.
+        self.submission_is_fresh(claimed, identity, Utc::now())
+            .await
+    }
+
+    async fn executor_is_ready(
+        &self,
+        identity: &AaveLiquidationIdentity,
+        reviewed_legs: &[ValidatedLeg],
+    ) -> Result<bool, RevenueError> {
+        self.rpc
+            .atlas_execution_contract_ready(
+                self.expected_solver,
+                self.signer.address(),
+                &self.expected_code_hash,
+                identity.maximum_input_amount,
+                identity.debt_asset,
+                identity.collateral_asset,
+                reviewed_legs,
+            )
+            .await
+            .map_err(RevenueError::from)
+    }
+
     async fn lane_enabled(&self) -> Result<bool, RevenueError> {
         Ok(sqlx::query_scalar(
             "SELECT armed AND NOT kill_switch
@@ -453,17 +570,28 @@ impl AtlasRevenueExecutor {
         sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended('phoenix-global-revenue-submission', 0))")
             .execute(&mut *transaction)
             .await?;
-        let lane: (bool, bool, String, String) = sqlx::query_as(
-            "SELECT armed, kill_switch, maximum_atlas_bid::text, retained_profit_floor::text
+        let lane = sqlx::query(
+            "SELECT armed, kill_switch, maximum_input_amount::text, maximum_gas_limit,
+                    maximum_fee_per_gas::text, maximum_atlas_bid::text,
+                    daily_loss_limit::text, retained_profit_floor::text
              FROM live_canary.revenue_lane_controls
              WHERE lane = 'atlas_solver' FOR UPDATE",
         )
         .fetch_one(&mut *transaction)
         .await?;
-        if !lane.0 || lane.1 {
+        if !lane.try_get::<bool, _>("armed")? || lane.try_get::<bool, _>("kill_switch")? {
             transaction.rollback().await?;
             return Ok(None);
         }
+        let lane_limits = AtlasLaneLimits {
+            maximum_input_amount: parse_u128(lane.try_get::<String, _>("maximum_input_amount")?)?,
+            maximum_gas_limit: u64::try_from(lane.try_get::<i64, _>("maximum_gas_limit")?)
+                .map_err(|_| RevenueError::Data)?,
+            maximum_fee_per_gas: parse_u128(lane.try_get::<String, _>("maximum_fee_per_gas")?)?,
+            maximum_atlas_bid: parse_u128(lane.try_get::<String, _>("maximum_atlas_bid")?)?,
+            daily_loss_limit: parse_u128(lane.try_get::<String, _>("daily_loss_limit")?)?,
+            retained_profit_floor: parse_u128(lane.try_get::<String, _>("retained_profit_floor")?)?,
+        };
         let lock = sqlx::query(
             "SELECT active_lane FROM live_canary.global_revenue_submission_lock
              WHERE singleton FOR UPDATE",
@@ -480,14 +608,54 @@ impl AtlasRevenueExecutor {
             transaction.rollback().await?;
             return Ok(None);
         }
+        // The daily cap is shared with direct execution losses. Unknown or
+        // failed Atlas submissions retain their complete bounded solver
+        // exposure for the UTC day, so an explicit lane re-arm cannot reset
+        // the budget. Pre-submission rejections carry no submission/inclusion
+        // hash and therefore consume no loss budget.
+        let daily_charged_exposure = parse_u128(
+            sqlx::query_scalar::<_, String>(
+                "WITH bounds AS (
+                   SELECT date_trunc('day', $1::timestamptz AT TIME ZONE 'UTC') AT TIME ZONE 'UTC' AS start_at
+                 ), direct_loss AS (
+                   SELECT COALESCE(SUM(CASE WHEN net_pnl_wei < 0 THEN -net_pnl_wei ELSE 0 END), 0) AS amount
+                   FROM live_canary.execution_outcomes, bounds
+                   WHERE recorded_at >= bounds.start_at AND recorded_at < bounds.start_at + interval '1 day'
+                 ), atlas_loss AS (
+                   SELECT COALESCE(SUM(i.solver_gas_limit::numeric * i.oracle_gas_price_wei), 0) AS amount
+                   FROM live_canary.atlas_solver_requests r
+                   JOIN live_canary.atlas_auction_ingress i ON i.auction_id = r.auction_id
+                   CROSS JOIN bounds
+                   WHERE r.updated_at >= bounds.start_at AND r.updated_at < bounds.start_at + interval '1 day'
+                     AND (
+                       r.status IN ('signed', 'submitted', 'submission_unknown')
+                       OR (
+                         r.status = 'lost'
+                         AND (r.submission_response_hash IS NOT NULL OR r.inclusion_transaction_hash IS NOT NULL)
+                       )
+                     )
+                 )
+                 SELECT (direct_loss.amount + atlas_loss.amount)::text FROM direct_loss, atlas_loss",
+            )
+            .bind(now)
+            .fetch_one(&mut *transaction)
+            .await?,
+        )?;
         let row = sqlx::query(
             "SELECT r.auction_id, r.maximum_bid::text, r.selected_bid::text, r.solver_operation,
                     i.solver_gas_limit, i.oracle_gas_price_wei::text,
-                    i.auction_deadline_block::text
+                    i.auction_deadline_block::text, s.retained_profit_floor::text AS signal_floor,
+                    s.evidence_mode
              FROM live_canary.atlas_solver_requests r
              JOIN live_canary.revenue_hunting_signals s ON s.signal_id = r.signal_id
              JOIN live_canary.atlas_auction_ingress i ON i.auction_id = r.auction_id
              WHERE r.status = 'ready'
+               AND s.source_lane = 'atlas_solver'
+               AND s.auction_id = r.auction_id
+               AND i.relevant_aave
+               AND i.terminal_outcome = 'candidate'
+               AND r.user_operation_hash = i.user_operation_hash
+               AND lower(r.solver_operation->>'user_op_hash') = r.user_operation_hash
                AND s.terminal_outcome = 'candidate'
                AND s.expected_net_pnl > GREATEST(s.retained_profit_floor, $1::numeric)
                AND s.conservative_net_pnl > GREATEST(s.retained_profit_floor, $1::numeric)
@@ -495,8 +663,8 @@ impl AtlasRevenueExecutor {
              ORDER BY s.conservative_net_pnl DESC, r.created_at
              FOR UPDATE OF r SKIP LOCKED LIMIT 1",
         )
-        .bind(&lane.3)
-        .bind(&lane.2)
+        .bind(lane_limits.retained_profit_floor.to_string())
+        .bind(lane_limits.maximum_atlas_bid.to_string())
         .fetch_optional(&mut *transaction)
         .await?;
         let Some(row) = row else {
@@ -513,6 +681,10 @@ impl AtlasRevenueExecutor {
             .try_get::<String, _>("auction_deadline_block")?
             .parse::<u64>()
             .map_err(|_| RevenueError::Data)?;
+        let signal_retained_profit_floor = parse_u128(row.try_get::<String, _>("signal_floor")?)?;
+        let evidence_mode = row
+            .try_get::<Option<String>, _>("evidence_mode")?
+            .ok_or(RevenueError::Data)?;
         let value: Value = row.try_get("solver_operation")?;
         let operation = parse_operation(value, selected_bid)?;
         sqlx::query(
@@ -541,6 +713,10 @@ impl AtlasRevenueExecutor {
             solver_gas_limit,
             oracle_gas_price,
             auction_deadline,
+            signal_retained_profit_floor,
+            daily_charged_exposure,
+            evidence_mode,
+            lane_limits,
             operation,
         }))
     }
@@ -630,6 +806,136 @@ fn parse_operation(value: Value, selected_bid: u128) -> Result<AtlasSolverOperat
         bid_amount: selected_bid,
         data: parse_bytes(&raw.data)?,
     })
+}
+
+fn validate_aave_atlas_safety(
+    claimed: &ClaimedAtlasRequest,
+    safety: &SafetyLimits,
+    now: DateTime<Utc>,
+) -> Result<(AaveLiquidationIdentity, Vec<ValidatedLeg>), RevenueError> {
+    let operation = &claimed.operation;
+    let lane = claimed.lane_limits;
+
+    // Atlas exposes one all-in oracle gas price in SolverOperation, not a
+    // separate EIP-1559 priority field. Requiring that price to fit both
+    // executor fee ceilings is the only fail-closed way to prevent the Atlas
+    // lane from bypassing the configured priority cap.
+    if operation.gas != claimed.solver_gas_limit
+        || operation.gas > lane.maximum_gas_limit
+        || operation.gas > safety.maximum_gas_limit
+        || operation.max_fee_per_gas != claimed.oracle_gas_price
+        || operation.max_fee_per_gas > lane.maximum_fee_per_gas
+        || operation.max_fee_per_gas > safety.maximum_max_fee_per_gas
+        || operation.max_fee_per_gas > safety.maximum_priority_fee_per_gas
+        || claimed.maximum_bid == 0
+        || claimed.maximum_bid > lane.maximum_atlas_bid
+        || operation.bid_amount > claimed.maximum_bid
+        || operation.bid_amount > lane.maximum_atlas_bid
+        || operation.bid_token.is_some()
+        || claimed.evidence_mode != ATLAS_ACTUAL_PATH_EVIDENCE_MODE
+    {
+        return Err(RevenueError::Data);
+    }
+
+    let identity = AaveLiquidationRequest::decode_encoded_identity(&operation.data)
+        .map_err(|_| RevenueError::Data)?;
+    let weth = CanonicalAddress::parse(ARBITRUM_WETH_ADDRESS).map_err(|_| RevenueError::Data)?;
+    if identity.borrower.as_bytes() == &[0; 20]
+        || identity.debt_asset != weth
+        || identity.repay_amount > lane.maximum_input_amount
+        || identity.repay_amount > safety.maximum_input_amount
+        || identity.maximum_input_amount > lane.maximum_input_amount
+        || identity.maximum_input_amount > safety.maximum_input_amount
+        || identity.maximum_atlas_bid != operation.bid_amount
+        || identity.route_id == [0; 32]
+        || !inner_deadline_is_fresh(identity.deadline, now)
+    {
+        return Err(RevenueError::Data);
+    }
+    let reviewed_legs = reviewed_atlas_aave_legs(&identity)?;
+
+    // The solver gas limit at the auction oracle price is the maximum bonded
+    // Atlas gas liability. It is encoded once in minProfit; the exact bid is
+    // already added independently by PhoenixExecutor and must not be added here.
+    let solver_exposure = u128::from(claimed.solver_gas_limit)
+        .checked_mul(claimed.oracle_gas_price)
+        .ok_or(RevenueError::Data)?;
+    // The claim transaction carries the durable UTC-day total of direct losses
+    // plus prior failed/unknown Atlas exposures. Charge this attempt before
+    // signing so an owner re-arm cannot reset either daily budget.
+    let daily_exposure_after_claim = claimed
+        .daily_charged_exposure
+        .checked_add(solver_exposure)
+        .ok_or(RevenueError::Data)?;
+    if daily_exposure_after_claim > lane.daily_loss_limit
+        || daily_exposure_after_claim > safety.maximum_daily_loss_wei
+    {
+        return Err(RevenueError::Data);
+    }
+    let retained_floor = claimed
+        .signal_retained_profit_floor
+        .max(lane.retained_profit_floor)
+        .max(safety.minimum_expected_profit);
+    let minimum_profit_with_exposure = retained_floor
+        .checked_add(solver_exposure)
+        .and_then(|value| value.checked_add(1))
+        .ok_or(RevenueError::Data)?;
+    if identity.minimum_profit < minimum_profit_with_exposure {
+        return Err(RevenueError::Data);
+    }
+    Ok((identity, reviewed_legs))
+}
+
+fn inner_deadline_is_fresh(deadline: u64, now: DateTime<Utc>) -> bool {
+    u64::try_from(now.timestamp())
+        .ok()
+        .and_then(|now| now.checked_add(ATLAS_SUBMISSION_MARGIN_SECONDS))
+        .is_some_and(|minimum_deadline| deadline > minimum_deadline)
+}
+
+fn reviewed_atlas_aave_legs(
+    identity: &AaveLiquidationIdentity,
+) -> Result<Vec<ValidatedLeg>, RevenueError> {
+    let weth = CanonicalAddress::parse(ARBITRUM_WETH_ADDRESS).map_err(|_| RevenueError::Data)?;
+    if identity.collateral_asset == weth {
+        return if identity.unwind_legs.is_empty() {
+            Ok(Vec::new())
+        } else {
+            Err(RevenueError::Data)
+        };
+    }
+
+    let native_usdc =
+        CanonicalAddress::parse(ARBITRUM_NATIVE_USDC_ADDRESS).map_err(|_| RevenueError::Data)?;
+    let factory = CanonicalAddress::parse(ARBITRUM_UNISWAP_V3_FACTORY_ADDRESS)
+        .map_err(|_| RevenueError::Data)?;
+    let [leg] = identity.unwind_legs.as_slice() else {
+        return Err(RevenueError::Data);
+    };
+    let expected_pool = match leg.fee {
+        500 => CURRENT_ROUTE_POOL_500_ADDRESS,
+        3_000 => CURRENT_ROUTE_POOL_3000_ADDRESS,
+        _ => return Err(RevenueError::Data),
+    };
+    if identity.collateral_asset != native_usdc
+        || leg.pool != CanonicalAddress::parse(expected_pool).map_err(|_| RevenueError::Data)?
+        || leg.token_in != native_usdc
+        || leg.token_out != weth
+        || leg.zero_for_one
+        || leg.minimum_amount_out == 0
+        || leg.minimum_amount_out != identity.minimum_unwind_output
+    {
+        return Err(RevenueError::Data);
+    }
+    Ok(vec![ValidatedLeg {
+        pool: leg.pool,
+        factory: Some(factory),
+        token_in: leg.token_in,
+        token_out: leg.token_out,
+        fee: leg.fee,
+        zero_for_one: leg.zero_for_one,
+        min_amount_out: leg.minimum_amount_out,
+    }])
 }
 
 fn parse_u128(value: impl AsRef<str>) -> Result<u128, RevenueError> {
@@ -880,7 +1186,99 @@ impl RevenueError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::Duration;
     use serde_json::json;
+
+    fn address(value: &str) -> CanonicalAddress {
+        CanonicalAddress::parse(value).expect("address")
+    }
+
+    fn safety_limits() -> SafetyLimits {
+        SafetyLimits {
+            maximum_gas_limit: 1_000,
+            maximum_max_fee_per_gas: 20,
+            maximum_priority_fee_per_gas: 10,
+            maximum_input_amount: 1_000,
+            minimum_expected_profit: 100,
+            maximum_daily_loss_wei: 10_000,
+        }
+    }
+
+    fn atlas_aave_request() -> AaveLiquidationRequest {
+        let weth = address(ARBITRUM_WETH_ADDRESS);
+        AaveLiquidationRequest {
+            route_id: [7; 32],
+            borrower: address("0x1111111111111111111111111111111111111111"),
+            debt_asset: weth,
+            collateral_asset: weth,
+            repay_amount: 100,
+            maximum_input_amount: 1_000,
+            minimum_collateral_received: 100,
+            minimum_unwind_output: 100,
+            minimum_profit: 5_101,
+            maximum_atlas_bid: 200,
+            deadline: Utc::now() + Duration::minutes(1),
+            unwind_legs: Vec::new(),
+        }
+    }
+
+    fn atlas_native_usdc_request(fee: u32, pool: &str) -> AaveLiquidationRequest {
+        let mut request = atlas_aave_request();
+        let native_usdc = address(ARBITRUM_NATIVE_USDC_ADDRESS);
+        request.collateral_asset = native_usdc;
+        request.unwind_legs = vec![ValidatedLeg {
+            pool: address(pool),
+            factory: Some(address(ARBITRUM_UNISWAP_V3_FACTORY_ADDRESS)),
+            token_in: native_usdc,
+            token_out: address(ARBITRUM_WETH_ADDRESS),
+            fee,
+            zero_for_one: false,
+            min_amount_out: request.minimum_unwind_output,
+        }];
+        request
+    }
+
+    fn claimed_with_request(request: &AaveLiquidationRequest) -> ClaimedAtlasRequest {
+        ClaimedAtlasRequest {
+            auction_id: "auction-1".to_string(),
+            maximum_bid: 400,
+            solver_gas_limit: 500,
+            oracle_gas_price: 10,
+            auction_deadline: 49_000_000,
+            signal_retained_profit_floor: 100,
+            daily_charged_exposure: 0,
+            evidence_mode: ATLAS_ACTUAL_PATH_EVIDENCE_MODE.to_string(),
+            lane_limits: AtlasLaneLimits {
+                maximum_input_amount: 1_000,
+                maximum_gas_limit: 1_000,
+                maximum_fee_per_gas: 20,
+                maximum_atlas_bid: 500,
+                daily_loss_limit: 10_000,
+                retained_profit_floor: 100,
+            },
+            operation: AtlasSolverOperation {
+                from: address("0x1111111111111111111111111111111111111111"),
+                to: address(ARBITRUM_ATLAS_V1_6_4_ADDRESS),
+                value: U256::zero(),
+                gas: 500,
+                max_fee_per_gas: 10,
+                deadline: 49_000_000,
+                solver: address("0x2222222222222222222222222222222222222222"),
+                control: address(ARBITRUM_ATLAS_DAPP_CONTROL_ADDRESS),
+                user_op_hash: [0x33; 32],
+                bid_token: None,
+                bid_amount: 200,
+                data: request.encoded_request().expect("Atlas payload"),
+            },
+        }
+    }
+
+    fn validate_test_request(
+        claimed: &ClaimedAtlasRequest,
+        limits: &SafetyLimits,
+    ) -> Result<(AaveLiquidationIdentity, Vec<ValidatedLeg>), RevenueError> {
+        validate_aave_atlas_safety(claimed, limits, Utc::now())
+    }
 
     #[test]
     fn prepared_operation_binds_exact_bid_and_official_atlas() {
@@ -918,6 +1316,145 @@ mod tests {
             parse_operation(value, 200_000),
             Err(RevenueError::Data)
         ));
+    }
+
+    #[test]
+    fn aave_atlas_acceptance_counts_solver_exposure_once() {
+        let request = atlas_aave_request();
+        let claimed = claimed_with_request(&request);
+
+        // minProfit must retain at least one wei after the reviewed floor and
+        // maximum solver exposure. The exact Atlas bid is enforced
+        // independently by the contract and is not added a second time here.
+        assert_eq!(request.minimum_profit, 100 + 500 * 10 + 1);
+        validate_test_request(&claimed, &safety_limits()).expect("safe operation");
+    }
+
+    #[test]
+    fn aave_atlas_acceptance_enforces_every_lane_cap() {
+        let request = atlas_aave_request();
+        let baseline = claimed_with_request(&request);
+        let limits = safety_limits();
+
+        let mut changed = baseline.clone();
+        changed.lane_limits.maximum_gas_limit = 499;
+        assert!(validate_test_request(&changed, &limits).is_err());
+
+        changed = baseline.clone();
+        changed.lane_limits.maximum_fee_per_gas = 9;
+        assert!(validate_test_request(&changed, &limits).is_err());
+
+        changed = baseline.clone();
+        changed.maximum_bid = 501;
+        assert!(validate_test_request(&changed, &limits).is_err());
+
+        changed = baseline.clone();
+        changed.operation.bid_token = Some(address(ARBITRUM_WETH_ADDRESS));
+        assert!(validate_test_request(&changed, &limits).is_err());
+
+        changed = baseline.clone();
+        changed.evidence_mode = "DUAL_PROVIDER_FORK_VERIFIED".to_string();
+        assert!(validate_test_request(&changed, &limits).is_err());
+
+        changed = baseline.clone();
+        changed.lane_limits.daily_loss_limit = 4_999;
+        assert!(validate_test_request(&changed, &limits).is_err());
+
+        changed = baseline.clone();
+        changed.daily_charged_exposure = 5_001;
+        assert!(validate_test_request(&changed, &limits).is_err());
+
+        let mut changed_request = request.clone();
+        changed_request.maximum_input_amount = 1_001;
+        changed = claimed_with_request(&changed_request);
+        assert!(validate_test_request(&changed, &limits).is_err());
+
+        changed_request = request.clone();
+        changed_request.minimum_profit = 5_100;
+        changed = claimed_with_request(&changed_request);
+        assert!(validate_test_request(&changed, &limits).is_err());
+
+        changed_request = request.clone();
+        changed_request.maximum_atlas_bid = 201;
+        changed = claimed_with_request(&changed_request);
+        assert!(validate_test_request(&changed, &limits).is_err());
+    }
+
+    #[test]
+    fn aave_atlas_acceptance_enforces_global_priority_and_exact_auction_gas() {
+        let request = atlas_aave_request();
+        let baseline = claimed_with_request(&request);
+
+        let mut gas_limited = safety_limits();
+        gas_limited.maximum_gas_limit = 499;
+        assert!(validate_test_request(&baseline, &gas_limited).is_err());
+
+        let mut fee_limited = safety_limits();
+        fee_limited.maximum_max_fee_per_gas = 9;
+        assert!(validate_test_request(&baseline, &fee_limited).is_err());
+
+        let mut priority_limited = safety_limits();
+        priority_limited.maximum_priority_fee_per_gas = 9;
+        assert!(validate_test_request(&baseline, &priority_limited).is_err());
+
+        let mut input_limited = safety_limits();
+        input_limited.maximum_input_amount = 999;
+        assert!(validate_test_request(&baseline, &input_limited).is_err());
+
+        let mut floor_raised = safety_limits();
+        floor_raised.minimum_expected_profit = 101;
+        assert!(validate_test_request(&baseline, &floor_raised).is_err());
+
+        let mut loss_limited = safety_limits();
+        loss_limited.maximum_daily_loss_wei = 4_999;
+        assert!(validate_test_request(&baseline, &loss_limited).is_err());
+
+        let mut changed = baseline;
+        changed.operation.gas = 499;
+        assert!(validate_test_request(&changed, &safety_limits()).is_err());
+    }
+
+    #[test]
+    fn aave_atlas_acceptance_requires_fresh_inner_deadline_and_nonzero_identity() {
+        let mut request = atlas_aave_request();
+        request.deadline = Utc::now() + Duration::seconds(10);
+        let claimed = claimed_with_request(&request);
+        assert!(validate_test_request(&claimed, &safety_limits()).is_err());
+
+        request = atlas_aave_request();
+        request.route_id = [0; 32];
+        let claimed = claimed_with_request(&request);
+        assert!(validate_test_request(&claimed, &safety_limits()).is_err());
+    }
+
+    #[test]
+    fn aave_atlas_acceptance_binds_exact_reviewed_collateral_route() {
+        for (fee, pool) in [
+            (500, CURRENT_ROUTE_POOL_500_ADDRESS),
+            (3_000, CURRENT_ROUTE_POOL_3000_ADDRESS),
+        ] {
+            let request = atlas_native_usdc_request(fee, pool);
+            validate_test_request(&claimed_with_request(&request), &safety_limits())
+                .expect("reviewed native USDC route");
+        }
+
+        let mut request = atlas_native_usdc_request(500, CURRENT_ROUTE_POOL_500_ADDRESS);
+        request.unwind_legs[0].pool = address(CURRENT_ROUTE_POOL_3000_ADDRESS);
+        assert!(validate_test_request(&claimed_with_request(&request), &safety_limits()).is_err());
+
+        request = atlas_native_usdc_request(500, CURRENT_ROUTE_POOL_500_ADDRESS);
+        request.unwind_legs[0].zero_for_one = true;
+        assert!(validate_test_request(&claimed_with_request(&request), &safety_limits()).is_err());
+
+        request = atlas_native_usdc_request(500, CURRENT_ROUTE_POOL_500_ADDRESS);
+        request.unwind_legs[0].min_amount_out = request.minimum_unwind_output - 1;
+        assert!(validate_test_request(&claimed_with_request(&request), &safety_limits()).is_err());
+
+        request = atlas_native_usdc_request(500, CURRENT_ROUTE_POOL_500_ADDRESS);
+        let unreviewed = address("0x1111111111111111111111111111111111111111");
+        request.collateral_asset = unreviewed;
+        request.unwind_legs[0].token_in = unreviewed;
+        assert!(validate_test_request(&claimed_with_request(&request), &safety_limits()).is_err());
     }
 
     #[test]

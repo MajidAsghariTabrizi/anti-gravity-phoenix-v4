@@ -136,6 +136,7 @@ LIVE_EXECUTOR_MAX_GAS_LIMIT=500000
 LIVE_EXECUTOR_MAX_MAX_FEE_PER_GAS_WEI=10000000000
 LIVE_EXECUTOR_MAX_PRIORITY_FEE_PER_GAS_WEI=2000000000
 LIVE_EXECUTOR_MAX_INPUT_AMOUNT=100000000000000
+LIVE_EXECUTOR_MAX_ATLAS_BID_WEI=1000000000000000
 LIVE_EXECUTOR_MIN_EXPECTED_PROFIT=1000000000000
 LIVE_EXECUTOR_MAX_DAILY_LOSS_WEI=10000000000000000
 LIVE_EXECUTOR_RECEIPT_TIMEOUT_SECONDS=180
@@ -167,5 +168,16 @@ if output=$("$validator" "$bad_allowlist" 2>&1); then
 fi
 assert_redacted "$output"
 printf '%s' "$output" | grep -q 'must contain SECONDARY_RPC_URL exactly'
+
+zero_atlas_bid="$tmp_dir/live-zero-atlas-bid.env"
+sed \
+  's/^LIVE_EXECUTOR_MAX_ATLAS_BID_WEI=.*/LIVE_EXECUTOR_MAX_ATLAS_BID_WEI=0/' \
+  "$live_env" >"$zero_atlas_bid"
+if output=$("$validator" "$zero_atlas_bid" 2>&1); then
+  echo "expected zero Atlas bid ceiling to fail"
+  exit 1
+fi
+assert_redacted "$output"
+printf '%s' "$output" | grep -q 'LIVE_EXECUTOR_MAX_ATLAS_BID_WEI must be greater than zero'
 
 echo "validate-production-env-tests: ok"

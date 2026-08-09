@@ -34,11 +34,15 @@ rendered=$test_root/rendered.json
 metadata=$test_root/metadata.json
 
 cp "$repo_dir/compose.prod.yml" "$compose_file"
-# The live Aave economics calibration must survive immutable release rendering.
+# The live Aave economics ceilings must survive immutable release rendering.
+grep -F -- '--maximum-input-amount=${LIVE_EXECUTOR_MAX_INPUT_AMOUNT:?LIVE_EXECUTOR_MAX_INPUT_AMOUNT is required}' "$compose_file" >/dev/null ||
+  fail "Atlas Aave hunter is not bound to the executor maximum input"
+grep -F -- '--maximum-atlas-bid-wei=${LIVE_EXECUTOR_MAX_ATLAS_BID_WEI:?LIVE_EXECUTOR_MAX_ATLAS_BID_WEI is required}' "$compose_file" >/dev/null ||
+  fail "Atlas Aave hunter is not bound to the configured maximum Atlas bid"
 grep -F -- '--flash-premium-bps=${ATLAS_AAVE_FLASH_PREMIUM_BPS:-5}' "$compose_file" >/dev/null ||
-  fail "Atlas flash premium default drifted from reviewed on-chain calibration"
+  fail "Atlas flash premium ceiling drifted from reviewed on-chain calibration"
 grep -F -- '--economic-reserve-bps=${ATLAS_AAVE_ECONOMIC_RESERVE_BPS:-25}' "$compose_file" >/dev/null ||
-  fail "Atlas economic reserve default drifted from reviewed legacy-equivalent calibration"
+  fail "Atlas positive-edge reserve default drifted from reviewed calibration"
 if grep -F -- '--flash-premium-bps=9' "$compose_file" >/dev/null; then
   fail "legacy Atlas flash premium resurfaced in release Compose"
 fi

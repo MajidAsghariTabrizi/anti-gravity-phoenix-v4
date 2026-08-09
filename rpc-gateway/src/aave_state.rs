@@ -3,14 +3,17 @@ use thiserror::Error;
 
 pub const AAVE_SCREEN_REQUEST_SCHEMA: &str = "phoenix.rpc.aave-screen-request.v1";
 pub const AAVE_SCREEN_RESPONSE_SCHEMA: &str = "phoenix.rpc.aave-screen-response.v1";
-pub const AAVE_EXACT_REQUEST_SCHEMA: &str = "phoenix.rpc.aave-exact-request.v1";
-pub const AAVE_EXACT_RESPONSE_SCHEMA: &str = "phoenix.rpc.aave-exact-response.v1";
-pub const AAVE_SIMULATE_REQUEST_SCHEMA: &str = "phoenix.rpc.aave-simulate-request.v1";
-pub const AAVE_SIMULATE_RESPONSE_SCHEMA: &str = "phoenix.rpc.aave-simulate-response.v1";
+pub const AAVE_EXACT_REQUEST_SCHEMA: &str = "phoenix.rpc.aave-exact-request.v2";
+pub const AAVE_EXACT_RESPONSE_SCHEMA: &str = "phoenix.rpc.aave-exact-response.v2";
+pub const AAVE_SIMULATE_REQUEST_SCHEMA: &str = "phoenix.rpc.aave-simulate-request.v2";
+pub const AAVE_SIMULATE_RESPONSE_SCHEMA: &str = "phoenix.rpc.aave-simulate-response.v2";
+pub const AAVE_SIMULATE_BATCH_REQUEST_SCHEMA: &str = "phoenix.rpc.aave-simulate-batch-request.v1";
+pub const AAVE_SIMULATE_BATCH_RESPONSE_SCHEMA: &str = "phoenix.rpc.aave-simulate-batch-response.v1";
 pub const AAVE_TAIL_REQUEST_SCHEMA: &str = "phoenix.rpc.aave-tail-request.v1";
 pub const AAVE_TAIL_RESPONSE_SCHEMA: &str = "phoenix.rpc.aave-tail-response.v1";
 pub const AAVE_V3_POOL_ARBITRUM: &str = "0x794a61358d6845594f94dc1db02a252b5b4814ad";
 pub const MAX_AAVE_SCREEN_ADDRESSES: usize = 100;
+pub const MAX_AAVE_SIMULATION_BATCH: usize = 8;
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -61,12 +64,15 @@ pub struct AaveExactRequest {
     pub chain_id: u64,
     pub request_id: String,
     pub borrower: String,
+    pub maximum_input_amount: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct AaveExactReserveState {
     pub asset: String,
+    pub reserve_id: u16,
+    pub decimals: u8,
     pub current_a_token_balance: String,
     pub current_stable_debt: String,
     pub current_variable_debt: String,
@@ -76,6 +82,7 @@ pub struct AaveExactReserveState {
     pub stable_debt_token: String,
     pub variable_debt_token: String,
     pub oracle_price_base: String,
+    pub liquidation_grace_period_until: u64,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -86,9 +93,13 @@ pub struct AaveExactProviderState {
     pub pool_implementation: String,
     pub pool_implementation_code_hash: String,
     pub user_configuration: String,
+    pub user_emode_category: u8,
+    pub emode_collateral_bitmap: String,
+    pub emode_liquidation_bonus_bps: u16,
+    pub flash_premium_bps: u16,
     pub account: AaveAccountData,
     pub reserves: Vec<AaveExactReserveState>,
-    pub liquidation: Option<AaveExactLiquidationState>,
+    pub liquidations: Vec<AaveExactLiquidationState>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -96,7 +107,10 @@ pub struct AaveExactProviderState {
 pub struct AaveExactLiquidationState {
     pub debt_asset: String,
     pub collateral_asset: String,
+    pub requested_repay_amount: String,
+    pub actual_repay_amount: String,
     pub repay_amount: String,
+    pub flash_premium_amount: String,
     pub seized_collateral: String,
     pub protocol_fee_collateral: String,
     pub liquidator_collateral: String,
@@ -135,6 +149,7 @@ pub struct AaveSimulateRequest {
     pub debt_asset: String,
     pub collateral_asset: String,
     pub repay_amount: String,
+    pub maximum_input_amount: String,
     pub minimum_collateral_received: String,
     pub minimum_unwind_output: String,
     pub minimum_profit: String,
@@ -170,7 +185,52 @@ pub struct AaveSimulateResponse {
     pub simulation_result_hash: String,
     pub realized_profit: String,
     pub conservative_net_pnl: String,
+    pub estimated_gas_limit: u64,
+    pub estimated_max_fee_per_gas_wei: String,
+    pub estimated_execution_cost_wei: String,
+    pub estimated_l1_cost_wei: String,
+    pub flash_premium_wei: String,
     pub deadline_unix_seconds: u64,
+    pub resolved_at_unix_ms: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct AaveSimulateBatchRequest {
+    pub schema_version: String,
+    pub chain_id: u64,
+    pub request_id: String,
+    pub simulations: Vec<AaveSimulateRequest>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct AaveSimulateBatchError {
+    pub error_class: String,
+    pub retryable: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct AaveSimulateBatchResult {
+    pub request_id: String,
+    pub response: Option<AaveSimulateResponse>,
+    pub error: Option<AaveSimulateBatchError>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct AaveSimulateBatchResponse {
+    pub schema_version: String,
+    pub chain_id: u64,
+    pub request_id: String,
+    pub block_number: u64,
+    pub block_hash: String,
+    pub state_root: String,
+    pub primary_provider_id: String,
+    pub secondary_provider_id: String,
+    pub evidence_mode: String,
+    pub results: Vec<AaveSimulateBatchResult>,
     pub resolved_at_unix_ms: u64,
 }
 
@@ -293,6 +353,11 @@ impl AaveExactRequest {
             || self.request_id.len() > 256
             || self.request_id.chars().any(char::is_control)
             || !canonical_address(&self.borrower)
+            || self
+                .maximum_input_amount
+                .parse::<u128>()
+                .ok()
+                .map_or(true, |value| value == 0)
         {
             return Err(AaveStateError::Invalid);
         }
@@ -302,8 +367,20 @@ impl AaveExactRequest {
 
 impl AaveSimulateRequest {
     pub fn validate(&self) -> Result<(), AaveStateError> {
+        let zero_leg = self.debt_asset == self.collateral_asset;
+        let route_identity_valid = if zero_leg {
+            self.selected_pool == "0x0000000000000000000000000000000000000000"
+                && self.selected_factory == "0x0000000000000000000000000000000000000000"
+                && self.selected_fee == 0
+                && !self.zero_for_one
+        } else {
+            canonical_address(&self.selected_pool)
+                && canonical_address(&self.selected_factory)
+                && matches!(self.selected_fee, 500 | 3_000)
+        };
         let positive = [
             &self.repay_amount,
+            &self.maximum_input_amount,
             &self.minimum_collateral_received,
             &self.minimum_unwind_output,
             &self.minimum_profit,
@@ -327,12 +404,10 @@ impl AaveSimulateRequest {
             || !canonical_address(&self.borrower)
             || !canonical_address(&self.debt_asset)
             || !canonical_address(&self.collateral_asset)
-            || !canonical_address(&self.selected_pool)
-            || !canonical_address(&self.selected_factory)
+            || !route_identity_valid
             || !canonical_digest(&self.executor_code_hash)
-            || !canonical_digest(&self.release_sha)
+            || !canonical_release_sha(&self.release_sha)
             || !positive
-            || self.selected_fee != 500 && self.selected_fee != 3_000
             || self.gas_limit == 0
             || self.deadline_unix_seconds == 0
             || self.atlas_bid.parse::<u128>().ok().is_none()
@@ -350,8 +425,26 @@ impl AaveSimulateRequest {
         if priority > maximum {
             return Err(AaveStateError::Invalid);
         }
+        let repay = self
+            .repay_amount
+            .parse::<u128>()
+            .map_err(|_| AaveStateError::Invalid)?;
+        let maximum_input = self
+            .maximum_input_amount
+            .parse::<u128>()
+            .map_err(|_| AaveStateError::Invalid)?;
+        if repay > maximum_input {
+            return Err(AaveStateError::Invalid);
+        }
         Ok(())
     }
+}
+
+fn canonical_release_sha(value: &str) -> bool {
+    value.len() == 40
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 impl AaveSimulateResponse {
@@ -374,8 +467,119 @@ impl AaveSimulateResponse {
             || self.deadline_unix_seconds != request.deadline_unix_seconds
             || self.realized_profit.parse::<u128>().ok().is_none()
             || self.conservative_net_pnl.parse::<u128>().ok().is_none()
+            || self.estimated_gas_limit == 0
+            || self.estimated_gas_limit > request.gas_limit
+            || self
+                .estimated_max_fee_per_gas_wei
+                .parse::<u128>()
+                .ok()
+                .map_or(true, |value| value == 0)
+            || self
+                .estimated_max_fee_per_gas_wei
+                .parse::<u128>()
+                .ok()
+                .zip(request.max_fee_per_gas.parse::<u128>().ok())
+                .map_or(true, |(estimated, maximum)| estimated > maximum)
+            || self
+                .estimated_execution_cost_wei
+                .parse::<u128>()
+                .ok()
+                .map_or(true, |value| value == 0)
+            || self.estimated_l1_cost_wei.parse::<u128>().ok().is_none()
+            || self.flash_premium_wei.parse::<u128>().ok().is_none()
         {
             return Err(AaveStateError::ProviderDisagreement);
+        }
+        let quoted_fee = self
+            .estimated_max_fee_per_gas_wei
+            .parse::<u128>()
+            .map_err(|_| AaveStateError::ProviderDisagreement)?;
+        let execution_cost = self
+            .estimated_execution_cost_wei
+            .parse::<u128>()
+            .map_err(|_| AaveStateError::ProviderDisagreement)?;
+        if u128::from(self.estimated_gas_limit).checked_mul(quoted_fee) != Some(execution_cost) {
+            return Err(AaveStateError::ProviderDisagreement);
+        }
+        Ok(())
+    }
+}
+
+impl AaveSimulateBatchRequest {
+    pub fn validate(&self) -> Result<(), AaveStateError> {
+        if self.schema_version != AAVE_SIMULATE_BATCH_REQUEST_SCHEMA
+            || self.chain_id != 42_161
+            || self.request_id.is_empty()
+            || self.request_id.len() > 256
+            || self.request_id.chars().any(char::is_control)
+            || self.simulations.is_empty()
+            || self.simulations.len() > MAX_AAVE_SIMULATION_BATCH
+        {
+            return Err(AaveStateError::Invalid);
+        }
+        let first = &self.simulations[0];
+        let mut request_ids = std::collections::HashSet::new();
+        for simulation in &self.simulations {
+            simulation.validate()?;
+            if simulation.chain_id != self.chain_id
+                || !request_ids.insert(simulation.request_id.as_str())
+                || simulation.block_number != first.block_number
+                || simulation.block_hash != first.block_hash
+                || simulation.state_root != first.state_root
+                || simulation.executor_address != first.executor_address
+                || simulation.executor_code_hash != first.executor_code_hash
+                || simulation.caller_address != first.caller_address
+                || simulation.release_sha != first.release_sha
+                || simulation.borrower != first.borrower
+                || simulation.debt_asset != first.debt_asset
+                || simulation.maximum_input_amount != first.maximum_input_amount
+                || simulation.retained_profit_floor != first.retained_profit_floor
+                || simulation.gas_limit != first.gas_limit
+                || simulation.max_fee_per_gas != first.max_fee_per_gas
+                || simulation.max_priority_fee_per_gas != first.max_priority_fee_per_gas
+                || simulation.deadline_unix_seconds != first.deadline_unix_seconds
+                || simulation.atlas_mode != first.atlas_mode
+            {
+                return Err(AaveStateError::Invalid);
+            }
+        }
+        Ok(())
+    }
+}
+
+impl AaveSimulateBatchResponse {
+    pub fn validate(&self, request: &AaveSimulateBatchRequest) -> Result<(), AaveStateError> {
+        request.validate()?;
+        let first = &request.simulations[0];
+        if self.schema_version != AAVE_SIMULATE_BATCH_RESPONSE_SCHEMA
+            || self.chain_id != request.chain_id
+            || self.request_id != request.request_id
+            || self.block_number != first.block_number
+            || self.block_hash != first.block_hash
+            || self.state_root != first.state_root
+            || self.primary_provider_id.is_empty()
+            || self.secondary_provider_id.is_empty()
+            || self.primary_provider_id == self.secondary_provider_id
+            || self.evidence_mode != "DUAL_PROVIDER_FORK_VERIFIED"
+            || self.results.len() != request.simulations.len()
+        {
+            return Err(AaveStateError::ProviderDisagreement);
+        }
+        for (result, simulation) in self.results.iter().zip(&request.simulations) {
+            if result.request_id != simulation.request_id {
+                return Err(AaveStateError::ProviderDisagreement);
+            }
+            match (&result.response, &result.error) {
+                (Some(response), None) => response.validate(simulation)?,
+                (None, Some(error))
+                    if !error.error_class.is_empty()
+                        && error.error_class.len() <= 64
+                        && error
+                            .error_class
+                            .bytes()
+                            .all(|byte| byte.is_ascii_lowercase() || byte == b'_') => {}
+                _ => return Err(AaveStateError::ProviderDisagreement),
+            }
         }
         Ok(())
     }
@@ -384,6 +588,10 @@ impl AaveSimulateResponse {
 impl AaveExactResponse {
     pub fn validate(&self, request: &AaveExactRequest) -> Result<(), AaveStateError> {
         request.validate()?;
+        let maximum_input = request
+            .maximum_input_amount
+            .parse::<u128>()
+            .map_err(|_| AaveStateError::Invalid)?;
         let mut primary = self.primary.clone();
         let mut secondary = self.secondary.clone();
         primary.provider_id.clear();
@@ -400,8 +608,51 @@ impl AaveExactResponse {
             || primary != secondary
             || self.primary.account.borrower != request.borrower
             || self.primary.reserves.len() != 2
+            || self.primary.liquidations.len() > 8
         {
             return Err(AaveStateError::ProviderDisagreement);
+        }
+        let mut seen = std::collections::HashSet::new();
+        for liquidation in &self.primary.liquidations {
+            let requested = liquidation
+                .requested_repay_amount
+                .parse::<u128>()
+                .map_err(|_| AaveStateError::ProviderDisagreement)?;
+            let actual = liquidation
+                .actual_repay_amount
+                .parse::<u128>()
+                .map_err(|_| AaveStateError::ProviderDisagreement)?;
+            let repay = liquidation
+                .repay_amount
+                .parse::<u128>()
+                .map_err(|_| AaveStateError::ProviderDisagreement)?;
+            let expected_premium = repay
+                .checked_mul(u128::from(self.primary.flash_premium_bps))
+                .and_then(|value| value.checked_add(5_000))
+                .map(|value| value / 10_000)
+                .ok_or(AaveStateError::ProviderDisagreement)?;
+            if requested == 0
+                || requested != actual
+                || actual != repay
+                || repay > maximum_input
+                || liquidation.flash_premium_amount.parse::<u128>().ok() != Some(expected_premium)
+                || !canonical_address(&liquidation.debt_asset)
+                || !canonical_address(&liquidation.collateral_asset)
+                || liquidation.seized_collateral.parse::<u128>().ok().is_none()
+                || liquidation
+                    .protocol_fee_collateral
+                    .parse::<u128>()
+                    .ok()
+                    .is_none()
+                || liquidation
+                    .liquidator_collateral
+                    .parse::<u128>()
+                    .ok()
+                    .map_or(true, |value| value == 0)
+                || !seen.insert((liquidation.collateral_asset.clone(), repay))
+            {
+                return Err(AaveStateError::ProviderDisagreement);
+            }
         }
         Ok(())
     }
@@ -505,11 +756,12 @@ mod tests {
             executor_address: "0x1111111111111111111111111111111111111111".to_string(),
             executor_code_hash: "3".repeat(64),
             caller_address: "0x2222222222222222222222222222222222222222".to_string(),
-            release_sha: "4".repeat(64),
+            release_sha: "4".repeat(40),
             borrower: "0x3333333333333333333333333333333333333333".to_string(),
             debt_asset: "0x82af49447d8a07e3bd95bd0d56f35241523fbab1".to_string(),
             collateral_asset: "0xaf88d065e77c8cc2239327c5edb3a432268e5831".to_string(),
             repay_amount: "1000000".to_string(),
+            maximum_input_amount: "2000000".to_string(),
             minimum_collateral_received: "2000000".to_string(),
             minimum_unwind_output: "1100000".to_string(),
             minimum_profit: "10000".to_string(),

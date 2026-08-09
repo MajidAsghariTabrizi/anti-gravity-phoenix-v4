@@ -81,7 +81,9 @@ async fn main() {
         store.pool(),
         signer.clone(),
         config.executor_address,
+        config.executor_code_hash.clone(),
         rpc.clone(),
+        config.limits.clone(),
     );
     let executor = LiveExecutor::new(config, signer, store.clone(), rpc);
     info!(

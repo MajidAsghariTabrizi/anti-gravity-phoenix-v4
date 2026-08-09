@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"flag"
 	"io"
 	"log"
 	"strings"
@@ -13,6 +14,21 @@ import (
 	"anti-gravity-phoenix-v4/atlas-observer/internal/hunter"
 	"anti-gravity-phoenix-v4/atlas-observer/internal/observer"
 )
+
+func TestFinancialCeilingFlagsBindExactValues(t *testing.T) {
+	flags := flag.NewFlagSet("financial-ceilings", flag.ContinueOnError)
+	var maximumInputAmount, maximumAtlasBidWei string
+	bindFinancialCeilingFlags(flags, &maximumInputAmount, &maximumAtlasBidWei)
+	if err := flags.Parse([]string{
+		"--maximum-input-amount=250000000000000000",
+		"--maximum-atlas-bid-wei=1000000000000000",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if maximumInputAmount != "250000000000000000" || maximumAtlasBidWei != "1000000000000000" {
+		t.Fatalf("financial ceilings were not bound exactly: input=%s atlas_bid=%s", maximumInputAmount, maximumAtlasBidWei)
+	}
+}
 
 type boundaryError struct {
 	class     string

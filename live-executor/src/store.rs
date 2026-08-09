@@ -847,14 +847,37 @@ impl ExecutorStore for PostgresExecutorStore {
                     date_trunc('day', $1::timestamptz AT TIME ZONE 'UTC')
                     AT TIME ZONE 'UTC'
                 ) AS start_at
+             ), direct_loss AS (
+                SELECT COALESCE(
+                    SUM(CASE WHEN net_pnl_wei < 0 THEN -net_pnl_wei ELSE 0 END),
+                    0
+                ) AS amount
+                FROM live_canary.execution_outcomes, bounds
+                WHERE recorded_at >= bounds.start_at
+                  AND recorded_at < bounds.start_at + interval '1 day'
+             ), atlas_loss AS (
+                SELECT COALESCE(
+                    SUM(i.solver_gas_limit::numeric * i.oracle_gas_price_wei),
+                    0
+                ) AS amount
+                FROM live_canary.atlas_solver_requests r
+                JOIN live_canary.atlas_auction_ingress i ON i.auction_id = r.auction_id
+                CROSS JOIN bounds
+                WHERE r.updated_at >= bounds.start_at
+                  AND r.updated_at < bounds.start_at + interval '1 day'
+                  AND (
+                    r.status IN ('signed', 'submitted', 'submission_unknown')
+                    OR (
+                      r.status = 'lost'
+                      AND (
+                        r.submission_response_hash IS NOT NULL
+                        OR r.inclusion_transaction_hash IS NOT NULL
+                      )
+                    )
+                  )
              )
-             SELECT COALESCE(
-                SUM(CASE WHEN net_pnl_wei < 0 THEN -net_pnl_wei ELSE 0 END),
-                0
-             )::text
-             FROM live_canary.execution_outcomes, bounds
-             WHERE recorded_at >= bounds.start_at
-               AND recorded_at < bounds.start_at + interval '1 day'",
+             SELECT (direct_loss.amount + atlas_loss.amount)::text
+             FROM direct_loss, atlas_loss",
         )
         .bind(now)
         .fetch_one(&self.pool)
@@ -1376,19 +1399,42 @@ async fn apply_autonomous_risk_feedback(
                 date_trunc('day', $1::timestamptz AT TIME ZONE 'UTC')
                 AT TIME ZONE 'UTC'
             ) AS start_at
+         ), direct_loss AS (
+            SELECT COALESCE(SUM(
+                CASE WHEN o.net_pnl_wei < 0 THEN -o.net_pnl_wei ELSE 0 END
+            ), 0) AS amount
+            FROM live_canary.execution_outcomes o
+            CROSS JOIN bounds
+            WHERE o.recorded_at >= bounds.start_at
+              AND o.recorded_at < bounds.start_at + interval '1 day'
+         ), atlas_loss AS (
+            SELECT COALESCE(SUM(
+                i.solver_gas_limit::numeric * i.oracle_gas_price_wei
+            ), 0) AS amount
+            FROM live_canary.atlas_solver_requests r
+            JOIN live_canary.atlas_auction_ingress i ON i.auction_id = r.auction_id
+            CROSS JOIN bounds
+            WHERE r.updated_at >= bounds.start_at
+              AND r.updated_at < bounds.start_at + interval '1 day'
+              AND (
+                r.status IN ('signed', 'submitted', 'submission_unknown')
+                OR (
+                  r.status = 'lost'
+                  AND (
+                    r.submission_response_hash IS NOT NULL
+                    OR r.inclusion_transaction_hash IS NOT NULL
+                  )
+                )
+              )
          )
          SELECT
-            COALESCE(SUM(
-                CASE WHEN o.net_pnl_wei < 0 THEN -o.net_pnl_wei ELSE 0 END
-            ), 0)::text,
+            (direct_loss.amount + atlas_loss.amount)::text,
             c.daily_loss_limit::text
          FROM live_canary.autonomous_global_control c
-         CROSS JOIN bounds
-         LEFT JOIN live_canary.execution_outcomes o
-           ON o.recorded_at >= bounds.start_at
-          AND o.recorded_at < bounds.start_at + interval '1 day'
+         CROSS JOIN direct_loss
+         CROSS JOIN atlas_loss
          WHERE c.singleton
-         GROUP BY c.daily_loss_limit",
+         ",
     )
     .bind(terminal_at)
     .fetch_one(&mut **transaction)

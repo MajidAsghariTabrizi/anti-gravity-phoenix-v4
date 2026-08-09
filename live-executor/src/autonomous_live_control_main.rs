@@ -2086,19 +2086,47 @@ outbox AS (
            ) AS stale
     FROM public.engine_outbox
 ),
-loss AS (
+bounds AS (
+    SELECT date_trunc('day', clock_timestamp() AT TIME ZONE 'UTC')
+           AT TIME ZONE 'UTC' AS start_at
+),
+direct_loss AS (
     SELECT COALESCE(sum(
                CASE WHEN outcome.net_pnl_wei < 0 THEN -outcome.net_pnl_wei ELSE 0 END
-           ) FILTER (
-               WHERE outcome.recorded_at >= date_trunc(
-                   'day', clock_timestamp() AT TIME ZONE 'UTC'
-               ) AT TIME ZONE 'UTC'
-           ), 0)::text AS current_daily_loss,
+           ), 0) AS amount
+    FROM live_canary.execution_outcomes outcome
+    CROSS JOIN bounds
+    WHERE outcome.recorded_at >= bounds.start_at
+      AND outcome.recorded_at < bounds.start_at + interval '1 day'
+),
+atlas_loss AS (
+    SELECT COALESCE(sum(
+               ingress.solver_gas_limit::numeric * ingress.oracle_gas_price_wei
+           ), 0) AS amount
+    FROM live_canary.atlas_solver_requests request
+    JOIN live_canary.atlas_auction_ingress ingress
+      ON ingress.auction_id = request.auction_id
+    CROSS JOIN bounds
+    WHERE request.updated_at >= bounds.start_at
+      AND request.updated_at < bounds.start_at + interval '1 day'
+      AND (
+        request.status IN ('signed', 'submitted', 'submission_unknown')
+        OR (
+          request.status = 'lost'
+          AND (
+            request.submission_response_hash IS NOT NULL
+            OR request.inclusion_transaction_hash IS NOT NULL
+          )
+        )
+      )
+),
+loss AS (
+    SELECT (direct_loss.amount + atlas_loss.amount)::text AS current_daily_loss,
            global.daily_loss_limit::text AS daily_loss_limit
     FROM live_canary.autonomous_global_control global
-    LEFT JOIN live_canary.execution_outcomes outcome ON true
+    CROSS JOIN direct_loss
+    CROSS JOIN atlas_loss
     WHERE global.singleton
-    GROUP BY global.daily_loss_limit
 )
 SELECT NOT legacy.armed AND legacy.kill_switch
            AND NOT global.armed AND global.kill_switch
@@ -2570,18 +2598,44 @@ async fn evaluate_economic_control(pool: &PgPool) -> ControlResult<()> {
     .await
     .map_err(|_| "integrity evidence is unavailable")?;
     let global: (String, String) = sqlx::query_as(
-        "SELECT COALESCE(sum(
-                    CASE WHEN outcome.net_pnl_wei < 0 THEN -outcome.net_pnl_wei ELSE 0 END
-                ) FILTER (
-                    WHERE outcome.recorded_at >= date_trunc(
-                        'day', now() AT TIME ZONE 'UTC'
-                    ) AT TIME ZONE 'UTC'
-                ), 0)::text,
+        "WITH bounds AS (
+            SELECT date_trunc('day', now() AT TIME ZONE 'UTC')
+                   AT TIME ZONE 'UTC' AS start_at
+         ), direct_loss AS (
+            SELECT COALESCE(sum(
+                       CASE WHEN outcome.net_pnl_wei < 0 THEN -outcome.net_pnl_wei ELSE 0 END
+                   ), 0) AS amount
+            FROM live_canary.execution_outcomes outcome
+            CROSS JOIN bounds
+            WHERE outcome.recorded_at >= bounds.start_at
+              AND outcome.recorded_at < bounds.start_at + interval '1 day'
+         ), atlas_loss AS (
+            SELECT COALESCE(sum(
+                       ingress.solver_gas_limit::numeric * ingress.oracle_gas_price_wei
+                   ), 0) AS amount
+            FROM live_canary.atlas_solver_requests request
+            JOIN live_canary.atlas_auction_ingress ingress
+              ON ingress.auction_id = request.auction_id
+            CROSS JOIN bounds
+            WHERE request.updated_at >= bounds.start_at
+              AND request.updated_at < bounds.start_at + interval '1 day'
+              AND (
+                request.status IN ('signed', 'submitted', 'submission_unknown')
+                OR (
+                  request.status = 'lost'
+                  AND (
+                    request.submission_response_hash IS NOT NULL
+                    OR request.inclusion_transaction_hash IS NOT NULL
+                  )
+                )
+              )
+         )
+         SELECT (direct_loss.amount + atlas_loss.amount)::text,
                 control.daily_loss_limit::text
          FROM live_canary.autonomous_global_control control
-         LEFT JOIN live_canary.execution_outcomes outcome ON true
-         WHERE control.singleton
-         GROUP BY control.daily_loss_limit",
+         CROSS JOIN direct_loss
+         CROSS JOIN atlas_loss
+         WHERE control.singleton",
     )
     .fetch_one(&mut *transaction)
     .await
@@ -3060,6 +3114,38 @@ async fn arm_revenue_lanes_in_pool(pool: &PgPool) -> ControlResult<()> {
     .map_err(|_| "active Atlas request inspection failed")?;
     if active_atlas_requests != 0 {
         return Err("revenue lane activation is blocked by an active Atlas request".into());
+    }
+    let atlas_daily_charged_exposure: String = sqlx::query_scalar(
+        "WITH bounds AS (
+           SELECT date_trunc('day', now() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC' AS start_at
+         ), direct_loss AS (
+           SELECT COALESCE(SUM(CASE WHEN net_pnl_wei < 0 THEN -net_pnl_wei ELSE 0 END), 0) AS amount
+           FROM live_canary.execution_outcomes, bounds
+           WHERE recorded_at >= bounds.start_at AND recorded_at < bounds.start_at + interval '1 day'
+         ), atlas_loss AS (
+           SELECT COALESCE(SUM(i.solver_gas_limit::numeric * i.oracle_gas_price_wei), 0) AS amount
+           FROM live_canary.atlas_solver_requests r
+           JOIN live_canary.atlas_auction_ingress i ON i.auction_id = r.auction_id
+           CROSS JOIN bounds
+           WHERE r.updated_at >= bounds.start_at AND r.updated_at < bounds.start_at + interval '1 day'
+             AND (
+               r.status IN ('signed', 'submitted', 'submission_unknown')
+               OR (
+                 r.status = 'lost'
+                 AND (r.submission_response_hash IS NOT NULL OR r.inclusion_transaction_hash IS NOT NULL)
+               )
+             )
+         )
+         SELECT (direct_loss.amount + atlas_loss.amount)::text FROM direct_loss, atlas_loss",
+    )
+    .fetch_one(&mut *transaction)
+    .await
+    .map_err(|_| "Atlas daily-loss accounting is unavailable")?;
+    let atlas_daily_charged_exposure = atlas_daily_charged_exposure
+        .parse::<u128>()
+        .map_err(|_| "Atlas daily-loss accounting is invalid")?;
+    if atlas_daily_charged_exposure >= daily_loss_limit {
+        return Err("revenue lane activation is blocked by the Atlas daily-loss limit".into());
     }
 
     let result = sqlx::query(

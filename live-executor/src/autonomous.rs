@@ -1169,14 +1169,42 @@ async fn load_risk_facts(
     route_fingerprint: &str,
     now: DateTime<Utc>,
 ) -> Result<RiskFacts, AutonomousMaterializerError> {
-    let day = now.date_naive();
     let global_loss: String = sqlx::query_scalar(
-        "SELECT COALESCE(SUM(CASE WHEN o.net_pnl_wei < 0 THEN -o.net_pnl_wei ELSE 0 END), 0)::text
-         FROM live_canary.execution_outcomes o
-         WHERE o.recorded_at >= $1::date
-           AND o.recorded_at < ($1::date + INTERVAL '1 day')",
+        "WITH bounds AS (
+            SELECT date_trunc('day', $1::timestamptz AT TIME ZONE 'UTC')
+                   AT TIME ZONE 'UTC' AS start_at
+         ), direct_loss AS (
+            SELECT COALESCE(SUM(
+                CASE WHEN o.net_pnl_wei < 0 THEN -o.net_pnl_wei ELSE 0 END
+            ), 0) AS amount
+            FROM live_canary.execution_outcomes o
+            CROSS JOIN bounds
+            WHERE o.recorded_at >= bounds.start_at
+              AND o.recorded_at < bounds.start_at + interval '1 day'
+         ), atlas_loss AS (
+            SELECT COALESCE(SUM(
+                i.solver_gas_limit::numeric * i.oracle_gas_price_wei
+            ), 0) AS amount
+            FROM live_canary.atlas_solver_requests r
+            JOIN live_canary.atlas_auction_ingress i ON i.auction_id = r.auction_id
+            CROSS JOIN bounds
+            WHERE r.updated_at >= bounds.start_at
+              AND r.updated_at < bounds.start_at + interval '1 day'
+              AND (
+                r.status IN ('signed', 'submitted', 'submission_unknown')
+                OR (
+                  r.status = 'lost'
+                  AND (
+                    r.submission_response_hash IS NOT NULL
+                    OR r.inclusion_transaction_hash IS NOT NULL
+                  )
+                )
+              )
+         )
+         SELECT (direct_loss.amount + atlas_loss.amount)::text
+         FROM direct_loss, atlas_loss",
     )
-    .bind(day)
+    .bind(now)
     .fetch_one(&mut **transaction)
     .await
     .map_err(database_error)?;
@@ -1189,7 +1217,7 @@ async fn load_risk_facts(
            AND o.recorded_at < ($2::date + INTERVAL '1 day')",
     )
     .bind(route_fingerprint)
-    .bind(day)
+    .bind(now.date_naive())
     .fetch_one(&mut **transaction)
     .await
     .map_err(database_error)?;

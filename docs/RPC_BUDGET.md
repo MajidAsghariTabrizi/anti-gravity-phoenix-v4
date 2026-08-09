@@ -48,7 +48,7 @@ checks, for a cold total of seven. The Engine examines at most one pending
 identity every 15 seconds and records at most three failed attempts; a complete
 or explicitly incomplete gateway response ends enrichment for that immutable
 identity. These calls use the existing request and transport budgets. The base
-Production burst of eight admits this bounded sequence and the cold dual-provider
+Production burst of sixteen admits this bounded sequence and the cold dual-provider
 Aave screen without changing the sustained call rate; the reviewed autonomous
 LIVE overlay burst remains 64. Budget rejection remains
 distinct incomplete/retry evidence; it never widens execution authority.
@@ -57,10 +57,32 @@ distinct incomplete/retry evidence; it never widens execution authority.
 
 - `RPC_STATE_REQUESTS_PER_MINUTE=12` limits incoming state HTTP requests.
 - `RPC_UPSTREAM_CALLS_PER_SECOND=1` sets the sustained real transport-call rate.
-- `RPC_UPSTREAM_CALL_BURST=8` is the base Production transport burst capacity.
+- `RPC_UPSTREAM_CALL_BURST=16` is the base Production transport burst capacity.
 - `RPC_PROVIDER_PROBE_INTERVAL_SECONDS=60` controls background provider probes.
 
 The transport token is acquired immediately before every real `JsonRpcClient::call`, including chain checks, code checks, head reads, Multicalls, block verification, retries, failover, and probes. Provider sequences are serialized and begin only when enough tokens are available for the complete setup or Multicall-plus-hash-check step, preventing a one-token retry loop from repeatedly issuing partial evidence calls. If no token is available, no transport call occurs, the current retry chain stops, and the caller receives a bounded retryable budget result. Request admission and transport admission are deliberately independent.
+
+## Bounded Aave Simulation Batches
+
+`POST /v1/aave/simulate-batch` admits one state request containing at most
+eight liquidation variants. The gateway paces every real provider call behind
+the same `1/s` transport budget instead of failing later variants according to
+their order. For `N` variants, a verified warm batch uses `4N + 4` upstream
+calls (two dynamic calls per provider and pre/post pin verification); an
+initial cold batch uses `4N + 14`, adding provider verification and the two
+pin-keyed executor contexts. Thus an eight-item batch is 36 warm calls or 46
+cold calls. A context-cache hit never skips the two-provider pre/post block,
+hash, and state-root checks.
+
+One fully materialized Aave opportunity uses at most eight state admissions:
+screen, initial Exact, probe batch, first convergence batch, optional second
+convergence batch, fresh Exact, final authority batch, and tail. The fresh
+Exact must reproduce the original complete liquidation quote set and flash
+premium; the final batch is rebound to its block/hash/state root and a new
+60-second calldata deadline. Quote drift or another required bounds-convergence
+pass fails closed. A future genuine Atlas callback simulation could add one
+more admission while remaining below the 12/minute ceiling; the current direct
+wrapper does not authorize an Atlas artifact.
 
 HTTP 429 is handled separately from transport failure. `Retry-After` delta seconds and HTTP dates are parsed, clamped to 60 seconds, and applied as provider cooldown. The same provider is not retried immediately. Failover still requires a transport token. Provider URLs are never metric labels or error fields.
 

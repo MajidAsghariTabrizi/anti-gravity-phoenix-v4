@@ -106,6 +106,7 @@ contract MockERC20 is IERC20 {
             bytes4 public withdrawalError;
             address public liquidationCollateral;
             uint256 public liquidationCollateralAmount;
+            uint256 public liquidationDebtAmount;
 
             constructor(uint256 p) {
                 premium = p;
@@ -121,6 +122,10 @@ contract MockERC20 is IERC20 {
                 liquidationCollateralAmount = amount;
             }
 
+            function setLiquidationDebtAmount(uint256 amount) external {
+                liquidationDebtAmount = amount;
+            }
+
             function liquidationCall(
                 address collateralAsset,
                 address debtAsset,
@@ -130,7 +135,8 @@ contract MockERC20 is IERC20 {
             ) external override {
                 require(!receiveAToken, "aToken");
                 require(collateralAsset == liquidationCollateral, "collateral");
-                require(IERC20(debtAsset).transferFrom(msg.sender, address(this), debtToCover), "cover");
+                uint256 consumed = liquidationDebtAmount == 0 ? debtToCover : liquidationDebtAmount;
+                require(IERC20(debtAsset).transferFrom(msg.sender, address(this), consumed), "cover");
                 MockERC20(collateralAsset).mint(msg.sender, liquidationCollateralAmount);
             }
 
@@ -253,10 +259,69 @@ contract MockERC20 is IERC20 {
                 });
             }
 
+            function wethIdentityLiquidationRequest()
+                internal
+                view
+                returns (PhoenixExecutor.AaveLiquidationRequest memory request)
+            {
+                PhoenixExecutor.Leg[] memory legs = new PhoenixExecutor.Leg[](0);
+                request = PhoenixExecutor.AaveLiquidationRequest({
+                    routeId: bytes32("aave-weth-identity"),
+                    borrower: address(0xB0B),
+                    debtAsset: address(weth),
+                    collateralAsset: address(weth),
+                    repayAmount: 100,
+                    receiveAToken: false,
+                    maxInputAmount: 1_000,
+                    minCollateralReceived: 110,
+                    minUnwindOutput: 110,
+                    minProfit: 5,
+                    maxAtlasBid: 0,
+                    deadline: block.timestamp + 1,
+                    unwindLegs: legs
+                });
+            }
+
             function testDirectAaveLiquidationHappyPath() public {
                 setUp();
                 executor.executeAaveLiquidation(liquidationRequest(5, 0));
                 require(usdc.balanceOf(address(executor)) == 16, "liquidation profit retained");
+            }
+
+            function testDirectAaveLiquidationRejectsCappedActualRepay() public {
+                setUp();
+                aave.setLiquidationDebtAmount(99);
+                try executor.executeAaveLiquidation(liquidationRequest(5, 0)) {
+                    revert("capped actual repay accepted");
+                } catch (bytes memory reason) {
+                    require(bytes4(reason) == PhoenixExecutor.RepayAmountMismatch.selector, "wrong repay error");
+                }
+            }
+
+            function testDirectAaveWethCollateralUsesDeterministicZeroLegRoute() public {
+                setUp();
+                aave.setLiquidationResult(address(weth), 110);
+                executor.executeAaveLiquidation(wethIdentityLiquidationRequest());
+
+                require(weth.balanceOf(address(executor)) == 9, "identity-route profit retained");
+            }
+
+            function testDirectAaveWethCollateralRejectsRepayRoundingCollision() public {
+                setUp();
+                PhoenixExecutor.AaveLiquidationRequest memory request = wethIdentityLiquidationRequest();
+                request.repayAmount = 101;
+                request.minCollateralReceived = 105;
+                request.minUnwindOutput = 105;
+                // A 100 WETH actual repayment returning 104 WETH collateral has
+                // the same net balance delta as the predicted 101 -> 105 path.
+                // The remaining Pool allowance must still expose the short repay.
+                aave.setLiquidationResult(address(weth), 104);
+                aave.setLiquidationDebtAmount(100);
+                try executor.executeAaveLiquidation(request) {
+                    revert("capped identity repay accepted");
+                } catch (bytes memory reason) {
+                    require(bytes4(reason) == PhoenixExecutor.RepayAmountMismatch.selector, "wrong identity error");
+                }
             }
 
             function testAtlasAaveLiquidationPaysBoundedBidAndRetainsMinimumProfit() public {
