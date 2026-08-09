@@ -315,6 +315,11 @@ if [ -n "$release_sha" ]; then
   install_source \
     "$source_root/contracts/PhoenixExecutor.compiled.json" \
     "$deploy_dir/contracts/PhoenixExecutor.compiled.json" 0640
+  # This one-way compatibility migration makes the legacy overlay's effective
+  # ceiling explicit. Rollback preserves the same key and economic policy.
+  python3 "$deploy_dir/production_mode.py" materialize-release-defaults \
+    --env-file "$env_file" ||
+    fail 'release-compatible production settings could not be materialized'
 fi
 
 "$deploy_dir/validate-production-env.sh" "$env_file"

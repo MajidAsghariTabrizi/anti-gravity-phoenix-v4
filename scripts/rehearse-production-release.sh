@@ -41,6 +41,7 @@ for required in \
   "$candidate_root/scripts/production_context.py" \
   "$candidate_root/scripts/production_mode.py" \
   "$candidate_root/scripts/render-production-compose.sh" \
+  "$candidate_root/scripts/validate-production-env.sh" \
   "$candidate_root/scripts/sql/economic-dashboard-snapshot.sql"
 do
   [ -f "$required" ] && [ ! -L "$required" ] ||
@@ -56,9 +57,13 @@ trap cleanup EXIT
 trap 'exit 1' HUP INT TERM
 
 release_env=$state_dir/candidate-release.env
+candidate_active_env=$state_dir/candidate-active.env
 candidate_evidence_env=$state_dir/candidate-evidence.env
+candidate_live_env=$state_dir/candidate-live.env
 rendered=$state_dir/candidate-compose.json
 metadata=$state_dir/candidate-render.json
+live_rendered=$state_dir/candidate-live-compose.json
+live_metadata=$state_dir/candidate-live-render.json
 monitor_output=$state_dir/monitor
 mkdir -m 0700 "$monitor_output"
 chown 1000:1000 "$monitor_output"
@@ -95,14 +100,34 @@ python3 "$candidate_root/scripts/production_context.py" manifest-env \
   --output "$release_env" ||
   fail candidate_manifest_invalid
 
-cp "$env_file" "$candidate_evidence_env" ||
-  fail candidate_evidence_environment_copy_failed
-chmod 0600 "$candidate_evidence_env"
-[ "$(stat -c '%u:%g:%a:%h' "$candidate_evidence_env")" = 0:0:600:1 ] ||
-  fail candidate_evidence_environment_metadata_invalid
+operator_env_digest_before=$(sha256sum "$env_file" | awk 'NR == 1 { print $1 }') ||
+  fail operator_environment_digest_failed
+copy_candidate_environment() {
+  source_environment=$1
+  target_environment=$2
+  cp "$source_environment" "$target_environment" ||
+    fail candidate_environment_copy_failed
+  chmod 0600 "$target_environment"
+  [ "$(stat -c '%u:%g:%a:%h' "$target_environment")" = 0:0:600:1 ] ||
+    fail candidate_environment_metadata_invalid
+}
+
+copy_candidate_environment "$env_file" "$candidate_active_env"
+python3 "$candidate_root/scripts/production_mode.py" \
+  materialize-release-defaults --env-file "$candidate_active_env" ||
+  fail candidate_active_environment_invalid
+
+copy_candidate_environment "$candidate_active_env" "$candidate_evidence_env"
 python3 "$candidate_root/scripts/production_mode.py" shadow \
   --env-file "$candidate_evidence_env" ||
   fail candidate_evidence_environment_invalid
+
+copy_candidate_environment "$candidate_active_env" "$candidate_live_env"
+python3 "$candidate_root/scripts/production_mode.py" live \
+  --env-file "$candidate_live_env" ||
+  fail candidate_live_environment_invalid
+"$candidate_root/scripts/validate-production-env.sh" "$candidate_live_env" ||
+  fail candidate_live_environment_invalid
 
 "$candidate_root/scripts/render-production-compose.sh" \
   --compose-file "$compose_file" \
@@ -114,7 +139,16 @@ python3 "$candidate_root/scripts/production_mode.py" shadow \
   --output "$rendered" \
   --metadata-output "$metadata" >/dev/null ||
   fail candidate_compose_render_failed
-rm -f "$candidate_evidence_env"
+"$candidate_root/scripts/render-production-compose.sh" \
+  --compose-file "$compose_file" \
+  --overlay-file "$overlay_file" \
+  --expected-mode LIVE \
+  --env-file "$candidate_live_env" \
+  --release-env "$release_env" \
+  --release-manifest "$release_manifest" \
+  --output "$live_rendered" \
+  --metadata-output "$live_metadata" >/dev/null ||
+  fail candidate_live_compose_render_failed
 
 postgres_image=$(
   python3 -I -B - "$rendered" <<'PY'
@@ -267,7 +301,7 @@ compose() {
   /usr/bin/timeout --signal=TERM --kill-after=2s 45s \
     python3 "$compose_runner" \
     --mode LIVE \
-    --env-file "$env_file" \
+    --env-file "$candidate_live_env" \
     --release-env "$release_env" \
     --compose-file "$compose_file" \
     --overlay-file "$overlay_file" \
@@ -487,14 +521,14 @@ database_network=
 active_health_mode=$(awk -F= '
   $1 == "PHOENIX_MODE" { print $2; found += 1 }
   END { if (found != 1) exit 1 }
-' "$env_file") || fail active_health_mode_invalid
+' "$candidate_active_env") || fail active_health_mode_invalid
 case "$active_health_mode" in
   SHADOW) ;;
   LIVE) active_health_mode=DISARMED_EVIDENCE ;;
   *) fail active_health_mode_invalid ;;
 esac
 PHOENIX_DEPLOY_ROOT="$deploy_root" \
-PHOENIX_ENV_FILE="$env_file" \
+PHOENIX_ENV_FILE="$candidate_active_env" \
 PHOENIX_RELEASE_ENV="$active_release_env" \
 PHOENIX_COMPOSE_FILE="$compose_file" \
 PHOENIX_COMPOSE_OVERLAY_FILE="$overlay_file" \
@@ -508,6 +542,11 @@ PHOENIX_HEALTH_SLEEP_SECONDS=0 \
 PHOENIX_HEALTH_COMMAND_TIMEOUT_SECONDS=15 \
   "$candidate_root/scripts/production-healthcheck.sh" ||
   fail candidate_health_contract_failed
+
+operator_env_digest_after=$(sha256sum "$env_file" | awk 'NR == 1 { print $1 }') ||
+  fail operator_environment_digest_failed
+[ "$operator_env_digest_after" = "$operator_env_digest_before" ] ||
+  fail operator_environment_changed_during_rehearsal
 
 printf '%s\n' \
   "{\"schema\":\"phoenix.release-rehearsal.v1\",\"release_sha\":\"$release_sha\",\"status\":\"passed\",\"monitor_healthy_seconds\":$monitor_healthy_seconds}"

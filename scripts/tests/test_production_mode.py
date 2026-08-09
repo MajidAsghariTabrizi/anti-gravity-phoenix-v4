@@ -31,6 +31,9 @@ class ProductionModeTests(unittest.TestCase):
         self.assertIn("PHOENIX_MODE=LIVE\n", live)
         self.assertIn("LIVE_EXECUTION=true\n", live)
         self.assertIn("AUTONOMOUS_EXECUTION=true\n", live)
+        self.assertIn(
+            "LIVE_EXECUTOR_MAX_ATLAS_BID_WEI=1000000000000000\n", live
+        )
         self.assertIn("SECRET_VALUE=not-printed\n", live)
         self.assertEqual(self.env_file.stat().st_mode & 0o777, 0o600)
 
@@ -39,6 +42,48 @@ class ProductionModeTests(unittest.TestCase):
         self.assertIn("PHOENIX_MODE=SHADOW\n", shadow)
         self.assertIn("LIVE_EXECUTION=false\n", shadow)
         self.assertIn("AUTONOMOUS_EXECUTION=false\n", shadow)
+        self.assertEqual(shadow.count("LIVE_EXECUTOR_MAX_ATLAS_BID_WEI="), 1)
+
+    def test_explicit_atlas_bid_ceiling_is_preserved(self) -> None:
+        with self.env_file.open("a", encoding="utf-8") as handle:
+            handle.write("LIVE_EXECUTOR_MAX_ATLAS_BID_WEI=42\n")
+
+        production_mode.update(self.env_file, "live")
+
+        live = self.env_file.read_text(encoding="utf-8")
+        self.assertIn("LIVE_EXECUTOR_MAX_ATLAS_BID_WEI=42\n", live)
+        self.assertNotIn(
+            "LIVE_EXECUTOR_MAX_ATLAS_BID_WEI=1000000000000000\n", live
+        )
+
+    def test_materialize_defaults_is_idempotent_and_preserves_mode(self) -> None:
+        production_mode.update(
+            self.env_file, production_mode.MATERIALIZE_DEFAULTS_ACTION
+        )
+        first = self.env_file.read_bytes()
+        production_mode.update(
+            self.env_file, production_mode.MATERIALIZE_DEFAULTS_ACTION
+        )
+
+        materialized = self.env_file.read_text(encoding="utf-8")
+        self.assertEqual(self.env_file.read_bytes(), first)
+        self.assertIn("PHOENIX_MODE=SHADOW\n", materialized)
+        self.assertIn("LIVE_EXECUTION=false\n", materialized)
+        self.assertIn("AUTONOMOUS_EXECUTION=false\n", materialized)
+        self.assertEqual(
+            materialized.count("LIVE_EXECUTOR_MAX_ATLAS_BID_WEI="), 1
+        )
+
+    def test_duplicate_atlas_bid_ceiling_fails_closed_without_replacement(self) -> None:
+        original = self.env_file.read_text(encoding="utf-8") + (
+            "LIVE_EXECUTOR_MAX_ATLAS_BID_WEI=42\n"
+            "LIVE_EXECUTOR_MAX_ATLAS_BID_WEI=43\n"
+        )
+        self.env_file.write_text(original, encoding="utf-8")
+
+        with self.assertRaisesRegex(production_mode.ModeError, "duplicate"):
+            production_mode.update(self.env_file, "live")
+        self.assertEqual(self.env_file.read_text(encoding="utf-8"), original)
 
     def test_duplicate_mode_key_fails_closed_without_replacement(self) -> None:
         original = (

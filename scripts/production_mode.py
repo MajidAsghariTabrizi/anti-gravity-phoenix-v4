@@ -23,6 +23,15 @@ VALUES = {
     },
 }
 
+# The live overlay has always applied this reviewed ceiling when the operator
+# environment predates the explicit Atlas setting.  Materialize that effective
+# policy atomically so newer releases can keep the Compose and validator
+# contracts strict without requiring an out-of-band host edit.
+RELEASE_COMPATIBILITY_DEFAULTS = {
+    "LIVE_EXECUTOR_MAX_ATLAS_BID_WEI": "1000000000000000",
+}
+MATERIALIZE_DEFAULTS_ACTION = "materialize-release-defaults"
+
 
 def update(path: Path, mode: str) -> None:
     if not path.is_absolute() or not path.is_file() or path.is_symlink():
@@ -33,7 +42,8 @@ def update(path: Path, mode: str) -> None:
     raw = path.read_text(encoding="utf-8")
     if "\x00" in raw:
         raise ModeError("production environment content is invalid")
-    replacements = VALUES[mode]
+    replacements = {} if mode == MATERIALIZE_DEFAULTS_ACTION else VALUES[mode]
+    managed_names = replacements.keys() | RELEASE_COMPATIBILITY_DEFAULTS.keys()
     seen: set[str] = set()
     output: list[str] = []
     for line in raw.splitlines():
@@ -42,14 +52,20 @@ def update(path: Path, mode: str) -> None:
             output.append(line)
             continue
         name = stripped.split("=", 1)[0].strip()
-        if name in replacements:
+        if name in managed_names:
             if name in seen:
-                raise ModeError(f"duplicate production mode key: {name}")
-            output.append(f"{name}={replacements[name]}")
+                raise ModeError(f"duplicate managed production key: {name}")
+            if name in replacements:
+                output.append(f"{name}={replacements[name]}")
+            else:
+                output.append(line)
             seen.add(name)
         else:
             output.append(line)
     for name, value in replacements.items():
+        if name not in seen:
+            output.append(f"{name}={value}")
+    for name, value in RELEASE_COMPATIBILITY_DEFAULTS.items():
         if name not in seen:
             output.append(f"{name}={value}")
     content = "\n".join(output) + "\n"
@@ -72,7 +88,9 @@ def update(path: Path, mode: str) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("mode", choices=tuple(VALUES))
+    parser.add_argument(
+        "mode", choices=(*VALUES, MATERIALIZE_DEFAULTS_ACTION)
+    )
     parser.add_argument("--env-file", required=True)
     args = parser.parse_args()
     try:
