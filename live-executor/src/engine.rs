@@ -9,8 +9,9 @@ use crate::rpc::{ExecutionRpc, RpcError, RpcErrorKind, TransactionReceipt};
 use crate::signer::{SignerError, TransactionDraft, TransactionSigner};
 use crate::store::{ExecutorStore, StoreError};
 use crate::APPROVAL_POLICY_VERSION;
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use sha2::{Digest, Sha256};
+use std::sync::Arc;
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -19,6 +20,7 @@ pub struct LiveExecutor<S, R> {
     signer: TransactionSigner,
     store: S,
     rpc: R,
+    clock: Arc<dyn Fn() -> DateTime<Utc> + Send + Sync>,
 }
 
 impl<S, R> LiveExecutor<S, R>
@@ -27,11 +29,25 @@ where
     R: ExecutionRpc,
 {
     pub fn new(config: ExecutorConfig, signer: TransactionSigner, store: S, rpc: R) -> Self {
+        Self::new_with_clock(config, signer, store, rpc, Utc::now)
+    }
+
+    pub fn new_with_clock<F>(
+        config: ExecutorConfig,
+        signer: TransactionSigner,
+        store: S,
+        rpc: R,
+        clock: F,
+    ) -> Self
+    where
+        F: Fn() -> DateTime<Utc> + Send + Sync + 'static,
+    {
         Self {
             config,
             signer,
             store,
             rpc,
+            clock: Arc::new(clock),
         }
     }
 
@@ -138,6 +154,22 @@ where
             .store
             .allocate_nonce(request.id, &self.config, network_nonce)
             .await?;
+        if !self
+            .pinned_block_is_current(&request)
+            .await
+            .unwrap_or(false)
+        {
+            self.store
+                .fail_unsubmitted(request.id, "stale_pinned_block", now)
+                .await?;
+            return Ok(ExecutionState::ArmedIdle);
+        }
+        if !submission_deadlines_are_fresh(&request, (self.clock)()) {
+            self.store
+                .fail_unsubmitted(request.id, "stale_submission_deadline", now)
+                .await?;
+            return Ok(ExecutionState::ArmedIdle);
+        }
         let signed = match self.signer.sign(TransactionDraft {
             chain_id: self.config.chain_id,
             nonce,
@@ -182,6 +214,22 @@ where
                 reason: DisarmReason::DailyLossBudget,
             });
         }
+        if !self
+            .pinned_block_is_current(&request)
+            .await
+            .unwrap_or(false)
+        {
+            self.store
+                .fail_unsubmitted(request.id, "stale_pinned_block", now)
+                .await?;
+            return Ok(ExecutionState::ArmedIdle);
+        }
+        if !submission_deadlines_are_fresh(&request, (self.clock)()) {
+            self.store
+                .fail_unsubmitted(request.id, "stale_submission_deadline", now)
+                .await?;
+            return Ok(ExecutionState::ArmedIdle);
+        }
 
         let returned_hash = match self.rpc.send_raw_transaction(signed.raw_bytes()).await {
             Ok(tx_hash) => tx_hash,
@@ -218,6 +266,11 @@ where
             request_id: request.id,
             tx_hash: returned_hash,
         })
+    }
+
+    async fn pinned_block_is_current(&self, request: &ExecutionRequest) -> Result<bool, RpcError> {
+        let (number, hash) = self.rpc.finalized_block_identity().await?;
+        Ok(number == request.pinned_block_number && hash == request.pinned_block_hash)
     }
 
     async fn reconcile_active(
@@ -525,6 +578,12 @@ where
         self.store.disarm(code).await?;
         Ok(ExecutionState::SubmissionUnknown { request_id, nonce })
     }
+}
+
+fn submission_deadlines_are_fresh(request: &ExecutionRequest, now: DateTime<Utc>) -> bool {
+    request.approved_at <= now
+        && request.approval_deadline > now
+        && request.deadline > now + ChronoDuration::seconds(15)
 }
 
 fn validate_and_encode(

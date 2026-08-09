@@ -1,5 +1,6 @@
 use rpc_gateway::aave_state::{
-    AaveExactRequest, AaveScreenRequest, AaveSimulateRequest, AaveTailRequest,
+    AaveExactRequest, AaveScreenRequest, AaveSimulateBatchRequest, AaveSimulateRequest,
+    AaveTailRequest,
 };
 use rpc_gateway::economic::MethodTimeouts;
 use rpc_gateway::hunter_state::{HunterStateRequest, HUNTER_STATE_REQUEST_SCHEMA};
@@ -28,6 +29,7 @@ use tokio_util::sync::CancellationToken;
 const MAX_HTTP_HEADER_BYTES: usize = 16 * 1024;
 const HTTP_READ_TIMEOUT: Duration = Duration::from_secs(3);
 const STATE_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+const AAVE_SIMULATION_BATCH_TIMEOUT: Duration = Duration::from_secs(50);
 #[derive(Clone, Debug)]
 struct Config {
     address: String,
@@ -363,6 +365,30 @@ async fn handle_request(
             match tokio::time::timeout(
                 STATE_REQUEST_TIMEOUT,
                 runtime.simulate_aave_liquidation(parsed),
+            )
+            .await
+            {
+                Ok(Ok(response)) => write_json(&mut stream, 200, &response).await,
+                Ok(Err(error)) => {
+                    write_json(&mut stream, error.http_status(), &error.response()).await
+                }
+                Err(_) => {
+                    let error = GatewayError::ProviderUnavailable;
+                    write_json(&mut stream, error.http_status(), &error.response()).await
+                }
+            }
+        }
+        ("POST", "/v1/aave/simulate-batch") => {
+            let parsed: AaveSimulateBatchRequest = match serde_json::from_slice(&request.body) {
+                Ok(parsed) => parsed,
+                Err(_) => {
+                    return write_json(&mut stream, 400, &GatewayError::InvalidRequest.response())
+                        .await;
+                }
+            };
+            match tokio::time::timeout(
+                AAVE_SIMULATION_BATCH_TIMEOUT,
+                runtime.simulate_aave_liquidations_batch(parsed),
             )
             .await
             {

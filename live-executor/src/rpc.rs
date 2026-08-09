@@ -1,5 +1,6 @@
 use crate::abi::RpcLog;
 use crate::model::{CanonicalAddress, ExecutionRequest, TransactionHash, ValidatedLeg};
+use crate::{ARBITRUM_AAVE_V3_POOL_ADDRESS, ARBITRUM_ATLAS_V1_6_4_ADDRESS, ARBITRUM_WETH_ADDRESS};
 use async_trait::async_trait;
 use reqwest::redirect::Policy;
 use reqwest::Client;
@@ -93,6 +94,7 @@ impl RpcError {
 #[async_trait]
 pub trait ExecutionRpc: Send + Sync {
     async fn chain_id(&self) -> Result<u64, RpcError>;
+    async fn finalized_block_identity(&self) -> Result<(u64, String), RpcError>;
     async fn execution_contract_ready(
         &self,
         request: &ExecutionRequest,
@@ -370,6 +372,75 @@ impl HttpExecutionRpc {
         Ok((owner, flash_provider))
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub async fn atlas_execution_contract_ready(
+        &self,
+        executor: CanonicalAddress,
+        expected_owner: CanonicalAddress,
+        expected_code_hash: &str,
+        maximum_input_amount: u128,
+        debt_asset: CanonicalAddress,
+        collateral_asset: CanonicalAddress,
+        legs: &[ValidatedLeg],
+    ) -> Result<bool, RpcError> {
+        let code = self
+            .call("eth_getCode", json!([executor.to_string(), "latest"]))
+            .await?
+            .as_str()
+            .and_then(parse_hex_bytes)
+            .ok_or_else(malformed)?;
+        if code.is_empty() || hex::encode(Sha256::digest(&code)) != expected_code_hash {
+            return Ok(false);
+        }
+        let expected_flash_provider =
+            CanonicalAddress::parse(ARBITRUM_AAVE_V3_POOL_ADDRESS).map_err(|_| malformed())?;
+        let expected_atlas =
+            CanonicalAddress::parse(ARBITRUM_ATLAS_V1_6_4_ADDRESS).map_err(|_| malformed())?;
+        let expected_weth =
+            CanonicalAddress::parse(ARBITRUM_WETH_ADDRESS).map_err(|_| malformed())?;
+        if call_address(self, executor, "owner", &[]).await? != Some(expected_owner)
+            || call_address(self, executor, "flashProvider", &[]).await?
+                != Some(expected_flash_provider)
+            || call_address(self, executor, "atlas", &[]).await? != Some(expected_atlas)
+            || call_address(self, executor, "weth", &[]).await? != Some(expected_weth)
+            || call_bool(self, executor, "paused", &[]).await?
+            || call_uint(self, executor, "maximumInputAmount", &[]).await? < maximum_input_amount
+            || !call_bool(
+                self,
+                executor,
+                "approvedAssets",
+                &[address_token(debt_asset)],
+            )
+            .await?
+            || !call_bool(
+                self,
+                executor,
+                "approvedAssets",
+                &[address_token(collateral_asset)],
+            )
+            .await?
+        {
+            return Ok(false);
+        }
+        for leg in legs {
+            let Some(factory) = leg.factory else {
+                return Ok(false);
+            };
+            if !call_bool(
+                self,
+                executor,
+                "approvedFactories",
+                &[address_token(factory)],
+            )
+            .await?
+                || !call_pool(self, executor, leg).await?
+            {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
     pub async fn executor_configuration_snapshot(
         &self,
         executor: CanonicalAddress,
@@ -498,6 +569,13 @@ impl ExecutionRpc for HttpExecutionRpc {
         parse_hex_u64(value.as_str().ok_or_else(malformed)?)
     }
 
+    async fn finalized_block_identity(&self) -> Result<(u64, String), RpcError> {
+        let value = self
+            .call("eth_getBlockByNumber", json!(["finalized", false]))
+            .await?;
+        parse_block_identity(&value)
+    }
+
     async fn execution_contract_ready(
         &self,
         request: &ExecutionRequest,
@@ -516,12 +594,31 @@ impl ExecutionRpc for HttpExecutionRpc {
         if code.is_empty() || hex::encode(Sha256::digest(&code)) != expected_code_hash {
             return Ok(false);
         }
+        let flash_provider =
+            call_address(self, request.executor_address, "flashProvider", &[]).await?;
+        let flash_asset_approved = call_bool(
+            self,
+            request.executor_address,
+            "approvedAssets",
+            &[address_token(request.flash_asset)],
+        )
+        .await?;
+        let is_aave_liquidation = request.aave_liquidation.is_some();
+        let router_approved = if is_aave_liquidation {
+            false
+        } else {
+            call_bool(
+                self,
+                request.executor_address,
+                "approvedRouters",
+                &[address_token(request.origin_router)],
+            )
+            .await?
+        };
         if call_address(self, request.executor_address, "owner", &[])
             .await?
             .is_none()
-            || call_address(self, request.executor_address, "flashProvider", &[])
-                .await?
-                .is_none()
+            || flash_provider.is_none()
             || call_bool(self, request.executor_address, "paused", &[]).await?
             || call_uint(self, request.executor_address, "maximumInputAmount", &[]).await?
                 < request.maximum_input_amount
@@ -532,22 +629,30 @@ impl ExecutionRpc for HttpExecutionRpc {
                 &[address_token(wallet)],
             )
             .await?
-            || !call_bool(
+            || !flash_asset_approved
+            || !execution_router_mapping_ready(is_aave_liquidation, router_approved)
+        {
+            return Ok(false);
+        }
+        if let Some(route) = request.aave_liquidation.as_ref() {
+            let expected_pool =
+                CanonicalAddress::parse(ARBITRUM_AAVE_V3_POOL_ADDRESS).map_err(|_| malformed())?;
+            let collateral_approved = call_bool(
                 self,
                 request.executor_address,
                 "approvedAssets",
-                &[address_token(request.flash_asset)],
+                &[address_token(route.collateral_asset)],
             )
-            .await?
-            || !call_bool(
-                self,
-                request.executor_address,
-                "approvedRouters",
-                &[address_token(request.origin_router)],
-            )
-            .await?
-        {
-            return Ok(false);
+            .await?;
+            if !direct_aave_contract_state_ready(
+                flash_provider,
+                request.origin_router,
+                expected_pool,
+                flash_asset_approved,
+                collateral_approved,
+            ) {
+                return Ok(false);
+            }
         }
         for leg in &request.legs {
             let Some(factory) = leg.factory else {
@@ -682,6 +787,18 @@ fn parse_log(value: &Value) -> Result<RpcLog, RpcError> {
     })
 }
 
+fn parse_block_identity(value: &Value) -> Result<(u64, String), RpcError> {
+    let object = value.as_object().ok_or_else(malformed)?;
+    let number = parse_u64_field(object, "number")?;
+    let hash = object
+        .get("hash")
+        .and_then(Value::as_str)
+        .filter(|value| canonical_hash(value))
+        .ok_or_else(malformed)?
+        .to_string();
+    Ok((number, hash))
+}
+
 fn parse_indexed_log(value: &Value) -> Result<IndexedRpcLog, RpcError> {
     let object = value.as_object().ok_or_else(malformed)?;
     if object.get("removed").and_then(Value::as_bool) != Some(false) {
@@ -697,6 +814,23 @@ fn parse_indexed_log(value: &Value) -> Result<IndexedRpcLog, RpcError> {
 
 fn address_token(address: CanonicalAddress) -> ethabi::Token {
     ethabi::Token::Address(primitive_types::H160::from_slice(address.as_bytes()))
+}
+
+fn direct_aave_contract_state_ready(
+    flash_provider: Option<CanonicalAddress>,
+    origin_router: CanonicalAddress,
+    expected_pool: CanonicalAddress,
+    debt_asset_approved: bool,
+    collateral_asset_approved: bool,
+) -> bool {
+    flash_provider == Some(expected_pool)
+        && origin_router == expected_pool
+        && debt_asset_approved
+        && collateral_asset_approved
+}
+
+fn execution_router_mapping_ready(is_aave_liquidation: bool, router_approved: bool) -> bool {
+    is_aave_liquidation || router_approved
 }
 
 async fn contract_call(
@@ -1061,6 +1195,25 @@ mod tests {
     }
 
     #[test]
+    fn finalized_block_identity_requires_canonical_number_and_hash() {
+        let hash = format!("0x{}", "a".repeat(64));
+        assert_eq!(
+            parse_block_identity(&json!({"number": "0x2a", "hash": hash})).expect("block"),
+            (42, format!("0x{}", "a".repeat(64)))
+        );
+        assert!(parse_block_identity(&json!({
+            "number": "0x02a",
+            "hash": format!("0x{}", "a".repeat(64))
+        }))
+        .is_err());
+        assert!(parse_block_identity(&json!({
+            "number": "0x2a",
+            "hash": format!("0x{}", "A".repeat(64))
+        }))
+        .is_err());
+    }
+
+    #[test]
     fn node_interface_quote_preserves_sender_block_and_calldata() {
         let from =
             CanonicalAddress::parse("0x1111111111111111111111111111111111111111").expect("from");
@@ -1075,5 +1228,51 @@ mod tests {
         assert_eq!(params[0]["to"], ARBITRUM_NODE_INTERFACE);
         assert_eq!(params[0]["data"], encoded);
         assert_eq!(params[1], block_tag);
+    }
+
+    #[test]
+    fn direct_aave_readiness_rejects_provider_router_or_asset_drift() {
+        let pool = CanonicalAddress::parse(ARBITRUM_AAVE_V3_POOL_ADDRESS).expect("pool");
+        let drift =
+            CanonicalAddress::parse("0x1111111111111111111111111111111111111111").expect("drift");
+
+        assert!(direct_aave_contract_state_ready(
+            Some(pool),
+            pool,
+            pool,
+            true,
+            true,
+        ));
+        assert!(!direct_aave_contract_state_ready(
+            Some(drift),
+            pool,
+            pool,
+            true,
+            true,
+        ));
+        assert!(!direct_aave_contract_state_ready(
+            Some(pool),
+            drift,
+            pool,
+            true,
+            true,
+        ));
+        assert!(!direct_aave_contract_state_ready(
+            Some(pool),
+            pool,
+            pool,
+            false,
+            true,
+        ));
+        assert!(!direct_aave_contract_state_ready(
+            Some(pool),
+            pool,
+            pool,
+            true,
+            false,
+        ));
+        assert!(execution_router_mapping_ready(true, false));
+        assert!(!execution_router_mapping_ready(false, false));
+        assert!(execution_router_mapping_ready(false, true));
     }
 }

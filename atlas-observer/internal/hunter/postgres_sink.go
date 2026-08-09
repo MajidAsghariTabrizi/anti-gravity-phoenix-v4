@@ -319,5 +319,8 @@ func rejectionReason(outcome string) any {
 	if outcome == "incomplete" {
 		return "economic_bound_incomplete"
 	}
+	if outcome == "atlas_evidence_rejection" {
+		return "atlas_callback_evidence_unavailable"
+	}
 	return nil
 }

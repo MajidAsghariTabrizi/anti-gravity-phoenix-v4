@@ -271,18 +271,20 @@ services:
       - --aave-batch-size=100
       - --aave-pace=60s
       - --retained-profit-floor-wei=${LIVE_EXECUTOR_MIN_EXPECTED_PROFIT:?LIVE_EXECUTOR_MIN_EXPECTED_PROFIT is required}
+      - --maximum-input-amount=${LIVE_EXECUTOR_MAX_INPUT_AMOUNT:?LIVE_EXECUTOR_MAX_INPUT_AMOUNT is required}
       - --maximum-gas-limit=${LIVE_EXECUTOR_MAX_GAS_LIMIT:?LIVE_EXECUTOR_MAX_GAS_LIMIT is required}
       - --maximum-fee-per-gas-wei=${LIVE_EXECUTOR_MAX_MAX_FEE_PER_GAS_WEI:?LIVE_EXECUTOR_MAX_MAX_FEE_PER_GAS_WEI is required}
       - --maximum-priority-fee-per-gas-wei=${LIVE_EXECUTOR_MAX_PRIORITY_FEE_PER_GAS_WEI:?LIVE_EXECUTOR_MAX_PRIORITY_FEE_PER_GAS_WEI is required}
+      - --maximum-atlas-bid-wei=${LIVE_EXECUTOR_MAX_ATLAS_BID_WEI:?LIVE_EXECUTOR_MAX_ATLAS_BID_WEI is required}
       - --executor-address=${LIVE_EXECUTOR_EXECUTOR_ADDRESS:?LIVE_EXECUTOR_EXECUTOR_ADDRESS is required}
       - --executor-code-hash=${LIVE_EXECUTOR_EXECUTOR_CODE_HASH:?LIVE_EXECUTOR_EXECUTOR_CODE_HASH is required}
       - --caller-address=${LIVE_EXECUTOR_WALLET_ADDRESS:?LIVE_EXECUTOR_WALLET_ADDRESS is required}
       - --release-sha=${PHOENIX_RELEASE_SHA:?PHOENIX_RELEASE_SHA is required}
-      # Aave premium is live-verified during financial calibration; keep a bounded
-      # env override while making the calibrated on-chain default release-durable.
+      # The gateway verifies the exact Pool premium at the pinned block. This
+      # configured value remains a fail-closed ceiling on the observed premium.
       - --flash-premium-bps=${ATLAS_AAVE_FLASH_PREMIUM_BPS:-5}
-      # Legacy live gate applies reserve to gross unwind notional. 25 bps is the
-      # reviewed equivalent until the positive-edge reserve model gains authority.
+      # Reserve is charged once against positive liquidation edge, after exact
+      # repayment and Pool premium, by the sole authoritative Candidate model.
       - --economic-reserve-bps=${ATLAS_AAVE_ECONOMIC_RESERVE_BPS:-25}
       - --rpc-gateway-url=http://rpc-gateway:9300
       - --health-addr=0.0.0.0:9700

@@ -126,6 +126,40 @@ a1770e87fd61db02a7725cd9eed3b1d07c3980af. Liquidation math source is
 aave-dao/aave-v3-origin commit
 fd1fbd9150426ca8ace9cee45b4acf912ae84f5b.
 
+At that pinned Origin revision, `LiquidationLogic` reads the variable-debt
+token balance for the repay path. Phoenix therefore sizes WETH repayment from
+variable debt only. A borrower with nonzero legacy stable WETH debt is marked
+`unsupported_stable_weth_debt` and fails closed borrower-locally; stable debt
+is never added to repay capacity, and it does not abort screening of unrelated
+borrowers in the same batch.
+
+The live WETH-debt liquidation universe is deliberately limited to reviewed
+collateral paths. WETH collateral uses the executor's deterministic identity
+route (no DEX legs). The current Production executor already approves WETH,
+so the route needs no additional owner action there. The corrected same-asset
+collateral accounting must nevertheless be deployed as a new, code-hash-bound
+executor before that route can create a Production Candidate; a replacement
+executor starts with an empty allowlist and must receive the normal reviewed
+WETH approval during its paused bootstrap. The existing fork-simulation gate
+keeps the route fail-closed against the older executor. Native USDC may still
+be reconstructed and quoted as fail-closed evidence, but the deployed
+executor's asset allowlist is authoritative. The reviewed WBTC/WETH 0.05%
+Uniswap V3 pool is `0x2f5e87c9312fa29aed5c179e456625d79015299c`;
+WBTC remains disabled until an
+owner explicitly calls `setAsset(WBTC, true)` and `approvePool` for that pool,
+the canonical Uniswap V3 factory, WBTC token0, WETH token1, fee 500, and enabled
+status. Phoenix never sends those owner calls from the hunter or release path.
+
+The current Aave fork endpoint calls the executor's direct
+`executeAaveLiquidation` wrapper. It does not recreate Atlas' complete
+`metacall`/`atlasSolverCall` context, including the execution environment and
+Atlas shortfall reconciliation. That evidence may authorize the direct Aave
+lane only. Auction-triggered Atlas artifacts remain fail-closed, and the Atlas
+signing boundary requires a distinct callback-path evidence mode that the
+current schema deliberately cannot persist. Enabling Atlas Aave submission
+therefore requires a future full callback/metacall simulator, an explicit
+schema migration, and the normal reviewed release process.
+
 scripts/export_aave_borrow_discovery.py builds hash-bound, resumable discovery
 chunks. The resulting archive and borrower addresses are discovery-only input.
 They grant no candidate, signer, bond, bid, submission, capital, or execution

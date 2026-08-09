@@ -277,6 +277,7 @@ struct FakeRpc {
 
 struct FakeRpcState {
     chain_id: u64,
+    finalized_blocks: VecDeque<(u64, String)>,
     pending_nonce: u64,
     send_count: usize,
     send_error: Option<RpcError>,
@@ -291,6 +292,10 @@ impl FakeRpc {
         Self {
             state: Arc::new(Mutex::new(FakeRpcState {
                 chain_id: ARBITRUM_ONE_CHAIN_ID,
+                finalized_blocks: VecDeque::from([
+                    (123_456, format!("0x{}", "d".repeat(64))),
+                    (123_456, format!("0x{}", "d".repeat(64))),
+                ]),
                 pending_nonce: 7,
                 send_count: 0,
                 send_error: None,
@@ -330,6 +335,10 @@ impl FakeRpc {
         self.state.lock().expect("state").chain_id = chain_id;
     }
 
+    fn set_finalized_blocks(&self, identities: Vec<(u64, String)>) {
+        self.state.lock().expect("state").finalized_blocks = identities.into();
+    }
+
     fn set_send_error(&self, kind: RpcErrorKind) {
         self.state.lock().expect("state").send_error = Some(RpcError {
             kind,
@@ -349,6 +358,20 @@ impl FakeRpc {
 impl ExecutionRpc for FakeRpc {
     async fn chain_id(&self) -> Result<u64, RpcError> {
         Ok(self.state.lock().expect("state").chain_id)
+    }
+
+    async fn finalized_block_identity(&self) -> Result<(u64, String), RpcError> {
+        let mut state = self.state.lock().expect("state");
+        if state.finalized_blocks.len() > 1 {
+            return state.finalized_blocks.pop_front().ok_or(RpcError {
+                kind: RpcErrorKind::MalformedResponse,
+                remote_code: None,
+            });
+        }
+        state.finalized_blocks.front().cloned().ok_or(RpcError {
+            kind: RpcErrorKind::MalformedResponse,
+            remote_code: None,
+        })
     }
 
     async fn execution_contract_ready(
@@ -401,6 +424,7 @@ struct Harness {
     request: ExecutionRequest,
     config: ExecutorConfig,
     now: DateTime<Utc>,
+    clock: Arc<Mutex<VecDeque<DateTime<Utc>>>>,
 }
 
 fn harness(request_count: usize) -> Harness {
@@ -447,7 +471,19 @@ fn harness(request_count: usize) -> Harness {
         .collect();
     let store = FakeStore::new(requests);
     let rpc = FakeRpc::new();
-    let executor = LiveExecutor::new(config.clone(), signer, store.clone(), rpc.clone());
+    let clock = Arc::new(Mutex::new(VecDeque::from([now, now])));
+    let executor =
+        LiveExecutor::new_with_clock(config.clone(), signer, store.clone(), rpc.clone(), {
+            let clock = Arc::clone(&clock);
+            move || {
+                let mut times = clock.lock().expect("clock");
+                if times.len() > 1 {
+                    times.pop_front().expect("clock time")
+                } else {
+                    *times.front().expect("clock time")
+                }
+            }
+        });
     Harness {
         executor,
         store,
@@ -455,6 +491,7 @@ fn harness(request_count: usize) -> Harness {
         request,
         config,
         now,
+        clock,
     }
 }
 
@@ -576,6 +613,91 @@ async fn repeated_poll_is_idempotent_while_pending() {
         .expect("reconcile");
     assert!(matches!(second, ExecutionState::Pending { .. }));
     assert_eq!(harness.rpc.send_count(), 1);
+}
+
+#[tokio::test]
+async fn finalized_block_drift_before_signing_fails_unsubmitted() {
+    let harness = harness(1);
+    harness.rpc.set_finalized_blocks(vec![(
+        harness.request.pinned_block_number + 1,
+        format!("0x{}", "e".repeat(64)),
+    )]);
+
+    let state = harness.executor.step(harness.now).await.expect("stale pin");
+
+    assert_eq!(state, ExecutionState::ArmedIdle);
+    assert_eq!(harness.rpc.send_count(), 0);
+    assert_eq!(harness.store.next_nonce(), 7);
+    assert_eq!(
+        harness.store.terminal_statuses(),
+        vec![AttemptStatus::Failed]
+    );
+}
+
+#[tokio::test]
+async fn finalized_block_drift_immediately_before_submit_fails_unsubmitted() {
+    let harness = harness(1);
+    harness.rpc.set_finalized_blocks(vec![
+        (
+            harness.request.pinned_block_number,
+            harness.request.pinned_block_hash.clone(),
+        ),
+        (
+            harness.request.pinned_block_number + 1,
+            format!("0x{}", "e".repeat(64)),
+        ),
+    ]);
+
+    let state = harness.executor.step(harness.now).await.expect("stale pin");
+
+    assert_eq!(state, ExecutionState::ArmedIdle);
+    assert_eq!(harness.rpc.send_count(), 0);
+    assert_eq!(harness.store.next_nonce(), 7);
+    assert_eq!(
+        harness.store.terminal_statuses(),
+        vec![AttemptStatus::Failed]
+    );
+}
+
+#[tokio::test]
+async fn approval_expiry_after_rpc_work_fails_before_signing() {
+    let harness = harness(1);
+    *harness.clock.lock().expect("clock") =
+        VecDeque::from([harness.now + ChronoDuration::seconds(31)]);
+
+    let state = harness
+        .executor
+        .step(harness.now)
+        .await
+        .expect("expired approval");
+
+    assert_eq!(state, ExecutionState::ArmedIdle);
+    assert_eq!(harness.rpc.send_count(), 0);
+    assert_eq!(harness.store.next_nonce(), 7);
+}
+
+#[tokio::test]
+async fn near_contract_deadline_after_signing_fails_immediately_before_submit() {
+    let harness = harness(1);
+    {
+        let mut state = harness.store.state.lock().expect("state");
+        state.requests[0].approval_deadline = harness.now + ChronoDuration::seconds(55);
+        state.requests[0].approval_digest = state.requests[0]
+            .canonical_approval_digest()
+            .expect("approval digest");
+    }
+    *harness.clock.lock().expect("clock") =
+        VecDeque::from([harness.now, harness.now + ChronoDuration::seconds(46)]);
+
+    let state = harness
+        .executor
+        .step(harness.now)
+        .await
+        .expect("near contract deadline");
+
+    assert_eq!(state, ExecutionState::ArmedIdle);
+    assert_eq!(harness.rpc.send_count(), 0);
+    assert_eq!(harness.store.next_nonce(), 7);
 }
 
 #[tokio::test]

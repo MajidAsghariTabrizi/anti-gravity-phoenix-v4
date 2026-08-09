@@ -23,7 +23,7 @@ func main() {
 	var startingCursor uint64
 	var batch int
 	var pace time.Duration
-	var retainedProfitFloor string
+	var retainedProfitFloor, maximumInputAmount, maximumAtlasBidWei string
 	var maximumGasLimit, flashPremiumBPS, economicReserveBPS uint64
 	var maximumFeePerGasWei string
 	var executorAddress, executorCodeHash, callerAddress, releaseSHA, maximumPriorityFeeWei string
@@ -38,6 +38,7 @@ func main() {
 	flag.StringVar(&retainedProfitFloor, "retained-profit-floor-wei", "", "strict Production retained-profit floor in WETH wei")
 	flag.Uint64Var(&maximumGasLimit, "maximum-gas-limit", 0, "maximum liquidation gas charged by the conservative gate")
 	flag.StringVar(&maximumFeePerGasWei, "maximum-fee-per-gas-wei", "", "maximum gas price charged by the conservative gate")
+	bindFinancialCeilingFlags(flag.CommandLine, &maximumInputAmount, &maximumAtlasBidWei)
 	flag.Uint64Var(&flashPremiumBPS, "flash-premium-bps", 9, "conservative flash premium in basis points")
 	flag.Uint64Var(&economicReserveBPS, "economic-reserve-bps", 500, "combined failure, latency, drift, and model reserve")
 	flag.StringVar(&executorAddress, "executor-address", "", "exact deployed PhoenixExecutor address")
@@ -66,8 +67,10 @@ func main() {
 		StateDir: filepath.Join(ledgerDir, "aave"), GatewayURL: gateway,
 		StartingCursor: startingCursor, BatchSize: batch, Pace: pace,
 		RetainedProfitFloorWei: retainedProfitFloor,
+		MaximumInputAmountWei:  maximumInputAmount,
 		MaximumGasLimit:        maximumGasLimit,
 		MaximumFeePerGasWei:    maximumFeePerGasWei,
+		MaximumAtlasBidWei:     maximumAtlasBidWei,
 		FlashPremiumBPS:        flashPremiumBPS,
 		EconomicReserveBPS:     economicReserveBPS,
 		ExecutorAddress:        executorAddress,
@@ -116,6 +119,11 @@ func main() {
 	if runErr != nil {
 		logger.Fatalf("hunter failed: %v", runErr)
 	}
+}
+
+func bindFinancialCeilingFlags(flags *flag.FlagSet, maximumInputAmount, maximumAtlasBidWei *string) {
+	flags.StringVar(maximumInputAmount, "maximum-input-amount", "", "maximum WETH-denominated liquidation input amount")
+	flags.StringVar(maximumAtlasBidWei, "maximum-atlas-bid-wei", "", "maximum configured Atlas bid in WETH wei")
 }
 
 type atlasCandidateScreener interface {

@@ -42,7 +42,23 @@ pub struct AaveLiquidationIdentity {
     pub debt_asset: CanonicalAddress,
     pub collateral_asset: CanonicalAddress,
     pub repay_amount: u128,
+    pub maximum_input_amount: u128,
+    pub minimum_collateral_received: u128,
+    pub minimum_unwind_output: u128,
+    pub minimum_profit: u128,
     pub maximum_atlas_bid: u128,
+    pub deadline: u64,
+    pub unwind_legs: Vec<AaveLiquidationLegIdentity>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AaveLiquidationLegIdentity {
+    pub pool: CanonicalAddress,
+    pub token_in: CanonicalAddress,
+    pub token_out: CanonicalAddress,
+    pub fee: u32,
+    pub zero_for_one: bool,
+    pub minimum_amount_out: u128,
 }
 
 impl AaveLiquidationRequest {
@@ -82,17 +98,22 @@ impl AaveLiquidationRequest {
         let minimum_unwind_output = token_uint(&fields[8])?;
         let minimum_profit = token_uint(&fields[9])?;
         let maximum_atlas_bid = token_uint(&fields[10])?;
-        let deadline = token_uint(&fields[11])?;
+        let deadline =
+            u64::try_from(token_uint(&fields[11])?).map_err(|_| AaveAbiError::InvalidRequest)?;
         let Token::Array(legs) = &fields[12] else {
             return Err(AaveAbiError::InvalidRequest);
         };
+        let unwind_legs = legs
+            .iter()
+            .map(decode_leg_identity)
+            .collect::<Result<Vec<_>, _>>()?;
         if repay_amount == 0
             || maximum_input_amount < repay_amount
             || minimum_collateral_received == 0
             || minimum_unwind_output == 0
             || minimum_profit == 0
             || deadline == 0
-            || legs.len() > crate::model::MAX_ROUTE_LEGS
+            || unwind_legs.len() > crate::model::MAX_ROUTE_LEGS
         {
             return Err(AaveAbiError::InvalidRequest);
         }
@@ -102,7 +123,13 @@ impl AaveLiquidationRequest {
             debt_asset,
             collateral_asset,
             repay_amount,
+            maximum_input_amount,
+            minimum_collateral_received,
+            minimum_unwind_output,
+            minimum_profit,
             maximum_atlas_bid,
+            deadline,
+            unwind_legs,
         })
     }
 
@@ -203,7 +230,25 @@ impl AaveLiquidationRequest {
             debt_asset: self.debt_asset,
             collateral_asset: self.collateral_asset,
             repay_amount: self.repay_amount,
+            maximum_input_amount: self.maximum_input_amount,
+            minimum_collateral_received: self.minimum_collateral_received,
+            minimum_unwind_output: self.minimum_unwind_output,
+            minimum_profit: self.minimum_profit,
             maximum_atlas_bid: self.maximum_atlas_bid,
+            deadline: u64::try_from(self.deadline.timestamp())
+                .expect("validated Aave deadline is a positive u64"),
+            unwind_legs: self
+                .unwind_legs
+                .iter()
+                .map(|leg| AaveLiquidationLegIdentity {
+                    pool: leg.pool,
+                    token_in: leg.token_in,
+                    token_out: leg.token_out,
+                    fee: leg.fee,
+                    zero_for_one: leg.zero_for_one,
+                    minimum_amount_out: leg.min_amount_out,
+                })
+                .collect(),
         }
     }
 }
@@ -374,6 +419,27 @@ fn token_uint(token: &Token) -> Result<u128, AaveAbiError> {
     Ok(value.low_u128())
 }
 
+fn decode_leg_identity(token: &Token) -> Result<AaveLiquidationLegIdentity, AaveAbiError> {
+    let Token::Tuple(fields) = token else {
+        return Err(AaveAbiError::InvalidRequest);
+    };
+    if fields.len() != 6 {
+        return Err(AaveAbiError::InvalidRequest);
+    }
+    let fee = u32::try_from(token_uint(&fields[3])?).map_err(|_| AaveAbiError::InvalidRequest)?;
+    let Token::Bool(zero_for_one) = &fields[4] else {
+        return Err(AaveAbiError::InvalidRequest);
+    };
+    Ok(AaveLiquidationLegIdentity {
+        pool: token_address(&fields[0])?,
+        token_in: token_address(&fields[1])?,
+        token_out: token_address(&fields[2])?,
+        fee,
+        zero_for_one: *zero_for_one,
+        minimum_amount_out: token_uint(&fields[5])?,
+    })
+}
+
 #[derive(Clone, Debug, Error, PartialEq, Eq)]
 pub enum AaveAbiError {
     #[error("PhoenixExecutor Aave ABI is invalid")]
@@ -431,7 +497,23 @@ mod tests {
         assert_eq!(identity.route_id, request.route_id);
         assert_eq!(identity.borrower, request.borrower);
         assert_eq!(identity.debt_asset, request.debt_asset);
+        assert_eq!(identity.repay_amount, request.repay_amount);
+        assert_eq!(identity.maximum_input_amount, request.maximum_input_amount);
+        assert_eq!(
+            identity.minimum_collateral_received,
+            request.minimum_collateral_received
+        );
+        assert_eq!(
+            identity.minimum_unwind_output,
+            request.minimum_unwind_output
+        );
+        assert_eq!(identity.minimum_profit, request.minimum_profit);
         assert_eq!(identity.maximum_atlas_bid, request.maximum_atlas_bid);
+        assert_eq!(identity.unwind_legs.len(), 1);
+        assert_eq!(
+            identity.unwind_legs[0].minimum_amount_out,
+            request.unwind_legs[0].min_amount_out
+        );
     }
 
     #[test]
@@ -442,5 +524,19 @@ mod tests {
         invalid = request();
         invalid.deadline = Utc::now() - Duration::seconds(1);
         assert_eq!(invalid.validate(), Err(AaveAbiError::InvalidRequest));
+    }
+
+    #[test]
+    fn encoded_zero_borrower_fails_closed() {
+        let mut token = request_token(&request()).expect("request token");
+        let Token::Tuple(fields) = &mut token else {
+            panic!("request tuple");
+        };
+        fields[1] = Token::Address(ethabi::Address::zero());
+        let encoded = ethabi::encode(&[token]);
+        assert_eq!(
+            AaveLiquidationRequest::decode_encoded_identity(&encoded),
+            Err(AaveAbiError::InvalidRequest)
+        );
     }
 }

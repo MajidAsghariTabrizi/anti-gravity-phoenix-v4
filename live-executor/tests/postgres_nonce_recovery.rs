@@ -486,6 +486,67 @@ async fn nonce_allocation_and_pending_state_survive_restart() {
         100
     );
 
+    let atlas_signal_id = Uuid::from_u128(60);
+    sqlx::query(
+        "INSERT INTO live_canary.revenue_hunting_signals(
+            signal_id, signal_identity, source_lane, auction_id, block_number,
+            block_hash, retained_profit_floor, terminal_outcome, evidence_hash,
+            observed_at, updated_at
+         ) VALUES (
+            $1, 'shared-loss-atlas-signal', 'atlas_solver', 'shared-loss-auction', 1,
+            $2, 1, 'incomplete', $3, $4, $4
+         )",
+    )
+    .bind(atlas_signal_id)
+    .bind(format!("0x{}", "1".repeat(64)))
+    .bind("2".repeat(64))
+    .bind(now)
+    .execute(&pool)
+    .await
+    .expect("seed Atlas loss signal");
+    sqlx::query(
+        "INSERT INTO live_canary.atlas_auction_ingress(
+            auction_id, user_operation_hash, parallel_auction_identity,
+            auction_deadline_block, oracle_gas_price_wei, solver_gas_limit,
+            dapp, relevant_aave, parallel_eligible, evidence_hash,
+            terminal_outcome, observed_at, updated_at
+         ) VALUES (
+            'shared-loss-auction', $1, 'shared-loss-parallel', 2, 10, 500,
+            $2, true, true, $3, 'candidate', $4, $4
+         )",
+    )
+    .bind(format!("0x{}", "3".repeat(64)))
+    .bind("0x1111111111111111111111111111111111111111")
+    .bind("4".repeat(64))
+    .bind(now)
+    .execute(&pool)
+    .await
+    .expect("seed Atlas loss ingress");
+    sqlx::query(
+        "INSERT INTO live_canary.atlas_solver_requests(
+            auction_id, signal_id, user_operation_hash, solver_operation_hash,
+            solver_operation, maximum_bid, selected_bid, status,
+            submission_response_hash, created_at, updated_at
+         ) VALUES (
+            'shared-loss-auction', $1, $2, $3, '{}'::jsonb, 1, 1, 'lost',
+            $4, $5, $5
+         )",
+    )
+    .bind(atlas_signal_id)
+    .bind(format!("0x{}", "3".repeat(64)))
+    .bind("5".repeat(64))
+    .bind("6".repeat(64))
+    .bind(now)
+    .execute(&pool)
+    .await
+    .expect("seed durable Atlas charged exposure");
+    assert_eq!(
+        second_restart
+            .daily_loss_wei(now)
+            .await
+            .expect("shared daily loss"),
+        5_100
+    );
     prepare_fork_approval_fixture(&pool).await;
     sqlx::query(
         "UPDATE live_canary.control
