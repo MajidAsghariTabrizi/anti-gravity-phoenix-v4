@@ -1784,6 +1784,13 @@ class BoundedTransportContinuationTests(unittest.TestCase):
             re.findall(r"'([A-Za-z0-9_.-]+):[0-7]{4}'", platform_installer)
         )
         self.assertEqual(dependencies - installed, set())
+        materialize = context_installer.index(
+            'production_mode.py" materialize-release-defaults'
+        )
+        validate = context_installer.index(
+            'validate-production-env.sh" "$env_file"'
+        )
+        self.assertLess(materialize, validate)
 
     def test_candidate_install_failure_rolls_back_in_same_resume(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -2501,6 +2508,10 @@ class WorkflowAndDeploymentContractTests(unittest.TestCase):
             health_rehearsal,
         )
         self.assertIn(
+            'PHOENIX_ENV_FILE="$candidate_active_env"', health_rehearsal
+        )
+        self.assertNotIn('PHOENIX_ENV_FILE="$env_file"', health_rehearsal)
+        self.assertIn(
             "PHOENIX_HEALTH_ALLOW_LEGACY_ATLAS_BINARY=true",
             health_rehearsal,
         )
@@ -2545,6 +2556,8 @@ class WorkflowAndDeploymentContractTests(unittest.TestCase):
         self.assertIn('--overlay-file "$overlay_file"', render)
         self.assertIn("--expected-mode DISARMED_EVIDENCE", render)
         self.assertIn('--env-file "$candidate_evidence_env"', render)
+        self.assertIn("--expected-mode LIVE", render)
+        self.assertIn('--env-file "$candidate_live_env"', render)
         self.assertNotIn('--env-file "$env_file"', render)
         preparation = self.rehearsal.split(
             'python3 "$candidate_root/scripts/production_context.py" manifest-env',
@@ -2553,9 +2566,18 @@ class WorkflowAndDeploymentContractTests(unittest.TestCase):
             '"$candidate_root/scripts/render-production-compose.sh"',
             maxsplit=1,
         )[0]
-        self.assertIn('cp "$env_file" "$candidate_evidence_env"', preparation)
+        self.assertIn(
+            'copy_candidate_environment "$env_file" "$candidate_active_env"',
+            preparation,
+        )
+        self.assertIn("materialize-release-defaults", preparation)
+        self.assertIn(
+            'validate-production-env.sh" "$candidate_live_env"', preparation
+        )
         self.assertIn('production_mode.py" shadow', preparation)
         self.assertIn('--env-file "$candidate_evidence_env"', preparation)
+        self.assertIn("operator_env_digest_before", preparation)
+        self.assertIn("operator_env_digest_after", self.rehearsal)
 
     def test_candidate_render_precedes_any_runtime_mutation(self) -> None:
         preflight_render = self.deploy.index(
