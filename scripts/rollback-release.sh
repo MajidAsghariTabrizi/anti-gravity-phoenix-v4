@@ -457,6 +457,23 @@ wait_service_healthy() {
   return 1
 }
 
+capture_service_failure_evidence() {
+  failure_service=$1
+  failure_id=$(compose ps -a -q "$failure_service" |
+    awk 'NF { print; exit }')
+  if [ -z "$failure_id" ]; then
+    echo "ROLLBACK_SERVICE_EVIDENCE: service=$failure_service state=missing"
+    return 0
+  fi
+  failure_state=$(docker inspect --format \
+    '{{.State.Status}}|{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}|{{.RestartCount}}|{{.State.OOMKilled}}|{{.State.ExitCode}}|{{.State.Error}}' \
+    "$failure_id" 2>/dev/null || true)
+  echo "ROLLBACK_SERVICE_EVIDENCE: service=$failure_service state=$failure_state"
+  echo "ROLLBACK_SERVICE_LOG_TAIL_BEGIN: service=$failure_service lines=100"
+  docker logs --timestamps --tail 100 "$failure_id" 2>&1 || true
+  echo "ROLLBACK_SERVICE_LOG_TAIL_END: service=$failure_service"
+}
+
 install_active_file() {
   source_file=$1
   target_file=$2
@@ -500,10 +517,34 @@ capture_protected_ids "$protected_before" || fail "protected services are not re
 # Word splitting is intentional for manifest-derived validated service names.
 # shellcheck disable=SC2086
 compose pull $pull_services
+atlas_start_deferred=false
 for service in $start_services; do
+  case "$service" in
+    rpc-gateway|phoenix-engine) continue ;;
+    atlas-observer)
+      atlas_start_deferred=true
+      continue
+      ;;
+  esac
   compose up -d --no-deps "$service"
   wait_service_healthy "$service" || fail "optional service did not become healthy during rollback: $service"
 done
+compose up -d --no-deps rpc-gateway
+wait_service_healthy rpc-gateway ||
+  fail "rpc-gateway did not become healthy during rollback"
+compose exec -T rpc-gateway wget -q -O - \
+  http://127.0.0.1:9300/readyz >/dev/null ||
+  fail "rpc-gateway readiness failed during rollback"
+if [ "$atlas_start_deferred" = true ]; then
+  compose up -d --no-deps --force-recreate atlas-observer
+  if ! wait_service_healthy atlas-observer; then
+    capture_service_failure_evidence atlas-observer
+    fail "optional service did not become healthy during rollback: atlas-observer"
+  fi
+fi
+compose up -d --no-deps phoenix-engine
+wait_service_healthy phoenix-engine ||
+  fail "phoenix-engine did not become healthy during rollback"
 for service in $absent_services; do
   [ -z "$(compose ps -a -q "$service" | awk 'NF { print; exit }')" ] ||
     fail "a service required to be absent remained after rollback: $service"

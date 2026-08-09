@@ -2852,9 +2852,25 @@ class WorkflowAndDeploymentContractTests(unittest.TestCase):
         self.assertLess(reconciliation_failure, removal)
 
     def test_candidate_standby_failure_reaches_exact_rollback_cleanup(self) -> None:
+        deployment_start = self.deploy.index(
+            'transition_mutable_protected "$rollback_release_env" "$release_env"'
+        )
+        stopped = self.deploy.index(
+            "compose stop -t 30 live-executor", deployment_start
+        )
+        removed = self.deploy.index("compose rm -f live-executor", stopped)
+        absence = self.deploy.index("compose ps -a -q live-executor", removed)
         start = self.deploy.index("compose up -d --no-deps live-executor")
         standby_phase = self.deploy.index("mark_phase HUNTING_STANDBY_STARTED")
+        self.assertLess(stopped, removed)
+        self.assertLess(removed, absence)
+        self.assertLess(absence, start)
         self.assertLess(start, standby_phase)
+        compensation = self.deploy.split("rollback_on_failure()", maxsplit=1)[1].split(
+            "mutation_started=0", maxsplit=1
+        )[0]
+        self.assertIn("compose rm -f live-executor", compensation)
+        self.assertIn("compose ps -a -q live-executor", compensation)
         self.assertIn("state_update_raw failure deployment_failed", self.deploy)
         self.assertIn("state_update_raw rollback ROLLBACK_STARTED", self.deploy)
         self.assertIn(
@@ -2923,6 +2939,57 @@ class WorkflowAndDeploymentContractTests(unittest.TestCase):
         self.assertLess(rpc_start, deferred_gate)
         self.assertLess(deferred_gate, atlas_start)
         self.assertLess(atlas_start, engine_start)
+
+    def test_rollback_rpc_gateway_is_ready_before_atlas_and_engine(self) -> None:
+        start_loop = self.rollback.index("for service in $start_services")
+        loop_end = self.rollback.index(
+            "compose up -d --no-deps rpc-gateway", start_loop
+        )
+        loop = self.rollback[start_loop:loop_end]
+        self.assertIn("rpc-gateway|phoenix-engine) continue", loop)
+        self.assertIn("atlas-observer)", loop)
+        self.assertIn("atlas_start_deferred=true\n      continue", loop)
+        rpc_start = loop_end
+        rpc_healthy = self.rollback.index(
+            "wait_service_healthy rpc-gateway", rpc_start
+        )
+        rpc_ready = self.rollback.index(
+            "http://127.0.0.1:9300/readyz", rpc_healthy
+        )
+        atlas_start = self.rollback.index(
+            "compose up -d --no-deps --force-recreate atlas-observer", rpc_ready
+        )
+        atlas_healthy = self.rollback.index(
+            "wait_service_healthy atlas-observer", atlas_start
+        )
+        engine_start = self.rollback.index(
+            "compose up -d --no-deps phoenix-engine", atlas_healthy
+        )
+        self.assertLess(rpc_start, rpc_healthy)
+        self.assertLess(rpc_healthy, rpc_ready)
+        self.assertLess(rpc_ready, atlas_start)
+        self.assertLess(atlas_start, atlas_healthy)
+        self.assertLess(atlas_healthy, engine_start)
+
+    def test_rollback_atlas_failure_preserves_bounded_diagnostics(self) -> None:
+        self.assertIn("capture_service_failure_evidence()", self.rollback)
+        self.assertIn("{{.RestartCount}}", self.rollback)
+        self.assertIn("{{.State.OOMKilled}}", self.rollback)
+        self.assertIn("{{.State.ExitCode}}", self.rollback)
+        self.assertIn(
+            'docker logs --timestamps --tail 100 "$failure_id"', self.rollback
+        )
+        atlas_start = self.rollback.index(
+            "compose up -d --no-deps --force-recreate atlas-observer"
+        )
+        diagnostics = self.rollback.index(
+            "capture_service_failure_evidence atlas-observer", atlas_start
+        )
+        failure = self.rollback.index(
+            "optional service did not become healthy during rollback: atlas-observer",
+            diagnostics,
+        )
+        self.assertLess(diagnostics, failure)
 
     def test_candidate_failure_allows_version_matched_legacy_atlas_rollback(self) -> None:
         rollback_invocation = self.deploy.split(

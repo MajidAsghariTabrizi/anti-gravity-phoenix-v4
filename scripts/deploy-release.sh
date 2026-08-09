@@ -725,6 +725,13 @@ rollback_on_failure() {
     state_update_raw rollback ROLLBACK_STARTED >/dev/null 2>&1 || true
     repause_ok=1
     compose stop -t 30 live-executor >/dev/null 2>&1 || true
+    if ! compose rm -f live-executor >/dev/null 2>&1; then
+      repause_ok=0
+      echo "DEPLOY_COMPENSATION_FAILED: stale live-executor container could not be removed"
+    elif [ -n "$(compose ps -a -q live-executor | awk 'NF { print; exit }')" ]; then
+      repause_ok=0
+      echo "DEPLOY_COMPENSATION_FAILED: stale live-executor container remains"
+    fi
     set +e
     disarm_output=$(compose run --rm --no-deps \
       -e PHOENIX_AUTONOMOUS_DISARM_ACK=DISARM_AUTONOMOUS_LIVE_42161 \
@@ -812,6 +819,10 @@ validate_live_rpc_rendering ||
 transition_mutable_protected "$rollback_release_env" "$release_env" ||
   fail "mutable protected services could not transition without loss"
 compose stop -t 30 live-executor >/dev/null 2>&1 || true
+compose rm -f live-executor >/dev/null ||
+  fail "stopped live-executor container could not be removed"
+[ -z "$(compose ps -a -q live-executor | awk 'NF { print; exit }')" ] ||
+  fail "live-executor container remained after removal"
 compose run --rm --no-deps autonomous-control migrate
 compose run --rm --no-deps migration-runner
 mark_phase MIGRATIONS_APPLIED
@@ -889,7 +900,7 @@ control_status=$(compose run --rm --no-deps autonomous-control status)
 printf '%s\n' "$control_status" |
   verify_runtime_control_phase DISARMED_DEPLOY ||
   fail "runtime controls are not fail-closed before evidence-start"
-[ -z "$(compose ps -q live-executor | awk 'NF { print; exit }')" ] ||
+[ -z "$(compose ps -a -q live-executor | awk 'NF { print; exit }')" ] ||
   fail "live-executor started before evidence-start"
 compose run --rm --no-deps \
   -e PHOENIX_RELEASE_SHA="$release_sha" \
@@ -899,7 +910,7 @@ evidence_status=$(compose run --rm --no-deps autonomous-control status)
 printf '%s\n' "$evidence_status" |
   verify_runtime_control_phase DISARMED_EVIDENCE ||
   fail "runtime did not enter fail-closed DISARMED_EVIDENCE"
-[ -z "$(compose ps -q live-executor | awk 'NF { print; exit }')" ] ||
+[ -z "$(compose ps -a -q live-executor | awk 'NF { print; exit }')" ] ||
   fail "live-executor started during evidence-start"
 mark_phase DISARMED_EVIDENCE_STARTED
 
