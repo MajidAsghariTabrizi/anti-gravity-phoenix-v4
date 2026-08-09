@@ -677,27 +677,27 @@ async fn approval_expiry_after_rpc_work_fails_before_signing() {
 }
 
 #[tokio::test]
-async fn near_contract_deadline_after_signing_fails_immediately_before_submit() {
+async fn short_non_aave_deadline_remains_eligible_immediately_before_submit() {
     let harness = harness(1);
     {
         let mut state = harness.store.state.lock().expect("state");
-        state.requests[0].approval_deadline = harness.now + ChronoDuration::seconds(55);
+        state.requests[0].approval_deadline = harness.now + ChronoDuration::seconds(59);
         state.requests[0].approval_digest = state.requests[0]
             .canonical_approval_digest()
             .expect("approval digest");
     }
     *harness.clock.lock().expect("clock") =
-        VecDeque::from([harness.now, harness.now + ChronoDuration::seconds(46)]);
+        VecDeque::from([harness.now, harness.now + ChronoDuration::seconds(58)]);
 
     let state = harness
         .executor
         .step(harness.now)
         .await
-        .expect("near contract deadline");
+        .expect("short non-Aave deadline");
 
-    assert_eq!(state, ExecutionState::ArmedIdle);
-    assert_eq!(harness.rpc.send_count(), 0);
-    assert_eq!(harness.store.next_nonce(), 7);
+    assert!(matches!(state, ExecutionState::Pending { .. }));
+    assert_eq!(harness.rpc.send_count(), 1);
+    assert_eq!(harness.store.next_nonce(), 8);
 }
 
 #[tokio::test]
