@@ -51,8 +51,8 @@ const ROUTER: &str = "0x68b3465833fb72a70ecdf485e0e4c7bd8665fc45";
 const RETAINED_PROFIT: u128 = 1_000_000_000_000;
 const GLOBAL_LOSS_LIMIT: u128 = 10_000_000_000_000_000;
 const ROUTE_LOSS_LIMIT: u128 = 10_000_000_000_000_000;
-const CANDIDATE_TTL_SECONDS: i64 = 30;
-const QUOTE_TTL_SECONDS: i64 = 20;
+const CANDIDATE_TTL_SECONDS: i64 = 3;
+const QUOTE_TTL_SECONDS: i64 = 2;
 const PREAPPROVAL_ZERO_DIGEST: &str =
     "0000000000000000000000000000000000000000000000000000000000000000";
 
@@ -622,10 +622,6 @@ impl Fixture {
             request.deadline
                 == at_whole_second(&bundle.event)? + ChronoDuration::seconds(CANDIDATE_TTL_SECONDS),
             "request deadline differs from candidate expiry",
-        )?;
-        require(
-            request.deadline > approval_time + ChronoDuration::seconds(15),
-            "request deadline does not preserve the signer inclusion margin",
         )?;
         require(
             request.approved_at == approval_time

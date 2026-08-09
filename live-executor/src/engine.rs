@@ -581,9 +581,60 @@ where
 }
 
 fn submission_deadlines_are_fresh(request: &ExecutionRequest, now: DateTime<Utc>) -> bool {
+    let inclusion_margin_seconds = if request.aave_liquidation.is_some() {
+        15
+    } else {
+        0
+    };
     request.approved_at <= now
         && request.approval_deadline > now
-        && request.deadline > now + ChronoDuration::seconds(15)
+        && execution_deadline_is_fresh(request.deadline, now, inclusion_margin_seconds)
+}
+
+fn execution_deadline_is_fresh(
+    deadline: DateTime<Utc>,
+    now: DateTime<Utc>,
+    inclusion_margin_seconds: i64,
+) -> bool {
+    deadline > now + ChronoDuration::seconds(inclusion_margin_seconds)
+}
+
+#[cfg(test)]
+mod deadline_tests {
+    use super::execution_deadline_is_fresh;
+    use chrono::{Duration as ChronoDuration, TimeZone, Utc};
+
+    #[test]
+    fn aave_deadline_requires_more_than_fifteen_seconds() {
+        let now = Utc
+            .with_ymd_and_hms(2026, 8, 9, 12, 0, 0)
+            .single()
+            .expect("time");
+        assert!(!execution_deadline_is_fresh(
+            now + ChronoDuration::seconds(15),
+            now,
+            15,
+        ));
+        assert!(execution_deadline_is_fresh(
+            now + ChronoDuration::seconds(16),
+            now,
+            15,
+        ));
+    }
+
+    #[test]
+    fn non_aave_deadline_only_needs_to_remain_future() {
+        let now = Utc
+            .with_ymd_and_hms(2026, 8, 9, 12, 0, 0)
+            .single()
+            .expect("time");
+        assert!(!execution_deadline_is_fresh(now, now, 0));
+        assert!(execution_deadline_is_fresh(
+            now + ChronoDuration::seconds(1),
+            now,
+            0,
+        ));
+    }
 }
 
 fn validate_and_encode(
