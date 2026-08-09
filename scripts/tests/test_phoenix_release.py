@@ -2516,7 +2516,7 @@ class WorkflowAndDeploymentContractTests(unittest.TestCase):
             health_rehearsal,
         )
         self.assertIn(
-            "PHOENIX_HEALTH_ALLOW_STOPPED_STANDBY=true",
+            'PHOENIX_HEALTH_ALLOW_STOPPED_STANDBY="$active_health_allow_stopped_standby"',
             health_rehearsal,
         )
         self.assertIn(
@@ -2531,12 +2531,49 @@ class WorkflowAndDeploymentContractTests(unittest.TestCase):
             '[ "$actual" = /usr/local/bin/atlas-observer ]',
             self.healthcheck,
         )
+        self.assertIn(
+            "active_health_mode=$active_runtime_mode", health_rehearsal
+        )
+        self.assertIn(
+            "active_health_allow_stopped_standby=false", health_rehearsal
+        )
         self.assertIn("SHADOW) ;;", health_rehearsal)
         self.assertIn(
-            "LIVE) active_health_mode=DISARMED_EVIDENCE",
+            "active_live_executor_id=$(active_compose ps --no-trunc -q "
+            "live-executor)",
             health_rehearsal,
         )
+        self.assertIn("active_live_executor_probe_failed", health_rehearsal)
+        self.assertIn(
+            '*[!0-9a-f]*) fail active_live_executor_identity_invalid',
+            health_rehearsal,
+        )
+        self.assertIn(
+            '[ "${#active_live_executor_id}" -eq 64 ]', health_rehearsal
+        )
+        self.assertIn("active_health_mode=DISARMED_EVIDENCE", health_rehearsal)
+        self.assertIn("active_health_allow_stopped_standby=true", health_rehearsal)
+        self.assertIn(
+            "active_live_executor_id_after=$(\n"
+            "    active_compose ps --no-trunc -q live-executor\n"
+            "  )",
+            health_rehearsal,
+        )
+        self.assertIn("active_live_executor_recheck_failed", health_rehearsal)
+        self.assertIn(
+            '[ "$active_live_executor_id_after" = "$active_live_executor_id" ]',
+            health_rehearsal,
+        )
+        self.assertIn("active_live_executor_identity_drift", health_rehearsal)
         self.assertIn("active_health_mode_invalid", health_rehearsal)
+        self.assertIn("END { if (found != 1) exit 1 }", health_rehearsal)
+        self.assertIn(
+            'operator_env_digest_after=$(sha256sum "$env_file"', health_rehearsal
+        )
+        self.assertIn(
+            '[ "$operator_env_digest_after" = "$operator_env_digest_before" ]',
+            health_rehearsal,
+        )
         self.assertIn(
             'image_volume = "/var/lib/postgresql/data"',
             self.rehearsal,

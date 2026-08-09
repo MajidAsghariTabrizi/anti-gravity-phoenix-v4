@@ -516,15 +516,43 @@ database_container=
 database_network=
 
 # Exercise the candidate health implementation against the immutable active
-# release topology. The active fail-closed runtime can be SHADOW after rollback
-# or LIVE with its executor stopped before candidate mutation begins.
-active_health_mode=$(awk -F= '
+# release topology. A LIVE release may have its executor running or stopped;
+# select the matching strict health contract from the observed topology.
+active_runtime_mode=$(awk -F= '
   $1 == "PHOENIX_MODE" { print $2; found += 1 }
   END { if (found != 1) exit 1 }
 ' "$candidate_active_env") || fail active_health_mode_invalid
-case "$active_health_mode" in
+active_health_mode=$active_runtime_mode
+active_health_allow_stopped_standby=false
+active_live_executor_id=
+active_compose() {
+  /usr/bin/timeout --signal=TERM --kill-after=2s 15s \
+    python3 "$compose_runner" \
+    --mode LIVE \
+    --env-file "$candidate_active_env" \
+    --release-env "$active_release_env" \
+    --compose-file "$compose_file" \
+    --overlay-file "$overlay_file" \
+    --project-directory "$deploy_dir" \
+    -- "$@"
+}
+case "$active_runtime_mode" in
   SHADOW) ;;
-  LIVE) active_health_mode=DISARMED_EVIDENCE ;;
+  LIVE)
+    active_live_executor_id=$(active_compose ps --no-trunc -q live-executor) ||
+      fail active_live_executor_probe_failed
+    case "$active_live_executor_id" in
+      "")
+        active_health_mode=DISARMED_EVIDENCE
+        active_health_allow_stopped_standby=true
+        ;;
+      *[!0-9a-f]*) fail active_live_executor_identity_invalid ;;
+      *)
+        [ "${#active_live_executor_id}" -eq 64 ] ||
+          fail active_live_executor_identity_invalid
+        ;;
+    esac
+    ;;
   *) fail active_health_mode_invalid ;;
 esac
 PHOENIX_DEPLOY_ROOT="$deploy_root" \
@@ -536,12 +564,19 @@ PHOENIX_COMPOSE_PROJECT_DIRECTORY="$deploy_dir" \
 PHOENIX_COMPOSE_RUNNER="$compose_runner" \
 PHOENIX_HEALTH_EXPECTED_MODE="$active_health_mode" \
 PHOENIX_HEALTH_ALLOW_LEGACY_ATLAS_BINARY=true \
-PHOENIX_HEALTH_ALLOW_STOPPED_STANDBY=true \
+PHOENIX_HEALTH_ALLOW_STOPPED_STANDBY="$active_health_allow_stopped_standby" \
 PHOENIX_HEALTH_RETRIES=1 \
 PHOENIX_HEALTH_SLEEP_SECONDS=0 \
 PHOENIX_HEALTH_COMMAND_TIMEOUT_SECONDS=15 \
   "$candidate_root/scripts/production-healthcheck.sh" ||
   fail candidate_health_contract_failed
+if [ "$active_runtime_mode" = LIVE ]; then
+  active_live_executor_id_after=$(
+    active_compose ps --no-trunc -q live-executor
+  ) || fail active_live_executor_recheck_failed
+  [ "$active_live_executor_id_after" = "$active_live_executor_id" ] ||
+    fail active_live_executor_identity_drift
+fi
 
 operator_env_digest_after=$(sha256sum "$env_file" | awk 'NR == 1 { print $1 }') ||
   fail operator_environment_digest_failed
