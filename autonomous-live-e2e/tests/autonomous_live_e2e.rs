@@ -51,28 +51,46 @@ const ROUTER: &str = "0x68b3465833fb72a70ecdf485e0e4c7bd8665fc45";
 const RETAINED_PROFIT: u128 = 1_000_000_000_000;
 const GLOBAL_LOSS_LIMIT: u128 = 10_000_000_000_000_000;
 const ROUTE_LOSS_LIMIT: u128 = 10_000_000_000_000_000;
-const CANDIDATE_TTL_SECONDS: i64 = 3;
-const QUOTE_TTL_SECONDS: i64 = 2;
+const CANDIDATE_TTL_SECONDS: i64 = 30;
+const QUOTE_TTL_SECONDS: i64 = 20;
 const PREAPPROVAL_ZERO_DIGEST: &str =
     "0000000000000000000000000000000000000000000000000000000000000000";
 
 type TestResult<T = ()> = Result<T, Box<dyn Error + Send + Sync>>;
+
+fn fixed_clock(at: DateTime<Utc>) -> impl Fn() -> DateTime<Utc> + Send + Sync + 'static {
+    move || at
+}
 
 static SERVICE_LOCK: Mutex<()> = Mutex::const_new(());
 static CONTROL_SNAPSHOT: OnceCell<ControlSnapshot> = OnceCell::const_new();
 static BASE_EPOCH: OnceLock<i64> = OnceLock::new();
 
 #[derive(Clone)]
-struct ReadyAnvilRpc(HttpExecutionRpc);
+struct ReadyAnvilRpc {
+    inner: HttpExecutionRpc,
+    pinned_block_number: u64,
+    pinned_block_hash: String,
+}
+
+impl ReadyAnvilRpc {
+    fn for_prepared(inner: HttpExecutionRpc, prepared: &Prepared) -> Self {
+        Self {
+            inner,
+            pinned_block_number: prepared.bundle.event.block_number,
+            pinned_block_hash: prepared.bundle.event.block_hash.clone(),
+        }
+    }
+}
 
 #[async_trait]
 impl ExecutionRpc for ReadyAnvilRpc {
     async fn chain_id(&self) -> Result<u64, RpcError> {
-        self.0.chain_id().await
+        self.inner.chain_id().await
     }
 
     async fn finalized_block_identity(&self) -> Result<(u64, String), RpcError> {
-        self.0.finalized_block_identity().await
+        Ok((self.pinned_block_number, self.pinned_block_hash.clone()))
     }
 
     async fn execution_contract_ready(
@@ -85,25 +103,25 @@ impl ExecutionRpc for ReadyAnvilRpc {
     }
 
     async fn pending_nonce(&self, wallet: CanonicalAddress) -> Result<u64, RpcError> {
-        self.0.pending_nonce(wallet).await
+        self.inner.pending_nonce(wallet).await
     }
 
     async fn send_raw_transaction(
         &self,
         raw_transaction: &[u8],
     ) -> Result<TransactionHash, RpcError> {
-        self.0.send_raw_transaction(raw_transaction).await
+        self.inner.send_raw_transaction(raw_transaction).await
     }
 
     async fn transaction_receipt(
         &self,
         tx_hash: TransactionHash,
     ) -> Result<Option<TransactionReceipt>, RpcError> {
-        self.0.transaction_receipt(tx_hash).await
+        self.inner.transaction_receipt(tx_hash).await
     }
 
     async fn transaction_known(&self, tx_hash: TransactionHash) -> Result<bool, RpcError> {
-        self.0.transaction_known(tx_hash).await
+        self.inner.transaction_known(tx_hash).await
     }
 }
 
@@ -111,6 +129,8 @@ impl ExecutionRpc for ReadyAnvilRpc {
 struct UnknownSubmissionRpc {
     inner: HttpExecutionRpc,
     send_count: Arc<AtomicUsize>,
+    pinned_block_number: u64,
+    pinned_block_hash: String,
 }
 
 #[async_trait]
@@ -120,7 +140,7 @@ impl ExecutionRpc for UnknownSubmissionRpc {
     }
 
     async fn finalized_block_identity(&self) -> Result<(u64, String), RpcError> {
-        self.inner.finalized_block_identity().await
+        Ok((self.pinned_block_number, self.pinned_block_hash.clone()))
     }
 
     async fn execution_contract_ready(
@@ -604,6 +624,10 @@ impl Fixture {
             "request deadline differs from candidate expiry",
         )?;
         require(
+            request.deadline > approval_time + ChronoDuration::seconds(15),
+            "request deadline does not preserve the signer inclusion margin",
+        )?;
+        require(
             request.approved_at == approval_time
                 && request.approval_deadline
                     == approval_time + ChronoDuration::seconds(QUOTE_TTL_SECONDS),
@@ -894,11 +918,12 @@ async fn scenario_05_signing_and_submission() -> TestResult {
         .pending_nonce(fixture.config.wallet_address)
         .await
         .map_err(boxed)?;
-    let executor = LiveExecutor::new(
+    let executor = LiveExecutor::new_with_clock(
         fixture.config.clone(),
         isolated_signer()?,
         PostgresExecutorStore::from_pool(fixture.pool.clone()),
-        ReadyAnvilRpc(fixture.rpc.clone()),
+        ReadyAnvilRpc::for_prepared(fixture.rpc.clone(), &prepared),
+        fixed_clock(prepared.approval_time),
     );
     fixture
         .diagnose("sign and submit exactly once", "request approved")
@@ -954,14 +979,17 @@ async fn scenario_06_ambiguous_unknown_submission() -> TestResult {
         .await
         .map_err(boxed)?;
     let send_count = Arc::new(AtomicUsize::new(0));
-    let executor = LiveExecutor::new(
+    let executor = LiveExecutor::new_with_clock(
         fixture.config.clone(),
         isolated_signer()?,
         PostgresExecutorStore::from_pool(fixture.pool.clone()),
         UnknownSubmissionRpc {
             inner: fixture.rpc.clone(),
             send_count: Arc::clone(&send_count),
+            pinned_block_number: prepared.bundle.event.block_number,
+            pinned_block_hash: prepared.bundle.event.block_hash.clone(),
         },
+        fixed_clock(prepared.approval_time),
     );
     fixture
         .diagnose(
@@ -1021,11 +1049,12 @@ async fn scenario_07_receipt_reconciliation() -> TestResult {
         return Ok(());
     };
     let prepared = fixture.approved(0).await?;
-    let executor = LiveExecutor::new(
+    let executor = LiveExecutor::new_with_clock(
         fixture.config.clone(),
         isolated_signer()?,
         PostgresExecutorStore::from_pool(fixture.pool.clone()),
-        ReadyAnvilRpc(fixture.rpc.clone()),
+        ReadyAnvilRpc::for_prepared(fixture.rpc.clone(), &prepared),
+        fixed_clock(prepared.approval_time),
     );
     let pending = executor.step(prepared.approval_time).await.map_err(boxed)?;
     require(
@@ -1066,11 +1095,12 @@ async fn scenario_08_outcome_v1_and_realized_pnl() -> TestResult {
         return Ok(());
     };
     let prepared = fixture.approved(0).await?;
-    let executor = LiveExecutor::new(
+    let executor = LiveExecutor::new_with_clock(
         fixture.config.clone(),
         isolated_signer()?,
         PostgresExecutorStore::from_pool(fixture.pool.clone()),
-        ReadyAnvilRpc(fixture.rpc.clone()),
+        ReadyAnvilRpc::for_prepared(fixture.rpc.clone(), &prepared),
+        fixed_clock(prepared.approval_time),
     );
     require(
         matches!(
@@ -1164,11 +1194,12 @@ async fn scenario_09_disarm_kill_switch_and_valid_rearm() -> TestResult {
     .bind(prepared.approval_time)
     .execute(&fixture.pool)
     .await?;
-    let executor = LiveExecutor::new(
+    let executor = LiveExecutor::new_with_clock(
         fixture.config.clone(),
         isolated_signer()?,
         PostgresExecutorStore::from_pool(fixture.pool.clone()),
-        ReadyAnvilRpc(fixture.rpc.clone()),
+        ReadyAnvilRpc::for_prepared(fixture.rpc.clone(), &prepared),
+        fixed_clock(prepared.approval_time),
     );
     fixture
         .diagnose("kill switch blocks claim", "global control disarmed")
@@ -1229,11 +1260,12 @@ async fn scenario_10_restart_and_nonce_recovery() -> TestResult {
         .pending_nonce(fixture.config.wallet_address)
         .await
         .map_err(boxed)?;
-    let executor = LiveExecutor::new(
+    let executor = LiveExecutor::new_with_clock(
         fixture.config.clone(),
         isolated_signer()?,
         PostgresExecutorStore::from_pool(fixture.pool.clone()),
-        ReadyAnvilRpc(fixture.rpc.clone()),
+        ReadyAnvilRpc::for_prepared(fixture.rpc.clone(), &prepared),
+        fixed_clock(prepared.approval_time),
     );
     require(
         matches!(
@@ -1243,11 +1275,12 @@ async fn scenario_10_restart_and_nonce_recovery() -> TestResult {
         "restart scenario did not submit",
     )?;
     drop(executor);
-    let restarted = LiveExecutor::new(
+    let restarted = LiveExecutor::new_with_clock(
         fixture.config.clone(),
         isolated_signer()?,
         PostgresExecutorStore::from_pool(fixture.pool.clone()),
-        ReadyAnvilRpc(fixture.rpc.clone()),
+        ReadyAnvilRpc::for_prepared(fixture.rpc.clone(), &prepared),
+        fixed_clock(prepared.approval_time),
     );
     fixture
         .diagnose(
@@ -1385,11 +1418,12 @@ async fn scenario_12_global_risk_feedback_at_threshold() -> TestResult {
     };
     let prepared = fixture.approved(0).await?;
     insert_synthetic_loss(&fixture.pool, &prepared, GLOBAL_LOSS_LIMIT, fixture.seed).await?;
-    let executor = LiveExecutor::new(
+    let executor = LiveExecutor::new_with_clock(
         fixture.config.clone(),
         isolated_signer()?,
         PostgresExecutorStore::from_pool(fixture.pool.clone()),
-        ReadyAnvilRpc(fixture.rpc.clone()),
+        ReadyAnvilRpc::for_prepared(fixture.rpc.clone(), &prepared),
+        fixed_clock(prepared.approval_time),
     );
     fixture
         .diagnose(
