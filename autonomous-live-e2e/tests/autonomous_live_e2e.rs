@@ -71,6 +71,10 @@ impl ExecutionRpc for ReadyAnvilRpc {
         self.0.chain_id().await
     }
 
+    async fn finalized_block_identity(&self) -> Result<(u64, String), RpcError> {
+        self.0.finalized_block_identity().await
+    }
+
     async fn execution_contract_ready(
         &self,
         _request: &ExecutionRequest,
@@ -113,6 +117,10 @@ struct UnknownSubmissionRpc {
 impl ExecutionRpc for UnknownSubmissionRpc {
     async fn chain_id(&self) -> Result<u64, RpcError> {
         self.inner.chain_id().await
+    }
+
+    async fn finalized_block_identity(&self) -> Result<(u64, String), RpcError> {
+        self.inner.finalized_block_identity().await
     }
 
     async fn execution_contract_ready(
