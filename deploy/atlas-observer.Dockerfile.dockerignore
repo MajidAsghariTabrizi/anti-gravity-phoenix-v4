@@ -1,5 +1,8 @@
 **
 !atlas-observer/
 !atlas-observer/**
+!fixtures/
+!fixtures/replay/
+!fixtures/replay/aave_profit_path_counterfactual_v1.json
 !deploy/
 !deploy/atlas-observer.Dockerfile

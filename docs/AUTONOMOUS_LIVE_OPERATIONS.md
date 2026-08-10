@@ -71,6 +71,27 @@ one-transaction test, signerless start, or executor-disabled start. The first
 transaction must come from a naturally occurring event that survives the
 committed LIVE policy.
 
+## Explicit MAX_REVIEWED revenue size authority
+
+`autonomous-live-control set-revenue-size-max-reviewed` is the only operator
+override for skipping outcome-based size promotion. It requires the exact
+acknowledgement
+`PHOENIX_SET_REVENUE_SIZE_ACK=SET_MAX_REVIEWED_LIVE_SIZE_42161` and accepts
+only the canonical reviewed maximum of `10000000000000000` wei. It is not an
+activation command: both Aave/Atlas revenue lanes and all generic execution
+controls must remain disarmed, the executor must be fully configured and
+paused, the global submission lock and all active/unresolved work must be
+empty, daily loss must remain below its unchanged limit, and the live Gateway
+and Aave/Atlas hunter must report fresh exact dual-provider readiness with a
+closed provider circuit.
+
+The command atomically changes only `economic_control.current_size_level`,
+`current_input_wei`, `control_epoch`, and the corresponding transition record.
+The phase deliberately remains `DISARMED_EVIDENCE`; it does not claim that the
+lanes are live. A later, separately acknowledged `arm-revenue-lanes` copies
+the exact economic size into both lane controls. Owner configuration, owner
+unpause, and executor start remain separate explicit operations.
+
 ## Rollback
 
 `rollback-release.sh` is the exact rollback entrypoint. It:
