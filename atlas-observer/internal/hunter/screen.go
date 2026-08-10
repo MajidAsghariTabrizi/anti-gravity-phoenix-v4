@@ -15,6 +15,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"reflect"
 	"regexp"
 	"sort"
 	"strings"
@@ -50,25 +51,36 @@ const (
 	providerCircuitSkippedTotalKey  = "provider_circuit_skipped_total"
 	providerCircuitCooldown         = 5 * time.Minute
 	gatewayBudgetCircuitCooldown    = 30 * time.Second
+	hotRevisitCadence               = 10 * time.Second
 	aaveSimulationBatchTimeout      = 55 * time.Second
 	exactBorrowerCooldown           = 2 * time.Minute
 	directForkEvidenceMode          = "DUAL_PROVIDER_FORK_VERIFIED"
+	counterfactualForkEvidenceMode  = "DUAL_PROVIDER_COUNTERFACTUAL_FORK_VERIFIED"
 	atlasCallbackEvidenceMode       = "DUAL_PROVIDER_ATLAS_CALLBACK_FORK_VERIFIED"
+	maximumReviewedInputWei         = "10000000000000000"
 	exactDeferredCooldownKey        = "exact_deferred_cooldown_total"
 	exactDeferredRouteIneligibleKey = "exact_deferred_route_ineligible_total"
 	exactRouteIneligibleObservedKey = "exact_route_ineligible_observed_total"
+	hotRecheckTotalKey              = "hot_recheck_total"
+	hotRecheckDeferredBudgetKey     = "hot_recheck_deferred_budget_total"
+	exactEvalStartedKey             = "exact_eval_started_total"
+	exactEvalCompletedKey           = "exact_eval_completed_total"
+	exactEvalLatencySumKey          = "exact_eval_latency_millis_sum"
+	exactEvalLatencyCountKey        = "exact_eval_latency_millis_count"
+	liquidatableToExactSumKey       = "liquidatable_to_exact_millis_sum"
+	liquidatableToExactCountKey     = "liquidatable_to_exact_millis_count"
+	routeIneligibleRechecksKey      = "route_ineligible_rechecks_total"
 	aavePoolAddress                 = "0x794a61358d6845594f94dc1db02a252b5b4814ad"
 	wethAddress                     = "0x82af49447d8a07e3bd95bd0d56f35241523fbab1"
 	nativeUSDCAddress               = "0xaf88d065e77c8cc2239327c5edb3a432268e5831"
 	zeroAddress                     = "0x0000000000000000000000000000000000000000"
 	uniswapFactoryAddress           = "0x1f98431c8ad98523631ae4a59f267346ea31f984"
-	uniswapPool500Address           = "0xc6962004f452be9203591991d15f6b388e09e8d0"
-	uniswapPool3000Address          = "0xc473e2aee3441bf9240be85eb122abb059a3b57c"
 )
 
 var addressPattern = regexp.MustCompile(`^0x[0-9a-f]{40}$`)
 var releaseSHAPattern = regexp.MustCompile(`^[0-9a-f]{40}$`)
 var errorClassPattern = regexp.MustCompile(`^[a-z][a-z0-9_]{0,63}$`)
+var errPriorityWindowStopped = errors.New("priority recheck window stopped")
 
 type Config struct {
 	DiscoveryPath          string
@@ -97,6 +109,14 @@ type SignalSink interface {
 	RecordAaveSignal(context.Context, signal) error
 }
 
+// LiveSizeAuthority is implemented by the durable Production sink. It keeps
+// shadow evaluation bounded by the reviewed ladder while ensuring that live
+// Candidate authority comes from the current economic/revenue-lane controls,
+// not merely from the executor-wide reviewed ceiling.
+type LiveSizeAuthority interface {
+	CurrentAaveLiveMaximumInputAmount(context.Context) (string, error)
+}
+
 type State struct {
 	Schema                             string            `json:"schema"`
 	DiscoverySHA256                    string            `json:"discovery_sha256"`
@@ -121,24 +141,28 @@ type State struct {
 	ProviderCircuitOpenTotal           uint64            `json:"provider_circuit_open_total"`
 	ProviderCircuitSkippedTotal        uint64            `json:"provider_circuit_skipped_total"`
 	ProviderCircuitOpenUntilUnixMillis int64             `json:"provider_circuit_open_until_unix_millis"`
+	HotQueueSize                       uint64            `json:"hot_queue_size"`
+	LiquidatableHotCount               uint64            `json:"liquidatable_hot_count"`
+	UrgentHotCount                     uint64            `json:"urgent_hot_count"`
 }
 
 type Screener struct {
-	config        Config
-	client        *http.Client
-	batchClient   *http.Client
-	operationMu   sync.Mutex
-	mu            sync.Mutex
-	state         State
-	debtBearing   map[string]bool
-	refreshKnown  map[string]bool
-	refreshOrder  []string
-	refreshCursor int
-	hotBorrowers  map[string]string
-	hotDebtBase   map[string]string
-	lastExactAt   map[string]time.Time
-	wait          func(context.Context, time.Duration) bool
-	now           func() time.Time
+	config              Config
+	client              *http.Client
+	batchClient         *http.Client
+	operationMu         sync.Mutex
+	mu                  sync.Mutex
+	state               State
+	debtBearing         map[string]bool
+	refreshKnown        map[string]bool
+	refreshOrder        []string
+	refreshCursor       int
+	hotBorrowers        map[string]string
+	hotDebtBase         map[string]string
+	lastExactAt         map[string]time.Time
+	firstLiquidatableAt map[string]time.Time
+	wait                func(context.Context, time.Duration) bool
+	now                 func() time.Time
 }
 
 type gatewayErrorContract struct {
@@ -226,17 +250,27 @@ type borrowerActivity struct {
 }
 
 type exactLiquidation struct {
-	DebtAsset                string `json:"debt_asset"`
-	CollateralAsset          string `json:"collateral_asset"`
-	RequestedRepayAmount     string `json:"requested_repay_amount"`
-	ActualRepayAmount        string `json:"actual_repay_amount"`
-	RepayAmount              string `json:"repay_amount"`
-	FlashPremiumAmount       string `json:"flash_premium_amount"`
-	SeizedCollateral         string `json:"seized_collateral"`
-	ProtocolFeeCollateral    string `json:"protocol_fee_collateral"`
-	LiquidatorCollateral     string `json:"liquidator_collateral"`
-	UniswapFee500OutputWETH  string `json:"uniswap_v3_fee_500_output_weth"`
-	UniswapFee3000OutputWETH string `json:"uniswap_v3_fee_3000_output_weth"`
+	DebtAsset              string             `json:"debt_asset"`
+	CollateralAsset        string             `json:"collateral_asset"`
+	RequestedRepayAmount   string             `json:"requested_repay_amount"`
+	ActualRepayAmount      string             `json:"actual_repay_amount"`
+	RepayAmount            string             `json:"repay_amount"`
+	FlashPremiumAmount     string             `json:"flash_premium_amount"`
+	SeizedCollateral       string             `json:"seized_collateral"`
+	ProtocolFeeCollateral  string             `json:"protocol_fee_collateral"`
+	LiquidatorCollateral   string             `json:"liquidator_collateral"`
+	OracleUnwindOutputWETH string             `json:"oracle_unwind_output_weth"`
+	UnwindQuotes           []exactUnwindQuote `json:"unwind_quotes"`
+}
+
+type exactUnwindQuote struct {
+	Pool       string `json:"pool"`
+	Factory    string `json:"factory"`
+	Token0     string `json:"token0"`
+	Token1     string `json:"token1"`
+	Fee        uint32 `json:"fee"`
+	ZeroForOne bool   `json:"zero_for_one"`
+	OutputWETH string `json:"output_weth"`
 }
 
 type exactReserve struct {
@@ -305,8 +339,30 @@ type signal struct {
 	SelectedRoute               string              `json:"selected_route,omitempty"`
 	TerminalOutcome             string              `json:"terminal_outcome"`
 	AuthorityRejectionReason    string              `json:"authority_rejection_reason,omitempty"`
+	SizeDiagnostics             []sizeDiagnostic    `json:"reviewed_size_diagnostics,omitempty"`
 	ExecutionCandidate          *executionCandidate `json:"-"`
 	AtlasCandidate              *atlasCandidate     `json:"-"`
+}
+
+type sizeDiagnostic struct {
+	ReviewedSize             string `json:"reviewed_size"`
+	Route                    string `json:"route"`
+	GrossLiquidationEdgeWei  string `json:"gross_liquidation_edge_wei"`
+	FlashPremiumWei          string `json:"flash_premium_wei"`
+	DEXUnwindLossWei         string `json:"dex_unwind_loss_wei"`
+	PriceImpactBPS           string `json:"price_impact_bps"`
+	GasLimit                 uint64 `json:"gas_limit"`
+	GasPriceWei              string `json:"gas_price_wei"`
+	L1CostWei                string `json:"l1_cost_wei"`
+	ExecutionCostWei         string `json:"execution_cost_wei"`
+	AtlasExposureWei         string `json:"atlas_exposure_wei"`
+	AtlasBidWei              string `json:"atlas_bid_wei"`
+	RiskReserveWei           string `json:"risk_reserve_wei"`
+	ExpectedNetPnLWei        string `json:"expected_net_pnl_wei"`
+	ConservativeNetPnLWei    string `json:"conservative_net_pnl_wei"`
+	MarginToRetainedFloorWei string `json:"margin_to_retained_profit_gate_wei"`
+	LiveAuthorized           bool   `json:"live_authorized"`
+	FinalRejectionReason     string `json:"final_rejection_reason,omitempty"`
 }
 
 type atlasPreparedOperation struct {
@@ -353,6 +409,8 @@ type simulationRequest struct {
 	CollateralAsset           string `json:"collateral_asset"`
 	RepayAmount               string `json:"repay_amount"`
 	MaximumInputAmount        string `json:"maximum_input_amount"`
+	LiveMaximumInputAmount    string `json:"live_maximum_input_amount"`
+	Counterfactual            bool   `json:"counterfactual"`
 	MinimumCollateralReceived string `json:"minimum_collateral_received"`
 	MinimumUnwindOutput       string `json:"minimum_unwind_output"`
 	MinimumProfit             string `json:"minimum_profit"`
@@ -457,6 +515,7 @@ type liquidationEvaluation struct {
 	MinimumCollateral string
 	MinimumUnwind     string
 	MinimumProfit     string
+	LiveMaximumInput  string
 }
 
 type liquidationProbe struct {
@@ -586,9 +645,10 @@ func New(config Config) (*Screener, error) {
 		batchClient: &http.Client{Timeout: aaveSimulationBatchTimeout}, state: state,
 		debtBearing: make(map[string]bool), refreshKnown: make(map[string]bool),
 		hotBorrowers: make(map[string]string), hotDebtBase: make(map[string]string),
-		lastExactAt: make(map[string]time.Time),
-		wait:        waitContext,
-		now:         func() time.Time { return time.Now().UTC() },
+		lastExactAt:         make(map[string]time.Time),
+		firstLiquidatableAt: make(map[string]time.Time),
+		wait:                waitContext,
+		now:                 func() time.Time { return time.Now().UTC() },
 	}
 	if err := s.loadState(); err != nil {
 		return nil, err
@@ -622,7 +682,6 @@ func (s *Screener) Run(ctx context.Context) error {
 	seedComplete := false
 	var pendingBatch []string
 	pendingAdvanceSeed := false
-runLoop:
 	for {
 		if wait := s.ProviderCircuitWaitDuration(); wait > 0 {
 			if err := s.recordProviderCircuitSkip(); err != nil {
@@ -676,8 +735,10 @@ runLoop:
 			pendingBatch = nil
 			pendingAdvanceSeed = false
 		}
-		tailBorrowers, err := s.pollTail(ctx)
-		if err != nil {
+		if err := s.runPriorityRecheckWindow(ctx, s.config.Pace); err != nil {
+			if errors.Is(err, errPriorityWindowStopped) {
+				return nil
+			}
 			if ctx.Err() != nil {
 				return nil
 			}
@@ -686,41 +747,103 @@ runLoop:
 				return recordErr
 			}
 			if !retryable {
-				s.recordError(gatewayErrorClass(err, "rpc_gateway_tail_failure"))
+				s.recordError(gatewayErrorClass(err, "rpc_gateway_priority_failure"))
 				return err
 			}
 			continue
 		}
+	}
+}
+
+func (s *Screener) runPriorityRecheckWindow(ctx context.Context, window time.Duration) error {
+	if window <= 0 {
+		return nil
+	}
+	if _, err := s.runTailPriority(ctx); err != nil {
+		return err
+	}
+	elapsed := time.Duration(0)
+	hotNext := true
+	for elapsed+hotRevisitCadence < window {
+		if !s.waitDuration(ctx, hotRevisitCadence) {
+			return errPriorityWindowStopped
+		}
+		elapsed += hotRevisitCadence
+		var err error
+		if hotNext {
+			_, err = s.runHotPriority(ctx)
+		} else {
+			_, err = s.runTailPriority(ctx)
+		}
+		if err != nil {
+			return err
+		}
+		hotNext = !hotNext
+	}
+	if remaining := window - elapsed; remaining > 0 && !s.waitDuration(ctx, remaining) {
+		return errPriorityWindowStopped
+	}
+	return nil
+}
+
+func (s *Screener) runTailPriority(ctx context.Context) (bool, error) {
+	tailBorrowers, err := s.pollTail(ctx)
+	if err != nil {
+		return false, err
+	}
+	if len(tailBorrowers) > 0 {
 		for offset := 0; offset < len(tailBorrowers); offset += MaximumBatch {
 			end := offset + MaximumBatch
 			if end > len(tailBorrowers) {
 				end = len(tailBorrowers)
 			}
 			if err := s.screen(ctx, tailBorrowers[offset:end], false, nil); err != nil {
-				if ctx.Err() != nil {
-					return nil
-				}
-				retryable, recordErr := s.RecordRetryableGatewayError(err)
-				if recordErr != nil {
-					return recordErr
-				}
-				if !retryable {
-					s.recordError(gatewayErrorClass(err, "rpc_gateway_tail_screen_failure"))
-					return err
-				}
-				continue runLoop
+				return false, err
 			}
 		}
-		if !s.waitDuration(ctx, s.config.Pace) {
-			return nil
-		}
+		return true, nil
 	}
+	return false, nil
+}
+
+func (s *Screener) runHotPriority(ctx context.Context) (bool, error) {
+	hot := s.nextHotBatch()
+	if len(hot) == 0 {
+		return false, nil
+	}
+	s.mu.Lock()
+	if s.state.Counts == nil {
+		s.state.Counts = make(map[string]uint64)
+	}
+	s.state.Counts[hotRecheckTotalKey]++
+	s.mu.Unlock()
+	if err := s.screen(ctx, hot, false, nil); err != nil {
+		class := gatewayErrorClass(err, "")
+		if strings.Contains(class, "budget") || strings.Contains(class, "rate_limited") {
+			s.mu.Lock()
+			s.state.Counts[hotRecheckDeferredBudgetKey]++
+			s.mu.Unlock()
+		}
+		return false, err
+	}
+	return true, nil
 }
 
 func (s *Screener) Snapshot() State {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	copy := s.state
+	copy.HotQueueSize = uint64(len(s.hotBorrowers))
+	copy.LiquidatableHotCount = 0
+	copy.UrgentHotCount = 0
+	for borrower, hf := range s.hotBorrowers {
+		switch classify(s.hotDebtBase[borrower], hf) {
+		case "liquidatable":
+			copy.LiquidatableHotCount++
+		case "urgent":
+			copy.UrgentHotCount++
+		}
+	}
 	copy.Counts = make(map[string]uint64, len(s.state.Counts))
 	for key, value := range s.state.Counts {
 		copy.Counts[key] = value
@@ -730,6 +853,68 @@ func (s *Screener) Snapshot() State {
 		copy.RouteIneligible[borrower] = reason
 	}
 	return copy
+}
+
+var exactLatencyBucketsMillis = [...]uint64{1_000, 5_000, 15_000, 30_000, 60_000, 120_000, 300_000}
+
+func (s *Screener) observeDurationLocked(sumKey, countKey, bucketPrefix string, duration time.Duration) {
+	if s.state.Counts == nil {
+		s.state.Counts = make(map[string]uint64)
+	}
+	millis := uint64(0)
+	if duration > 0 {
+		millis = uint64(duration / time.Millisecond)
+	}
+	s.state.Counts[sumKey] += millis
+	s.state.Counts[countKey]++
+	for _, boundary := range exactLatencyBucketsMillis {
+		if millis <= boundary {
+			s.state.Counts[fmt.Sprintf("%s%d", bucketPrefix, boundary)]++
+		}
+	}
+}
+
+func (s *Screener) MetricsText() string {
+	state := s.Snapshot()
+	lines := []string{
+		"# TYPE phoenix_aave_hot_queue_size gauge",
+		fmt.Sprintf("phoenix_aave_hot_queue_size %d", state.HotQueueSize),
+		"# TYPE phoenix_aave_liquidatable_hot_count gauge",
+		fmt.Sprintf("phoenix_aave_liquidatable_hot_count %d", state.LiquidatableHotCount),
+		"# TYPE phoenix_aave_urgent_hot_count gauge",
+		fmt.Sprintf("phoenix_aave_urgent_hot_count %d", state.UrgentHotCount),
+		"# TYPE phoenix_aave_hot_recheck_total counter",
+		fmt.Sprintf("phoenix_aave_hot_recheck_total %d", state.Counts[hotRecheckTotalKey]),
+		"# TYPE phoenix_aave_hot_recheck_deferred_budget_total counter",
+		fmt.Sprintf("phoenix_aave_hot_recheck_deferred_budget_total %d", state.Counts[hotRecheckDeferredBudgetKey]),
+		"# TYPE phoenix_aave_exact_eval_started_total counter",
+		fmt.Sprintf("phoenix_aave_exact_eval_started_total %d", state.Counts[exactEvalStartedKey]),
+		"# TYPE phoenix_aave_exact_eval_completed_total counter",
+		fmt.Sprintf("phoenix_aave_exact_eval_completed_total %d", state.Counts[exactEvalCompletedKey]),
+		"# TYPE phoenix_aave_route_ineligible_rechecks_total counter",
+		fmt.Sprintf("phoenix_aave_route_ineligible_rechecks_total %d", state.Counts[routeIneligibleRechecksKey]),
+		"# TYPE phoenix_aave_provider_circuit_deferrals_total counter",
+		fmt.Sprintf("phoenix_aave_provider_circuit_deferrals_total %d", state.ProviderCircuitSkippedTotal),
+	}
+	appendHistogram := func(name, sumKey, countKey, bucketPrefix string) {
+		lines = append(lines, fmt.Sprintf("# TYPE %s histogram", name))
+		for _, boundary := range exactLatencyBucketsMillis {
+			lines = append(lines, fmt.Sprintf(
+				"%s_bucket{le=\"%d\"} %d",
+				name,
+				boundary,
+				state.Counts[fmt.Sprintf("%s%d", bucketPrefix, boundary)],
+			))
+		}
+		lines = append(lines,
+			fmt.Sprintf("%s_bucket{le=\"+Inf\"} %d", name, state.Counts[countKey]),
+			fmt.Sprintf("%s_sum %d", name, state.Counts[sumKey]),
+			fmt.Sprintf("%s_count %d", name, state.Counts[countKey]),
+		)
+	}
+	appendHistogram("phoenix_aave_exact_eval_latency_ms", exactEvalLatencySumKey, exactEvalLatencyCountKey, "exact_eval_latency_millis_bucket_le_")
+	appendHistogram("phoenix_aave_first_liquidatable_to_exact_eval_ms", liquidatableToExactSumKey, liquidatableToExactCountKey, "liquidatable_to_exact_millis_bucket_le_")
+	return strings.Join(lines, "\n") + "\n"
 }
 
 func waitContext(ctx context.Context, delay time.Duration) bool {
@@ -1221,10 +1406,18 @@ func (s *Screener) screen(ctx context.Context, borrowers []string, advanceSeed b
 		if bucket == "liquidatable" || bucket == "urgent" || bucket == "watch" {
 			s.hotBorrowers[primary.Borrower] = primary.HealthFactorWAD
 			s.hotDebtBase[primary.Borrower] = primary.TotalDebtBase
+			if bucket == "liquidatable" {
+				if _, present := s.firstLiquidatableAt[primary.Borrower]; !present {
+					s.firstLiquidatableAt[primary.Borrower] = s.nowUTC()
+				}
+			} else {
+				delete(s.firstLiquidatableAt, primary.Borrower)
+			}
 		} else {
 			delete(s.hotBorrowers, primary.Borrower)
 			delete(s.hotDebtBase, primary.Borrower)
 			delete(s.lastExactAt, primary.Borrower)
+			delete(s.firstLiquidatableAt, primary.Borrower)
 			delete(s.state.RouteIneligible, primary.Borrower)
 		}
 		if err := s.updateBorrowerActivityLocked(primary.Borrower, primary.TotalDebtBase != "0"); err != nil {
@@ -1273,12 +1466,32 @@ func (s *Screener) screen(ctx context.Context, borrowers []string, advanceSeed b
 				// normal exact cooldown instead of deferring them forever.
 				if knownRouteIneligible {
 					delete(s.state.RouteIneligible, primary.Borrower)
+					s.state.Counts[routeIneligibleRechecksKey]++
 				}
+				exactStartedAt := s.nowUTC()
+				s.state.Counts[exactEvalStartedKey]++
 				s.mu.Unlock()
 				exactRecord, exactErr := s.resolveExact(ctx, record, auction)
 				s.mu.Lock()
 				if exactErr != nil {
 					return exactErr
+				}
+				exactCompletedAt := s.nowUTC()
+				s.state.Counts[exactEvalCompletedKey]++
+				s.observeDurationLocked(
+					exactEvalLatencySumKey,
+					exactEvalLatencyCountKey,
+					"exact_eval_latency_millis_bucket_le_",
+					exactCompletedAt.Sub(exactStartedAt),
+				)
+				if firstObserved, present := s.firstLiquidatableAt[primary.Borrower]; present {
+					s.observeDurationLocked(
+						liquidatableToExactSumKey,
+						liquidatableToExactCountKey,
+						"liquidatable_to_exact_millis_bucket_le_",
+						exactCompletedAt.Sub(firstObserved),
+					)
+					delete(s.firstLiquidatableAt, primary.Borrower)
 				}
 				record = exactRecord
 				s.lastExactAt[primary.Borrower] = now
@@ -1401,13 +1614,17 @@ func exactRouteIneligibleReason(reserves []exactReserve) string {
 }
 
 func (s *Screener) resolveExact(ctx context.Context, record signal, auction *observer.LedgerRecord) (signal, error) {
+	liveMaximumInput, err := s.currentAaveLiveMaximumInputAmount(ctx)
+	if err != nil {
+		return record, err
+	}
 	requestID := fmt.Sprintf("aave-exact-%d-%d", record.Cursor, time.Now().UnixMilli())
 	body, _ := json.Marshal(exactRequest{
-		SchemaVersion:      "phoenix.rpc.aave-exact-request.v2",
+		SchemaVersion:      "phoenix.rpc.aave-exact-request.v3",
 		ChainID:            42161,
 		RequestID:          requestID,
 		Borrower:           record.Borrower,
-		MaximumInputAmount: s.config.MaximumInputAmountWei,
+		MaximumInputAmount: maximumReviewedInputWei,
 	})
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, s.config.GatewayURL+"/v1/aave/exact", bytes.NewReader(body))
 	if err != nil {
@@ -1426,7 +1643,7 @@ func (s *Screener) resolveExact(ctx context.Context, record signal, auction *obs
 	if err := json.NewDecoder(io.LimitReader(response.Body, maximumResponse)).Decode(&result); err != nil {
 		return record, err
 	}
-	if result.SchemaVersion != "phoenix.rpc.aave-exact-response.v2" || result.ChainID != 42161 || result.RequestID != requestID || result.BlockNumber == 0 || result.BlockHash == "" || result.StateRoot == "" || result.Primary.ProviderID == result.Secondary.ProviderID || !equalExactProviders(result.Primary, result.Secondary) {
+	if result.SchemaVersion != "phoenix.rpc.aave-exact-response.v3" || result.ChainID != 42161 || result.RequestID != requestID || result.BlockNumber == 0 || result.BlockHash == "" || result.StateRoot == "" || result.Primary.ProviderID == result.Secondary.ProviderID || !equalExactProviders(result.Primary, result.Secondary) {
 		return record, errors.New("exact Aave provider evidence is incomplete")
 	}
 	record.Block = result.BlockNumber
@@ -1440,12 +1657,14 @@ func (s *Screener) resolveExact(ctx context.Context, record signal, auction *obs
 	if err := s.validateLiquidationVariants(result.Primary.Liquidations, result.Primary.FlashPremiumBPS); err != nil {
 		return record, err
 	}
-	selected, hadSimulationFailure := s.evaluateLiquidationBatch(
+	selected, hadSimulationFailure, diagnostics := s.evaluateLiquidationBatch(
 		ctx,
 		record,
 		result.Primary.Liquidations,
 		result.Primary.FlashPremiumBPS,
+		liveMaximumInput,
 	)
+	record.SizeDiagnostics = diagnostics
 	if selected == nil {
 		if hadSimulationFailure {
 			record.TerminalOutcome = "fork_pending"
@@ -1464,6 +1683,29 @@ func (s *Screener) resolveExact(ctx context.Context, record signal, auction *obs
 	record.ExecutionCostWei = selected.ExecutionCost.String()
 	record.EstimatedL1CostWei = selected.EstimatedL1Cost.String()
 	record.FlashPremiumWei = selected.Liquidation.FlashPremiumAmount
+	selectedRepay, selectedRepayOK := newBigUint(selected.Liquidation.RepayAmount)
+	liveMaximum, liveMaximumOK := newBigUint(liveMaximumInput)
+	if !selectedRepayOK || !liveMaximumOK {
+		return record, errors.New("selected liquidation size authority is invalid")
+	}
+	if selectedRepay.Cmp(liveMaximum) > 0 {
+		if selected.Simulation.EvidenceMode != counterfactualForkEvidenceMode {
+			return record, errors.New("counterfactual size lacks counterfactual fork evidence")
+		}
+		record.Authority = false
+		record.TerminalOutcome = "counterfactual_positive"
+		record.AuthorityRejectionReason = "live_size_authorization_required"
+		setDiagnosticRejection(
+			record.SizeDiagnostics,
+			selected.Liquidation,
+			selected.Route,
+			record.AuthorityRejectionReason,
+		)
+		return record, nil
+	}
+	if selected.Simulation.EvidenceMode != directForkEvidenceMode {
+		return record, errors.New("live-authorized size lacks direct fork evidence")
+	}
 	if auction != nil {
 		atlas, atlasErr := s.buildAtlasCandidate(ctx, record, selected, auction)
 		if atlasErr != nil {
@@ -1488,14 +1730,35 @@ func (s *Screener) resolveExact(ctx context.Context, record signal, auction *obs
 	return record, nil
 }
 
+func (s *Screener) currentAaveLiveMaximumInputAmount(ctx context.Context) (string, error) {
+	configured, configuredOK := newBigUint(s.config.MaximumInputAmountWei)
+	reviewed, reviewedOK := newBigUint(maximumReviewedInputWei)
+	if !configuredOK || !reviewedOK || configured.Sign() <= 0 || configured.Cmp(reviewed) > 0 {
+		return "", errors.New("configured Aave live size ceiling is invalid")
+	}
+	value := s.config.MaximumInputAmountWei
+	if authority, ok := s.config.SignalSink.(LiveSizeAuthority); ok {
+		current, err := authority.CurrentAaveLiveMaximumInputAmount(ctx)
+		if err != nil {
+			return "", err
+		}
+		value = current
+	}
+	parsed, parsedOK := newBigUint(value)
+	if !parsedOK || parsed.Sign() <= 0 || parsed.Cmp(configured) > 0 || parsed.Cmp(reviewed) > 0 {
+		return "", errors.New("current Aave live size authority is invalid")
+	}
+	return parsed.String(), nil
+}
+
 func (s *Screener) fetchExactSnapshot(ctx context.Context, borrower string) (exactResponse, error) {
 	requestID := fmt.Sprintf("aave-exact-refresh-%d", time.Now().UnixNano())
 	body, _ := json.Marshal(exactRequest{
-		SchemaVersion:      "phoenix.rpc.aave-exact-request.v2",
+		SchemaVersion:      "phoenix.rpc.aave-exact-request.v3",
 		ChainID:            42161,
 		RequestID:          requestID,
 		Borrower:           borrower,
-		MaximumInputAmount: s.config.MaximumInputAmountWei,
+		MaximumInputAmount: maximumReviewedInputWei,
 	})
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, s.config.GatewayURL+"/v1/aave/exact", bytes.NewReader(body))
 	if err != nil {
@@ -1514,15 +1777,15 @@ func (s *Screener) fetchExactSnapshot(ctx context.Context, borrower string) (exa
 	if err := json.NewDecoder(io.LimitReader(response.Body, maximumResponse)).Decode(&result); err != nil {
 		return exactResponse{}, err
 	}
-	if result.SchemaVersion != "phoenix.rpc.aave-exact-response.v2" || result.ChainID != 42161 || result.RequestID != requestID || result.BlockNumber == 0 || result.BlockHash == "" || result.StateRoot == "" || result.Primary.ProviderID == result.Secondary.ProviderID || !equalExactProviders(result.Primary, result.Secondary) {
+	if result.SchemaVersion != "phoenix.rpc.aave-exact-response.v3" || result.ChainID != 42161 || result.RequestID != requestID || result.BlockNumber == 0 || result.BlockHash == "" || result.StateRoot == "" || result.Primary.ProviderID == result.Secondary.ProviderID || !equalExactProviders(result.Primary, result.Secondary) {
 		return exactResponse{}, errors.New("fresh exact Aave provider evidence is incomplete")
 	}
 	return result, nil
 }
 
 func (s *Screener) validateLiquidationVariants(liquidations []exactLiquidation, flashPremiumBPS uint64) error {
-	maximumInput, maximumOK := newBigUint(s.config.MaximumInputAmountWei)
-	if !maximumOK || maximumInput.Sign() <= 0 || flashPremiumBPS == 0 || flashPremiumBPS > s.config.FlashPremiumBPS || len(liquidations) == 0 || len(liquidations) > 8 {
+	maximumInput, maximumOK := newBigUint(maximumReviewedInputWei)
+	if !maximumOK || maximumInput.Sign() <= 0 || flashPremiumBPS == 0 || flashPremiumBPS > s.config.FlashPremiumBPS || len(liquidations) == 0 || len(liquidations) > 14 {
 		return errors.New("exact liquidation bounds are invalid")
 	}
 	previousByCollateral := make(map[string]*big.Int)
@@ -1538,7 +1801,7 @@ func (s *Screener) validateLiquidationVariants(liquidations []exactLiquidation, 
 			return errors.New("exact liquidation variant is invalid")
 		}
 		countByCollateral[collateral]++
-		if countByCollateral[collateral] > 4 {
+		if countByCollateral[collateral] > 7 {
 			return errors.New("exact liquidation grid exceeds its collateral bound")
 		}
 		if previous := previousByCollateral[collateral]; previous != nil && actual.Cmp(previous) <= 0 {
@@ -1553,52 +1816,66 @@ func (s *Screener) validateLiquidationVariants(liquidations []exactLiquidation, 
 	return nil
 }
 
-func (s *Screener) evaluateLiquidationBatch(ctx context.Context, record signal, liquidations []exactLiquidation, originalFlashPremiumBPS uint64) (*liquidationEvaluation, bool) {
+func (s *Screener) evaluateLiquidationBatch(ctx context.Context, record signal, liquidations []exactLiquidation, originalFlashPremiumBPS uint64, liveMaximumInput string) (*liquidationEvaluation, bool, []sizeDiagnostic) {
 	deadline := uint64(s.nowUTC().Add(60 * time.Second).Unix())
 	probes := make([]*liquidationProbe, 0, len(liquidations))
 	requests := make([]simulationRequest, 0, len(liquidations))
+	diagnostics := make([]sizeDiagnostic, 0, len(liquidations))
+	diagnosticIndex := make(map[string]int)
+	floor, _ := newBigUint(s.config.RetainedProfitFloorWei)
 	hadSimulationFailure := false
 	for index := range liquidations {
-		probe, err := s.prepareLiquidationProbe(&liquidations[index])
+		prepared, err := s.prepareLiquidationProbes(&liquidations[index])
 		if err != nil {
 			hadSimulationFailure = true
 			continue
 		}
-		if probe == nil {
-			continue
+		for _, probe := range prepared {
+			diagnostic := newSizeDiagnostic(probe, liveMaximumInput)
+			diagnosticIndex[liquidationDiagnosticKey(probe.Liquidation, probe.Route)] = len(diagnostics)
+			diagnostics = append(diagnostics, diagnostic)
+			if probe.ExactEdge.Cmp(floor) <= 0 {
+				diagnostics[len(diagnostics)-1].FinalRejectionReason = "gross_edge_below_retained_profit_gate"
+				continue
+			}
+			probes = append(probes, probe)
+			requests = append(requests, s.newSimulationRequest(record, probe.Liquidation, simulationRequest{
+				MinimumCollateralReceived: probe.MinimumCollateral,
+				MinimumUnwindOutput:       "1",
+				MinimumProfit:             s.config.RetainedProfitFloorWei,
+				ExpectedProfit:            probe.ExactEdge.String(),
+				SelectedPool:              probe.Route.SelectedPool,
+				SelectedFactory:           probe.Route.Factory,
+				SelectedFee:               probe.Route.SelectedFee,
+				ZeroForOne:                probe.Route.ZeroForOne,
+			}, deadline, liveMaximumInput))
 		}
-		probes = append(probes, probe)
-		requests = append(requests, s.newSimulationRequest(record, probe.Liquidation, simulationRequest{
-			MinimumCollateralReceived: probe.MinimumCollateral,
-			MinimumUnwindOutput:       "1",
-			MinimumProfit:             s.config.RetainedProfitFloorWei,
-			ExpectedProfit:            probe.ExactEdge.String(),
-			SelectedPool:              probe.Route.SelectedPool,
-			SelectedFactory:           probe.Route.Factory,
-			SelectedFee:               probe.Route.SelectedFee,
-			ZeroForOne:                probe.Route.ZeroForOne,
-		}, deadline))
 	}
 	if len(requests) == 0 {
-		return nil, hadSimulationFailure
+		return nil, hadSimulationFailure, diagnostics
 	}
 	outcomes, err := s.simulateExactBatch(ctx, record, requests)
 	if err != nil {
-		return nil, true
+		return nil, true, diagnostics
 	}
 	viable := make([]*liquidationEvaluation, 0, len(outcomes))
 	for index, outcome := range outcomes {
 		if outcome.Err != nil {
 			hadSimulationFailure = true
+			diagnostics[diagnosticIndex[liquidationDiagnosticKey(probes[index].Liquidation, probes[index].Route)]].FinalRejectionReason = "fork_simulation_failed"
 			continue
 		}
-		evaluation, evaluationErr := s.evaluateLiquidationProbe(probes[index], outcome.Response)
+		evaluation, evaluationErr := s.evaluateLiquidationProbe(probes[index], outcome.Response, liveMaximumInput)
 		if evaluationErr != nil {
 			hadSimulationFailure = true
+			diagnostics[diagnosticIndex[liquidationDiagnosticKey(probes[index].Liquidation, probes[index].Route)]].FinalRejectionReason = "fork_economics_invalid"
 			continue
 		}
 		if evaluation != nil {
+			updateSizeDiagnostic(&diagnostics[diagnosticIndex[liquidationDiagnosticKey(evaluation.Liquidation, evaluation.Route)]], evaluation, floor)
 			viable = append(viable, evaluation)
+		} else {
+			diagnostics[diagnosticIndex[liquidationDiagnosticKey(probes[index].Liquidation, probes[index].Route)]].FinalRejectionReason = "conservative_net_pnl_below_threshold"
 		}
 	}
 
@@ -1617,7 +1894,7 @@ func (s *Screener) evaluateLiquidationBatch(ctx context.Context, record signal, 
 				SelectedFactory:           evaluation.Route.Factory,
 				SelectedFee:               evaluation.Route.SelectedFee,
 				ZeroForOne:                evaluation.Route.ZeroForOne,
-			}, deadline))
+			}, deadline, liveMaximumInput))
 		}
 		outcomes, err = s.simulateExactBatch(ctx, record, requests)
 		if err != nil {
@@ -1628,37 +1905,43 @@ func (s *Screener) evaluateLiquidationBatch(ctx context.Context, record signal, 
 		for index, outcome := range outcomes {
 			if outcome.Err != nil {
 				hadSimulationFailure = true
+				setDiagnosticRejection(diagnostics, pending[index].Liquidation, pending[index].Route, "fork_simulation_failed")
 				continue
 			}
 			complete, retry, evaluationErr := s.advanceLiquidationMaterialization(pending[index], outcome.Response)
 			if evaluationErr != nil {
 				hadSimulationFailure = true
+				setDiagnosticRejection(diagnostics, pending[index].Liquidation, pending[index].Route, "fork_economics_invalid")
 				continue
 			}
 			if complete != nil {
+				updateSizeDiagnostic(&diagnostics[diagnosticIndex[liquidationDiagnosticKey(complete.Liquidation, complete.Route)]], complete, floor)
 				finalized = append(finalized, complete)
 			} else if retry != nil {
 				if attempt == 1 {
 					hadSimulationFailure = true
+					setDiagnosticRejection(diagnostics, retry.Liquidation, retry.Route, "bound_convergence_failed")
 				} else {
 					next = append(next, retry)
 				}
+			} else {
+				setDiagnosticRejection(diagnostics, pending[index].Liquidation, pending[index].Route, "conservative_net_pnl_below_threshold")
 			}
 		}
 		pending = next
 	}
 	if len(finalized) == 0 {
-		return nil, hadSimulationFailure
+		return nil, hadSimulationFailure, diagnostics
 	}
 	sort.SliceStable(finalized, func(left, right int) bool {
 		return betterLiquidationEvaluation(finalized[right], finalized[left])
 	})
 	freshExact, err := s.fetchExactSnapshot(ctx, record.Borrower)
 	if err != nil || freshExact.Primary.FlashPremiumBPS != originalFlashPremiumBPS || !equalLiquidations(freshExact.Primary.Liquidations, liquidations) {
-		return nil, true
+		return nil, true, diagnostics
 	}
 	if err := s.validateLiquidationVariants(freshExact.Primary.Liquidations, freshExact.Primary.FlashPremiumBPS); err != nil {
-		return nil, true
+		return nil, true, diagnostics
 	}
 	record.Block = freshExact.BlockNumber
 	record.BlockHash = freshExact.BlockHash
@@ -1675,57 +1958,163 @@ func (s *Screener) evaluateLiquidationBatch(ctx context.Context, record signal, 
 			SelectedFactory:           evaluation.Route.Factory,
 			SelectedFee:               evaluation.Route.SelectedFee,
 			ZeroForOne:                evaluation.Route.ZeroForOne,
-		}, deadline))
+		}, deadline, liveMaximumInput))
 	}
 	outcomes, err = s.simulateExactBatch(ctx, record, requests)
 	if err != nil {
-		return nil, true
+		return nil, true, diagnostics
 	}
 	var selected *liquidationEvaluation
 	for index, outcome := range outcomes {
 		if outcome.Err != nil {
 			hadSimulationFailure = true
+			setDiagnosticRejection(diagnostics, finalized[index].Liquidation, finalized[index].Route, "fork_simulation_failed")
 			continue
 		}
 		fresh, retry, evaluationErr := s.advanceLiquidationMaterialization(finalized[index], outcome.Response)
 		if retry != nil {
-			return nil, true
+			setDiagnosticRejection(diagnostics, retry.Liquidation, retry.Route, "bound_convergence_failed")
+			return nil, true, diagnostics
 		}
 		if evaluationErr != nil {
 			hadSimulationFailure = true
+			setDiagnosticRejection(diagnostics, finalized[index].Liquidation, finalized[index].Route, "fork_economics_invalid")
 			continue
 		}
-		if fresh != nil && betterLiquidationEvaluation(fresh, selected) {
-			selected = fresh
+		if fresh != nil {
+			updateSizeDiagnostic(&diagnostics[diagnosticIndex[liquidationDiagnosticKey(fresh.Liquidation, fresh.Route)]], fresh, floor)
+			if betterLiquidationEvaluation(fresh, selected) {
+				selected = fresh
+			}
+		} else {
+			setDiagnosticRejection(diagnostics, finalized[index].Liquidation, finalized[index].Route, "conservative_net_pnl_below_threshold")
 		}
 	}
-	return selected, hadSimulationFailure
+	for index := range diagnostics {
+		if selected == nil || liquidationDiagnosticKey(selected.Liquidation, selected.Route) != liquidationDiagnosticKeyValues(diagnostics[index].ReviewedSize, diagnostics[index].Route) {
+			if diagnostics[index].FinalRejectionReason == "" && diagnostics[index].ConservativeNetPnLWei != "" {
+				diagnostics[index].FinalRejectionReason = "smallest_positive_reviewed_size_not_selected"
+			}
+		}
+	}
+	sort.SliceStable(diagnostics, func(left, right int) bool {
+		leftSize, _ := newBigUint(diagnostics[left].ReviewedSize)
+		rightSize, _ := newBigUint(diagnostics[right].ReviewedSize)
+		if comparison := leftSize.Cmp(rightSize); comparison != 0 {
+			return comparison < 0
+		}
+		return diagnostics[left].Route < diagnostics[right].Route
+	})
+	return selected, hadSimulationFailure, diagnostics
 }
 
-func (s *Screener) prepareLiquidationProbe(liquidation *exactLiquidation) (*liquidationProbe, error) {
-	route, err := liquidationRouteFor(liquidation)
+func (s *Screener) prepareLiquidationProbes(liquidation *exactLiquidation) ([]*liquidationProbe, error) {
+	routes, err := liquidationRoutesFor(liquidation)
 	if err != nil {
 		return nil, err
 	}
 	repay, repayOK := newBigUint(liquidation.RepayAmount)
 	flash, flashOK := newBigUint(liquidation.FlashPremiumAmount)
-	floor, floorOK := newBigUint(s.config.RetainedProfitFloorWei)
 	minimumCollateral, collateralOK := newBigUint(liquidation.LiquidatorCollateral)
-	if !repayOK || !flashOK || !floorOK || !collateralOK || minimumCollateral.Sign() <= 0 {
+	if !repayOK || !flashOK || !collateralOK || minimumCollateral.Sign() <= 0 {
 		return nil, errors.New("exact liquidation economics are invalid")
 	}
-	exactEdge := new(big.Int).Sub(new(big.Int).Set(route.Output), repay)
-	exactEdge.Sub(exactEdge, flash)
-	if exactEdge.Cmp(floor) <= 0 {
-		return nil, nil
+	probes := make([]*liquidationProbe, 0, len(routes))
+	for _, route := range routes {
+		exactEdge := new(big.Int).Sub(new(big.Int).Set(route.Output), repay)
+		exactEdge.Sub(exactEdge, flash)
+		probes = append(probes, &liquidationProbe{
+			Liquidation: liquidation, Route: route, ExactEdge: exactEdge,
+			MinimumCollateral: minimumCollateral.String(),
+		})
 	}
-	return &liquidationProbe{
-		Liquidation: liquidation, Route: route, ExactEdge: exactEdge,
-		MinimumCollateral: minimumCollateral.String(),
-	}, nil
+	return probes, nil
 }
 
-func (s *Screener) evaluateLiquidationProbe(probe *liquidationProbe, simulation *simulationResponse) (*liquidationEvaluation, error) {
+func liquidationDiagnosticKey(liquidation *exactLiquidation, route liquidationRoute) string {
+	if liquidation == nil {
+		return ""
+	}
+	return liquidationDiagnosticKeyValues(liquidation.RepayAmount, route.Name)
+}
+
+func liquidationDiagnosticKeyValues(size, route string) string {
+	return size + "|" + route
+}
+
+func setDiagnosticRejection(diagnostics []sizeDiagnostic, liquidation *exactLiquidation, route liquidationRoute, reason string) {
+	key := liquidationDiagnosticKey(liquidation, route)
+	for index := range diagnostics {
+		if liquidationDiagnosticKeyValues(diagnostics[index].ReviewedSize, diagnostics[index].Route) == key {
+			diagnostics[index].FinalRejectionReason = reason
+			return
+		}
+	}
+}
+
+func newSizeDiagnostic(probe *liquidationProbe, liveMaximumText string) sizeDiagnostic {
+	diagnostic := sizeDiagnostic{
+		ReviewedSize:             probe.Liquidation.RepayAmount,
+		Route:                    probe.Route.Name,
+		FlashPremiumWei:          probe.Liquidation.FlashPremiumAmount,
+		AtlasExposureWei:         "0",
+		AtlasBidWei:              "0",
+		RiskReserveWei:           "0",
+		ExecutionCostWei:         "0",
+		L1CostWei:                "0",
+		GasPriceWei:              "0",
+		ExpectedNetPnLWei:        "0",
+		ConservativeNetPnLWei:    "0",
+		MarginToRetainedFloorWei: "0",
+	}
+	repay, repayOK := newBigUint(probe.Liquidation.RepayAmount)
+	flash, flashOK := newBigUint(probe.Liquidation.FlashPremiumAmount)
+	liveMaximum, liveOK := newBigUint(liveMaximumText)
+	if repayOK && flashOK {
+		diagnostic.GrossLiquidationEdgeWei = new(big.Int).Add(new(big.Int).Set(probe.ExactEdge), flash).String()
+	}
+	if repayOK && liveOK {
+		diagnostic.LiveAuthorized = repay.Cmp(liveMaximum) <= 0
+	}
+	oracle, oracleOK := newBigUint(probe.Liquidation.OracleUnwindOutputWETH)
+	if !oracleOK || oracle.Sign() == 0 {
+		oracle = new(big.Int).Set(probe.Route.Output)
+	}
+	loss := new(big.Int).Sub(new(big.Int).Set(oracle), probe.Route.Output)
+	if loss.Sign() < 0 {
+		loss.SetInt64(0)
+	}
+	diagnostic.DEXUnwindLossWei = loss.String()
+	if oracle.Sign() > 0 {
+		diagnostic.PriceImpactBPS = new(big.Int).Div(
+			new(big.Int).Mul(new(big.Int).Set(loss), big.NewInt(10_000)),
+			oracle,
+		).String()
+	} else {
+		diagnostic.PriceImpactBPS = "0"
+	}
+	return diagnostic
+}
+
+func updateSizeDiagnostic(diagnostic *sizeDiagnostic, evaluation *liquidationEvaluation, floor *big.Int) {
+	if diagnostic == nil || evaluation == nil || evaluation.Simulation == nil {
+		return
+	}
+	diagnostic.GasLimit = evaluation.Simulation.EstimatedGasLimit
+	diagnostic.GasPriceWei = evaluation.Simulation.EstimatedMaxFeePerGasWei
+	diagnostic.L1CostWei = evaluation.EstimatedL1Cost.String()
+	diagnostic.ExecutionCostWei = evaluation.ExecutionCost.String()
+	diagnostic.RiskReserveWei = evaluation.RiskReserve.String()
+	diagnostic.ExpectedNetPnLWei = evaluation.Expected.String()
+	diagnostic.ConservativeNetPnLWei = evaluation.Conservative.String()
+	diagnostic.MarginToRetainedFloorWei = new(big.Int).Sub(
+		new(big.Int).Set(evaluation.Conservative),
+		floor,
+	).String()
+	diagnostic.FinalRejectionReason = ""
+}
+
+func (s *Screener) evaluateLiquidationProbe(probe *liquidationProbe, simulation *simulationResponse, liveMaximumInput string) (*liquidationEvaluation, error) {
 	if probe == nil || probe.Liquidation == nil || probe.Route.Output == nil || probe.ExactEdge == nil {
 		return nil, errors.New("liquidation probe is incomplete")
 	}
@@ -1750,7 +2139,8 @@ func (s *Screener) evaluateLiquidationProbe(probe *liquidationProbe, simulation 
 		Expected: expected, Conservative: conservative, RiskReserve: reserve,
 		ExecutionCost: cost, EstimatedL1Cost: l1Cost,
 		MinimumCollateral: probe.MinimumCollateral, MinimumUnwind: minimumUnwind.String(),
-		MinimumProfit: strictMinimumProfit(floor, cost).String(),
+		MinimumProfit:    strictMinimumProfit(floor, cost).String(),
+		LiveMaximumInput: liveMaximumInput,
 	}, nil
 }
 
@@ -1787,7 +2177,8 @@ func (s *Screener) advanceLiquidationMaterialization(probe *liquidationEvaluatio
 			Expected: finalExpected, Conservative: finalConservative, RiskReserve: finalReserve,
 			ExecutionCost: finalCost, EstimatedL1Cost: finalL1Cost,
 			MinimumCollateral: probe.MinimumCollateral, MinimumUnwind: probe.MinimumUnwind,
-			MinimumProfit: probe.MinimumProfit,
+			MinimumProfit:    probe.MinimumProfit,
+			LiveMaximumInput: probe.LiveMaximumInput,
 		}, nil, nil
 	}
 	retry := *probe
@@ -1796,39 +2187,61 @@ func (s *Screener) advanceLiquidationMaterialization(probe *liquidationEvaluatio
 	return nil, &retry, nil
 }
 
-func liquidationRouteFor(liquidation *exactLiquidation) (liquidationRoute, error) {
+func liquidationRoutesFor(liquidation *exactLiquidation) ([]liquidationRoute, error) {
 	if liquidation == nil || strings.ToLower(liquidation.DebtAsset) != wethAddress {
-		return liquidationRoute{}, errors.New("unsupported exact debt route")
+		return nil, errors.New("unsupported exact debt route")
 	}
 	if strings.ToLower(liquidation.CollateralAsset) == wethAddress {
 		output, ok := newBigUint(liquidation.LiquidatorCollateral)
 		if !ok || output.Sign() <= 0 {
-			return liquidationRoute{}, errors.New("exact identity-route output is invalid")
+			return nil, errors.New("exact identity-route output is invalid")
 		}
-		return liquidationRoute{
+		return []liquidationRoute{{
 			Name: "WETH_IDENTITY", Output: output, SelectedPool: zeroAddress,
 			Factory: zeroAddress, TokenPath: []string{wethAddress},
-		}, nil
+		}}, nil
 	}
 	if strings.ToLower(liquidation.CollateralAsset) != nativeUSDCAddress {
-		return liquidationRoute{}, errors.New("unsupported exact collateral route")
+		return nil, errors.New("unsupported exact collateral route")
 	}
-	fee500, ok500 := newBigUint(liquidation.UniswapFee500OutputWETH)
-	fee3000, ok3000 := newBigUint(liquidation.UniswapFee3000OutputWETH)
-	if !ok500 || !ok3000 || fee500.Sign() <= 0 && fee3000.Sign() <= 0 {
-		return liquidationRoute{}, errors.New("exact route quotation is invalid")
+	routes := make([]liquidationRoute, 0, len(liquidation.UnwindQuotes))
+	seen := make(map[string]bool)
+	for _, quote := range liquidation.UnwindQuotes {
+		pool := strings.ToLower(quote.Pool)
+		factory := strings.ToLower(quote.Factory)
+		token0 := strings.ToLower(quote.Token0)
+		token1 := strings.ToLower(quote.Token1)
+		output, outputOK := newBigUint(quote.OutputWETH)
+		zeroForOne, directionOK := uniswapZeroForOne(nativeUSDCAddress, token0, token1)
+		identityValid := addressPattern.MatchString(pool) && factory == uniswapFactoryAddress &&
+			directionOK &&
+			(quote.Fee == 100 || quote.Fee == 500 || quote.Fee == 3_000) &&
+			quote.ZeroForOne == zeroForOne && !seen[pool]
+		if !identityValid || !outputOK || output.Sign() <= 0 {
+			return nil, errors.New("exact route quotation identity is invalid")
+		}
+		seen[pool] = true
+		routes = append(routes, liquidationRoute{
+			Name: fmt.Sprintf("UNISWAP_V3_%d", quote.Fee), Output: output,
+			SelectedPool: pool, Factory: factory, SelectedFee: quote.Fee,
+			ZeroForOne: zeroForOne, TokenPath: []string{nativeUSDCAddress, wethAddress},
+		})
 	}
-	route := liquidationRoute{
-		Name: "UNISWAP_V3_500", Output: fee500, SelectedPool: uniswapPool500Address,
-		Factory: uniswapFactoryAddress, SelectedFee: 500, TokenPath: []string{nativeUSDCAddress, wethAddress},
+	if len(routes) == 0 {
+		return nil, errors.New("exact route quotation is invalid")
 	}
-	if fee3000.Cmp(fee500) > 0 {
-		route.Name = "UNISWAP_V3_3000"
-		route.Output = fee3000
-		route.SelectedPool = uniswapPool3000Address
-		route.SelectedFee = 3_000
+	sort.Slice(routes, func(left, right int) bool { return routes[left].SelectedFee < routes[right].SelectedFee })
+	return routes, nil
+}
+
+func uniswapZeroForOne(tokenIn, token0, token1 string) (bool, bool) {
+	if tokenIn == token0 && token0 != token1 {
+		return true, true
 	}
-	return route, nil
+	if tokenIn == token1 && token0 != token1 {
+		return false, true
+	}
+	return false, false
 }
 
 func executionLegsFor(route liquidationRoute, minimumUnwind string) []executionLeg {
@@ -1883,15 +2296,18 @@ func betterLiquidationEvaluation(candidate, current *liquidationEvaluation) bool
 	if current == nil {
 		return true
 	}
+	candidateRepay, _ := newBigUint(candidate.Liquidation.RepayAmount)
+	currentRepay, _ := newBigUint(current.Liquidation.RepayAmount)
+	if comparison := candidateRepay.Cmp(currentRepay); comparison != 0 {
+		return comparison < 0
+	}
 	if comparison := candidate.Conservative.Cmp(current.Conservative); comparison != 0 {
 		return comparison > 0
 	}
 	if comparison := candidate.Expected.Cmp(current.Expected); comparison != 0 {
 		return comparison > 0
 	}
-	candidateRepay, _ := newBigUint(candidate.Liquidation.RepayAmount)
-	currentRepay, _ := newBigUint(current.Liquidation.RepayAmount)
-	return candidateRepay.Cmp(currentRepay) < 0
+	return candidate.Route.Name < current.Route.Name
 }
 
 func strictMinimumProfit(floor, cost *big.Int) *big.Int {
@@ -1996,7 +2412,7 @@ func (s *Screener) buildAtlasCandidate(
 		ZeroForOne:                selected.Route.ZeroForOne,
 		AtlasMode:                 true,
 		AtlasBid:                  selectedBid.String(),
-	})
+	}, selected.LiveMaximumInput)
 	if err != nil {
 		return nil, nil
 	}
@@ -2064,12 +2480,13 @@ func (s *Screener) buildAtlasCandidate(
 	}, nil
 }
 
-func (s *Screener) simulateExact(ctx context.Context, record signal, liquidation *exactLiquidation, partial simulationRequest) (*simulationResponse, error) {
+func (s *Screener) simulateExact(ctx context.Context, record signal, liquidation *exactLiquidation, partial simulationRequest, liveMaximumInput string) (*simulationResponse, error) {
 	request := s.newSimulationRequest(
 		record,
 		liquidation,
 		partial,
 		uint64(s.nowUTC().Add(60*time.Second).Unix()),
+		liveMaximumInput,
 	)
 	outcomes, err := s.simulateExactBatch(ctx, record, []simulationRequest{request})
 	if err != nil {
@@ -2081,8 +2498,8 @@ func (s *Screener) simulateExact(ctx context.Context, record signal, liquidation
 	return outcomes[0].Response, outcomes[0].Err
 }
 
-func (s *Screener) newSimulationRequest(record signal, liquidation *exactLiquidation, partial simulationRequest, deadline uint64) simulationRequest {
-	partial.SchemaVersion = "phoenix.rpc.aave-simulate-request.v2"
+func (s *Screener) newSimulationRequest(record signal, liquidation *exactLiquidation, partial simulationRequest, deadline uint64, liveMaximumInput string) simulationRequest {
+	partial.SchemaVersion = "phoenix.rpc.aave-simulate-request.v3"
 	partial.ChainID = 42161
 	partial.RequestID = fmt.Sprintf("aave-sim-%d-%s-%s-%d", record.Cursor, liquidation.CollateralAsset, liquidation.RepayAmount, time.Now().UnixNano())
 	partial.BlockNumber = record.Block
@@ -2096,7 +2513,15 @@ func (s *Screener) newSimulationRequest(record signal, liquidation *exactLiquida
 	partial.DebtAsset = liquidation.DebtAsset
 	partial.CollateralAsset = liquidation.CollateralAsset
 	partial.RepayAmount = liquidation.RepayAmount
-	partial.MaximumInputAmount = s.config.MaximumInputAmountWei
+	repay, repayOK := newBigUint(liquidation.RepayAmount)
+	liveMaximum, liveOK := newBigUint(liveMaximumInput)
+	partial.LiveMaximumInputAmount = liveMaximumInput
+	partial.Counterfactual = repayOK && liveOK && repay.Cmp(liveMaximum) > 0
+	if partial.Counterfactual {
+		partial.MaximumInputAmount = maximumReviewedInputWei
+	} else {
+		partial.MaximumInputAmount = liveMaximumInput
+	}
 	partial.RetainedProfitFloor = s.config.RetainedProfitFloorWei
 	partial.GasLimit = s.config.MaximumGasLimit
 	partial.MaxFeePerGas = s.config.MaximumFeePerGasWei
@@ -2109,24 +2534,50 @@ func (s *Screener) newSimulationRequest(record signal, liquidation *exactLiquida
 }
 
 func (s *Screener) simulateExactBatch(ctx context.Context, record signal, simulations []simulationRequest) ([]simulationBatchOutcome, error) {
-	if len(simulations) == 0 || len(simulations) > 8 {
+	if len(simulations) == 0 {
 		return nil, errors.New("simulation batch size is invalid")
 	}
-	expectedEvidenceMode := directForkEvidenceMode
-	for _, simulation := range simulations {
-		if simulation.AtlasMode {
-			expectedEvidenceMode = atlasCallbackEvidenceMode
-			break
+	outcomes := make([]simulationBatchOutcome, 0, len(simulations))
+	for offset := 0; offset < len(simulations); offset += 8 {
+		end := offset + 8
+		if end > len(simulations) {
+			end = len(simulations)
 		}
+		// Each Production-sized chunk can consume most of its 60-second paced
+		// gateway window. Refresh only the execution deadline (never the pinned
+		// state or economic bounds) so a later reviewed route cannot fail merely
+		// because an earlier chunk used the shared upstream budget.
+		chunkRequests := append([]simulationRequest(nil), simulations[offset:end]...)
+		chunkDeadline := uint64(s.nowUTC().Add(60 * time.Second).Unix())
+		for index := range chunkRequests {
+			chunkRequests[index].DeadlineUnixSeconds = chunkDeadline
+		}
+		chunk, err := s.simulateExactBatchChunk(ctx, record, chunkRequests)
+		if err != nil {
+			return nil, err
+		}
+		outcomes = append(outcomes, chunk...)
 	}
+	return outcomes, nil
+}
+
+func (s *Screener) simulateExactBatchChunk(ctx context.Context, record signal, simulations []simulationRequest) ([]simulationBatchOutcome, error) {
+	if len(simulations) == 0 || len(simulations) > 8 {
+		return nil, errors.New("simulation batch chunk size is invalid")
+	}
+	atlasMode := simulations[0].AtlasMode
 	for _, simulation := range simulations {
-		if simulation.AtlasMode != (expectedEvidenceMode == atlasCallbackEvidenceMode) {
+		if simulation.AtlasMode != atlasMode {
 			return nil, errors.New("simulation batch mixes incompatible evidence paths")
 		}
 	}
+	expectedBatchEvidenceMode := directForkEvidenceMode
+	if atlasMode {
+		expectedBatchEvidenceMode = atlasCallbackEvidenceMode
+	}
 	requestID := fmt.Sprintf("aave-sim-batch-%d-%d", record.Cursor, time.Now().UnixNano())
 	batch := simulationBatchRequest{
-		SchemaVersion: "phoenix.rpc.aave-simulate-batch-request.v1",
+		SchemaVersion: "phoenix.rpc.aave-simulate-batch-request.v2",
 		ChainID:       42161,
 		RequestID:     requestID,
 		Simulations:   simulations,
@@ -2156,7 +2607,7 @@ func (s *Screener) simulateExactBatch(ctx context.Context, record signal, simula
 	if err := json.NewDecoder(io.LimitReader(response.Body, maximumResponse)).Decode(&result); err != nil {
 		return nil, err
 	}
-	if result.SchemaVersion != "phoenix.rpc.aave-simulate-batch-response.v1" || result.ChainID != 42161 || result.RequestID != requestID || result.BlockNumber != record.Block || result.BlockHash != record.BlockHash || result.StateRoot != record.StateRoot || result.PrimaryProviderID == "" || result.PrimaryProviderID == result.SecondaryProviderID || result.EvidenceMode != expectedEvidenceMode || len(result.Results) != len(simulations) {
+	if result.SchemaVersion != "phoenix.rpc.aave-simulate-batch-response.v2" || result.ChainID != 42161 || result.RequestID != requestID || result.BlockNumber != record.Block || result.BlockHash != record.BlockHash || result.StateRoot != record.StateRoot || result.PrimaryProviderID == "" || result.PrimaryProviderID == result.SecondaryProviderID || result.EvidenceMode != expectedBatchEvidenceMode || len(result.Results) != len(simulations) {
 		return nil, errors.New("simulation batch evidence is incomplete")
 	}
 	outcomes := make([]simulationBatchOutcome, len(simulations))
@@ -2175,6 +2626,12 @@ func (s *Screener) simulateExactBatch(ctx context.Context, record signal, simula
 			}
 			continue
 		}
+		expectedEvidenceMode := directForkEvidenceMode
+		if simulations[index].AtlasMode {
+			expectedEvidenceMode = atlasCallbackEvidenceMode
+		} else if simulations[index].Counterfactual {
+			expectedEvidenceMode = counterfactualForkEvidenceMode
+		}
 		if err := validateSimulationResponse(item.Response, &simulations[index], record, expectedEvidenceMode); err != nil {
 			return nil, err
 		}
@@ -2184,7 +2641,7 @@ func (s *Screener) simulateExactBatch(ctx context.Context, record signal, simula
 }
 
 func validateSimulationResponse(result *simulationResponse, request *simulationRequest, record signal, expectedEvidenceMode string) error {
-	if result == nil || request == nil || result.SchemaVersion != "phoenix.rpc.aave-simulate-response.v2" || result.ChainID != 42161 || result.RequestID != request.RequestID || result.BlockNumber != record.Block || result.BlockHash != record.BlockHash || result.StateRoot != record.StateRoot || result.PrimaryProviderID == "" || result.PrimaryProviderID == result.SecondaryProviderID || result.EvidenceMode != expectedEvidenceMode || len(result.RouteID) != 66 || len(result.CalldataHash) != 64 || len(result.SimulationResultHash) != 64 || result.DeadlineUnixSeconds != request.DeadlineUnixSeconds {
+	if result == nil || request == nil || result.SchemaVersion != "phoenix.rpc.aave-simulate-response.v3" || result.ChainID != 42161 || result.RequestID != request.RequestID || result.BlockNumber != record.Block || result.BlockHash != record.BlockHash || result.StateRoot != record.StateRoot || result.PrimaryProviderID == "" || result.PrimaryProviderID == result.SecondaryProviderID || result.EvidenceMode != expectedEvidenceMode || len(result.RouteID) != 66 || len(result.CalldataHash) != 64 || len(result.SimulationResultHash) != 64 || result.DeadlineUnixSeconds != request.DeadlineUnixSeconds {
 		return errors.New("simulation evidence is incomplete")
 	}
 	calldata, err := hex.DecodeString(strings.TrimPrefix(result.CalldataHex, "0x"))
@@ -2217,6 +2674,15 @@ func (s *Screener) buildExecutionCandidate(record signal, selected *liquidationE
 	}
 	liquidation := selected.Liquidation
 	simulation := selected.Simulation
+	repay, repayOK := newBigUint(liquidation.RepayAmount)
+	liveMaximumInput := selected.LiveMaximumInput
+	if liveMaximumInput == "" {
+		liveMaximumInput = s.config.MaximumInputAmountWei
+	}
+	liveMaximum, liveMaximumOK := newBigUint(liveMaximumInput)
+	if !repayOK || !liveMaximumOK || repay.Cmp(liveMaximum) > 0 || simulation.EvidenceMode != directForkEvidenceMode {
+		return nil, errors.New("selected liquidation exceeds live size authority")
+	}
 	approvedAt := time.Now().UTC().Truncate(time.Second)
 	approvalDeadline := approvedAt.Add(15 * time.Second)
 	deadline := time.Unix(int64(simulation.DeadlineUnixSeconds), 0).UTC()
@@ -2235,7 +2701,7 @@ func (s *Screener) buildExecutionCandidate(record signal, selected *liquidationE
 		ExecutorAddress: s.config.ExecutorAddress, ExecutorCodeHash: s.config.ExecutorCodeHash,
 		CalldataHash: simulation.CalldataHash, SimulationResultHash: simulation.SimulationResultHash,
 		PinnedBlockNumber: record.Block, PinnedBlockHash: record.BlockHash,
-		FlashAsset: liquidation.DebtAsset, FlashAmount: liquidation.RepayAmount, MaximumInputAmount: s.config.MaximumInputAmountWei,
+		FlashAsset: liquidation.DebtAsset, FlashAmount: liquidation.RepayAmount, MaximumInputAmount: liveMaximumInput,
 		MinimumProfit: selected.MinimumProfit, ExpectedProfit: simulation.RealizedProfit,
 		Deadline: deadline, Legs: legs, GasLimit: simulation.EstimatedGasLimit,
 		MaxFeePerGas: simulation.EstimatedMaxFeePerGasWei, MaxPriorityFeePerGas: s.config.MaximumPriorityFeeWei,
@@ -2305,15 +2771,7 @@ func (c *executionCandidate) approvalBody() ([]byte, error) {
 }
 
 func equalLiquidations(first, second []exactLiquidation) bool {
-	if len(first) != len(second) {
-		return false
-	}
-	for index := range first {
-		if first[index] != second[index] {
-			return false
-		}
-	}
-	return true
+	return reflect.DeepEqual(first, second)
 }
 
 func generousUpperBound(value account, wethPriceText string) (*big.Int, error) {
@@ -2603,6 +3061,12 @@ func (s *Screener) ensureHotMapsLocked() {
 	}
 	if s.lastExactAt == nil {
 		s.lastExactAt = make(map[string]time.Time)
+	}
+	if s.firstLiquidatableAt == nil {
+		s.firstLiquidatableAt = make(map[string]time.Time)
+	}
+	if s.state.Counts == nil {
+		s.state.Counts = make(map[string]uint64)
 	}
 	if s.state.RouteIneligible == nil {
 		s.state.RouteIneligible = make(map[string]string)

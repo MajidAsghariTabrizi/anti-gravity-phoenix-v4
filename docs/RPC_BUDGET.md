@@ -69,20 +69,30 @@ eight liquidation variants. The gateway paces every real provider call behind
 the same `1/s` transport budget instead of failing later variants according to
 their order. For `N` variants, a verified warm batch uses `4N + 4` upstream
 calls (two dynamic calls per provider and pre/post pin verification); an
-initial cold batch uses `4N + 14`, adding provider verification and the two
-pin-keyed executor contexts. Thus an eight-item batch is 36 warm calls or 46
-cold calls. A context-cache hit never skips the two-provider pre/post block,
+initial cold batch uses `4N + 16`, adding provider verification and the two
+pin-keyed executor contexts, including the independently read executor maximum
+input slot. Thus an eight-item batch is 36 warm calls or 48 cold calls. A
+context-cache hit never skips the two-provider pre/post block,
 hash, and state-root checks.
 
-One fully materialized Aave opportunity uses at most eight state admissions:
-screen, initial Exact, probe batch, first convergence batch, optional second
-convergence batch, fresh Exact, final authority batch, and tail. The fresh
-Exact must reproduce the original complete liquidation quote set and flash
-premium; the final batch is rebound to its block/hash/state root and a new
-60-second calldata deadline. Quote drift or another required bounds-convergence
-pass fails closed. A future genuine Atlas callback simulation could add one
-more admission while remaining below the 12/minute ceiling; the current direct
-wrapper does not authorize an Atlas artifact.
+For one route per reviewed size, a fully materialized Aave opportunity uses at
+most eight state admissions: screen, initial Exact, probe batch, first
+convergence batch, optional second convergence batch, fresh Exact, final
+authority batch, and tail. The reviewed native-USDC unwind universe can expand
+one seven-size collateral grid to 21 variants (28 when the WETH identity grid
+is also present), so each simulation phase is chunked into `ceil(N/8)` bounded
+state requests, at most four. Each later chunk renews only its 60-second
+calldata deadline; block number, block hash, state root, bounds, and economics
+remain pinned. At the Production `1/s` transport rate the 36-call warm chunks
+span more than one state-token refill interval, so this preserves the
+`12/minute` admission ceiling without increasing either configured budget.
+
+The fresh Exact must reproduce the original complete liquidation quote set and
+flash premium; the final phase is rebound to its block/hash/state root. Quote
+drift or another required bounds-convergence pass fails closed. A future
+genuine Atlas callback simulation adds another admission only when callback
+evidence exists; the current direct wrapper does not authorize an Atlas
+artifact.
 
 HTTP 429 is handled separately from transport failure. `Retry-After` delta seconds and HTTP dates are parsed, clamped to 60 seconds, and applied as provider cooldown. The same provider is not retried immediately. Failover still requires a transport token. Provider URLs are never metric labels or error fields.
 

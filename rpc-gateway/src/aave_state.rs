@@ -3,17 +3,173 @@ use thiserror::Error;
 
 pub const AAVE_SCREEN_REQUEST_SCHEMA: &str = "phoenix.rpc.aave-screen-request.v1";
 pub const AAVE_SCREEN_RESPONSE_SCHEMA: &str = "phoenix.rpc.aave-screen-response.v1";
-pub const AAVE_EXACT_REQUEST_SCHEMA: &str = "phoenix.rpc.aave-exact-request.v2";
-pub const AAVE_EXACT_RESPONSE_SCHEMA: &str = "phoenix.rpc.aave-exact-response.v2";
-pub const AAVE_SIMULATE_REQUEST_SCHEMA: &str = "phoenix.rpc.aave-simulate-request.v2";
-pub const AAVE_SIMULATE_RESPONSE_SCHEMA: &str = "phoenix.rpc.aave-simulate-response.v2";
-pub const AAVE_SIMULATE_BATCH_REQUEST_SCHEMA: &str = "phoenix.rpc.aave-simulate-batch-request.v1";
-pub const AAVE_SIMULATE_BATCH_RESPONSE_SCHEMA: &str = "phoenix.rpc.aave-simulate-batch-response.v1";
+pub const AAVE_EXACT_REQUEST_SCHEMA: &str = "phoenix.rpc.aave-exact-request.v3";
+pub const AAVE_EXACT_RESPONSE_SCHEMA: &str = "phoenix.rpc.aave-exact-response.v3";
+pub const AAVE_SIMULATE_REQUEST_SCHEMA: &str = "phoenix.rpc.aave-simulate-request.v3";
+pub const AAVE_SIMULATE_RESPONSE_SCHEMA: &str = "phoenix.rpc.aave-simulate-response.v3";
+pub const AAVE_SIMULATE_BATCH_REQUEST_SCHEMA: &str = "phoenix.rpc.aave-simulate-batch-request.v2";
+pub const AAVE_SIMULATE_BATCH_RESPONSE_SCHEMA: &str = "phoenix.rpc.aave-simulate-batch-response.v2";
 pub const AAVE_TAIL_REQUEST_SCHEMA: &str = "phoenix.rpc.aave-tail-request.v1";
 pub const AAVE_TAIL_RESPONSE_SCHEMA: &str = "phoenix.rpc.aave-tail-response.v1";
 pub const AAVE_V3_POOL_ARBITRUM: &str = "0x794a61358d6845594f94dc1db02a252b5b4814ad";
 pub const MAX_AAVE_SCREEN_ADDRESSES: usize = 100;
 pub const MAX_AAVE_SIMULATION_BATCH: usize = 8;
+pub const MAXIMUM_REVIEWED_INPUT_WEI: u128 = 10_000_000_000_000_000;
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum EconomicPhase {
+    DisarmedDeploy,
+    DisarmedEvidence,
+    CanaryReady,
+    LiveCanaryMin,
+    LiveScaleL1,
+    LiveScaleL2,
+    LiveScaleL3,
+    LiveScaleL4,
+    LiveScaleL5,
+    LiveMaxReviewed,
+    Cooldown,
+    DisarmedFailure,
+}
+
+impl EconomicPhase {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::DisarmedDeploy => "DISARMED_DEPLOY",
+            Self::DisarmedEvidence => "DISARMED_EVIDENCE",
+            Self::CanaryReady => "CANARY_READY",
+            Self::LiveCanaryMin => "LIVE_CANARY_MIN",
+            Self::LiveScaleL1 => "LIVE_SCALE_L1",
+            Self::LiveScaleL2 => "LIVE_SCALE_L2",
+            Self::LiveScaleL3 => "LIVE_SCALE_L3",
+            Self::LiveScaleL4 => "LIVE_SCALE_L4",
+            Self::LiveScaleL5 => "LIVE_SCALE_L5",
+            Self::LiveMaxReviewed => "LIVE_MAX_REVIEWED",
+            Self::Cooldown => "COOLDOWN",
+            Self::DisarmedFailure => "DISARMED_FAILURE",
+        }
+    }
+
+    pub const fn is_live(self) -> bool {
+        matches!(
+            self,
+            Self::LiveCanaryMin
+                | Self::LiveScaleL1
+                | Self::LiveScaleL2
+                | Self::LiveScaleL3
+                | Self::LiveScaleL4
+                | Self::LiveScaleL5
+                | Self::LiveMaxReviewed
+        )
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+pub enum SizeLevel {
+    #[serde(rename = "MIN")]
+    Min,
+    #[serde(rename = "L1")]
+    L1,
+    #[serde(rename = "L2")]
+    L2,
+    #[serde(rename = "L3")]
+    L3,
+    #[serde(rename = "L4")]
+    L4,
+    #[serde(rename = "L5")]
+    L5,
+    #[serde(rename = "MAX_REVIEWED")]
+    MaxReviewed,
+}
+
+impl SizeLevel {
+    pub const ALL: [Self; 7] = [
+        Self::Min,
+        Self::L1,
+        Self::L2,
+        Self::L3,
+        Self::L4,
+        Self::L5,
+        Self::MaxReviewed,
+    ];
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Min => "MIN",
+            Self::L1 => "L1",
+            Self::L2 => "L2",
+            Self::L3 => "L3",
+            Self::L4 => "L4",
+            Self::L5 => "L5",
+            Self::MaxReviewed => "MAX_REVIEWED",
+        }
+    }
+
+    pub const fn amount_wei(self) -> u128 {
+        match self {
+            Self::Min => 100_000_000_000_000,
+            Self::L1 => 250_000_000_000_000,
+            Self::L2 => 500_000_000_000_000,
+            Self::L3 => 1_000_000_000_000_000,
+            Self::L4 => 2_500_000_000_000_000,
+            Self::L5 => 5_000_000_000_000_000,
+            Self::MaxReviewed => MAXIMUM_REVIEWED_INPUT_WEI,
+        }
+    }
+
+    pub const fn phase(self) -> EconomicPhase {
+        match self {
+            Self::Min => EconomicPhase::LiveCanaryMin,
+            Self::L1 => EconomicPhase::LiveScaleL1,
+            Self::L2 => EconomicPhase::LiveScaleL2,
+            Self::L3 => EconomicPhase::LiveScaleL3,
+            Self::L4 => EconomicPhase::LiveScaleL4,
+            Self::L5 => EconomicPhase::LiveScaleL5,
+            Self::MaxReviewed => EconomicPhase::LiveMaxReviewed,
+        }
+    }
+
+    pub const fn next(self) -> Option<Self> {
+        match self {
+            Self::Min => Some(Self::L1),
+            Self::L1 => Some(Self::L2),
+            Self::L2 => Some(Self::L3),
+            Self::L3 => Some(Self::L4),
+            Self::L4 => Some(Self::L5),
+            Self::L5 => Some(Self::MaxReviewed),
+            Self::MaxReviewed => None,
+        }
+    }
+
+    pub const fn previous(self) -> Self {
+        match self {
+            Self::Min | Self::L1 => Self::Min,
+            Self::L2 => Self::L1,
+            Self::L3 => Self::L2,
+            Self::L4 => Self::L3,
+            Self::L5 => Self::L4,
+            Self::MaxReviewed => Self::L5,
+        }
+    }
+}
+
+impl TryFrom<&str> for SizeLevel {
+    type Error = ();
+
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        match value {
+            "MIN" => Ok(Self::Min),
+            "L1" => Ok(Self::L1),
+            "L2" => Ok(Self::L2),
+            "L3" => Ok(Self::L3),
+            "L4" => Ok(Self::L4),
+            "L5" => Ok(Self::L5),
+            "MAX_REVIEWED" => Ok(Self::MaxReviewed),
+            _ => Err(()),
+        }
+    }
+}
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -114,8 +270,20 @@ pub struct AaveExactLiquidationState {
     pub seized_collateral: String,
     pub protocol_fee_collateral: String,
     pub liquidator_collateral: String,
-    pub uniswap_v3_fee_500_output_weth: String,
-    pub uniswap_v3_fee_3000_output_weth: String,
+    pub oracle_unwind_output_weth: String,
+    pub unwind_quotes: Vec<AaveExactUnwindQuoteState>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct AaveExactUnwindQuoteState {
+    pub pool: String,
+    pub factory: String,
+    pub token0: String,
+    pub token1: String,
+    pub fee: u32,
+    pub zero_for_one: bool,
+    pub output_weth: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -150,6 +318,8 @@ pub struct AaveSimulateRequest {
     pub collateral_asset: String,
     pub repay_amount: String,
     pub maximum_input_amount: String,
+    pub live_maximum_input_amount: String,
+    pub counterfactual: bool,
     pub minimum_collateral_received: String,
     pub minimum_unwind_output: String,
     pub minimum_profit: String,
@@ -353,11 +523,7 @@ impl AaveExactRequest {
             || self.request_id.len() > 256
             || self.request_id.chars().any(char::is_control)
             || !canonical_address(&self.borrower)
-            || self
-                .maximum_input_amount
-                .parse::<u128>()
-                .ok()
-                .map_or(true, |value| value == 0)
+            || self.maximum_input_amount.parse::<u128>().ok() != Some(MAXIMUM_REVIEWED_INPUT_WEI)
         {
             return Err(AaveStateError::Invalid);
         }
@@ -376,11 +542,12 @@ impl AaveSimulateRequest {
         } else {
             canonical_address(&self.selected_pool)
                 && canonical_address(&self.selected_factory)
-                && matches!(self.selected_fee, 500 | 3_000)
+                && matches!(self.selected_fee, 100 | 500 | 3_000)
         };
         let positive = [
             &self.repay_amount,
             &self.maximum_input_amount,
+            &self.live_maximum_input_amount,
             &self.minimum_collateral_received,
             &self.minimum_unwind_output,
             &self.minimum_profit,
@@ -433,7 +600,17 @@ impl AaveSimulateRequest {
             .maximum_input_amount
             .parse::<u128>()
             .map_err(|_| AaveStateError::Invalid)?;
-        if repay > maximum_input {
+        let live_maximum_input = self
+            .live_maximum_input_amount
+            .parse::<u128>()
+            .map_err(|_| AaveStateError::Invalid)?;
+        if repay > maximum_input
+            || maximum_input > MAXIMUM_REVIEWED_INPUT_WEI
+            || live_maximum_input > maximum_input
+            || self.counterfactual != (repay > live_maximum_input)
+            || (!self.counterfactual && maximum_input != live_maximum_input)
+            || (self.counterfactual && maximum_input != MAXIMUM_REVIEWED_INPUT_WEI)
+        {
             return Err(AaveStateError::Invalid);
         }
         Ok(())
@@ -450,6 +627,11 @@ fn canonical_release_sha(value: &str) -> bool {
 impl AaveSimulateResponse {
     pub fn validate(&self, request: &AaveSimulateRequest) -> Result<(), AaveStateError> {
         request.validate()?;
+        let expected_evidence_mode = if request.counterfactual {
+            "DUAL_PROVIDER_COUNTERFACTUAL_FORK_VERIFIED"
+        } else {
+            "DUAL_PROVIDER_FORK_VERIFIED"
+        };
         if self.schema_version != AAVE_SIMULATE_RESPONSE_SCHEMA
             || self.chain_id != request.chain_id
             || self.request_id != request.request_id
@@ -459,7 +641,7 @@ impl AaveSimulateResponse {
             || self.primary_provider_id.is_empty()
             || self.secondary_provider_id.is_empty()
             || self.primary_provider_id == self.secondary_provider_id
-            || self.evidence_mode != "DUAL_PROVIDER_FORK_VERIFIED"
+            || self.evidence_mode != expected_evidence_mode
             || !canonical_block_hash(&self.route_id)
             || !canonical_data(&self.calldata_hex)
             || !canonical_digest(&self.calldata_hash)
@@ -532,7 +714,7 @@ impl AaveSimulateBatchRequest {
                 || simulation.release_sha != first.release_sha
                 || simulation.borrower != first.borrower
                 || simulation.debt_asset != first.debt_asset
-                || simulation.maximum_input_amount != first.maximum_input_amount
+                || simulation.live_maximum_input_amount != first.live_maximum_input_amount
                 || simulation.retained_profit_floor != first.retained_profit_floor
                 || simulation.gas_limit != first.gas_limit
                 || simulation.max_fee_per_gas != first.max_fee_per_gas
@@ -608,7 +790,7 @@ impl AaveExactResponse {
             || primary != secondary
             || self.primary.account.borrower != request.borrower
             || self.primary.reserves.len() != 2
-            || self.primary.liquidations.len() > 8
+            || self.primary.liquidations.len() > SizeLevel::ALL.len() * 2
         {
             return Err(AaveStateError::ProviderDisagreement);
         }
@@ -626,6 +808,22 @@ impl AaveExactResponse {
                 .repay_amount
                 .parse::<u128>()
                 .map_err(|_| AaveStateError::ProviderDisagreement)?;
+            let seized_collateral = liquidation
+                .seized_collateral
+                .parse::<u128>()
+                .map_err(|_| AaveStateError::ProviderDisagreement)?;
+            let protocol_fee_collateral = liquidation
+                .protocol_fee_collateral
+                .parse::<u128>()
+                .map_err(|_| AaveStateError::ProviderDisagreement)?;
+            let liquidator_collateral = liquidation
+                .liquidator_collateral
+                .parse::<u128>()
+                .map_err(|_| AaveStateError::ProviderDisagreement)?;
+            let oracle_unwind_output = liquidation
+                .oracle_unwind_output_weth
+                .parse::<u128>()
+                .map_err(|_| AaveStateError::ProviderDisagreement)?;
             let expected_premium = repay
                 .checked_mul(u128::from(self.primary.flash_premium_bps))
                 .and_then(|value| value.checked_add(5_000))
@@ -638,18 +836,44 @@ impl AaveExactResponse {
                 || liquidation.flash_premium_amount.parse::<u128>().ok() != Some(expected_premium)
                 || !canonical_address(&liquidation.debt_asset)
                 || !canonical_address(&liquidation.collateral_asset)
-                || liquidation.seized_collateral.parse::<u128>().ok().is_none()
-                || liquidation
-                    .protocol_fee_collateral
-                    .parse::<u128>()
-                    .ok()
-                    .is_none()
-                || liquidation
-                    .liquidator_collateral
-                    .parse::<u128>()
-                    .ok()
-                    .map_or(true, |value| value == 0)
+                || liquidator_collateral == 0
+                || oracle_unwind_output == 0
+                || protocol_fee_collateral.checked_add(liquidator_collateral)
+                    != Some(seized_collateral)
                 || !seen.insert((liquidation.collateral_asset.clone(), repay))
+            {
+                return Err(AaveStateError::ProviderDisagreement);
+            }
+            if liquidation.collateral_asset == liquidation.debt_asset {
+                if oracle_unwind_output != liquidator_collateral
+                    || !liquidation.unwind_quotes.is_empty()
+                {
+                    return Err(AaveStateError::ProviderDisagreement);
+                }
+                continue;
+            }
+            let mut quoted_pools = std::collections::HashSet::new();
+            if liquidation.unwind_quotes.is_empty()
+                || liquidation.unwind_quotes.len() > 4
+                || liquidation.unwind_quotes.iter().any(|quote| {
+                    let tokens_match = (quote.token0 == liquidation.collateral_asset
+                        && quote.token1 == liquidation.debt_asset)
+                        || (quote.token1 == liquidation.collateral_asset
+                            && quote.token0 == liquidation.debt_asset);
+                    !canonical_address(&quote.pool)
+                        || !canonical_address(&quote.factory)
+                        || !canonical_address(&quote.token0)
+                        || !canonical_address(&quote.token1)
+                        || !tokens_match
+                        || !matches!(quote.fee, 100 | 500 | 3_000)
+                        || quote.zero_for_one != (quote.token0 == liquidation.collateral_asset)
+                        || quote
+                            .output_weth
+                            .parse::<u128>()
+                            .ok()
+                            .map_or(true, |value| value == 0)
+                        || !quoted_pools.insert((quote.pool.clone(), quote.fee))
+                })
             {
                 return Err(AaveStateError::ProviderDisagreement);
             }
@@ -762,6 +986,8 @@ mod tests {
             collateral_asset: "0xaf88d065e77c8cc2239327c5edb3a432268e5831".to_string(),
             repay_amount: "1000000".to_string(),
             maximum_input_amount: "2000000".to_string(),
+            live_maximum_input_amount: "2000000".to_string(),
+            counterfactual: false,
             minimum_collateral_received: "2000000".to_string(),
             minimum_unwind_output: "1100000".to_string(),
             minimum_profit: "10000".to_string(),

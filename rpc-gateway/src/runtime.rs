@@ -1,11 +1,12 @@
 use crate::aave_state::{
     AaveAccountData, AaveExactLiquidationState, AaveExactProviderState, AaveExactRequest,
-    AaveExactReserveState, AaveExactResponse, AaveProviderScreen, AaveScreenRequest,
-    AaveScreenResponse, AaveSimulateBatchError, AaveSimulateBatchRequest,
+    AaveExactReserveState, AaveExactResponse, AaveExactUnwindQuoteState, AaveProviderScreen,
+    AaveScreenRequest, AaveScreenResponse, AaveSimulateBatchError, AaveSimulateBatchRequest,
     AaveSimulateBatchResponse, AaveSimulateBatchResult, AaveSimulateRequest, AaveSimulateResponse,
-    AaveTailRequest, AaveTailResponse, AAVE_EXACT_RESPONSE_SCHEMA, AAVE_SCREEN_RESPONSE_SCHEMA,
-    AAVE_SIMULATE_BATCH_RESPONSE_SCHEMA, AAVE_SIMULATE_RESPONSE_SCHEMA, AAVE_TAIL_RESPONSE_SCHEMA,
-    AAVE_V3_POOL_ARBITRUM,
+    AaveTailRequest, AaveTailResponse, SizeLevel, AAVE_EXACT_RESPONSE_SCHEMA,
+    AAVE_SCREEN_RESPONSE_SCHEMA, AAVE_SIMULATE_BATCH_RESPONSE_SCHEMA,
+    AAVE_SIMULATE_RESPONSE_SCHEMA, AAVE_TAIL_RESPONSE_SCHEMA, AAVE_V3_POOL_ARBITRUM,
+    MAXIMUM_REVIEWED_INPUT_WEI,
 };
 use crate::budget::GlobalBudget;
 use crate::cache::TtlCache;
@@ -33,6 +34,7 @@ use crate::source_state::{
 use crate::transport::{JsonRpcClient, RpcCallResult, TransportError};
 use ethabi::{ParamType, Token};
 use primitive_types::U256;
+use serde::Deserialize;
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -70,10 +72,14 @@ const ARBITRUM_NODE_INTERFACE: &str = "0x00000000000000000000000000000000000000c
 const ZERO_ADDRESS: &str = "0x0000000000000000000000000000000000000000";
 const UNISWAP_V3_QUOTER_V2_ARBITRUM: &str = "0x61ffe014ba17989e743c5f6cb21bf9697530b21e";
 const UNISWAP_V3_FACTORY_ARBITRUM: &str = "0x1f98431c8ad98523631ae4a59f267346ea31f984";
-const UNISWAP_WETH_USDC_POOL_500_ARBITRUM: &str = "0xc6962004f452be9203591991d15f6b388e09e8d0";
-const UNISWAP_WETH_USDC_POOL_3000_ARBITRUM: &str = "0xc473e2aee3441bf9240be85eb122abb059a3b57c";
 const PHOENIX_EXECUTOR_PACKED_CONFIG_SLOT: &str =
     "0x0000000000000000000000000000000000000000000000000000000000000002";
+const PHOENIX_EXECUTOR_MAXIMUM_INPUT_SLOT: &str =
+    "0x0000000000000000000000000000000000000000000000000000000000000008";
+const REVIEWED_ROUTE_REGISTRY: &str =
+    include_str!("../../fixtures/routes/weth_usdc_uniswap_v3.json");
+const REVIEWED_POOL_PROOFS: &str =
+    include_str!("../../fixtures/routes/arbitrum_uniswap_v3_pool_proofs.json");
 const UNISWAP_QUOTE_EXACT_INPUT_SINGLE_SELECTOR: &str = "0xc6a5026a";
 const GAS_ESTIMATE_COMPONENTS_SELECTOR: &str = "0xc94e6eeb";
 const PERCENTAGE_FACTOR: u64 = 10_000;
@@ -120,7 +126,139 @@ struct AaveSimulationEvidence {
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct AaveSimulationContext {
     packed_executor_config: String,
+    maximum_input_amount: U256,
     flash_premium_bps: u16,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct ReviewedRouteRegistryEntry {
+    legs: Vec<ReviewedRouteRegistryLeg>,
+    strategy: ReviewedRouteRegistryStrategy,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct ReviewedRouteRegistryLeg {
+    state_target: String,
+    protocol: String,
+    fee: u32,
+    token_in: String,
+    token_out: String,
+    direction: String,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct ReviewedRouteRegistryStrategy {
+    candidate_sizes: Vec<String>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct ReviewedPoolProofs {
+    schema_version: String,
+    chain_id: u64,
+    protocol: String,
+    factory: String,
+    pools: Vec<ReviewedPoolProof>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct ReviewedPoolProof {
+    token0: String,
+    token1: String,
+    fee: u32,
+    pool_address: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReviewedAaveUnwindRoute {
+    pub pool: String,
+    pub factory: String,
+    pub token0: String,
+    pub token1: String,
+    pub fee: u32,
+    pub zero_for_one: bool,
+}
+
+pub fn reviewed_aave_unwind_routes() -> Result<Vec<ReviewedAaveUnwindRoute>, GatewayError> {
+    let registry: Vec<ReviewedRouteRegistryEntry> = serde_json::from_str(REVIEWED_ROUTE_REGISTRY)
+        .map_err(|_| GatewayError::ProviderIntegrity)?;
+    let proofs: ReviewedPoolProofs =
+        serde_json::from_str(REVIEWED_POOL_PROOFS).map_err(|_| GatewayError::ProviderIntegrity)?;
+    let reviewed_sizes = SizeLevel::ALL
+        .iter()
+        .map(|level| level.amount_wei().to_string())
+        .collect::<Vec<_>>();
+    if proofs.schema_version != "phoenix.route.pool-proofs.v1"
+        || proofs.chain_id != ARBITRUM_ONE_CHAIN_ID
+        || proofs.protocol != "UniswapV3"
+        || proofs.factory != UNISWAP_V3_FACTORY_ARBITRUM
+        || registry.is_empty()
+        || registry
+            .iter()
+            .any(|route| route.strategy.candidate_sizes != reviewed_sizes)
+    {
+        return Err(GatewayError::ProviderIntegrity);
+    }
+    let reviewed_pools = registry
+        .into_iter()
+        .flat_map(|route| route.legs)
+        .filter(|leg| {
+            leg.protocol == "UniswapV3"
+                && leg.token_in == ARBITRUM_NATIVE_USDC
+                && leg.token_out == ARBITRUM_WETH
+                && matches!(leg.fee, 100 | 500 | 3_000)
+        })
+        .map(|leg| (leg.state_target, leg.fee, leg.direction))
+        .collect::<HashSet<_>>();
+    let mut routes = proofs
+        .pools
+        .into_iter()
+        .filter(|proof| {
+            let Some(zero_for_one) =
+                uniswap_zero_for_one(ARBITRUM_NATIVE_USDC, &proof.token0, &proof.token1)
+            else {
+                return false;
+            };
+            let direction = if zero_for_one {
+                "zero_for_one"
+            } else {
+                "one_for_zero"
+            };
+            reviewed_pools.contains(&(proof.pool_address.clone(), proof.fee, direction.to_string()))
+        })
+        .map(|proof| ReviewedAaveUnwindRoute {
+            zero_for_one: proof.token0 == ARBITRUM_NATIVE_USDC,
+            pool: proof.pool_address,
+            factory: proofs.factory.clone(),
+            token0: proof.token0,
+            token1: proof.token1,
+            fee: proof.fee,
+        })
+        .collect::<Vec<_>>();
+    routes.sort_by_key(|route| route.fee);
+    if routes.is_empty()
+        || routes.len() > 4
+        || routes.iter().any(|route| {
+            !matches!(route.fee, 100 | 500 | 3_000)
+                || route.pool.len() != 42
+                || !route.pool.starts_with("0x")
+        })
+        || routes
+            .windows(2)
+            .any(|pair| pair[0].fee == pair[1].fee || pair[0].pool == pair[1].pool)
+    {
+        return Err(GatewayError::ProviderIntegrity);
+    }
+    Ok(routes)
+}
+
+fn uniswap_zero_for_one(token_in: &str, token0: &str, token1: &str) -> Option<bool> {
+    if token_in == token0 && token0 != token1 {
+        Some(true)
+    } else if token_in == token1 && token0 != token1 {
+        Some(false)
+    } else {
+        None
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1439,6 +1577,29 @@ impl GatewayRuntime {
             .as_str()
             .and_then(decode_executor_packed_config)
             .ok_or(GatewayError::ProviderIntegrity)?;
+        let maximum_input_amount = self
+            .recorded_call(
+                provider,
+                RpcMethod::EthGetStorageAt,
+                json!([
+                    request.executor_address,
+                    PHOENIX_EXECUTOR_MAXIMUM_INPUT_SLOT,
+                    block_quantity.clone()
+                ]),
+                Some(block),
+                0,
+                slot,
+                None,
+                false,
+            )
+            .await
+            .map_err(|failure| map_call_failure(failure.cause))?
+            .value
+            .as_str()
+            .and_then(parse_hex_u256_word)
+            .ok_or(GatewayError::ProviderIntegrity)?;
+        let executor_state_diff =
+            aave_executor_simulation_state_diff(request, &packed, maximum_input_amount)?;
         let result = self
             .recorded_call(
                 provider,
@@ -1453,9 +1614,7 @@ impl GatewayRuntime {
                     block_quantity.clone(),
                     {
                         request.executor_address.clone(): {
-                            "stateDiff": {
-                                PHOENIX_EXECUTOR_PACKED_CONFIG_SLOT: packed.clone()
-                            }
+                            "stateDiff": executor_state_diff.clone()
                         }
                     }
                 ]),
@@ -1484,9 +1643,7 @@ impl GatewayRuntime {
                     block_quantity.clone(),
                     {
                         request.executor_address.clone(): {
-                            "stateDiff": {
-                                PHOENIX_EXECUTOR_PACKED_CONFIG_SLOT: packed
-                            }
+                            "stateDiff": executor_state_diff
                         }
                     }
                 ]),
@@ -1642,6 +1799,33 @@ impl GatewayRuntime {
             .as_str()
             .and_then(decode_executor_packed_config)
             .ok_or(GatewayError::ProviderIntegrity)?;
+        let maximum_input_amount = self
+            .paced_recorded_call(
+                provider,
+                RpcMethod::EthGetStorageAt,
+                json!([
+                    request.executor_address,
+                    PHOENIX_EXECUTOR_MAXIMUM_INPUT_SLOT,
+                    block_quantity.clone()
+                ]),
+                Some(block),
+                0,
+                slot,
+                None,
+                false,
+                pacing_deadline,
+            )
+            .await
+            .map_err(|failure| map_call_failure(failure.cause))?
+            .value
+            .as_str()
+            .and_then(parse_hex_u256_word)
+            .ok_or(GatewayError::ProviderIntegrity)?;
+        aave_executor_simulation_state_diff(
+            request,
+            &packed_executor_config,
+            maximum_input_amount,
+        )?;
         let flash_premium_bps = self
             .paced_recorded_call(
                 provider,
@@ -1668,6 +1852,7 @@ impl GatewayRuntime {
         Ok((
             AaveSimulationContext {
                 packed_executor_config,
+                maximum_input_amount,
                 flash_premium_bps,
             },
             Some(key),
@@ -1686,6 +1871,11 @@ impl GatewayRuntime {
         pacing_deadline: Instant,
     ) -> Result<AaveSimulationEvidence, GatewayError> {
         let block_quantity = format_quantity(block.number);
+        let executor_state_diff = aave_executor_simulation_state_diff(
+            request,
+            &context.packed_executor_config,
+            context.maximum_input_amount,
+        )?;
         let result = self
             .paced_recorded_call(
                 provider,
@@ -1700,9 +1890,7 @@ impl GatewayRuntime {
                     block_quantity.clone(),
                     {
                         request.executor_address.clone(): {
-                            "stateDiff": {
-                                PHOENIX_EXECUTOR_PACKED_CONFIG_SLOT: context.packed_executor_config.clone()
-                            }
+                            "stateDiff": executor_state_diff.clone()
                         }
                     }
                 ]),
@@ -1732,9 +1920,7 @@ impl GatewayRuntime {
                     block_quantity,
                     {
                         request.executor_address.clone(): {
-                            "stateDiff": {
-                                PHOENIX_EXECUTOR_PACKED_CONFIG_SLOT: context.packed_executor_config.clone()
-                            }
+                            "stateDiff": executor_state_diff
                         }
                     }
                 ]),
@@ -2028,18 +2214,19 @@ impl GatewayRuntime {
             .map(|(index, _)| index)
             .collect::<Vec<_>>();
         if !quoted_indices.is_empty() {
+            let reviewed_routes = reviewed_aave_unwind_routes()?;
             let quote_calls = quoted_indices
                 .iter()
                 .flat_map(|index| {
                     let amount = decimal_u256(&liquidations[*index].liquidator_collateral)
                         .expect("validated liquidation collateral");
-                    [500_u32, 3_000_u32].into_iter().map(move |fee| EthCall {
+                    reviewed_routes.iter().map(move |route| EthCall {
                         target: UNISWAP_V3_QUOTER_V2_ARBITRUM.to_string(),
                         calldata: encode_uniswap_quote(
                             ARBITRUM_NATIVE_USDC,
                             ARBITRUM_WETH,
                             amount,
-                            fee,
+                            route.fee,
                         ),
                     })
                 })
@@ -2051,10 +2238,22 @@ impl GatewayRuntime {
                 return Err(GatewayError::ProviderIntegrity);
             }
             for (quote_index, liquidation_index) in quoted_indices.into_iter().enumerate() {
-                liquidations[liquidation_index].uniswap_v3_fee_500_output_weth =
-                    U256::from_big_endian(&quotes[quote_index * 2][..32]).to_string();
-                liquidations[liquidation_index].uniswap_v3_fee_3000_output_weth =
-                    U256::from_big_endian(&quotes[quote_index * 2 + 1][..32]).to_string();
+                liquidations[liquidation_index].unwind_quotes = reviewed_routes
+                    .iter()
+                    .enumerate()
+                    .map(|(route_index, route)| AaveExactUnwindQuoteState {
+                        pool: route.pool.clone(),
+                        factory: route.factory.clone(),
+                        token0: route.token0.clone(),
+                        token1: route.token1.clone(),
+                        fee: route.fee,
+                        zero_for_one: route.zero_for_one,
+                        output_weth: U256::from_big_endian(
+                            &quotes[quote_index * reviewed_routes.len() + route_index][..32],
+                        )
+                        .to_string(),
+                    })
+                    .collect();
             }
         }
         let verify = self
@@ -3946,7 +4145,11 @@ fn build_aave_simulation_response(
         state_root: request.state_root.clone(),
         primary_provider_id: primary_provider_id.to_string(),
         secondary_provider_id: secondary_provider_id.to_string(),
-        evidence_mode: "DUAL_PROVIDER_FORK_VERIFIED".to_string(),
+        evidence_mode: if request.counterfactual {
+            "DUAL_PROVIDER_COUNTERFACTUAL_FORK_VERIFIED".to_string()
+        } else {
+            "DUAL_PROVIDER_FORK_VERIFIED".to_string()
+        },
         route_id: route_id.to_string(),
         calldata_hex,
         calldata_hash,
@@ -3974,14 +4177,12 @@ fn validate_aave_simulation_identity(request: &AaveSimulateRequest) -> Result<()
             && request.selected_fee == 0
             && !request.zero_for_one
     } else if request.collateral_asset == ARBITRUM_NATIVE_USDC {
-        let selected_pool = match request.selected_fee {
-            500 => UNISWAP_WETH_USDC_POOL_500_ARBITRUM,
-            3_000 => UNISWAP_WETH_USDC_POOL_3000_ARBITRUM,
-            _ => return Err(GatewayError::InvalidRequest),
-        };
-        request.selected_factory == UNISWAP_V3_FACTORY_ARBITRUM
-            && request.selected_pool == selected_pool
-            && !request.zero_for_one
+        reviewed_aave_unwind_routes()?.iter().any(|route| {
+            request.selected_factory == route.factory
+                && request.selected_pool == route.pool
+                && request.selected_fee == route.fee
+                && request.zero_for_one == route.zero_for_one
+        })
     } else {
         false
     };
@@ -3992,7 +4193,7 @@ fn validate_aave_simulation_identity(request: &AaveSimulateRequest) -> Result<()
         .as_secs();
     if request.debt_asset != ARBITRUM_WETH
         || !route_valid
-        || request.atlas_mode != !atlas_bid.is_zero()
+        || request.atlas_mode == atlas_bid.is_zero()
         || request.deadline_unix_seconds <= now
         || request.deadline_unix_seconds > now.saturating_add(120)
     {
@@ -4014,12 +4215,15 @@ fn aave_simulation_route_id(request: &AaveSimulateRequest) -> Result<String, Gat
         "collateral_asset": request.collateral_asset,
         "repay_amount": request.repay_amount,
         "maximum_input_amount": request.maximum_input_amount,
+        "live_maximum_input_amount": request.live_maximum_input_amount,
+        "counterfactual": request.counterfactual,
         "minimum_collateral_received": request.minimum_collateral_received,
         "minimum_unwind_output": request.minimum_unwind_output,
         "minimum_profit": request.minimum_profit,
         "selected_pool": request.selected_pool,
         "selected_factory": request.selected_factory,
         "selected_fee": request.selected_fee,
+        "zero_for_one": request.zero_for_one,
         "deadline": request.deadline_unix_seconds,
         "atlas_mode": request.atlas_mode,
         "atlas_bid": request.atlas_bid,
@@ -4201,6 +4405,39 @@ fn decode_executor_packed_config(value: &str) -> Option<String> {
     Some(format!("0x{}", hex::encode(bytes)))
 }
 
+fn aave_executor_simulation_state_diff(
+    request: &AaveSimulateRequest,
+    packed_executor_config: &str,
+    onchain_maximum_input: U256,
+) -> Result<Value, GatewayError> {
+    let live_maximum_input = decimal_u256(&request.live_maximum_input_amount)?;
+    let reviewed_maximum_input = U256::from(MAXIMUM_REVIEWED_INPUT_WEI);
+    if onchain_maximum_input.is_zero()
+        || onchain_maximum_input > reviewed_maximum_input
+        || live_maximum_input > onchain_maximum_input
+    {
+        return Err(GatewayError::ProviderIntegrity);
+    }
+    let mut state_diff = serde_json::Map::new();
+    state_diff.insert(
+        PHOENIX_EXECUTOR_PACKED_CONFIG_SLOT.to_string(),
+        Value::String(packed_executor_config.to_string()),
+    );
+    if request.counterfactual {
+        state_diff.insert(
+            PHOENIX_EXECUTOR_MAXIMUM_INPUT_SLOT.to_string(),
+            Value::String(u256_storage_word(reviewed_maximum_input)),
+        );
+    }
+    Ok(Value::Object(state_diff))
+}
+
+fn u256_storage_word(value: U256) -> String {
+    let mut word = [0_u8; 32];
+    value.to_big_endian(&mut word);
+    format!("0x{}", hex::encode(word))
+}
+
 fn parse_hex_u256_word(value: &str) -> Option<U256> {
     if value.len() != 66 || !value.starts_with("0x") {
         return None;
@@ -4370,11 +4607,11 @@ fn supported_aave_liquidations(
                 continue;
             }
             let flash_premium = percent_mul(amounts.actual_repay, U256::from(flash_premium_bps))?;
-            let identity_output = if collateral.asset == ARBITRUM_WETH {
-                amounts.liquidator_collateral.to_string()
-            } else {
-                "0".to_string()
-            };
+            let oracle_unwind_output = mul_div_floor(
+                checked_mul(amounts.liquidator_collateral, collateral_price)?,
+                debt_unit,
+                checked_mul(collateral_unit, debt_price)?,
+            )?;
             variants.push(AaveExactLiquidationState {
                 debt_asset: ARBITRUM_WETH.to_string(),
                 collateral_asset: collateral.asset.clone(),
@@ -4385,8 +4622,8 @@ fn supported_aave_liquidations(
                 seized_collateral: amounts.seized_before_fee.to_string(),
                 protocol_fee_collateral: amounts.protocol_fee.to_string(),
                 liquidator_collateral: amounts.liquidator_collateral.to_string(),
-                uniswap_v3_fee_500_output_weth: identity_output.clone(),
-                uniswap_v3_fee_3000_output_weth: identity_output,
+                oracle_unwind_output_weth: oracle_unwind_output.to_string(),
+                unwind_quotes: Vec::new(),
             });
         }
     }
@@ -4480,14 +4717,12 @@ fn aave_liquidation_grace_elapsed(
 }
 
 fn liquidation_size_grid(maximum_repay: U256) -> Result<Vec<U256>, GatewayError> {
-    let mut sizes = Vec::with_capacity(4);
-    for percentage in [2_500_u64, 5_000, 7_500, 10_000] {
-        let amount = percent_mul_floor(maximum_repay, U256::from(percentage))?;
-        if !amount.is_zero() && sizes.last() != Some(&amount) {
-            sizes.push(amount);
-        }
-    }
-    Ok(sizes)
+    let bounded_maximum = maximum_repay.min(U256::from(MAXIMUM_REVIEWED_INPUT_WEI));
+    Ok(SizeLevel::ALL
+        .into_iter()
+        .map(|level| U256::from(level.amount_wei()))
+        .filter(|amount| *amount <= bounded_maximum)
+        .collect())
 }
 
 fn asset_unit(decimals: u8) -> Result<U256, GatewayError> {
@@ -5423,7 +5658,15 @@ mod tests {
             let value = match method {
                 RpcMethod::EthChainId => json!(ARBITRUM_CHAIN_ID_HEX),
                 RpcMethod::EthGetCode => json!("0x60006000"),
-                RpcMethod::EthGetStorageAt => json!(test_executor_packed_config()),
+                RpcMethod::EthGetStorageAt => {
+                    if params.get(1).and_then(Value::as_str)
+                        == Some(PHOENIX_EXECUTOR_MAXIMUM_INPUT_SLOT)
+                    {
+                        json!(u256_storage_word(U256::from(MAXIMUM_REVIEWED_INPUT_WEI)))
+                    } else {
+                        json!(test_executor_packed_config())
+                    }
+                }
                 RpcMethod::EthGetBlockByNumber => {
                     let tag = params[0].as_str().unwrap();
                     let mut block = self.block_for_tag(tag);
@@ -5637,6 +5880,8 @@ mod tests {
                 collateral_asset: ARBITRUM_WETH.to_string(),
                 repay_amount: ((index + 1) * 1_000).to_string(),
                 maximum_input_amount: "10000".to_string(),
+                live_maximum_input_amount: "10000".to_string(),
+                counterfactual: false,
                 minimum_collateral_received: "1000".to_string(),
                 minimum_unwind_output: "1".to_string(),
                 minimum_profit: "1".to_string(),
@@ -5692,7 +5937,7 @@ mod tests {
             .iter()
             .all(|result| result.response.is_some() && result.error.is_none()));
         let cold_calls = client.calls();
-        assert_eq!(cold_calls.len(), 46);
+        assert_eq!(cold_calls.len(), 48);
         assert_eq!(
             cold_calls
                 .iter()
@@ -5705,7 +5950,7 @@ mod tests {
                 .iter()
                 .filter(|call| call.method == RpcMethod::EthGetStorageAt)
                 .count(),
-            2
+            4
         );
 
         let second = runtime
@@ -6878,12 +7123,14 @@ mod tests {
             collateral_asset: ARBITRUM_NATIVE_USDC.to_string(),
             repay_amount: "1000000".to_string(),
             maximum_input_amount: "2000000".to_string(),
+            live_maximum_input_amount: "2000000".to_string(),
+            counterfactual: false,
             minimum_collateral_received: "2000000".to_string(),
             minimum_unwind_output: "1100000".to_string(),
             minimum_profit: "50001000".to_string(),
             expected_profit: "100000000".to_string(),
             retained_profit_floor: "1000".to_string(),
-            selected_pool: UNISWAP_WETH_USDC_POOL_500_ARBITRUM.to_string(),
+            selected_pool: "0xc6962004f452be9203591991d15f6b388e09e8d0".to_string(),
             selected_factory: UNISWAP_V3_FACTORY_ARBITRUM.to_string(),
             selected_fee: 500,
             zero_for_one: false,
@@ -6931,6 +7178,36 @@ mod tests {
             unpaused,
             format!("0x{}0000{}", "00".repeat(10), &AAVE_V3_POOL_ARBITRUM[2..])
         );
+        let direct_state_diff =
+            aave_executor_simulation_state_diff(&request, &unpaused, U256::from(2_000_000_u64))
+                .unwrap();
+        assert_eq!(
+            direct_state_diff
+                .get(PHOENIX_EXECUTOR_PACKED_CONFIG_SLOT)
+                .and_then(Value::as_str),
+            Some(unpaused.as_str())
+        );
+        assert!(direct_state_diff
+            .get(PHOENIX_EXECUTOR_MAXIMUM_INPUT_SLOT)
+            .is_none());
+
+        let mut counterfactual = request.clone();
+        counterfactual.repay_amount = "3000000".to_string();
+        counterfactual.maximum_input_amount = MAXIMUM_REVIEWED_INPUT_WEI.to_string();
+        counterfactual.counterfactual = true;
+        counterfactual.validate().unwrap();
+        let counterfactual_state_diff = aave_executor_simulation_state_diff(
+            &counterfactual,
+            &unpaused,
+            U256::from(2_000_000_u64),
+        )
+        .unwrap();
+        assert_eq!(
+            counterfactual_state_diff
+                .get(PHOENIX_EXECUTOR_MAXIMUM_INPUT_SLOT)
+                .and_then(Value::as_str),
+            Some(u256_storage_word(U256::from(MAXIMUM_REVIEWED_INPUT_WEI)).as_str())
+        );
 
         let request_type = ParamType::Tuple(vec![
             ParamType::FixedBytes(32),
@@ -6975,6 +7252,37 @@ mod tests {
             panic!("identity liquidation tuple")
         };
         assert!(fields[12].clone().into_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn reviewed_aave_routes_cover_every_verified_fee_and_derive_both_directions() {
+        let routes = reviewed_aave_unwind_routes().unwrap();
+        assert_eq!(
+            routes.iter().map(|route| route.fee).collect::<Vec<_>>(),
+            vec![100, 500, 3_000]
+        );
+        assert!(routes.iter().all(|route| {
+            route.factory == UNISWAP_V3_FACTORY_ARBITRUM
+                && route.token0 == ARBITRUM_WETH
+                && route.token1 == ARBITRUM_NATIVE_USDC
+                && !route.zero_for_one
+        }));
+        assert_eq!(
+            uniswap_zero_for_one(ARBITRUM_NATIVE_USDC, ARBITRUM_NATIVE_USDC, ARBITRUM_WETH),
+            Some(true)
+        );
+        assert_eq!(
+            uniswap_zero_for_one(ARBITRUM_NATIVE_USDC, ARBITRUM_WETH, ARBITRUM_NATIVE_USDC),
+            Some(false)
+        );
+        assert_eq!(
+            uniswap_zero_for_one(
+                ARBITRUM_NATIVE_USDC,
+                ARBITRUM_WETH,
+                "0x1111111111111111111111111111111111111111"
+            ),
+            None
+        );
     }
 
     fn aave_configuration(
@@ -7076,10 +7384,7 @@ mod tests {
 
     #[test]
     fn aave_size_grid_is_bounded_deduplicated_and_clamped() {
-        assert_eq!(
-            liquidation_size_grid(U256::from(3)).unwrap(),
-            vec![U256::from(1), U256::from(2), U256::from(3)]
-        );
+        assert!(liquidation_size_grid(U256::from(3)).unwrap().is_empty());
         let (account, reserves) = exact_aave_fixture(CLOSE_FACTOR_HF_THRESHOLD_WAD);
         let cap = U256::from(3) * U256::exp10(18);
         let variants =
@@ -7090,10 +7395,12 @@ mod tests {
                 .filter(|variant| variant.collateral_asset == collateral)
                 .map(|variant| decimal_u256(&variant.actual_repay_amount).unwrap())
                 .collect::<Vec<_>>();
-            assert_eq!(sizes.len(), 4);
-            assert_eq!(sizes.last(), Some(&cap));
+            assert_eq!(sizes.len(), SizeLevel::ALL.len());
+            assert_eq!(sizes.last(), Some(&U256::from(MAXIMUM_REVIEWED_INPUT_WEI)));
             assert!(sizes.windows(2).all(|pair| pair[0] < pair[1]));
-            assert!(sizes.iter().all(|size| *size <= cap));
+            assert!(sizes
+                .iter()
+                .all(|size| *size <= U256::from(MAXIMUM_REVIEWED_INPUT_WEI)));
         }
     }
 
@@ -7110,7 +7417,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             decimal_u256(&full_usdc.actual_repay_amount).unwrap(),
-            U256::from(10) * U256::exp10(18)
+            U256::from(MAXIMUM_REVIEWED_INPUT_WEI)
         );
 
         let (above_boundary, reserves) = exact_aave_fixture(CLOSE_FACTOR_HF_THRESHOLD_WAD + 1);
@@ -7129,7 +7436,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             decimal_u256(&half_usdc.actual_repay_amount).unwrap(),
-            U256::from(5) * U256::exp10(18)
+            U256::from(MAXIMUM_REVIEWED_INPUT_WEI)
         );
         assert_eq!(
             percent_mul(U256::one(), U256::from(5_000)).unwrap(),
@@ -7201,7 +7508,7 @@ mod tests {
         assert_eq!(fee.liquidator_collateral, U256::one());
 
         let (account, reserves) = exact_aave_fixture(CLOSE_FACTOR_HF_THRESHOLD_WAD);
-        let cap = U256::exp10(18);
+        let cap = U256::from(MAXIMUM_REVIEWED_INPUT_WEI);
         let normal =
             supported_aave_liquidations(&account, &reserves, cap, U256::zero(), 0, 5).unwrap();
         let emode =
