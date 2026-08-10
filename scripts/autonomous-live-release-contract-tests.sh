@@ -19,6 +19,7 @@ for path in \
   live-executor/schema/005_closed_loop_economic_control.sql \
   live-executor/src/economic_control.rs \
   live-executor/src/autonomous_live_control_main.rs \
+  rpc-gateway/src/aave_state.rs \
   scripts/deploy-release.sh \
   scripts/rollback-release.sh \
   scripts/activate-economic-canary.sh \
@@ -62,6 +63,7 @@ rollback = read("scripts/rollback-release.sh")
 activate = read("scripts/activate-economic-canary.sh")
 control = read("live-executor/src/autonomous_live_control_main.rs")
 state = read("live-executor/src/economic_control.rs")
+canonical_state = read("rpc-gateway/src/aave_state.rs")
 schema = read("live-executor/schema/005_closed_loop_economic_control.sql")
 health = read("scripts/production-healthcheck.sh")
 monitor = read("scripts/economic-dashboard-loop.sh")
@@ -450,7 +452,15 @@ phases = (
     "DISARMED_FAILURE",
 )
 for phase in phases:
-    require(phase in state and phase in schema, f"economic_phase_missing:{phase}")
+    require(phase in canonical_state and phase in schema, f"economic_phase_missing:{phase}")
+
+require(
+    "pub use rpc_gateway::aave_state::{" in state
+    and "EconomicPhase" in state
+    and "SizeLevel" in state
+    and "MAXIMUM_REVIEWED_INPUT_WEI" in state,
+    "canonical_economic_state_reexport_missing",
+)
 
 for amount in (
     "100_000_000_000_000",
@@ -461,7 +471,7 @@ for amount in (
     "5_000_000_000_000_000",
     "10_000_000_000_000_000",
 ):
-    require(amount in state, f"ladder_amount_missing:{amount}")
+    require(amount in canonical_state, f"ladder_amount_missing:{amount}")
 for threshold in (
     "MINIMUM_OBSERVATIONS: u64 = 100",
     "MINIMUM_VALID_ACCEPTANCE_BPS: u16 = 9_990",
