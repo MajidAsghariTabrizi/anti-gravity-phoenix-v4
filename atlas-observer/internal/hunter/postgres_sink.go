@@ -44,6 +44,91 @@ func (s *PostgresSignalSink) Close() { s.pool.Close() }
 
 func (s *PostgresSignalSink) AtlasAuctions() <-chan *observer.LedgerRecord { return s.atlasAuctions }
 
+type liveSizeAuthorityRow struct {
+	lane                string
+	armed               bool
+	killSwitch          bool
+	maximumInputAmount  string
+	economicPhase       string
+	economicInputAmount string
+}
+
+func (s *PostgresSignalSink) CurrentAaveLiveMaximumInputAmount(ctx context.Context) (string, error) {
+	rows, err := s.pool.Query(ctx, `
+		SELECT lane, armed, kill_switch,
+		       maximum_input_amount::text AS maximum_input_amount,
+		       economic.phase AS economic_phase,
+		       economic.current_input_wei::text AS economic_input_amount
+		FROM live_canary.revenue_lane_controls
+		CROSS JOIN live_canary.economic_control AS economic
+		WHERE economic.singleton
+		  AND lane IN ('aave_liquidation', 'atlas_solver')
+		ORDER BY lane
+	`)
+	if err != nil {
+		return "", errors.New("current Aave live size authority is unavailable")
+	}
+	defer rows.Close()
+	states := make([]liveSizeAuthorityRow, 0, 2)
+	for rows.Next() {
+		var state liveSizeAuthorityRow
+		if err := rows.Scan(
+			&state.lane,
+			&state.armed,
+			&state.killSwitch,
+			&state.maximumInputAmount,
+			&state.economicPhase,
+			&state.economicInputAmount,
+		); err != nil {
+			return "", errors.New("current Aave live size authority is invalid")
+		}
+		states = append(states, state)
+	}
+	if err := rows.Err(); err != nil {
+		return "", errors.New("current Aave live size authority is unavailable")
+	}
+	return validatedAaveLiveMaximumInputAmount(states)
+}
+
+func validatedAaveLiveMaximumInputAmount(states []liveSizeAuthorityRow) (string, error) {
+	if len(states) != 2 || states[0].lane != "aave_liquidation" || states[1].lane != "atlas_solver" {
+		return "", errors.New("current Aave revenue lane authority is incomplete")
+	}
+	reviewed, reviewedOK := newBigUint(maximumReviewedInputWei)
+	if !reviewedOK {
+		return "", errors.New("reviewed Aave size authority is invalid")
+	}
+	closed := true
+	active := true
+	for _, state := range states {
+		closed = closed && !state.armed && state.killSwitch
+		active = active && state.armed && !state.killSwitch
+		if state.economicPhase != states[0].economicPhase || state.economicInputAmount != states[0].economicInputAmount {
+			return "", errors.New("economic size authority diverged across revenue lanes")
+		}
+	}
+	if closed {
+		// The gateway wire contract requires a positive live maximum. One wei is
+		// below every reviewed SizeLevel, so every evaluated size remains
+		// counterfactual and cannot materialize a live Candidate while disarmed.
+		return "1", nil
+	}
+	if !active || !strings.HasPrefix(states[0].economicPhase, "LIVE_") {
+		return "", errors.New("Aave revenue lane authority is partially armed")
+	}
+	economic, economicOK := newBigUint(states[0].economicInputAmount)
+	if !economicOK || economic.Sign() <= 0 || economic.Cmp(reviewed) > 0 {
+		return "", errors.New("economic Aave size authority is invalid")
+	}
+	for _, state := range states {
+		laneMaximum, laneOK := newBigUint(state.maximumInputAmount)
+		if !laneOK || laneMaximum.Cmp(economic) != 0 {
+			return "", errors.New("revenue lane and economic size authorities diverged")
+		}
+	}
+	return economic.String(), nil
+}
+
 func (s *PostgresSignalSink) RecordAtlasAuction(ctx context.Context, record *observer.LedgerRecord) error {
 	if record == nil || record.AuctionID == "" || record.UserOpHash == "" || record.AuctionDeadlineBlock == "" || record.NotificationSHA256 == "" {
 		return errors.New("Atlas auction identity is incomplete")
@@ -159,7 +244,7 @@ func (s *PostgresSignalSink) RecordAaveSignal(ctx context.Context, record signal
 			('prefiltered','exact_pending','fork_pending','incomplete')
 	`, signalID, identityBody, record.Cursor, record.Borrower, record.Block,
 		record.BlockHash, stateRoot, upper, expected, conservative, s.floor,
-		evidenceMode, record.TerminalOutcome, rejectionReason(record.TerminalOutcome),
+		evidenceMode, persistedTerminalOutcome(record), signalRejectionReason(record),
 		hex.EncodeToString(evidence[:]), record.ObservedAt)
 	if err != nil {
 		return err
@@ -312,14 +397,28 @@ func deterministicUUID(digest [32]byte) string {
 	return fmt.Sprintf("%s-%s-%s-%s-%s", hex.EncodeToString(bytes[0:4]), hex.EncodeToString(bytes[4:6]), hex.EncodeToString(bytes[6:8]), hex.EncodeToString(bytes[8:10]), hex.EncodeToString(bytes[10:16]))
 }
 
-func rejectionReason(outcome string) any {
-	if outcome == "economic_rejection" {
+func persistedTerminalOutcome(record signal) string {
+	switch record.TerminalOutcome {
+	case "counterfactual_positive":
+		return "economic_rejection"
+	case "atlas_evidence_rejection":
+		return "fork_rejection"
+	default:
+		return record.TerminalOutcome
+	}
+}
+
+func signalRejectionReason(record signal) any {
+	if record.AuthorityRejectionReason != "" {
+		return record.AuthorityRejectionReason
+	}
+	if record.TerminalOutcome == "economic_rejection" {
 		return "zero_cost_upper_bound_below_floor"
 	}
-	if outcome == "incomplete" {
+	if record.TerminalOutcome == "incomplete" {
 		return "economic_bound_incomplete"
 	}
-	if outcome == "atlas_evidence_rejection" {
+	if record.TerminalOutcome == "atlas_evidence_rejection" {
 		return "atlas_callback_evidence_unavailable"
 	}
 	return nil

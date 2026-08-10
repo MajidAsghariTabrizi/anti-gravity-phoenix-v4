@@ -58,7 +58,7 @@ pub struct ExecutorConfigurationSnapshot {
     pub paused: bool,
     pub maximum_input_amount: u128,
     pub searcher_authorized: bool,
-    pub asset_approved: bool,
+    pub assets_approved: Vec<bool>,
     pub router_approved: bool,
     pub factories_approved: Vec<bool>,
     pub pools_approved: Vec<bool>,
@@ -445,7 +445,7 @@ impl HttpExecutionRpc {
         &self,
         executor: CanonicalAddress,
         searcher: CanonicalAddress,
-        asset: CanonicalAddress,
+        assets: &[CanonicalAddress],
         router: CanonicalAddress,
         legs: &[ValidatedLeg],
     ) -> Result<ExecutorConfigurationSnapshot, RpcError> {
@@ -475,6 +475,11 @@ impl HttpExecutionRpc {
             );
             pools_approved.push(call_pool(self, executor, leg).await?);
         }
+        let mut assets_approved = Vec::with_capacity(assets.len());
+        for asset in assets {
+            assets_approved
+                .push(call_bool(self, executor, "approvedAssets", &[address_token(*asset)]).await?);
+        }
         Ok(ExecutorConfigurationSnapshot {
             runtime_code_hash: hex::encode(Sha256::digest(&code)),
             owner: call_address(self, executor, "owner", &[]).await?,
@@ -488,8 +493,7 @@ impl HttpExecutionRpc {
                 &[address_token(searcher)],
             )
             .await?,
-            asset_approved: call_bool(self, executor, "approvedAssets", &[address_token(asset)])
-                .await?,
+            assets_approved,
             router_approved: call_bool(self, executor, "approvedRouters", &[address_token(router)])
                 .await?,
             factories_approved,

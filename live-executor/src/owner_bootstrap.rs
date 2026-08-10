@@ -8,6 +8,7 @@ use crate::signer::{TransactionDraft, TransactionSigner};
 use crate::ARBITRUM_ONE_CHAIN_ID;
 use async_trait::async_trait;
 use ethabi::{ParamType, Token};
+use rpc_gateway::runtime::reviewed_aave_unwind_routes;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashSet};
@@ -25,8 +26,8 @@ pub const UNPAUSE_ACK_ENV: &str = "PHOENIX_EXECUTOR_OWNER_UNPAUSE_ACK";
 pub const UNPAUSE_ACK: &str = "UNPAUSE_CONFIGURED_EXECUTOR_42161";
 pub const PAUSE_ACK_ENV: &str = "PHOENIX_EXECUTOR_OWNER_PAUSE_ACK";
 pub const PAUSE_ACK: &str = "PAUSE_EXECUTOR_AFTER_FAILED_DEPLOY_42161";
-const OWNER_EVIDENCE_SCHEMA: &str = "phoenix.executor-owner-bootstrap-evidence.v1";
-const OWNER_PLAN_SCHEMA: &str = "phoenix.executor-owner-plan.v2";
+const OWNER_EVIDENCE_SCHEMA: &str = "phoenix.executor-owner-bootstrap-evidence.v2";
+const OWNER_PLAN_SCHEMA: &str = "phoenix.executor-owner-plan.v3";
 
 const OWNER_ENVIRONMENT_NAMES: &[&str] = &[
     "CHAIN_ID",
@@ -105,6 +106,7 @@ struct OwnerBootstrapContext {
     release_sha: String,
     policy_hash: String,
     settlement_asset: CanonicalAddress,
+    assets: Vec<CanonicalAddress>,
     routers: Vec<CanonicalAddress>,
     legs: Vec<ValidatedLeg>,
 }
@@ -225,6 +227,8 @@ impl OwnerBootstrapContext {
         if maximum_input > policy.maximum_input {
             return Err(OwnerBootstrapError::MaximumInputExceedsPolicy);
         }
+        let assets = reviewed_owner_assets(&policy)?;
+        let legs = reviewed_owner_legs(&policy)?;
         Ok(Self {
             chain_id,
             wallet,
@@ -248,8 +252,9 @@ impl OwnerBootstrapContext {
             release_sha,
             policy_hash: policy.hash,
             settlement_asset: policy.settlement_asset,
+            assets,
             routers,
-            legs: policy.legs,
+            legs,
         })
     }
 
@@ -281,7 +286,7 @@ struct RoutePolicy {
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum OwnerActionKind {
     Searcher,
-    Asset,
+    Asset(usize),
     Router(usize),
     Factory(usize),
     Pool(usize),
@@ -350,7 +355,7 @@ impl OwnerBootstrapRpc for HttpExecutionRpc {
         self.executor_configuration_snapshot(
             context.executor,
             context.wallet,
-            context.settlement_asset,
+            &context.assets,
             router,
             &context.legs,
         )
@@ -679,7 +684,7 @@ async fn read_validated_snapshots<R: OwnerBootstrapRpc>(
             || snapshot.paused != first.paused
             || snapshot.maximum_input_amount != first.maximum_input_amount
             || snapshot.searcher_authorized != first.searcher_authorized
-            || snapshot.asset_approved != first.asset_approved
+            || snapshot.assets_approved != first.assets_approved
             || snapshot.factories_approved != first.factories_approved
             || snapshot.pools_approved != first.pools_approved
         {
@@ -693,7 +698,8 @@ fn validate_snapshot_shape(
     context: &OwnerBootstrapContext,
     snapshot: &ExecutorConfigurationSnapshot,
 ) -> Result<(), OwnerBootstrapError> {
-    if snapshot.factories_approved.len() != context.legs.len()
+    if snapshot.assets_approved.len() != context.assets.len()
+        || snapshot.factories_approved.len() != context.legs.len()
         || snapshot.pools_approved.len() != context.legs.len()
     {
         return Err(OwnerBootstrapError::RpcDisagreement);
@@ -725,7 +731,7 @@ fn configuration_complete(
         return false;
     };
     first.searcher_authorized
-        && first.asset_approved
+        && first.assets_approved.iter().all(|approved| *approved)
         && first.maximum_input_amount == context.maximum_input
         && first.factories_approved.iter().all(|approved| *approved)
         && first.pools_approved.iter().all(|approved| *approved)
@@ -735,22 +741,22 @@ fn configuration_complete(
 fn desired_configuration_actions(
     context: &OwnerBootstrapContext,
 ) -> Result<Vec<OwnerAction>, OwnerBootstrapError> {
-    let mut actions = vec![
-        action(
-            OwnerActionKind::Searcher,
-            "authorize autonomous searcher",
-            "setSearcher",
-            &[ParamType::Address, ParamType::Bool],
-            &[address_token(context.wallet), Token::Bool(true)],
-        ),
-        action(
-            OwnerActionKind::Asset,
-            "approve settlement asset",
+    let mut actions = vec![action(
+        OwnerActionKind::Searcher,
+        "authorize autonomous searcher",
+        "setSearcher",
+        &[ParamType::Address, ParamType::Bool],
+        &[address_token(context.wallet), Token::Bool(true)],
+    )];
+    for (index, asset) in context.assets.iter().enumerate() {
+        actions.push(action(
+            OwnerActionKind::Asset(index),
+            "approve reviewed execution asset",
             "setAsset",
             &[ParamType::Address, ParamType::Bool],
-            &[address_token(context.settlement_asset), Token::Bool(true)],
-        ),
-    ];
+            &[address_token(*asset), Token::Bool(true)],
+        ));
+    }
     for (index, router) in context.routers.iter().enumerate() {
         actions.push(action(
             OwnerActionKind::Router(index),
@@ -833,7 +839,7 @@ fn action_needed(
     let first = &snapshots[0];
     match candidate.kind {
         OwnerActionKind::Searcher => !first.searcher_authorized,
-        OwnerActionKind::Asset => !first.asset_approved,
+        OwnerActionKind::Asset(index) => !first.assets_approved[index],
         OwnerActionKind::Router(index) => !snapshots[index].router_approved,
         OwnerActionKind::Factory(index) => !first.factories_approved[index],
         OwnerActionKind::Pool(index) => !first.pools_approved[index],
@@ -903,12 +909,13 @@ fn snapshot_evidence(
         "paused": first.paused,
         "maximum_input_amount": first.maximum_input_amount.to_string(),
         "expected_searcher": context.wallet.to_string(),
-        "expected_asset": context.settlement_asset.to_string(),
+        "settlement_asset": context.settlement_asset.to_string(),
+        "expected_assets": context.assets.iter().map(ToString::to_string).collect::<Vec<_>>(),
         "expected_routers": context.routers.iter().map(ToString::to_string).collect::<Vec<_>>(),
         "expected_factories": expected_factories,
         "expected_pools": context.legs.iter().map(|leg| leg.pool.to_string()).collect::<Vec<_>>(),
         "searcher_authorized": first.searcher_authorized,
-        "asset_approved": first.asset_approved,
+        "assets_approved": first.assets_approved,
         "routers_approved": snapshots.iter().all(|snapshot| snapshot.router_approved),
         "factories_approved": first.factories_approved.iter().all(|value| *value),
         "pools_approved": first.pools_approved.iter().all(|value| *value),
@@ -1004,6 +1011,55 @@ fn parse_policy() -> Result<RoutePolicy, OwnerBootstrapError> {
         settlement_asset,
         legs,
     })
+}
+
+fn reviewed_owner_assets(
+    policy: &RoutePolicy,
+) -> Result<Vec<CanonicalAddress>, OwnerBootstrapError> {
+    let mut assets = vec![policy.settlement_asset];
+    for route in reviewed_aave_unwind_routes().map_err(|_| OwnerBootstrapError::InvalidPolicy)? {
+        for token in [route.token0, route.token1] {
+            let token = parse_address(&token)?;
+            if !assets.contains(&token) {
+                assets.push(token);
+            }
+        }
+    }
+    if assets.len() != 2 {
+        return Err(OwnerBootstrapError::InvalidPolicy);
+    }
+    Ok(assets)
+}
+
+fn reviewed_owner_legs(policy: &RoutePolicy) -> Result<Vec<ValidatedLeg>, OwnerBootstrapError> {
+    let mut legs = policy.legs.clone();
+    for route in reviewed_aave_unwind_routes().map_err(|_| OwnerBootstrapError::InvalidPolicy)? {
+        let pool = parse_address(&route.pool)?;
+        let factory = parse_address(&route.factory)?;
+        let token0 = parse_address(&route.token0)?;
+        let token1 = parse_address(&route.token1)?;
+        if let Some(existing) = legs.iter().find(|leg| leg.pool == pool) {
+            let same_pair = (existing.token_in == token0 && existing.token_out == token1)
+                || (existing.token_in == token1 && existing.token_out == token0);
+            if existing.factory != Some(factory) || existing.fee != route.fee || !same_pair {
+                return Err(OwnerBootstrapError::InvalidPolicy);
+            }
+            continue;
+        }
+        legs.push(ValidatedLeg {
+            pool,
+            factory: Some(factory),
+            token_in: if route.zero_for_one { token0 } else { token1 },
+            token_out: if route.zero_for_one { token1 } else { token0 },
+            fee: route.fee,
+            zero_for_one: route.zero_for_one,
+            min_amount_out: 1,
+        });
+    }
+    if legs.len() != 3 {
+        return Err(OwnerBootstrapError::InvalidPolicy);
+    }
+    Ok(legs)
 }
 
 fn address_token(address: CanonicalAddress) -> Token {
@@ -1402,6 +1458,7 @@ mod tests {
             release_sha: "a".repeat(40),
             policy_hash: "b".repeat(64),
             settlement_asset: address(ASSET),
+            assets: vec![address(ASSET), address(TOKEN)],
             routers: vec![address(ROUTER)],
             legs: vec![
                 ValidatedLeg {
@@ -1437,7 +1494,7 @@ mod tests {
             paused,
             maximum_input_amount: context.maximum_input,
             searcher_authorized: true,
-            asset_approved: true,
+            assets_approved: vec![true; context.assets.len()],
             router_approved: true,
             factories_approved: vec![true; context.legs.len()],
             pools_approved: vec![true; context.legs.len()],
@@ -1786,7 +1843,7 @@ mod tests {
     async fn unpause_is_blocked_until_configuration_is_complete() {
         let context = context();
         let mut snapshot = complete_snapshot(&context, true);
-        snapshot.asset_approved = false;
+        snapshot.assets_approved[1] = false;
         let rpc = MockRpc::new(snapshot);
         assert_eq!(
             execute_mutation(&context, &rpc, &test_signer(), OwnerMutation::Unpause)
@@ -1860,6 +1917,33 @@ mod tests {
             OwnerBootstrapContext::from_values(&values).expect_err("duplicate routers"),
             OwnerBootstrapError::InvalidRouterSet
         );
+    }
+
+    #[test]
+    fn owner_context_includes_reviewed_aave_assets_and_all_verified_unwind_pools() {
+        let context = OwnerBootstrapContext::from_values(&full_values()).expect("owner context");
+        assert_eq!(context.assets.len(), 2);
+        assert!(context
+            .assets
+            .contains(&address("0x82af49447d8a07e3bd95bd0d56f35241523fbab1")));
+        assert!(context
+            .assets
+            .contains(&address("0xaf88d065e77c8cc2239327c5edb3a432268e5831")));
+        assert_eq!(context.legs.len(), 3);
+        assert_eq!(
+            context.legs.iter().map(|leg| leg.fee).collect::<Vec<_>>(),
+            vec![500, 3_000, 100]
+        );
+        let fee_100 = context
+            .legs
+            .iter()
+            .find(|leg| leg.fee == 100)
+            .expect("reviewed fee-100 Aave unwind");
+        assert_eq!(
+            fee_100.pool,
+            address("0x6f38e884725a116c9c7fbf208e79fe8828a2595f")
+        );
+        assert!(!fee_100.zero_for_one);
     }
 
     #[test]

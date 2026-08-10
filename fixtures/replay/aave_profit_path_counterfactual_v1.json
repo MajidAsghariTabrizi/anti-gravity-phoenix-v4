@@ -1,0 +1,86 @@
+{
+  "schema_version": "phoenix.aave-profit-path-replay.v1",
+  "retained_profit_floor_wei": "50",
+  "economic_reserve_bps": 1000,
+  "scheduler": {
+    "cold_revisit_ms": 60000,
+    "priority_slot_ms": 10000,
+    "maximum_hot_revisit_ms": 20000,
+    "state_requests_per_minute": 12,
+    "before_scheduler_requests_per_minute": 2,
+    "after_scheduler_requests_per_minute": 7
+  },
+  "opportunities": [
+    {
+      "id": "fixed-cost-breaks-at-small",
+      "sizes": [
+        {
+          "reviewed_size": "100000000000000",
+          "routes": [
+            {"fee": 100, "post_flash_edge_wei": "140", "execution_cost_wei": "100"},
+            {"fee": 500, "post_flash_edge_wei": "130", "execution_cost_wei": "100"},
+            {"fee": 3000, "post_flash_edge_wei": "120", "execution_cost_wei": "100"}
+          ]
+        },
+        {
+          "reviewed_size": "250000000000000",
+          "routes": [
+            {"fee": 100, "post_flash_edge_wei": "190", "execution_cost_wei": "100"},
+            {"fee": 500, "post_flash_edge_wei": "210", "execution_cost_wei": "115"},
+            {"fee": 3000, "post_flash_edge_wei": "225", "execution_cost_wei": "150"}
+          ]
+        }
+      ]
+    },
+    {
+      "id": "fixed-cost-breaks-at-medium",
+      "sizes": [
+        {
+          "reviewed_size": "100000000000000",
+          "routes": [
+            {"fee": 100, "post_flash_edge_wei": "100", "execution_cost_wei": "110"},
+            {"fee": 500, "post_flash_edge_wei": "120", "execution_cost_wei": "120"},
+            {"fee": 3000, "post_flash_edge_wei": "130", "execution_cost_wei": "140"}
+          ]
+        },
+        {
+          "reviewed_size": "250000000000000",
+          "routes": [
+            {"fee": 100, "post_flash_edge_wei": "150", "execution_cost_wei": "110"},
+            {"fee": 500, "post_flash_edge_wei": "170", "execution_cost_wei": "140"},
+            {"fee": 3000, "post_flash_edge_wei": "180", "execution_cost_wei": "160"}
+          ]
+        },
+        {
+          "reviewed_size": "500000000000000",
+          "routes": [
+            {"fee": 100, "post_flash_edge_wei": "210", "execution_cost_wei": "110"},
+            {"fee": 500, "post_flash_edge_wei": "220", "execution_cost_wei": "140"},
+            {"fee": 3000, "post_flash_edge_wei": "230", "execution_cost_wei": "175"}
+          ]
+        }
+      ]
+    },
+    {
+      "id": "fixed-cost-still-dominates",
+      "sizes": [
+        {
+          "reviewed_size": "100000000000000",
+          "routes": [
+            {"fee": 100, "post_flash_edge_wei": "80", "execution_cost_wei": "100"},
+            {"fee": 500, "post_flash_edge_wei": "90", "execution_cost_wei": "110"},
+            {"fee": 3000, "post_flash_edge_wei": "100", "execution_cost_wei": "130"}
+          ]
+        },
+        {
+          "reviewed_size": "10000000000000000",
+          "routes": [
+            {"fee": 100, "post_flash_edge_wei": "145", "execution_cost_wei": "100"},
+            {"fee": 500, "post_flash_edge_wei": "150", "execution_cost_wei": "110"},
+            {"fee": 3000, "post_flash_edge_wei": "165", "execution_cost_wei": "130"}
+          ]
+        }
+      ]
+    }
+  ]
+}

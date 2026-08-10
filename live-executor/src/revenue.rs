@@ -4,14 +4,16 @@ use crate::config::SafetyLimits;
 use crate::model::{CanonicalAddress, ValidatedLeg};
 use crate::rpc::{ExecutionRpc, HttpExecutionRpc, IndexedRpcLog, RpcError};
 use crate::signer::TransactionSigner;
+#[cfg(test)]
+use crate::ARBITRUM_UNISWAP_V3_FACTORY_ADDRESS;
 use crate::{
     ARBITRUM_ATLAS_DAPP_CONTROL_ADDRESS, ARBITRUM_ATLAS_V1_6_4_ADDRESS,
-    ARBITRUM_NATIVE_USDC_ADDRESS, ARBITRUM_UNISWAP_V3_FACTORY_ADDRESS, ARBITRUM_WETH_ADDRESS,
-    CURRENT_ROUTE_POOL_3000_ADDRESS, CURRENT_ROUTE_POOL_500_ADDRESS,
+    ARBITRUM_NATIVE_USDC_ADDRESS, ARBITRUM_WETH_ADDRESS,
 };
 use chrono::{DateTime, Utc};
 use ethabi::{ParamType, Token};
 use primitive_types::U256;
+use rpc_gateway::runtime::reviewed_aave_unwind_routes;
 use serde::Deserialize;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -907,21 +909,23 @@ fn reviewed_atlas_aave_legs(
 
     let native_usdc =
         CanonicalAddress::parse(ARBITRUM_NATIVE_USDC_ADDRESS).map_err(|_| RevenueError::Data)?;
-    let factory = CanonicalAddress::parse(ARBITRUM_UNISWAP_V3_FACTORY_ADDRESS)
-        .map_err(|_| RevenueError::Data)?;
     let [leg] = identity.unwind_legs.as_slice() else {
         return Err(RevenueError::Data);
     };
-    let expected_pool = match leg.fee {
-        500 => CURRENT_ROUTE_POOL_500_ADDRESS,
-        3_000 => CURRENT_ROUTE_POOL_3000_ADDRESS,
-        _ => return Err(RevenueError::Data),
-    };
+    let reviewed_route = reviewed_aave_unwind_routes()
+        .map_err(|_| RevenueError::Data)?
+        .into_iter()
+        .find(|route| route.fee == leg.fee)
+        .ok_or(RevenueError::Data)?;
+    let expected_pool =
+        CanonicalAddress::parse(&reviewed_route.pool).map_err(|_| RevenueError::Data)?;
+    let factory =
+        CanonicalAddress::parse(&reviewed_route.factory).map_err(|_| RevenueError::Data)?;
     if identity.collateral_asset != native_usdc
-        || leg.pool != CanonicalAddress::parse(expected_pool).map_err(|_| RevenueError::Data)?
+        || leg.pool != expected_pool
         || leg.token_in != native_usdc
         || leg.token_out != weth
-        || leg.zero_for_one
+        || leg.zero_for_one != reviewed_route.zero_for_one
         || leg.minimum_amount_out == 0
         || leg.minimum_amount_out != identity.minimum_unwind_output
     {
@@ -1429,28 +1433,27 @@ mod tests {
 
     #[test]
     fn aave_atlas_acceptance_binds_exact_reviewed_collateral_route() {
-        for (fee, pool) in [
-            (500, CURRENT_ROUTE_POOL_500_ADDRESS),
-            (3_000, CURRENT_ROUTE_POOL_3000_ADDRESS),
-        ] {
-            let request = atlas_native_usdc_request(fee, pool);
+        let reviewed = reviewed_aave_unwind_routes().expect("reviewed Aave routes");
+        assert_eq!(reviewed.len(), 3);
+        for route in &reviewed {
+            let request = atlas_native_usdc_request(route.fee, &route.pool);
             validate_test_request(&claimed_with_request(&request), &safety_limits())
                 .expect("reviewed native USDC route");
         }
 
-        let mut request = atlas_native_usdc_request(500, CURRENT_ROUTE_POOL_500_ADDRESS);
-        request.unwind_legs[0].pool = address(CURRENT_ROUTE_POOL_3000_ADDRESS);
+        let mut request = atlas_native_usdc_request(reviewed[0].fee, &reviewed[0].pool);
+        request.unwind_legs[0].pool = address(&reviewed[1].pool);
         assert!(validate_test_request(&claimed_with_request(&request), &safety_limits()).is_err());
 
-        request = atlas_native_usdc_request(500, CURRENT_ROUTE_POOL_500_ADDRESS);
+        request = atlas_native_usdc_request(reviewed[0].fee, &reviewed[0].pool);
         request.unwind_legs[0].zero_for_one = true;
         assert!(validate_test_request(&claimed_with_request(&request), &safety_limits()).is_err());
 
-        request = atlas_native_usdc_request(500, CURRENT_ROUTE_POOL_500_ADDRESS);
+        request = atlas_native_usdc_request(reviewed[0].fee, &reviewed[0].pool);
         request.unwind_legs[0].min_amount_out = request.minimum_unwind_output - 1;
         assert!(validate_test_request(&claimed_with_request(&request), &safety_limits()).is_err());
 
-        request = atlas_native_usdc_request(500, CURRENT_ROUTE_POOL_500_ADDRESS);
+        request = atlas_native_usdc_request(reviewed[0].fee, &reviewed[0].pool);
         let unreviewed = address("0x1111111111111111111111111111111111111111");
         request.collateral_asset = unreviewed;
         request.unwind_legs[0].token_in = unreviewed;

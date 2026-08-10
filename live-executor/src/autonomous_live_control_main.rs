@@ -2827,6 +2827,33 @@ async fn apply_promotion(
     .fetch_one(&mut **transaction)
     .await
     .map_err(|_| "route promotion control is unavailable")?;
+    let revenue_lane_rows = sqlx::query(
+        "SELECT lane, armed, kill_switch,
+                maximum_input_amount::text AS maximum_input_amount
+         FROM live_canary.revenue_lane_controls
+         WHERE lane IN ('atlas_solver', 'aave_liquidation')
+         ORDER BY lane
+         FOR UPDATE",
+    )
+    .fetch_all(&mut **transaction)
+    .await
+    .map_err(|_| "revenue lane promotion control is unavailable")?;
+    let revenue_lane_states = revenue_lane_rows
+        .iter()
+        .map(|row| {
+            Ok((
+                row.try_get::<String, _>("lane")
+                    .map_err(|_| "revenue lane promotion control is invalid")?,
+                row.try_get::<bool, _>("armed")
+                    .map_err(|_| "revenue lane promotion control is invalid")?,
+                row.try_get::<bool, _>("kill_switch")
+                    .map_err(|_| "revenue lane promotion control is invalid")?,
+                row_u128_text(row, "maximum_input_amount")?,
+            ))
+        })
+        .collect::<ControlResult<Vec<_>>>()?;
+    let active_revenue_lanes =
+        validate_revenue_lane_size_authority(&revenue_lane_states, previous.level.amount_wei())?;
     let global_epoch = global
         .try_get::<i64, _>("control_epoch")
         .map_err(|_| "global promotion control is invalid")?
@@ -2926,6 +2953,22 @@ async fn apply_promotion(
     .execute(&mut **transaction)
     .await
     .map_err(|_| "route promotion failed")?;
+    let revenue_lanes = sqlx::query(
+        "UPDATE live_canary.revenue_lane_controls
+         SET maximum_input_amount = $1::numeric,
+             control_epoch = control_epoch + 1,
+             updated_at = $2::timestamptz
+         WHERE lane IN ('atlas_solver', 'aave_liquidation')
+           AND armed AND NOT kill_switch",
+    )
+    .bind(next_level.amount_wei().to_string())
+    .bind(&updated_at)
+    .execute(&mut **transaction)
+    .await
+    .map_err(|_| "revenue lane promotion failed")?;
+    if revenue_lanes.rows_affected() != active_revenue_lanes {
+        return Err("revenue lane size authorities diverged during promotion".into());
+    }
     let next_epoch = previous.control_epoch + 1;
     sqlx::query(
         "UPDATE live_canary.economic_control
@@ -2954,6 +2997,36 @@ async fn apply_promotion(
         next_epoch,
     )
     .await
+}
+
+fn validate_revenue_lane_size_authority(
+    lanes: &[(String, bool, bool, u128)],
+    expected_input: u128,
+) -> ControlResult<u64> {
+    if lanes.len() != 2 || lanes[0].0 != "aave_liquidation" || lanes[1].0 != "atlas_solver" {
+        return Err("the exact revenue lane set is unavailable".into());
+    }
+    let active = lanes
+        .iter()
+        .filter(|(_, armed, kill, _)| *armed && !*kill)
+        .count();
+    let closed = lanes
+        .iter()
+        .filter(|(_, armed, kill, _)| !*armed && *kill)
+        .count();
+    if active == 2 {
+        if lanes
+            .iter()
+            .any(|(_, _, _, maximum)| *maximum != expected_input)
+        {
+            return Err("revenue lane size authority diverged from economic control".into());
+        }
+        Ok(2)
+    } else if closed == 2 {
+        Ok(0)
+    } else {
+        Err("revenue lane activation states diverged".into())
+    }
 }
 
 async fn disarm(pool: &PgPool) -> ControlResult<()> {
@@ -3065,7 +3138,13 @@ async fn arm_revenue_lanes() -> ControlResult<()> {
 async fn arm_revenue_lanes_in_pool(pool: &PgPool) -> ControlResult<()> {
     require_schema(pool).await?;
 
-    let maximum_input_amount = required_u128("LIVE_EXECUTOR_MAX_INPUT_AMOUNT")?;
+    let reviewed_maximum_input_amount = required_u128("LIVE_EXECUTOR_MAX_INPUT_AMOUNT")?;
+    if reviewed_maximum_input_amount != MAXIMUM_REVIEWED_INPUT_WEI {
+        return Err(
+            "executor maximum input must equal the reviewed maximum before revenue lanes can arm"
+                .into(),
+        );
+    }
     let maximum_gas_limit = required_u128("LIVE_EXECUTOR_MAX_GAS_LIMIT")?;
     let maximum_gas_limit: i64 = maximum_gas_limit
         .try_into()
@@ -3081,6 +3160,28 @@ async fn arm_revenue_lanes_in_pool(pool: &PgPool) -> ControlResult<()> {
         .begin()
         .await
         .map_err(|_| "database transaction failed")?;
+    let economic = sqlx::query(
+        "SELECT current_size_level, current_input_wei::text AS current_input_wei
+         FROM live_canary.economic_control
+         WHERE singleton
+         FOR UPDATE",
+    )
+    .fetch_one(&mut *transaction)
+    .await
+    .map_err(|_| "economic size authority is unavailable")?;
+    let current_size_level: String = economic
+        .try_get("current_size_level")
+        .map_err(|_| "economic size authority is invalid")?;
+    let current_size_level = SizeLevel::try_from(current_size_level.as_str())
+        .map_err(|_| "economic size authority is invalid")?;
+    let current_input_wei: String = economic
+        .try_get("current_input_wei")
+        .map_err(|_| "economic size authority is invalid")?;
+    let lane_maximum_input_amount = current_input_wei
+        .parse::<u128>()
+        .ok()
+        .filter(|value| *value == current_size_level.amount_wei())
+        .ok_or("economic size level and input authority diverged")?;
     let active_lane: Option<String> = sqlx::query_scalar(
         "SELECT active_lane
          FROM live_canary.global_revenue_submission_lock
@@ -3162,7 +3263,7 @@ async fn arm_revenue_lanes_in_pool(pool: &PgPool) -> ControlResult<()> {
              updated_at = now()
          WHERE lane IN ('atlas_solver', 'aave_liquidation')",
     )
-    .bind(maximum_input_amount.to_string())
+    .bind(lane_maximum_input_amount.to_string())
     .bind(maximum_gas_limit)
     .bind(maximum_fee_per_gas.to_string())
     .bind(maximum_atlas_bid.to_string())
@@ -3180,7 +3281,7 @@ async fn arm_revenue_lanes_in_pool(pool: &PgPool) -> ControlResult<()> {
         .map_err(|_| "revenue lane activation commit failed")?;
     println!(
         "REVENUE_LANES_ARMED_OK: lanes=atlas_solver,aave_liquidation armed=true kill_switch=false maximum_input_amount={} maximum_gas_limit={} maximum_fee_per_gas={} maximum_atlas_bid={} daily_loss_limit={} retained_profit_floor={}",
-        maximum_input_amount,
+        lane_maximum_input_amount,
         maximum_gas_limit,
         maximum_fee_per_gas,
         maximum_atlas_bid,
@@ -3998,5 +4099,36 @@ mod tests {
             }
             assert!(validate_readiness_against_evidence(&evidence, &wrong).is_err());
         }
+    }
+
+    #[test]
+    fn revenue_lane_size_authority_must_track_the_economic_level_exactly() {
+        let expected = SizeLevel::L2.amount_wei();
+        let active = vec![
+            ("aave_liquidation".to_string(), true, false, expected),
+            ("atlas_solver".to_string(), true, false, expected),
+        ];
+        assert_eq!(
+            validate_revenue_lane_size_authority(&active, expected).unwrap(),
+            2
+        );
+
+        let closed = vec![
+            ("aave_liquidation".to_string(), false, true, 1),
+            ("atlas_solver".to_string(), false, true, 2),
+        ];
+        assert_eq!(
+            validate_revenue_lane_size_authority(&closed, expected).unwrap(),
+            0
+        );
+
+        let mut divergent_size = active.clone();
+        divergent_size[1].3 = SizeLevel::L4.amount_wei();
+        assert!(validate_revenue_lane_size_authority(&divergent_size, expected).is_err());
+
+        let mut partially_armed = active;
+        partially_armed[1].1 = false;
+        partially_armed[1].2 = true;
+        assert!(validate_revenue_lane_size_authority(&partially_armed, expected).is_err());
     }
 }

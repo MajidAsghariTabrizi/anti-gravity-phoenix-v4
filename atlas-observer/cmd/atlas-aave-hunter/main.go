@@ -162,7 +162,10 @@ func runAtlasCandidateLoop(ctx context.Context, auctions <-chan *observer.Ledger
 func healthHandler(ledger *observer.Ledger, screener *hunter.Screener) http.Handler {
 	atlasHandler := observer.NewHealthHandler(ledger)
 	mux := http.NewServeMux()
-	mux.Handle("/metrics", atlasHandler)
+	mux.HandleFunc("/metrics", func(writer http.ResponseWriter, request *http.Request) {
+		atlasHandler.ServeHTTP(writer, request)
+		_, _ = fmt.Fprint(writer, screener.MetricsText())
+	})
 	mux.HandleFunc("/healthz", func(writer http.ResponseWriter, request *http.Request) {
 		now := time.Now().UTC()
 		state := screener.Snapshot()

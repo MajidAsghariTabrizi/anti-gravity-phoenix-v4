@@ -49,9 +49,12 @@ The constrained deployment path performs these operations in order:
    owner, flash provider, and executor configuration.
 2. If owner configuration is incomplete, run
    `autonomous-live-control owner-plan`. The emitted
-   `phoenix.executor-owner-plan.v1` contains only unsigned target, value,
-   calldata, chain, expected post-state, and the verification command. Stop
-   with `EXTERNAL_OWNER_AUTHORIZATION_REQUIRED`.
+   `phoenix.executor-owner-plan.v3` contains only unsigned target, value,
+   calldata, chain, expected post-state, and the verification command. The
+   plan includes every verified native-USDC/WETH Uniswap V3 unwind asset and
+   pool required by the current Aave route registry. Stop with
+   `EXTERNAL_OWNER_AUTHORIZATION_REQUIRED`; configuration remains a separate
+   paused, explicitly acknowledged owner operation.
 3. Install the LIVE operator-mode flags atomically without exposing or
    changing secret values.
 4. Apply service-owned migrations through v4 and verify schema identity.
