@@ -70,6 +70,7 @@ const MIGRATIONS: [(&str, &str); 6] = [
 ];
 const ACTIVATE_ACK: &str = "ACTIVATE_READY_MIN_CANARY_42161";
 const ARM_REVENUE_LANES_ACK: &str = "ARM_ATLAS_AAVE_LIVE_42161";
+const SET_REVENUE_SIZE_MAX_REVIEWED_ACK: &str = "SET_MAX_REVIEWED_LIVE_SIZE_42161";
 const DISARM_ACK: &str = "DISARM_AUTONOMOUS_LIVE_42161";
 const DISARMED_DEPLOY_ACK: &str = "INSTALL_DISARMED_EVIDENCE_RELEASE_42161";
 const EVIDENCE_START_ACK: &str = "START_DISARMED_EVIDENCE_42161";
@@ -78,6 +79,9 @@ const AUTHORIZATION_ACK: &str = "INSTALL_BOUNDED_AUTOMATION_AUTHORIZATION_42161"
 const MATERIALIZE_ACTIVATION_ACK: &str = "MATERIALIZE_VALIDATED_MIN_CANARY_42161";
 const ACTIVATION_REQUEST_OUTBOX_ENV: &str = "PHOENIX_ACTIVATION_REQUEST_OUTBOX";
 const MAX_CONTROL_FILE_BYTES: u64 = 256 * 1024;
+const MAX_READINESS_RESPONSE_BYTES: u64 = 64 * 1024;
+const RPC_GATEWAY_READINESS_URL: &str = "http://rpc-gateway:9300/readyz";
+const ATLAS_HUNTER_READINESS_URL: &str = "http://atlas-observer:9700/readyz";
 const IMAGE_RUNTIME_PROBE_COMMAND: &str = "__image_runtime_probe__";
 const IMAGE_RUNTIME_OK: &str = "AUTONOMOUS_CONTROL_RUNTIME_OK";
 
@@ -180,6 +184,7 @@ async fn run() -> ControlResult<()> {
         "install-authorization" => install_authorization(&database_pool().await?).await?,
         "materialize-activation-contracts" => materialize_activation_contracts().await?,
         "activate-ready-canary" => activate(&database_pool().await?).await?,
+        "set-revenue-size-max-reviewed" => set_revenue_size_max_reviewed().await?,
         "arm-revenue-lanes" => arm_revenue_lanes().await?,
         "activate" => return Err("direct activation is disabled; use activate-ready-canary".into()),
         "evaluate-economic-control" => evaluate_economic_control(&database_pool().await?).await?,
@@ -3126,6 +3131,382 @@ async fn disarm(pool: &PgPool) -> ControlResult<()> {
     Ok(())
 }
 
+#[derive(Clone, Debug)]
+struct MaxReviewedAuthorityFacts {
+    current_input_wei: u128,
+    maximum_reviewed_input_wei: u128,
+    revenue_lanes: Vec<(String, bool, bool, u128)>,
+    generic_controls_closed: bool,
+    submission_lock_free: bool,
+    active_attempts: i64,
+    unresolved_submissions: i64,
+    active_atlas_requests: i64,
+    current_daily_loss: u128,
+    daily_loss_limit: u128,
+}
+
+fn validate_max_reviewed_authority_transition(
+    previous: &EconomicState,
+    release_sha: &str,
+    facts: &MaxReviewedAuthorityFacts,
+) -> ControlResult<()> {
+    if !canonical_hex(release_sha, 40) || previous.release_sha.as_deref() != Some(release_sha) {
+        return Err("MAX_REVIEWED authority does not bind the current release".into());
+    }
+    if previous.phase != EconomicPhase::DisarmedEvidence {
+        return Err("MAX_REVIEWED authority requires DISARMED_EVIDENCE".into());
+    }
+    if facts.maximum_reviewed_input_wei != MAXIMUM_REVIEWED_INPUT_WEI
+        || facts.current_input_wei != previous.level.amount_wei()
+    {
+        return Err("economic size authority is invalid".into());
+    }
+    if validate_revenue_lane_size_authority(&facts.revenue_lanes, previous.level.amount_wei())? != 0
+    {
+        return Err("MAX_REVIEWED authority requires both revenue lanes disarmed".into());
+    }
+    if !facts.generic_controls_closed {
+        return Err("MAX_REVIEWED authority requires generic execution controls disarmed".into());
+    }
+    if !facts.submission_lock_free {
+        return Err("MAX_REVIEWED authority is blocked by the global revenue lock".into());
+    }
+    if facts.active_attempts != 0 {
+        return Err("MAX_REVIEWED authority is blocked by an active execution attempt".into());
+    }
+    if facts.unresolved_submissions != 0 {
+        return Err("MAX_REVIEWED authority is blocked by an unresolved submission".into());
+    }
+    if facts.active_atlas_requests != 0 {
+        return Err("MAX_REVIEWED authority is blocked by an active Atlas request".into());
+    }
+    if facts.current_daily_loss >= facts.daily_loss_limit {
+        return Err("MAX_REVIEWED authority is blocked by the daily-loss limit".into());
+    }
+    Ok(())
+}
+
+fn validate_hunter_readiness(payload: &Value, now_millis: i64) -> ControlResult<()> {
+    if payload.get("ok").and_then(Value::as_bool) != Some(true)
+        || payload.get("hunting_health").and_then(Value::as_bool) != Some(true)
+        || payload
+            .get("exact_execution_readiness")
+            .and_then(Value::as_bool)
+            != Some(true)
+        || payload.get("atlas_connected").and_then(Value::as_bool) != Some(true)
+        || payload
+            .get("provider_recovery_state")
+            .and_then(Value::as_str)
+            != Some("ready")
+        || payload.get("degraded_reason").and_then(Value::as_str) != Some("")
+    {
+        return Err("exact Aave/Atlas readiness is not green".into());
+    }
+    let circuit_until = payload
+        .get("provider_circuit_open_until_unix_millis")
+        .and_then(Value::as_i64)
+        .ok_or("provider circuit evidence is invalid")?;
+    if circuit_until > now_millis {
+        return Err("provider circuit is open".into());
+    }
+    let primary = payload
+        .get("primary_provider_id")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or("dual-provider readiness evidence is invalid")?;
+    let secondary = payload
+        .get("secondary_provider_id")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or("dual-provider readiness evidence is invalid")?;
+    if primary == secondary
+        || payload
+            .get("last_dual_agreement_at")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .is_none()
+    {
+        return Err("dual-provider readiness evidence is invalid".into());
+    }
+    Ok(())
+}
+
+async fn require_max_reviewed_runtime_readiness() -> ControlResult<()> {
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .connect_timeout(Duration::from_secs(3))
+        .timeout(Duration::from_secs(5))
+        .build()
+        .map_err(|_| "readiness client initialization failed")?;
+    let gateway = client
+        .get(RPC_GATEWAY_READINESS_URL)
+        .send()
+        .await
+        .map_err(|_| "RPC Gateway readiness is unavailable")?;
+    if !gateway.status().is_success()
+        || gateway
+            .content_length()
+            .is_some_and(|length| length > MAX_READINESS_RESPONSE_BYTES)
+    {
+        return Err("RPC Gateway readiness is not green".into());
+    }
+    let gateway_body = gateway
+        .bytes()
+        .await
+        .map_err(|_| "RPC Gateway readiness is unavailable")?;
+    if gateway_body.len() as u64 > MAX_READINESS_RESPONSE_BYTES
+        || std::str::from_utf8(&gateway_body).map(str::trim).ok() != Some("ready")
+    {
+        return Err("RPC Gateway readiness is invalid".into());
+    }
+
+    let hunter = client
+        .get(ATLAS_HUNTER_READINESS_URL)
+        .send()
+        .await
+        .map_err(|_| "Aave/Atlas hunter readiness is unavailable")?;
+    if !hunter.status().is_success()
+        || hunter
+            .content_length()
+            .is_some_and(|length| length > MAX_READINESS_RESPONSE_BYTES)
+    {
+        return Err("Aave/Atlas hunter readiness is not green".into());
+    }
+    let hunter_body = hunter
+        .bytes()
+        .await
+        .map_err(|_| "Aave/Atlas hunter readiness is unavailable")?;
+    if hunter_body.len() as u64 > MAX_READINESS_RESPONSE_BYTES {
+        return Err("Aave/Atlas hunter readiness is invalid".into());
+    }
+    let payload: Value = serde_json::from_slice(&hunter_body)
+        .map_err(|_| "Aave/Atlas hunter readiness is invalid")?;
+    validate_hunter_readiness(&payload, Utc::now().timestamp_millis())
+}
+
+async fn set_revenue_size_max_reviewed() -> ControlResult<()> {
+    if required("PHOENIX_SET_REVENUE_SIZE_ACK")? != SET_REVENUE_SIZE_MAX_REVIEWED_ACK {
+        return Err("MAX_REVIEWED revenue size acknowledgement is invalid".into());
+    }
+    require_signerless_control()?;
+    let release_sha = required("PHOENIX_RELEASE_SHA")?;
+    if !canonical_hex(&release_sha, 40) {
+        return Err("release SHA is invalid".into());
+    }
+    if required_u128("LIVE_EXECUTOR_MAX_INPUT_AMOUNT")? != MAXIMUM_REVIEWED_INPUT_WEI {
+        return Err("configured maximum input must equal MAXIMUM_REVIEWED_INPUT_WEI".into());
+    }
+    let daily_loss_limit = required_u128("LIVE_EXECUTOR_MAX_DAILY_LOSS_WEI")?;
+    let owner_evidence = configured_preflight_from_environment().await?;
+    let owner_state = owner_evidence
+        .get("final_state")
+        .ok_or("owner configuration evidence is invalid")?;
+    if owner_evidence.get("status").and_then(Value::as_str) != Some("ready-paused")
+        || owner_evidence.get("release_sha").and_then(Value::as_str) != Some(release_sha.as_str())
+        || owner_state
+            .get("configuration_complete")
+            .and_then(Value::as_bool)
+            != Some(true)
+        || owner_state.get("paused").and_then(Value::as_bool) != Some(true)
+        || owner_state
+            .get("maximum_input_amount")
+            .and_then(Value::as_str)
+            .and_then(|value| value.parse::<u128>().ok())
+            != Some(MAXIMUM_REVIEWED_INPUT_WEI)
+    {
+        return Err("executor is not fully configured and paused at MAX_REVIEWED".into());
+    }
+    require_max_reviewed_runtime_readiness().await?;
+
+    let pool = database_pool().await?;
+    require_schema(&pool).await?;
+    let mut transaction = pool
+        .begin()
+        .await
+        .map_err(|_| "database transaction failed")?;
+    let previous = economic_state_for_update(&mut transaction).await?;
+    let economic = sqlx::query(
+        "SELECT current_input_wei::text AS current_input_wei,
+                maximum_reviewed_input_wei::text AS maximum_reviewed_input_wei
+         FROM live_canary.economic_control WHERE singleton",
+    )
+    .fetch_one(&mut *transaction)
+    .await
+    .map_err(|_| "economic size authority is unavailable")?;
+    let current_input_wei = row_u128_text(&economic, "current_input_wei")?;
+    let maximum_reviewed_input_wei = row_u128_text(&economic, "maximum_reviewed_input_wei")?;
+
+    let revenue_lane_rows = sqlx::query(
+        "SELECT lane, armed, kill_switch,
+                maximum_input_amount::text AS maximum_input_amount
+         FROM live_canary.revenue_lane_controls
+         WHERE lane IN ('atlas_solver', 'aave_liquidation')
+         ORDER BY lane FOR UPDATE",
+    )
+    .fetch_all(&mut *transaction)
+    .await
+    .map_err(|_| "revenue lane controls are unavailable")?;
+    let revenue_lanes = revenue_lane_rows
+        .iter()
+        .map(|row| {
+            Ok((
+                row.try_get::<String, _>("lane")
+                    .map_err(|_| "revenue lane control is invalid")?,
+                row.try_get::<bool, _>("armed")
+                    .map_err(|_| "revenue lane control is invalid")?,
+                row.try_get::<bool, _>("kill_switch")
+                    .map_err(|_| "revenue lane control is invalid")?,
+                row_u128_text(row, "maximum_input_amount")?,
+            ))
+        })
+        .collect::<ControlResult<Vec<_>>>()?;
+
+    let submission_lock = sqlx::query(
+        "SELECT active_lane, active_identity, acquired_at
+         FROM live_canary.global_revenue_submission_lock
+         WHERE singleton FOR UPDATE",
+    )
+    .fetch_one(&mut *transaction)
+    .await
+    .map_err(|_| "global revenue submission lock is unavailable")?;
+    let submission_lock_free = submission_lock
+        .try_get::<Option<String>, _>("active_lane")
+        .map_err(|_| "global revenue submission lock is invalid")?
+        .is_none()
+        && submission_lock
+            .try_get::<Option<String>, _>("active_identity")
+            .map_err(|_| "global revenue submission lock is invalid")?
+            .is_none()
+        && submission_lock
+            .try_get::<Option<DateTime<Utc>>, _>("acquired_at")
+            .map_err(|_| "global revenue submission lock is invalid")?
+            .is_none();
+    let runtime = sqlx::query(
+        "WITH bounds AS (
+           SELECT date_trunc('day', now() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC' AS start_at
+         ), direct_loss AS (
+           SELECT COALESCE(SUM(CASE WHEN net_pnl_wei < 0 THEN -net_pnl_wei ELSE 0 END), 0) AS amount
+           FROM live_canary.execution_outcomes, bounds
+           WHERE recorded_at >= bounds.start_at AND recorded_at < bounds.start_at + interval '1 day'
+         ), atlas_loss AS (
+           SELECT COALESCE(SUM(i.solver_gas_limit::numeric * i.oracle_gas_price_wei), 0) AS amount
+           FROM live_canary.atlas_solver_requests r
+           JOIN live_canary.atlas_auction_ingress i ON i.auction_id = r.auction_id
+           CROSS JOIN bounds
+           WHERE r.updated_at >= bounds.start_at AND r.updated_at < bounds.start_at + interval '1 day'
+             AND (
+               r.status IN ('signed', 'submitted', 'submission_unknown')
+               OR (
+                 r.status = 'lost'
+                 AND (r.submission_response_hash IS NOT NULL OR r.inclusion_transaction_hash IS NOT NULL)
+               )
+             )
+         )
+         SELECT NOT legacy.armed AND legacy.kill_switch
+                    AND NOT global.armed AND global.kill_switch
+                    AND global.execution_mode = 'disarmed'
+                    AND EXISTS (SELECT 1 FROM live_canary.autonomous_route_controls)
+                    AND NOT EXISTS (
+                      SELECT 1 FROM live_canary.autonomous_route_controls
+                      WHERE enabled OR NOT kill_switch
+                    ) AS generic_controls_closed,
+                (SELECT count(*) FROM live_canary.execution_attempts
+                 WHERE status IN (
+                   'claimed', 'nonce_allocated', 'submission_unknown', 'pending', 'timed_out'
+                 )) AS active_attempts,
+                (SELECT count(*) FROM live_canary.execution_attempts
+                 WHERE status IN ('submission_unknown', 'pending', 'timed_out'))
+                   AS unresolved_submissions,
+                (SELECT count(*) FROM live_canary.atlas_solver_requests
+                 WHERE status IN ('claimed', 'signed', 'submitted', 'submission_unknown'))
+                   AS active_atlas_requests,
+                (direct_loss.amount + atlas_loss.amount)::text AS current_daily_loss
+         FROM live_canary.control legacy
+         CROSS JOIN live_canary.autonomous_global_control global
+         CROSS JOIN direct_loss
+         CROSS JOIN atlas_loss
+         WHERE legacy.singleton AND global.singleton",
+    )
+    .fetch_one(&mut *transaction)
+    .await
+    .map_err(|_| "MAX_REVIEWED runtime authority is unavailable")?;
+    let facts = MaxReviewedAuthorityFacts {
+        current_input_wei,
+        maximum_reviewed_input_wei,
+        revenue_lanes,
+        generic_controls_closed: runtime
+            .try_get("generic_controls_closed")
+            .map_err(|_| "MAX_REVIEWED runtime authority is invalid")?,
+        submission_lock_free,
+        active_attempts: runtime
+            .try_get("active_attempts")
+            .map_err(|_| "MAX_REVIEWED runtime authority is invalid")?,
+        unresolved_submissions: runtime
+            .try_get("unresolved_submissions")
+            .map_err(|_| "MAX_REVIEWED runtime authority is invalid")?,
+        active_atlas_requests: runtime
+            .try_get("active_atlas_requests")
+            .map_err(|_| "MAX_REVIEWED runtime authority is invalid")?,
+        current_daily_loss: row_u128_text(&runtime, "current_daily_loss")?,
+        daily_loss_limit,
+    };
+    validate_max_reviewed_authority_transition(&previous, &release_sha, &facts)?;
+
+    if previous.level == SizeLevel::MaxReviewed && current_input_wei == MAXIMUM_REVIEWED_INPUT_WEI {
+        transaction
+            .commit()
+            .await
+            .map_err(|_| "MAX_REVIEWED authority verification commit failed")?;
+        println!(
+            "REVENUE_SIZE_MAX_REVIEWED_OK: status=already-set size_level=MAX_REVIEWED maximum_input_amount={}",
+            MAXIMUM_REVIEWED_INPUT_WEI
+        );
+        return Ok(());
+    }
+
+    let next_epoch = previous.control_epoch + 1;
+    let updated = sqlx::query(
+        "UPDATE live_canary.economic_control
+         SET current_size_level = 'MAX_REVIEWED',
+             current_input_wei = $1::numeric,
+             control_epoch = $2,
+             last_transition_reason = 'owner_accepted_max_reviewed_hunt',
+             updated_at = now()
+         WHERE singleton AND phase = 'DISARMED_EVIDENCE'
+           AND release_sha = $3 AND control_epoch = $4",
+    )
+    .bind(MAXIMUM_REVIEWED_INPUT_WEI.to_string())
+    .bind(next_epoch)
+    .bind(&release_sha)
+    .bind(previous.control_epoch)
+    .execute(&mut *transaction)
+    .await
+    .map_err(|_| "MAX_REVIEWED economic authority update failed")?;
+    if updated.rows_affected() != 1 {
+        return Err("MAX_REVIEWED economic authority changed concurrently".into());
+    }
+    insert_transition(
+        &mut transaction,
+        &previous,
+        previous.phase,
+        SizeLevel::MaxReviewed,
+        "owner_accepted_max_reviewed_hunt",
+        None,
+        Some(&release_sha),
+        next_epoch,
+    )
+    .await?;
+    transaction
+        .commit()
+        .await
+        .map_err(|_| "MAX_REVIEWED economic authority commit failed")?;
+    println!(
+        "REVENUE_SIZE_MAX_REVIEWED_OK: status=updated size_level=MAX_REVIEWED maximum_input_amount={} revenue_lanes_armed=false",
+        MAXIMUM_REVIEWED_INPUT_WEI
+    );
+    Ok(())
+}
+
 async fn arm_revenue_lanes() -> ControlResult<()> {
     if required("PHOENIX_REVENUE_LANES_ACK")? != ARM_REVENUE_LANES_ACK {
         return Err("revenue lane acknowledgement is invalid".into());
@@ -3917,6 +4298,49 @@ mod tests {
         }
     }
 
+    fn max_reviewed_authority_facts() -> MaxReviewedAuthorityFacts {
+        MaxReviewedAuthorityFacts {
+            current_input_wei: SizeLevel::Min.amount_wei(),
+            maximum_reviewed_input_wei: MAXIMUM_REVIEWED_INPUT_WEI,
+            revenue_lanes: vec![
+                (
+                    "aave_liquidation".to_string(),
+                    false,
+                    true,
+                    SizeLevel::Min.amount_wei(),
+                ),
+                (
+                    "atlas_solver".to_string(),
+                    false,
+                    true,
+                    SizeLevel::Min.amount_wei(),
+                ),
+            ],
+            generic_controls_closed: true,
+            submission_lock_free: true,
+            active_attempts: 0,
+            unresolved_submissions: 0,
+            active_atlas_requests: 0,
+            current_daily_loss: 0,
+            daily_loss_limit: 1,
+        }
+    }
+
+    fn hunter_readiness() -> Value {
+        json!({
+            "ok": true,
+            "hunting_health": true,
+            "exact_execution_readiness": true,
+            "atlas_connected": true,
+            "provider_recovery_state": "ready",
+            "degraded_reason": "",
+            "provider_circuit_open_until_unix_millis": 0,
+            "primary_provider_id": "primary",
+            "secondary_provider_id": "secondary",
+            "last_dual_agreement_at": "2026-08-10T00:00:00Z"
+        })
+    }
+
     fn readiness() -> ReadinessBinding {
         let start = evidence_time();
         ReadinessBinding {
@@ -4130,5 +4554,96 @@ mod tests {
         partially_armed[1].1 = false;
         partially_armed[1].2 = true;
         assert!(validate_revenue_lane_size_authority(&partially_armed, expected).is_err());
+    }
+
+    #[test]
+    fn max_reviewed_operator_authority_requires_every_closed_state_gate() {
+        assert_eq!(
+            SET_REVENUE_SIZE_MAX_REVIEWED_ACK,
+            "SET_MAX_REVIEWED_LIVE_SIZE_42161"
+        );
+        let current = state(EconomicPhase::DisarmedEvidence);
+        let valid = max_reviewed_authority_facts();
+        assert!(
+            validate_max_reviewed_authority_transition(&current, &"a".repeat(40), &valid).is_ok()
+        );
+
+        let mut variants = Vec::new();
+        let mut wrong_input = valid.clone();
+        wrong_input.current_input_wei += 1;
+        variants.push(wrong_input);
+        let mut wrong_maximum = valid.clone();
+        wrong_maximum.maximum_reviewed_input_wei -= 1;
+        variants.push(wrong_maximum);
+        let mut armed_lane = valid.clone();
+        armed_lane.revenue_lanes[0].1 = true;
+        armed_lane.revenue_lanes[0].2 = false;
+        variants.push(armed_lane);
+        let mut generic_open = valid.clone();
+        generic_open.generic_controls_closed = false;
+        variants.push(generic_open);
+        let mut locked = valid.clone();
+        locked.submission_lock_free = false;
+        variants.push(locked);
+        let mut active = valid.clone();
+        active.active_attempts = 1;
+        variants.push(active);
+        let mut unresolved = valid.clone();
+        unresolved.unresolved_submissions = 1;
+        variants.push(unresolved);
+        let mut atlas = valid.clone();
+        atlas.active_atlas_requests = 1;
+        variants.push(atlas);
+        let mut loss_limited = valid;
+        loss_limited.current_daily_loss = 1;
+        variants.push(loss_limited);
+        assert!(variants.iter().all(|facts| {
+            validate_max_reviewed_authority_transition(&current, &"a".repeat(40), facts).is_err()
+        }));
+
+        let wrong_phase = state(EconomicPhase::LiveCanaryMin);
+        assert!(validate_max_reviewed_authority_transition(
+            &wrong_phase,
+            &"a".repeat(40),
+            &max_reviewed_authority_facts(),
+        )
+        .is_err());
+        assert!(validate_max_reviewed_authority_transition(
+            &current,
+            &"b".repeat(40),
+            &max_reviewed_authority_facts(),
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn max_reviewed_operator_requires_fresh_exact_dual_provider_readiness() {
+        let now_millis = 1_800_000_000_000;
+        let valid = hunter_readiness();
+        assert!(validate_hunter_readiness(&valid, now_millis).is_ok());
+
+        for field in [
+            "ok",
+            "hunting_health",
+            "exact_execution_readiness",
+            "atlas_connected",
+        ] {
+            let mut invalid = valid.clone();
+            invalid[field] = Value::Bool(false);
+            assert!(validate_hunter_readiness(&invalid, now_millis).is_err());
+        }
+        let mut circuit_open = valid.clone();
+        circuit_open["provider_circuit_open_until_unix_millis"] =
+            Value::Number((now_millis + 1).into());
+        assert!(validate_hunter_readiness(&circuit_open, now_millis).is_err());
+        let mut recovering = valid.clone();
+        recovering["provider_recovery_state"] = Value::String("recovering".to_string());
+        assert!(validate_hunter_readiness(&recovering, now_millis).is_err());
+        let mut same_provider = valid.clone();
+        same_provider["secondary_provider_id"] = Value::String("primary".to_string());
+        assert!(validate_hunter_readiness(&same_provider, now_millis).is_err());
+        let mut no_agreement = valid;
+        no_agreement["last_dual_agreement_at"] = Value::Null;
+        assert!(validate_hunter_readiness(&no_agreement, now_millis).is_err());
     }
 }

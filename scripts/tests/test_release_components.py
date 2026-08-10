@@ -67,6 +67,32 @@ def workflow_job_names(source: str) -> tuple[str, ...]:
 
 
 class ReleaseComponentRegistryTests(unittest.TestCase):
+    def test_aave_image_build_contexts_include_canonical_fixtures(self) -> None:
+        atlas_dockerfile = (ROOT / "deploy/atlas-observer.Dockerfile").read_text(
+            encoding="utf-8"
+        )
+        atlas_ignore = (
+            ROOT / "deploy/atlas-observer.Dockerfile.dockerignore"
+        ).read_text(encoding="utf-8")
+        self.assertIn(
+            "COPY fixtures/replay/aave_profit_path_counterfactual_v1.json "
+            "/src/fixtures/replay/aave_profit_path_counterfactual_v1.json",
+            atlas_dockerfile,
+        )
+        self.assertIn(
+            "!fixtures/replay/aave_profit_path_counterfactual_v1.json",
+            atlas_ignore,
+        )
+
+        fork_dockerfile = (ROOT / "deploy/fork-sandbox.Dockerfile").read_text(
+            encoding="utf-8"
+        )
+        fork_ignore = (
+            ROOT / "deploy/fork-sandbox.Dockerfile.dockerignore"
+        ).read_text(encoding="utf-8")
+        self.assertIn("COPY fixtures/routes ./fixtures/routes", fork_dockerfile)
+        self.assertIn("!fixtures/routes/**", fork_ignore)
+
     def test_registry_is_the_exact_eight_image_contract(self) -> None:
         self.assertEqual(release_components.RELEASE_IMAGES, EXPECTED_IMAGES)
         self.assertEqual(release_components.PROTECTED_IMAGES, EXPECTED_PROTECTED)

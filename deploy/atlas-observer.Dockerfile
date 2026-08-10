@@ -3,6 +3,7 @@ WORKDIR /src/atlas-observer
 COPY atlas-observer/go.mod atlas-observer/go.sum ./
 RUN go mod download
 COPY atlas-observer ./
+COPY fixtures/replay/aave_profit_path_counterfactual_v1.json /src/fixtures/replay/aave_profit_path_counterfactual_v1.json
 RUN go test ./...
 RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/atlas-observer ./cmd/atlas-observer
 RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/atlas-aave-hunter ./cmd/atlas-aave-hunter

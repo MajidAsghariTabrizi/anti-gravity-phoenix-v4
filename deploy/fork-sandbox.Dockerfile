@@ -12,6 +12,7 @@ RUN set -eux; \
     cargo build --locked --release --manifest-path fork-sandbox/Cargo.toml
 COPY rpc-gateway ./rpc-gateway
 COPY fork-sandbox ./fork-sandbox
+COPY fixtures/routes ./fixtures/routes
 COPY migrations ./migrations
 COPY phoenix-engine/Cargo.toml ./phoenix-engine/Cargo.toml
 COPY compose.prod.yml ./compose.prod.yml

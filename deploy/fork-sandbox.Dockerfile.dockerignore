@@ -3,6 +3,9 @@
 !rpc-gateway/**
 !fork-sandbox/
 !fork-sandbox/**
+!fixtures/
+!fixtures/routes/
+!fixtures/routes/**
 !phoenix-engine/
 !phoenix-engine/Cargo.toml
 !migrations/
