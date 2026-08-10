@@ -113,7 +113,10 @@ func validatedAaveLiveMaximumInputAmount(states []liveSizeAuthorityRow) (string,
 		// counterfactual and cannot materialize a live Candidate while disarmed.
 		return "1", nil
 	}
-	if !active || !strings.HasPrefix(states[0].economicPhase, "LIVE_") {
+	liveEconomicPhase := strings.HasPrefix(states[0].economicPhase, "LIVE_")
+	explicitMaximumReviewedAuthority := states[0].economicPhase == "DISARMED_EVIDENCE" &&
+		states[0].economicInputAmount == maximumReviewedInputWei
+	if !active || (!liveEconomicPhase && !explicitMaximumReviewedAuthority) {
 		return "", errors.New("Aave revenue lane authority is partially armed")
 	}
 	economic, economicOK := newBigUint(states[0].economicInputAmount)

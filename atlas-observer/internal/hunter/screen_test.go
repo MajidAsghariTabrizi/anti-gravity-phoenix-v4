@@ -577,6 +577,80 @@ func TestValidatedAaveLiveMaximumRequiresExactLaneEconomicAgreement(t *testing.T
 	}
 }
 
+func TestValidatedAaveLiveMaximumAcceptsExplicitMaximumReviewedLaneAuthority(t *testing.T) {
+	active := []liveSizeAuthorityRow{
+		{lane: "aave_liquidation", armed: true, maximumInputAmount: maximumReviewedInputWei, economicPhase: "DISARMED_EVIDENCE", economicInputAmount: maximumReviewedInputWei},
+		{lane: "atlas_solver", armed: true, maximumInputAmount: maximumReviewedInputWei, economicPhase: "DISARMED_EVIDENCE", economicInputAmount: maximumReviewedInputWei},
+	}
+	if got, err := validatedAaveLiveMaximumInputAmount(active); err != nil || got != maximumReviewedInputWei {
+		t.Fatalf("maximum=%s err=%v", got, err)
+	}
+
+	tests := []struct {
+		name   string
+		mutate func([]liveSizeAuthorityRow) []liveSizeAuthorityRow
+	}{
+		{name: "partially armed", mutate: func(rows []liveSizeAuthorityRow) []liveSizeAuthorityRow {
+			rows[1].armed = false
+			rows[1].killSwitch = true
+			return rows
+		}},
+		{name: "one lane kill switched", mutate: func(rows []liveSizeAuthorityRow) []liveSizeAuthorityRow {
+			rows[1].killSwitch = true
+			return rows
+		}},
+		{name: "missing lane", mutate: func(rows []liveSizeAuthorityRow) []liveSizeAuthorityRow {
+			return rows[:1]
+		}},
+		{name: "extra lane", mutate: func(rows []liveSizeAuthorityRow) []liveSizeAuthorityRow {
+			return append(rows, liveSizeAuthorityRow{lane: "unexpected"})
+		}},
+		{name: "lane maximum mismatch", mutate: func(rows []liveSizeAuthorityRow) []liveSizeAuthorityRow {
+			rows[1].maximumInputAmount = "500000000000000"
+			return rows
+		}},
+		{name: "non maximum reviewed evidence authority", mutate: func(rows []liveSizeAuthorityRow) []liveSizeAuthorityRow {
+			for index := range rows {
+				rows[index].maximumInputAmount = "500000000000000"
+				rows[index].economicInputAmount = "500000000000000"
+			}
+			return rows
+		}},
+		{name: "deploy phase armed", mutate: func(rows []liveSizeAuthorityRow) []liveSizeAuthorityRow {
+			for index := range rows {
+				rows[index].economicPhase = "DISARMED_DEPLOY"
+			}
+			return rows
+		}},
+		{name: "failure phase armed", mutate: func(rows []liveSizeAuthorityRow) []liveSizeAuthorityRow {
+			for index := range rows {
+				rows[index].economicPhase = "DISARMED_FAILURE"
+			}
+			return rows
+		}},
+		{name: "economic authority divergence", mutate: func(rows []liveSizeAuthorityRow) []liveSizeAuthorityRow {
+			rows[1].economicInputAmount = "500000000000000"
+			return rows
+		}},
+		{name: "above reviewed maximum", mutate: func(rows []liveSizeAuthorityRow) []liveSizeAuthorityRow {
+			for index := range rows {
+				rows[index].maximumInputAmount = "10000000000000001"
+				rows[index].economicInputAmount = "10000000000000001"
+			}
+			return rows
+		}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			rows := append([]liveSizeAuthorityRow(nil), active...)
+			rows = test.mutate(rows)
+			if got, err := validatedAaveLiveMaximumInputAmount(rows); err == nil {
+				t.Fatalf("accepted maximum %s", got)
+			}
+		})
+	}
+}
+
 func TestCounterfactualPositivePersistsWithinExistingSchemaWithoutAuthority(t *testing.T) {
 	record := signal{
 		TerminalOutcome:          "counterfactual_positive",
