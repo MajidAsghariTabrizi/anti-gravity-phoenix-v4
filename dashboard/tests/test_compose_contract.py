@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import copy
 import importlib.util
 import unittest
@@ -50,18 +51,25 @@ class ComposeContractTests(unittest.TestCase):
         requirements = (ROOT / "dashboard" / "requirements.txt").read_text(
             encoding="utf-8"
         )
+        imported_modules = set()
+        for node in ast.walk(ast.parse(source)):
+            if isinstance(node, ast.Import):
+                imported_modules.update(alias.name.split(".", 1)[0] for alias in node.names)
+            elif isinstance(node, ast.ImportFrom) and node.module:
+                imported_modules.add(node.module.split(".", 1)[0])
+
         for forbidden in (
             "POSTGRES_DSN",
             "PROMETHEUS_METRICS_URL",
-            "psycopg",
-            "requests",
-            "urllib",
-            "subprocess",
             "docker.sock",
         ):
             with self.subTest(forbidden=forbidden):
                 self.assertNotIn(forbidden, source)
                 self.assertNotIn(forbidden, requirements)
+        for forbidden_module in ("psycopg", "requests", "urllib", "subprocess", "docker"):
+            with self.subTest(forbidden_module=forbidden_module):
+                self.assertNotIn(forbidden_module, imported_modules)
+                self.assertNotIn(forbidden_module, requirements)
 
     def test_valid_isolated_service_passes(self) -> None:
         self.assertEqual(HELPER.validate_compose(copy.deepcopy(VALID_CONFIG)), [])

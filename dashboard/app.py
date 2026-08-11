@@ -91,10 +91,25 @@ def _load_economic_snapshot() -> dict[str, Any] | None:
 def _render_economic_snapshot(snapshot: dict[str, Any]) -> None:
     executive = snapshot["executive"]
     st.title("Phoenix LIVE Economic Control")
-    if executive["armed"]:
-        st.warning("Execution authority is open under the bounded economic control.")
+    lane_authority = executive.get("lane_authority", {})
+    generic_authority = lane_authority.get("generic_dex", {})
+    aave_authority = lane_authority.get("aave_liquidation", {})
+    atlas_authority = lane_authority.get("atlas_solver", {})
+    revenue_open = any(
+        lane.get("armed") is True and lane.get("kill_switch") is False
+        for lane in (aave_authority, atlas_authority)
+    )
+    generic_open = (
+        generic_authority.get("effective_armed") is True
+        if lane_authority
+        else executive["armed"] is True
+    )
+    if generic_open:
+        st.warning("Generic DEX execution authority is open under bounded controls.")
+    elif revenue_open:
+        st.warning("Generic DEX is closed; one or more bounded revenue lanes are open.")
     else:
-        st.success("Execution authority is closed.")
+        st.success("Generic DEX and the bounded revenue lanes are closed.")
     _metric_grid(
         [
             ("Release", executive["current_release"]),
@@ -110,10 +125,39 @@ def _render_economic_snapshot(snapshot: dict[str, Any]) -> None:
         ],
         width=5,
     )
+    if lane_authority:
+        st.subheader("Execution authority by lane")
+        st.dataframe(
+            _rows(
+                [
+                    {
+                        "lane": "Generic DEX",
+                        "armed": generic_authority.get("effective_armed", False),
+                        "kill_switch": generic_authority.get("effective_kill_switch", True),
+                    },
+                    {
+                        "lane": "Aave liquidation",
+                        "armed": aave_authority.get("armed", False),
+                        "kill_switch": aave_authority.get("kill_switch", True),
+                    },
+                    {
+                        "lane": "Atlas solver",
+                        "armed": atlas_authority.get("armed", False),
+                        "kill_switch": atlas_authority.get("kill_switch", True),
+                    },
+                ]
+            ),
+            width="stretch",
+            hide_index=True,
+        )
     funnel_tab, economics_tab, safety_tab, growth_tab = st.tabs(
         ["Funnel", "Economics", "Safety", "Growth"]
     )
     with funnel_tab:
+        st.subheader("Generic DEX funnel")
+        st.caption(
+            "Generic Engine only. simulation_evidence_insufficient is not an Aave or Atlas rejection."
+        )
         windows = snapshot["funnel"].get("windows", {})
         window_rows = [
             {"window": label, **values}
@@ -132,6 +176,95 @@ def _render_economic_snapshot(snapshot: dict[str, Any]) -> None:
             width="stretch",
             hide_index=True,
         )
+        revenue_windows = snapshot["funnel"].get("revenue_lane_windows", {})
+        lane_columns = {
+            "aave_liquidation": (
+                "Aave liquidation funnel",
+                [
+                    "discovered_liquidatable_signals",
+                    "distinct_liquidatable_borrowers",
+                    "prefilter_positive",
+                    "exact_eligible",
+                    "exact_attempted",
+                    "exact_completed",
+                    "route_eligible",
+                    "fork_attempted",
+                    "fork_passed",
+                    "counterfactual_positive",
+                    "live_authorized_positive",
+                    "candidate_materialized",
+                    "execution_requests",
+                    "attempts",
+                    "submissions",
+                    "reconciled_outcomes",
+                    "realized_net_pnl_wei",
+                    "closest_margin_to_gate_wei",
+                    "best_reviewed_size_wei",
+                    "best_route",
+                    "liquidatable_to_exact_p50_ms",
+                    "liquidatable_to_exact_p95_ms",
+                    "exact_fork_p50_ms",
+                    "exact_fork_p95_ms",
+                    "unknown_diagnostic_rejection_key_rows",
+                    "unexpected_generic_reason_rows",
+                ],
+            ),
+            "atlas_solver": (
+                "Atlas solver funnel",
+                [
+                    "ingress",
+                    "relevant_aave",
+                    "parallel_eligible",
+                    "candidate_signals",
+                    "actual_path_verified_candidate_signals",
+                    "request_materialized",
+                    "created_cohort_with_submission_evidence",
+                    "created_cohort_with_inclusion_evidence",
+                    "created_cohort_terminal_outcomes",
+                    "created_cohort_realized_net_pnl_wei",
+                ],
+            ),
+        }
+        for lane, (title, columns) in lane_columns.items():
+            lane_windows = revenue_windows.get(lane, {})
+            if not isinstance(lane_windows, dict):
+                continue
+            st.subheader(title)
+            st.dataframe(
+                _rows(
+                    [
+                        {
+                            "window": label,
+                            **{column: values.get(column) for column in columns},
+                        }
+                        for label, values in lane_windows.items()
+                        if isinstance(values, dict)
+                    ]
+                ),
+                width="stretch",
+                hide_index=True,
+            )
+            seven_day = lane_windows.get("7d", {})
+            if isinstance(seven_day, dict):
+                for breakdown in (
+                    "exact_deferred_by_reason",
+                    "rejection_reason_counts",
+                    "diagnostic_rejection_occurrences",
+                    "current_status_counts",
+                ):
+                    values = seven_day.get(breakdown)
+                    if isinstance(values, dict):
+                        st.caption(f"{title} — {breakdown.replace('_', ' ')} (7 days)")
+                        st.dataframe(
+                            _rows(
+                                [
+                                    {"reason_or_status": key, "count": value}
+                                    for key, value in values.items()
+                                ]
+                            ),
+                            width="stretch",
+                            hide_index=True,
+                        )
     with economics_tab:
         economics = snapshot["economics"]
         scalar_rows = [
@@ -140,18 +273,41 @@ def _render_economic_snapshot(snapshot: dict[str, Any]) -> None:
             if not isinstance(value, (dict, list))
         ]
         st.dataframe(_rows(scalar_rows), width="stretch", hide_index=True)
-        st.subheader("Route ranking — 7 days")
+        st.subheader("Generic DEX route ranking — 7 days")
         st.dataframe(
             _rows(economics.get("route_ranking_7d", [])),
             width="stretch",
             hide_index=True,
         )
-        st.subheader("Bounded Size Sweep — 7 days")
+        st.subheader("Generic DEX bounded size sweep — 7 days")
         st.dataframe(
             _rows(economics.get("size_sweep_7d", [])),
             width="stretch",
             hide_index=True,
         )
+        for title, key in (
+            ("Aave Exact — 7 days", "aave_exact_7d"),
+            ("Atlas Solver — 7 days", "atlas_solver_7d"),
+        ):
+            section = economics.get(key, {})
+            if not isinstance(section, dict):
+                continue
+            st.subheader(title)
+            st.dataframe(
+                _rows(
+                    [
+                        {
+                            "metric": metric,
+                            "value": json.dumps(value, sort_keys=True)
+                            if isinstance(value, dict)
+                            else value,
+                        }
+                        for metric, value in section.items()
+                    ]
+                ),
+                width="stretch",
+                hide_index=True,
+            )
     for tab, section in (
         (safety_tab, snapshot["safety"]),
         (growth_tab, snapshot["growth"]),
