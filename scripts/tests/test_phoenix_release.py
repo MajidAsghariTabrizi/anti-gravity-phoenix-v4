@@ -1792,6 +1792,17 @@ class BoundedTransportContinuationTests(unittest.TestCase):
         )
         self.assertLess(materialize, validate)
 
+    def test_context_installer_uses_compatible_schema_copy_helper(self) -> None:
+        context_installer = (
+            ROOT / "scripts/install-production-release-context.sh"
+        ).read_text()
+        self.assertIn(
+            'install_versioned_source \\\n'
+            '  "live-executor/schema/007_aave_economic_diagnostics.sql"',
+            context_installer,
+        )
+        self.assertNotIn("install_protected_file", context_installer)
+
     def test_candidate_install_failure_rolls_back_in_same_resume(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             paths = self.paths(Path(temporary))
