@@ -108,6 +108,7 @@ const MAX_STATE_RESOLUTION: Duration = Duration::from_secs(25);
 const MAX_COALESCE_WAIT: Duration = Duration::from_secs(26);
 const HUNTER_STATE_CACHE_TTL: Duration = Duration::from_secs(5);
 const AAVE_SIMULATION_CONTEXT_TTL: Duration = Duration::from_secs(120);
+const AAVE_EXACT_STATIC_CONTEXT_TTL: Duration = Duration::from_secs(120);
 const MAX_SOURCE_STATE_EVIDENCE_BYTES: usize = 512 * 1024;
 
 type SharedBundleResult = Option<Result<ProviderBundle, GatewayError>>;
@@ -128,6 +129,21 @@ struct AaveSimulationContext {
     packed_executor_config: String,
     maximum_input_amount: U256,
     flash_premium_bps: u16,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct AaveExactStaticContext {
+    pool_code_hash: String,
+    pool_implementation: String,
+    pool_implementation_code_hash: String,
+    reserve_ids: Vec<u16>,
+    state_root: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PinnedBlockState {
+    block: PinnedBlock,
+    state_root: String,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -352,6 +368,7 @@ pub struct GatewayRuntime {
     verification_cache: Arc<Mutex<TtlCache<VerificationEvidence>>>,
     hunter_state_cache: Arc<Mutex<TtlCache<Vec<ProviderStateAgreement>>>>,
     aave_simulation_context_cache: Arc<Mutex<TtlCache<AaveSimulationContext>>>,
+    aave_exact_static_context_cache: Arc<Mutex<TtlCache<AaveExactStaticContext>>>,
     primary_in_flight: Arc<Mutex<HashMap<String, watch::Receiver<SharedBundleResult>>>>,
     verification_in_flight: Arc<Mutex<HashMap<String, watch::Receiver<SharedVerificationResult>>>>,
     head: Arc<Mutex<Option<HeadSnapshot>>>,
@@ -422,6 +439,7 @@ impl GatewayRuntime {
             verification_cache: Arc::new(Mutex::new(TtlCache::new(CACHE_CAPACITY))),
             hunter_state_cache: Arc::new(Mutex::new(TtlCache::new(CACHE_CAPACITY))),
             aave_simulation_context_cache: Arc::new(Mutex::new(TtlCache::new(CACHE_CAPACITY))),
+            aave_exact_static_context_cache: Arc::new(Mutex::new(TtlCache::new(CACHE_CAPACITY))),
             primary_in_flight: Arc::new(Mutex::new(HashMap::new())),
             verification_in_flight: Arc::new(Mutex::new(HashMap::new())),
             head: Arc::new(Mutex::new(None)),
@@ -917,23 +935,25 @@ impl GatewayRuntime {
         self.ensure_provider_verified_paced(&secondary, pacing_deadline)
             .await
             .map_err(map_call_failure)?;
-        let block = self
-            .common_finalized_block_paced(&primary, &secondary, pacing_deadline)
+        let finalized = self
+            .common_finalized_block_state_paced(&primary, &secondary, pacing_deadline)
             .await?;
-        let (primary_state, primary_root) = self
+        let (primary_state, primary_root, primary_pending_context) = self
             .perform_aave_exact(
                 &primary,
                 &request,
-                &block,
+                &finalized.block,
+                &finalized.state_root,
                 ProviderSlot::Primary,
                 pacing_deadline,
             )
             .await?;
-        let (secondary_state, secondary_root) = self
+        let (secondary_state, secondary_root, secondary_pending_context) = self
             .perform_aave_exact(
                 &secondary,
                 &request,
-                &block,
+                &finalized.block,
+                &finalized.state_root,
                 ProviderSlot::Secondary,
                 pacing_deadline,
             )
@@ -947,8 +967,8 @@ impl GatewayRuntime {
             schema_version: AAVE_EXACT_RESPONSE_SCHEMA.to_string(),
             chain_id: ARBITRUM_ONE_CHAIN_ID,
             request_id: request.request_id.clone(),
-            block_number: block.number,
-            block_hash: block.hash,
+            block_number: finalized.block.number,
+            block_hash: finalized.block.hash,
             state_root: primary_root,
             primary: primary_state,
             secondary: secondary_state,
@@ -957,6 +977,23 @@ impl GatewayRuntime {
         response
             .validate(&request)
             .map_err(|_| GatewayError::ProviderDisagreement)?;
+        let now = Instant::now();
+        if let Some((key, context)) = primary_pending_context {
+            self.aave_exact_static_context_cache.lock().await.insert(
+                key,
+                context,
+                AAVE_EXACT_STATIC_CONTEXT_TTL,
+                now,
+            );
+        }
+        if let Some((key, context)) = secondary_pending_context {
+            self.aave_exact_static_context_cache.lock().await.insert(
+                key,
+                context,
+                AAVE_EXACT_STATIC_CONTEXT_TTL,
+                now,
+            );
+        }
         Ok(response)
     }
 
@@ -1419,17 +1456,22 @@ impl GatewayRuntime {
         Ok(primary_head)
     }
 
-    async fn common_finalized_block_paced(
+    async fn common_finalized_block_state_paced(
         &self,
         primary: &ProviderLease,
         secondary: &ProviderLease,
         pacing_deadline: Instant,
-    ) -> Result<PinnedBlock, GatewayError> {
+    ) -> Result<PinnedBlockState, GatewayError> {
         let primary_head = self
-            .provider_block_paced(primary, "finalized", ProviderSlot::Primary, pacing_deadline)
+            .provider_block_state_paced(
+                primary,
+                "finalized",
+                ProviderSlot::Primary,
+                pacing_deadline,
+            )
             .await?;
         let secondary_head = self
-            .provider_block_paced(
+            .provider_block_state_paced(
                 secondary,
                 "finalized",
                 ProviderSlot::Secondary,
@@ -1464,13 +1506,13 @@ impl GatewayRuntime {
         parse_block(&result.value).ok_or(GatewayError::ProviderIntegrity)
     }
 
-    async fn provider_block_paced(
+    async fn provider_block_state_paced(
         &self,
         provider: &ProviderLease,
         tag: &str,
         slot: ProviderSlot,
         pacing_deadline: Instant,
-    ) -> Result<PinnedBlock, GatewayError> {
+    ) -> Result<PinnedBlockState, GatewayError> {
         let result = self
             .paced_recorded_call(
                 provider,
@@ -1485,7 +1527,10 @@ impl GatewayRuntime {
             )
             .await
             .map_err(|failure| map_call_failure(failure.cause))?;
-        parse_block(&result.value).ok_or(GatewayError::ProviderIntegrity)
+        let block = parse_block(&result.value).ok_or(GatewayError::ProviderIntegrity)?;
+        let state_root =
+            parse_block_state_root(&result.value).ok_or(GatewayError::ProviderIntegrity)?;
+        Ok(PinnedBlockState { block, state_root })
     }
 
     async fn aave_tail_logs(
@@ -1951,73 +1996,122 @@ impl GatewayRuntime {
         provider: &ProviderLease,
         request: &AaveExactRequest,
         block: &PinnedBlock,
+        expected_state_root: &str,
         slot: ProviderSlot,
         pacing_deadline: Instant,
-    ) -> Result<(AaveExactProviderState, String), GatewayError> {
+    ) -> Result<
+        (
+            AaveExactProviderState,
+            String,
+            Option<(String, AaveExactStaticContext)>,
+        ),
+        GatewayError,
+    > {
         let block_quantity = format_quantity(block.number);
-        let pool_code_hash = self
-            .exact_code_hash_paced(
-                provider,
-                AAVE_V3_POOL_ARBITRUM,
-                block,
-                slot,
-                pacing_deadline,
-            )
-            .await?;
-        let implementation_word = self
-            .paced_recorded_call(
-                provider,
-                RpcMethod::EthGetStorageAt,
-                json!([
-                    AAVE_V3_POOL_ARBITRUM,
-                    EIP1967_IMPLEMENTATION_SLOT,
-                    block_quantity.clone()
-                ]),
-                Some(block),
-                0,
-                slot,
-                None,
-                false,
-                pacing_deadline,
-            )
-            .await
-            .map_err(|failure| map_call_failure(failure.cause))?
-            .value
-            .as_str()
-            .and_then(parse_storage_address)
-            .filter(|value| value == AAVE_POOL_IMPLEMENTATION_ARBITRUM)
-            .ok_or(GatewayError::ProviderIntegrity)?;
-        let implementation_code_hash = self
-            .exact_code_hash_paced(provider, &implementation_word, block, slot, pacing_deadline)
-            .await?;
-
-        let reserve_list = self
-            .hunter_multicall_paced(
-                provider,
-                block,
-                slot,
-                &[EthCall {
-                    target: AAVE_V3_POOL_ARBITRUM.to_string(),
-                    calldata: AAVE_GET_RESERVES_LIST_SELECTOR.to_string(),
-                }],
-                pacing_deadline,
-            )
-            .await?
-            .into_iter()
-            .next()
-            .and_then(|value| decode_address_array(&value))
-            .ok_or(GatewayError::ProviderIntegrity)?;
         let supported_assets = [ARBITRUM_WETH, ARBITRUM_NATIVE_USDC];
-        let reserve_ids = supported_assets
-            .iter()
-            .map(|asset| {
-                reserve_list
-                    .iter()
-                    .position(|candidate| candidate == asset)
-                    .and_then(|index| u16::try_from(index).ok())
-                    .ok_or(GatewayError::ProviderIntegrity)
-            })
-            .collect::<Result<Vec<_>, _>>()?;
+        let static_key =
+            aave_exact_static_context_key(provider.provider_id(), block, expected_state_root);
+        let cached_context = self
+            .aave_exact_static_context_cache
+            .lock()
+            .await
+            .get(&static_key, Instant::now());
+        let (
+            pool_code_hash,
+            implementation_word,
+            implementation_code_hash,
+            reserve_ids,
+            pending_context,
+        ) = if let Some(context) = cached_context {
+            if context.state_root != expected_state_root
+                || context.reserve_ids.len() != supported_assets.len()
+            {
+                return Err(GatewayError::ProviderIntegrity);
+            }
+            (
+                context.pool_code_hash,
+                context.pool_implementation,
+                context.pool_implementation_code_hash,
+                context.reserve_ids,
+                None,
+            )
+        } else {
+            let pool_code_hash = self
+                .exact_code_hash_paced(
+                    provider,
+                    AAVE_V3_POOL_ARBITRUM,
+                    block,
+                    slot,
+                    pacing_deadline,
+                )
+                .await?;
+            let implementation_word = self
+                .paced_recorded_call(
+                    provider,
+                    RpcMethod::EthGetStorageAt,
+                    json!([
+                        AAVE_V3_POOL_ARBITRUM,
+                        EIP1967_IMPLEMENTATION_SLOT,
+                        block_quantity.clone()
+                    ]),
+                    Some(block),
+                    0,
+                    slot,
+                    None,
+                    false,
+                    pacing_deadline,
+                )
+                .await
+                .map_err(|failure| map_call_failure(failure.cause))?
+                .value
+                .as_str()
+                .and_then(parse_storage_address)
+                .filter(|value| value == AAVE_POOL_IMPLEMENTATION_ARBITRUM)
+                .ok_or(GatewayError::ProviderIntegrity)?;
+            let implementation_code_hash = self
+                .exact_code_hash_paced(provider, &implementation_word, block, slot, pacing_deadline)
+                .await?;
+            let reserve_list = self
+                .hunter_multicall_paced(
+                    provider,
+                    block,
+                    slot,
+                    &[EthCall {
+                        target: AAVE_V3_POOL_ARBITRUM.to_string(),
+                        calldata: AAVE_GET_RESERVES_LIST_SELECTOR.to_string(),
+                    }],
+                    pacing_deadline,
+                )
+                .await?
+                .into_iter()
+                .next()
+                .and_then(|value| decode_address_array(&value))
+                .ok_or(GatewayError::ProviderIntegrity)?;
+            let reserve_ids = supported_assets
+                .iter()
+                .map(|asset| {
+                    reserve_list
+                        .iter()
+                        .position(|candidate| candidate == asset)
+                        .and_then(|index| u16::try_from(index).ok())
+                        .ok_or(GatewayError::ProviderIntegrity)
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let pending = AaveExactStaticContext {
+                pool_code_hash: pool_code_hash.clone(),
+                pool_implementation: implementation_word.clone(),
+                pool_implementation_code_hash: implementation_code_hash.clone(),
+                reserve_ids: reserve_ids.clone(),
+                state_root: expected_state_root.to_string(),
+            };
+            (
+                pool_code_hash,
+                implementation_word,
+                implementation_code_hash,
+                reserve_ids,
+                Some((static_key.clone(), pending)),
+            )
+        };
 
         let account_call =
             encode_one_address(AAVE_GET_USER_ACCOUNT_DATA_SELECTOR, &request.borrower);
@@ -2299,6 +2393,9 @@ impl GatewayRuntime {
             .map(str::to_ascii_lowercase)
             .filter(|value| canonical_block_hash(value))
             .ok_or(GatewayError::ProviderIntegrity)?;
+        if state_root != expected_state_root {
+            return Err(GatewayError::ProviderIntegrity);
+        }
         Ok((
             AaveExactProviderState {
                 provider_id: provider.provider_id().to_string(),
@@ -2315,6 +2412,7 @@ impl GatewayRuntime {
                 liquidations,
             },
             state_root,
+            pending_context,
         ))
     }
 
@@ -4010,6 +4108,17 @@ fn route_block_key(route_config_hash: &str, block: &PinnedBlock) -> String {
     format!("{route_config_hash}:{}:{}", block.number, block.hash)
 }
 
+fn aave_exact_static_context_key(
+    provider_id: &str,
+    block: &PinnedBlock,
+    state_root: &str,
+) -> String {
+    format!(
+        "aave-exact:{provider_id}:{}:{}:{state_root}:{AAVE_V3_POOL_ARBITRUM}:{ARBITRUM_WETH}:{ARBITRUM_NATIVE_USDC}",
+        block.number, block.hash
+    )
+}
+
 fn parse_block(value: &Value) -> Option<PinnedBlock> {
     let number = value.get("number")?.as_str()?;
     let hash = value.get("hash")?.as_str()?.to_ascii_lowercase();
@@ -4020,6 +4129,14 @@ fn parse_block(value: &Value) -> Option<PinnedBlock> {
         number: u64::from_str_radix(number.strip_prefix("0x")?, 16).ok()?,
         hash,
     })
+}
+
+fn parse_block_state_root(value: &Value) -> Option<String> {
+    value
+        .get("stateRoot")?
+        .as_str()
+        .map(str::to_ascii_lowercase)
+        .filter(|root| canonical_block_hash(root))
 }
 
 fn normalize_state_bytes(
@@ -5488,9 +5605,11 @@ mod tests {
     struct ModelClient {
         calls: StdMutex<Vec<CallRecord>>,
         head: StdMutex<PinnedBlock>,
+        state_root: StdMutex<String>,
         rate_limit_once: StdMutex<HashSet<String>>,
         source_receipt_failure: StdMutex<HashSet<String>>,
         disagreement: AtomicBool,
+        exact_disagreement: AtomicBool,
         finalized_disagreement: AtomicBool,
         malformed_multicall: AtomicBool,
         delay_multicall: Duration,
@@ -5504,9 +5623,11 @@ mod tests {
                     number: 100,
                     hash: BLOCK_HASH.to_string(),
                 }),
+                state_root: StdMutex::new(format!("0x{}", "d".repeat(64))),
                 rate_limit_once: StdMutex::new(HashSet::new()),
                 source_receipt_failure: StdMutex::new(HashSet::new()),
                 disagreement: AtomicBool::new(false),
+                exact_disagreement: AtomicBool::new(false),
                 finalized_disagreement: AtomicBool::new(false),
                 malformed_multicall: AtomicBool::new(false),
                 delay_multicall: Duration::ZERO,
@@ -5527,6 +5648,10 @@ mod tests {
                 number,
                 hash: hash.to_string(),
             };
+        }
+
+        fn set_state_root(&self, state_root: &str) {
+            *self.state_root.lock().unwrap() = state_root.to_string();
         }
 
         fn calls(&self) -> Vec<CallRecord> {
@@ -5588,6 +5713,8 @@ mod tests {
                     let Token::Bytes(calldata) = &values[2] else {
                         panic!("aggregate3 inner calldata missing");
                     };
+                    let argument_address =
+                        || format!("0x{}", hex::encode(&calldata[calldata.len() - 20..]));
                     let output = match calldata.as_slice() {
                         [0x0d, 0xfe, 0x16, 0x81] => address_word(0x33),
                         [0xd2, 0x12, 0x20, 0xa7] => address_word(0x44),
@@ -5619,15 +5746,60 @@ mod tests {
                         }
                         [0xbf, 0x92, 0x85, 0x7c, ..] => {
                             let mut output = vec![0_u8; 32 * 6];
-                            for word in output.chunks_exact_mut(32) {
-                                word[31] = 1;
-                            }
+                            output[31] = 2;
+                            output[63] = if self.exact_disagreement.load(Ordering::Relaxed)
+                                && provider_id == "provider_1"
+                            {
+                                2
+                            } else {
+                                1
+                            };
+                            output[127] = 0x1f;
+                            output[128 + 31] = 0x1d;
+                            U256::from(900_000_000_000_000_000_u64)
+                                .to_big_endian(&mut output[160..192]);
+                            output
+                        }
+                        [0x44, 0x17, 0xa5, 0x83, ..]
+                        | [0xed, 0xdf, 0x1b, 0x79, ..]
+                        | [0x5c, 0x9a, 0x8b, 0x18, ..] => u32_word(0),
+                        [0x07, 0x4b, 0x2e, 0x43] => u32_word(5),
+                        [0xd1, 0x94, 0x6d, 0xbc] => encode(&[Token::Array(vec![
+                            Token::Address(ARBITRUM_WETH.parse().unwrap()),
+                            Token::Address(ARBITRUM_NATIVE_USDC.parse().unwrap()),
+                        ])]),
+                        [0x28, 0xdd, 0x2d, 0x01, ..] => vec![0_u8; 32 * 9],
+                        [0xc4, 0x4b, 0x11, 0xf7, ..] => {
+                            let decimals = if argument_address() == ARBITRUM_WETH {
+                                18
+                            } else {
+                                6
+                            };
+                            u256_word(
+                                U256::from_dec_str(&aave_configuration(
+                                    decimals, 10_500, 1_000, true, false,
+                                ))
+                                .unwrap(),
+                            )
+                        }
+                        [0xd2, 0x49, 0x3b, 0x6c, ..] => {
+                            let mut output = Vec::with_capacity(96);
+                            output.extend(address_word(0x11));
+                            output.extend(address_word(0x22));
+                            output.extend(address_word(0x33));
                             output
                         }
                         [0xb3, 0x59, 0x6f, 0x07, ..] => {
                             let mut output = vec![0_u8; 32];
                             output[31] = 1;
                             output
+                        }
+                        [0x52, 0x75, 0x17, 0x97, ..] => {
+                            if calldata[calldata.len() - 1] == 0 {
+                                address_bytes(ARBITRUM_WETH)
+                            } else {
+                                address_bytes(ARBITRUM_NATIVE_USDC)
+                            }
                         }
                         _ => panic!("unexpected inner selector"),
                     };
@@ -5663,6 +5835,14 @@ mod tests {
                         == Some(PHOENIX_EXECUTOR_MAXIMUM_INPUT_SLOT)
                     {
                         json!(u256_storage_word(U256::from(MAXIMUM_REVIEWED_INPUT_WEI)))
+                    } else if params.get(1).and_then(Value::as_str)
+                        == Some(EIP1967_IMPLEMENTATION_SLOT)
+                    {
+                        json!(format!(
+                            "0x{}{}",
+                            "00".repeat(12),
+                            &AAVE_POOL_IMPLEMENTATION_ARBITRUM[2..]
+                        ))
                     } else {
                         json!(test_executor_packed_config())
                     }
@@ -5677,10 +5857,18 @@ mod tests {
                         block.number = block.number.saturating_sub(1);
                         block.hash = NEXT_HASH.to_string();
                     }
+                    let state_root = self.state_root.lock().unwrap().clone();
                     if block.number == 100 && block.hash == BLOCK_HASH {
-                        source_block_fixture()
+                        let mut value = source_block_fixture();
+                        value["stateRoot"] = json!(state_root);
+                        value
                     } else {
-                        json!({"number": format_quantity(block.number), "hash": block.hash})
+                        json!({
+                            "number": format_quantity(block.number),
+                            "hash": block.hash,
+                            "stateRoot": state_root,
+                            "timestamp": "0x1"
+                        })
                     }
                 }
                 RpcMethod::EthGetTransactionByHash => source_transaction_fixture(),
@@ -5750,6 +5938,19 @@ mod tests {
     fn u32_word(value: u32) -> Vec<u8> {
         let mut word = vec![0_u8; 32];
         word[28..].copy_from_slice(&value.to_be_bytes());
+        word
+    }
+
+    fn u256_word(value: U256) -> Vec<u8> {
+        let mut word = vec![0_u8; 32];
+        value.to_big_endian(&mut word);
+        word
+    }
+
+    fn address_bytes(value: &str) -> Vec<u8> {
+        let decoded = hex::decode(value.trim_start_matches("0x")).unwrap();
+        let mut word = vec![0_u8; 32];
+        word[12..].copy_from_slice(&decoded);
         word
     }
 
@@ -5860,6 +6061,16 @@ mod tests {
         }
     }
 
+    fn aave_exact_request(suffix: &str) -> AaveExactRequest {
+        AaveExactRequest {
+            schema_version: crate::aave_state::AAVE_EXACT_REQUEST_SCHEMA.to_string(),
+            chain_id: ARBITRUM_ONE_CHAIN_ID,
+            request_id: format!("aave-exact-{suffix}"),
+            borrower: "0x4444444444444444444444444444444444444444".to_string(),
+            maximum_input_amount: MAXIMUM_REVIEWED_INPUT_WEI.to_string(),
+        }
+    }
+
     fn aave_simulation_batch_request(size: usize, suffix: &str) -> AaveSimulateBatchRequest {
         let executor_code_hash = canonical_hash_bytes(&hex::decode("60006000").unwrap());
         let deadline = unix_time_seconds() + 60;
@@ -5905,6 +6116,147 @@ mod tests {
             request_id: format!("aave-batch-{suffix}"),
             simulations,
         }
+    }
+
+    #[tokio::test]
+    async fn aave_exact_static_context_same_state_hit_reduces_calls() {
+        let baseline_client = Arc::new(ModelClient::default());
+        let baseline_first_runtime = runtime(baseline_client.clone());
+        mark_test_providers_verified(&baseline_first_runtime).await;
+        let baseline_first = baseline_first_runtime
+            .resolve_aave_exact(aave_exact_request("baseline-first"))
+            .await
+            .unwrap();
+        let baseline_second_runtime = runtime(baseline_client.clone());
+        mark_test_providers_verified(&baseline_second_runtime).await;
+        let baseline_second = baseline_second_runtime
+            .resolve_aave_exact(aave_exact_request("baseline-second"))
+            .await
+            .unwrap();
+        assert_eq!(baseline_client.calls().len(), 28);
+        assert_ne!(
+            baseline_first.primary.provider_id,
+            baseline_first.secondary.provider_id
+        );
+        assert_ne!(
+            baseline_second.primary.provider_id,
+            baseline_second.secondary.provider_id
+        );
+
+        let client = Arc::new(ModelClient::default());
+        let runtime = runtime(client.clone());
+        mark_test_providers_verified(&runtime).await;
+
+        let first = runtime
+            .resolve_aave_exact(aave_exact_request("cold"))
+            .await
+            .unwrap();
+        let cold_calls = client.calls();
+        assert_eq!(cold_calls.len(), 14);
+        assert_eq!(
+            runtime.aave_exact_static_context_cache.lock().await.len(),
+            2
+        );
+
+        let second = runtime
+            .resolve_aave_exact(aave_exact_request("warm"))
+            .await
+            .unwrap();
+        let all_calls = client.calls();
+        assert_eq!(all_calls.len(), 20);
+        let warm_calls = &all_calls[cold_calls.len()..];
+        assert_eq!(warm_calls.len(), 6);
+        assert_eq!(multicall_inner_counts(warm_calls), vec![16, 16]);
+        assert!(warm_calls.iter().all(|call| !matches!(
+            call.method,
+            RpcMethod::EthGetCode | RpcMethod::EthGetStorageAt
+        )));
+        assert_eq!(first.block_number, second.block_number);
+        assert_eq!(first.block_hash, second.block_hash);
+        assert_eq!(first.state_root, second.state_root);
+        assert_ne!(second.primary.provider_id, second.secondary.provider_id);
+    }
+
+    #[tokio::test]
+    async fn aave_exact_static_context_misses_on_each_pinned_identity_component() {
+        for identity in ["number", "hash", "state_root"] {
+            let client = Arc::new(ModelClient::default());
+            let runtime = runtime(client.clone());
+            mark_test_providers_verified(&runtime).await;
+            runtime
+                .resolve_aave_exact(aave_exact_request("initial"))
+                .await
+                .unwrap();
+            let initial_call_count = client.calls().len();
+            match identity {
+                "number" => client.set_head(101, BLOCK_HASH),
+                "hash" => client.set_head(100, REORG_HASH),
+                "state_root" => client.set_state_root(&format!("0x{}", "e".repeat(64))),
+                _ => unreachable!(),
+            }
+
+            runtime
+                .resolve_aave_exact(aave_exact_request(identity))
+                .await
+                .unwrap();
+            let all_calls = client.calls();
+            let miss_calls = &all_calls[initial_call_count..];
+            assert_eq!(miss_calls.len(), 14, "identity={identity}");
+            assert_eq!(
+                miss_calls
+                    .iter()
+                    .filter(|call| call.method == RpcMethod::EthGetCode)
+                    .count(),
+                4,
+                "identity={identity}"
+            );
+            assert_eq!(
+                miss_calls
+                    .iter()
+                    .filter(|call| call.method == RpcMethod::EthGetStorageAt)
+                    .count(),
+                2,
+                "identity={identity}"
+            );
+            assert_eq!(
+                multicall_inner_counts(miss_calls),
+                vec![1, 16, 1, 16],
+                "identity={identity}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn aave_exact_static_context_disagreement_does_not_populate() {
+        let client = Arc::new(ModelClient::default());
+        let runtime = runtime(client.clone());
+        mark_test_providers_verified(&runtime).await;
+        client.exact_disagreement.store(true, Ordering::Relaxed);
+
+        assert_eq!(
+            runtime
+                .resolve_aave_exact(aave_exact_request("disagreed"))
+                .await,
+            Err(GatewayError::ProviderDisagreement)
+        );
+        assert!(runtime
+            .aave_exact_static_context_cache
+            .lock()
+            .await
+            .is_empty());
+        let failed_call_count = client.calls().len();
+
+        client.exact_disagreement.store(false, Ordering::Relaxed);
+        runtime
+            .resolve_aave_exact(aave_exact_request("retry"))
+            .await
+            .unwrap();
+        let all_calls = client.calls();
+        assert_eq!(all_calls[failed_call_count..].len(), 14);
+        assert_eq!(
+            runtime.aave_exact_static_context_cache.lock().await.len(),
+            2
+        );
     }
 
     #[tokio::test]
@@ -6690,6 +7042,7 @@ mod tests {
             "hash": BLOCK_HASH,
             "stateRoot": format!("0x{}", "d".repeat(64)),
             "parentHash": REORG_HASH,
+            "timestamp": "0x1",
             "transactions": [
                 format!("0x{}", "8".repeat(64)),
                 format!("0x{}", "9".repeat(64)),

@@ -54,13 +54,16 @@ const (
 	hotRevisitCadence               = 10 * time.Second
 	aaveSimulationBatchTimeout      = 55 * time.Second
 	exactBorrowerCooldown           = 2 * time.Minute
+	exactAdmissionCadence           = time.Minute
 	directForkEvidenceMode          = "DUAL_PROVIDER_FORK_VERIFIED"
 	counterfactualForkEvidenceMode  = "DUAL_PROVIDER_COUNTERFACTUAL_FORK_VERIFIED"
 	atlasCallbackEvidenceMode       = "DUAL_PROVIDER_ATLAS_CALLBACK_FORK_VERIFIED"
 	maximumReviewedInputWei         = "10000000000000000"
 	exactDeferredCooldownKey        = "exact_deferred_cooldown_total"
 	exactDeferredRouteIneligibleKey = "exact_deferred_route_ineligible_total"
+	exactDeferredSchedulerKey       = "exact_deferred_scheduler_capacity_total"
 	exactRouteIneligibleObservedKey = "exact_route_ineligible_observed_total"
+	atlasCallbackUnavailableKey     = "atlas_callback_evidence_unavailable_total"
 	hotRecheckTotalKey              = "hot_recheck_total"
 	hotRecheckDeferredBudgetKey     = "hot_recheck_deferred_budget_total"
 	exactEvalStartedKey             = "exact_eval_started_total"
@@ -109,6 +112,10 @@ type SignalSink interface {
 	RecordAaveSignal(context.Context, signal) error
 }
 
+type AtlasAuctionDispositionSink interface {
+	RecordAtlasCallbackUnavailable(context.Context, string, string) error
+}
+
 // LiveSizeAuthority is implemented by the durable Production sink. It keeps
 // shadow evaluation bounded by the reviewed ladder while ensuring that live
 // Candidate authority comes from the current economic/revenue-lane controls,
@@ -133,7 +140,9 @@ type State struct {
 	DebtBearingCount                   uint64            `json:"debt_bearing_count"`
 	Counts                             map[string]uint64 `json:"counts"`
 	RouteIneligible                    map[string]string `json:"route_ineligible,omitempty"`
+	TailInvalidatedBlock               map[string]uint64 `json:"tail_invalidated_block,omitempty"`
 	ExactQueueCount                    uint64            `json:"exact_queue_count"`
+	LastExactAdmissionAt               *time.Time        `json:"last_exact_admission_at,omitempty"`
 	IncompleteCount                    uint64            `json:"incomplete_count"`
 	LastErrorClass                     string            `json:"last_error_class,omitempty"`
 	LastAttemptAt                      *time.Time        `json:"last_attempt_at,omitempty"`
@@ -144,25 +153,38 @@ type State struct {
 	HotQueueSize                       uint64            `json:"hot_queue_size"`
 	LiquidatableHotCount               uint64            `json:"liquidatable_hot_count"`
 	UrgentHotCount                     uint64            `json:"urgent_hot_count"`
+	ExactEligibleNowCount              uint64            `json:"-"`
+	SchedulerBlockedCount              uint64            `json:"-"`
+	CooldownBlockedCount               uint64            `json:"-"`
+	RouteIneligibleCount               uint64            `json:"-"`
+	ProviderBlockedCount               uint64            `json:"-"`
+	ExactEvaluationsInFlight           uint64            `json:"-"`
+	OldestExactEligibleAgeMillis       uint64            `json:"-"`
+	ActiveForkPendingCount             uint64            `json:"-"`
 }
 
 type Screener struct {
-	config              Config
-	client              *http.Client
-	batchClient         *http.Client
-	operationMu         sync.Mutex
-	mu                  sync.Mutex
-	state               State
-	debtBearing         map[string]bool
-	refreshKnown        map[string]bool
-	refreshOrder        []string
-	refreshCursor       int
-	hotBorrowers        map[string]string
-	hotDebtBase         map[string]string
-	lastExactAt         map[string]time.Time
-	firstLiquidatableAt map[string]time.Time
-	wait                func(context.Context, time.Duration) bool
-	now                 func() time.Time
+	config               Config
+	client               *http.Client
+	batchClient          *http.Client
+	operationMu          sync.Mutex
+	mu                   sync.Mutex
+	state                State
+	debtBearing          map[string]bool
+	refreshKnown         map[string]bool
+	refreshOrder         []string
+	refreshCursor        int
+	hotBorrowers         map[string]string
+	hotDebtBase          map[string]string
+	hotUpperPositive     map[string]bool
+	latestOutcome        map[string]string
+	lastExactAt          map[string]time.Time
+	firstLiquidatableAt  map[string]time.Time
+	lastExactAdmissionAt time.Time
+	hasDurableAdmission  bool
+	exactInFlight        uint64
+	wait                 func(context.Context, time.Duration) bool
+	now                  func() time.Time
 }
 
 type gatewayErrorContract struct {
@@ -316,32 +338,34 @@ type exactResponse struct {
 }
 
 type signal struct {
-	Schema                      string              `json:"schema"`
-	ObservedAt                  time.Time           `json:"observed_at"`
-	Cursor                      uint64              `json:"cursor"`
-	Block                       uint64              `json:"block_number"`
-	BlockHash                   string              `json:"block_hash"`
-	Borrower                    string              `json:"borrower"`
-	DebtBase                    string              `json:"total_debt_base"`
-	HF                          string              `json:"health_factor_wad"`
-	Bucket                      string              `json:"bucket"`
-	Authority                   bool                `json:"candidate_authority"`
-	ExactDeferredReason         string              `json:"exact_deferred_reason,omitempty"`
-	ExactRouteIneligibleReason  string              `json:"exact_route_ineligible_reason,omitempty"`
-	ZeroCostProfitUpperBoundWei string              `json:"zero_cost_profit_upper_bound_wei,omitempty"`
-	ExpectedNetPnLWei           string              `json:"expected_net_pnl_wei,omitempty"`
-	ConservativeNetPnLWei       string              `json:"conservative_net_pnl_wei,omitempty"`
-	RiskReserveAmountWei        string              `json:"risk_reserve_amount_wei,omitempty"`
-	ExecutionCostWei            string              `json:"execution_cost_wei,omitempty"`
-	EstimatedL1CostWei          string              `json:"estimated_l1_cost_wei,omitempty"`
-	FlashPremiumWei             string              `json:"flash_premium_wei,omitempty"`
-	StateRoot                   string              `json:"state_root,omitempty"`
-	SelectedRoute               string              `json:"selected_route,omitempty"`
-	TerminalOutcome             string              `json:"terminal_outcome"`
-	AuthorityRejectionReason    string              `json:"authority_rejection_reason,omitempty"`
-	SizeDiagnostics             []sizeDiagnostic    `json:"reviewed_size_diagnostics,omitempty"`
-	ExecutionCandidate          *executionCandidate `json:"-"`
-	AtlasCandidate              *atlasCandidate     `json:"-"`
+	Schema                      string                  `json:"schema"`
+	ObservedAt                  time.Time               `json:"observed_at"`
+	ExactCompletedAt            *time.Time              `json:"exact_completed_at,omitempty"`
+	Cursor                      uint64                  `json:"cursor"`
+	Block                       uint64                  `json:"block_number"`
+	BlockHash                   string                  `json:"block_hash"`
+	Borrower                    string                  `json:"borrower"`
+	DebtBase                    string                  `json:"total_debt_base"`
+	HF                          string                  `json:"health_factor_wad"`
+	Bucket                      string                  `json:"bucket"`
+	Authority                   bool                    `json:"candidate_authority"`
+	ExactDeferredReason         string                  `json:"exact_deferred_reason,omitempty"`
+	ExactRouteIneligibleReason  string                  `json:"exact_route_ineligible_reason,omitempty"`
+	ZeroCostProfitUpperBoundWei string                  `json:"zero_cost_profit_upper_bound_wei,omitempty"`
+	ExpectedNetPnLWei           string                  `json:"expected_net_pnl_wei,omitempty"`
+	ConservativeNetPnLWei       string                  `json:"conservative_net_pnl_wei,omitempty"`
+	RiskReserveAmountWei        string                  `json:"risk_reserve_amount_wei,omitempty"`
+	ExecutionCostWei            string                  `json:"execution_cost_wei,omitempty"`
+	EstimatedL1CostWei          string                  `json:"estimated_l1_cost_wei,omitempty"`
+	FlashPremiumWei             string                  `json:"flash_premium_wei,omitempty"`
+	StateRoot                   string                  `json:"state_root,omitempty"`
+	SelectedRoute               string                  `json:"selected_route,omitempty"`
+	TerminalOutcome             string                  `json:"terminal_outcome"`
+	AuthorityRejectionReason    string                  `json:"authority_rejection_reason,omitempty"`
+	SizeDiagnostics             []sizeDiagnostic        `json:"reviewed_size_diagnostics,omitempty"`
+	ExactDiagnostics            *exactDiagnosticSummary `json:"exact_diagnostics,omitempty"`
+	ExecutionCandidate          *executionCandidate     `json:"-"`
+	AtlasCandidate              *atlasCandidate         `json:"-"`
 }
 
 type sizeDiagnostic struct {
@@ -363,6 +387,29 @@ type sizeDiagnostic struct {
 	MarginToRetainedFloorWei string `json:"margin_to_retained_profit_gate_wei"`
 	LiveAuthorized           bool   `json:"live_authorized"`
 	FinalRejectionReason     string `json:"final_rejection_reason,omitempty"`
+	EvidenceMode             string `json:"evidence_mode,omitempty"`
+	Selected                 bool   `json:"selected,omitempty"`
+}
+
+type exactDiagnosticSummary struct {
+	Schema                           string            `json:"schema"`
+	EvaluationStage                  string            `json:"evaluation_stage"`
+	RouteEligibility                 string            `json:"route_eligibility"`
+	ReviewedCombinationCount         uint64            `json:"reviewed_combination_count"`
+	RejectionCounts                  map[string]uint64 `json:"rejection_counts"`
+	TopDiagnostics                   []sizeDiagnostic  `json:"top_diagnostics,omitempty"`
+	BestDiagnostic                   *sizeDiagnostic   `json:"best_diagnostic,omitempty"`
+	BestLiveAuthorizedDiagnostic     *sizeDiagnostic   `json:"best_live_authorized_diagnostic,omitempty"`
+	SelectedDiagnostic               *sizeDiagnostic   `json:"selected_diagnostic,omitempty"`
+	ClosestMarginToRetainedFloorWei  string            `json:"closest_margin_to_retained_profit_gate_wei,omitempty"`
+	AnyCounterfactualPositive        bool              `json:"any_counterfactual_positive"`
+	AnyLiveAuthorizedPositive        bool              `json:"any_live_authorized_positive"`
+	ForkAttempted                    bool              `json:"fork_attempted"`
+	ForkPassed                       bool              `json:"fork_passed"`
+	ForkEvidenceMode                 string            `json:"fork_evidence_mode,omitempty"`
+	FailureClass                     string            `json:"failure_class,omitempty"`
+	LiquidatableToExactLatencyMillis uint64            `json:"liquidatable_to_exact_latency_ms"`
+	ExactForkLatencyMillis           uint64            `json:"exact_fork_latency_ms"`
 }
 
 type atlasPreparedOperation struct {
@@ -645,6 +692,8 @@ func New(config Config) (*Screener, error) {
 		batchClient: &http.Client{Timeout: aaveSimulationBatchTimeout}, state: state,
 		debtBearing: make(map[string]bool), refreshKnown: make(map[string]bool),
 		hotBorrowers: make(map[string]string), hotDebtBase: make(map[string]string),
+		hotUpperPositive:    make(map[string]bool),
+		latestOutcome:       make(map[string]string),
 		lastExactAt:         make(map[string]time.Time),
 		firstLiquidatableAt: make(map[string]time.Time),
 		wait:                waitContext,
@@ -833,13 +882,52 @@ func (s *Screener) Snapshot() State {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	copy := s.state
+	now := s.nowUTC()
+	providerBlocked := copy.LastErrorClass != "" ||
+		(copy.ProviderCircuitOpenUntilUnixMillis > 0 && copy.ProviderCircuitOpenUntilUnixMillis > now.UnixMilli())
 	copy.HotQueueSize = uint64(len(s.hotBorrowers))
 	copy.LiquidatableHotCount = 0
 	copy.UrgentHotCount = 0
+	copy.ExactEvaluationsInFlight = s.exactInFlight
 	for borrower, hf := range s.hotBorrowers {
+		if s.state.RouteIneligible[borrower] != "" {
+			copy.RouteIneligibleCount++
+		}
 		switch classify(s.hotDebtBase[borrower], hf) {
 		case "liquidatable":
 			copy.LiquidatableHotCount++
+			if s.latestOutcome[borrower] == "fork_pending" {
+				copy.ActiveForkPendingCount++
+			}
+			if !s.hotUpperPositive[borrower] {
+				continue
+			}
+			routeReason := s.state.RouteIneligible[borrower]
+			if routeReason == "no_weth_debt" {
+				continue
+			}
+			if completedAt, present := s.lastExactAt[borrower]; present &&
+				!now.Before(completedAt) && now.Sub(completedAt) < exactBorrowerCooldown {
+				copy.CooldownBlockedCount++
+				continue
+			}
+			if providerBlocked {
+				copy.ProviderBlockedCount++
+				continue
+			}
+			if exactAdmissionBlocked(now, s.lastExactAdmissionAt) {
+				copy.SchedulerBlockedCount++
+				continue
+			}
+			copy.ExactEligibleNowCount++
+			completedAt, served := s.lastExactAt[borrower]
+			eligibleSince := exactEligibleSince(s.firstLiquidatableAt[borrower], completedAt, served)
+			if !eligibleSince.IsZero() && !now.Before(eligibleSince) {
+				age := uint64(now.Sub(eligibleSince) / time.Millisecond)
+				if age > copy.OldestExactEligibleAgeMillis {
+					copy.OldestExactEligibleAgeMillis = age
+				}
+			}
 		case "urgent":
 			copy.UrgentHotCount++
 		}
@@ -883,6 +971,24 @@ func (s *Screener) MetricsText() string {
 		fmt.Sprintf("phoenix_aave_liquidatable_hot_count %d", state.LiquidatableHotCount),
 		"# TYPE phoenix_aave_urgent_hot_count gauge",
 		fmt.Sprintf("phoenix_aave_urgent_hot_count %d", state.UrgentHotCount),
+		"# TYPE phoenix_aave_exact_eligible_now gauge",
+		fmt.Sprintf("phoenix_aave_exact_eligible_now %d", state.ExactEligibleNowCount),
+		"# TYPE phoenix_aave_exact_scheduler_blocked gauge",
+		fmt.Sprintf("phoenix_aave_exact_scheduler_blocked %d", state.SchedulerBlockedCount),
+		"# TYPE phoenix_aave_exact_cooldown_blocked gauge",
+		fmt.Sprintf("phoenix_aave_exact_cooldown_blocked %d", state.CooldownBlockedCount),
+		"# TYPE phoenix_aave_route_ineligible_current gauge",
+		fmt.Sprintf("phoenix_aave_route_ineligible_current %d", state.RouteIneligibleCount),
+		"# TYPE phoenix_aave_exact_provider_blocked gauge",
+		fmt.Sprintf("phoenix_aave_exact_provider_blocked %d", state.ProviderBlockedCount),
+		"# TYPE phoenix_aave_exact_evaluations_in_flight gauge",
+		fmt.Sprintf("phoenix_aave_exact_evaluations_in_flight %d", state.ExactEvaluationsInFlight),
+		"# TYPE phoenix_aave_oldest_exact_eligible_age_ms gauge",
+		fmt.Sprintf("phoenix_aave_oldest_exact_eligible_age_ms %d", state.OldestExactEligibleAgeMillis),
+		"# TYPE phoenix_aave_active_fork_pending gauge",
+		fmt.Sprintf("phoenix_aave_active_fork_pending %d", state.ActiveForkPendingCount),
+		"# TYPE phoenix_aave_exact_queue_ledger_entries_total counter",
+		fmt.Sprintf("phoenix_aave_exact_queue_ledger_entries_total %d", state.ExactQueueCount),
 		"# TYPE phoenix_aave_hot_recheck_total counter",
 		fmt.Sprintf("phoenix_aave_hot_recheck_total %d", state.Counts[hotRecheckTotalKey]),
 		"# TYPE phoenix_aave_hot_recheck_deferred_budget_total counter",
@@ -895,6 +1001,8 @@ func (s *Screener) MetricsText() string {
 		fmt.Sprintf("phoenix_aave_route_ineligible_rechecks_total %d", state.Counts[routeIneligibleRechecksKey]),
 		"# TYPE phoenix_aave_provider_circuit_deferrals_total counter",
 		fmt.Sprintf("phoenix_aave_provider_circuit_deferrals_total %d", state.ProviderCircuitSkippedTotal),
+		"# TYPE phoenix_atlas_callback_evidence_unavailable_total counter",
+		fmt.Sprintf("phoenix_atlas_callback_evidence_unavailable_total %d", state.Counts[atlasCallbackUnavailableKey]),
 	}
 	appendHistogram := func(name, sumKey, countKey, bucketPrefix string) {
 		lines = append(lines, fmt.Sprintf("# TYPE %s histogram", name))
@@ -1207,7 +1315,14 @@ func (s *Screener) pollTail(ctx context.Context) ([]string, error) {
 		// immediately invalidates both the short Exact cooldown and any
 		// route-ineligibility learned from a prior Exact reserve snapshot.
 		delete(s.lastExactAt, borrower)
+		delete(s.firstLiquidatableAt, borrower)
+		delete(s.latestOutcome, borrower)
+		delete(s.hotUpperPositive, borrower)
 		delete(s.state.RouteIneligible, borrower)
+		if s.state.TailInvalidatedBlock == nil {
+			s.state.TailInvalidatedBlock = make(map[string]uint64)
+		}
+		s.state.TailInvalidatedBlock[borrower] = result.ToBlock
 	}
 	now := time.Now().UTC()
 	s.state.TailNextBlock = result.NextBlock
@@ -1222,20 +1337,22 @@ func (s *Screener) HandleAtlasAuction(ctx context.Context, auction *observer.Led
 	if auction == nil || !auction.RelevantAaveAuction || auction.ChainID != 42161 {
 		return nil
 	}
-	if s.IsProviderCircuitOpen() {
-		if err := s.recordProviderCircuitSkip(); err != nil {
+	// The gateway currently proves only the direct executeAaveLiquidation
+	// wrapper, never Atlas' caller/bid/reconcile callback path. Screening the
+	// entire hot cohort for each auction therefore cannot produce authority and
+	// only repeats Exact/fork work. Persist that capability rejection directly.
+	if sink, ok := s.config.SignalSink.(AtlasAuctionDispositionSink); ok {
+		if err := sink.RecordAtlasCallbackUnavailable(ctx, auction.AuctionID, auction.NotificationSHA256); err != nil {
 			return err
 		}
-		return nil
 	}
-	if s.Snapshot().LastErrorClass != "" {
-		return nil
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.state.Counts == nil {
+		s.state.Counts = make(map[string]uint64)
 	}
-	borrowers := s.nextHotBatch()
-	if len(borrowers) == 0 {
-		return nil
-	}
-	return s.screen(ctx, borrowers, false, auction)
+	s.state.Counts[atlasCallbackUnavailableKey]++
+	return nil
 }
 
 func liquidationPriorityRank(debt, hf string) int {
@@ -1326,27 +1443,116 @@ func prioritizedAccountOrder(accounts []account) []int {
 	return order
 }
 
+func exactEligibleSince(firstLiquidatableAt, lastExactAt time.Time, served bool) time.Time {
+	eligibleSince := firstLiquidatableAt
+	if served {
+		cooldownEligibleAt := lastExactAt.Add(exactBorrowerCooldown)
+		if eligibleSince.Before(cooldownEligibleAt) {
+			eligibleSince = cooldownEligibleAt
+		}
+	}
+	return eligibleSince
+}
+
+func exactAdmissionBlocked(now, lastAdmission time.Time) bool {
+	return !lastAdmission.IsZero() &&
+		(now.Before(lastAdmission) || now.Sub(lastAdmission) < exactAdmissionCadence)
+}
+
+func (s *Screener) schedulerAccountOrder(accounts []account) []int {
+	order := prioritizedAccountOrder(accounts)
+	sort.SliceStable(order, func(i, j int) bool {
+		left := accounts[order[i]]
+		right := accounts[order[j]]
+		leftRank := liquidationPriorityRank(left.TotalDebtBase, left.HealthFactorWAD)
+		rightRank := liquidationPriorityRank(right.TotalDebtBase, right.HealthFactorWAD)
+		if leftRank != rightRank || leftRank != 0 {
+			return false
+		}
+		leftCompleted, leftServed := s.lastExactAt[left.Borrower]
+		rightCompleted, rightServed := s.lastExactAt[right.Borrower]
+		if leftServed != rightServed {
+			return !leftServed
+		}
+		leftEligibleSince := exactEligibleSince(s.firstLiquidatableAt[left.Borrower], leftCompleted, leftServed)
+		rightEligibleSince := exactEligibleSince(s.firstLiquidatableAt[right.Borrower], rightCompleted, rightServed)
+		if leftEligibleSince.IsZero() != rightEligibleSince.IsZero() {
+			// A new account has no epoch until this response is processed. Keep
+			// an already-waiting never-served borrower ahead of that arrival.
+			return !leftEligibleSince.IsZero()
+		}
+		if !leftEligibleSince.Equal(rightEligibleSince) {
+			return leftEligibleSince.Before(rightEligibleSince)
+		}
+		return false
+	})
+	return order
+}
+
 func (s *Screener) nextHotBatch() []string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	type entry struct {
-		borrower        string
-		hf              string
-		debt            string
-		routeIneligible bool
+		borrower      string
+		hf            string
+		debt          string
+		rank          int
+		served        bool
+		eligibleSince time.Time
 	}
+	now := s.nowUTC()
 	entries := make([]entry, 0, len(s.hotBorrowers))
 	for borrower, hf := range s.hotBorrowers {
+		bucket := classify(s.hotDebtBase[borrower], hf)
+		routeReason := s.state.RouteIneligible[borrower]
+		rank := 4
+		switch bucket {
+		case "liquidatable":
+			rank = 1
+			completedAt, recentlyResolved := s.lastExactAt[borrower]
+			cooldownBlocked := recentlyResolved && !now.Before(completedAt) &&
+				now.Sub(completedAt) < exactBorrowerCooldown
+			if s.hotUpperPositive[borrower] && routeReason != "no_weth_debt" && !cooldownBlocked {
+				rank = 0
+			} else if routeReason != "" {
+				rank = 4
+			}
+		case "urgent":
+			rank = 2
+		case "watch":
+			rank = 3
+		}
+		if routeReason == "no_weth_debt" {
+			rank = 5
+		}
+		completedAt, served := s.lastExactAt[borrower]
+		eligibleSince := exactEligibleSince(s.firstLiquidatableAt[borrower], completedAt, served)
 		entries = append(entries, entry{
-			borrower:        borrower,
-			hf:              hf,
-			debt:            s.hotDebtBase[borrower],
-			routeIneligible: s.state.RouteIneligible[borrower] != "",
+			borrower:      borrower,
+			hf:            hf,
+			debt:          s.hotDebtBase[borrower],
+			rank:          rank,
+			served:        served,
+			eligibleSince: eligibleSince,
 		})
 	}
 	sort.Slice(entries, func(i, j int) bool {
-		if entries[i].routeIneligible != entries[j].routeIneligible {
-			return !entries[i].routeIneligible
+		if entries[i].rank != entries[j].rank {
+			return entries[i].rank < entries[j].rank
+		}
+		if entries[i].rank == 0 {
+			if entries[i].served != entries[j].served {
+				return !entries[i].served
+			}
+			if !entries[i].eligibleSince.Equal(entries[j].eligibleSince) {
+				if entries[i].eligibleSince.IsZero() {
+					return true
+				}
+				if entries[j].eligibleSince.IsZero() {
+					return false
+				}
+				return entries[i].eligibleSince.Before(entries[j].eligibleSince)
+			}
 		}
 		return liquidationPriorityLess(
 			entries[i].debt,
@@ -1396,8 +1602,13 @@ func (s *Screener) screen(ctx context.Context, borrowers []string, advanceSeed b
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.ensureHotMapsLocked()
+	for _, borrower := range borrowers {
+		if invalidatedBlock := s.state.TailInvalidatedBlock[borrower]; invalidatedBlock > result.BlockNumber {
+			return errors.New("gateway Aave screen predates tail invalidation")
+		}
+	}
 	exactAuthorityWasDegraded := s.state.LastErrorClass != ""
-	for _, index := range prioritizedAccountOrder(result.Primary.Accounts) {
+	for _, index := range s.schedulerAccountOrder(result.Primary.Accounts) {
 		primary := result.Primary.Accounts[index]
 		if primary != result.Secondary.Accounts[index] || primary.Borrower != borrowers[index] {
 			return errors.New("gateway Aave providers disagree")
@@ -1416,6 +1627,8 @@ func (s *Screener) screen(ctx context.Context, borrowers []string, advanceSeed b
 		} else {
 			delete(s.hotBorrowers, primary.Borrower)
 			delete(s.hotDebtBase, primary.Borrower)
+			delete(s.hotUpperPositive, primary.Borrower)
+			delete(s.latestOutcome, primary.Borrower)
 			delete(s.lastExactAt, primary.Borrower)
 			delete(s.firstLiquidatableAt, primary.Borrower)
 			delete(s.state.RouteIneligible, primary.Borrower)
@@ -1423,10 +1636,14 @@ func (s *Screener) screen(ctx context.Context, borrowers []string, advanceSeed b
 		if err := s.updateBorrowerActivityLocked(primary.Borrower, primary.TotalDebtBase != "0"); err != nil {
 			return err
 		}
-		record := signal{Schema: "phoenix.atlas-aave-hunting-signal.v1", ObservedAt: time.Now().UTC(), Cursor: cursor + uint64(index), Block: result.BlockNumber, BlockHash: result.BlockHash, Borrower: primary.Borrower, DebtBase: primary.TotalDebtBase, HF: primary.HealthFactorWAD, Bucket: bucket, Authority: false, TerminalOutcome: "prefiltered"}
+		record := signal{Schema: "phoenix.atlas-aave-hunting-signal.v1", ObservedAt: s.nowUTC(), Cursor: cursor + uint64(index), Block: result.BlockNumber, BlockHash: result.BlockHash, Borrower: primary.Borrower, DebtBase: primary.TotalDebtBase, HF: primary.HealthFactorWAD, Bucket: bucket, Authority: false, TerminalOutcome: "prefiltered"}
+		if bucket != "liquidatable" {
+			delete(s.hotUpperPositive, primary.Borrower)
+		}
 		if bucket == "liquidatable" {
 			upper, upperErr := generousUpperBound(primary, result.Primary.WETHPriceBase)
 			if upperErr != nil {
+				s.hotUpperPositive[primary.Borrower] = false
 				bucket = "incomplete"
 				record.Bucket = bucket
 				record.TerminalOutcome = "incomplete"
@@ -1434,11 +1651,16 @@ func (s *Screener) screen(ctx context.Context, borrowers []string, advanceSeed b
 				record.ZeroCostProfitUpperBoundWei = upper.String()
 				floor, _ := newBigUint(s.config.RetainedProfitFloorWei)
 				if upper.Cmp(floor) <= 0 {
+					s.hotUpperPositive[primary.Borrower] = false
 					record.TerminalOutcome = "economic_rejection"
 				} else {
+					s.hotUpperPositive[primary.Borrower] = true
 					record.TerminalOutcome = "exact_pending"
 				}
 			}
+		}
+		if record.TerminalOutcome == "exact_pending" && exactAuthorityWasDegraded {
+			record.ExactDeferredReason = "provider_recovery_requires_fresh_screen"
 		}
 		if record.TerminalOutcome == "exact_pending" && !exactAuthorityWasDegraded {
 			now := s.nowUTC()
@@ -1460,6 +1682,9 @@ func (s *Screener) screen(ctx context.Context, borrowers []string, advanceSeed b
 					s.state.Counts = make(map[string]uint64)
 				}
 				s.state.Counts[exactDeferredCooldownKey]++
+			} else if exactAdmissionBlocked(now, s.lastExactAdmissionAt) {
+				record.ExactDeferredReason = "scheduler_capacity"
+				s.state.Counts[exactDeferredSchedulerKey]++
 			} else {
 				// Collateral supply/withdraw and collateral-enable changes are not
 				// present in the debt tail. Re-probe those route reasons after the
@@ -1469,10 +1694,22 @@ func (s *Screener) screen(ctx context.Context, borrowers []string, advanceSeed b
 					s.state.Counts[routeIneligibleRechecksKey]++
 				}
 				exactStartedAt := s.nowUTC()
+				s.lastExactAdmissionAt = exactStartedAt
+				s.hasDurableAdmission = true
+				s.state.LastExactAdmissionAt = &exactStartedAt
 				s.state.Counts[exactEvalStartedKey]++
+				// Persist the global admission before issuing any Exact RPC. A
+				// provider error or process restart must not reopen the 60-second
+				// state-request slot and create a restart burst.
+				if err := s.persistStateLocked(); err != nil {
+					s.state.Counts[exactEvalStartedKey]--
+					return err
+				}
+				s.exactInFlight++
 				s.mu.Unlock()
 				exactRecord, exactErr := s.resolveExact(ctx, record, auction)
 				s.mu.Lock()
+				s.exactInFlight--
 				if exactErr != nil {
 					return exactErr
 				}
@@ -1484,7 +1721,9 @@ func (s *Screener) screen(ctx context.Context, borrowers []string, advanceSeed b
 					"exact_eval_latency_millis_bucket_le_",
 					exactCompletedAt.Sub(exactStartedAt),
 				)
+				liquidatableToExact := time.Duration(0)
 				if firstObserved, present := s.firstLiquidatableAt[primary.Borrower]; present {
+					liquidatableToExact = exactCompletedAt.Sub(firstObserved)
 					s.observeDurationLocked(
 						liquidatableToExactSumKey,
 						liquidatableToExactCountKey,
@@ -1494,7 +1733,13 @@ func (s *Screener) screen(ctx context.Context, borrowers []string, advanceSeed b
 					delete(s.firstLiquidatableAt, primary.Borrower)
 				}
 				record = exactRecord
-				s.lastExactAt[primary.Borrower] = now
+				record.ExactCompletedAt = &exactCompletedAt
+				record.ExactDiagnostics = buildExactDiagnosticSummary(
+					record,
+					exactCompletedAt.Sub(exactStartedAt),
+					liquidatableToExact,
+				)
+				s.lastExactAt[primary.Borrower] = exactCompletedAt
 				if record.ExactRouteIneligibleReason != "" {
 					s.state.RouteIneligible[primary.Borrower] = record.ExactRouteIneligibleReason
 					if s.state.Counts == nil {
@@ -1506,8 +1751,18 @@ func (s *Screener) screen(ctx context.Context, borrowers []string, advanceSeed b
 				}
 			}
 		}
+		if _, hot := s.hotBorrowers[primary.Borrower]; hot {
+			if record.ExactDeferredReason == "" || s.latestOutcome[primary.Borrower] == "" {
+				s.latestOutcome[primary.Borrower] = record.TerminalOutcome
+			}
+		} else {
+			delete(s.latestOutcome, primary.Borrower)
+		}
 		if err := appendJSON(filepath.Join(s.config.StateDir, "signals.ndjson"), record); err != nil {
 			return err
+		}
+		if invalidatedBlock := s.state.TailInvalidatedBlock[primary.Borrower]; invalidatedBlock != 0 && record.Block >= invalidatedBlock {
+			delete(s.state.TailInvalidatedBlock, primary.Borrower)
 		}
 		if s.config.SignalSink != nil {
 			s.mu.Unlock()
@@ -1646,11 +1901,17 @@ func (s *Screener) resolveExact(ctx context.Context, record signal, auction *obs
 	if result.SchemaVersion != "phoenix.rpc.aave-exact-response.v3" || result.ChainID != 42161 || result.RequestID != requestID || result.BlockNumber == 0 || result.BlockHash == "" || result.StateRoot == "" || result.Primary.ProviderID == result.Secondary.ProviderID || !equalExactProviders(result.Primary, result.Secondary) {
 		return record, errors.New("exact Aave provider evidence is incomplete")
 	}
+	if result.BlockNumber < record.Block {
+		return record, errors.New("exact Aave evidence predates its dual screen")
+	}
 	record.Block = result.BlockNumber
 	record.BlockHash = result.BlockHash
 	record.StateRoot = result.StateRoot
 	if len(result.Primary.Liquidations) == 0 {
 		record.ExactRouteIneligibleReason = exactRouteIneligibleReason(result.Primary.Reserves)
+		if record.ExactRouteIneligibleReason == "" {
+			record.AuthorityRejectionReason = "no_reviewed_liquidation_variant"
+		}
 		record.TerminalOutcome = "economic_rejection"
 		return record, nil
 	}
@@ -1701,6 +1962,7 @@ func (s *Screener) resolveExact(ctx context.Context, record signal, auction *obs
 			selected.Route,
 			record.AuthorityRejectionReason,
 		)
+		markSelectedDiagnostic(record.SizeDiagnostics, selected.Liquidation, selected.Route)
 		return record, nil
 	}
 	if selected.Simulation.EvidenceMode != directForkEvidenceMode {
@@ -1712,6 +1974,7 @@ func (s *Screener) resolveExact(ctx context.Context, record signal, auction *obs
 			return record, atlasErr
 		}
 		if atlas == nil {
+			markSelectedDiagnostic(record.SizeDiagnostics, selected.Liquidation, selected.Route)
 			record.Authority = false
 			record.TerminalOutcome = "atlas_evidence_rejection"
 			record.AuthorityRejectionReason = "atlas_callback_evidence_unavailable"
@@ -1725,6 +1988,7 @@ func (s *Screener) resolveExact(ctx context.Context, record signal, auction *obs
 		}
 		record.ExecutionCandidate = candidate
 	}
+	markSelectedDiagnostic(record.SizeDiagnostics, selected.Liquidation, selected.Route)
 	record.Authority = true
 	record.TerminalOutcome = "candidate"
 	return record, nil
@@ -1800,6 +2064,22 @@ func (s *Screener) validateLiquidationVariants(liquidations []exactLiquidation, 
 		if !requestedOK || !actualOK || !repayOK || !premiumOK || requested.Sign() <= 0 || actual.Sign() <= 0 || actual.Cmp(repay) != 0 || actual.Cmp(requested) != 0 || actual.Cmp(maximumInput) > 0 || strings.ToLower(liquidation.DebtAsset) != wethAddress || collateral != wethAddress && collateral != nativeUSDCAddress || !addressPattern.MatchString(collateral) {
 			return errors.New("exact liquidation variant is invalid")
 		}
+		if collateral == nativeUSDCAddress && (len(liquidation.UnwindQuotes) == 0 || len(liquidation.UnwindQuotes) > 3) {
+			return errors.New("exact liquidation route count exceeds its reviewed bound")
+		}
+		fees := make(map[uint32]bool, len(liquidation.UnwindQuotes))
+		pools := make(map[string]bool, len(liquidation.UnwindQuotes))
+		for _, quote := range liquidation.UnwindQuotes {
+			if collateral != nativeUSDCAddress {
+				break
+			}
+			pool := strings.ToLower(quote.Pool)
+			if fees[quote.Fee] || pools[pool] {
+				return errors.New("exact liquidation routes are not unique")
+			}
+			fees[quote.Fee] = true
+			pools[pool] = true
+		}
 		countByCollateral[collateral]++
 		if countByCollateral[collateral] > 7 {
 			return errors.New("exact liquidation grid exceeds its collateral bound")
@@ -1835,7 +2115,12 @@ func (s *Screener) evaluateLiquidationBatch(ctx context.Context, record signal, 
 			diagnosticIndex[liquidationDiagnosticKey(probe.Liquidation, probe.Route)] = len(diagnostics)
 			diagnostics = append(diagnostics, diagnostic)
 			if probe.ExactEdge.Cmp(floor) <= 0 {
-				diagnostics[len(diagnostics)-1].FinalRejectionReason = "gross_edge_below_retained_profit_gate"
+				diagnostic := &diagnostics[len(diagnostics)-1]
+				diagnostic.MarginToRetainedFloorWei = new(big.Int).Sub(
+					new(big.Int).Set(probe.ExactEdge),
+					floor,
+				).String()
+				diagnostic.FinalRejectionReason = "gross_edge_below_retained_profit_gate"
 				continue
 			}
 			probes = append(probes, probe)
@@ -1856,6 +2141,9 @@ func (s *Screener) evaluateLiquidationBatch(ctx context.Context, record signal, 
 	}
 	outcomes, err := s.simulateExactBatch(ctx, record, requests)
 	if err != nil {
+		for _, probe := range probes {
+			setDiagnosticRejection(diagnostics, probe.Liquidation, probe.Route, "fork_simulation_failed")
+		}
 		return nil, true, diagnostics
 	}
 	viable := make([]*liquidationEvaluation, 0, len(outcomes))
@@ -1865,7 +2153,7 @@ func (s *Screener) evaluateLiquidationBatch(ctx context.Context, record signal, 
 			diagnostics[diagnosticIndex[liquidationDiagnosticKey(probes[index].Liquidation, probes[index].Route)]].FinalRejectionReason = "fork_simulation_failed"
 			continue
 		}
-		evaluation, evaluationErr := s.evaluateLiquidationProbe(probes[index], outcome.Response, liveMaximumInput)
+		evaluation, viableForMaterialization, evaluationErr := s.evaluateLiquidationProbe(probes[index], outcome.Response, liveMaximumInput)
 		if evaluationErr != nil {
 			hadSimulationFailure = true
 			diagnostics[diagnosticIndex[liquidationDiagnosticKey(probes[index].Liquidation, probes[index].Route)]].FinalRejectionReason = "fork_economics_invalid"
@@ -1873,6 +2161,8 @@ func (s *Screener) evaluateLiquidationBatch(ctx context.Context, record signal, 
 		}
 		if evaluation != nil {
 			updateSizeDiagnostic(&diagnostics[diagnosticIndex[liquidationDiagnosticKey(evaluation.Liquidation, evaluation.Route)]], evaluation, floor)
+		}
+		if viableForMaterialization {
 			viable = append(viable, evaluation)
 		} else {
 			diagnostics[diagnosticIndex[liquidationDiagnosticKey(probes[index].Liquidation, probes[index].Route)]].FinalRejectionReason = "conservative_net_pnl_below_threshold"
@@ -1899,6 +2189,9 @@ func (s *Screener) evaluateLiquidationBatch(ctx context.Context, record signal, 
 		outcomes, err = s.simulateExactBatch(ctx, record, requests)
 		if err != nil {
 			hadSimulationFailure = true
+			for _, evaluation := range pending {
+				setDiagnosticRejection(diagnostics, evaluation.Liquidation, evaluation.Route, "fork_simulation_failed")
+			}
 			break
 		}
 		next := make([]*liquidationEvaluation, 0, len(pending))
@@ -1937,10 +2230,28 @@ func (s *Screener) evaluateLiquidationBatch(ctx context.Context, record signal, 
 		return betterLiquidationEvaluation(finalized[right], finalized[left])
 	})
 	freshExact, err := s.fetchExactSnapshot(ctx, record.Borrower)
-	if err != nil || freshExact.Primary.FlashPremiumBPS != originalFlashPremiumBPS || !equalLiquidations(freshExact.Primary.Liquidations, liquidations) {
+	if err != nil {
+		for _, evaluation := range finalized {
+			setDiagnosticRejection(diagnostics, evaluation.Liquidation, evaluation.Route, "fresh_exact_unavailable")
+		}
+		return nil, true, diagnostics
+	}
+	if freshExact.Primary.FlashPremiumBPS != originalFlashPremiumBPS || !equalLiquidations(freshExact.Primary.Liquidations, liquidations) {
+		for _, evaluation := range finalized {
+			setDiagnosticRejection(diagnostics, evaluation.Liquidation, evaluation.Route, "fresh_state_mismatch")
+		}
+		return nil, true, diagnostics
+	}
+	if freshExact.BlockNumber < record.Block {
+		for _, evaluation := range finalized {
+			setDiagnosticRejection(diagnostics, evaluation.Liquidation, evaluation.Route, "fresh_state_mismatch")
+		}
 		return nil, true, diagnostics
 	}
 	if err := s.validateLiquidationVariants(freshExact.Primary.Liquidations, freshExact.Primary.FlashPremiumBPS); err != nil {
+		for _, evaluation := range finalized {
+			setDiagnosticRejection(diagnostics, evaluation.Liquidation, evaluation.Route, "fresh_state_mismatch")
+		}
 		return nil, true, diagnostics
 	}
 	record.Block = freshExact.BlockNumber
@@ -1962,6 +2273,9 @@ func (s *Screener) evaluateLiquidationBatch(ctx context.Context, record signal, 
 	}
 	outcomes, err = s.simulateExactBatch(ctx, record, requests)
 	if err != nil {
+		for _, evaluation := range finalized {
+			setDiagnosticRejection(diagnostics, evaluation.Liquidation, evaluation.Route, "fork_simulation_failed")
+		}
 		return nil, true, diagnostics
 	}
 	var selected *liquidationEvaluation
@@ -2052,6 +2366,161 @@ func setDiagnosticRejection(diagnostics []sizeDiagnostic, liquidation *exactLiqu
 	}
 }
 
+func markSelectedDiagnostic(diagnostics []sizeDiagnostic, liquidation *exactLiquidation, route liquidationRoute) {
+	key := liquidationDiagnosticKey(liquidation, route)
+	for index := range diagnostics {
+		if liquidationDiagnosticKeyValues(diagnostics[index].ReviewedSize, diagnostics[index].Route) == key {
+			diagnostics[index].Selected = true
+			return
+		}
+	}
+}
+
+func diagnosticMargin(diagnostic sizeDiagnostic) (*big.Int, bool) {
+	if diagnostic.GasLimit == 0 && diagnostic.FinalRejectionReason != "gross_edge_below_retained_profit_gate" {
+		return nil, false
+	}
+	value, ok := new(big.Int).SetString(diagnostic.MarginToRetainedFloorWei, 10)
+	return value, ok
+}
+
+func canonicalExactFailureClass(counts map[string]uint64) string {
+	for _, reason := range []string{
+		"fresh_state_mismatch",
+		"fresh_exact_unavailable",
+		"bound_convergence_failed",
+		"fork_simulation_failed",
+		"fork_economics_invalid",
+		"conservative_net_pnl_below_threshold",
+		"gross_edge_below_retained_profit_gate",
+	} {
+		if counts[reason] > 0 {
+			return reason
+		}
+	}
+	return ""
+}
+
+func buildExactDiagnosticSummary(record signal, exactForkLatency, liquidatableToExact time.Duration) *exactDiagnosticSummary {
+	summary := &exactDiagnosticSummary{
+		Schema:                   "phoenix.aave-exact-diagnostics.v1",
+		EvaluationStage:          "exact",
+		RouteEligibility:         "eligible",
+		ReviewedCombinationCount: uint64(len(record.SizeDiagnostics)),
+		RejectionCounts:          make(map[string]uint64),
+	}
+	if record.ExactRouteIneligibleReason != "" {
+		summary.RouteEligibility = record.ExactRouteIneligibleReason
+	}
+	if exactForkLatency > 0 {
+		summary.ExactForkLatencyMillis = uint64(exactForkLatency / time.Millisecond)
+	}
+	if liquidatableToExact > 0 {
+		summary.LiquidatableToExactLatencyMillis = uint64(liquidatableToExact / time.Millisecond)
+	}
+	ranked := make([]sizeDiagnostic, 0, len(record.SizeDiagnostics))
+	for index := range record.SizeDiagnostics {
+		diagnostic := record.SizeDiagnostics[index]
+		if diagnostic.FinalRejectionReason != "" {
+			summary.RejectionCounts[diagnostic.FinalRejectionReason]++
+		}
+		if diagnostic.GasLimit > 0 || strings.HasPrefix(diagnostic.FinalRejectionReason, "fork_") ||
+			diagnostic.FinalRejectionReason == "bound_convergence_failed" ||
+			strings.HasPrefix(diagnostic.FinalRejectionReason, "fresh_") {
+			summary.ForkAttempted = true
+		}
+		if diagnostic.EvidenceMode != "" {
+			summary.ForkPassed = true
+		}
+		margin, marginOK := diagnosticMargin(diagnostic)
+		if marginOK {
+			ranked = append(ranked, diagnostic)
+			if margin.Sign() > 0 {
+				if diagnostic.LiveAuthorized {
+					summary.AnyLiveAuthorizedPositive = true
+				} else {
+					summary.AnyCounterfactualPositive = true
+				}
+			}
+		}
+		if diagnostic.Selected {
+			copy := diagnostic
+			summary.SelectedDiagnostic = &copy
+			summary.ForkEvidenceMode = diagnostic.EvidenceMode
+		}
+	}
+	if record.AuthorityRejectionReason != "" && summary.RejectionCounts[record.AuthorityRejectionReason] == 0 {
+		summary.RejectionCounts[record.AuthorityRejectionReason]++
+	}
+	if record.ExactRouteIneligibleReason != "" {
+		summary.RejectionCounts[record.ExactRouteIneligibleReason]++
+	}
+	sort.SliceStable(ranked, func(left, right int) bool {
+		leftMargin, _ := diagnosticMargin(ranked[left])
+		rightMargin, _ := diagnosticMargin(ranked[right])
+		if comparison := leftMargin.Cmp(rightMargin); comparison != 0 {
+			return comparison > 0
+		}
+		leftSize, _ := newBigUint(ranked[left].ReviewedSize)
+		rightSize, _ := newBigUint(ranked[right].ReviewedSize)
+		if comparison := leftSize.Cmp(rightSize); comparison != 0 {
+			return comparison < 0
+		}
+		return ranked[left].Route < ranked[right].Route
+	})
+	if len(ranked) > 0 {
+		best := ranked[0]
+		summary.BestDiagnostic = &best
+		closest := ranked[0]
+		closestMargin, _ := diagnosticMargin(closest)
+		closestDistance := new(big.Int).Abs(new(big.Int).Set(closestMargin))
+		for index := 1; index < len(ranked); index++ {
+			margin, _ := diagnosticMargin(ranked[index])
+			distance := new(big.Int).Abs(new(big.Int).Set(margin))
+			if distance.Cmp(closestDistance) < 0 ||
+				(distance.Cmp(closestDistance) == 0 && margin.Cmp(closestMargin) > 0) {
+				closest = ranked[index]
+				closestMargin = margin
+				closestDistance = distance
+			}
+		}
+		summary.ClosestMarginToRetainedFloorWei = closest.MarginToRetainedFloorWei
+		if summary.ForkEvidenceMode == "" {
+			summary.ForkEvidenceMode = best.EvidenceMode
+		}
+		for index := range ranked {
+			if ranked[index].LiveAuthorized {
+				bestLive := ranked[index]
+				summary.BestLiveAuthorizedDiagnostic = &bestLive
+				break
+			}
+		}
+		limit := len(ranked)
+		if limit > 3 {
+			limit = 3
+		}
+		summary.TopDiagnostics = append(summary.TopDiagnostics, ranked[:limit]...)
+	}
+	summary.FailureClass = canonicalExactFailureClass(summary.RejectionCounts)
+	if summary.FailureClass == "" {
+		if record.AuthorityRejectionReason != "" {
+			summary.FailureClass = record.AuthorityRejectionReason
+		} else if record.ExactRouteIneligibleReason != "" {
+			summary.FailureClass = record.ExactRouteIneligibleReason
+		}
+	}
+	if summary.ForkAttempted {
+		summary.EvaluationStage = "fork"
+	}
+	if summary.FailureClass == "fresh_state_mismatch" || summary.FailureClass == "fresh_exact_unavailable" {
+		summary.EvaluationStage = "fresh_exact"
+	}
+	if record.TerminalOutcome == "candidate" {
+		summary.EvaluationStage = "candidate_materialized"
+	}
+	return summary
+}
+
 func newSizeDiagnostic(probe *liquidationProbe, liveMaximumText string) sizeDiagnostic {
 	diagnostic := sizeDiagnostic{
 		ReviewedSize:             probe.Liquidation.RepayAmount,
@@ -2111,37 +2580,36 @@ func updateSizeDiagnostic(diagnostic *sizeDiagnostic, evaluation *liquidationEva
 		new(big.Int).Set(evaluation.Conservative),
 		floor,
 	).String()
+	diagnostic.EvidenceMode = evaluation.Simulation.EvidenceMode
 	diagnostic.FinalRejectionReason = ""
 }
 
-func (s *Screener) evaluateLiquidationProbe(probe *liquidationProbe, simulation *simulationResponse, liveMaximumInput string) (*liquidationEvaluation, error) {
+func (s *Screener) evaluateLiquidationProbe(probe *liquidationProbe, simulation *simulationResponse, liveMaximumInput string) (*liquidationEvaluation, bool, error) {
 	if probe == nil || probe.Liquidation == nil || probe.Route.Output == nil || probe.ExactEdge == nil {
-		return nil, errors.New("liquidation probe is incomplete")
+		return nil, false, errors.New("liquidation probe is incomplete")
 	}
 	realized, cost, l1Cost, err := s.boundedSimulationEconomics(simulation, probe.Liquidation)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	if realized.Cmp(probe.ExactEdge) != 0 {
-		return nil, errors.New("exact quote and fork realization disagree")
+		return nil, false, errors.New("exact quote and fork realization disagree")
 	}
 	expected, err := authoritativeGatewayNet(simulation, realized, cost, new(big.Int))
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	floor, _ := newBigUint(s.config.RetainedProfitFloorWei)
 	reserve, conservative, minimumUnwind := profitEdgeReserve(expected, probe.Route.Output, s.config.EconomicReserveBPS)
-	if conservative.Cmp(floor) <= 0 || minimumUnwind.Sign() <= 0 {
-		return nil, nil
-	}
-	return &liquidationEvaluation{
+	evaluation := &liquidationEvaluation{
 		Liquidation: probe.Liquidation, Route: probe.Route, Simulation: simulation,
 		Expected: expected, Conservative: conservative, RiskReserve: reserve,
 		ExecutionCost: cost, EstimatedL1Cost: l1Cost,
 		MinimumCollateral: probe.MinimumCollateral, MinimumUnwind: minimumUnwind.String(),
 		MinimumProfit:    strictMinimumProfit(floor, cost).String(),
 		LiveMaximumInput: liveMaximumInput,
-	}, nil
+	}
+	return evaluation, conservative.Cmp(floor) > 0 && minimumUnwind.Sign() > 0, nil
 }
 
 func (s *Screener) advanceLiquidationMaterialization(probe *liquidationEvaluation, simulation *simulationResponse) (*liquidationEvaluation, *liquidationEvaluation, error) {
@@ -2934,6 +3402,14 @@ func (s *Screener) loadState() error {
 	if state.RouteIneligible == nil {
 		state.RouteIneligible = make(map[string]string)
 	}
+	if state.TailInvalidatedBlock == nil {
+		state.TailInvalidatedBlock = make(map[string]uint64)
+	}
+	for borrower, invalidatedBlock := range state.TailInvalidatedBlock {
+		if !addressPattern.MatchString(borrower) || invalidatedBlock == 0 {
+			return errors.New("existing tail-invalidation state is invalid")
+		}
+	}
 	for borrower, reason := range state.RouteIneligible {
 		if !addressPattern.MatchString(borrower) {
 			return errors.New("existing route-ineligible state is invalid")
@@ -2951,6 +3427,10 @@ func (s *Screener) loadState() error {
 		}
 	}
 	s.state = state
+	if state.LastExactAdmissionAt != nil {
+		s.lastExactAdmissionAt = state.LastExactAdmissionAt.UTC()
+		s.hasDurableAdmission = true
+	}
 	return nil
 }
 
@@ -3059,6 +3539,12 @@ func (s *Screener) ensureHotMapsLocked() {
 	if s.hotDebtBase == nil {
 		s.hotDebtBase = make(map[string]string)
 	}
+	if s.hotUpperPositive == nil {
+		s.hotUpperPositive = make(map[string]bool)
+	}
+	if s.latestOutcome == nil {
+		s.latestOutcome = make(map[string]string)
+	}
 	if s.lastExactAt == nil {
 		s.lastExactAt = make(map[string]time.Time)
 	}
@@ -3075,18 +3561,52 @@ func (s *Screener) ensureHotMapsLocked() {
 
 func (s *Screener) applyHotSignal(record signal) {
 	s.ensureHotMapsLocked()
+	if invalidatedBlock, present := s.state.TailInvalidatedBlock[record.Borrower]; present {
+		if record.Block < invalidatedBlock {
+			return
+		}
+		delete(s.state.TailInvalidatedBlock, record.Borrower)
+	}
 	if record.Bucket == "liquidatable" || record.Bucket == "urgent" || record.Bucket == "watch" {
 		s.hotBorrowers[record.Borrower] = record.HF
 		s.hotDebtBase[record.Borrower] = record.DebtBase
-		if record.StateRoot != "" {
-			previous, exists := s.lastExactAt[record.Borrower]
-			if !exists || record.ObservedAt.After(previous) {
-				s.lastExactAt[record.Borrower] = record.ObservedAt
+		if record.Bucket == "liquidatable" {
+			upper, upperOK := newBigUint(record.ZeroCostProfitUpperBoundWei)
+			floor, floorOK := newBigUint(s.config.RetainedProfitFloorWei)
+			s.hotUpperPositive[record.Borrower] = upperOK && floorOK && upper.Cmp(floor) > 0
+		} else {
+			delete(s.hotUpperPositive, record.Borrower)
+		}
+		if record.ExactDeferredReason == "" || s.latestOutcome[record.Borrower] == "" {
+			s.latestOutcome[record.Borrower] = record.TerminalOutcome
+		}
+		if record.Bucket == "liquidatable" {
+			if _, present := s.firstLiquidatableAt[record.Borrower]; !present {
+				s.firstLiquidatableAt[record.Borrower] = record.ObservedAt
 			}
+		} else {
+			delete(s.firstLiquidatableAt, record.Borrower)
+		}
+		if record.StateRoot != "" {
+			completedAt := record.ObservedAt
+			if record.ExactCompletedAt != nil && !record.ExactCompletedAt.Before(record.ObservedAt) {
+				completedAt = *record.ExactCompletedAt
+			}
+			previous, exists := s.lastExactAt[record.Borrower]
+			if !exists || completedAt.After(previous) {
+				s.lastExactAt[record.Borrower] = completedAt
+			}
+			if !s.hasDurableAdmission && completedAt.After(s.lastExactAdmissionAt) {
+				s.lastExactAdmissionAt = completedAt
+				s.state.LastExactAdmissionAt = &completedAt
+			}
+			delete(s.firstLiquidatableAt, record.Borrower)
 		}
 	} else {
 		delete(s.hotBorrowers, record.Borrower)
 		delete(s.hotDebtBase, record.Borrower)
+		delete(s.hotUpperPositive, record.Borrower)
+		delete(s.latestOutcome, record.Borrower)
 		delete(s.lastExactAt, record.Borrower)
 	}
 }

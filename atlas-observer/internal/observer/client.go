@@ -197,16 +197,21 @@ func (c *Client) runConnection(ctx context.Context) (returnErr error) {
 			c.logger.Printf("rejected Atlas notification reason=%s", decodeErr)
 			continue
 		}
+		exactDuplicate := c.ledger.hasExactEvidence(record.AuctionID, record.NotificationSHA256)
 		added, err := c.ledger.Append(record)
 		if err != nil {
 			return err
 		}
-		if added {
-			if c.sink != nil {
-				if err := c.sink.RecordAtlasAuction(ctx, record); err != nil {
-					return fmt.Errorf("persist Atlas auction identity: %w", err)
-				}
+		// Replay exact duplicates through the idempotent sink. This repairs the
+		// narrow crash boundary where the immutable ledger append completed but
+		// the database write did not. Changed-payload duplicates remain ledgered
+		// as invalid and never cross the durable ingress boundary.
+		if c.sink != nil && (added || exactDuplicate) {
+			if err := c.sink.RecordAtlasAuction(ctx, record); err != nil {
+				return fmt.Errorf("persist Atlas auction identity: %w", err)
 			}
+		}
+		if added {
 			asset := "unknown"
 			if record.OracleUpdate != nil && record.OracleUpdate.Asset != nil {
 				asset = *record.OracleUpdate.Asset
@@ -215,4 +220,11 @@ func (c *Client) runConnection(ctx context.Context) (returnErr error) {
 			c.logger.Printf("auction recorded asset=%s relevant_aave=%t count=%d", asset, record.RelevantAaveAuction, state.UniqueAuctionCount)
 		}
 	}
+}
+
+func (l *Ledger) hasExactEvidence(auctionID, notificationSHA256 string) bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	digest, present := l.seen[auctionID]
+	return present && digest == notificationSHA256
 }
