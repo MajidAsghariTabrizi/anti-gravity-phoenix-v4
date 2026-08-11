@@ -119,6 +119,12 @@ sudo cmp "$repo_root/release-components.json" \
 sudo cmp "$trusted_healthcheck" \
   "$modern_root/deploy/production-healthcheck.sh" >/dev/null ||
   fail 'modern context did not receive the trusted production healthcheck'
+sudo cmp "$repo_root/live-executor/schema/007_aave_economic_diagnostics.sql" \
+  "$modern_root/deploy/live-executor/schema/007_aave_economic_diagnostics.sql" \
+  >/dev/null || fail 'modern context did not receive schema 007 byte-for-byte'
+[ "$(sudo stat -c '%U:%G:%a' \
+  "$modern_root/deploy/live-executor/schema/007_aave_economic_diagnostics.sql")" = \
+  "root:$owner_group:640" ] || fail 'modern schema 007 metadata is invalid'
 
 legacy_sha=4444444444444444444444444444444444444444
 asset_dir=$tmp_root/release-assets
@@ -142,6 +148,18 @@ then
   fail 'manifest-declared release context source was allowed to be absent'
 fi
 
+declared_missing_schema_root=$tmp_root/declared-missing-schema
+cp -R "$legacy_root" "$declared_missing_schema_root"
+rm -f -- \
+  "$declared_missing_schema_root/live-executor/schema/007_aave_economic_diagnostics.sql"
+declared_missing_schema_host=$tmp_root/declared-missing-schema-host
+if run_installer \
+  "$declared_missing_schema_host" "$legacy_sha" "$declared_missing_schema_root" \
+  >/dev/null 2>&1
+then
+  fail 'manifest-declared schema 007 was allowed to be absent'
+fi
+
 python3 - "$legacy_root/release-assets-manifest.json" <<'PY'
 import json
 import sys
@@ -154,6 +172,7 @@ legacy_absent = {
     "scripts/activate-economic-canary.sh",
     "scripts/economic-dashboard-loop.sh",
     "scripts/sql/economic-dashboard-snapshot.sql",
+    "live-executor/schema/007_aave_economic_diagnostics.sql",
 }
 value["files"] = [
     item for item in value["files"] if item["path"] not in legacy_absent
@@ -188,7 +207,8 @@ for legacy_absent_target in \
   docs/AUTOMATED_ECONOMIC_CONTROL.md \
   activate-economic-canary.sh \
   economic-dashboard-loop.sh \
-  sql/economic-dashboard-snapshot.sql
+  sql/economic-dashboard-snapshot.sql \
+  live-executor/schema/007_aave_economic_diagnostics.sql
 do
   [ ! -e "$legacy_host/deploy/$legacy_absent_target" ] ||
     fail "legacy context installed an undeclared source: $legacy_absent_target"
