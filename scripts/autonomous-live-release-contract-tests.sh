@@ -17,6 +17,7 @@ for path in \
   migrations/014_exact_source_identity.sql \
   migrations/015_bounded_economic_view_plans.sql \
   live-executor/schema/005_closed_loop_economic_control.sql \
+  live-executor/schema/007_aave_economic_diagnostics.sql \
   live-executor/src/economic_control.rs \
   live-executor/src/autonomous_live_control_main.rs \
   rpc-gateway/src/aave_state.rs \
@@ -65,6 +66,7 @@ control = read("live-executor/src/autonomous_live_control_main.rs")
 state = read("live-executor/src/economic_control.rs")
 canonical_state = read("rpc-gateway/src/aave_state.rs")
 schema = read("live-executor/schema/005_closed_loop_economic_control.sql")
+diagnostic_schema = read("live-executor/schema/007_aave_economic_diagnostics.sql")
 health = read("scripts/production-healthcheck.sh")
 monitor = read("scripts/economic-dashboard-loop.sh")
 dashboard_sql = read("scripts/sql/economic-dashboard-snapshot.sql")
@@ -341,6 +343,7 @@ for forbidden in (
     require(forbidden not in deploy, f"normal_deploy_authority_leak:{forbidden}")
 
 operation = deploy.index("\ncompose pull $pull_services\n")
+observer_quiesced = deploy.index("compose stop -t 30 atlas-observer", operation)
 migrate = deploy.index("autonomous-control migrate", operation)
 disarmed = deploy.index("autonomous-control disarmed-deploy", operation)
 engine = deploy.index("compose up -d --no-deps phoenix-engine", operation)
@@ -359,7 +362,8 @@ standby_controls = deploy.index(
     "hunting standby changed fail-closed runtime controls", standby
 )
 require(
-    migrate
+    observer_quiesced
+    < migrate
     < disarmed
     < engine
     < burn
@@ -402,7 +406,29 @@ require(
     '"activate" => return Err(' in control,
     "legacy_direct_activation_not_disabled",
 )
-require("phoenix.live-canary-schema.v6" in control, "schema_v6_not_required")
+require("phoenix.live-canary-schema.v7" in control, "schema_v7_not_required")
+for required in (
+    "exact_diagnostics JSONB",
+    "phoenix.aave-exact-diagnostics.v1",
+    "jsonb_array_length(exact_diagnostics->'top_diagnostics') <= 3",
+    "atlas_auction_ingress",
+    "rejection_reason",
+    "live_canary_revenue_signal_source_observed",
+    "live_canary_atlas_ingress_observed",
+    "live_canary_atlas_solver_request_created",
+    "live_canary_execution_request_route_created",
+):
+    require(required in diagnostic_schema, f"aave_diagnostic_schema_missing:{required}")
+for required in (
+    "Generic Phoenix DEX Engine only",
+    "simulation_evidence_insufficient",
+    "revenue_lane_windows",
+    "aave_exact_7d",
+    "atlas_solver_7d",
+    "diagnostic_rejection_occurrences",
+    "unexpected_generic_reason_rows",
+):
+    require(required in dashboard_sql, f"lane_dashboard_contract_missing:{required}")
 for required in (
     "ARM_ATLAS_AAVE_LIVE_42161",
     "WHERE lane IN ('atlas_solver', 'aave_liquidation')",
@@ -669,7 +695,7 @@ docker network create --internal "$test_network" >/dev/null
 docker run -d \
   --name "$postgres_container" \
   --network "$test_network" \
-  --tmpfs /var/lib/postgresql/data:rw,nosuid,nodev,size=512m \
+  --tmpfs /var/lib/postgresql/data:rw,nosuid,nodev,size=2g \
   -e POSTGRES_USER=phoenix_test \
   -e POSTGRES_PASSWORD=phoenix_test_password \
   -e POSTGRES_DB=phoenix_test \
@@ -702,10 +728,152 @@ for migration in "$repo_root"/migrations/*.sql; do
     fail "historical migration failed: ${migration##*/}"
 done
 for schema in "$repo_root"/live-executor/schema/*.sql; do
+  case "${schema##*/}" in
+    007_*)
+      # Seed the supplied 581,496-row Production observation at a rounded-up
+      # 600,000-row v6 cohort before v7. These lightweight prefilter rows prove
+      # the additive column/index migration against the existing table scale;
+      # the bounded Exact JSON cohort is added after v7 below.
+      docker exec -i "$postgres_container" \
+        psql -X -q -v ON_ERROR_STOP=1 -U phoenix_test -d phoenix_test <<'SQL' >/dev/null ||
+INSERT INTO live_canary.revenue_hunting_signals(
+  signal_id, signal_identity, source_lane, source_cursor, block_number,
+  block_hash, retained_profit_floor, terminal_outcome, evidence_hash,
+  observed_at
+)
+SELECT
+  md5('production-scale-aave-' || value)::uuid,
+  'production-scale-aave-' || value,
+  'aave_liquidation', value, 1000000 + value,
+  '0x' || repeat('0', 64), 100, 'prefiltered',
+  md5('production-scale-evidence-a-' || value) ||
+    md5('production-scale-evidence-b-' || value),
+  now() - ((value % 604800) * interval '1 second')
+FROM generate_series(1, 600000) AS generated(value);
+ANALYZE live_canary.revenue_hunting_signals;
+SQL
+        fail "Production-scale v6 Aave signal fixture was rejected"
+      ;;
+  esac
   docker exec -i "$postgres_container" \
     psql -X -v ON_ERROR_STOP=1 -U phoenix_test -d phoenix_test \
     <"$schema" >/dev/null ||
     fail "live schema failed: ${schema##*/}"
+done
+
+docker exec -i "$postgres_container" \
+  psql -X -q -v ON_ERROR_STOP=1 -U phoenix_test -d phoenix_test <<'SQL' >/dev/null ||
+BEGIN;
+DO $$
+DECLARE
+  rejected BOOLEAN;
+BEGIN
+  rejected := false;
+  BEGIN
+    INSERT INTO live_canary.revenue_hunting_signals(
+      signal_id, signal_identity, source_lane, block_number, block_hash,
+      retained_profit_floor, terminal_outcome, exact_diagnostics,
+      evidence_hash, observed_at
+    ) VALUES (
+      '00000000-0000-0000-0000-000000000711', 'invalid-empty-diagnostics',
+      'aave_liquidation', 1, '0x' || repeat('a', 64), 1,
+      'economic_rejection', '{}'::jsonb, repeat('a', 64), now()
+    );
+  EXCEPTION WHEN check_violation THEN rejected := true;
+  END;
+  IF NOT rejected THEN RAISE EXCEPTION 'empty diagnostics were accepted'; END IF;
+
+  rejected := false;
+  BEGIN
+    INSERT INTO live_canary.revenue_hunting_signals(
+      signal_id, signal_identity, source_lane, block_number, block_hash,
+      retained_profit_floor, terminal_outcome, exact_diagnostics,
+      evidence_hash, observed_at
+    ) VALUES (
+      '00000000-0000-0000-0000-000000000712', 'invalid-missing-counts',
+      'aave_liquidation', 1, '0x' || repeat('a', 64), 1,
+      'economic_rejection', '{"schema":"phoenix.aave-exact-diagnostics.v1"}'::jsonb,
+      repeat('b', 64), now()
+    );
+  EXCEPTION WHEN check_violation THEN rejected := true;
+  END;
+  IF NOT rejected THEN RAISE EXCEPTION 'missing rejection counts were accepted'; END IF;
+
+  rejected := false;
+  BEGIN
+    INSERT INTO live_canary.revenue_hunting_signals(
+      signal_id, signal_identity, source_lane, block_number, block_hash,
+      retained_profit_floor, terminal_outcome, exact_diagnostics,
+      evidence_hash, observed_at
+    ) VALUES (
+      '00000000-0000-0000-0000-000000000713', 'invalid-missing-schema',
+      'aave_liquidation', 1, '0x' || repeat('a', 64), 1,
+      'economic_rejection', '{"rejection_counts":{}}'::jsonb,
+      repeat('c', 64), now()
+    );
+  EXCEPTION WHEN check_violation THEN rejected := true;
+  END;
+  IF NOT rejected THEN RAISE EXCEPTION 'missing diagnostic schema was accepted'; END IF;
+
+  rejected := false;
+  BEGIN
+    INSERT INTO live_canary.revenue_hunting_signals(
+      signal_id, signal_identity, source_lane, block_number, block_hash,
+      retained_profit_floor, terminal_outcome, exact_diagnostics,
+      evidence_hash, observed_at
+    ) VALUES (
+      '00000000-0000-0000-0000-000000000714', 'invalid-diagnostic-lane',
+      'atlas_solver', 1, '0x' || repeat('a', 64), 1,
+      'economic_rejection',
+      '{"schema":"phoenix.aave-exact-diagnostics.v1","rejection_counts":{}}'::jsonb,
+      repeat('d', 64), now()
+    );
+  EXCEPTION WHEN check_violation THEN rejected := true;
+  END;
+  IF NOT rejected THEN RAISE EXCEPTION 'wrong-lane diagnostics were accepted'; END IF;
+END
+$$;
+INSERT INTO live_canary.revenue_hunting_signals(
+  signal_id, signal_identity, source_lane, block_number, block_hash,
+  retained_profit_floor, terminal_outcome, exact_diagnostics,
+  evidence_hash, observed_at
+) VALUES (
+  '00000000-0000-0000-0000-000000000715', 'valid-minimal-diagnostics',
+  'aave_liquidation', 1, '0x' || repeat('a', 64), 1,
+  'economic_rejection',
+  '{"schema":"phoenix.aave-exact-diagnostics.v1","rejection_counts":{}}'::jsonb,
+  repeat('e', 64), now()
+);
+ROLLBACK;
+SQL
+  fail "Aave diagnostic JSON constraint accepted malformed evidence"
+
+dashboard_index_plan=$(
+  docker exec -i "$postgres_container" \
+    psql -X -q -A -t -v ON_ERROR_STOP=1 -U phoenix_test -d phoenix_test <<'SQL'
+SET enable_seqscan = off;
+EXPLAIN (COSTS OFF)
+SELECT observed_at FROM live_canary.revenue_hunting_signals
+WHERE source_lane = 'aave_liquidation' AND observed_at >= now() - interval '7 days';
+EXPLAIN (COSTS OFF)
+SELECT observed_at FROM live_canary.atlas_auction_ingress
+WHERE observed_at >= now() - interval '7 days';
+EXPLAIN (COSTS OFF)
+SELECT created_at FROM live_canary.atlas_solver_requests
+WHERE created_at >= now() - interval '7 days';
+EXPLAIN (COSTS OFF)
+SELECT created_at FROM live_canary.execution_requests
+WHERE route_type = 'AAVE_LIQUIDATION_V1' AND created_at >= now() - interval '7 days';
+SQL
+) || fail "lane dashboard index plans could not be explained"
+for expected_index in \
+  live_canary_revenue_signal_source_observed \
+  live_canary_atlas_ingress_observed \
+  live_canary_atlas_solver_request_created \
+  live_canary_execution_request_route_created
+do
+  printf '%s\n' "$dashboard_index_plan" | grep -Fq "$expected_index" ||
+    fail "lane dashboard index is not usable: $expected_index"
 done
 
 historical_view=$(
@@ -734,6 +902,21 @@ if document["economics"]["size_sweep_7d"] != []:
     raise SystemExit("historical size sweep must be empty")
 if set(document["funnel"]["windows"]) != {"1h", "24h", "7d"}:
     raise SystemExit("historical dashboard funnel is incomplete")
+revenue = document["funnel"].get("revenue_lane_windows", {})
+if set(revenue) != {"aave_liquidation", "atlas_solver"}:
+    raise SystemExit("historical revenue-lane funnel is incomplete")
+if any(set(windows) != {"1h", "24h", "7d"} for windows in revenue.values()):
+    raise SystemExit("historical revenue-lane windows are incomplete")
+if "Generic Phoenix DEX Engine only" not in document["funnel"]["semantics"].get("scope", ""):
+    raise SystemExit("Generic funnel scope is ambiguous")
+if "never an Aave fork" not in document["funnel"]["semantics"].get(
+    "simulation_evidence_insufficient", ""
+):
+    raise SystemExit("Generic simulation rejection was mislabeled as Aave evidence")
+if set(document["executive"].get("lane_authority", {})) != {
+    "generic_dex", "aave_liquidation", "atlas_solver"
+}:
+    raise SystemExit("lane authority is not displayed independently")
 PY
   fail "historical dashboard snapshot contract failed"
 
@@ -871,7 +1054,234 @@ if document["economics"]["loss_ledger_7d"] != []:
     raise SystemExit("empty upgraded database must have an empty loss ledger")
 if document["economics"]["daily_attack_surface_7d"] != []:
     raise SystemExit("empty upgraded database must have an empty attack surface")
+if document["economics"].get("aave_exact_7d", {}).get("exact_evaluated_signals") != "0":
+    raise SystemExit("empty upgraded database has Aave Exact evidence")
+if document["economics"].get("atlas_solver_7d", {}).get("request_materialized") != "0":
+    raise SystemExit("empty upgraded database has Atlas request evidence")
 PY
   fail "upgraded dashboard snapshot contract failed"
+
+docker exec -i "$postgres_container" \
+  psql -X -v ON_ERROR_STOP=1 -U phoenix_test -d phoenix_test <<'SQL' >/dev/null ||
+INSERT INTO live_canary.revenue_hunting_signals(
+    signal_id, signal_identity, source_lane, source_cursor, borrower,
+    block_number, block_hash, state_root, zero_cost_profit_upper_bound,
+    expected_net_pnl, conservative_net_pnl, retained_profit_floor,
+    evidence_mode, terminal_outcome, rejection_reason, exact_diagnostics,
+    evidence_hash, observed_at
+) VALUES (
+    '00000000-0000-0000-0000-000000000701', 'fixture-aave-exact',
+    'aave_liquidation', 1, '0x1111111111111111111111111111111111111111',
+    100, '0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+    '0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
+    200, 120, 90, 100, 'DUAL_PROVIDER_FORK_VERIFIED',
+    'economic_rejection', 'conservative_net_pnl_below_threshold',
+    '{
+      "schema":"phoenix.aave-exact-diagnostics.v1",
+      "evaluation_stage":"fork",
+      "route_eligibility":"eligible",
+      "reviewed_combination_count":2,
+      "rejection_counts":{"conservative_net_pnl_below_threshold":1},
+      "top_diagnostics":[{
+        "reviewed_size":"100000000000000","route":"WETH_IDENTITY",
+        "gross_liquidation_edge_wei":"200","flash_premium_wei":"5",
+        "dex_unwind_loss_wei":"0","price_impact_bps":"0","gas_limit":100,
+        "gas_price_wei":"1","l1_cost_wei":"3","execution_cost_wei":"100",
+        "atlas_exposure_wei":"0","atlas_bid_wei":"0","risk_reserve_wei":"10",
+        "expected_net_pnl_wei":"120","conservative_net_pnl_wei":"90",
+        "margin_to_retained_profit_gate_wei":"-10","live_authorized":true,
+        "final_rejection_reason":"conservative_net_pnl_below_threshold",
+        "evidence_mode":"DUAL_PROVIDER_FORK_VERIFIED"
+      }],
+      "best_diagnostic":{
+        "reviewed_size":"100000000000000","route":"WETH_IDENTITY",
+        "gross_liquidation_edge_wei":"200","flash_premium_wei":"5",
+        "dex_unwind_loss_wei":"0","price_impact_bps":"0","gas_limit":100,
+        "gas_price_wei":"1","l1_cost_wei":"3","execution_cost_wei":"100",
+        "atlas_exposure_wei":"0","atlas_bid_wei":"0","risk_reserve_wei":"10",
+        "expected_net_pnl_wei":"120","conservative_net_pnl_wei":"90",
+        "margin_to_retained_profit_gate_wei":"-10","live_authorized":true,
+        "final_rejection_reason":"conservative_net_pnl_below_threshold",
+        "evidence_mode":"DUAL_PROVIDER_FORK_VERIFIED"
+      },
+      "closest_margin_to_retained_profit_gate_wei":"-10",
+      "any_counterfactual_positive":false,
+      "any_live_authorized_positive":false,
+      "fork_attempted":true,
+      "fork_passed":true,
+      "fork_evidence_mode":"DUAL_PROVIDER_FORK_VERIFIED",
+      "failure_class":"conservative_net_pnl_below_threshold",
+      "liquidatable_to_exact_latency_ms":1200,
+      "exact_fork_latency_ms":800
+    }'::jsonb,
+    'cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc', now()
+), (
+    '00000000-0000-0000-0000-000000000702', 'fixture-aave-generic-integrity',
+    'aave_liquidation', 2, '0x2222222222222222222222222222222222222222',
+    101, '0xdddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd',
+    NULL, 200, NULL, NULL, 100, NULL, 'economic_rejection',
+    'fork_simulation_failed', '{
+      "schema":"phoenix.aave-exact-diagnostics.v1",
+      "evaluation_stage":"exact",
+      "route_eligibility":"eligible",
+      "reviewed_combination_count":0,
+      "rejection_counts":{"simulation_evidence_insufficient":1},
+      "any_counterfactual_positive":false,
+      "any_live_authorized_positive":false,
+      "fork_attempted":false,
+      "fork_passed":false,
+      "failure_class":"simulation_evidence_insufficient",
+      "liquidatable_to_exact_latency_ms":0,
+      "exact_fork_latency_ms":0
+    }'::jsonb,
+    'eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee', now()
+);
+
+INSERT INTO live_canary.atlas_auction_ingress(
+    auction_id, user_operation_hash, parallel_auction_identity,
+    auction_deadline_block, oracle_gas_price_wei, solver_gas_limit,
+    dapp, relevant_aave, parallel_eligible, evidence_hash,
+    terminal_outcome, rejection_reason, observed_at
+) VALUES (
+    'fixture-atlas-auction',
+    '0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff',
+    'fixture-parallel-identity', 1000, 1, 100000,
+    '0x3333333333333333333333333333333333333333', true, true,
+    'abababababababababababababababababababababababababababababababab',
+    'economic_rejection', 'atlas_callback_evidence_unavailable', now()
+);
+SQL
+  fail "lane-specific dashboard fixtures were rejected"
+
+{
+  printf '%s\n' 'BEGIN TRANSACTION READ ONLY;'
+  cat "$repo_root/scripts/sql/economic-dashboard-snapshot.sql"
+  printf '%s\n' 'ROLLBACK;'
+} | docker exec -i "$postgres_container" \
+  psql -X -q -A -t -U phoenix_test -d phoenix_test \
+  >"$test_root/lane-dashboard.json" ||
+  fail "lane-specific dashboard snapshot failed"
+PYTHONDONTWRITEBYTECODE=1 python3 -I -B - "$test_root/lane-dashboard.json" <<'PY' ||
+import json
+import sys
+from pathlib import Path
+
+raw = Path(sys.argv[1]).read_text(encoding="utf-8")
+document = json.loads(raw)
+aave = document["funnel"]["revenue_lane_windows"]["aave_liquidation"]["7d"]
+atlas = document["funnel"]["revenue_lane_windows"]["atlas_solver"]["7d"]
+if aave["exact_attempted"] != "not_available" or aave["exact_completed"] != "2" or aave["fork_passed"] != "1":
+    raise SystemExit(f"Aave exact/fork funnel is incorrect: {aave}")
+if aave["unexpected_generic_reason_rows"] != "1":
+    raise SystemExit("Generic simulation rejection leaked into the Aave reason ledger")
+if aave["rejection_reason_counts"]["conservative_net_pnl_below_threshold"] != 1:
+    raise SystemExit("Aave canonical rejection reason was not counted")
+if aave["diagnostic_rejection_occurrences"]["conservative_net_pnl_below_threshold"] != 1:
+    raise SystemExit("Aave per-size rejection evidence was not aggregated")
+if aave["unknown_diagnostic_rejection_key_rows"] != "1":
+    raise SystemExit("unknown Aave diagnostic reason was not bounded and exposed")
+if atlas["ingress"] != "1" or atlas["relevant_aave"] != "1":
+    raise SystemExit(f"Atlas ingress funnel is incorrect: {atlas}")
+if atlas["parallel_eligible"] != "1" or atlas["candidate_signals"] != "0":
+    raise SystemExit(f"Atlas ingress eligibility was mislabeled as a callback stage: {atlas}")
+if atlas["actual_path_verified_candidate_signals"] != "0":
+    raise SystemExit("Atlas callback authority was fabricated")
+if atlas["request_materialized"] != "0":
+    raise SystemExit("Atlas callback rejection fabricated a solver request")
+if atlas["rejection_reason_counts"]["atlas_callback_evidence_unavailable"] != 1:
+    raise SystemExit("Atlas callback capability rejection was not persisted")
+best = document["economics"]["aave_exact_7d"]["best_observed_diagnostic"]
+if best.get("route") != "WETH_IDENTITY" or best.get("reviewed_size") != "100000000000000":
+    raise SystemExit(f"Aave bounded economics are incomplete: {best}")
+if "0x1111111111111111111111111111111111111111" in raw or "fixture-atlas-auction" in raw:
+    raise SystemExit("high-cardinality lane identity leaked into the dashboard")
+PY
+  fail "lane-specific dashboard contract failed"
+
+# Exercise the complete snapshot with a full-week 10,080-row Exact cohort and
+# a rounded-up 20,000-row Atlas cohort. Together with the 600,000 v6 signals
+# above, this is larger than the supplied current Production signal/ingress
+# counts while preserving the observed sparse Exact-diagnostics distribution.
+docker exec -i "$postgres_container" \
+  psql -X -q -v ON_ERROR_STOP=1 -U phoenix_test -d phoenix_test <<'SQL' >/dev/null ||
+INSERT INTO live_canary.revenue_hunting_signals(
+  signal_id, signal_identity, source_lane, source_cursor, block_number,
+  block_hash, zero_cost_profit_upper_bound, retained_profit_floor,
+  terminal_outcome, rejection_reason, exact_diagnostics, evidence_hash,
+  observed_at
+)
+SELECT
+  md5('volume-aave-' || value)::uuid,
+  'volume-aave-' || value,
+  'aave_liquidation', value, 1000 + value,
+  '0x' || repeat('1', 64), 200, 100,
+  'economic_rejection', 'conservative_net_pnl_below_threshold',
+  '{
+    "schema":"phoenix.aave-exact-diagnostics.v1",
+    "evaluation_stage":"fork",
+    "route_eligibility":"eligible",
+    "reviewed_combination_count":1,
+    "rejection_counts":{"conservative_net_pnl_below_threshold":1},
+    "any_counterfactual_positive":false,
+    "any_live_authorized_positive":false,
+    "fork_attempted":true,
+    "fork_passed":true,
+    "fork_evidence_mode":"DUAL_PROVIDER_FORK_VERIFIED",
+    "failure_class":"conservative_net_pnl_below_threshold",
+    "liquidatable_to_exact_latency_ms":1000,
+    "exact_fork_latency_ms":500
+  }'::jsonb,
+  md5('volume-aave-evidence-a-' || value) || md5('volume-aave-evidence-b-' || value),
+  now() - ((value % 604800) * interval '1 second')
+FROM generate_series(1, 10080) AS generated(value);
+
+INSERT INTO live_canary.atlas_auction_ingress(
+  auction_id, user_operation_hash, parallel_auction_identity,
+  auction_deadline_block, oracle_gas_price_wei, solver_gas_limit, dapp,
+  relevant_aave, parallel_eligible, evidence_hash, terminal_outcome,
+  rejection_reason, observed_at
+)
+SELECT
+  'volume-atlas-' || value,
+  '0x' || repeat('2', 64), 'volume-parallel-' || value,
+  1000 + value, 1, 100000, '0x' || repeat('3', 40),
+  true, true,
+  md5('volume-atlas-evidence-a-' || value) || md5('volume-atlas-evidence-b-' || value),
+  'economic_rejection', 'atlas_callback_evidence_unavailable',
+  now() - ((value % 604800) * interval '1 second')
+FROM generate_series(1, 20000) AS generated(value);
+
+ANALYZE live_canary.revenue_hunting_signals;
+ANALYZE live_canary.atlas_auction_ingress;
+SQL
+  fail "representative lane dashboard fixtures were rejected"
+
+volume_query_started=$(date +%s)
+docker exec -i \
+  -e PGOPTIONS='-c statement_timeout=30s -c lock_timeout=5s' \
+  "$postgres_container" \
+  psql -X -q -A -t -U phoenix_test -d phoenix_test \
+  <"$repo_root/scripts/sql/economic-dashboard-snapshot.sql" \
+  >"$test_root/representative-dashboard.json" ||
+  fail "representative lane dashboard exceeded the Production query contract"
+volume_query_seconds=$(($(date +%s) - volume_query_started))
+[ "$volume_query_seconds" -le 35 ] ||
+  fail "representative lane dashboard exceeded the bounded wall-clock margin"
+PYTHONDONTWRITEBYTECODE=1 python3 -I -B - \
+  "$test_root/representative-dashboard.json" "$volume_query_seconds" <<'PY' ||
+import json
+import sys
+from pathlib import Path
+
+document = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+aave = document["funnel"]["revenue_lane_windows"]["aave_liquidation"]["7d"]
+atlas = document["funnel"]["revenue_lane_windows"]["atlas_solver"]["7d"]
+if int(aave["exact_completed"]) < 10082:
+    raise SystemExit("representative Aave rows were not fully aggregated")
+if int(atlas["ingress"]) < 20001:
+    raise SystemExit("representative Atlas rows were not fully aggregated")
+print(f"REPRESENTATIVE_DASHBOARD_QUERY_OK: seconds={sys.argv[2]} aave={aave['exact_completed']} atlas={atlas['ingress']}")
+PY
+  fail "representative lane dashboard result was invalid"
 
 echo "AUTONOMOUS_LIVE_RELEASE_CONTRACT_TEST_OK"

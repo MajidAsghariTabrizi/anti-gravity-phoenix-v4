@@ -485,19 +485,28 @@ func TestAtlasHotScreensAreSkippedWhileCircuitIsOpen(t *testing.T) {
 		t.Fatal(err)
 	}
 	if requests != 0 {
-		t.Fatalf("atlas hot screen bypassed circuit guardrail: requests=%d", requests)
+		t.Fatalf("Atlas callback capability rejection emitted RPC work: requests=%d", requests)
 	}
-	if screener.Snapshot().ProviderCircuitSkippedTotal != 1 {
-		t.Fatalf("expected one skip, got %+v", screener.Snapshot())
+	state := screener.Snapshot()
+	if state.ProviderCircuitSkippedTotal != 0 || state.Counts[atlasCallbackUnavailableKey] != 1 {
+		t.Fatalf("Atlas callback capability rejection was misclassified: %+v", state)
 	}
 }
 
 type recordingSignalSink struct {
-	records []signal
+	records                     []signal
+	atlasCallbackUnavailableIDs []string
+	atlasCallbackEvidenceHashes []string
 }
 
 func (s *recordingSignalSink) RecordAaveSignal(_ context.Context, record signal) error {
 	s.records = append(s.records, record)
+	return nil
+}
+
+func (s *recordingSignalSink) RecordAtlasCallbackUnavailable(_ context.Context, auctionID, evidenceHash string) error {
+	s.atlasCallbackUnavailableIDs = append(s.atlasCallbackUnavailableIDs, auctionID)
+	s.atlasCallbackEvidenceHashes = append(s.atlasCallbackEvidenceHashes, evidenceHash)
 	return nil
 }
 
@@ -778,6 +787,19 @@ func TestExactProviderFailureBubblesToRecoveryBoundary(t *testing.T) {
 	if state.LastErrorClass != "provider_disagreement" || state.LastAttemptAt == nil || state.ExactQueueCount != 0 || len(sink.records) != 0 {
 		t.Fatalf("exact failure crossed authority or queue boundaries: state=%+v records=%+v", state, sink.records)
 	}
+	if state.LastExactAdmissionAt == nil || !exactAdmissionBlocked(screener.nowUTC(), *state.LastExactAdmissionAt) {
+		t.Fatalf("failed Exact did not durably consume its global admission: %+v", state)
+	}
+	reloaded := &Screener{config: Config{StateDir: directory}}
+	if err := reloaded.loadState(); err != nil {
+		t.Fatal(err)
+	}
+	if reloaded.lastExactAdmissionAt.IsZero() || !exactAdmissionBlocked(screener.nowUTC(), reloaded.lastExactAdmissionAt) {
+		t.Fatalf("restart reopened a failed Exact admission: %+v", reloaded.state)
+	}
+	if reloaded.state.Counts[exactEvalStartedKey] != 1 {
+		t.Fatalf("restart lost the durable Exact start count: %+v", reloaded.state.Counts)
+	}
 }
 
 func TestDegradedAtlasAuctionDoesNotStartCompetingRecovery(t *testing.T) {
@@ -786,16 +808,18 @@ func TestDegradedAtlasAuctionDoesNotStartCompetingRecovery(t *testing.T) {
 		requests++
 	}))
 	defer server.Close()
+	sink := &recordingSignalSink{}
 	screener := &Screener{
-		config:       Config{GatewayURL: server.URL},
+		config:       Config{GatewayURL: server.URL, SignalSink: sink},
 		client:       server.Client(),
 		state:        State{Schema: StateSchema, Counts: map[string]uint64{}, LastErrorClass: "provider_unavailable"},
 		hotBorrowers: map[string]string{"0x1111111111111111111111111111111111111111": "900000000000000000"},
 	}
-	if err := screener.HandleAtlasAuction(context.Background(), &observer.LedgerRecord{ChainID: 42161, RelevantAaveAuction: true}); err != nil {
+	evidenceHash := strings.Repeat("a", 64)
+	if err := screener.HandleAtlasAuction(context.Background(), &observer.LedgerRecord{AuctionID: "auction-1", ChainID: 42161, RelevantAaveAuction: true, NotificationSHA256: evidenceHash}); err != nil {
 		t.Fatal(err)
 	}
-	if requests != 0 || screener.Snapshot().ExactQueueCount != 0 {
+	if requests != 0 || screener.Snapshot().ExactQueueCount != 0 || len(sink.records) != 0 || len(sink.atlasCallbackUnavailableIDs) != 1 || sink.atlasCallbackUnavailableIDs[0] != "auction-1" || sink.atlasCallbackEvidenceHashes[0] != evidenceHash {
 		t.Fatalf("Atlas started a competing recovery path: requests=%d state=%+v", requests, screener.Snapshot())
 	}
 }
@@ -914,7 +938,238 @@ func TestLiquidatablePriorityPrefersLargerDebtBeforeLowerHealthFactor(t *testing
 	}
 }
 
-func TestPriorityWindowFitsStateBudgetAndAlternatesTailWithHotWork(t *testing.T) {
+func TestExactSchedulerPrefersNeverServedThenOldestEligibleAcrossCooldown(t *testing.T) {
+	now := time.Date(2026, 8, 11, 0, 0, 0, 0, time.UTC)
+	highDebt := "0x1111111111111111111111111111111111111111"
+	lowDebt := "0x2222222222222222222222222222222222222222"
+	newBorrower := "0x3333333333333333333333333333333333333333"
+	screener := &Screener{
+		hotBorrowers: map[string]string{
+			highDebt: "900000000000000000",
+			lowDebt:  "990000000000000000",
+		},
+		hotDebtBase: map[string]string{highDebt: "1000000", lowDebt: "1"},
+		hotUpperPositive: map[string]bool{
+			highDebt: true,
+			lowDebt:  true,
+		},
+		lastExactAt: map[string]time.Time{highDebt: now.Add(-3 * time.Minute)},
+		firstLiquidatableAt: map[string]time.Time{
+			lowDebt: now.Add(-time.Minute),
+		},
+		state: State{RouteIneligible: map[string]string{}},
+		now:   func() time.Time { return now },
+	}
+	if batch := screener.nextHotBatch(); len(batch) < 2 || batch[0] != lowDebt {
+		t.Fatalf("never-served eligible borrower was starved by debt priority: %v", batch)
+	}
+	accounts := []account{
+		{Borrower: highDebt, TotalDebtBase: "1000000", HealthFactorWAD: "900000000000000000"},
+		{Borrower: lowDebt, TotalDebtBase: "1", HealthFactorWAD: "990000000000000000"},
+	}
+	if order := screener.schedulerAccountOrder(accounts); len(order) != 2 || order[0] != 1 {
+		t.Fatalf("screen execution reordered the fair scheduler selection: %v", order)
+	}
+	newArrival := []account{
+		{Borrower: newBorrower, TotalDebtBase: "1000000000", HealthFactorWAD: "900000000000000000"},
+		{Borrower: lowDebt, TotalDebtBase: "1", HealthFactorWAD: "990000000000000000"},
+	}
+	if order := screener.schedulerAccountOrder(newArrival); len(order) != 2 || order[0] != 1 {
+		t.Fatalf("new high-debt arrival leapfrogged an existing waiter: %v", order)
+	}
+
+	screener.lastExactAt[lowDebt] = now
+	screener.hotBorrowers[newBorrower] = "995000000000000000"
+	screener.hotDebtBase[newBorrower] = "1"
+	screener.hotUpperPositive[newBorrower] = true
+	screener.firstLiquidatableAt[newBorrower] = now
+	now = now.Add(3 * time.Minute)
+	batch := screener.nextHotBatch()
+	if len(batch) != 3 || batch[0] != newBorrower || batch[1] != highDebt || batch[2] != lowDebt {
+		t.Fatalf("never-served/oldest-eligible order drifted after cooldown: %v", batch)
+	}
+}
+
+func TestExactSchedulerUsesTheCurrentLiquidationEpochAfterUrgentInterlude(t *testing.T) {
+	now := time.Date(2026, 8, 11, 0, 10, 0, 0, time.UTC)
+	reentered := "0x1111111111111111111111111111111111111111"
+	continuouslyLiquidatable := "0x2222222222222222222222222222222222222222"
+	screener := &Screener{
+		hotBorrowers: map[string]string{
+			reentered:                "900000000000000000",
+			continuouslyLiquidatable: "990000000000000000",
+		},
+		hotDebtBase: map[string]string{
+			reentered:                "1000000",
+			continuouslyLiquidatable: "1",
+		},
+		hotUpperPositive: map[string]bool{
+			reentered:                true,
+			continuouslyLiquidatable: true,
+		},
+		lastExactAt: map[string]time.Time{
+			reentered:                now.Add(-10 * time.Minute),
+			continuouslyLiquidatable: now.Add(-3 * time.Minute),
+		},
+		firstLiquidatableAt: map[string]time.Time{
+			reentered: now.Add(-30 * time.Second),
+		},
+		state: State{RouteIneligible: map[string]string{}},
+		now:   func() time.Time { return now },
+	}
+	if batch := screener.nextHotBatch(); len(batch) != 2 || batch[0] != continuouslyLiquidatable {
+		t.Fatalf("old cooldown epoch outranked the current liquidation epoch: %v", batch)
+	}
+	accounts := []account{
+		{Borrower: reentered, TotalDebtBase: "1000000", HealthFactorWAD: "900000000000000000"},
+		{Borrower: continuouslyLiquidatable, TotalDebtBase: "1", HealthFactorWAD: "990000000000000000"},
+	}
+	if order := screener.schedulerAccountOrder(accounts); len(order) != 2 || order[0] != 1 {
+		t.Fatalf("screen reordered the current liquidation epoch: %v", order)
+	}
+	snapshot := screener.Snapshot()
+	if snapshot.ExactEligibleNowCount != 2 || snapshot.OldestExactEligibleAgeMillis != uint64(time.Minute/time.Millisecond) {
+		t.Fatalf("eligible-age gauge retained a stale liquidation epoch: %+v", snapshot)
+	}
+}
+
+func TestDeferredScreenPreservesLastCompletedForkOutcome(t *testing.T) {
+	borrower := "0x1111111111111111111111111111111111111111"
+	screener := &Screener{
+		config: Config{RetainedProfitFloorWei: "1"},
+		state:  State{Counts: map[string]uint64{}, RouteIneligible: map[string]string{}},
+	}
+	screener.applyHotSignal(signal{
+		ObservedAt: time.Date(2026, 8, 11, 0, 0, 0, 0, time.UTC),
+		Borrower:   borrower, Bucket: "liquidatable", DebtBase: "1",
+		HF: "900000000000000000", ZeroCostProfitUpperBoundWei: "2",
+		TerminalOutcome: "fork_pending", StateRoot: "0x" + strings.Repeat("a", 64),
+	})
+	screener.applyHotSignal(signal{
+		ObservedAt: time.Date(2026, 8, 11, 0, 0, 10, 0, time.UTC),
+		Borrower:   borrower, Bucket: "liquidatable", DebtBase: "1",
+		HF: "900000000000000000", ZeroCostProfitUpperBoundWei: "2",
+		TerminalOutcome: "exact_pending", ExactDeferredReason: "borrower_cooldown",
+	})
+	if got := screener.latestOutcome[borrower]; got != "fork_pending" {
+		t.Fatalf("cooldown signal erased unresolved fork outcome: %s", got)
+	}
+}
+
+func TestHotReplayResetsLiquidationEpochAtEachExactCompletion(t *testing.T) {
+	borrower := "0x1111111111111111111111111111111111111111"
+	start := time.Date(2026, 8, 11, 0, 0, 0, 0, time.UTC)
+	screener := &Screener{
+		config: Config{RetainedProfitFloorWei: "1"},
+		state:  State{Counts: map[string]uint64{}, RouteIneligible: map[string]string{}},
+	}
+	exact := func(observedAt time.Time, rootByte string) {
+		completedAt := observedAt.Add(30 * time.Second)
+		screener.applyHotSignal(signal{
+			ObservedAt: observedAt, ExactCompletedAt: &completedAt,
+			Borrower: borrower, Bucket: "liquidatable", DebtBase: "1",
+			HF: "900000000000000000", ZeroCostProfitUpperBoundWei: "2",
+			TerminalOutcome: "fork_pending", StateRoot: "0x" + strings.Repeat(rootByte, 64),
+		})
+		if _, present := screener.firstLiquidatableAt[borrower]; present {
+			t.Fatalf("completed Exact retained a prior liquidation epoch: %+v", screener.firstLiquidatableAt)
+		}
+		if got := screener.lastExactAt[borrower]; !got.Equal(completedAt) {
+			t.Fatalf("completion-based cooldown replayed from %s instead of %s", got, completedAt)
+		}
+	}
+	deferred := func(observedAt time.Time) {
+		screener.applyHotSignal(signal{
+			ObservedAt: observedAt,
+			Borrower:   borrower, Bucket: "liquidatable", DebtBase: "1",
+			HF: "900000000000000000", ZeroCostProfitUpperBoundWei: "2",
+			TerminalOutcome: "exact_pending", ExactDeferredReason: "borrower_cooldown",
+		})
+	}
+
+	exact(start, "a")
+	deferred(start.Add(40 * time.Second))
+	if got := screener.firstLiquidatableAt[borrower]; !got.Equal(start.Add(40 * time.Second)) {
+		t.Fatalf("first replay epoch=%s", got)
+	}
+	exact(start.Add(2*time.Minute), "b")
+	deferred(start.Add(2*time.Minute + 40*time.Second))
+	if got := screener.firstLiquidatableAt[borrower]; !got.Equal(start.Add(2*time.Minute + 40*time.Second)) {
+		t.Fatalf("second replay epoch inherited historical latency: %s", got)
+	}
+}
+
+func TestCompactExactSummaryUsesClosestMarginAndDoesNotDoubleCountAuthorityReason(t *testing.T) {
+	record := signal{
+		AuthorityRejectionReason: "live_size_authorization_required",
+		SizeDiagnostics: []sizeDiagnostic{
+			{ReviewedSize: "1", Route: "WETH_IDENTITY", GasLimit: 1, MarginToRetainedFloorWei: "100"},
+			{ReviewedSize: "2", Route: "WETH_IDENTITY", GasLimit: 1, MarginToRetainedFloorWei: "-2"},
+			{ReviewedSize: "3", Route: "WETH_IDENTITY", GasLimit: 1, MarginToRetainedFloorWei: "5", FinalRejectionReason: "live_size_authorization_required", Selected: true},
+		},
+	}
+	summary := buildExactDiagnosticSummary(record, time.Second, time.Second)
+	if summary.ClosestMarginToRetainedFloorWei != "-2" {
+		t.Fatalf("closest margin=%s summary=%+v", summary.ClosestMarginToRetainedFloorWei, summary)
+	}
+	if summary.RejectionCounts["live_size_authorization_required"] != 1 {
+		t.Fatalf("record-level authority reason was double counted: %+v", summary.RejectionCounts)
+	}
+	if len(summary.TopDiagnostics) != 3 || summary.SelectedDiagnostic == nil {
+		t.Fatalf("bounded compact diagnostics are incomplete: %+v", summary)
+	}
+}
+
+func TestCompactExactDiagnosticsRoundTripIsBounded(t *testing.T) {
+	diagnostics := make([]sizeDiagnostic, 0, 5)
+	for index, margin := range []string{"50", "40", "30", "20", "10"} {
+		diagnostics = append(diagnostics, sizeDiagnostic{
+			ReviewedSize: strconv.Itoa(index + 1), Route: "WETH_IDENTITY", GasLimit: 1,
+			MarginToRetainedFloorWei: margin, LiveAuthorized: true,
+		})
+	}
+	record := signal{
+		Schema: "phoenix.atlas-aave-hunting-signal.v1", ObservedAt: time.Now().UTC(),
+		Borrower: "0x1111111111111111111111111111111111111111", TerminalOutcome: "economic_rejection",
+		SizeDiagnostics: diagnostics,
+	}
+	record.ExactDiagnostics = buildExactDiagnosticSummary(record, time.Second, 2*time.Second)
+	encoded, err := json.Marshal(record)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(encoded) >= 64*1024 || len(record.ExactDiagnostics.TopDiagnostics) != 3 {
+		t.Fatalf("compact diagnostics exceeded their bound: bytes=%d summary=%+v", len(encoded), record.ExactDiagnostics)
+	}
+	var decoded signal
+	if err := json.Unmarshal(encoded, &decoded); err != nil {
+		t.Fatal(err)
+	}
+	if decoded.ExactDiagnostics == nil || decoded.ExactDiagnostics.Schema != "phoenix.aave-exact-diagnostics.v1" || len(decoded.ExactDiagnostics.TopDiagnostics) != 3 || decoded.ExactDiagnostics.ReviewedCombinationCount != 5 {
+		t.Fatalf("compact diagnostics did not round trip: %+v", decoded.ExactDiagnostics)
+	}
+}
+
+func TestCandidateArtifactsRequireAnAcceptedDurableSignalWrite(t *testing.T) {
+	for name, record := range map[string]signal{
+		"direct": {ExecutionCandidate: &executionCandidate{}},
+		"atlas":  {AtlasCandidate: &atlasCandidate{}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if err := requireAcceptedCandidateSignalWrite(0, record); err == nil {
+				t.Fatal("conflicting terminal evidence permitted a candidate artifact")
+			}
+			if err := requireAcceptedCandidateSignalWrite(1, record); err != nil {
+				t.Fatalf("accepted signal write was rejected: %v", err)
+			}
+		})
+	}
+	if err := requireAcceptedCandidateSignalWrite(0, signal{}); err != nil {
+		t.Fatalf("a non-authoritative deferred replay must remain a harmless no-op: %v", err)
+	}
+}
+
+func TestEmptyTailPriorityWindowAlternatesTailWithHotWork(t *testing.T) {
 	borrower := "0x1111111111111111111111111111111111111111"
 	sequence := make([]string, 0, 6)
 	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
@@ -968,11 +1223,6 @@ func TestPriorityWindowFitsStateBudgetAndAlternatesTailWithHotWork(t *testing.T)
 	want := []string{"tail", "hot", "tail", "hot", "tail", "hot"}
 	if strings.Join(sequence, ",") != strings.Join(want, ",") || len(waits) != 6 {
 		t.Fatalf("priority cadence drifted: sequence=%v waits=%v", sequence, waits)
-	}
-	// Six priority admissions plus one cold screen leave five of the reviewed
-	// twelve state requests for one full Exact/finalization sequence.
-	if stateAdmissions := len(sequence) + 1; stateAdmissions != 7 || 12-stateAdmissions != 5 {
-		t.Fatalf("state request reserve drifted: admissions=%d", stateAdmissions)
 	}
 	if screener.Snapshot().Counts[hotRecheckTotalKey] != 3 {
 		t.Fatalf("hot rechecks were not counted: %+v", screener.Snapshot().Counts)
@@ -1042,18 +1292,26 @@ func TestHotBudgetDeferralIsFailClosedAndObservable(t *testing.T) {
 }
 
 func TestAaveMetricsExposeHotAndExactLatencyEvidence(t *testing.T) {
+	now := time.Date(2026, 8, 11, 0, 0, 20, 0, time.UTC)
+	liquidatable := "0x1111111111111111111111111111111111111111"
+	urgent := "0x2222222222222222222222222222222222222222"
 	screener := &Screener{
 		state: State{Schema: StateSchema, Counts: map[string]uint64{
 			hotRecheckTotalKey: 3, exactEvalStartedKey: 2, exactEvalCompletedKey: 2,
-		}},
+		}, ExactQueueCount: 42, RouteIneligible: map[string]string{urgent: "no_weth_debt"}},
 		hotBorrowers: map[string]string{
-			"0x1111111111111111111111111111111111111111": "900000000000000000",
-			"0x2222222222222222222222222222222222222222": "1010000000000000000",
+			liquidatable: "900000000000000000",
+			urgent:       "1010000000000000000",
 		},
 		hotDebtBase: map[string]string{
-			"0x1111111111111111111111111111111111111111": "1000",
-			"0x2222222222222222222222222222222222222222": "2000",
+			liquidatable: "1000",
+			urgent:       "2000",
 		},
+		hotUpperPositive:    map[string]bool{liquidatable: true},
+		latestOutcome:       map[string]string{liquidatable: "fork_pending"},
+		firstLiquidatableAt: map[string]time.Time{liquidatable: now.Add(-20 * time.Second)},
+		exactInFlight:       1,
+		now:                 func() time.Time { return now },
 	}
 	screener.mu.Lock()
 	screener.observeDurationLocked(exactEvalLatencySumKey, exactEvalLatencyCountKey, "exact_eval_latency_millis_bucket_le_", 4*time.Second)
@@ -1064,6 +1322,15 @@ func TestAaveMetricsExposeHotAndExactLatencyEvidence(t *testing.T) {
 		"phoenix_aave_hot_queue_size 2",
 		"phoenix_aave_liquidatable_hot_count 1",
 		"phoenix_aave_urgent_hot_count 1",
+		"phoenix_aave_exact_eligible_now 1",
+		"phoenix_aave_exact_scheduler_blocked 0",
+		"phoenix_aave_exact_cooldown_blocked 0",
+		"phoenix_aave_route_ineligible_current 1",
+		"phoenix_aave_exact_provider_blocked 0",
+		"phoenix_aave_exact_evaluations_in_flight 1",
+		"phoenix_aave_oldest_exact_eligible_age_ms 20000",
+		"phoenix_aave_active_fork_pending 1",
+		"phoenix_aave_exact_queue_ledger_entries_total 42",
 		"phoenix_aave_hot_recheck_total 3",
 		"phoenix_aave_exact_eval_latency_ms_bucket{le=\"5000\"} 1",
 		"phoenix_aave_first_liquidatable_to_exact_eval_ms_bucket{le=\"15000\"} 1",
@@ -1151,6 +1418,56 @@ func TestRecentExactEvidenceDefersDuplicateBorrowerWithoutExactRPC(t *testing.T)
 	}
 	if screener.Snapshot().Counts[exactDeferredCooldownKey] != 1 {
 		t.Fatalf("duplicate Exact deferral was not counted: %+v", screener.Snapshot().Counts)
+	}
+}
+
+func TestGlobalExactAdmissionDefersAnotherBorrowerButStillRefreshesHF(t *testing.T) {
+	now := time.Date(2026, 8, 8, 8, 0, 30, 0, time.UTC)
+	borrower := "0x2222222222222222222222222222222222222222"
+	exactRequests := 0
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		switch request.URL.Path {
+		case "/v1/aave/screen":
+			var input screenRequest
+			if err := json.NewDecoder(request.Body).Decode(&input); err != nil {
+				t.Fatal(err)
+			}
+			borrowerAccount := account{
+				Borrower: borrower, TotalDebtBase: "1000000000000",
+				HealthFactorWAD: "900000000000000000",
+			}
+			_ = json.NewEncoder(writer).Encode(screenResponse{
+				SchemaVersion: ResponseSchema, ChainID: 42161, RequestID: input.RequestID,
+				BlockNumber: 491300001, BlockHash: "0x" + strings.Repeat("a", 64),
+				Primary:   providerScreen{ProviderID: "primary", WETHPriceBase: "300000000000", Accounts: []account{borrowerAccount}},
+				Secondary: providerScreen{ProviderID: "secondary", WETHPriceBase: "300000000000", Accounts: []account{borrowerAccount}},
+			})
+		case "/v1/aave/exact":
+			exactRequests++
+			t.Fatal("global Exact admission was bypassed")
+		default:
+			t.Fatalf("unexpected path: %s", request.URL.Path)
+		}
+	}))
+	defer server.Close()
+	sink := &recordingSignalSink{}
+	screener := &Screener{
+		config: Config{StateDir: t.TempDir(), GatewayURL: server.URL, RetainedProfitFloorWei: "1", SignalSink: sink},
+		client: server.Client(), state: State{Schema: StateSchema, Counts: map[string]uint64{}},
+		debtBearing: make(map[string]bool), refreshKnown: make(map[string]bool),
+		hotBorrowers: make(map[string]string), hotDebtBase: make(map[string]string),
+		lastExactAt: make(map[string]time.Time), firstLiquidatableAt: make(map[string]time.Time),
+		lastExactAdmissionAt: now.Add(-30 * time.Second),
+		now:                  func() time.Time { return now },
+	}
+	if err := screener.screen(context.Background(), []string{borrower}, false, nil); err != nil {
+		t.Fatal(err)
+	}
+	if exactRequests != 0 || len(sink.records) != 1 || sink.records[0].ExactDeferredReason != "scheduler_capacity" {
+		t.Fatalf("global Exact admission was not fail-closed: calls=%d records=%+v", exactRequests, sink.records)
+	}
+	if screener.hotBorrowers[borrower] != "900000000000000000" || screener.Snapshot().Counts[exactDeferredSchedulerKey] != 1 || screener.Snapshot().SchedulerBlockedCount != 1 {
+		t.Fatalf("HF refresh or scheduler evidence was lost: %+v", screener.Snapshot())
 	}
 }
 
@@ -1589,11 +1906,8 @@ func TestAaveProfitPathCounterfactualReplay(t *testing.T) {
 		RetainedProfitFloorWei string `json:"retained_profit_floor_wei"`
 		EconomicReserveBPS     uint64 `json:"economic_reserve_bps"`
 		Scheduler              struct {
-			ColdRevisitMS                    uint64 `json:"cold_revisit_ms"`
-			MaximumHotRevisitMS              uint64 `json:"maximum_hot_revisit_ms"`
-			StateRequestsPerMinute           int    `json:"state_requests_per_minute"`
-			BeforeSchedulerRequestsPerMinute int    `json:"before_scheduler_requests_per_minute"`
-			AfterSchedulerRequestsPerMinute  int    `json:"after_scheduler_requests_per_minute"`
+			ColdRevisitMS       uint64 `json:"cold_revisit_ms"`
+			MaximumHotRevisitMS uint64 `json:"maximum_hot_revisit_ms"`
 		} `json:"scheduler"`
 		Opportunities []replayOpportunity `json:"opportunities"`
 	}
@@ -1642,10 +1956,8 @@ func TestAaveProfitPathCounterfactualReplay(t *testing.T) {
 	if positiveOpportunities != 2 || breakEven["fixed-cost-breaks-at-small"] != "250000000000000" || breakEven["fixed-cost-breaks-at-medium"] != "500000000000000" || breakEven["fixed-cost-still-dominates"] != "" || winners["fixed-cost-breaks-at-small"] != 500 || winners["fixed-cost-breaks-at-medium"] != 100 {
 		t.Fatalf("counterfactual replay drifted: positive=%d break_even=%+v winners=%+v", positiveOpportunities, breakEven, winners)
 	}
-	rpcDelta := fixture.Scheduler.AfterSchedulerRequestsPerMinute - fixture.Scheduler.BeforeSchedulerRequestsPerMinute
-	rpcReserve := fixture.Scheduler.StateRequestsPerMinute - fixture.Scheduler.AfterSchedulerRequestsPerMinute
-	if fixture.Scheduler.MaximumHotRevisitMS >= fixture.Scheduler.ColdRevisitMS || rpcDelta != 5 || rpcReserve != 5 {
-		t.Fatalf("scheduler replay drifted: %+v delta=%d reserve=%d", fixture.Scheduler, rpcDelta, rpcReserve)
+	if fixture.Scheduler.MaximumHotRevisitMS >= fixture.Scheduler.ColdRevisitMS {
+		t.Fatalf("scheduler replay drifted: %+v", fixture.Scheduler)
 	}
 	summary, _ := json.Marshal(map[string]any{
 		"fixture_only_not_production_alpha": true,
@@ -1653,10 +1965,214 @@ func TestAaveProfitPathCounterfactualReplay(t *testing.T) {
 		"positive_opportunity_count":        positiveOpportunities,
 		"winning_fee_tiers":                 winners,
 		"maximum_hot_revisit_ms":            fixture.Scheduler.MaximumHotRevisitMS,
-		"state_request_delta_per_minute":    rpcDelta,
-		"state_request_reserve_per_minute":  rpcReserve,
 	})
 	t.Log(string(summary))
+}
+
+func TestAaveExactSchedulerBoundedBeforeAfterModel(t *testing.T) {
+	type replayMetrics struct {
+		ExactStartAttempts         int
+		CooldownDeferrals          int
+		SchedulerDeferrals         int
+		AdmittedExactSlots         int
+		LowDebtFirstExactAtSeconds *int
+	}
+	start := time.Date(2026, 8, 11, 0, 0, 0, 0, time.UTC)
+	high := "0x1111111111111111111111111111111111111111"
+	middle := "0x2222222222222222222222222222222222222222"
+	low := "0x3333333333333333333333333333333333333333"
+	accounts := []account{
+		{Borrower: high, TotalDebtBase: "1000000", HealthFactorWAD: "900000000000000000"},
+		{Borrower: middle, TotalDebtBase: "1000", HealthFactorWAD: "950000000000000000"},
+		{Borrower: low, TotalDebtBase: "1", HealthFactorWAD: "990000000000000000"},
+	}
+
+	// This synthetic reference models admission pressure when debt order retries
+	// every eligible borrower until a single shared slot is consumed. It is not
+	// a claim about the Gateway's continuous token-bucket implementation; the
+	// HTTP-path and Rust cache tests below provide the measured code-path data.
+	legacy := replayMetrics{}
+	legacyLastExact := make(map[string]time.Time)
+	legacyLastAdmission := time.Time{}
+	for offset := 0; offset <= 180; offset += 10 {
+		now := start.Add(time.Duration(offset) * time.Second)
+		for _, index := range prioritizedAccountOrder(accounts) {
+			borrower := accounts[index].Borrower
+			if completedAt, served := legacyLastExact[borrower]; served && now.Sub(completedAt) < exactBorrowerCooldown {
+				legacy.CooldownDeferrals++
+				continue
+			}
+			legacy.ExactStartAttempts++
+			if exactAdmissionBlocked(now, legacyLastAdmission) {
+				break
+			}
+			legacyLastAdmission = now
+			legacyLastExact[borrower] = now
+			legacy.AdmittedExactSlots++
+			if borrower == low && legacy.LowDebtFirstExactAtSeconds == nil {
+				value := offset
+				legacy.LowDebtFirstExactAtSeconds = &value
+			}
+		}
+	}
+
+	after := replayMetrics{}
+	now := start
+	screener := &Screener{
+		lastExactAt: map[string]time.Time{},
+		firstLiquidatableAt: map[string]time.Time{
+			high: start, middle: start, low: start,
+		},
+		now: func() time.Time { return now },
+	}
+	for offset := 0; offset <= 180; offset += 10 {
+		now = start.Add(time.Duration(offset) * time.Second)
+		for _, index := range screener.schedulerAccountOrder(accounts) {
+			borrower := accounts[index].Borrower
+			if completedAt, served := screener.lastExactAt[borrower]; served && now.Sub(completedAt) < exactBorrowerCooldown {
+				after.CooldownDeferrals++
+				continue
+			}
+			if exactAdmissionBlocked(now, screener.lastExactAdmissionAt) {
+				after.SchedulerDeferrals++
+				continue
+			}
+			screener.lastExactAdmissionAt = now
+			screener.lastExactAt[borrower] = now
+			after.ExactStartAttempts++
+			after.AdmittedExactSlots++
+			if borrower == low && after.LowDebtFirstExactAtSeconds == nil {
+				value := offset
+				after.LowDebtFirstExactAtSeconds = &value
+			}
+		}
+	}
+
+	if legacy.ExactStartAttempts != 23 || legacy.LowDebtFirstExactAtSeconds != nil {
+		t.Fatalf("synthetic admission-pressure model drifted: %+v", legacy)
+	}
+	if after.ExactStartAttempts != 4 || after.LowDebtFirstExactAtSeconds == nil || *after.LowDebtFirstExactAtSeconds != 120 {
+		t.Fatalf("bounded fair scheduler replay drifted: %+v", after)
+	}
+	if after.SchedulerDeferrals == 0 || legacy.AdmittedExactSlots != after.AdmittedExactSlots {
+		t.Fatalf("modeled admitted slots changed rather than timing: before=%+v after=%+v", legacy, after)
+	}
+	summary, _ := json.Marshal(map[string]any{
+		"model_trace_seconds":                        180,
+		"modeled_before_exact_start_attempts":        legacy.ExactStartAttempts,
+		"modeled_after_exact_start_attempts":         after.ExactStartAttempts,
+		"modeled_before_cooldown_deferrals":          legacy.CooldownDeferrals,
+		"modeled_after_cooldown_deferrals":           after.CooldownDeferrals,
+		"modeled_after_scheduler_deferrals":          after.SchedulerDeferrals,
+		"modeled_before_low_debt_first_exact":        "not_reached",
+		"modeled_after_low_debt_first_exact_seconds": *after.LowDebtFirstExactAtSeconds,
+		"modeled_admitted_exact_slots":               after.AdmittedExactSlots,
+	})
+	t.Log(string(summary))
+}
+
+func TestAaveExactSchedulerHTTPPathIsBoundedAndDual(t *testing.T) {
+	start := time.Date(2026, 8, 11, 0, 0, 0, 0, time.UTC)
+	now := start
+	high := "0x1111111111111111111111111111111111111111"
+	low := "0x2222222222222222222222222222222222222222"
+	exactStarts := map[string]int{}
+	exactDualProviderChecks := 0
+	lowFirstExactSeconds := -1
+
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		switch request.URL.Path {
+		case "/v1/aave/screen":
+			var input screenRequest
+			if err := json.NewDecoder(request.Body).Decode(&input); err != nil {
+				t.Fatal(err)
+			}
+			accounts := make([]account, 0, len(input.Borrowers))
+			for _, borrower := range input.Borrowers {
+				debt := "1000000000000"
+				if borrower == low {
+					debt = "1000000000"
+				}
+				accounts = append(accounts, account{
+					Borrower: borrower, TotalCollateralBase: "2000000000000",
+					TotalDebtBase: debt, AvailableBorrowsBase: "0",
+					CurrentLiquidationThreshold: "8000", LoanToValueBPS: "7500",
+					HealthFactorWAD: "900000000000000000",
+				})
+			}
+			_ = json.NewEncoder(writer).Encode(screenResponse{
+				SchemaVersion: ResponseSchema, ChainID: 42161, RequestID: input.RequestID,
+				BlockNumber: 491300000, BlockHash: "0x" + strings.Repeat("a", 64),
+				Primary:   providerScreen{ProviderID: "production-nownodes-arbitrum", WETHPriceBase: "300000000000", Accounts: accounts},
+				Secondary: providerScreen{ProviderID: "production-slot-0", WETHPriceBase: "300000000000", Accounts: accounts},
+			})
+		case "/v1/aave/exact":
+			var input exactRequest
+			if err := json.NewDecoder(request.Body).Decode(&input); err != nil {
+				t.Fatal(err)
+			}
+			exactStarts[input.Borrower]++
+			if input.Borrower == low && lowFirstExactSeconds < 0 {
+				lowFirstExactSeconds = int(now.Sub(start) / time.Second)
+			}
+			reserve := exactReserve{
+				Asset: wethAddress, CurrentATokenBalance: "1", CurrentStableDebt: "0",
+				CurrentVariableDebt: "1000", UsageAsCollateralEnabled: true,
+			}
+			primary := exactProvider{ProviderID: "production-nownodes-arbitrum", Reserves: []exactReserve{reserve}, FlashPremiumBPS: 5}
+			secondary := primary
+			secondary.ProviderID = "production-slot-0"
+			exactDualProviderChecks += 2
+			_ = json.NewEncoder(writer).Encode(exactResponse{
+				SchemaVersion: "phoenix.rpc.aave-exact-response.v3", ChainID: 42161,
+				RequestID: input.RequestID, BlockNumber: 491300000,
+				BlockHash: "0x" + strings.Repeat("b", 64), StateRoot: "0x" + strings.Repeat("c", 64),
+				Primary: primary, Secondary: secondary,
+			})
+		default:
+			t.Fatalf("unexpected path: %s", request.URL.Path)
+		}
+	}))
+	defer server.Close()
+
+	sink := &recordingSignalSink{}
+	screener := &Screener{
+		config: Config{
+			GatewayURL: server.URL, StateDir: t.TempDir(), RetainedProfitFloorWei: "1",
+			MaximumInputAmountWei: maximumReviewedInputWei, SignalSink: sink,
+		},
+		client: server.Client(), now: func() time.Time { return now },
+		state:       State{Schema: StateSchema, Counts: map[string]uint64{}, RouteIneligible: map[string]string{}},
+		debtBearing: make(map[string]bool), refreshKnown: make(map[string]bool),
+		hotBorrowers: make(map[string]string), hotDebtBase: make(map[string]string),
+		lastExactAt: make(map[string]time.Time), firstLiquidatableAt: make(map[string]time.Time),
+	}
+	for offset := 0; offset <= 110; offset += 10 {
+		now = start.Add(time.Duration(offset) * time.Second)
+		if err := screener.screen(context.Background(), []string{high, low}, false, nil); err != nil {
+			t.Fatalf("screen at +%ds failed: %v", offset, err)
+		}
+	}
+	state := screener.Snapshot()
+	if exactStarts[high] != 1 || exactStarts[low] != 1 || state.Counts[exactEvalStartedKey] != 2 || state.Counts[exactEvalCompletedKey] != 2 {
+		t.Fatalf("real scheduler path duplicated Exact work: starts=%+v state=%+v", exactStarts, state.Counts)
+	}
+	if lowFirstExactSeconds != 60 || state.Counts[exactDeferredSchedulerKey] == 0 || state.Counts[exactDeferredCooldownKey] == 0 {
+		t.Fatalf("real scheduler path lost bounded fairness evidence: first=%d state=%+v", lowFirstExactSeconds, state.Counts)
+	}
+	if exactDualProviderChecks != 4 {
+		t.Fatalf("real Exact path weakened dual evidence: checks=%d", exactDualProviderChecks)
+	}
+	for _, record := range sink.records {
+		if record.Authority || record.ExecutionCandidate != nil || record.AtlasCandidate != nil {
+			t.Fatalf("scheduler timing created Candidate authority: %+v", record)
+		}
+	}
+	if screener.hotBorrowers[low] != "900000000000000000" {
+		t.Fatalf("HF refresh stopped while Exact was deferred: %+v", screener.hotBorrowers)
+	}
+	t.Logf("actual_path exact_starts=2 scheduler_deferrals=%d cooldown_deferrals=%d low_first_exact_seconds=%d dual_checks=%d candidate_authority=0",
+		state.Counts[exactDeferredSchedulerKey], state.Counts[exactDeferredCooldownKey], lowFirstExactSeconds, exactDualProviderChecks)
 }
 
 func TestResolveExactContinuesPastFailedSizeAndBindsSelectedRepay(t *testing.T) {
@@ -2564,11 +3080,11 @@ func TestStableDebtIsBorrowerScopedAndDoesNotAbortScreenBatch(t *testing.T) {
 	if err := screener.screen(context.Background(), []string{stableBorrower, otherBorrower}, false, nil); err != nil {
 		t.Fatal(err)
 	}
-	if len(exactCalls) != 2 || exactCalls[0] != stableBorrower || exactCalls[1] != otherBorrower {
-		t.Fatalf("stable debt aborted or reordered the borrower batch: %v", exactCalls)
+	if len(exactCalls) != 1 || exactCalls[0] != stableBorrower {
+		t.Fatalf("screen-wide Exact capacity was not bounded deterministically: %v", exactCalls)
 	}
 	state := screener.Snapshot()
-	if state.RouteIneligible[stableBorrower] != "unsupported_stable_weth_debt" || state.RouteIneligible[otherBorrower] != "no_weth_debt" {
+	if state.RouteIneligible[stableBorrower] != "unsupported_stable_weth_debt" || state.RouteIneligible[otherBorrower] != "" || len(sink.records) != 2 || sink.records[1].Borrower != otherBorrower || sink.records[1].ExactDeferredReason != "scheduler_capacity" {
 		t.Fatalf("borrower-scoped route diagnoses were not persisted: routes=%+v signals=%+v", state.RouteIneligible, sink.records)
 	}
 }
@@ -2687,6 +3203,16 @@ func TestRouteIneligibleStatePersistsAndTailInvalidatesDurably(t *testing.T) {
 	if err := first.persistState(); err != nil {
 		t.Fatal(err)
 	}
+	oldObservedAt := time.Now().UTC().Add(-time.Hour)
+	oldCompletedAt := oldObservedAt.Add(time.Second)
+	if err := appendJSON(filepath.Join(directory, "signals.ndjson"), signal{
+		Schema: "phoenix.atlas-aave-hunting-signal.v1", ObservedAt: oldObservedAt,
+		ExactCompletedAt: &oldCompletedAt, Borrower: borrower, DebtBase: "1000",
+		HF: "900000000000000000", Bucket: "liquidatable", StateRoot: "0x" + strings.Repeat("c", 64),
+		ZeroCostProfitUpperBoundWei: "2", TerminalOutcome: "fork_pending",
+	}); err != nil {
+		t.Fatal(err)
+	}
 
 	second := &Screener{
 		config: Config{
@@ -2732,6 +3258,11 @@ func TestRouteIneligibleStatePersistsAndTailInvalidatesDurably(t *testing.T) {
 	second.state.TailNextBlock = 100
 	second.debtBearing = make(map[string]bool)
 	second.refreshKnown = make(map[string]bool)
+	second.hotBorrowers = map[string]string{borrower: "900000000000000000"}
+	second.hotDebtBase = map[string]string{borrower: "1000"}
+	second.hotUpperPositive = map[string]bool{borrower: true}
+	second.latestOutcome = map[string]string{borrower: "fork_pending"}
+	second.firstLiquidatableAt = map[string]time.Time{borrower: time.Now().UTC().Add(-time.Hour)}
 
 	borrowers, err := second.pollTail(context.Background())
 	if err != nil {
@@ -2742,6 +3273,12 @@ func TestRouteIneligibleStatePersistsAndTailInvalidatesDurably(t *testing.T) {
 	}
 	if _, exists := second.state.RouteIneligible[borrower]; exists {
 		t.Fatalf("tail event did not clear route-ineligible state: %+v", second.state.RouteIneligible)
+	}
+	if _, exists := second.firstLiquidatableAt[borrower]; exists || second.latestOutcome[borrower] != "" || second.hotUpperPositive[borrower] {
+		t.Fatalf("tail event retained stale Exact evidence: epoch=%v outcome=%q upper_positive=%t", second.firstLiquidatableAt[borrower], second.latestOutcome[borrower], second.hotUpperPositive[borrower])
+	}
+	if second.Snapshot().ActiveForkPendingCount != 0 {
+		t.Fatalf("tail-invalidated fork evidence remained active: %+v", second.Snapshot())
 	}
 
 	var durable State
@@ -2754,6 +3291,80 @@ func TestRouteIneligibleStatePersistsAndTailInvalidatesDurably(t *testing.T) {
 	}
 	if _, exists := durable.RouteIneligible[borrower]; exists {
 		t.Fatalf("tail invalidation was not persisted: %+v", durable.RouteIneligible)
+	}
+	if durable.TailInvalidatedBlock[borrower] != 100 {
+		t.Fatalf("tail Exact invalidation was not block-bound: %+v", durable.TailInvalidatedBlock)
+	}
+
+	// A future wall-clock timestamp cannot make pre-tail block evidence newer,
+	// and a lagging dual screen must not clear the tombstone or start Exact.
+	second.applyHotSignal(signal{
+		ObservedAt: time.Now().UTC().Add(24 * time.Hour), Block: 99,
+		Borrower: borrower, Bucket: "liquidatable", DebtBase: "1000",
+		HF: "900000000000000000", ZeroCostProfitUpperBoundWei: "2",
+		TerminalOutcome: "fork_pending", StateRoot: "0x" + strings.Repeat("c", 64),
+	})
+	if second.latestOutcome[borrower] != "" || second.state.TailInvalidatedBlock[borrower] != 100 {
+		t.Fatalf("pre-tail block evidence bypassed the tombstone: outcome=%q tombstones=%+v", second.latestOutcome[borrower], second.state.TailInvalidatedBlock)
+	}
+	screenBlock := uint64(99)
+	exactRequests := 0
+	screenServer := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		switch request.URL.Path {
+		case "/v1/aave/screen":
+			var input screenRequest
+			_ = json.NewDecoder(request.Body).Decode(&input)
+			borrowerAccount := account{
+				Borrower: borrower, TotalCollateralBase: "2000000000000",
+				TotalDebtBase: "1000000000000", CurrentLiquidationThreshold: "8000",
+				HealthFactorWAD: "900000000000000000",
+			}
+			_ = json.NewEncoder(writer).Encode(screenResponse{
+				SchemaVersion: ResponseSchema, ChainID: 42161, RequestID: input.RequestID,
+				BlockNumber: screenBlock, BlockHash: "0x" + strings.Repeat("d", 64),
+				Primary:   providerScreen{ProviderID: "primary", WETHPriceBase: "300000000000", Accounts: []account{borrowerAccount}},
+				Secondary: providerScreen{ProviderID: "secondary", WETHPriceBase: "300000000000", Accounts: []account{borrowerAccount}},
+			})
+		case "/v1/aave/exact":
+			exactRequests++
+			var input exactRequest
+			_ = json.NewDecoder(request.Body).Decode(&input)
+			primary := exactProvider{ProviderID: "primary"}
+			secondary := primary
+			secondary.ProviderID = "secondary"
+			_ = json.NewEncoder(writer).Encode(exactResponse{
+				SchemaVersion: "phoenix.rpc.aave-exact-response.v3", ChainID: 42161,
+				RequestID: input.RequestID, BlockNumber: 99,
+				BlockHash: "0x" + strings.Repeat("e", 64), StateRoot: "0x" + strings.Repeat("f", 64),
+				Primary: primary, Secondary: secondary,
+			})
+		default:
+			t.Fatalf("unexpected path: %s", request.URL.Path)
+		}
+	}))
+	defer screenServer.Close()
+	second.config.GatewayURL = screenServer.URL
+	second.config.RetainedProfitFloorWei = "1"
+	second.config.MaximumInputAmountWei = maximumReviewedInputWei
+	second.client = screenServer.Client()
+	if err := second.screen(context.Background(), []string{borrower}, false, nil); err == nil || exactRequests != 0 {
+		t.Fatalf("pre-tail screen was not rejected before Exact: calls=%d err=%v", exactRequests, err)
+	}
+	screenBlock = 100
+	if err := second.screen(context.Background(), []string{borrower}, false, nil); err == nil || exactRequests != 1 {
+		t.Fatalf("Exact evidence older than its screen was not rejected: calls=%d err=%v", exactRequests, err)
+	}
+	restarted := &Screener{
+		config: Config{StateDir: directory, DiscoverySHA256: discoveryHash, StartingCursor: 0, RetainedProfitFloorWei: "1"},
+	}
+	if err := restarted.loadState(); err != nil {
+		t.Fatal(err)
+	}
+	if err := restarted.loadHotSignals(); err != nil {
+		t.Fatal(err)
+	}
+	if restarted.latestOutcome[borrower] != "" || !restarted.lastExactAt[borrower].IsZero() || !restarted.firstLiquidatableAt[borrower].IsZero() || restarted.hotUpperPositive[borrower] || restarted.Snapshot().ActiveForkPendingCount != 0 {
+		t.Fatalf("restart resurrected tail-invalidated Exact evidence: outcome=%q exact=%v epoch=%v", restarted.latestOutcome[borrower], restarted.lastExactAt[borrower], restarted.firstLiquidatableAt[borrower])
 	}
 }
 

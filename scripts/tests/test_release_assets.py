@@ -20,6 +20,7 @@ LIVE_CANARY_ASSETS = (
     "live-executor/schema/004_autonomous_live_runtime.sql",
     "live-executor/schema/005_closed_loop_economic_control.sql",
     "live-executor/schema/006_atlas_aave_revenue_lanes.sql",
+    "live-executor/schema/007_aave_economic_diagnostics.sql",
     "compose.live-autonomous.yml",
     "deploy/phoenix-economic-activation.path",
     "deploy/phoenix-economic-activation.service",

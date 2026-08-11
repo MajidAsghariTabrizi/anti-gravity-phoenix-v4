@@ -82,11 +82,16 @@ window_funnel AS (
         (SELECT count(*) FROM live_canary.autonomous_candidates candidate
          WHERE candidate.created_at >= evidence_window.window_start) AS candidates,
         (SELECT count(*) FROM live_canary.execution_requests request
-         WHERE request.created_at >= evidence_window.window_start) AS execution_requests,
+         WHERE request.created_at >= evidence_window.window_start
+           AND request.route_type = 'PHOENIX_DEX_V1') AS execution_requests,
         (SELECT count(*) FROM live_canary.execution_attempts attempt
-         WHERE attempt.claimed_at >= evidence_window.window_start) AS attempts,
+         JOIN live_canary.execution_requests request ON request.id = attempt.request_id
+         WHERE attempt.claimed_at >= evidence_window.window_start
+           AND request.route_type = 'PHOENIX_DEX_V1') AS attempts,
         (SELECT count(*) FROM live_canary.execution_attempts attempt
-         WHERE attempt.submitted_at >= evidence_window.window_start) AS submissions,
+         JOIN live_canary.execution_requests request ON request.id = attempt.request_id
+         WHERE attempt.submitted_at >= evidence_window.window_start
+           AND request.route_type = 'PHOENIX_DEX_V1') AS submissions,
         (SELECT count(*) FROM live_canary.autonomous_outcome_attributions outcome
          WHERE outcome.attributed_at >= evidence_window.window_start) AS realized_outcomes
     FROM windows evidence_window
@@ -160,6 +165,460 @@ window_documents AS (
     ) AS values
     FROM window_funnel funnel
     JOIN window_rejections rejection USING (label)
+),
+bounded_aave_signals AS MATERIALIZED (
+    SELECT signal_identity, borrower, zero_cost_profit_upper_bound,
+           retained_profit_floor, terminal_outcome, rejection_reason,
+           exact_diagnostics, observed_at
+    FROM live_canary.revenue_hunting_signals
+    WHERE source_lane = 'aave_liquidation'
+      AND observed_at >= now() - interval '7 days'
+),
+bounded_aave_exact_signals AS MATERIALIZED (
+    SELECT *
+    FROM bounded_aave_signals
+    WHERE exact_diagnostics IS NOT NULL
+),
+bounded_aave_requests AS MATERIALIZED (
+    SELECT id, created_at
+    FROM live_canary.execution_requests
+    WHERE route_type = 'AAVE_LIQUIDATION_V1'
+      AND created_at >= now() - interval '7 days'
+),
+bounded_aave_attempts AS MATERIALIZED (
+    SELECT attempt.claimed_at, attempt.submitted_at
+    FROM live_canary.execution_attempts attempt
+    JOIN bounded_aave_requests request ON request.id = attempt.request_id
+),
+bounded_aave_outcomes AS MATERIALIZED (
+    SELECT outcome.recorded_at, outcome.net_pnl_wei
+    FROM live_canary.execution_outcomes outcome
+    JOIN bounded_aave_requests request ON request.id = outcome.request_id
+),
+aave_window_funnel AS (
+    SELECT
+        evidence_window.label,
+        evidence_window.window_start,
+        count(*) FILTER (
+            WHERE signal.zero_cost_profit_upper_bound IS NOT NULL
+        ) AS discovered_liquidatable_signals,
+        count(DISTINCT signal.borrower) FILTER (
+            WHERE signal.zero_cost_profit_upper_bound IS NOT NULL
+        ) AS distinct_liquidatable_borrowers,
+        count(*) FILTER (
+            WHERE signal.zero_cost_profit_upper_bound > signal.retained_profit_floor
+        ) AS prefilter_positive,
+        count(*) FILTER (WHERE signal.exact_diagnostics IS NOT NULL) AS exact_evaluated,
+        count(*) FILTER (
+            WHERE signal.exact_diagnostics->>'route_eligibility' = 'eligible'
+        ) AS route_eligible,
+        count(*) FILTER (
+            WHERE signal.exact_diagnostics->>'fork_attempted' = 'true'
+        ) AS fork_attempted,
+        count(*) FILTER (
+            WHERE signal.exact_diagnostics->>'fork_passed' = 'true'
+        ) AS fork_passed,
+        count(*) FILTER (
+            WHERE signal.exact_diagnostics->>'any_counterfactual_positive' = 'true'
+        ) AS counterfactual_positive,
+        count(*) FILTER (
+            WHERE signal.exact_diagnostics->>'any_live_authorized_positive' = 'true'
+        ) AS live_authorized_positive,
+        count(*) FILTER (WHERE signal.terminal_outcome = 'candidate') AS candidate_signals,
+        percentile_cont(0.5) WITHIN GROUP (
+            ORDER BY (signal.exact_diagnostics->>'liquidatable_to_exact_latency_ms')::numeric
+        ) FILTER (
+            WHERE signal.exact_diagnostics->>'liquidatable_to_exact_latency_ms' ~ '^[0-9]+$'
+        ) AS liquidatable_to_exact_p50_ms,
+        percentile_cont(0.95) WITHIN GROUP (
+            ORDER BY (signal.exact_diagnostics->>'liquidatable_to_exact_latency_ms')::numeric
+        ) FILTER (
+            WHERE signal.exact_diagnostics->>'liquidatable_to_exact_latency_ms' ~ '^[0-9]+$'
+        ) AS liquidatable_to_exact_p95_ms,
+        percentile_cont(0.5) WITHIN GROUP (
+            ORDER BY (signal.exact_diagnostics->>'exact_fork_latency_ms')::numeric
+        ) FILTER (
+            WHERE signal.exact_diagnostics->>'exact_fork_latency_ms' ~ '^[0-9]+$'
+        ) AS exact_fork_p50_ms,
+        percentile_cont(0.95) WITHIN GROUP (
+            ORDER BY (signal.exact_diagnostics->>'exact_fork_latency_ms')::numeric
+        ) FILTER (
+            WHERE signal.exact_diagnostics->>'exact_fork_latency_ms' ~ '^[0-9]+$'
+        ) AS exact_fork_p95_ms,
+        (SELECT count(*) FROM bounded_aave_requests request
+         WHERE request.created_at >= evidence_window.window_start) AS execution_requests,
+        (SELECT count(*) FROM bounded_aave_attempts attempt
+         WHERE attempt.claimed_at >= evidence_window.window_start) AS attempts,
+        (SELECT count(*) FROM bounded_aave_attempts attempt
+         WHERE attempt.submitted_at >= evidence_window.window_start) AS submissions,
+        (SELECT count(*) FROM bounded_aave_outcomes outcome
+         WHERE outcome.recorded_at >= evidence_window.window_start) AS reconciled_outcomes,
+        (SELECT coalesce(sum(outcome.net_pnl_wei), 0) FROM bounded_aave_outcomes outcome
+         WHERE outcome.recorded_at >= evidence_window.window_start) AS realized_net_pnl
+    FROM windows evidence_window
+    LEFT JOIN bounded_aave_signals signal
+      ON signal.observed_at >= evidence_window.window_start
+    GROUP BY evidence_window.label, evidence_window.window_start
+),
+aave_window_documents AS (
+    SELECT jsonb_object_agg(
+        funnel.label,
+        jsonb_build_object(
+            'window_start', to_char(funnel.window_start AT TIME ZONE 'UTC',
+                'YYYY-MM-DD"T"HH24:MI:SS"Z"'),
+            'discovered_liquidatable_signals', funnel.discovered_liquidatable_signals::text,
+            'distinct_liquidatable_borrowers', funnel.distinct_liquidatable_borrowers::text,
+            'prefilter_positive', funnel.prefilter_positive::text,
+            'exact_eligible', funnel.prefilter_positive::text,
+            'exact_deferred_by_reason', reasons.deferrals,
+            'exact_attempted', 'not_available',
+            'exact_completed', funnel.exact_evaluated::text,
+            'exact_evaluated', funnel.exact_evaluated::text,
+            'route_eligible', funnel.route_eligible::text,
+            'fork_attempted', funnel.fork_attempted::text,
+            'fork_passed', funnel.fork_passed::text,
+            'counterfactual_positive', funnel.counterfactual_positive::text,
+            'live_authorized_positive', funnel.live_authorized_positive::text,
+            'candidate_materialized', funnel.candidate_signals::text,
+            'execution_requests', funnel.execution_requests::text,
+            'attempts', funnel.attempts::text,
+            'submissions', funnel.submissions::text,
+            'reconciled_outcomes', funnel.reconciled_outcomes::text,
+            'realized_net_pnl_wei', funnel.realized_net_pnl::text,
+            'closest_margin_to_gate_wei',
+                coalesce(closest.margin_to_gate::text, 'not_available'),
+            'best_reviewed_size_wei', coalesce(best.reviewed_size, 'not_available'),
+            'best_route', coalesce(best.route, 'not_available'),
+            'liquidatable_to_exact_p50_ms',
+                coalesce(funnel.liquidatable_to_exact_p50_ms::text, 'not_available'),
+            'liquidatable_to_exact_p95_ms',
+                coalesce(funnel.liquidatable_to_exact_p95_ms::text, 'not_available'),
+            'exact_fork_p50_ms',
+                coalesce(funnel.exact_fork_p50_ms::text, 'not_available'),
+            'exact_fork_p95_ms',
+                coalesce(funnel.exact_fork_p95_ms::text, 'not_available'),
+            'rejection_reason_counts', reasons.rejections,
+            'diagnostic_rejection_occurrences', diagnostic_reasons.occurrences,
+            'unknown_diagnostic_rejection_key_rows',
+                diagnostic_reasons.unknown_key_rows::text,
+            'unexpected_generic_reason_rows', reasons.unexpected_generic_reason_rows::text
+        )
+        ORDER BY CASE funnel.label WHEN '1h' THEN 1 WHEN '24h' THEN 2 ELSE 3 END
+    ) AS values
+    FROM aave_window_funnel funnel
+    LEFT JOIN LATERAL (
+        SELECT
+            jsonb_build_object(
+                'provider_recovery_requires_fresh_screen', count(*)
+                    FILTER (WHERE signal.rejection_reason = 'provider_recovery_requires_fresh_screen'),
+                'borrower_cooldown', count(*)
+                    FILTER (WHERE signal.rejection_reason = 'borrower_cooldown'),
+                'scheduler_capacity', count(*)
+                    FILTER (WHERE signal.rejection_reason = 'scheduler_capacity'),
+                'route_ineligible_until_tail', count(*)
+                    FILTER (WHERE signal.rejection_reason = 'route_ineligible_until_tail')
+            ) AS deferrals,
+            jsonb_build_object(
+                'prefilter_upper_bound_below_floor', count(*) FILTER
+                    (WHERE signal.rejection_reason = 'prefilter_upper_bound_below_floor'),
+                'no_weth_debt', count(*) FILTER
+                    (WHERE signal.rejection_reason = 'no_weth_debt'),
+                'no_supported_collateral', count(*) FILTER
+                    (WHERE signal.rejection_reason = 'no_supported_collateral'),
+                'supported_collateral_disabled', count(*) FILTER
+                    (WHERE signal.rejection_reason = 'supported_collateral_disabled'),
+                'unsupported_stable_weth_debt', count(*) FILTER
+                    (WHERE signal.rejection_reason = 'unsupported_stable_weth_debt'),
+                'no_reviewed_liquidation_variant', count(*) FILTER
+                    (WHERE signal.rejection_reason = 'no_reviewed_liquidation_variant'),
+                'gross_edge_below_retained_profit_gate', count(*) FILTER
+                    (WHERE signal.rejection_reason = 'gross_edge_below_retained_profit_gate'),
+                'fork_simulation_failed', count(*) FILTER
+                    (WHERE signal.rejection_reason = 'fork_simulation_failed'),
+                'fork_economics_invalid', count(*) FILTER
+                    (WHERE signal.rejection_reason = 'fork_economics_invalid'),
+                'bound_convergence_failed', count(*) FILTER
+                    (WHERE signal.rejection_reason = 'bound_convergence_failed'),
+                'conservative_net_pnl_below_threshold', count(*) FILTER
+                    (WHERE signal.rejection_reason = 'conservative_net_pnl_below_threshold'),
+                'live_size_authorization_required', count(*) FILTER
+                    (WHERE signal.rejection_reason = 'live_size_authorization_required'),
+                'fresh_state_mismatch', count(*) FILTER
+                    (WHERE signal.rejection_reason = 'fresh_state_mismatch'),
+                'fresh_exact_unavailable', count(*) FILTER
+                    (WHERE signal.rejection_reason = 'fresh_exact_unavailable'),
+                'economic_bound_incomplete', count(*) FILTER
+                    (WHERE signal.rejection_reason = 'economic_bound_incomplete')
+            ) AS rejections,
+            count(*) FILTER (
+                WHERE signal.rejection_reason = 'simulation_evidence_insufficient'
+                   OR signal.exact_diagnostics->>'failure_class' =
+                      'simulation_evidence_insufficient'
+                   OR signal.exact_diagnostics->'rejection_counts' ?
+                      'simulation_evidence_insufficient'
+            ) AS unexpected_generic_reason_rows
+        FROM bounded_aave_signals signal
+        WHERE signal.observed_at >= funnel.window_start
+    ) reasons ON true
+    LEFT JOIN LATERAL (
+        SELECT (
+            signal.exact_diagnostics->>'closest_margin_to_retained_profit_gate_wei'
+        )::numeric AS margin_to_gate
+        FROM bounded_aave_exact_signals signal
+        WHERE signal.observed_at >= funnel.window_start
+          AND signal.exact_diagnostics->>'closest_margin_to_retained_profit_gate_wei'
+              ~ '^-?[0-9]+$'
+        ORDER BY abs((
+            signal.exact_diagnostics->>'closest_margin_to_retained_profit_gate_wei'
+        )::numeric), signal.observed_at DESC
+        LIMIT 1
+    ) closest ON true
+    LEFT JOIN LATERAL (
+        SELECT
+            jsonb_build_object(
+                'gross_edge_below_retained_profit_gate', coalesce(sum(
+                    CASE WHEN signal.exact_diagnostics->'rejection_counts'
+                                   ->>'gross_edge_below_retained_profit_gate' ~ '^[0-9]+$'
+                         THEN (signal.exact_diagnostics->'rejection_counts'
+                                   ->>'gross_edge_below_retained_profit_gate')::bigint ELSE 0 END), 0),
+                'fork_simulation_failed', coalesce(sum(
+                    CASE WHEN signal.exact_diagnostics->'rejection_counts'
+                                   ->>'fork_simulation_failed' ~ '^[0-9]+$'
+                         THEN (signal.exact_diagnostics->'rejection_counts'
+                                   ->>'fork_simulation_failed')::bigint ELSE 0 END), 0),
+                'fork_economics_invalid', coalesce(sum(
+                    CASE WHEN signal.exact_diagnostics->'rejection_counts'
+                                   ->>'fork_economics_invalid' ~ '^[0-9]+$'
+                         THEN (signal.exact_diagnostics->'rejection_counts'
+                                   ->>'fork_economics_invalid')::bigint ELSE 0 END), 0),
+                'bound_convergence_failed', coalesce(sum(
+                    CASE WHEN signal.exact_diagnostics->'rejection_counts'
+                                   ->>'bound_convergence_failed' ~ '^[0-9]+$'
+                         THEN (signal.exact_diagnostics->'rejection_counts'
+                                   ->>'bound_convergence_failed')::bigint ELSE 0 END), 0),
+                'conservative_net_pnl_below_threshold', coalesce(sum(
+                    CASE WHEN signal.exact_diagnostics->'rejection_counts'
+                                   ->>'conservative_net_pnl_below_threshold' ~ '^[0-9]+$'
+                         THEN (signal.exact_diagnostics->'rejection_counts'
+                                   ->>'conservative_net_pnl_below_threshold')::bigint ELSE 0 END), 0),
+                'smallest_positive_reviewed_size_not_selected', coalesce(sum(
+                    CASE WHEN signal.exact_diagnostics->'rejection_counts'
+                                   ->>'smallest_positive_reviewed_size_not_selected' ~ '^[0-9]+$'
+                         THEN (signal.exact_diagnostics->'rejection_counts'
+                                   ->>'smallest_positive_reviewed_size_not_selected')::bigint ELSE 0 END), 0),
+                'live_size_authorization_required', coalesce(sum(
+                    CASE WHEN signal.exact_diagnostics->'rejection_counts'
+                                   ->>'live_size_authorization_required' ~ '^[0-9]+$'
+                         THEN (signal.exact_diagnostics->'rejection_counts'
+                                   ->>'live_size_authorization_required')::bigint ELSE 0 END), 0),
+                'fresh_state_mismatch', coalesce(sum(
+                    CASE WHEN signal.exact_diagnostics->'rejection_counts'
+                                   ->>'fresh_state_mismatch' ~ '^[0-9]+$'
+                         THEN (signal.exact_diagnostics->'rejection_counts'
+                                   ->>'fresh_state_mismatch')::bigint ELSE 0 END), 0),
+                'fresh_exact_unavailable', coalesce(sum(
+                    CASE WHEN signal.exact_diagnostics->'rejection_counts'
+                                   ->>'fresh_exact_unavailable' ~ '^[0-9]+$'
+                         THEN (signal.exact_diagnostics->'rejection_counts'
+                                   ->>'fresh_exact_unavailable')::bigint ELSE 0 END), 0)
+            ) AS occurrences,
+            (
+                SELECT count(*)
+                FROM bounded_aave_exact_signals exact_signal
+                CROSS JOIN LATERAL jsonb_object_keys(
+                    exact_signal.exact_diagnostics->'rejection_counts'
+                ) AS rejection_key(value)
+                WHERE exact_signal.observed_at >= funnel.window_start
+                  AND rejection_key.value NOT IN (
+                      'gross_edge_below_retained_profit_gate',
+                      'fork_simulation_failed',
+                      'fork_economics_invalid',
+                      'bound_convergence_failed',
+                      'conservative_net_pnl_below_threshold',
+                      'smallest_positive_reviewed_size_not_selected',
+                      'live_size_authorization_required',
+                      'fresh_state_mismatch',
+                      'fresh_exact_unavailable'
+                  )
+            ) AS unknown_key_rows
+        FROM bounded_aave_exact_signals signal
+        WHERE signal.observed_at >= funnel.window_start
+    ) diagnostic_reasons ON true
+    LEFT JOIN LATERAL (
+        SELECT signal.exact_diagnostics->'best_diagnostic'->>'reviewed_size' AS reviewed_size,
+               signal.exact_diagnostics->'best_diagnostic'->>'route' AS route
+        FROM bounded_aave_exact_signals signal
+        WHERE signal.observed_at >= funnel.window_start
+          AND signal.exact_diagnostics->'best_diagnostic'->>'margin_to_retained_profit_gate_wei'
+              ~ '^-?[0-9]+$'
+        ORDER BY (
+            signal.exact_diagnostics->'best_diagnostic'->>'margin_to_retained_profit_gate_wei'
+        )::numeric DESC,
+        signal.observed_at DESC
+        LIMIT 1
+    ) best ON true
+),
+bounded_atlas_ingress AS MATERIALIZED (
+    SELECT auction_id, relevant_aave, parallel_eligible, terminal_outcome,
+           rejection_reason, observed_at, updated_at
+    FROM live_canary.atlas_auction_ingress
+    WHERE observed_at >= now() - interval '7 days'
+),
+bounded_atlas_signals AS MATERIALIZED (
+    SELECT signal_identity, evidence_mode, observed_at
+    FROM live_canary.revenue_hunting_signals
+    WHERE source_lane = 'atlas_solver'
+      AND observed_at >= now() - interval '7 days'
+),
+bounded_atlas_requests AS MATERIALIZED (
+    SELECT auction_id, status, submission_response_hash,
+           inclusion_transaction_hash, realized_net_pnl, created_at, updated_at
+    FROM live_canary.atlas_solver_requests
+    WHERE created_at >= now() - interval '7 days'
+),
+atlas_window_documents AS (
+    SELECT jsonb_object_agg(
+        evidence_window.label,
+        jsonb_build_object(
+            'window_start', to_char(evidence_window.window_start AT TIME ZONE 'UTC',
+                'YYYY-MM-DD"T"HH24:MI:SS"Z"'),
+            'ingress', (SELECT count(*) FROM bounded_atlas_ingress ingress
+                WHERE ingress.observed_at >= evidence_window.window_start)::text,
+            'relevant_aave', (SELECT count(*) FROM bounded_atlas_ingress ingress
+                WHERE ingress.observed_at >= evidence_window.window_start
+                  AND ingress.relevant_aave)::text,
+            'parallel_eligible', (SELECT count(*) FROM bounded_atlas_ingress ingress
+                WHERE ingress.observed_at >= evidence_window.window_start
+                  AND ingress.relevant_aave AND ingress.parallel_eligible)::text,
+            'candidate_signals', (SELECT count(*) FROM bounded_atlas_signals signal
+                WHERE signal.observed_at >= evidence_window.window_start)::text,
+            'actual_path_verified_candidate_signals', (SELECT count(*) FROM bounded_atlas_signals signal
+                WHERE signal.observed_at >= evidence_window.window_start
+                  AND signal.evidence_mode = 'DUAL_PROVIDER_ATLAS_CALLBACK_FORK_VERIFIED')::text,
+            'request_materialized', (SELECT count(*) FROM bounded_atlas_requests request
+                WHERE request.created_at >= evidence_window.window_start)::text,
+            'created_cohort_with_submission_evidence', (SELECT count(*) FROM bounded_atlas_requests request
+                WHERE request.created_at >= evidence_window.window_start
+                  AND request.submission_response_hash IS NOT NULL)::text,
+            'created_cohort_with_inclusion_evidence', (SELECT count(*) FROM bounded_atlas_requests request
+                WHERE request.created_at >= evidence_window.window_start
+                  AND request.inclusion_transaction_hash IS NOT NULL)::text,
+            'created_cohort_terminal_outcomes', (SELECT count(*) FROM bounded_atlas_requests request
+                WHERE request.created_at >= evidence_window.window_start
+                  AND request.status IN ('lost','expired','reconciled'))::text,
+            'created_cohort_realized_net_pnl_wei', (SELECT coalesce(sum(request.realized_net_pnl), 0)
+                FROM bounded_atlas_requests request
+                WHERE request.created_at >= evidence_window.window_start
+                  AND request.status = 'reconciled')::text,
+            'current_status_counts', jsonb_build_object(
+                'ready', (SELECT count(*) FROM bounded_atlas_requests request
+                    WHERE request.created_at >= evidence_window.window_start
+                      AND request.status = 'ready'),
+                'claimed', (SELECT count(*) FROM bounded_atlas_requests request
+                    WHERE request.created_at >= evidence_window.window_start
+                      AND request.status = 'claimed'),
+                'signed', (SELECT count(*) FROM bounded_atlas_requests request
+                    WHERE request.created_at >= evidence_window.window_start
+                      AND request.status = 'signed'),
+                'submitted', (SELECT count(*) FROM bounded_atlas_requests request
+                    WHERE request.created_at >= evidence_window.window_start
+                      AND request.status = 'submitted'),
+                'included', (SELECT count(*) FROM bounded_atlas_requests request
+                    WHERE request.created_at >= evidence_window.window_start
+                      AND request.status = 'included'),
+                'lost', (SELECT count(*) FROM bounded_atlas_requests request
+                    WHERE request.created_at >= evidence_window.window_start
+                      AND request.status = 'lost'),
+                'expired', (SELECT count(*) FROM bounded_atlas_requests request
+                    WHERE request.created_at >= evidence_window.window_start
+                      AND request.status = 'expired'),
+                'submission_unknown', (SELECT count(*) FROM bounded_atlas_requests request
+                    WHERE request.created_at >= evidence_window.window_start
+                      AND request.status = 'submission_unknown'),
+                'reconciled', (SELECT count(*) FROM bounded_atlas_requests request
+                    WHERE request.created_at >= evidence_window.window_start
+                      AND request.status = 'reconciled')
+            ),
+            'rejection_reason_counts', jsonb_build_object(
+                'atlas_callback_evidence_unavailable', (
+                    SELECT count(*) FROM bounded_atlas_ingress ingress
+                    WHERE ingress.observed_at >= evidence_window.window_start
+                      AND ingress.rejection_reason = 'atlas_callback_evidence_unavailable'
+                ),
+                'other_economic_rejection', (
+                    SELECT count(*) FROM bounded_atlas_ingress ingress
+                    WHERE ingress.observed_at >= evidence_window.window_start
+                      AND ingress.terminal_outcome = 'economic_rejection'
+                      AND ingress.rejection_reason IS DISTINCT FROM
+                          'atlas_callback_evidence_unavailable'
+                      AND ingress.rejection_reason IS NOT NULL
+                ),
+                'missing_rejection_reason', (
+                    SELECT count(*) FROM bounded_atlas_ingress ingress
+                    WHERE ingress.observed_at >= evidence_window.window_start
+                      AND ingress.terminal_outcome = 'economic_rejection'
+                      AND ingress.rejection_reason IS NULL
+                )
+            )
+        )
+        ORDER BY CASE evidence_window.label WHEN '1h' THEN 1 WHEN '24h' THEN 2 ELSE 3 END
+    ) AS values
+    FROM windows evidence_window
+),
+aave_exact_economics AS (
+    SELECT jsonb_build_object(
+        'exact_evaluated_signals', (SELECT count(*) FROM bounded_aave_exact_signals)::text,
+        'reviewed_combination_count', (SELECT coalesce(sum(
+            (signal.exact_diagnostics->>'reviewed_combination_count')::numeric
+        ), 0) FROM bounded_aave_exact_signals signal
+            WHERE signal.exact_diagnostics->>'reviewed_combination_count' ~ '^[0-9]{1,20}$')::text,
+        'selected_diagnostic_count', (SELECT count(*) FROM bounded_aave_exact_signals signal
+            WHERE signal.exact_diagnostics ? 'selected_diagnostic')::text,
+        'best_diagnostic_count', (SELECT count(*) FROM bounded_aave_exact_signals signal
+            WHERE signal.exact_diagnostics ? 'best_diagnostic')::text,
+        'best_observed_diagnostic', coalesce((
+            SELECT signal.exact_diagnostics->'best_diagnostic'
+            FROM bounded_aave_exact_signals signal
+            WHERE signal.exact_diagnostics->'best_diagnostic'
+                  ->>'margin_to_retained_profit_gate_wei' ~ '^-?[0-9]+$'
+            ORDER BY (signal.exact_diagnostics->'best_diagnostic'
+                      ->>'margin_to_retained_profit_gate_wei')::numeric DESC,
+                     signal.observed_at DESC
+            LIMIT 1
+        ), '{}'::jsonb),
+        'minimum_selected_margin_to_gate_wei', coalesce((SELECT min(
+            (signal.exact_diagnostics->'selected_diagnostic'
+             ->>'margin_to_retained_profit_gate_wei')::numeric
+        ) FROM bounded_aave_exact_signals signal
+          WHERE signal.exact_diagnostics->'selected_diagnostic'
+                ->>'margin_to_retained_profit_gate_wei' ~ '^-?[0-9]+$')::text,
+          'not_available'),
+        'maximum_selected_margin_to_gate_wei', coalesce((SELECT max(
+            (signal.exact_diagnostics->'selected_diagnostic'
+             ->>'margin_to_retained_profit_gate_wei')::numeric
+        ) FROM bounded_aave_exact_signals signal
+          WHERE signal.exact_diagnostics->'selected_diagnostic'
+                ->>'margin_to_retained_profit_gate_wei' ~ '^-?[0-9]+$')::text,
+          'not_available'),
+        'average_liquidatable_to_exact_latency_ms', coalesce((SELECT avg(
+            (signal.exact_diagnostics->>'liquidatable_to_exact_latency_ms')::numeric
+        ) FROM bounded_aave_exact_signals signal
+          WHERE signal.exact_diagnostics->>'liquidatable_to_exact_latency_ms'
+                ~ '^[0-9]+$')::text, 'not_available'),
+        'average_exact_fork_latency_ms', coalesce((SELECT avg(
+            (signal.exact_diagnostics->>'exact_fork_latency_ms')::numeric
+        ) FROM bounded_aave_exact_signals signal
+          WHERE signal.exact_diagnostics->>'exact_fork_latency_ms'
+                ~ '^[0-9]+$')::text, 'not_available')
+    ) AS values
+),
+revenue_lane_authority AS (
+    SELECT
+        bool_or(armed) FILTER (WHERE lane = 'aave_liquidation') AS aave_armed,
+        bool_or(kill_switch) FILTER (WHERE lane = 'aave_liquidation') AS aave_kill_switch,
+        bool_or(armed) FILTER (WHERE lane = 'atlas_solver') AS atlas_armed,
+        bool_or(kill_switch) FILTER (WHERE lane = 'atlas_solver') AS atlas_kill_switch
+    FROM live_canary.revenue_lane_controls
 ),
 size_points AS (
 \if :phoenix_has_economic_truth
@@ -742,17 +1201,60 @@ snapshot AS (
             'realized_net_pnl_7d_wei', profit.realized_net_pnl_7d::text,
             'realized_net_pnl_30d_wei', profit.realized_net_pnl_30d::text,
             'active_route', control.route_fingerprint,
+            'lane_authority', jsonb_build_object(
+                'generic_dex', jsonb_build_object(
+                    'effective_armed', execution_control.armed
+                        AND global_control.armed
+                        AND NOT global_control.kill_switch
+                        AND NOT execution_control.kill_switch
+                        AND global_control.execution_mode = 'live'
+                        AND control.phase LIKE 'LIVE_%',
+                    'effective_kill_switch', execution_control.kill_switch
+                        OR global_control.kill_switch
+                        OR global_control.execution_mode <> 'live'
+                        OR control.phase NOT LIKE 'LIVE_%',
+                    'execution_armed', execution_control.armed,
+                    'execution_kill_switch', execution_control.kill_switch,
+                    'global_armed', global_control.armed,
+                    'global_kill_switch', global_control.kill_switch,
+                    'execution_mode', global_control.execution_mode,
+                    'economic_phase', control.phase
+                ),
+                'aave_liquidation', jsonb_build_object(
+                    'armed', coalesce(revenue_lane_authority.aave_armed, false),
+                    'kill_switch', coalesce(revenue_lane_authority.aave_kill_switch, true)
+                ),
+                'atlas_solver', jsonb_build_object(
+                    'armed', coalesce(revenue_lane_authority.atlas_armed, false),
+                    'kill_switch', coalesce(revenue_lane_authority.atlas_kill_switch, true)
+                )
+            ),
             'next_promotion_gate', '20 reconciled outcomes; positive net PnL; all safety gates',
             'last_transition_reason', control.last_transition_reason
         ),
         'funnel', jsonb_build_object(
             'semantics', jsonb_build_object(
+                'scope', 'Generic Phoenix DEX Engine only',
                 'route_matches', 'count of exact configured Route fingerprints matched',
                 'complete_evaluations', 'canonical complete economic facts',
                 'near_profitable', 'margin to conservative gate within one configured minimum',
-                'candidates', 'materialized autonomous Candidates only'
+                'candidates', 'materialized Generic DEX autonomous Candidates only',
+                'simulation_evidence_insufficient',
+                    'Generic Engine state simulation was stale or non-runnable; never an Aave fork or Atlas callback classification',
+                'aave_direct_stages',
+                    'screen and Exact values are signal-event volumes; direct request, attempt, submission, and outcome values are independent lane stage-event volumes, not per-signal conversions',
+                'aave_exact_attempted',
+                    'not durably observable; exact_completed/exact_evaluated count only persisted completed Exact summaries',
+                'atlas_request_stages',
+                    'submission, inclusion, terminal outcome, and PnL values describe current evidence for requests created in each window, not event timestamps',
+                'atlas_rejections',
+                    'rejection reasons are observed-auction cohort counts for each window'
             ),
-            'windows', window_documents.values
+            'windows', window_documents.values,
+            'revenue_lane_windows', jsonb_build_object(
+                'aave_liquidation', aave_window_documents.values,
+                'atlas_solver', atlas_window_documents.values
+            )
         ),
         'economics', jsonb_build_object(
             'north_star', 'REALIZED NET PNL AFTER ALL COSTS',
@@ -766,6 +1268,8 @@ snapshot AS (
             'by_size_level', level_profit.values,
             'route_ranking_7d', route_ranking.values,
             'size_sweep_7d', size_summary.values,
+            'aave_exact_7d', aave_exact_economics.values,
+            'atlas_solver_7d', atlas_window_documents.values->'7d',
             'loss_ledger_7d', loss_ledger.values,
             'daily_attack_surface_7d', daily_attack_surface.values,
             'loss_cause_contract', jsonb_build_array(
@@ -817,6 +1321,10 @@ snapshot AS (
     ) AS document
     FROM params
     CROSS JOIN window_documents
+    CROSS JOIN aave_window_documents
+    CROSS JOIN atlas_window_documents
+    CROSS JOIN aave_exact_economics
+    CROSS JOIN revenue_lane_authority
     CROSS JOIN size_summary
     CROSS JOIN route_ranking
     CROSS JOIN loss_ledger
@@ -825,10 +1333,11 @@ snapshot AS (
     CROSS JOIN level_profit
     CROSS JOIN live_canary.realized_profit_windows profit
     CROSS JOIN live_canary.economic_control control
+    CROSS JOIN live_canary.control execution_control
     CROSS JOIN live_canary.autonomous_global_control global_control
     LEFT JOIN live_canary.autonomous_route_controls route_control
       ON route_control.route_fingerprint = control.route_fingerprint
-    WHERE control.singleton AND global_control.singleton
+    WHERE control.singleton AND execution_control.singleton AND global_control.singleton
 )
 SELECT document::text FROM snapshot;
 

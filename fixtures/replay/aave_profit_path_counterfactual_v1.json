@@ -5,10 +5,7 @@
   "scheduler": {
     "cold_revisit_ms": 60000,
     "priority_slot_ms": 10000,
-    "maximum_hot_revisit_ms": 20000,
-    "state_requests_per_minute": 12,
-    "before_scheduler_requests_per_minute": 2,
-    "after_scheduler_requests_per_minute": 7
+    "maximum_hot_revisit_ms": 20000
   },
   "opportunities": [
     {

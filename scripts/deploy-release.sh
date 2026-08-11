@@ -823,6 +823,14 @@ compose rm -f live-executor >/dev/null ||
   fail "stopped live-executor container could not be removed"
 [ -z "$(compose ps -a -q live-executor | awk 'NF { print; exit }')" ] ||
   fail "live-executor container remained after removal"
+# Quiesce the only writer of the additive Aave/Atlas diagnostic tables before
+# PostgreSQL validates the bounded JSON contract and builds its range indexes.
+# The target observer is recreated below only after both migration runners
+# finish and the candidate RPC gateway is healthy.
+compose stop -t 30 atlas-observer >/dev/null ||
+  fail "atlas-observer could not be quiesced before migration"
+[ -z "$(compose ps -q atlas-observer | awk 'NF { print; exit }')" ] ||
+  fail "atlas-observer remained running during migration"
 compose run --rm --no-deps autonomous-control migrate
 compose run --rm --no-deps migration-runner
 mark_phase MIGRATIONS_APPLIED

@@ -20,6 +20,13 @@ type PostgresSignalSink struct {
 	atlasAuctions chan *observer.LedgerRecord
 }
 
+func requireAcceptedCandidateSignalWrite(rowsAffected int64, record signal) error {
+	if rowsAffected != 1 && (record.ExecutionCandidate != nil || record.AtlasCandidate != nil) {
+		return errors.New("Aave candidate signal identity conflicts with durable evidence")
+	}
+	return nil
+}
+
 func OpenPostgresSignalSink(ctx context.Context, dsn, floor string) (*PostgresSignalSink, error) {
 	if dsn == "" || floor == "" {
 		return nil, errors.New("durable signal sink configuration is incomplete")
@@ -144,25 +151,53 @@ func (s *PostgresSignalSink) RecordAtlasAuction(ctx context.Context, record *obs
 			asset = *record.OracleUpdate.Asset
 		}
 	}
-	_, err := s.pool.Exec(ctx, `
+	terminalOutcome := "observed"
+	var rejectionReason any
+	if record.RelevantAaveAuction {
+		terminalOutcome = "economic_rejection"
+		rejectionReason = "atlas_callback_evidence_unavailable"
+	}
+	result, err := s.pool.Exec(ctx, `
 		INSERT INTO live_canary.atlas_auction_ingress(
 			auction_id, user_operation_hash, parallel_auction_identity,
 			auction_deadline_block, oracle_gas_price_wei, solver_gas_limit,
 			dapp, oracle_aggregator, oracle_asset, relevant_aave,
-			parallel_eligible, evidence_hash, observed_at
+			parallel_eligible, evidence_hash, terminal_outcome,
+			rejection_reason, observed_at
 		) VALUES (
 			$1, $2, $3, $4::numeric, $5::numeric, $6,
-			$7, $8, $9, $10, $11, $12, $13
+			$7, $8, $9, $10, $11, $12, $13, $14, $15
 		)
 		ON CONFLICT (auction_id) DO UPDATE SET
+			terminal_outcome = EXCLUDED.terminal_outcome,
+			rejection_reason = EXCLUDED.rejection_reason,
 			updated_at = now()
 		WHERE live_canary.atlas_auction_ingress.evidence_hash = EXCLUDED.evidence_hash
+		  AND live_canary.atlas_auction_ingress.terminal_outcome IN ('observed','exact_pending')
 	`, record.AuctionID, strings.ToLower(record.UserOpHash), record.ParallelAuctionIdentity,
 		record.AuctionDeadlineBlock, record.OracleGasPriceWei, record.SolverGasLimit,
 		strings.ToLower(record.Dapp), aggregator, asset, record.RelevantAaveAuction,
-		record.ParallelEligible, record.NotificationSHA256, record.ObservedAt)
+		record.ParallelEligible, record.NotificationSHA256, terminalOutcome,
+		rejectionReason, record.ObservedAt)
 	if err != nil {
 		return err
+	}
+	accepted := result.RowsAffected() == 1
+	if !accepted {
+		var exactReplay bool
+		if err := s.pool.QueryRow(ctx, `
+			SELECT EXISTS (
+				SELECT 1
+				FROM live_canary.atlas_auction_ingress
+				WHERE auction_id = $1 AND evidence_hash = $2
+			)
+		`, record.AuctionID, record.NotificationSHA256).Scan(&exactReplay); err != nil {
+			return err
+		}
+		if !exactReplay {
+			return errors.New("Atlas auction evidence identity conflicts with durable ingress")
+		}
+		return nil
 	}
 	if record.RelevantAaveAuction {
 		copy := *record
@@ -171,6 +206,29 @@ func (s *PostgresSignalSink) RecordAtlasAuction(ctx context.Context, record *obs
 		case <-ctx.Done():
 			return ctx.Err()
 		}
+	}
+	return nil
+}
+
+func (s *PostgresSignalSink) RecordAtlasCallbackUnavailable(ctx context.Context, auctionID, evidenceHash string) error {
+	if len(auctionID) < 1 || len(auctionID) > 128 || len(evidenceHash) != 64 {
+		return errors.New("Atlas auction identity is invalid")
+	}
+	result, err := s.pool.Exec(ctx, `
+		UPDATE live_canary.atlas_auction_ingress
+		SET terminal_outcome = 'economic_rejection',
+		    rejection_reason = 'atlas_callback_evidence_unavailable',
+		    updated_at = now()
+		WHERE auction_id = $1
+		  AND evidence_hash = $2
+		  AND relevant_aave
+		  AND terminal_outcome IN ('observed','exact_pending','economic_rejection')
+	`, auctionID, evidenceHash)
+	if err != nil {
+		return err
+	}
+	if result.RowsAffected() != 1 {
+		return errors.New("Atlas auction disposition identity is incomplete")
 	}
 	return nil
 }
@@ -213,23 +271,33 @@ func (s *PostgresSignalSink) RecordAaveSignal(ctx context.Context, record signal
 	var evidenceMode any
 	if record.ExecutionCandidate != nil {
 		evidenceMode = record.ExecutionCandidate.RoutePayload.EvidenceMode
+	} else if record.ExactDiagnostics != nil && record.ExactDiagnostics.ForkEvidenceMode != "" {
+		evidenceMode = record.ExactDiagnostics.ForkEvidenceMode
+	}
+	var exactDiagnostics any
+	if record.ExactDiagnostics != nil {
+		encoded, marshalErr := json.Marshal(record.ExactDiagnostics)
+		if marshalErr != nil || len(encoded) > 64*1024 {
+			return errors.New("Aave exact diagnostics are invalid")
+		}
+		exactDiagnostics = string(encoded)
 	}
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback(ctx)
-	_, err = tx.Exec(ctx, `
+	result, err := tx.Exec(ctx, `
 		INSERT INTO live_canary.revenue_hunting_signals(
 			signal_id, signal_identity, source_lane, source_cursor, borrower,
 			block_number, block_hash, state_root, zero_cost_profit_upper_bound,
 			expected_net_pnl, conservative_net_pnl,
 			retained_profit_floor, evidence_mode, terminal_outcome,
-			rejection_reason, evidence_hash, observed_at
+			rejection_reason, exact_diagnostics, evidence_hash, observed_at
 		) VALUES (
 			$1, $2, 'aave_liquidation', $3::numeric, $4,
 			$5::numeric, $6, $7, $8::numeric, $9::numeric, $10::numeric,
-			$11::numeric, $12, $13, $14, $15, $16
+			$11::numeric, $12, $13, $14, $15::jsonb, $16, $17
 		)
 		ON CONFLICT (signal_identity) DO UPDATE SET
 			block_number = EXCLUDED.block_number,
@@ -241,15 +309,25 @@ func (s *PostgresSignalSink) RecordAaveSignal(ctx context.Context, record signal
 			evidence_mode = EXCLUDED.evidence_mode,
 			terminal_outcome = EXCLUDED.terminal_outcome,
 			rejection_reason = EXCLUDED.rejection_reason,
+			exact_diagnostics = EXCLUDED.exact_diagnostics,
 			evidence_hash = EXCLUDED.evidence_hash,
 			updated_at = now()
-		WHERE live_canary.revenue_hunting_signals.terminal_outcome IN
-			('prefiltered','exact_pending','fork_pending','incomplete')
+		WHERE (
+			live_canary.revenue_hunting_signals.terminal_outcome IN
+				('prefiltered','exact_pending','fork_pending','incomplete')
+			AND NOT (
+				live_canary.revenue_hunting_signals.exact_diagnostics IS NOT NULL
+				AND EXCLUDED.exact_diagnostics IS NULL
+			)
+		) OR live_canary.revenue_hunting_signals.evidence_hash = EXCLUDED.evidence_hash
 	`, signalID, identityBody, record.Cursor, record.Borrower, record.Block,
 		record.BlockHash, stateRoot, upper, expected, conservative, s.floor,
 		evidenceMode, persistedTerminalOutcome(record), signalRejectionReason(record),
-		hex.EncodeToString(evidence[:]), record.ObservedAt)
+		exactDiagnostics, hex.EncodeToString(evidence[:]), record.ObservedAt)
 	if err != nil {
+		return err
+	}
+	if err := requireAcceptedCandidateSignalWrite(result.RowsAffected(), record); err != nil {
 		return err
 	}
 	if record.ExecutionCandidate != nil {
@@ -415,8 +493,22 @@ func signalRejectionReason(record signal) any {
 	if record.AuthorityRejectionReason != "" {
 		return record.AuthorityRejectionReason
 	}
-	if record.TerminalOutcome == "economic_rejection" {
-		return "zero_cost_upper_bound_below_floor"
+	if record.ExactRouteIneligibleReason != "" {
+		return record.ExactRouteIneligibleReason
+	}
+	if record.ExactDeferredReason != "" {
+		return record.ExactDeferredReason
+	}
+	if record.ExactDiagnostics != nil && record.ExactDiagnostics.FailureClass != "" {
+		return record.ExactDiagnostics.FailureClass
+	}
+	if len(record.SizeDiagnostics) > 0 {
+		if failure := buildExactDiagnosticSummary(record, 0, 0).FailureClass; failure != "" {
+			return failure
+		}
+	}
+	if record.TerminalOutcome == "economic_rejection" && record.StateRoot == "" && record.ZeroCostProfitUpperBoundWei != "" {
+		return "prefilter_upper_bound_below_floor"
 	}
 	if record.TerminalOutcome == "incomplete" {
 		return "economic_bound_incomplete"
