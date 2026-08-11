@@ -20,6 +20,9 @@ for path in \
   live-executor/schema/007_aave_economic_diagnostics.sql \
   live-executor/src/economic_control.rs \
   live-executor/src/autonomous_live_control_main.rs \
+  live-executor/src/store.rs \
+  live-executor/src/revenue.rs \
+  atlas-observer/internal/hunter/postgres_sink.go \
   rpc-gateway/src/aave_state.rs \
   scripts/deploy-release.sh \
   scripts/rollback-release.sh \
@@ -63,6 +66,9 @@ deploy = read("scripts/deploy-release.sh")
 rollback = read("scripts/rollback-release.sh")
 activate = read("scripts/activate-economic-canary.sh")
 control = read("live-executor/src/autonomous_live_control_main.rs")
+executor_store = read("live-executor/src/store.rs")
+revenue_executor = read("live-executor/src/revenue.rs")
+observer_sink = read("atlas-observer/internal/hunter/postgres_sink.go")
 state = read("live-executor/src/economic_control.rs")
 canonical_state = read("rpc-gateway/src/aave_state.rs")
 schema = read("live-executor/schema/005_closed_loop_economic_control.sql")
@@ -81,6 +87,12 @@ release_model = read("scripts/phoenix_release/model.py")
 release_gateway = read("scripts/phoenix_release/gateway.py")
 assets = read("scripts/release_assets.py")
 installer = read("scripts/install-production-release-context.sh")
+
+require(
+    "BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY;\nSET LOCAL jit = off;"
+    in dashboard_sql,
+    "dashboard_query_must_disable_jit_inside_read_only_transaction",
+)
 
 rpc_service = re.search(
     r"(?ms)^  rpc-gateway:\s*\n(?P<body>.*?)(?=^  [a-zA-Z0-9_-]+:\s*\n|\Z)",
@@ -405,6 +417,84 @@ for command in (
 require(
     '"activate" => return Err(' in control,
     "legacy_direct_activation_not_disabled",
+)
+rpc_disagreement_branch = re.search(
+    r"else if evidence\.rpc_disagreements >= 2 \{(?P<body>.*?)\n\s*\} else if",
+    control,
+    re.DOTALL,
+)
+require(rpc_disagreement_branch is not None, "provider_disagreement_branch_missing")
+require(
+    'fail_close_execution_authority(&mut transaction, "rpc_disagreement"'
+    in rpc_disagreement_branch.group("body"),
+    "provider_disagreement_must_atomically_close_execution_authority",
+)
+require(
+    "WHERE lane IN ('atlas_solver', 'aave_liquidation')" in executor_store
+    and "if revenue_lanes.rows_affected() != 2" in executor_store,
+    "runtime_fail_close_must_update_the_exact_revenue_lane_pair",
+)
+require(
+    "UPDATE live_canary.revenue_lane_controls" not in revenue_executor
+    and revenue_executor.count("fail_close_execution_authority(") >= 2,
+    "atlas_failure_paths_must_not_close_only_one_revenue_lane",
+)
+atlas_failed_start = revenue_executor.index("AtlasOutcome::Failed { transaction_hash } =>")
+atlas_failed_end = revenue_executor.index("AtlasOutcome::Reconciled {", atlas_failed_start)
+atlas_failed = revenue_executor[atlas_failed_start:atlas_failed_end]
+require(
+    atlas_failed.index("self.pool.begin()")
+    < atlas_failed.index('fail_close_execution_authority(')
+    < atlas_failed.index('"atlas_inclusion_failed"')
+    < atlas_failed.index("status='lost'")
+    < atlas_failed.index("release_lock(")
+    < atlas_failed.index("transaction.commit()"),
+    "atlas_inclusion_failure_must_fail_close_then_preserve_lost_and_release_lock",
+)
+kill_unknown_start = revenue_executor.index("async fn kill_unknown(")
+kill_unknown_end = revenue_executor.index("\n}\n\nasync fn release_lock(", kill_unknown_start)
+kill_unknown = revenue_executor[kill_unknown_start:kill_unknown_end]
+require(
+    kill_unknown.index("self.pool.begin()")
+    < kill_unknown.index("fail_close_execution_authority(&mut transaction, reason")
+    < kill_unknown.index("status = 'submission_unknown'")
+    < kill_unknown.index("transaction.commit()"),
+    "atlas_unknown_submission_must_fail_close_then_preserve_unknown_state",
+)
+require(
+    "release_lock(" not in kill_unknown,
+    "atlas_unknown_submission_must_retain_the_global_submission_lock",
+)
+require(
+    "converge_revenue_provider_authority(&pool)" in control
+    and '"provider_current_class_failure_streak"' in control
+    and '"revenue_lane_authority_diverged"' in control,
+    "revenue_supervisor_must_converge_partial_and_persistent_provider_failures",
+)
+record_signal_start = observer_sink.index(
+    "func (s *PostgresSignalSink) RecordAaveSignal("
+)
+record_signal_end = observer_sink.index(
+    "func normalizeCandidateAuthority(", record_signal_start
+)
+record_signal = observer_sink[record_signal_start:record_signal_end]
+normalizer_end = observer_sink.index("func withoutCandidateAuthority(", record_signal_end)
+normalizer = observer_sink[record_signal_end:normalizer_end]
+require(
+    record_signal.index("s.pool.Begin(ctx)")
+    < record_signal.index("normalizeCandidateAuthority(ctx, tx, record)")
+    < record_signal.index("insertExecutionCandidate(")
+    < record_signal.index("insertAtlasCandidate(")
+    < record_signal.index("tx.Commit(ctx)"),
+    "observer_candidate_artifacts_must_follow_locked_authority_normalization",
+)
+require(
+    normalizer.index("FROM live_canary.economic_control")
+    < normalizer.index("FOR UPDATE")
+    < normalizer.index("FROM live_canary.revenue_lane_controls")
+    < normalizer.rindex("FOR UPDATE")
+    < normalizer.index("validatedAaveLiveMaximumInputAmount(states)"),
+    "observer_candidate_authority_must_lock_economic_then_exact_revenue_lanes",
 )
 require("phoenix.live-canary-schema.v7" in control, "schema_v7_not_required")
 for required in (
@@ -1251,14 +1341,13 @@ SELECT
   now() - ((value % 604800) * interval '1 second')
 FROM generate_series(1, 20000) AS generated(value);
 
-ANALYZE live_canary.revenue_hunting_signals;
 ANALYZE live_canary.atlas_auction_ingress;
 SQL
   fail "representative lane dashboard fixtures were rejected"
 
 volume_query_started=$(date +%s)
 docker exec -i \
-  -e PGOPTIONS='-c statement_timeout=30s -c lock_timeout=5s' \
+  -e PGOPTIONS='-c statement_timeout=30s -c lock_timeout=5s -c jit=on' \
   "$postgres_container" \
   psql -X -q -A -t -U phoenix_test -d phoenix_test \
   <"$repo_root/scripts/sql/economic-dashboard-snapshot.sql" \

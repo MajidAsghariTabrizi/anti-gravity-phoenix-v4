@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	"anti-gravity-phoenix-v4/atlas-observer/internal/observer"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
@@ -60,6 +61,17 @@ type liveSizeAuthorityRow struct {
 	economicInputAmount string
 }
 
+var errRevenueLaneAuthorityDiverged = errors.New("revenue lane authority diverged")
+
+const (
+	revenueAuthorityClosedReason   = "revenue_authority_closed"
+	liveSizeAuthorityChangedReason = "live_size_authority_changed"
+)
+
+func revenueLaneAuthorityError(detail string) error {
+	return fmt.Errorf("%w: %s", errRevenueLaneAuthorityDiverged, detail)
+}
+
 func (s *PostgresSignalSink) CurrentAaveLiveMaximumInputAmount(ctx context.Context) (string, error) {
 	rows, err := s.pool.Query(ctx, `
 		SELECT lane, armed, kill_switch,
@@ -99,7 +111,7 @@ func (s *PostgresSignalSink) CurrentAaveLiveMaximumInputAmount(ctx context.Conte
 
 func validatedAaveLiveMaximumInputAmount(states []liveSizeAuthorityRow) (string, error) {
 	if len(states) != 2 || states[0].lane != "aave_liquidation" || states[1].lane != "atlas_solver" {
-		return "", errors.New("current Aave revenue lane authority is incomplete")
+		return "", revenueLaneAuthorityError("current Aave revenue lane authority is incomplete")
 	}
 	reviewed, reviewedOK := newBigUint(maximumReviewedInputWei)
 	if !reviewedOK {
@@ -111,7 +123,7 @@ func validatedAaveLiveMaximumInputAmount(states []liveSizeAuthorityRow) (string,
 		closed = closed && !state.armed && state.killSwitch
 		active = active && state.armed && !state.killSwitch
 		if state.economicPhase != states[0].economicPhase || state.economicInputAmount != states[0].economicInputAmount {
-			return "", errors.New("economic size authority diverged across revenue lanes")
+			return "", revenueLaneAuthorityError("economic size authority diverged across revenue lanes")
 		}
 	}
 	if closed {
@@ -124,16 +136,16 @@ func validatedAaveLiveMaximumInputAmount(states []liveSizeAuthorityRow) (string,
 	explicitMaximumReviewedAuthority := states[0].economicPhase == "DISARMED_EVIDENCE" &&
 		states[0].economicInputAmount == maximumReviewedInputWei
 	if !active || (!liveEconomicPhase && !explicitMaximumReviewedAuthority) {
-		return "", errors.New("Aave revenue lane authority is partially armed")
+		return "", revenueLaneAuthorityError("Aave revenue lane authority is partially armed")
 	}
 	economic, economicOK := newBigUint(states[0].economicInputAmount)
 	if !economicOK || economic.Sign() <= 0 || economic.Cmp(reviewed) > 0 {
-		return "", errors.New("economic Aave size authority is invalid")
+		return "", revenueLaneAuthorityError("economic Aave size authority is invalid")
 	}
 	for _, state := range states {
 		laneMaximum, laneOK := newBigUint(state.maximumInputAmount)
 		if !laneOK || laneMaximum.Cmp(economic) != 0 {
-			return "", errors.New("revenue lane and economic size authorities diverged")
+			return "", revenueLaneAuthorityError("revenue lane and economic size authorities diverged")
 		}
 	}
 	return economic.String(), nil
@@ -233,9 +245,20 @@ func (s *PostgresSignalSink) RecordAtlasCallbackUnavailable(ctx context.Context,
 	return nil
 }
 
-func (s *PostgresSignalSink) RecordAaveSignal(ctx context.Context, record signal) error {
+func (s *PostgresSignalSink) RecordAaveSignal(ctx context.Context, record signal) (signal, error) {
 	if record.TerminalOutcome == "" || record.Block == 0 || record.BlockHash == "" {
-		return errors.New("Aave signal identity is incomplete")
+		return record, errors.New("Aave signal identity is incomplete")
+	}
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return record, err
+	}
+	defer tx.Rollback(ctx)
+	if record.ExecutionCandidate != nil || record.AtlasCandidate != nil {
+		record, err = normalizeCandidateAuthority(ctx, tx, record)
+		if err != nil {
+			return record, err
+		}
 	}
 	var approvalDigest, simulationResultHash string
 	if record.ExecutionCandidate != nil {
@@ -248,7 +271,7 @@ func (s *PostgresSignalSink) RecordAaveSignal(ctx context.Context, record signal
 		SimulationResultHash string `json:"simulation_result_hash,omitempty"`
 	}{record, approvalDigest, simulationResultHash})
 	if err != nil {
-		return err
+		return record, err
 	}
 	evidence := sha256.Sum256(body)
 	identityBody := fmt.Sprintf("aave_liquidation|%s|%d|%d", record.Borrower, record.Block, record.Cursor)
@@ -278,15 +301,10 @@ func (s *PostgresSignalSink) RecordAaveSignal(ctx context.Context, record signal
 	if record.ExactDiagnostics != nil {
 		encoded, marshalErr := json.Marshal(record.ExactDiagnostics)
 		if marshalErr != nil || len(encoded) > 64*1024 {
-			return errors.New("Aave exact diagnostics are invalid")
+			return record, errors.New("Aave exact diagnostics are invalid")
 		}
 		exactDiagnostics = string(encoded)
 	}
-	tx, err := s.pool.Begin(ctx)
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback(ctx)
 	result, err := tx.Exec(ctx, `
 		INSERT INTO live_canary.revenue_hunting_signals(
 			signal_id, signal_identity, source_lane, source_cursor, borrower,
@@ -325,22 +343,116 @@ func (s *PostgresSignalSink) RecordAaveSignal(ctx context.Context, record signal
 		evidenceMode, persistedTerminalOutcome(record), signalRejectionReason(record),
 		exactDiagnostics, hex.EncodeToString(evidence[:]), record.ObservedAt)
 	if err != nil {
-		return err
+		return record, err
 	}
 	if err := requireAcceptedCandidateSignalWrite(result.RowsAffected(), record); err != nil {
-		return err
+		return record, err
 	}
 	if record.ExecutionCandidate != nil {
 		if err := insertExecutionCandidate(ctx, tx, record.ExecutionCandidate); err != nil {
-			return err
+			return record, err
 		}
 	}
 	if record.AtlasCandidate != nil {
 		if err := insertAtlasCandidate(ctx, tx, record, record.AtlasCandidate, s.floor); err != nil {
-			return err
+			return record, err
 		}
 	}
-	return tx.Commit(ctx)
+	return record, tx.Commit(ctx)
+}
+
+func normalizeCandidateAuthority(ctx context.Context, tx pgx.Tx, record signal) (signal, error) {
+	var economicPhase, economicInput string
+	if err := tx.QueryRow(ctx, `
+		SELECT phase, current_input_wei::text
+		FROM live_canary.economic_control
+		WHERE singleton
+		FOR UPDATE
+	`).Scan(&economicPhase, &economicInput); err != nil {
+		return record, errors.New("candidate economic authority is unavailable")
+	}
+	rows, err := tx.Query(ctx, `
+		SELECT lane, armed, kill_switch, maximum_input_amount::text
+		FROM live_canary.revenue_lane_controls
+		WHERE lane IN ('aave_liquidation', 'atlas_solver')
+		ORDER BY lane
+		FOR UPDATE
+	`)
+	if err != nil {
+		return record, errors.New("candidate revenue authority is unavailable")
+	}
+	defer rows.Close()
+	states := make([]liveSizeAuthorityRow, 0, 2)
+	for rows.Next() {
+		var state liveSizeAuthorityRow
+		if err := rows.Scan(&state.lane, &state.armed, &state.killSwitch, &state.maximumInputAmount); err != nil {
+			return record, errors.New("candidate revenue authority is invalid")
+		}
+		state.economicPhase = economicPhase
+		state.economicInputAmount = economicInput
+		states = append(states, state)
+	}
+	if err := rows.Err(); err != nil {
+		return record, errors.New("candidate revenue authority is unavailable")
+	}
+	currentMaximum, authorityErr := validatedAaveLiveMaximumInputAmount(states)
+	active := len(states) == 2
+	for _, state := range states {
+		active = active && state.armed && !state.killSwitch
+	}
+	return normalizeCandidateForCurrentAuthority(record, currentMaximum, authorityErr, active)
+}
+
+func normalizeCandidateForCurrentAuthority(
+	record signal,
+	currentMaximum string,
+	authorityErr error,
+	active bool,
+) (signal, error) {
+	if authorityErr != nil {
+		if !errors.Is(authorityErr, errRevenueLaneAuthorityDiverged) {
+			return record, authorityErr
+		}
+		return withoutCandidateAuthority(record, revenueLaneAuthorityDivergedClass), nil
+	}
+	if !active {
+		return withoutCandidateAuthority(record, revenueAuthorityClosedReason), nil
+	}
+	if !candidateMatchesCurrentAuthority(record, currentMaximum) {
+		return withoutCandidateAuthority(record, liveSizeAuthorityChangedReason), nil
+	}
+	return record, nil
+}
+
+func withoutCandidateAuthority(record signal, reason string) signal {
+	record.Authority = false
+	record.ExecutionCandidate = nil
+	record.AtlasCandidate = nil
+	record.TerminalOutcome = "exact_pending"
+	record.ExactDeferredReason = reason
+	return record
+}
+
+func candidateMatchesCurrentAuthority(record signal, currentMaximum string) bool {
+	maximum, maximumOK := newBigUint(currentMaximum)
+	if !maximumOK || maximum.Sign() <= 0 {
+		return false
+	}
+	if record.ExecutionCandidate != nil {
+		selected, selectedOK := newBigUint(record.ExecutionCandidate.SelectedSize)
+		if !selectedOK || selected.Sign() <= 0 || selected.Cmp(maximum) > 0 ||
+			record.ExecutionCandidate.MaximumInputAmount != currentMaximum {
+			return false
+		}
+	}
+	if record.AtlasCandidate != nil {
+		selected, selectedOK := newBigUint(record.AtlasCandidate.SelectedSize)
+		if !selectedOK || selected.Sign() <= 0 || selected.Cmp(maximum) > 0 ||
+			record.AtlasCandidate.MaximumInputAmount != currentMaximum {
+			return false
+		}
+	}
+	return record.ExecutionCandidate != nil || record.AtlasCandidate != nil
 }
 
 type candidateExecutor interface {

@@ -6,6 +6,8 @@ import (
 	"flag"
 	"io"
 	"log"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -133,6 +135,59 @@ func TestTemporaryProviderFailureKeepsServiceAndHuntingHealthyWithoutAuthority(t
 	}
 	if health.DegradedReason != "provider_unavailable" || health.RecoveryState != "recovering" {
 		t.Fatalf("provider recovery evidence is incomplete: %+v", health)
+	}
+}
+
+func TestDivergentRevenueAuthorityIsFailClosedWithoutFailingServiceLiveness(t *testing.T) {
+	now := time.Now().UTC()
+	health := evaluateLaneHealth(now, observer.LedgerState{
+		Connected: true, LastSubscriptionAt: &now,
+	}, hunter.State{
+		Cursor: 1200, LastBatchAt: &now, LastTailAt: &now, LastAttemptAt: &now,
+		LastDualAgreementAt: &now, LastErrorClass: "revenue_lane_authority_diverged",
+		LastBlockNumber: 491273850, LastBlockHash: "0x" + strings.Repeat("a", 64),
+		LastProviderPrimary: "production-primary", LastProviderSecond: "production-secondary",
+	})
+	if !health.ServiceHealthy || health.HuntingHealthy || health.ExactExecutionReady {
+		t.Fatalf("divergent revenue authority crossed the readiness boundary: %+v", health)
+	}
+	if health.DegradedReason != "revenue_lane_authority_diverged" || health.RecoveryState != "recovering" {
+		t.Fatalf("divergent revenue authority was not exposed clearly: %+v", health)
+	}
+}
+
+func TestDivergentRevenueAuthorityKeepsHealthAliveAndReadinessClosed(t *testing.T) {
+	health := laneHealth{
+		ServiceHealthy:      true,
+		HuntingHealthy:      false,
+		ExactExecutionReady: false,
+		DegradedReason:      "revenue_lane_authority_diverged",
+		RecoveryState:       "recovering",
+	}
+	state := hunter.State{
+		LastErrorClass: "revenue_lane_authority_diverged",
+		Counts:         map[string]uint64{},
+	}
+	service := httptest.NewRecorder()
+	writeHealthResponse(service, health, state, false, false)
+	if service.Code != http.StatusOK || !strings.Contains(service.Body.String(), `"ok":true`) {
+		t.Fatalf("service liveness did not remain healthy: code=%d body=%s", service.Code, service.Body.String())
+	}
+	readiness := httptest.NewRecorder()
+	writeHealthResponse(readiness, health, state, true, true)
+	if readiness.Code != http.StatusServiceUnavailable ||
+		!strings.Contains(readiness.Body.String(), `"ok":false`) ||
+		!strings.Contains(readiness.Body.String(), `"degraded_reason":"revenue_lane_authority_diverged"`) {
+		t.Fatalf("divergent authority did not fail readiness closed: code=%d body=%s", readiness.Code, readiness.Body.String())
+	}
+}
+
+func TestHealthPayloadPublishesCurrentProviderFailureStreak(t *testing.T) {
+	payload := healthPayload(laneHealth{}, hunter.State{Counts: map[string]uint64{
+		"provider_current_class_failure_streak": 2,
+	}}, false)
+	if got := payload["provider_current_class_failure_streak"]; got != uint64(2) {
+		t.Fatalf("current provider failure streak=%v want=2", got)
 	}
 }
 

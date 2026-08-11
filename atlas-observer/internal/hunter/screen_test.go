@@ -170,7 +170,7 @@ func TestRetryableProviderFailureIsRecordedWithoutCandidateAuthority(t *testing.
 			if !accepted || !acceptedAgain || state.LastErrorClass != test.wantClass || state.LastAttemptAt == nil || state.ExactQueueCount != 0 {
 				t.Fatalf("retryable provider recovery crossed an authority boundary: accepted=%t/%t state=%+v", accepted, acceptedAgain, state)
 			}
-			if state.Counts[providerDegradationTotalKey] != 1 || state.Counts[providerRecoveryAttemptTotalKey] != 2 || state.Counts[providerDegradedSinceMillisKey] == 0 {
+			if state.Counts[providerDegradationTotalKey] != 1 || state.Counts[providerRecoveryAttemptTotalKey] != 2 || state.Counts[providerDegradedSinceMillisKey] == 0 || state.Counts[providerCurrentFailureStreakKey] != 1 {
 				t.Fatalf("retryable recovery counters are invalid: %+v", state.Counts)
 			}
 		})
@@ -205,6 +205,36 @@ func TestRetryableProviderErrorOpensCircuitForFiveMinutes(t *testing.T) {
 	state := screener.Snapshot()
 	if state.ProviderCircuitOpenTotal != 1 || state.ProviderCircuitOpenUntilUnixMillis != now.Add(providerCircuitCooldown).UnixMilli() || !screener.IsProviderCircuitOpen() {
 		t.Fatalf("circuit did not open for expected duration: %+v", state)
+	}
+}
+
+func TestProviderFailureStreakCountsReopenedCircuitAndResetsOnRecovery(t *testing.T) {
+	now := time.Date(2026, 8, 6, 0, 0, 0, 0, time.UTC)
+	screener := &Screener{
+		config: Config{StateDir: t.TempDir()},
+		state:  State{Schema: StateSchema, Counts: map[string]uint64{}},
+		now:    func() time.Time { return now },
+	}
+	failure := &gatewayResponseError{statusCode: http.StatusBadGateway, class: "provider_disagreement"}
+	if accepted, err := screener.RecordRetryableGatewayError(failure); err != nil || !accepted {
+		t.Fatalf("first provider failure was not accepted: accepted=%t err=%v", accepted, err)
+	}
+	now = now.Add(providerCircuitCooldown + time.Second)
+	if accepted, err := screener.RecordRetryableGatewayError(failure); err != nil || !accepted {
+		t.Fatalf("reopened provider failure was not accepted: accepted=%t err=%v", accepted, err)
+	}
+	if got := screener.Snapshot().Counts[providerCurrentFailureStreakKey]; got != 2 {
+		t.Fatalf("current provider failure streak=%d want=2", got)
+	}
+	screener.mu.Lock()
+	screener.recordProviderRecoveryLocked(now)
+	screener.mu.Unlock()
+	now = now.Add(time.Second)
+	if accepted, err := screener.RecordRetryableGatewayError(failure); err != nil || !accepted {
+		t.Fatalf("post-recovery provider failure was not accepted: accepted=%t err=%v", accepted, err)
+	}
+	if got := screener.Snapshot().Counts[providerCurrentFailureStreakKey]; got != 1 {
+		t.Fatalf("post-recovery provider failure streak=%d want=1", got)
 	}
 }
 
@@ -499,9 +529,9 @@ type recordingSignalSink struct {
 	atlasCallbackEvidenceHashes []string
 }
 
-func (s *recordingSignalSink) RecordAaveSignal(_ context.Context, record signal) error {
+func (s *recordingSignalSink) RecordAaveSignal(_ context.Context, record signal) (signal, error) {
 	s.records = append(s.records, record)
-	return nil
+	return record, nil
 }
 
 func (s *recordingSignalSink) RecordAtlasCallbackUnavailable(_ context.Context, auctionID, evidenceHash string) error {
@@ -580,7 +610,7 @@ func TestValidatedAaveLiveMaximumRequiresExactLaneEconomicAgreement(t *testing.T
 	for index, mutate := range mutations {
 		rows := append([]liveSizeAuthorityRow(nil), active...)
 		mutate(rows)
-		if got, err := validatedAaveLiveMaximumInputAmount(rows); err == nil {
+		if got, err := validatedAaveLiveMaximumInputAmount(rows); err == nil || !errors.Is(err, errRevenueLaneAuthorityDiverged) {
 			t.Fatalf("mutation %d accepted maximum %s", index, got)
 		}
 	}
@@ -653,10 +683,185 @@ func TestValidatedAaveLiveMaximumAcceptsExplicitMaximumReviewedLaneAuthority(t *
 		t.Run(test.name, func(t *testing.T) {
 			rows := append([]liveSizeAuthorityRow(nil), active...)
 			rows = test.mutate(rows)
-			if got, err := validatedAaveLiveMaximumInputAmount(rows); err == nil {
+			if got, err := validatedAaveLiveMaximumInputAmount(rows); err == nil || !errors.Is(err, errRevenueLaneAuthorityDiverged) {
 				t.Fatalf("accepted maximum %s", got)
 			}
 		})
+	}
+}
+
+func TestCandidateAuthorityBindsDirectAndAtlasSizeToLockedMaximum(t *testing.T) {
+	current := "500000000000000"
+	valid := signal{
+		ExecutionCandidate: &executionCandidate{SelectedSize: current, MaximumInputAmount: current},
+		AtlasCandidate:     &atlasCandidate{SelectedSize: current, MaximumInputAmount: current},
+	}
+	if !candidateMatchesCurrentAuthority(valid, current) {
+		t.Fatal("candidate matching the locked authority was rejected")
+	}
+	for name, mutate := range map[string]func(signal) signal{
+		"direct evaluated at old maximum": func(value signal) signal {
+			value.ExecutionCandidate.MaximumInputAmount = maximumReviewedInputWei
+			return value
+		},
+		"direct selected above maximum": func(value signal) signal {
+			value.ExecutionCandidate.SelectedSize = maximumReviewedInputWei
+			return value
+		},
+		"Atlas evaluated at old maximum": func(value signal) signal {
+			value.AtlasCandidate.MaximumInputAmount = maximumReviewedInputWei
+			return value
+		},
+		"Atlas selected above maximum": func(value signal) signal {
+			value.AtlasCandidate.SelectedSize = maximumReviewedInputWei
+			return value
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			value := signal{
+				ExecutionCandidate: &executionCandidate{SelectedSize: current, MaximumInputAmount: current},
+				AtlasCandidate:     &atlasCandidate{SelectedSize: current, MaximumInputAmount: current},
+			}
+			if candidateMatchesCurrentAuthority(mutate(value), current) {
+				t.Fatal("stale candidate authority was accepted")
+			}
+		})
+	}
+}
+
+func TestCandidateAuthorityNormalizationRemovesEveryMoneyPathArtifact(t *testing.T) {
+	record := withoutCandidateAuthority(signal{
+		Authority:          true,
+		TerminalOutcome:    "candidate",
+		ExecutionCandidate: &executionCandidate{},
+		AtlasCandidate:     &atlasCandidate{},
+	}, revenueLaneAuthorityDivergedClass)
+	if record.Authority || record.ExecutionCandidate != nil || record.AtlasCandidate != nil ||
+		record.TerminalOutcome != "exact_pending" ||
+		record.ExactDeferredReason != revenueLaneAuthorityDivergedClass {
+		t.Fatalf("candidate authority normalization was incomplete: %+v", record)
+	}
+}
+
+func TestCoherentAuthorityChangesStripStaleCandidateWithoutReportingDivergence(t *testing.T) {
+	record := signal{
+		Authority:          true,
+		TerminalOutcome:    "candidate",
+		ExecutionCandidate: &executionCandidate{SelectedSize: maximumReviewedInputWei, MaximumInputAmount: maximumReviewedInputWei},
+	}
+	promoted, err := normalizeCandidateForCurrentAuthority(record, "500000000000000", nil, true)
+	if err != nil || promoted.Authority || promoted.ExecutionCandidate != nil ||
+		promoted.ExactDeferredReason != liveSizeAuthorityChangedReason ||
+		promoted.ExactDeferredReason == revenueLaneAuthorityDivergedClass {
+		t.Fatalf("coherent size change was misclassified: record=%+v err=%v", promoted, err)
+	}
+	closed, err := normalizeCandidateForCurrentAuthority(record, "1", nil, false)
+	if err != nil || closed.Authority || closed.ExecutionCandidate != nil ||
+		closed.ExactDeferredReason != revenueAuthorityClosedReason ||
+		closed.ExactDeferredReason == revenueLaneAuthorityDivergedClass {
+		t.Fatalf("coherent closed authority was misclassified: record=%+v err=%v", closed, err)
+	}
+	diverged, err := normalizeCandidateForCurrentAuthority(
+		record,
+		"",
+		revenueLaneAuthorityError("partial pair"),
+		false,
+	)
+	if err != nil || diverged.ExactDeferredReason != revenueLaneAuthorityDivergedClass {
+		t.Fatalf("true divergence was not preserved: record=%+v err=%v", diverged, err)
+	}
+}
+
+func TestDivergentRevenueAuthorityDefersExactWithoutStoppingDiscovery(t *testing.T) {
+	directory := t.TempDir()
+	now := time.Now().UTC()
+	borrowerAccount := account{
+		Borrower:                    "0x1111111111111111111111111111111111111111",
+		TotalCollateralBase:         "2000000000000",
+		TotalDebtBase:               "1000000000000",
+		AvailableBorrowsBase:        "0",
+		CurrentLiquidationThreshold: "8000",
+		LoanToValueBPS:              "7500",
+		HealthFactorWAD:             "900000000000000000",
+	}
+	screenCalls := 0
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if request.URL.Path != "/v1/aave/screen" {
+			t.Fatalf("divergent authority emitted Exact work: %s", request.URL.Path)
+		}
+		screenCalls++
+		var input screenRequest
+		if err := json.NewDecoder(request.Body).Decode(&input); err != nil {
+			t.Fatal(err)
+		}
+		_ = json.NewEncoder(writer).Encode(screenResponse{
+			SchemaVersion: ResponseSchema,
+			ChainID:       42161,
+			RequestID:     input.RequestID,
+			BlockNumber:   491300000,
+			BlockHash:     "0x" + strings.Repeat("a", 64),
+			Primary: providerScreen{
+				ProviderID: "production-primary", WETHPriceBase: "300000000000", Accounts: []account{borrowerAccount},
+			},
+			Secondary: providerScreen{
+				ProviderID: "production-secondary", WETHPriceBase: "300000000000", Accounts: []account{borrowerAccount},
+			},
+		})
+	}))
+	defer server.Close()
+	sink := &liveAuthoritySignalSink{err: revenueLaneAuthorityError("Aave off while Atlas remains armed")}
+	screener := &Screener{
+		config: Config{
+			StateDir: directory, GatewayURL: server.URL,
+			RetainedProfitFloorWei: "1", MaximumInputAmountWei: maximumReviewedInputWei,
+			SignalSink: sink,
+		},
+		client: server.Client(), state: State{Schema: StateSchema, Counts: map[string]uint64{}},
+		debtBearing: make(map[string]bool), refreshKnown: make(map[string]bool),
+		hotBorrowers: make(map[string]string), hotDebtBase: make(map[string]string),
+		hotUpperPositive: make(map[string]bool), latestOutcome: make(map[string]string),
+		lastExactAt: make(map[string]time.Time), firstLiquidatableAt: make(map[string]time.Time),
+		now: func() time.Time { return now },
+	}
+	if err := screener.screen(context.Background(), []string{borrowerAccount.Borrower}, false, nil); err != nil {
+		t.Fatalf("divergent authority stopped discovery: %v", err)
+	}
+	if err := screener.screen(context.Background(), []string{borrowerAccount.Borrower}, false, nil); err != nil {
+		t.Fatalf("persisted divergent authority stopped discovery: %v", err)
+	}
+	if screenCalls != 2 || len(sink.records) != 2 {
+		t.Fatalf("discovery did not remain alive: screens=%d records=%d", screenCalls, len(sink.records))
+	}
+	for _, record := range sink.records {
+		if record.Authority || record.ExecutionCandidate != nil || record.AtlasCandidate != nil ||
+			record.TerminalOutcome != "exact_pending" || record.ExactDeferredReason != revenueLaneAuthorityDivergedClass {
+			t.Fatalf("divergent authority crossed the Candidate boundary: %+v", record)
+		}
+	}
+	state := screener.Snapshot()
+	if state.LastErrorClass != revenueLaneAuthorityDivergedClass || state.ExactEvaluationsInFlight != 0 ||
+		state.Counts[revenueLaneAuthorityDivergedKey] != 1 || state.Counts[exactEvalCompletedKey] != 0 {
+		t.Fatalf("divergent authority degradation was not durable: %+v", state)
+	}
+
+	// Control convergence is re-probed on the next fresh dual-provider screen,
+	// even when no borrower remains liquidatable and no Exact call is admitted.
+	sink.err = nil
+	sink.maximum = "1"
+	borrowerAccount.TotalDebtBase = "0"
+	borrowerAccount.HealthFactorWAD = "2000000000000000000"
+	now = now.Add(time.Minute)
+	if err := screener.screen(context.Background(), []string{borrowerAccount.Borrower}, false, nil); err != nil {
+		t.Fatalf("coherent closed authority did not recover discovery: %v", err)
+	}
+	state = screener.Snapshot()
+	if screenCalls != 3 || len(sink.records) != 3 || state.LastErrorClass != "" ||
+		state.ExactEvaluationsInFlight != 0 || state.Counts[exactEvalCompletedKey] != 0 {
+		t.Fatalf("coherent authority did not clear degradation without Exact work: %+v", state)
+	}
+	recovered := sink.records[2]
+	if recovered.Authority || recovered.ExecutionCandidate != nil || recovered.AtlasCandidate != nil {
+		t.Fatalf("authority recovery created money-path work: %+v", recovered)
 	}
 }
 
@@ -1579,7 +1784,7 @@ func TestGatewayBudgetExhaustionUsesShortCircuitCooldown(t *testing.T) {
 	}
 	if state.ProviderCircuitOpenTotal != 1 ||
 		state.ProviderCircuitOpenUntilUnixMillis != now.Add(gatewayBudgetCircuitCooldown).UnixMilli() ||
-		state.LastErrorClass != "provider_rate_limited" {
+		state.LastErrorClass != "gateway_budget_exhausted" {
 		t.Fatalf("local gateway budget did not use bounded short cooldown: %+v", state)
 	}
 }
@@ -2832,7 +3037,7 @@ func TestAuctionWithDirectWrapperEvidencePersistsNoLaneArtifact(t *testing.T) {
 		t.Fatalf("auction emitted a bypass/duplicate lane artifact: %+v", record)
 	}
 	sink := &recordingSignalSink{}
-	if err := sink.RecordAaveSignal(context.Background(), record); err != nil {
+	if _, err := sink.RecordAaveSignal(context.Background(), record); err != nil {
 		t.Fatal(err)
 	}
 	if len(sink.records) != 1 || sink.records[0].ExecutionCandidate != nil || sink.records[0].AtlasCandidate != nil || signalRejectionReason(sink.records[0]) != "atlas_callback_evidence_unavailable" {

@@ -170,32 +170,38 @@ func healthHandler(ledger *observer.Ledger, screener *hunter.Screener) http.Hand
 		now := time.Now().UTC()
 		state := screener.Snapshot()
 		health := evaluateLaneHealth(now, ledger.Snapshot(now), state)
-		status := http.StatusOK
-		if !health.ServiceHealthy {
-			status = http.StatusServiceUnavailable
-		}
-		writer.Header().Set("Content-Type", "application/json")
-		writer.WriteHeader(status)
-		payload := healthPayload(health, state, false)
-		payload["ok"] = status == http.StatusOK
-		_ = json.NewEncoder(writer).Encode(payload)
+		writeHealthResponse(writer, health, state, false, false)
 	})
 	mux.HandleFunc("/readyz", func(writer http.ResponseWriter, request *http.Request) {
 		now := time.Now().UTC()
 		atlas := ledger.Snapshot(now)
 		aave := screener.Snapshot()
 		health := evaluateLaneHealth(now, atlas, aave)
-		status := http.StatusOK
-		if !health.HuntingHealthy {
-			status = http.StatusServiceUnavailable
-		}
-		writer.Header().Set("Content-Type", "application/json")
-		writer.WriteHeader(status)
-		payload := healthPayload(health, aave, atlas.Connected)
-		payload["ok"] = status == http.StatusOK
-		_ = json.NewEncoder(writer).Encode(payload)
+		writeHealthResponse(writer, health, aave, atlas.Connected, true)
 	})
 	return mux
+}
+
+func writeHealthResponse(
+	writer http.ResponseWriter,
+	health laneHealth,
+	state hunter.State,
+	atlasConnected bool,
+	requireHunting bool,
+) {
+	ok := health.ServiceHealthy
+	if requireHunting {
+		ok = health.HuntingHealthy
+	}
+	status := http.StatusOK
+	if !ok {
+		status = http.StatusServiceUnavailable
+	}
+	writer.Header().Set("Content-Type", "application/json")
+	writer.WriteHeader(status)
+	payload := healthPayload(health, state, atlasConnected)
+	payload["ok"] = ok
+	_ = json.NewEncoder(writer).Encode(payload)
 }
 
 const laneFreshnessWindow = 10 * time.Minute
@@ -216,7 +222,8 @@ func evaluateLaneHealth(now time.Time, atlas observer.LedgerState, aave hunter.S
 	circuitOpen := aave.ProviderCircuitOpenUntilUnixMillis > 0 && aave.ProviderCircuitOpenUntilUnixMillis > now.UnixMilli()
 	serviceHealthy := aave.Cursor >= 1100
 	atlasHealthy := atlas.Connected && atlas.LastSubscriptionAt != nil && atlas.InvalidCount == 0 && !atlas.Completed
-	huntingHealthy := serviceHealthy && atlasHealthy && (batchFresh || tailFresh || attemptFresh)
+	authorityDiverged := aave.LastErrorClass == "revenue_lane_authority_diverged"
+	huntingHealthy := serviceHealthy && atlasHealthy && (batchFresh || tailFresh || attemptFresh) && !authorityDiverged
 	exactReady := huntingHealthy && batchFresh && tailFresh && dualFresh && aave.LastErrorClass == "" && !circuitOpen &&
 		aave.LastBlockNumber > 0 && len(aave.LastBlockHash) == 66 && aave.LastProviderPrimary != "" &&
 		aave.LastProviderSecond != "" && aave.LastProviderPrimary != aave.LastProviderSecond
@@ -264,6 +271,7 @@ func healthPayload(health laneHealth, state hunter.State, atlasConnected bool) m
 		"aave_exact_cooldown_blocked":             state.CooldownBlockedCount,
 		"aave_route_ineligible_current":           state.RouteIneligibleCount,
 		"aave_exact_provider_blocked":             state.ProviderBlockedCount,
+		"aave_exact_authority_blocked":            state.AuthorityBlockedCount,
 		"aave_exact_evaluations_in_flight":        state.ExactEvaluationsInFlight,
 		"aave_oldest_exact_eligible_age_ms":       state.OldestExactEligibleAgeMillis,
 		"aave_active_fork_pending":                state.ActiveForkPendingCount,
@@ -272,6 +280,7 @@ func healthPayload(health laneHealth, state hunter.State, atlasConnected bool) m
 		"last_dual_agreement_at":                  state.LastDualAgreementAt,
 		"last_recovery_attempt_at":                state.LastAttemptAt,
 		"provider_retryable_degradation_total":    state.Counts["provider_retryable_degradation_total"],
+		"provider_current_class_failure_streak":   state.Counts["provider_current_class_failure_streak"],
 		"provider_recovery_attempt_total":         state.Counts["provider_recovery_attempt_total"],
 		"provider_recovery_success_total":         state.Counts["provider_recovery_success_total"],
 		"provider_circuit_open_total":             state.ProviderCircuitOpenTotal,

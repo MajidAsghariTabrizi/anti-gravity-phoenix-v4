@@ -4,6 +4,7 @@ use crate::config::SafetyLimits;
 use crate::model::{CanonicalAddress, ValidatedLeg};
 use crate::rpc::{ExecutionRpc, HttpExecutionRpc, IndexedRpcLog, RpcError};
 use crate::signer::TransactionSigner;
+use crate::store::{fail_close_execution_authority, StoreError};
 #[cfg(test)]
 use crate::ARBITRUM_UNISWAP_V3_FACTORY_ADDRESS;
 use crate::{
@@ -453,10 +454,14 @@ impl AtlasRevenueExecutor {
             }
             AtlasOutcome::Failed { transaction_hash } => {
                 let mut transaction = self.pool.begin().await?;
+                fail_close_execution_authority(
+                    &mut transaction,
+                    "atlas_inclusion_failed",
+                    Utc::now(),
+                )
+                .await?;
                 sqlx::query("UPDATE live_canary.atlas_solver_requests SET status='lost', inclusion_transaction_hash=$2, updated_at=now() WHERE auction_id=$1 AND status IN ('submitted','submission_unknown')")
                     .bind(&active.auction_id).bind(transaction_hash).execute(&mut *transaction).await?;
-                sqlx::query("UPDATE live_canary.revenue_lane_controls SET armed=false, kill_switch=true, disarm_reason='atlas_inclusion_failed', control_epoch=control_epoch+1, updated_at=now() WHERE lane='atlas_solver'")
-                    .execute(&mut *transaction).await?;
                 release_lock(&mut transaction, &active.auction_id).await?;
                 transaction.commit().await?;
                 Ok(AtlasExecutionState::Rejected {
@@ -747,20 +752,12 @@ impl AtlasRevenueExecutor {
         reason: &'static str,
     ) -> Result<(), RevenueError> {
         let mut transaction = self.pool.begin().await?;
+        fail_close_execution_authority(&mut transaction, reason, Utc::now()).await?;
         sqlx::query(
             "UPDATE live_canary.atlas_solver_requests SET status = 'submission_unknown', updated_at = now()
              WHERE auction_id = $1 AND status IN ('claimed','signed')",
         )
         .bind(auction_id)
-        .execute(&mut *transaction)
-        .await?;
-        sqlx::query(
-            "UPDATE live_canary.revenue_lane_controls
-             SET armed = false, kill_switch = true, disarm_reason = $1,
-                 control_epoch = control_epoch + 1, updated_at = now()
-             WHERE lane = 'atlas_solver'",
-        )
-        .bind(reason)
         .execute(&mut *transaction)
         .await?;
         transaction.commit().await?;
@@ -1170,6 +1167,8 @@ pub enum RevenueError {
     Database(#[from] sqlx::Error),
     #[error("revenue request data is invalid")]
     Data,
+    #[error("revenue control fail-close failed")]
+    Control(#[from] StoreError),
     #[error(transparent)]
     Atlas(#[from] AtlasError),
     #[error("revenue RPC evidence failure")]
@@ -1181,6 +1180,7 @@ impl RevenueError {
         match self {
             Self::Database(_) => "atlas_database",
             Self::Data => "atlas_evidence_integrity",
+            Self::Control(_) => "atlas_control_fail_close",
             Self::Atlas(_) => "atlas_gateway_or_operation",
             Self::Rpc(_) => "atlas_outcome_rpc",
         }

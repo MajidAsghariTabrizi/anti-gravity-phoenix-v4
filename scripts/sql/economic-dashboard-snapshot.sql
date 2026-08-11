@@ -1,6 +1,7 @@
 \set ON_ERROR_STOP on
 
 BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY;
+SET LOCAL jit = off;
 
 SELECT to_regclass('public.phoenix_live_economic_truth') IS NOT NULL
     AS phoenix_has_economic_truth \gset
