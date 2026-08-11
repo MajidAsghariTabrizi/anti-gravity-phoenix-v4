@@ -82,6 +82,10 @@ async fn nonce_allocation_and_pending_state_survive_restart() {
         .execute(&pool)
         .await
         .expect("apply Atlas/Aave revenue lane schema");
+    sqlx::raw_sql(include_str!("../schema/007_aave_economic_diagnostics.sql"))
+        .execute(&pool)
+        .await
+        .expect("apply Aave economic diagnostics schema");
 
     let signer = TransactionSigner::from_secret(&hex::encode([13_u8; 32]), ARBITRUM_ONE_CHAIN_ID)
         .expect("signer");

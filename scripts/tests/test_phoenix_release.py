@@ -2386,6 +2386,18 @@ class WorkflowAndDeploymentContractTests(unittest.TestCase):
             self.rehearsal,
         )
 
+    def test_deploy_quiesces_observer_before_additive_diagnostic_migration(self) -> None:
+        operation = self.deploy.index("\ncompose pull $pull_services\n")
+        stop = self.deploy.index("compose stop -t 30 atlas-observer", operation)
+        absence = self.deploy.index("compose ps -q atlas-observer", stop)
+        migrate = self.deploy.index("autonomous-control migrate", absence)
+        restart = self.deploy.index(
+            "compose up -d --no-deps atlas-observer", migrate
+        )
+        self.assertLess(stop, absence)
+        self.assertLess(absence, migrate)
+        self.assertLess(migrate, restart)
+
     def test_ci_preserves_jobs_and_runs_expensive_suites_only_on_main(
         self,
     ) -> None:
