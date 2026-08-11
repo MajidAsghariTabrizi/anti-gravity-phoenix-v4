@@ -17,6 +17,7 @@ use phoenix_live_executor::owner_bootstrap::{
     OwnerBootstrapError, OwnerMutation,
 };
 use phoenix_live_executor::rpc::{ExecutionRpc, HttpExecutionRpc};
+use phoenix_live_executor::store::fail_close_execution_authority;
 #[cfg(test)]
 use phoenix_live_executor::REVERSE_ROUTE_FINGERPRINT;
 use phoenix_live_executor::{
@@ -36,7 +37,7 @@ use std::fmt::{Display, Formatter};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use url::Url;
 use uuid::Uuid;
 
@@ -86,6 +87,7 @@ const MAX_CONTROL_FILE_BYTES: u64 = 256 * 1024;
 const MAX_READINESS_RESPONSE_BYTES: u64 = 64 * 1024;
 const RPC_GATEWAY_READINESS_URL: &str = "http://rpc-gateway:9300/readyz";
 const ATLAS_HUNTER_READINESS_URL: &str = "http://atlas-observer:9700/readyz";
+const REVENUE_PROVIDER_AUTHORITY_CHECK_INTERVAL: Duration = Duration::from_secs(10);
 const IMAGE_RUNTIME_PROBE_COMMAND: &str = "__image_runtime_probe__";
 const IMAGE_RUNTIME_OK: &str = "AUTONOMOUS_CONTROL_RUNTIME_OK";
 
@@ -1586,7 +1588,17 @@ async fn supervise_economic_control() -> ControlResult<()> {
         .unwrap_or(500);
     let pool = database_pool().await?;
     let mut emitted_fork_result = None;
+    let mut last_revenue_provider_check = None;
     loop {
+        if last_revenue_provider_check
+            .map(|checked: Instant| checked.elapsed() >= REVENUE_PROVIDER_AUTHORITY_CHECK_INTERVAL)
+            .unwrap_or(true)
+        {
+            if let Err(error) = converge_revenue_provider_authority(&pool).await {
+                eprintln!("REVENUE_PROVIDER_AUTHORITY_CHECK_FAILED: {error}");
+            }
+            last_revenue_provider_check = Some(Instant::now());
+        }
         let delay = if current_economic_phase(&pool).await? == EconomicPhase::DisarmedEvidence {
             match collect_activation_request(&pool, None).await {
                 Ok(Some(request))
@@ -1632,6 +1644,122 @@ async fn current_economic_phase(pool: &PgPool) -> ControlResult<EconomicPhase> {
             .await
             .map_err(|_| "economic control is unavailable")?;
     parse_phase(&phase)
+}
+
+fn persistent_hunter_provider_failure(payload: &Value, now_millis: i64) -> ControlResult<bool> {
+    let reason = payload
+        .get("degraded_reason")
+        .and_then(Value::as_str)
+        .ok_or("Aave/Atlas degraded reason is invalid")?;
+    let recovery = payload
+        .get("provider_recovery_state")
+        .and_then(Value::as_str)
+        .ok_or("Aave/Atlas recovery state is invalid")?;
+    let class_degradations = payload
+        .get("provider_current_class_failure_streak")
+        .and_then(Value::as_u64)
+        .ok_or("Aave/Atlas current failure streak is invalid")?;
+    let circuit_until = payload
+        .get("provider_circuit_open_until_unix_millis")
+        .and_then(Value::as_i64)
+        .ok_or("Aave/Atlas circuit evidence is invalid")?;
+    let execution_authority_invalidating = matches!(
+        reason,
+        "provider_disagreement"
+            | "provider_unavailable"
+            | "provider_timeout"
+            | "provider_rate_limited"
+    );
+    Ok(execution_authority_invalidating
+        && recovery == "recovering"
+        && class_degradations >= 2
+        && circuit_until > now_millis)
+}
+
+async fn converge_revenue_provider_authority(pool: &PgPool) -> ControlResult<()> {
+    let rows = sqlx::query(
+        "SELECT lane, armed, kill_switch
+         FROM live_canary.revenue_lane_controls
+         WHERE lane IN ('aave_liquidation', 'atlas_solver')
+         ORDER BY lane",
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(|_| "revenue lane authority is unavailable")?;
+    if rows.len() != 2
+        || rows[0].try_get::<String, _>("lane").ok().as_deref() != Some("aave_liquidation")
+        || rows[1].try_get::<String, _>("lane").ok().as_deref() != Some("atlas_solver")
+    {
+        return Err("the exact revenue lane set is unavailable".into());
+    }
+    let states = rows
+        .iter()
+        .map(|row| {
+            Ok((
+                row.try_get::<bool, _>("armed")
+                    .map_err(|_| "revenue lane authority is invalid")?,
+                row.try_get::<bool, _>("kill_switch")
+                    .map_err(|_| "revenue lane authority is invalid")?,
+            ))
+        })
+        .collect::<ControlResult<Vec<_>>>()?;
+    let both_closed = states.iter().all(|(armed, kill)| !armed && *kill);
+    if both_closed {
+        return Ok(());
+    }
+    let both_active = states.iter().all(|(armed, kill)| *armed && !kill);
+    let reason = if both_active {
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .map_err(|_| "Aave/Atlas readiness client initialization failed")?;
+        let response = client
+            .get(ATLAS_HUNTER_READINESS_URL)
+            .send()
+            .await
+            .map_err(|_| "Aave/Atlas hunter readiness is unavailable")?;
+        let bytes = response
+            .bytes()
+            .await
+            .map_err(|_| "Aave/Atlas hunter readiness is unavailable")?;
+        if bytes.len() > 64 * 1024 {
+            return Err("Aave/Atlas hunter readiness is oversized".into());
+        }
+        let payload: Value =
+            serde_json::from_slice(&bytes).map_err(|_| "Aave/Atlas hunter readiness is invalid")?;
+        let degraded_reason = payload
+            .get("degraded_reason")
+            .and_then(Value::as_str)
+            .ok_or("Aave/Atlas degraded reason is invalid")?;
+        if degraded_reason == "revenue_lane_authority_diverged" {
+            "revenue_lane_authority_diverged"
+        } else if persistent_hunter_provider_failure(&payload, Utc::now().timestamp_millis())? {
+            match degraded_reason {
+                "provider_disagreement" => "provider_disagreement",
+                "provider_unavailable" => "provider_unavailable",
+                "provider_timeout" => "provider_timeout",
+                "provider_rate_limited" => "provider_rate_limited",
+                _ => return Err("Aave/Atlas degraded reason is invalid".into()),
+            }
+        } else {
+            return Ok(());
+        }
+    } else {
+        "revenue_lane_authority_diverged"
+    };
+    let mut transaction = pool
+        .begin()
+        .await
+        .map_err(|_| "revenue fail-close transaction failed")?;
+    fail_close_execution_authority(&mut transaction, reason, Utc::now())
+        .await
+        .map_err(|_| "revenue provider fail-close failed")?;
+    transaction
+        .commit()
+        .await
+        .map_err(|_| "revenue provider fail-close commit failed")?;
+    println!("REVENUE_PROVIDER_AUTHORITY_DISARMED: reason={reason}");
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -2718,7 +2846,9 @@ async fn evaluate_economic_control(pool: &PgPool) -> ControlResult<()> {
     } else if evidence.reconciled_outcomes > 0 && evidence.prediction_error_bps > 1_000 {
         route_failure(&mut transaction, &previous, "prediction_error").await?;
     } else if evidence.rpc_disagreements >= 2 {
-        route_failure(&mut transaction, &previous, "rpc_disagreement").await?;
+        fail_close_execution_authority(&mut transaction, "rpc_disagreement", Utc::now())
+            .await
+            .map_err(|_| "provider disagreement fail-close failed")?;
     } else if evidence.wallet_gas_reserve_wei <= evidence.gas_reserve_floor_wei {
         route_failure(&mut transaction, &previous, "gas_reserve_floor").await?;
     } else if let Ok(Transition::Promote { level, .. }) =
@@ -4337,6 +4467,7 @@ mod tests {
             "exact_execution_readiness": true,
             "atlas_connected": true,
             "provider_recovery_state": "ready",
+            "provider_current_class_failure_streak": 0,
             "degraded_reason": "",
             "provider_circuit_open_until_unix_millis": 0,
             "primary_provider_id": "primary",
@@ -4649,5 +4780,35 @@ mod tests {
         let mut no_agreement = valid;
         no_agreement["last_dual_agreement_at"] = Value::Null;
         assert!(validate_hunter_readiness(&no_agreement, now_millis).is_err());
+    }
+
+    #[test]
+    fn repeated_current_provider_failures_require_an_open_circuit_before_fail_close() {
+        let now_millis = Utc::now().timestamp_millis();
+        for reason in [
+            "provider_disagreement",
+            "provider_unavailable",
+            "provider_timeout",
+            "provider_rate_limited",
+        ] {
+            let mut payload = hunter_readiness();
+            payload["degraded_reason"] = Value::String(reason.to_string());
+            payload["provider_recovery_state"] = Value::String("recovering".to_string());
+            payload["provider_current_class_failure_streak"] = json!(2);
+            payload["provider_circuit_open_until_unix_millis"] = json!(now_millis + 60_000);
+            assert!(persistent_hunter_provider_failure(&payload, now_millis).unwrap());
+
+            payload["provider_current_class_failure_streak"] = json!(1);
+            assert!(!persistent_hunter_provider_failure(&payload, now_millis).unwrap());
+            payload["provider_current_class_failure_streak"] = json!(2);
+            payload["provider_circuit_open_until_unix_millis"] = json!(now_millis);
+            assert!(!persistent_hunter_provider_failure(&payload, now_millis).unwrap());
+        }
+        let mut budget = hunter_readiness();
+        budget["degraded_reason"] = Value::String("gateway_budget_exhausted".to_string());
+        budget["provider_recovery_state"] = Value::String("recovering".to_string());
+        budget["provider_current_class_failure_streak"] = json!(3);
+        budget["provider_circuit_open_until_unix_millis"] = json!(now_millis + 60_000);
+        assert!(!persistent_hunter_provider_failure(&budget, now_millis).unwrap());
     }
 }

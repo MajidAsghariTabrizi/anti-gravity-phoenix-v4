@@ -277,6 +277,7 @@ struct FakeRpc {
 
 struct FakeRpcState {
     chain_id: u64,
+    chain_error: Option<RpcError>,
     finalized_blocks: VecDeque<(u64, String)>,
     pending_nonce: u64,
     send_count: usize,
@@ -292,6 +293,7 @@ impl FakeRpc {
         Self {
             state: Arc::new(Mutex::new(FakeRpcState {
                 chain_id: ARBITRUM_ONE_CHAIN_ID,
+                chain_error: None,
                 finalized_blocks: VecDeque::from([
                     (123_456, format!("0x{}", "d".repeat(64))),
                     (123_456, format!("0x{}", "d".repeat(64))),
@@ -335,6 +337,13 @@ impl FakeRpc {
         self.state.lock().expect("state").chain_id = chain_id;
     }
 
+    fn set_chain_error(&self, kind: RpcErrorKind) {
+        self.state.lock().expect("state").chain_error = Some(RpcError {
+            kind,
+            remote_code: None,
+        });
+    }
+
     fn set_finalized_blocks(&self, identities: Vec<(u64, String)>) {
         self.state.lock().expect("state").finalized_blocks = identities.into();
     }
@@ -357,7 +366,11 @@ impl FakeRpc {
 #[async_trait]
 impl ExecutionRpc for FakeRpc {
     async fn chain_id(&self) -> Result<u64, RpcError> {
-        Ok(self.state.lock().expect("state").chain_id)
+        let state = self.state.lock().expect("state");
+        if let Some(error) = state.chain_error.clone() {
+            return Err(error);
+        }
+        Ok(state.chain_id)
     }
 
     async fn finalized_block_identity(&self) -> Result<(u64, String), RpcError> {
@@ -887,6 +900,29 @@ async fn non_arbitrum_rpc_disarms_before_claim_or_submission() {
     );
     assert_eq!(harness.rpc.send_count(), 0);
     assert_eq!(harness.store.disarm_reason(), Some("rpc_chain_mismatch"));
+}
+
+#[tokio::test]
+async fn chain_id_timeout_disarms_before_claim_or_submission() {
+    let harness = harness(1);
+    harness.rpc.set_chain_error(RpcErrorKind::Timeout);
+    let state = harness
+        .executor
+        .step(harness.now)
+        .await
+        .expect("timeout fail-close");
+    assert_eq!(
+        state,
+        ExecutionState::Disarmed {
+            reason: DisarmReason::RpcFailure
+        }
+    );
+    let store = harness.store.state.lock().expect("state");
+    assert_eq!(store.disarm_reason, Some("rpc_timeout"));
+    assert_eq!(store.requests.len(), 1);
+    assert!(store.active.is_none());
+    assert!(store.terminal.is_empty());
+    assert_eq!(harness.rpc.send_count(), 0);
 }
 
 #[tokio::test]

@@ -887,110 +887,120 @@ impl ExecutorStore for PostgresExecutorStore {
     }
 
     async fn disarm(&self, reason: &'static str) -> Result<(), StoreError> {
-        if reason.is_empty() || reason.len() > 128 {
-            return Err(StoreError::Invariant);
-        }
         let mut transaction = self.pool.begin().await.map_err(StoreError::from)?;
-        let economic = sqlx::query(
-            "SELECT phase, current_size_level, release_sha, control_epoch
+        fail_close_execution_authority(&mut transaction, reason, Utc::now()).await?;
+        transaction.commit().await.map_err(StoreError::from)
+    }
+}
+
+pub async fn fail_close_execution_authority(
+    transaction: &mut Transaction<'_, Postgres>,
+    reason: &str,
+    transitioned_at: DateTime<Utc>,
+) -> Result<(), StoreError> {
+    if reason.is_empty() || reason.len() > 128 {
+        return Err(StoreError::Invariant);
+    }
+    let economic = sqlx::query(
+        "SELECT phase, current_size_level, release_sha, control_epoch
              FROM live_canary.economic_control
              WHERE singleton
              FOR UPDATE",
-        )
-        .fetch_one(&mut *transaction)
-        .await
+    )
+    .fetch_one(&mut **transaction)
+    .await
+    .map_err(StoreError::from)?;
+    let previous_phase: String = economic.try_get("phase").map_err(StoreError::from)?;
+    let previous_level: String = economic
+        .try_get("current_size_level")
         .map_err(StoreError::from)?;
-        let previous_phase: String = economic.try_get("phase").map_err(StoreError::from)?;
-        let previous_level: String = economic
-            .try_get("current_size_level")
-            .map_err(StoreError::from)?;
-        let release_sha: Option<String> =
-            economic.try_get("release_sha").map_err(StoreError::from)?;
-        let previous_epoch: i64 = economic
-            .try_get("control_epoch")
-            .map_err(StoreError::from)?;
-        let updated = sqlx::query(
-            "UPDATE live_canary.control
+    let release_sha: Option<String> = economic.try_get("release_sha").map_err(StoreError::from)?;
+    let previous_epoch: i64 = economic
+        .try_get("control_epoch")
+        .map_err(StoreError::from)?;
+    let updated = sqlx::query(
+        "UPDATE live_canary.control
              SET armed = false, kill_switch = true, disarm_reason = $1, updated_at = now()
              WHERE singleton",
-        )
-        .bind(reason)
-        .execute(&mut *transaction)
-        .await
-        .map_err(StoreError::from)?;
-        if updated.rows_affected() != 1 {
-            return Err(StoreError::Invariant);
-        }
-        let autonomous = sqlx::query(
-            "UPDATE live_canary.autonomous_global_control
+    )
+    .bind(reason)
+    .execute(&mut **transaction)
+    .await
+    .map_err(StoreError::from)?;
+    if updated.rows_affected() != 1 {
+        return Err(StoreError::Invariant);
+    }
+    let autonomous = sqlx::query(
+        "UPDATE live_canary.autonomous_global_control
              SET armed = false, kill_switch = true, execution_mode = 'disarmed',
                  disarm_reason = $1, control_hash = NULL,
                  control_contract = NULL, updated_at = now()
              WHERE singleton",
-        )
-        .bind(reason)
-        .execute(&mut *transaction)
-        .await
-        .map_err(StoreError::from)?;
-        if autonomous.rows_affected() != 1 {
-            return Err(StoreError::Invariant);
-        }
-        sqlx::query(
-            "UPDATE live_canary.revenue_lane_controls
+    )
+    .bind(reason)
+    .execute(&mut **transaction)
+    .await
+    .map_err(StoreError::from)?;
+    if autonomous.rows_affected() != 1 {
+        return Err(StoreError::Invariant);
+    }
+    let revenue_lanes = sqlx::query(
+        "UPDATE live_canary.revenue_lane_controls
              SET armed = false, kill_switch = true, disarm_reason = $1,
-                 control_epoch = control_epoch + 1, updated_at = now()
-             WHERE lane = 'aave_liquidation'",
-        )
-        .bind(reason)
-        .execute(&mut *transaction)
-        .await
-        .map_err(StoreError::from)?;
-        sqlx::query(
-            "UPDATE live_canary.autonomous_route_controls
+                  control_epoch = control_epoch + 1, updated_at = now()
+             WHERE lane IN ('atlas_solver', 'aave_liquidation')",
+    )
+    .bind(reason)
+    .execute(&mut **transaction)
+    .await
+    .map_err(StoreError::from)?;
+    if revenue_lanes.rows_affected() != 2 {
+        return Err(StoreError::Invariant);
+    }
+    sqlx::query(
+        "UPDATE live_canary.autonomous_route_controls
              SET enabled = false, kill_switch = true, disarm_reason = $1,
                  cooldown_until = NULL, control_hash = NULL,
                  control_contract = NULL, control_epoch = control_epoch + 1,
                  updated_at = now()",
-        )
-        .bind(reason)
-        .execute(&mut *transaction)
-        .await
-        .map_err(StoreError::from)?;
-        sqlx::query(
-            "UPDATE live_canary.economic_control
+    )
+    .bind(reason)
+    .execute(&mut **transaction)
+    .await
+    .map_err(StoreError::from)?;
+    sqlx::query(
+        "UPDATE live_canary.economic_control
              SET phase = 'DISARMED_FAILURE', cooldown_until = NULL,
                  control_epoch = $2,
                  last_transition_reason = $1, updated_at = now()
              WHERE singleton",
-        )
-        .bind(reason)
-        .bind(previous_epoch + 1)
-        .execute(&mut *transaction)
-        .await
-        .map_err(StoreError::from)?;
-        sqlx::query(
+    )
+    .bind(reason)
+    .bind(previous_epoch + 1)
+    .execute(&mut **transaction)
+    .await
+    .map_err(StoreError::from)?;
+    sqlx::query(
             "UPDATE live_canary.autonomous_candidates
              SET status = 'disarmed', updated_at = now()
              WHERE status IN ('materialized', 'approval_pending', 'approved', 'request_materialized',
                               'claimed', 'signed')",
         )
-        .execute(&mut *transaction)
-        .await
-        .map_err(StoreError::from)?;
-        insert_runtime_transition(
-            &mut transaction,
-            &previous_phase,
-            &previous_level,
-            "DISARMED_FAILURE",
-            &previous_level,
-            reason,
-            release_sha.as_deref(),
-            previous_epoch + 1,
-            Utc::now(),
-        )
-        .await?;
-        transaction.commit().await.map_err(StoreError::from)
-    }
+    .execute(&mut **transaction)
+    .await
+    .map_err(StoreError::from)?;
+    insert_runtime_transition(
+        transaction,
+        &previous_phase,
+        &previous_level,
+        "DISARMED_FAILURE",
+        &previous_level,
+        reason,
+        release_sha.as_deref(),
+        previous_epoch + 1,
+        transitioned_at,
+    )
+    .await
 }
 
 #[allow(clippy::too_many_arguments)]

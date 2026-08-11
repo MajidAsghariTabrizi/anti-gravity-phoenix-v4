@@ -13,7 +13,7 @@ use phoenix_live_executor::model::{
     ValidatedLeg,
 };
 use phoenix_live_executor::signer::TransactionSigner;
-use phoenix_live_executor::store::{ExecutorStore, PostgresExecutorStore};
+use phoenix_live_executor::store::{ExecutorStore, PostgresExecutorStore, StoreError};
 use phoenix_live_executor::{
     ARBITRUM_NATIVE_USDC_ADDRESS, ARBITRUM_ONE_CHAIN_ID, ARBITRUM_WETH_ADDRESS,
     CURRENT_ROUTE_FINGERPRINT, CURRENT_ROUTE_POOL_3000_ADDRESS, CURRENT_ROUTE_POOL_500_ADDRESS,
@@ -551,6 +551,158 @@ async fn nonce_allocation_and_pending_state_survive_restart() {
             .expect("shared daily loss"),
         5_100
     );
+
+    sqlx::query(
+        "UPDATE live_canary.revenue_lane_controls
+         SET armed = true, kill_switch = false,
+             disarm_reason = 'fixture_runtime_armed'
+         WHERE lane IN ('atlas_solver', 'aave_liquidation')",
+    )
+    .execute(&pool)
+    .await
+    .expect("arm both revenue lanes for runtime failure fixture");
+    let lane_epochs_before = sqlx::query(
+        "SELECT lane, control_epoch
+         FROM live_canary.revenue_lane_controls
+         WHERE lane IN ('atlas_solver', 'aave_liquidation')
+         ORDER BY lane",
+    )
+    .fetch_all(&pool)
+    .await
+    .expect("load revenue lane epochs");
+    assert_eq!(lane_epochs_before.len(), 2);
+    let durable_rows_before: (i64, i64, i64) = sqlx::query_as(
+        "SELECT
+            (SELECT count(*) FROM live_canary.execution_requests),
+            (SELECT count(*) FROM live_canary.execution_attempts),
+            (SELECT count(*) FROM live_canary.atlas_solver_requests)",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("load durable money-path row counts");
+    sqlx::query(
+        "UPDATE live_canary.global_revenue_submission_lock
+         SET active_lane = 'atlas_solver',
+             active_identity = 'preserved-runtime-fail-close',
+             acquired_at = $1
+         WHERE singleton",
+    )
+    .bind(now)
+    .execute(&pool)
+    .await
+    .expect("seed active revenue submission lock");
+    let durable_work_before: String = sqlx::query_scalar(
+        "SELECT jsonb_build_object(
+            'requests', (SELECT COALESCE(jsonb_agg(to_jsonb(r) ORDER BY r.id), '[]'::jsonb)
+                         FROM live_canary.execution_requests AS r),
+            'attempts', (SELECT COALESCE(jsonb_agg(to_jsonb(a) ORDER BY a.request_id), '[]'::jsonb)
+                         FROM live_canary.execution_attempts AS a),
+            'atlas', (SELECT COALESCE(jsonb_agg(to_jsonb(s) ORDER BY s.auction_id), '[]'::jsonb)
+                      FROM live_canary.atlas_solver_requests AS s),
+            'submission_lock', (SELECT to_jsonb(l)
+                                FROM live_canary.global_revenue_submission_lock AS l
+                                WHERE l.singleton)
+         )::text",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("snapshot durable money-path truth");
+
+    second_restart
+        .disarm("rpc_timeout")
+        .await
+        .expect("atomically fail-close both revenue lanes");
+
+    let lane_states = sqlx::query(
+        "SELECT lane, armed, kill_switch, disarm_reason, control_epoch
+         FROM live_canary.revenue_lane_controls
+         WHERE lane IN ('atlas_solver', 'aave_liquidation')
+         ORDER BY lane",
+    )
+    .fetch_all(&pool)
+    .await
+    .expect("load fail-closed revenue lanes");
+    assert_eq!(lane_states.len(), 2);
+    for (before, after) in lane_epochs_before.iter().zip(&lane_states) {
+        assert_eq!(
+            after.try_get::<String, _>("lane").expect("lane"),
+            before.try_get::<String, _>("lane").expect("lane")
+        );
+        assert!(!after.try_get::<bool, _>("armed").expect("armed"));
+        assert!(after.try_get::<bool, _>("kill_switch").expect("kill"));
+        assert_eq!(
+            after.try_get::<String, _>("disarm_reason").expect("reason"),
+            "rpc_timeout"
+        );
+        assert_eq!(
+            after.try_get::<i64, _>("control_epoch").expect("epoch"),
+            before.try_get::<i64, _>("control_epoch").expect("epoch") + 1
+        );
+    }
+    let economic: (String, String) = sqlx::query_as(
+        "SELECT phase, last_transition_reason
+         FROM live_canary.economic_control
+         WHERE singleton",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("load fail-closed economic control");
+    assert_eq!(
+        economic,
+        ("DISARMED_FAILURE".to_string(), "rpc_timeout".to_string())
+    );
+    let generic_closed: (bool, bool, bool, bool) = sqlx::query_as(
+        "SELECT
+            (SELECT NOT armed AND kill_switch
+             FROM live_canary.control WHERE singleton),
+            (SELECT NOT armed AND kill_switch AND execution_mode = 'disarmed'
+             FROM live_canary.autonomous_global_control WHERE singleton),
+            COALESCE((SELECT bool_and(NOT enabled)
+                      FROM live_canary.autonomous_route_controls), true),
+            COALESCE((SELECT bool_and(kill_switch)
+                      FROM live_canary.autonomous_route_controls), true)",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("load fail-closed Generic controls");
+    assert_eq!(generic_closed, (true, true, true, true));
+    let durable_rows_after: (i64, i64, i64) = sqlx::query_as(
+        "SELECT
+            (SELECT count(*) FROM live_canary.execution_requests),
+            (SELECT count(*) FROM live_canary.execution_attempts),
+            (SELECT count(*) FROM live_canary.atlas_solver_requests)",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("reload durable money-path row counts");
+    assert_eq!(durable_rows_after, durable_rows_before);
+    let durable_work_after: String = sqlx::query_scalar(
+        "SELECT jsonb_build_object(
+            'requests', (SELECT COALESCE(jsonb_agg(to_jsonb(r) ORDER BY r.id), '[]'::jsonb)
+                         FROM live_canary.execution_requests AS r),
+            'attempts', (SELECT COALESCE(jsonb_agg(to_jsonb(a) ORDER BY a.request_id), '[]'::jsonb)
+                         FROM live_canary.execution_attempts AS a),
+            'atlas', (SELECT COALESCE(jsonb_agg(to_jsonb(s) ORDER BY s.auction_id), '[]'::jsonb)
+                      FROM live_canary.atlas_solver_requests AS s),
+            'submission_lock', (SELECT to_jsonb(l)
+                                FROM live_canary.global_revenue_submission_lock AS l
+                                WHERE l.singleton)
+         )::text",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("reload durable money-path truth");
+    assert_eq!(durable_work_after, durable_work_before);
+    sqlx::query(
+        "UPDATE live_canary.global_revenue_submission_lock
+         SET active_lane = NULL, active_identity = NULL, acquired_at = NULL,
+             control_epoch = control_epoch + 1
+         WHERE singleton AND active_identity = 'preserved-runtime-fail-close'",
+    )
+    .execute(&pool)
+    .await
+    .expect("release preserved runtime fail-close lock fixture");
+
     prepare_fork_approval_fixture(&pool).await;
     sqlx::query(
         "UPDATE live_canary.control
@@ -600,6 +752,54 @@ async fn nonce_allocation_and_pending_state_survive_restart() {
     .await
     .expect("count materialized approval");
     assert_eq!(approved_count, 1);
+
+    sqlx::query(
+        "UPDATE live_canary.revenue_lane_controls
+         SET armed = true, kill_switch = false,
+             disarm_reason = 'fixture_rollback_armed'
+         WHERE lane IN ('atlas_solver', 'aave_liquidation')",
+    )
+    .execute(&pool)
+    .await
+    .expect("re-arm exact revenue pair for rollback fixture");
+    sqlx::query("DELETE FROM live_canary.revenue_lane_controls WHERE lane = 'atlas_solver'")
+        .execute(&pool)
+        .await
+        .expect("remove one lane for invariant rollback fixture");
+    let control_before_failed_disarm: String = sqlx::query_scalar(
+        "SELECT jsonb_build_object(
+            'legacy', (SELECT to_jsonb(c) FROM live_canary.control AS c WHERE c.singleton),
+            'global', (SELECT to_jsonb(g) FROM live_canary.autonomous_global_control AS g WHERE g.singleton),
+            'economic', (SELECT to_jsonb(e) FROM live_canary.economic_control AS e WHERE e.singleton),
+            'routes', (SELECT jsonb_agg(to_jsonb(r) ORDER BY r.route_fingerprint)
+                       FROM live_canary.autonomous_route_controls AS r),
+            'aave', (SELECT to_jsonb(l) FROM live_canary.revenue_lane_controls AS l
+                     WHERE l.lane = 'aave_liquidation')
+         )::text",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("snapshot controls before incomplete-pair failure");
+    let missing_lane_error = second_restart
+        .disarm("provider_disagreement")
+        .await
+        .expect_err("missing exact lane must abort fail-close transaction");
+    assert_eq!(missing_lane_error, StoreError::Invariant);
+    let control_after_failed_disarm: String = sqlx::query_scalar(
+        "SELECT jsonb_build_object(
+            'legacy', (SELECT to_jsonb(c) FROM live_canary.control AS c WHERE c.singleton),
+            'global', (SELECT to_jsonb(g) FROM live_canary.autonomous_global_control AS g WHERE g.singleton),
+            'economic', (SELECT to_jsonb(e) FROM live_canary.economic_control AS e WHERE e.singleton),
+            'routes', (SELECT jsonb_agg(to_jsonb(r) ORDER BY r.route_fingerprint)
+                       FROM live_canary.autonomous_route_controls AS r),
+            'aave', (SELECT to_jsonb(l) FROM live_canary.revenue_lane_controls AS l
+                     WHERE l.lane = 'aave_liquidation')
+         )::text",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("snapshot controls after incomplete-pair failure");
+    assert_eq!(control_after_failed_disarm, control_before_failed_disarm);
 
     sqlx::raw_sql("DROP SCHEMA live_canary CASCADE")
         .execute(&pool)

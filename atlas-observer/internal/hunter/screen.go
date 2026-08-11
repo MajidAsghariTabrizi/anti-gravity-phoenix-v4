@@ -41,12 +41,17 @@ const (
 	startupRetryTimeout             = 90 * time.Second
 	maximumStartupRetries           = 3
 	providerDegradationTotalKey     = "provider_retryable_degradation_total"
+	providerDisagreementTotalKey    = "provider_disagreement_degradation_total"
+	providerUnavailableTotalKey     = "provider_unavailable_degradation_total"
+	providerTimeoutTotalKey         = "provider_timeout_degradation_total"
+	providerRateLimitedTotalKey     = "provider_rate_limited_degradation_total"
 	providerRecoveryAttemptTotalKey = "provider_recovery_attempt_total"
 	providerRecoverySuccessTotalKey = "provider_recovery_success_total"
 	providerDegradedSinceMillisKey  = "provider_degraded_since_unix_millis"
 	providerLastDegradedAtMillisKey = "provider_last_degraded_at_unix_millis"
 	providerLastRecoveryAtMillisKey = "provider_last_recovery_at_unix_millis"
 	providerLastDegradedDurationKey = "provider_last_degraded_duration_millis"
+	providerCurrentFailureStreakKey = "provider_current_class_failure_streak"
 	providerCircuitOpenTotalKey     = "provider_circuit_open_total"
 	providerCircuitSkippedTotalKey  = "provider_circuit_skipped_total"
 	providerCircuitCooldown         = 5 * time.Minute
@@ -80,6 +85,11 @@ const (
 	uniswapFactoryAddress           = "0x1f98431c8ad98523631ae4a59f267346ea31f984"
 )
 
+const (
+	revenueLaneAuthorityDivergedKey   = "revenue_lane_authority_diverged_total"
+	revenueLaneAuthorityDivergedClass = "revenue_lane_authority_diverged"
+)
+
 var addressPattern = regexp.MustCompile(`^0x[0-9a-f]{40}$`)
 var releaseSHAPattern = regexp.MustCompile(`^[0-9a-f]{40}$`)
 var errorClassPattern = regexp.MustCompile(`^[a-z][a-z0-9_]{0,63}$`)
@@ -109,7 +119,7 @@ type Config struct {
 }
 
 type SignalSink interface {
-	RecordAaveSignal(context.Context, signal) error
+	RecordAaveSignal(context.Context, signal) (signal, error)
 }
 
 type AtlasAuctionDispositionSink interface {
@@ -158,6 +168,7 @@ type State struct {
 	CooldownBlockedCount               uint64            `json:"-"`
 	RouteIneligibleCount               uint64            `json:"-"`
 	ProviderBlockedCount               uint64            `json:"-"`
+	AuthorityBlockedCount              uint64            `json:"-"`
 	ExactEvaluationsInFlight           uint64            `json:"-"`
 	OldestExactEligibleAgeMillis       uint64            `json:"-"`
 	ActiveForkPendingCount             uint64            `json:"-"`
@@ -429,6 +440,8 @@ type atlasPreparedOperation struct {
 
 type atlasCandidate struct {
 	AuctionID            string
+	SelectedSize         string
+	MaximumInputAmount   string
 	MaximumBid           string
 	SelectedBid          string
 	ExpectedNetPnL       string
@@ -883,8 +896,9 @@ func (s *Screener) Snapshot() State {
 	defer s.mu.Unlock()
 	copy := s.state
 	now := s.nowUTC()
-	providerBlocked := copy.LastErrorClass != "" ||
+	providerBlocked := (copy.LastErrorClass != "" && copy.LastErrorClass != revenueLaneAuthorityDivergedClass) ||
 		(copy.ProviderCircuitOpenUntilUnixMillis > 0 && copy.ProviderCircuitOpenUntilUnixMillis > now.UnixMilli())
+	authorityBlocked := copy.LastErrorClass == revenueLaneAuthorityDivergedClass
 	copy.HotQueueSize = uint64(len(s.hotBorrowers))
 	copy.LiquidatableHotCount = 0
 	copy.UrgentHotCount = 0
@@ -913,6 +927,10 @@ func (s *Screener) Snapshot() State {
 			}
 			if providerBlocked {
 				copy.ProviderBlockedCount++
+				continue
+			}
+			if authorityBlocked {
+				copy.AuthorityBlockedCount++
 				continue
 			}
 			if exactAdmissionBlocked(now, s.lastExactAdmissionAt) {
@@ -981,6 +999,8 @@ func (s *Screener) MetricsText() string {
 		fmt.Sprintf("phoenix_aave_route_ineligible_current %d", state.RouteIneligibleCount),
 		"# TYPE phoenix_aave_exact_provider_blocked gauge",
 		fmt.Sprintf("phoenix_aave_exact_provider_blocked %d", state.ProviderBlockedCount),
+		"# TYPE phoenix_aave_exact_authority_blocked gauge",
+		fmt.Sprintf("phoenix_aave_exact_authority_blocked %d", state.AuthorityBlockedCount),
 		"# TYPE phoenix_aave_exact_evaluations_in_flight gauge",
 		fmt.Sprintf("phoenix_aave_exact_evaluations_in_flight %d", state.ExactEvaluationsInFlight),
 		"# TYPE phoenix_aave_oldest_exact_eligible_age_ms gauge",
@@ -1155,8 +1175,19 @@ func (s *Screener) openProviderCircuitLocked(now time.Time, class string, cooldo
 	if cooldown <= 0 {
 		cooldown = providerCircuitCooldown
 	}
-	if !s.providerCircuitIsOpenLocked(now) {
+	if s.state.Counts == nil {
+		s.state.Counts = make(map[string]uint64)
+	}
+	circuitAlreadyOpen := s.providerCircuitIsOpenLocked(now)
+	if !circuitAlreadyOpen {
 		s.state.ProviderCircuitOpenTotal++
+	}
+	if !circuitAlreadyOpen || s.state.LastErrorClass != class {
+		if s.state.LastErrorClass == class {
+			s.state.Counts[providerCurrentFailureStreakKey]++
+		} else {
+			s.state.Counts[providerCurrentFailureStreakKey] = 1
+		}
 	}
 	s.state.ProviderCircuitOpenUntilUnixMillis = now.Add(cooldown).UnixMilli()
 	return s.recordProviderDegradationLocked(now, class)
@@ -1201,7 +1232,7 @@ func retryableProviderError(err error) (string, time.Duration, bool) {
 				gatewayErr.statusCode == http.StatusTooManyRequests ||
 					gatewayErr.statusCode == http.StatusServiceUnavailable
 		case "state_request_budget_exhausted", "upstream_call_budget_exhausted":
-			return "provider_rate_limited", gatewayBudgetCircuitCooldown,
+			return "gateway_budget_exhausted", gatewayBudgetCircuitCooldown,
 				gatewayErr.statusCode == http.StatusTooManyRequests && gatewayErr.retryable
 		default:
 			return "", 0, false
@@ -1599,6 +1630,16 @@ func (s *Screener) screen(ctx context.Context, borrowers []string, advanceSeed b
 	if result.SchemaVersion != ResponseSchema || result.ChainID != 42161 || result.RequestID != requestID || result.BlockNumber == 0 || len(result.BlockHash) != 66 || result.Primary.ProviderID == result.Secondary.ProviderID || result.Primary.WETHPriceBase != result.Secondary.WETHPriceBase || len(result.Primary.Accounts) != len(borrowers) || len(result.Secondary.Accounts) != len(borrowers) {
 		return errors.New("gateway Aave evidence is incomplete")
 	}
+	previousAuthorityDiverged := s.Snapshot().LastErrorClass == revenueLaneAuthorityDivergedClass
+	authorityDiverged := false
+	if _, hasDurableAuthority := s.config.SignalSink.(LiveSizeAuthority); hasDurableAuthority {
+		if _, authorityErr := s.currentAaveLiveMaximumInputAmount(ctx); authorityErr != nil {
+			if !errors.Is(authorityErr, errRevenueLaneAuthorityDiverged) {
+				return authorityErr
+			}
+			authorityDiverged = true
+		}
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.ensureHotMapsLocked()
@@ -1607,7 +1648,11 @@ func (s *Screener) screen(ctx context.Context, borrowers []string, advanceSeed b
 			return errors.New("gateway Aave screen predates tail invalidation")
 		}
 	}
-	exactAuthorityWasDegraded := s.state.LastErrorClass != ""
+	exactAuthorityWasDegraded := s.state.LastErrorClass != "" &&
+		s.state.LastErrorClass != revenueLaneAuthorityDivergedClass
+	if authorityDiverged && !previousAuthorityDiverged {
+		s.state.Counts[revenueLaneAuthorityDivergedKey]++
+	}
 	for _, index := range s.schedulerAccountOrder(result.Primary.Accounts) {
 		primary := result.Primary.Accounts[index]
 		if primary != result.Secondary.Accounts[index] || primary.Borrower != borrowers[index] {
@@ -1659,10 +1704,12 @@ func (s *Screener) screen(ctx context.Context, borrowers []string, advanceSeed b
 				}
 			}
 		}
-		if record.TerminalOutcome == "exact_pending" && exactAuthorityWasDegraded {
+		if record.TerminalOutcome == "exact_pending" && authorityDiverged {
+			record.ExactDeferredReason = revenueLaneAuthorityDivergedClass
+		} else if record.TerminalOutcome == "exact_pending" && exactAuthorityWasDegraded {
 			record.ExactDeferredReason = "provider_recovery_requires_fresh_screen"
 		}
-		if record.TerminalOutcome == "exact_pending" && !exactAuthorityWasDegraded {
+		if record.TerminalOutcome == "exact_pending" && !exactAuthorityWasDegraded && !authorityDiverged {
 			now := s.nowUTC()
 			routeReason, knownRouteIneligible := s.state.RouteIneligible[primary.Borrower]
 			lastExact, recentlyResolved := s.lastExactAt[primary.Borrower]
@@ -1711,44 +1758,80 @@ func (s *Screener) screen(ctx context.Context, borrowers []string, advanceSeed b
 				s.mu.Lock()
 				s.exactInFlight--
 				if exactErr != nil {
-					return exactErr
-				}
-				exactCompletedAt := s.nowUTC()
-				s.state.Counts[exactEvalCompletedKey]++
-				s.observeDurationLocked(
-					exactEvalLatencySumKey,
-					exactEvalLatencyCountKey,
-					"exact_eval_latency_millis_bucket_le_",
-					exactCompletedAt.Sub(exactStartedAt),
-				)
-				liquidatableToExact := time.Duration(0)
-				if firstObserved, present := s.firstLiquidatableAt[primary.Borrower]; present {
-					liquidatableToExact = exactCompletedAt.Sub(firstObserved)
-					s.observeDurationLocked(
-						liquidatableToExactSumKey,
-						liquidatableToExactCountKey,
-						"liquidatable_to_exact_millis_bucket_le_",
-						exactCompletedAt.Sub(firstObserved),
-					)
-					delete(s.firstLiquidatableAt, primary.Borrower)
-				}
-				record = exactRecord
-				record.ExactCompletedAt = &exactCompletedAt
-				record.ExactDiagnostics = buildExactDiagnosticSummary(
-					record,
-					exactCompletedAt.Sub(exactStartedAt),
-					liquidatableToExact,
-				)
-				s.lastExactAt[primary.Borrower] = exactCompletedAt
-				if record.ExactRouteIneligibleReason != "" {
-					s.state.RouteIneligible[primary.Borrower] = record.ExactRouteIneligibleReason
-					if s.state.Counts == nil {
-						s.state.Counts = make(map[string]uint64)
+					if !errors.Is(exactErr, errRevenueLaneAuthorityDiverged) {
+						return exactErr
 					}
-					s.state.Counts[exactRouteIneligibleObservedKey]++
+					// Divergent revenue authority is a durable fail-closed control state,
+					// not a process-integrity failure. Keep discovery and health serving,
+					// but never materialize Candidate or request authority.
+					record.Authority = false
+					record.ExecutionCandidate = nil
+					record.AtlasCandidate = nil
+					record.TerminalOutcome = "exact_pending"
+					record.ExactDeferredReason = revenueLaneAuthorityDivergedClass
+					if !authorityDiverged {
+						s.state.Counts[revenueLaneAuthorityDivergedKey]++
+					}
+					authorityDiverged = true
 				} else {
-					delete(s.state.RouteIneligible, primary.Borrower)
+					authorityDiverged = false
+					exactCompletedAt := s.nowUTC()
+					s.state.Counts[exactEvalCompletedKey]++
+					s.observeDurationLocked(
+						exactEvalLatencySumKey,
+						exactEvalLatencyCountKey,
+						"exact_eval_latency_millis_bucket_le_",
+						exactCompletedAt.Sub(exactStartedAt),
+					)
+					liquidatableToExact := time.Duration(0)
+					if firstObserved, present := s.firstLiquidatableAt[primary.Borrower]; present {
+						liquidatableToExact = exactCompletedAt.Sub(firstObserved)
+						s.observeDurationLocked(
+							liquidatableToExactSumKey,
+							liquidatableToExactCountKey,
+							"liquidatable_to_exact_millis_bucket_le_",
+							exactCompletedAt.Sub(firstObserved),
+						)
+						delete(s.firstLiquidatableAt, primary.Borrower)
+					}
+					record = exactRecord
+					record.ExactCompletedAt = &exactCompletedAt
+					record.ExactDiagnostics = buildExactDiagnosticSummary(
+						record,
+						exactCompletedAt.Sub(exactStartedAt),
+						liquidatableToExact,
+					)
+					s.lastExactAt[primary.Borrower] = exactCompletedAt
+					if record.ExactRouteIneligibleReason != "" {
+						s.state.RouteIneligible[primary.Borrower] = record.ExactRouteIneligibleReason
+						if s.state.Counts == nil {
+							s.state.Counts = make(map[string]uint64)
+						}
+						s.state.Counts[exactRouteIneligibleObservedKey]++
+					} else {
+						delete(s.state.RouteIneligible, primary.Borrower)
+					}
 				}
+			}
+		}
+		if authorityDiverged && record.TerminalOutcome == "exact_pending" {
+			record.ExactDeferredReason = revenueLaneAuthorityDivergedClass
+		}
+		sinkRecorded := false
+		if s.config.SignalSink != nil && (record.ExecutionCandidate != nil || record.AtlasCandidate != nil) {
+			s.mu.Unlock()
+			normalized, sinkErr := s.config.SignalSink.RecordAaveSignal(ctx, record)
+			s.mu.Lock()
+			if sinkErr != nil {
+				return sinkErr
+			}
+			record = normalized
+			sinkRecorded = true
+			if record.ExactDeferredReason == revenueLaneAuthorityDivergedClass {
+				if !authorityDiverged {
+					s.state.Counts[revenueLaneAuthorityDivergedKey]++
+				}
+				authorityDiverged = true
 			}
 		}
 		if _, hot := s.hotBorrowers[primary.Borrower]; hot {
@@ -1764,13 +1847,14 @@ func (s *Screener) screen(ctx context.Context, borrowers []string, advanceSeed b
 		if invalidatedBlock := s.state.TailInvalidatedBlock[primary.Borrower]; invalidatedBlock != 0 && record.Block >= invalidatedBlock {
 			delete(s.state.TailInvalidatedBlock, primary.Borrower)
 		}
-		if s.config.SignalSink != nil {
+		if s.config.SignalSink != nil && !sinkRecorded {
 			s.mu.Unlock()
-			sinkErr := s.config.SignalSink.RecordAaveSignal(ctx, record)
+			normalized, sinkErr := s.config.SignalSink.RecordAaveSignal(ctx, record)
 			s.mu.Lock()
 			if sinkErr != nil {
 				return sinkErr
 			}
+			record = normalized
 		}
 		if bucket == "urgent" || record.TerminalOutcome == "fork_pending" {
 			if err := appendJSON(filepath.Join(s.config.StateDir, "exact-queue.ndjson"), record); err != nil {
@@ -1791,6 +1875,10 @@ func (s *Screener) screen(ctx context.Context, borrowers []string, advanceSeed b
 	s.state.LastBatchAt = &now
 	s.state.LastDualAgreementAt = &now
 	s.recordProviderRecoveryLocked(now)
+	if authorityDiverged {
+		s.state.LastErrorClass = revenueLaneAuthorityDivergedClass
+		s.state.LastAttemptAt = &now
+	}
 	return s.persistStateLocked()
 }
 
@@ -2936,6 +3024,8 @@ func (s *Screener) buildAtlasCandidate(
 	operationHash := sha256.Sum256(encoded)
 	return &atlasCandidate{
 		AuctionID:            auction.AuctionID,
+		SelectedSize:         selected.Liquidation.RepayAmount,
+		MaximumInputAmount:   selected.LiveMaximumInput,
 		MaximumBid:           maximumBid.String(),
 		SelectedBid:          selectedBid.String(),
 		ExpectedNetPnL:       finalExpected.String(),
@@ -3299,6 +3389,9 @@ func (s *Screener) recordProviderDegradationLocked(now time.Time, class string) 
 	}
 	if s.state.Counts[providerDegradedSinceMillisKey] == 0 {
 		s.state.Counts[providerDegradationTotalKey]++
+		if classKey := providerDegradationClassKey(class); classKey != "" {
+			s.state.Counts[classKey]++
+		}
 		s.state.Counts[providerDegradedSinceMillisKey] = uint64(now.UnixMilli())
 	}
 	s.state.Counts[providerRecoveryAttemptTotalKey]++
@@ -3307,6 +3400,21 @@ func (s *Screener) recordProviderDegradationLocked(now time.Time, class string) 
 	s.state.LastErrorClass = class
 	s.state.LastAttemptAt = &now
 	return s.persistStateLocked()
+}
+
+func providerDegradationClassKey(class string) string {
+	switch class {
+	case "provider_disagreement":
+		return providerDisagreementTotalKey
+	case "provider_unavailable":
+		return providerUnavailableTotalKey
+	case "provider_timeout":
+		return providerTimeoutTotalKey
+	case "provider_rate_limited":
+		return providerRateLimitedTotalKey
+	default:
+		return ""
+	}
 }
 
 func (s *Screener) recordProviderRecoveryLocked(now time.Time) {
@@ -3327,6 +3435,7 @@ func (s *Screener) recordProviderRecoveryLocked(now time.Time) {
 		}
 		delete(s.state.Counts, providerDegradedSinceMillisKey)
 	}
+	delete(s.state.Counts, providerCurrentFailureStreakKey)
 	s.state.LastErrorClass = ""
 }
 
