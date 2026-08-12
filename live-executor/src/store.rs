@@ -14,7 +14,7 @@ use sqlx::{PgPool, Postgres, Row, Transaction};
 use thiserror::Error;
 use uuid::Uuid;
 
-const SCHEMA_VERSION: &str = "phoenix.live-canary-schema.v7";
+const SCHEMA_VERSION: &str = "phoenix.live-canary-schema.v8";
 const ACTIVE_STATUSES: &str =
     "'claimed', 'nonce_allocated', 'submission_unknown', 'pending', 'timed_out'";
 
@@ -133,13 +133,15 @@ impl ExecutorStore for PostgresExecutorStore {
             return Err(StoreError::Schema);
         }
         let lanes: i64 = sqlx::query_scalar(
-            "SELECT count(*) FROM live_canary.revenue_lane_controls
-             WHERE lane IN ('phoenix_dex', 'atlas_solver', 'aave_liquidation')",
+            "SELECT
+                (SELECT count(*) FROM live_canary.revenue_lane_controls
+                 WHERE lane IN ('phoenix_dex', 'atlas_solver', 'aave_liquidation'))
+                + (SELECT count(*) FROM live_canary.revenue_provider_authority WHERE singleton)",
         )
         .fetch_one(&self.pool)
         .await
         .map_err(StoreError::from)?;
-        if lanes != 3 {
+        if lanes != 4 {
             return Err(StoreError::Schema);
         }
         Ok(())
@@ -151,18 +153,24 @@ impl ExecutorStore for PostgresExecutorStore {
                     (c.armed AND NOT c.kill_switch AND a.armed
                      AND NOT a.kill_switch AND a.execution_mode = 'live'
                      AND e.phase LIKE 'LIVE_%')
-                    OR (lane.armed AND NOT lane.kill_switch) AS armed,
+                    OR (lane.armed AND NOT lane.kill_switch AND provider.exact_execution_ready
+                        AND e.phase = 'DISARMED_EVIDENCE'
+                        AND e.current_size_level = 'MAX_REVIEWED') AS armed,
                     NOT (
                         (c.armed AND NOT c.kill_switch AND a.armed
                          AND NOT a.kill_switch AND a.execution_mode = 'live'
                          AND e.phase LIKE 'LIVE_%')
-                        OR (lane.armed AND NOT lane.kill_switch)
+                        OR (lane.armed AND NOT lane.kill_switch AND provider.exact_execution_ready
+                            AND e.phase = 'DISARMED_EVIDENCE'
+                            AND e.current_size_level = 'MAX_REVIEWED')
                     ) AS kill_switch
              FROM live_canary.control c
              CROSS JOIN live_canary.autonomous_global_control a
              CROSS JOIN live_canary.economic_control e
              CROSS JOIN live_canary.revenue_lane_controls lane
+             CROSS JOIN live_canary.revenue_provider_authority provider
              WHERE c.singleton AND a.singleton AND e.singleton
+               AND provider.singleton
                AND lane.lane = 'aave_liquidation'",
         )
         .fetch_one(&self.pool)
@@ -205,16 +213,24 @@ impl ExecutorStore for PostgresExecutorStore {
                     AND e.phase LIKE 'LIVE_%' AS dex_armed,
                     c.kill_switch OR a.kill_switch
                     OR e.phase NOT LIKE 'LIVE_%' AS dex_kill_switch,
-                    lane.armed AS aave_armed, lane.kill_switch AS aave_kill_switch,
+                    lane.armed AND provider.exact_execution_ready
+                    AND e.phase = 'DISARMED_EVIDENCE'
+                    AND e.current_size_level = 'MAX_REVIEWED' AS aave_armed,
+                    lane.kill_switch OR NOT provider.exact_execution_ready
+                    OR e.phase <> 'DISARMED_EVIDENCE'
+                    OR e.current_size_level <> 'MAX_REVIEWED' AS aave_kill_switch,
                     lane.maximum_input_amount::text AS aave_maximum_input,
-                    e.current_input_wei::text AS current_input_wei
+                    e.current_input_wei::text AS current_input_wei,
+                    provider.request_evidence_not_before
              FROM live_canary.control c
              CROSS JOIN live_canary.autonomous_global_control a
              CROSS JOIN live_canary.economic_control e
              CROSS JOIN live_canary.revenue_lane_controls lane
+             CROSS JOIN live_canary.revenue_provider_authority provider
              WHERE c.singleton AND a.singleton AND e.singleton
+               AND provider.singleton
                AND lane.lane = 'aave_liquidation'
-             FOR UPDATE OF c, a, e, lane",
+             FOR UPDATE OF c, a, e, lane, provider",
         )
         .fetch_one(&mut *transaction)
         .await
@@ -232,6 +248,9 @@ impl ExecutorStore for PostgresExecutorStore {
             .map_err(StoreError::from)?;
         let current_input_wei: String = control
             .try_get("current_input_wei")
+            .map_err(StoreError::from)?;
+        let request_evidence_not_before: DateTime<Utc> = control
+            .try_get("request_evidence_not_before")
             .map_err(StoreError::from)?;
         if (!dex_armed || dex_kill_switch) && (!aave_armed || aave_kill_switch) {
             transaction.commit().await.map_err(StoreError::from)?;
@@ -276,7 +295,8 @@ impl ExecutorStore for PostgresExecutorStore {
                      AND r.selected_size = $3::numeric)
                     OR
                     (r.route_type = 'AAVE_LIQUIDATION_V1' AND $6 AND NOT $7
-                     AND r.selected_size <= $8::numeric)
+                     AND r.selected_size <= $8::numeric
+                     AND r.created_at >= $9)
                  )
              ORDER BY r.approved_at, r.id
              FOR UPDATE OF r SKIP LOCKED
@@ -291,6 +311,7 @@ impl ExecutorStore for PostgresExecutorStore {
         .bind(aave_armed)
         .bind(aave_kill_switch)
         .bind(&aave_maximum_input)
+        .bind(request_evidence_not_before)
         .fetch_optional(&mut *transaction)
         .await
         .map_err(StoreError::from)?;
@@ -957,6 +978,26 @@ pub async fn fail_close_execution_authority(
     if revenue_lanes.rows_affected() != 2 {
         return Err(StoreError::Invariant);
     }
+    let provider_gate = sqlx::query(
+        "UPDATE live_canary.revenue_provider_authority
+             SET exact_execution_ready = false, gate_reason = $1,
+                 gate_updated_at = $2, request_evidence_not_before = $2,
+                 recovery_status = 'blocked',
+                 sample_count = 0,
+                 sample_1_at = NULL, sample_1_primary_provider = NULL, sample_1_confirmation_provider = NULL,
+                 sample_2_at = NULL, sample_2_primary_provider = NULL, sample_2_confirmation_provider = NULL,
+                 sample_3_at = NULL, sample_3_primary_provider = NULL, sample_3_confirmation_provider = NULL,
+                 updated_at = now()
+             WHERE singleton",
+    )
+    .bind(reason)
+    .bind(transitioned_at)
+    .execute(&mut **transaction)
+    .await
+    .map_err(StoreError::from)?;
+    if provider_gate.rows_affected() != 1 {
+        return Err(StoreError::Invariant);
+    }
     sqlx::query(
         "UPDATE live_canary.autonomous_route_controls
              SET enabled = false, kill_switch = true, disarm_reason = $1,
@@ -980,6 +1021,52 @@ pub async fn fail_close_execution_authority(
     .execute(&mut **transaction)
     .await
     .map_err(StoreError::from)?;
+    if matches!(
+        reason,
+        "provider_disagreement"
+            | "provider_unavailable"
+            | "provider_timeout"
+            | "provider_rate_limited"
+    ) && previous_phase == "DISARMED_EVIDENCE"
+        && previous_level == "MAX_REVIEWED"
+    {
+        let release = release_sha.as_deref().ok_or(StoreError::Invariant)?;
+        let recovery = sqlx::query(
+            "UPDATE live_canary.revenue_provider_authority
+             SET recovery_status = 'collecting', failure_reason = $1,
+                 failure_control_epoch = $2, failure_transition_at = $3,
+                 failure_release_sha = $4, restore_phase = 'DISARMED_EVIDENCE',
+                 restore_size_level = 'MAX_REVIEWED', last_block_reason = NULL,
+                 recovery_evidence_hash = NULL, updated_at = now()
+             WHERE singleton",
+        )
+        .bind(reason)
+        .bind(previous_epoch + 1)
+        .bind(transitioned_at)
+        .bind(release)
+        .execute(&mut **transaction)
+        .await
+        .map_err(StoreError::from)?;
+        if recovery.rows_affected() != 1 {
+            return Err(StoreError::Invariant);
+        }
+    } else {
+        let cleared = sqlx::query(
+            "UPDATE live_canary.revenue_provider_authority
+             SET recovery_status = 'blocked', failure_reason = NULL,
+                 failure_control_epoch = NULL, failure_transition_at = NULL,
+                 failure_release_sha = NULL, restore_phase = NULL,
+                 restore_size_level = NULL, last_block_reason = 'non_provider_failure',
+                 recovery_evidence_hash = NULL, updated_at = now()
+             WHERE singleton",
+        )
+        .execute(&mut **transaction)
+        .await
+        .map_err(StoreError::from)?;
+        if cleared.rows_affected() != 1 {
+            return Err(StoreError::Invariant);
+        }
+    }
     sqlx::query(
             "UPDATE live_canary.autonomous_candidates
              SET status = 'disarmed', updated_at = now()

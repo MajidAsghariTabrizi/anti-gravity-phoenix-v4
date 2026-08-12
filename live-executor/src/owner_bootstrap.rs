@@ -403,6 +403,15 @@ pub async fn configured_preflight_from_environment() -> Result<Value, OwnerBoots
     configured_preflight(&context, &rpc).await
 }
 
+// runtime_preflight validates the exact executor identity and configuration
+// without requiring a pause transition. Provider-only recovery consumes this
+// read-only evidence and is explicitly forbidden from unpausing the contract.
+pub async fn runtime_preflight_from_environment() -> Result<Value, OwnerBootstrapError> {
+    let context = OwnerBootstrapContext::from_environment()?;
+    let rpc = production_rpc(&context)?;
+    runtime_preflight(&context, &rpc).await
+}
+
 pub async fn execute_from_environment(
     mutation: OwnerMutation,
 ) -> Result<Value, OwnerBootstrapError> {
@@ -499,6 +508,28 @@ async fn configured_preflight<R: OwnerBootstrapRpc>(
         "release_sha": context.release_sha,
         "route_policy_hash": context.policy_hash,
         "status": "ready-paused",
+        "final_state": snapshot_evidence(context, &snapshots)
+    }))
+}
+
+async fn runtime_preflight<R: OwnerBootstrapRpc>(
+    context: &OwnerBootstrapContext,
+    rpc: &R,
+) -> Result<Value, OwnerBootstrapError> {
+    ensure_chain(context, rpc).await?;
+    let snapshots = read_validated_snapshots(context, rpc).await?;
+    if !configuration_complete(context, &snapshots) {
+        return Err(OwnerBootstrapError::ConfigurationIncomplete);
+    }
+    let paused = snapshots[0].paused;
+    Ok(json!({
+        "schema": OWNER_EVIDENCE_SCHEMA,
+        "command": "runtime-preflight",
+        "chain_id": context.chain_id,
+        "executor": context.executor.to_string(),
+        "release_sha": context.release_sha,
+        "route_policy_hash": context.policy_hash,
+        "status": if paused { "ready-paused" } else { "ready-unpaused" },
         "final_state": snapshot_evidence(context, &snapshots)
     }))
 }
@@ -1837,6 +1868,21 @@ mod tests {
                 .expect_err("unpaused"),
             OwnerBootstrapError::ConfiguredPreflightRequiresPaused
         );
+    }
+
+    #[tokio::test]
+    async fn runtime_preflight_accepts_exact_paused_or_unpaused_configuration_without_mutation() {
+        let context = context();
+        for paused in [true, false] {
+            let rpc = MockRpc::new(complete_snapshot(&context, paused));
+            let evidence = runtime_preflight(&context, &rpc)
+                .await
+                .expect("runtime preflight");
+            assert_eq!(evidence["release_sha"], context.release_sha);
+            assert_eq!(evidence["final_state"]["paused"], paused);
+            assert_eq!(evidence["final_state"]["configuration_complete"], true);
+            assert_eq!(rpc.submit_calls.load(Ordering::SeqCst), 0);
+        }
     }
 
     #[tokio::test]

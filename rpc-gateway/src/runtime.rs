@@ -1,12 +1,12 @@
 use crate::aave_state::{
     AaveAccountData, AaveExactLiquidationState, AaveExactProviderState, AaveExactRequest,
-    AaveExactReserveState, AaveExactResponse, AaveExactUnwindQuoteState, AaveProviderScreen,
-    AaveScreenRequest, AaveScreenResponse, AaveSimulateBatchError, AaveSimulateBatchRequest,
-    AaveSimulateBatchResponse, AaveSimulateBatchResult, AaveSimulateRequest, AaveSimulateResponse,
-    AaveTailRequest, AaveTailResponse, SizeLevel, AAVE_EXACT_RESPONSE_SCHEMA,
-    AAVE_SCREEN_RESPONSE_SCHEMA, AAVE_SIMULATE_BATCH_RESPONSE_SCHEMA,
-    AAVE_SIMULATE_RESPONSE_SCHEMA, AAVE_TAIL_RESPONSE_SCHEMA, AAVE_V3_POOL_ARBITRUM,
-    MAXIMUM_REVIEWED_INPUT_WEI,
+    AaveExactReserveState, AaveExactResponse, AaveExactUnwindQuoteState, AavePrimaryScreenResponse,
+    AaveProviderScreen, AaveScreenRequest, AaveScreenResponse, AaveSimulateBatchError,
+    AaveSimulateBatchRequest, AaveSimulateBatchResponse, AaveSimulateBatchResult,
+    AaveSimulateRequest, AaveSimulateResponse, AaveTailRequest, AaveTailResponse, SizeLevel,
+    AAVE_EXACT_RESPONSE_SCHEMA, AAVE_PRIMARY_SCREEN_RESPONSE_SCHEMA, AAVE_SCREEN_RESPONSE_SCHEMA,
+    AAVE_SIMULATE_BATCH_RESPONSE_SCHEMA, AAVE_SIMULATE_RESPONSE_SCHEMA, AAVE_TAIL_RESPONSE_SCHEMA,
+    AAVE_V3_POOL_ARBITRUM, MAXIMUM_REVIEWED_INPUT_WEI,
 };
 use crate::budget::GlobalBudget;
 use crate::cache::TtlCache;
@@ -903,6 +903,58 @@ impl GatewayRuntime {
         response
             .validate(&request)
             .map_err(|_| GatewayError::ProviderDisagreement)?;
+        Ok(response)
+    }
+
+    /// Returns bounded discovery data from the highest-priority healthy
+    /// provider only.  This endpoint has no execution authority: callers must
+    /// obtain a fresh dual-provider Aave Exact result before a candidate can be
+    /// persisted or submitted.
+    pub async fn resolve_aave_primary_screen(
+        &self,
+        request: AaveScreenRequest,
+    ) -> Result<AavePrimaryScreenResponse, GatewayError> {
+        request
+            .validate()
+            .map_err(|_| GatewayError::InvalidRequest)?;
+        if !self.request_budget.lock().await.admit(Instant::now()) {
+            return Err(GatewayError::RequestBudgetExhausted);
+        }
+        let _operation_guard = self.upstream_operation_lock.lock().await;
+        let primary = self
+            .reserve_provider(&HashSet::new())
+            .await
+            .ok_or(GatewayError::ProviderUnavailable)?;
+        let required_calls = self.provider_setup_call_count(primary.provider_id()).await + 2;
+        if !self.admit_upstream_sequence(required_calls).await {
+            return Err(GatewayError::UpstreamBudgetExhausted);
+        }
+        self.ensure_provider_verified(&primary)
+            .await
+            .map_err(map_call_failure)?;
+        let block = self
+            .provider_block(&primary, "finalized", ProviderSlot::Primary)
+            .await?;
+        let (accounts, weth_price_base) = self
+            .perform_aave_screen(&primary, &request, &block, ProviderSlot::Primary)
+            .await?;
+        self.mark_provider_success(primary.provider_id()).await;
+        let response = AavePrimaryScreenResponse {
+            schema_version: AAVE_PRIMARY_SCREEN_RESPONSE_SCHEMA.to_string(),
+            chain_id: ARBITRUM_ONE_CHAIN_ID,
+            request_id: request.request_id.clone(),
+            block_number: block.number,
+            block_hash: block.hash,
+            primary: AaveProviderScreen {
+                provider_id: primary.provider_id().to_string(),
+                weth_price_base,
+                accounts,
+            },
+            resolved_at_unix_ms: unix_time_ms(),
+        };
+        response
+            .validate(&request)
+            .map_err(|_| GatewayError::InvalidRequest)?;
         Ok(response)
     }
 
@@ -5581,7 +5633,7 @@ fn unix_time_seconds() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::providers::parse_provider_config;
+    use crate::providers::{parse_provider_config, parse_provider_config_with_ids};
     use crate::shadow_state::{PoolStateRequest, SHADOW_STATE_SCHEMA_VERSION};
     use async_trait::async_trait;
     use ethabi::{decode, encode, ParamType, Token};
@@ -6175,6 +6227,70 @@ mod tests {
         assert_eq!(first.block_hash, second.block_hash);
         assert_eq!(first.state_root, second.state_root);
         assert_ne!(second.primary.provider_id, second.secondary.provider_id);
+    }
+
+    #[tokio::test]
+    async fn aave_exact_uses_healthy_independent_availability_provider_when_preferred_peer_cools_down(
+    ) {
+        let client = Arc::new(ModelClient::default());
+        let config = parse_provider_config_with_ids(
+            "https://primary.example,https://preferred-confirmation.example,https://availability.example",
+            "100,2,1",
+            "production-nownodes-arbitrum,production-slot-0,availability-slot-1",
+        )
+        .unwrap();
+        let runtime = GatewayRuntime::with_limits(
+            config,
+            client.clone(),
+            MethodTimeouts {
+                eth_call: Duration::from_secs(2),
+                state_read: Duration::from_secs(2),
+                logs: Duration::from_secs(5),
+            },
+            RuntimeRpcMetrics::default(),
+            GatewayReadiness::new(true),
+            GatewayLimits {
+                state_requests_per_minute: 1_000,
+                upstream_calls_per_second: 1_000,
+                upstream_call_burst: 1_000,
+            },
+        );
+        runtime.chain_verified.lock().await.extend([
+            "production-nownodes-arbitrum".to_string(),
+            "production-slot-0".to_string(),
+            "availability-slot-1".to_string(),
+        ]);
+        runtime.multicall_verified.lock().await.extend([
+            "production-nownodes-arbitrum".to_string(),
+            "production-slot-0".to_string(),
+            "availability-slot-1".to_string(),
+        ]);
+        assert!(runtime
+            .providers
+            .lock()
+            .await
+            .record_failure("production-slot-0", Instant::now()));
+
+        let exact = runtime
+            .resolve_aave_exact(aave_exact_request("availability-fallback"))
+            .await
+            .unwrap();
+
+        assert_eq!(exact.primary.provider_id, "production-nownodes-arbitrum");
+        assert_eq!(exact.secondary.provider_id, "availability-slot-1");
+        assert_ne!(exact.primary.provider_id, exact.secondary.provider_id);
+        let providers = client
+            .calls()
+            .into_iter()
+            .map(|call| call.provider_id)
+            .collect::<HashSet<_>>();
+        assert_eq!(
+            providers,
+            HashSet::from([
+                "production-nownodes-arbitrum".to_string(),
+                "availability-slot-1".to_string(),
+            ])
+        );
     }
 
     #[tokio::test]

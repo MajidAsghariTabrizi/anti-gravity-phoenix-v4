@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"syscall"
 	"time"
 
@@ -66,19 +67,22 @@ func main() {
 		DiscoveryPath: discovery, DiscoverySHA256: discoveryHash,
 		StateDir: filepath.Join(ledgerDir, "aave"), GatewayURL: gateway,
 		StartingCursor: startingCursor, BatchSize: batch, Pace: pace,
-		RetainedProfitFloorWei: retainedProfitFloor,
-		MaximumInputAmountWei:  maximumInputAmount,
-		MaximumGasLimit:        maximumGasLimit,
-		MaximumFeePerGasWei:    maximumFeePerGasWei,
-		MaximumAtlasBidWei:     maximumAtlasBidWei,
-		FlashPremiumBPS:        flashPremiumBPS,
-		EconomicReserveBPS:     economicReserveBPS,
-		ExecutorAddress:        executorAddress,
-		ExecutorCodeHash:       executorCodeHash,
-		CallerAddress:          callerAddress,
-		ReleaseSHA:             releaseSHA,
-		MaximumPriorityFeeWei:  maximumPriorityFeeWei,
-		SignalSink:             sink,
+		RetainedProfitFloorWei:         retainedProfitFloor,
+		MaximumInputAmountWei:          maximumInputAmount,
+		MaximumGasLimit:                maximumGasLimit,
+		MaximumFeePerGasWei:            maximumFeePerGasWei,
+		MaximumAtlasBidWei:             maximumAtlasBidWei,
+		FlashPremiumBPS:                flashPremiumBPS,
+		EconomicReserveBPS:             economicReserveBPS,
+		ExecutorAddress:                executorAddress,
+		ExecutorCodeHash:               executorCodeHash,
+		CallerAddress:                  callerAddress,
+		ReleaseSHA:                     releaseSHA,
+		MaximumPriorityFeeWei:          maximumPriorityFeeWei,
+		PrimaryDiscovery:               true,
+		ExactStateBudgetPerMinute:      envUint64("PHOENIX_EXACT_STATE_REQUEST_BUDGET_PER_MINUTE", 12),
+		ExactDiscoveryReservePerMinute: envUint64("PHOENIX_EXACT_DISCOVERY_RESERVE_PER_MINUTE", 7),
+		SignalSink:                     sink,
 	})
 	if err != nil {
 		logger.Fatalf("open Aave screener: %v", err)
@@ -86,6 +90,12 @@ func main() {
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
+	resetCtx, resetCancel := context.WithTimeout(ctx, 5*time.Second)
+	if err := screener.ResetProviderRecoveryEvidence(resetCtx); err != nil {
+		resetCancel()
+		logger.Fatalf("reset provider recovery evidence: %v", err)
+	}
+	resetCancel()
 	atlasErrors := make(chan error, 1)
 	aaveErrors := make(chan error, 1)
 	atlasCandidateErrors := make(chan error, 1)
@@ -119,6 +129,18 @@ func main() {
 	if runErr != nil {
 		logger.Fatalf("hunter failed: %v", runErr)
 	}
+}
+
+func envUint64(name string, fallback uint64) uint64 {
+	value := os.Getenv(name)
+	if value == "" {
+		return fallback
+	}
+	parsed, err := strconv.ParseUint(value, 10, 64)
+	if err != nil || parsed == 0 {
+		return 0
+	}
+	return parsed
 }
 
 func bindFinancialCeilingFlags(flags *flag.FlagSet, maximumInputAmount, maximumAtlasBidWei *string) {
@@ -274,6 +296,8 @@ func healthPayload(health laneHealth, state hunter.State, atlasConnected bool) m
 		"aave_exact_authority_blocked":            state.AuthorityBlockedCount,
 		"aave_exact_evaluations_in_flight":        state.ExactEvaluationsInFlight,
 		"aave_oldest_exact_eligible_age_ms":       state.OldestExactEligibleAgeMillis,
+		"aave_exact_budget_tokens_milli":          state.ExactBudgetTokensMilli,
+		"aave_exact_average_state_requests_milli": state.ExactAverageStateRequestsMilli,
 		"aave_active_fork_pending":                state.ActiveForkPendingCount,
 		"primary_provider_id":                     state.LastProviderPrimary,
 		"secondary_provider_id":                   state.LastProviderSecond,
@@ -290,6 +314,8 @@ func healthPayload(health laneHealth, state hunter.State, atlasConnected bool) m
 		"provider_last_degraded_unix_millis":      state.Counts["provider_last_degraded_at_unix_millis"],
 		"provider_last_recovery_unix_millis":      state.Counts["provider_last_recovery_at_unix_millis"],
 		"provider_last_degraded_duration_millis":  state.Counts["provider_last_degraded_duration_millis"],
+		"provider_recovery_sample_count":          len(state.ProviderRecoverySamples),
+		"provider_recovery_samples":               state.ProviderRecoverySamples,
 		"signer_present":                          false,
 	}
 }

@@ -213,6 +213,24 @@ pub struct AaveScreenResponse {
     pub resolved_at_unix_ms: u64,
 }
 
+// A primary screen is discovery-only input.  It deliberately has no
+// independent-provider assertion and therefore must never be used to create
+// execution authority.  The observer always obtains a fresh AaveExactResponse
+// before it can materialize a candidate.
+pub const AAVE_PRIMARY_SCREEN_RESPONSE_SCHEMA: &str = "phoenix.rpc.aave-primary-screen-response.v1";
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct AavePrimaryScreenResponse {
+    pub schema_version: String,
+    pub chain_id: u64,
+    pub request_id: String,
+    pub block_number: u64,
+    pub block_hash: String,
+    pub primary: AaveProviderScreen,
+    pub resolved_at_unix_ms: u64,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct AaveExactRequest {
@@ -906,6 +924,30 @@ impl AaveScreenResponse {
                 .any(|(account, borrower)| account.borrower != *borrower)
         {
             return Err(AaveStateError::ProviderDisagreement);
+        }
+        Ok(())
+    }
+}
+
+impl AavePrimaryScreenResponse {
+    pub fn validate(&self, request: &AaveScreenRequest) -> Result<(), AaveStateError> {
+        request.validate()?;
+        if self.schema_version != AAVE_PRIMARY_SCREEN_RESPONSE_SCHEMA
+            || self.chain_id != request.chain_id
+            || self.request_id != request.request_id
+            || self.block_number == 0
+            || !canonical_block_hash(&self.block_hash)
+            || self.primary.provider_id.is_empty()
+            || self.primary.accounts.len() != request.borrowers.len()
+            || self.primary.weth_price_base == "0"
+            || self
+                .primary
+                .accounts
+                .iter()
+                .zip(&request.borrowers)
+                .any(|(account, borrower)| account.borrower != *borrower)
+        {
+            return Err(AaveStateError::Invalid);
         }
         Ok(())
     }

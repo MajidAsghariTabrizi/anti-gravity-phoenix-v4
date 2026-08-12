@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 
 	"anti-gravity-phoenix-v4/atlas-observer/internal/observer"
 	"github.com/jackc/pgx/v5"
@@ -66,7 +67,139 @@ var errRevenueLaneAuthorityDiverged = errors.New("revenue lane authority diverge
 const (
 	revenueAuthorityClosedReason   = "revenue_authority_closed"
 	liveSizeAuthorityChangedReason = "live_size_authority_changed"
+	providerRecoverySampleWindow   = 2 * time.Minute
 )
+
+func (s *PostgresSignalSink) RecordProviderFailure(ctx context.Context, reason string, observedAt time.Time) error {
+	if reason == "" || observedAt.IsZero() {
+		return errors.New("provider failure evidence is invalid")
+	}
+	result, err := s.pool.Exec(ctx, `
+		UPDATE live_canary.revenue_provider_authority
+		SET exact_execution_ready = false,
+		    gate_reason = $1,
+		    gate_updated_at = $2,
+		    request_evidence_not_before = $2,
+		    sample_count = 0,
+		    sample_1_at = NULL, sample_1_primary_provider = NULL, sample_1_confirmation_provider = NULL,
+		    sample_2_at = NULL, sample_2_primary_provider = NULL, sample_2_confirmation_provider = NULL,
+		    sample_3_at = NULL, sample_3_primary_provider = NULL, sample_3_confirmation_provider = NULL,
+		    recovery_status = 'collecting',
+		    updated_at = now()
+		WHERE singleton
+	`, reason, observedAt.UTC())
+	if err != nil || result.RowsAffected() != 1 {
+		return errors.New("provider execution gate is unavailable")
+	}
+	return nil
+}
+
+func (s *PostgresSignalSink) ResetProviderRecoveryEvidence(ctx context.Context, reason string, observedAt time.Time) error {
+	return s.RecordProviderFailure(ctx, reason, observedAt)
+}
+
+func canonicalProviderID(value string) bool {
+	if len(value) < 1 || len(value) > 64 {
+		return false
+	}
+	for index, char := range value {
+		if (char >= 'a' && char <= 'z') || (char >= '0' && char <= '9') || (index > 0 && (char == '.' || char == '_' || char == '-')) {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
+func recordProviderAgreement(ctx context.Context, tx pgx.Tx, observedAt time.Time, primary, confirmation string) error {
+	if observedAt.IsZero() || !canonicalProviderID(primary) || !canonicalProviderID(confirmation) || primary == confirmation {
+		return errors.New("provider agreement evidence is invalid")
+	}
+	var failureTransition *time.Time
+	var recoveryStatus string
+	var requestEvidenceNotBefore time.Time
+	var count int16
+	var sampleAt [3]*time.Time
+	var samplePrimary [3]*string
+	var sampleConfirmation [3]*string
+	err := tx.QueryRow(ctx, `
+		SELECT failure_transition_at, recovery_status,
+		       request_evidence_not_before, sample_count,
+		       sample_1_at, sample_1_primary_provider, sample_1_confirmation_provider,
+		       sample_2_at, sample_2_primary_provider, sample_2_confirmation_provider,
+		       sample_3_at, sample_3_primary_provider, sample_3_confirmation_provider
+		FROM live_canary.revenue_provider_authority
+		WHERE singleton
+		FOR UPDATE
+	`).Scan(
+		&failureTransition, &recoveryStatus, &requestEvidenceNotBefore, &count,
+		&sampleAt[0], &samplePrimary[0], &sampleConfirmation[0],
+		&sampleAt[1], &samplePrimary[1], &sampleConfirmation[1],
+		&sampleAt[2], &samplePrimary[2], &sampleConfirmation[2],
+	)
+	if err != nil || count < 0 || count > 3 {
+		return errors.New("provider recovery state is unavailable")
+	}
+	now := observedAt.UTC()
+	if !now.After(requestEvidenceNotBefore.UTC()) {
+		return errors.New("provider agreement predates the request evidence floor")
+	}
+	if failureTransition != nil && !now.After(failureTransition.UTC()) {
+		return errors.New("provider agreement predates the failure transition")
+	}
+	type sample struct {
+		at           time.Time
+		primary      string
+		confirmation string
+	}
+	samples := make([]sample, 0, 3)
+	for index := 0; index < int(count); index++ {
+		if sampleAt[index] == nil || samplePrimary[index] == nil || sampleConfirmation[index] == nil {
+			return errors.New("provider recovery samples are invalid")
+		}
+		samples = append(samples, sample{sampleAt[index].UTC(), *samplePrimary[index], *sampleConfirmation[index]})
+	}
+	if len(samples) > 0 && recoveryStatus != "ready" && recoveryStatus != "recovered" {
+		last := samples[len(samples)-1].at
+		if !now.After(last) || now.Sub(last) > providerRecoverySampleWindow {
+			samples = nil
+		}
+	}
+	samples = append(samples, sample{now, primary, confirmation})
+	if len(samples) > 3 {
+		samples = append([]sample(nil), samples[len(samples)-3:]...)
+	}
+	var at [3]any
+	var first [3]any
+	var second [3]any
+	for index, value := range samples {
+		at[index], first[index], second[index] = value.at, value.primary, value.confirmation
+	}
+	status := "collecting"
+	if len(samples) == 3 {
+		if recoveryStatus == "recovered" {
+			status = "recovered"
+		} else {
+			status = "ready"
+		}
+	}
+	exactExecutionReady := len(samples) == 3 && (status == "ready" || status == "recovered")
+	result, err := tx.Exec(ctx, `
+		UPDATE live_canary.revenue_provider_authority
+		SET exact_execution_ready = $13,
+		    gate_reason = 'exact_dual_agreement', gate_updated_at = $1,
+		    recovery_status = $2, sample_count = $3,
+		    sample_1_at = $4, sample_1_primary_provider = $5, sample_1_confirmation_provider = $6,
+		    sample_2_at = $7, sample_2_primary_provider = $8, sample_2_confirmation_provider = $9,
+		    sample_3_at = $10, sample_3_primary_provider = $11, sample_3_confirmation_provider = $12,
+		    updated_at = now()
+		WHERE singleton
+	`, now, status, len(samples), at[0], first[0], second[0], at[1], first[1], second[1], at[2], first[2], second[2], exactExecutionReady)
+	if err != nil || result.RowsAffected() != 1 {
+		return errors.New("provider agreement persistence failed")
+	}
+	return nil
+}
 
 func revenueLaneAuthorityError(detail string) error {
 	return fmt.Errorf("%w: %s", errRevenueLaneAuthorityDiverged, detail)
@@ -254,6 +387,15 @@ func (s *PostgresSignalSink) RecordAaveSignal(ctx context.Context, record signal
 		return record, err
 	}
 	defer tx.Rollback(ctx)
+	if record.ExactPrimaryProvider != "" || record.ExactSecondaryProvider != "" {
+		observedAt := record.ObservedAt
+		if record.ExactCompletedAt != nil {
+			observedAt = record.ExactCompletedAt.UTC()
+		}
+		if err := recordProviderAgreement(ctx, tx, observedAt, record.ExactPrimaryProvider, record.ExactSecondaryProvider); err != nil {
+			return record, err
+		}
+	}
 	if record.ExecutionCandidate != nil || record.AtlasCandidate != nil {
 		record, err = normalizeCandidateAuthority(ctx, tx, record)
 		if err != nil {
@@ -363,12 +505,14 @@ func (s *PostgresSignalSink) RecordAaveSignal(ctx context.Context, record signal
 
 func normalizeCandidateAuthority(ctx context.Context, tx pgx.Tx, record signal) (signal, error) {
 	var economicPhase, economicInput string
+	var providerExecutionReady bool
 	if err := tx.QueryRow(ctx, `
-		SELECT phase, current_input_wei::text
+		SELECT economic.phase, economic.current_input_wei::text, provider.exact_execution_ready
 		FROM live_canary.economic_control
-		WHERE singleton
-		FOR UPDATE
-	`).Scan(&economicPhase, &economicInput); err != nil {
+		CROSS JOIN live_canary.revenue_provider_authority AS provider
+		WHERE economic.singleton AND provider.singleton
+		FOR UPDATE OF economic, provider
+	`).Scan(&economicPhase, &economicInput, &providerExecutionReady); err != nil {
 		return record, errors.New("candidate economic authority is unavailable")
 	}
 	rows, err := tx.Query(ctx, `
@@ -396,7 +540,7 @@ func normalizeCandidateAuthority(ctx context.Context, tx pgx.Tx, record signal) 
 		return record, errors.New("candidate revenue authority is unavailable")
 	}
 	currentMaximum, authorityErr := validatedAaveLiveMaximumInputAmount(states)
-	active := len(states) == 2
+	active := providerExecutionReady && len(states) == 2
 	for _, state := range states {
 		active = active && state.armed && !state.killSwitch
 	}
@@ -485,14 +629,14 @@ func insertExecutionCandidate(ctx context.Context, executor candidateExecutor, c
 			maximum_input_amount, minimum_profit, expected_profit, deadline,
 			legs, gas_limit, max_fee_per_gas, max_priority_fee_per_gas,
 			approved_by, approved_at, approval_deadline, policy_version,
-			approval_digest, status
+			approval_digest, status, created_at, updated_at
 		) VALUES (
 			$1::uuid, $2::uuid, 'phoenix.live-execution-request.v2', 42161, $3,
 			'AAVE_LIQUIDATION_V1', 'AAVE_LIQUIDATION_V1', $4::jsonb, $5::numeric,
 			$6::jsonb, $7, $8, $9, $10, $11, $12,
 			$13::numeric, $14, $15, $16::numeric, $17::numeric, $18::numeric,
 			$19::numeric, $20, $21::jsonb, $22, $23::numeric, $24::numeric,
-			$25, $26, $27, $28, $29, 'approved'
+			$25, $26, $27, $28, $29, 'approved', $26, $26
 		)
 		ON CONFLICT (id) DO UPDATE SET updated_at = now()
 		WHERE live_canary.execution_requests.opportunity_id = EXCLUDED.opportunity_id

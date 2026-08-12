@@ -19,6 +19,13 @@ services:
       LIVE_EXECUTOR_EXPECTED_FLASH_PROVIDER: ${LIVE_EXECUTOR_EXPECTED_FLASH_PROVIDER:?LIVE_EXECUTOR_EXPECTED_FLASH_PROVIDER is required}
       LIVE_EXECUTOR_MAX_INPUT_AMOUNT: ${LIVE_EXECUTOR_MAX_INPUT_AMOUNT:?LIVE_EXECUTOR_MAX_INPUT_AMOUNT is required}
 
+  atlas-observer:
+    environment:
+      PHOENIX_EXACT_STATE_REQUEST_BUDGET_PER_MINUTE: "60"
+      # The gateway's protected 60/min budget leaves twenty-four requests for
+      # base/hot/tail discovery and thirty-six for observed Exact work.
+      PHOENIX_EXACT_DISCOVERY_RESERVE_PER_MINUTE: "24"
+
   autonomous-control:
     profiles: ["live-autonomous"]
     image: ${LIVE_EXECUTOR_IMAGE:?LIVE_EXECUTOR_IMAGE is required}
@@ -132,10 +139,24 @@ services:
       PHOENIX_ACTIVATION_REQUEST_OUTBOX: /activation-outbox
       PHOENIX_ACTIVATION_REQUEST_INTERVAL_MILLISECONDS: "500"
       PHOENIX_ECONOMIC_SUPERVISOR_INTERVAL_SECONDS: "45"
+      PHOENIX_CURRENT_RELEASE_PATH: /release-identity/current-release
+      PHOENIX_RELEASE_ASSETS_PATH: /release-identity/release-assets.sha
     volumes:
       - type: bind
         source: /opt/phoenix/evidence/activation-requests
         target: /activation-outbox
+        bind:
+          create_host_path: false
+      - type: bind
+        source: /opt/phoenix/deploy/current-release
+        target: /release-identity/current-release
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: /opt/phoenix/deploy/release-assets.sha
+        target: /release-identity/release-assets.sha
+        read_only: true
         bind:
           create_host_path: false
     depends_on:

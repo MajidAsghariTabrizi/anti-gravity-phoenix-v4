@@ -86,6 +86,10 @@ async fn nonce_allocation_and_pending_state_survive_restart() {
         .execute(&pool)
         .await
         .expect("apply Aave economic diagnostics schema");
+    sqlx::raw_sql(include_str!("../schema/008_revenue_provider_authority.sql"))
+        .execute(&pool)
+        .await
+        .expect("apply revenue provider authority schema");
 
     let signer = TransactionSigner::from_secret(&hex::encode([13_u8; 32]), ARBITRUM_ONE_CHAIN_ID)
         .expect("signer");
@@ -553,14 +557,58 @@ async fn nonce_allocation_and_pending_state_survive_restart() {
     );
 
     sqlx::query(
+        "UPDATE live_canary.economic_control
+         SET phase = 'DISARMED_EVIDENCE', current_size_level = 'MAX_REVIEWED',
+             current_input_wei = $1::numeric
+         WHERE singleton",
+    )
+    .bind(SizeLevel::MaxReviewed.amount_wei().to_string())
+    .execute(&pool)
+    .await
+    .expect("set isolated MAX_REVIEWED economic authority");
+    sqlx::query(
         "UPDATE live_canary.revenue_lane_controls
          SET armed = true, kill_switch = false,
+             maximum_input_amount = $1::numeric,
              disarm_reason = 'fixture_runtime_armed'
          WHERE lane IN ('atlas_solver', 'aave_liquidation')",
     )
+    .bind(SizeLevel::MaxReviewed.amount_wei().to_string())
     .execute(&pool)
     .await
     .expect("arm both revenue lanes for runtime failure fixture");
+    sqlx::query(
+        "UPDATE live_canary.revenue_provider_authority
+         SET exact_execution_ready=true, gate_reason='fixture_exact_ready', gate_updated_at=now(),
+             recovery_status='ready', sample_count=3,
+             sample_1_at=now()-interval '3 seconds', sample_1_primary_provider='primary-1', sample_1_confirmation_provider='confirmation-1',
+             sample_2_at=now()-interval '2 seconds', sample_2_primary_provider='primary-2', sample_2_confirmation_provider='confirmation-2',
+             sample_3_at=now()-interval '1 second', sample_3_primary_provider='primary-3', sample_3_confirmation_provider='confirmation-3'
+         WHERE singleton",
+    )
+    .execute(&pool)
+    .await
+    .expect("open transient provider execution gate fixture");
+    assert!(
+        second_restart
+            .control_state()
+            .await
+            .expect("armed provider gate state")
+            .armed
+    );
+    sqlx::query(
+        "UPDATE live_canary.revenue_provider_authority
+         SET exact_execution_ready=false, gate_reason='provider_unavailable', gate_updated_at=now()
+         WHERE singleton",
+    )
+    .execute(&pool)
+    .await
+    .expect("close transient provider execution gate fixture");
+    let transient = second_restart
+        .control_state()
+        .await
+        .expect("transient provider gate state");
+    assert!(!transient.armed && transient.kill_switch);
     let lane_epochs_before = sqlx::query(
         "SELECT lane, control_epoch
          FROM live_canary.revenue_lane_controls
@@ -651,6 +699,14 @@ async fn nonce_allocation_and_pending_state_survive_restart() {
         economic,
         ("DISARMED_FAILURE".to_string(), "rpc_timeout".to_string())
     );
+    let provider_gate: (bool, String, i16) = sqlx::query_as(
+        "SELECT exact_execution_ready, gate_reason, sample_count
+         FROM live_canary.revenue_provider_authority WHERE singleton",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("load fail-closed provider gate");
+    assert_eq!(provider_gate, (false, "rpc_timeout".to_string(), 0));
     let generic_closed: (bool, bool, bool, bool) = sqlx::query_as(
         "SELECT
             (SELECT NOT armed AND kill_switch
