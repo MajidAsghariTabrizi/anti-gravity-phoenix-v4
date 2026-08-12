@@ -333,6 +333,30 @@ async fn handle_request(
                 }
             }
         }
+        ("POST", "/v1/aave/screen-primary") => {
+            let parsed: AaveScreenRequest = match serde_json::from_slice(&request.body) {
+                Ok(parsed) => parsed,
+                Err(_) => {
+                    return write_json(&mut stream, 400, &GatewayError::InvalidRequest.response())
+                        .await;
+                }
+            };
+            match tokio::time::timeout(
+                STATE_REQUEST_TIMEOUT,
+                runtime.resolve_aave_primary_screen(parsed),
+            )
+            .await
+            {
+                Ok(Ok(response)) => write_json(&mut stream, 200, &response).await,
+                Ok(Err(error)) => {
+                    write_json(&mut stream, error.http_status(), &error.response()).await
+                }
+                Err(_) => {
+                    let error = GatewayError::ProviderUnavailable;
+                    write_json(&mut stream, error.http_status(), &error.response()).await
+                }
+            }
+        }
         ("POST", "/v1/aave/exact") => {
             let parsed: AaveExactRequest = match serde_json::from_slice(&request.body) {
                 Ok(parsed) => parsed,

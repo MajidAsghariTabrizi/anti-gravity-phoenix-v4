@@ -18,6 +18,7 @@ for path in \
   migrations/015_bounded_economic_view_plans.sql \
   live-executor/schema/005_closed_loop_economic_control.sql \
   live-executor/schema/007_aave_economic_diagnostics.sql \
+  live-executor/schema/008_revenue_provider_authority.sql \
   live-executor/src/economic_control.rs \
   live-executor/src/autonomous_live_control_main.rs \
   live-executor/src/store.rs \
@@ -73,6 +74,7 @@ state = read("live-executor/src/economic_control.rs")
 canonical_state = read("rpc-gateway/src/aave_state.rs")
 schema = read("live-executor/schema/005_closed_loop_economic_control.sql")
 diagnostic_schema = read("live-executor/schema/007_aave_economic_diagnostics.sql")
+provider_schema = read("live-executor/schema/008_revenue_provider_authority.sql")
 health = read("scripts/production-healthcheck.sh")
 monitor = read("scripts/economic-dashboard-loop.sh")
 dashboard_sql = read("scripts/sql/economic-dashboard-snapshot.sql")
@@ -124,6 +126,20 @@ for reviewed_budget in (
         f"live_rpc_budget_not_literal:{reviewed_budget}",
     )
 
+observer_service = re.search(
+    r"(?ms)^  atlas-observer:\s*\n(?P<body>.*?)(?=^  [a-zA-Z0-9_-]+:\s*\n|\Z)",
+    compose,
+)
+require(observer_service is not None, "atlas_observer_service_missing")
+for reviewed_budget in (
+    'PHOENIX_EXACT_STATE_REQUEST_BUDGET_PER_MINUTE: "60"',
+    'PHOENIX_EXACT_DISCOVERY_RESERVE_PER_MINUTE: "24"',
+):
+    require(
+        reviewed_budget in observer_service.group("body"),
+        f"observer_exact_budget_not_literal:{reviewed_budget}",
+    )
+
 service = re.search(
     r"(?ms)^  autonomous-control:\s*\n(?P<body>.*?)(?=^  [a-zA-Z0-9_-]+:\s*\n|\Z)",
     compose,
@@ -158,6 +174,11 @@ for required in (
     "cap_drop: [ALL]",
     "no-new-privileges:true",
     "/activation-outbox",
+    "PHOENIX_CURRENT_RELEASE_PATH: /release-identity/current-release",
+    "PHOENIX_RELEASE_ASSETS_PATH: /release-identity/release-assets.sha",
+    "source: /opt/phoenix/deploy/current-release",
+    "source: /opt/phoenix/deploy/release-assets.sha",
+    "read_only: true",
 ):
     require(required in supervisor_service, f"activation_producer_hardening_missing:{required}")
 for forbidden in (
@@ -496,7 +517,41 @@ require(
     < normalizer.index("validatedAaveLiveMaximumInputAmount(states)"),
     "observer_candidate_authority_must_lock_economic_then_exact_revenue_lanes",
 )
+require(
+    "approval_digest, status, created_at, updated_at" in observer_sink
+    and "'approved', $26, $26" in observer_sink,
+    "aave_request_evidence_time_must_bind_exact_completion",
+)
 require("phoenix.live-canary-schema.v7" in control, "schema_v7_not_required")
+require("phoenix.live-canary-schema.v8" in control, "schema_v8_not_required")
+require("revenue_provider_authority" in provider_schema, "provider_authority_schema_missing")
+require("exact_execution_ready" in provider_schema, "provider_execution_gate_missing")
+require("request_evidence_not_before" in provider_schema, "provider_request_evidence_floor_missing")
+require("provider.exact_execution_ready" in executor_store, "aave_claim_missing_provider_gate")
+require("provider.exact_execution_ready" in revenue_executor, "atlas_claim_missing_provider_gate")
+require("r.created_at >= $9" in executor_store, "aave_claim_missing_post_failure_evidence_floor")
+require("r.created_at >= $3" in revenue_executor, "atlas_claim_missing_post_failure_evidence_floor")
+require("revenue_provider_authority" in observer_sink, "candidate_sink_missing_provider_gate")
+require("provider_authority_auto_recovered" in control, "provider_recovery_transition_missing")
+require("failure_control_epoch" in control, "provider_recovery_epoch_binding_missing")
+for required in (
+    "runtime_preflight_from_environment()",
+    "exact_release_identity()",
+    "provider_recovery_samples(payload)",
+    "failure_transition_at",
+    "active_attempts",
+    "unresolved_submissions",
+    "active_atlas",
+    "lock_free",
+    "current_daily_loss",
+    "executor_paused",
+    "recovery_attempted_total",
+    "recovery_succeeded_total",
+    "recovery_blocked_total",
+    "recovery_evidence_hash",
+    "WHERE lane IN ('aave_liquidation','atlas_solver') AND NOT armed AND kill_switch",
+):
+    require(required in control, f"provider_recovery_contract_missing:{required}")
 for required in (
     "exact_diagnostics JSONB",
     "phoenix.aave-exact-diagnostics.v1",
@@ -525,6 +580,7 @@ for required in (
     "revenue lane activation is blocked by an active submission",
     "revenue lane activation is blocked by an active attempt",
     "revenue lane activation is blocked by an active Atlas request",
+    "revenue lane activation requires fresh exact provider authority",
     "disarmed deployment is blocked by an active revenue submission",
     "disarmed deployment is blocked by an active Atlas request",
 ):
@@ -850,6 +906,66 @@ SQL
     <"$schema" >/dev/null ||
     fail "live schema failed: ${schema##*/}"
 done
+
+docker exec -i "$postgres_container" \
+  psql -X -q -v ON_ERROR_STOP=1 -U phoenix_test -d phoenix_test <<'SQL' >/dev/null ||
+DO $$
+DECLARE
+  row_count BIGINT;
+  gate_ready BOOLEAN;
+BEGIN
+  SELECT count(*), bool_or(exact_execution_ready)
+  INTO row_count, gate_ready
+  FROM live_canary.revenue_provider_authority
+  WHERE singleton;
+  IF row_count <> 1 OR gate_ready THEN
+    RAISE EXCEPTION 'provider authority singleton did not install fail closed';
+  END IF;
+
+  BEGIN
+    UPDATE live_canary.revenue_provider_authority
+    SET exact_execution_ready = true, recovery_status = 'ready'
+    WHERE singleton;
+    RAISE EXCEPTION 'provider authority opened without three Exact samples';
+  EXCEPTION WHEN check_violation THEN NULL;
+  END;
+
+  UPDATE live_canary.revenue_provider_authority
+  SET recovery_status = 'ready', sample_count = 3,
+      sample_1_at = now() - interval '3 seconds',
+      sample_1_primary_provider = 'primary-1',
+      sample_1_confirmation_provider = 'confirmation-1',
+      sample_2_at = now() - interval '2 seconds',
+      sample_2_primary_provider = 'primary-2',
+      sample_2_confirmation_provider = 'confirmation-2',
+      sample_3_at = now() - interval '1 second',
+      sample_3_primary_provider = 'primary-3',
+      sample_3_confirmation_provider = 'confirmation-3',
+      exact_execution_ready = true
+  WHERE singleton;
+
+  IF NOT (SELECT exact_execution_ready AND sample_count = 3
+          FROM live_canary.revenue_provider_authority WHERE singleton) THEN
+    RAISE EXCEPTION 'three Exact samples did not satisfy the provider authority contract';
+  END IF;
+
+  UPDATE live_canary.revenue_provider_authority
+  SET exact_execution_ready = false, recovery_status = 'collecting',
+      sample_count = 0,
+      sample_1_at = NULL, sample_1_primary_provider = NULL, sample_1_confirmation_provider = NULL,
+      sample_2_at = NULL, sample_2_primary_provider = NULL, sample_2_confirmation_provider = NULL,
+      sample_3_at = NULL, sample_3_primary_provider = NULL, sample_3_confirmation_provider = NULL
+  WHERE singleton;
+  IF NOT EXISTS (
+    SELECT 1 FROM live_canary.schema_contract
+    WHERE version = 'phoenix.live-canary-schema.v8'
+  ) THEN
+    RAISE EXCEPTION 'schema v8 marker missing';
+  END IF;
+END;
+$$;
+SQL
+  fail "revenue provider authority schema contract was rejected"
 
 docker exec -i "$postgres_container" \
   psql -X -q -v ON_ERROR_STOP=1 -U phoenix_test -d phoenix_test <<'SQL' >/dev/null ||

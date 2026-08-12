@@ -1801,6 +1801,11 @@ class BoundedTransportContinuationTests(unittest.TestCase):
             '  "live-executor/schema/007_aave_economic_diagnostics.sql"',
             context_installer,
         )
+        self.assertIn(
+            'install_versioned_source \\\n'
+            '  "live-executor/schema/008_revenue_provider_authority.sql"',
+            context_installer,
+        )
         self.assertNotIn("install_protected_file", context_installer)
 
     def test_candidate_install_failure_rolls_back_in_same_resume(self) -> None:

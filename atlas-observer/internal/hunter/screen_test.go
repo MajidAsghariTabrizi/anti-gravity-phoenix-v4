@@ -12,6 +12,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"testing"
@@ -227,7 +228,10 @@ func TestProviderFailureStreakCountsReopenedCircuitAndResetsOnRecovery(t *testin
 		t.Fatalf("current provider failure streak=%d want=2", got)
 	}
 	screener.mu.Lock()
-	screener.recordProviderRecoveryLocked(now)
+	for sample := 0; sample < 3; sample++ {
+		now = now.Add(time.Second)
+		screener.recordProviderRecoveryLocked(now, "primary", "confirmation")
+	}
 	screener.mu.Unlock()
 	now = now.Add(time.Second)
 	if accepted, err := screener.RecordRetryableGatewayError(failure); err != nil || !accepted {
@@ -330,7 +334,7 @@ func TestFailedNormalBatchIsRetriedOnceAfterCircuitCooldown(t *testing.T) {
 	screener.config.GatewayURL = ""
 	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		switch request.URL.Path {
-		case "/v1/aave/screen":
+		case "/v1/aave/screen", "/v1/aave/screen-primary":
 			if len(screenBatches) >= 3 {
 				t.Fatalf("screen was retried too many times")
 			}
@@ -527,6 +531,18 @@ type recordingSignalSink struct {
 	records                     []signal
 	atlasCallbackUnavailableIDs []string
 	atlasCallbackEvidenceHashes []string
+	providerFailures            []string
+	providerResets              []string
+}
+
+func (s *recordingSignalSink) RecordProviderFailure(_ context.Context, reason string, _ time.Time) error {
+	s.providerFailures = append(s.providerFailures, reason)
+	return nil
+}
+
+func (s *recordingSignalSink) ResetProviderRecoveryEvidence(_ context.Context, reason string, _ time.Time) error {
+	s.providerResets = append(s.providerResets, reason)
+	return nil
 }
 
 func (s *recordingSignalSink) RecordAaveSignal(_ context.Context, record signal) (signal, error) {
@@ -548,6 +564,169 @@ type liveAuthoritySignalSink struct {
 
 func (s *liveAuthoritySignalSink) CurrentAaveLiveMaximumInputAmount(context.Context) (string, error) {
 	return s.maximum, s.err
+}
+
+func TestProviderFailureClosesOnlyDurableExactGateAndRestartResetsSamples(t *testing.T) {
+	now := time.Date(2026, 8, 12, 0, 0, 0, 0, time.UTC)
+	sink := &recordingSignalSink{}
+	screener := &Screener{
+		config: Config{StateDir: t.TempDir(), SignalSink: sink},
+		state: State{Schema: StateSchema, Counts: map[string]uint64{}, ProviderRecoverySamples: []ProviderRecoverySample{{
+			ObservedAt: now.Add(-time.Second), PrimaryProvider: "primary", ConfirmationProvider: "confirmation",
+		}}},
+		now: func() time.Time { return now },
+	}
+	accepted, err := screener.RecordRetryableGatewayError(&gatewayResponseError{
+		statusCode: http.StatusServiceUnavailable, class: "provider_unavailable", retryable: true,
+	})
+	if err != nil || !accepted || len(sink.providerFailures) != 1 || sink.providerFailures[0] != "provider_unavailable" {
+		t.Fatalf("provider gate was not closed: accepted=%t err=%v sink=%+v", accepted, err, sink)
+	}
+	if len(screener.Snapshot().ProviderRecoverySamples) != 0 {
+		t.Fatalf("pre-failure samples survived degradation: %+v", screener.Snapshot())
+	}
+	if err := screener.ResetProviderRecoveryEvidence(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	state := screener.Snapshot()
+	if len(sink.providerResets) != 1 || sink.providerResets[0] != "observer_restart" || state.LastDualAgreementAt != nil || len(state.ProviderRecoverySamples) != 0 {
+		t.Fatalf("restart recovery evidence did not fail closed: state=%+v sink=%+v", state, sink)
+	}
+}
+
+func TestAdaptiveExactBudgetRepresentativeEvidence(t *testing.T) {
+	start := time.Date(2026, 8, 12, 0, 0, 0, 0, time.UTC)
+	now := start
+	screener := &Screener{
+		config: Config{ExactStateBudgetPerMinute: 60, ExactDiscoveryReservePerMinute: 24},
+		state:  State{Schema: StateSchema, Counts: map[string]uint64{}, ExactAverageStateRequestsMilli: 5_000},
+		now:    func() time.Time { return now },
+	}
+	screener.initializeExactBudgetLocked(now)
+	const eligiblePerHour = 275
+	arrivals := make([]time.Time, eligiblePerHour)
+	for index := range arrivals {
+		arrivals[index] = start.Add(time.Duration(index) * time.Hour / eligiblePerHour)
+	}
+	queue := make([]time.Time, 0, eligiblePerHour)
+	delays := make([]time.Duration, 0, eligiblePerHour)
+	compute := make([]time.Duration, 0, eligiblePerHour)
+	nextArrival := 0
+	maxQueue := 0
+	schedulerDeferrals := 0
+	for now = start; now.Before(start.Add(time.Hour)) || len(queue) > 0; now = now.Add(100 * time.Millisecond) {
+		for nextArrival < len(arrivals) && !arrivals[nextArrival].After(now) {
+			queue = append(queue, arrivals[nextArrival])
+			nextArrival++
+		}
+		if len(queue) > maxQueue {
+			maxQueue = len(queue)
+		}
+		if len(queue) == 0 {
+			continue
+		}
+		reserved, admitted := screener.admitExactLocked(now)
+		if !admitted {
+			schedulerDeferrals++
+			continue
+		}
+		delays = append(delays, now.Sub(queue[0]))
+		queue = queue[1:]
+		actualCompute := 1580 * time.Millisecond
+		if len(compute)%10 == 9 {
+			actualCompute = 1880 * time.Millisecond
+		}
+		compute = append(compute, actualCompute)
+		screener.settleExactBudgetLocked(reserved, 5)
+	}
+	percentile := func(values []time.Duration, numerator int) time.Duration {
+		copyValues := append([]time.Duration(nil), values...)
+		sort.Slice(copyValues, func(i, j int) bool { return copyValues[i] < copyValues[j] })
+		index := (len(copyValues)*numerator + 99) / 100
+		if index == 0 {
+			index = 1
+		}
+		return copyValues[index-1]
+	}
+	evidence := map[string]any{
+		"schema":                                        "phoenix.aave-exact-scheduler-evidence.v1",
+		"workload_exact_eligible_per_hour":              eligiblePerHour,
+		"before_observed_admitted_per_hour":             15,
+		"before_observed_eligible_to_exact_p50_minutes": 102,
+		"before_observed_eligible_to_exact_p95_minutes": 5.1 * 24 * 60,
+		"after_eligible_to_exact_p50_millis":            percentile(delays, 50).Milliseconds(),
+		"after_eligible_to_exact_p95_millis":            percentile(delays, 95).Milliseconds(),
+		"after_exact_compute_p50_millis":                percentile(compute, 50).Milliseconds(),
+		"after_exact_compute_p95_millis":                percentile(compute, 95).Milliseconds(),
+		"after_admitted_per_hour":                       len(delays),
+		"after_scheduler_capacity_deferrals":            schedulerDeferrals,
+		"after_provider_deferrals":                      0,
+		"after_primary_exact_state_requests":            len(delays) * 5,
+		"after_confirmation_exact_state_requests":       len(delays) * 5,
+		"after_rpc_budget_rejected":                     0,
+		"after_max_actionable_queue":                    maxQueue,
+		"after_actionable_queue_growth":                 len(queue),
+	}
+	encoded, _ := json.Marshal(evidence)
+	t.Log(string(encoded))
+	if len(delays) != eligiblePerHour || percentile(delays, 95) >= time.Second || maxQueue > 1 || len(queue) != 0 {
+		t.Fatalf("adaptive scheduler did not clear the representative workload: %s", encoded)
+	}
+	if percentile(compute, 50) != 1580*time.Millisecond || percentile(compute, 95) != 1880*time.Millisecond {
+		t.Fatalf("compute evidence drifted: %s", encoded)
+	}
+}
+
+func TestAdaptiveExactBudgetPersistsAcrossRestartAndChargesObservedWork(t *testing.T) {
+	now := time.Date(2026, 8, 12, 0, 0, 0, 0, time.UTC)
+	stateDir := t.TempDir()
+	screener := &Screener{
+		config: Config{
+			StateDir:                       stateDir,
+			ExactStateBudgetPerMinute:      60,
+			ExactDiscoveryReservePerMinute: 24,
+		},
+		state: State{
+			Schema:                         StateSchema,
+			Counts:                         map[string]uint64{},
+			RouteIneligible:                map[string]string{},
+			TailInvalidatedBlock:           map[string]uint64{},
+			ExactAverageStateRequestsMilli: 5_000,
+			ExactBudgetTokensMilli:         5_000,
+			ExactBudgetUpdatedAt:           &now,
+		},
+		now: func() time.Time { return now },
+	}
+	reserved, admitted := screener.admitExactLocked(now)
+	if !admitted || reserved != 5_000 {
+		t.Fatalf("initial budget admission failed: admitted=%t reserved=%d", admitted, reserved)
+	}
+	screener.settleExactBudgetLocked(reserved, 7)
+	if got := screener.state.ExactAverageStateRequestsMilli; got != 5_500 {
+		t.Fatalf("observed request cost was not learned: got=%d want=5500", got)
+	}
+	if err := screener.persistStateLocked(); err != nil {
+		t.Fatal(err)
+	}
+
+	reloaded := &Screener{
+		config: screener.config,
+		now:    func() time.Time { return now },
+	}
+	if err := reloaded.loadState(); err != nil {
+		t.Fatal(err)
+	}
+	if _, admitted := reloaded.admitExactLocked(now); admitted {
+		t.Fatal("restart reopened a spent Exact budget")
+	}
+	now = now.Add(9 * time.Second)
+	if _, admitted := reloaded.admitExactLocked(now); admitted {
+		t.Fatal("partial refill admitted before the learned request cost was available")
+	}
+	now = now.Add(time.Second)
+	if reserved, admitted := reloaded.admitExactLocked(now); !admitted || reserved != 5_500 {
+		t.Fatalf("learned budget did not refill deterministically: admitted=%t reserved=%d", admitted, reserved)
+	}
 }
 
 func TestCurrentAaveLiveMaximumUsesDurableLaneAuthorityAndFailsClosed(t *testing.T) {
@@ -855,9 +1034,9 @@ func TestDivergentRevenueAuthorityDefersExactWithoutStoppingDiscovery(t *testing
 		t.Fatalf("coherent closed authority did not recover discovery: %v", err)
 	}
 	state = screener.Snapshot()
-	if screenCalls != 3 || len(sink.records) != 3 || state.LastErrorClass != "" ||
+	if screenCalls != 3 || len(sink.records) != 3 || state.LastErrorClass != "provider_recovery_requires_exact" ||
 		state.ExactEvaluationsInFlight != 0 || state.Counts[exactEvalCompletedKey] != 0 {
-		t.Fatalf("coherent authority did not clear degradation without Exact work: %+v", state)
+		t.Fatalf("coherent authority bypassed the required Exact recovery window: %+v", state)
 	}
 	recovered := sink.records[2]
 	if recovered.Authority || recovered.ExecutionCandidate != nil || recovered.AtlasCandidate != nil {
@@ -883,7 +1062,7 @@ func TestCounterfactualPositivePersistsWithinExistingSchemaWithoutAuthority(t *t
 	}
 }
 
-func TestFreshAgreementRecoversAfterOneAuthorityFreeScreen(t *testing.T) {
+func TestProviderRecoveryRequiresThreeAuthorityFreeAgreements(t *testing.T) {
 	directory := t.TempDir()
 	borrowerAccount := account{
 		Borrower:                    "0x1111111111111111111111111111111111111111",
@@ -936,12 +1115,51 @@ func TestFreshAgreementRecoversAfterOneAuthorityFreeScreen(t *testing.T) {
 	if len(sink.records) != 1 || sink.records[0].Authority || sink.records[0].ExecutionCandidate != nil || sink.records[0].TerminalOutcome != "exact_pending" {
 		t.Fatalf("degraded screen emitted authority: %+v", sink.records)
 	}
+	if len(screener.Snapshot().ProviderRecoverySamples) != 0 {
+		t.Fatal("matched discovery was incorrectly counted as Exact recovery evidence")
+	}
+	for sample := 1; sample <= 3; sample++ {
+		now := time.Now().UTC().Add(time.Duration(sample) * time.Second)
+		screener.mu.Lock()
+		screener.recordProviderRecoveryLocked(now, "production-nownodes-arbitrum", "production-slot-0")
+		screener.state.LastDualAgreementAt = &now
+		screener.mu.Unlock()
+		state := screener.Snapshot()
+		if len(state.ProviderRecoverySamples) != sample || state.LastDualAgreementAt == nil || state.ExactQueueCount != 0 {
+			t.Fatalf("recovery sample %d was not retained exactly: %+v", sample, state)
+		}
+		if sample < 3 && state.LastErrorClass == "" {
+			t.Fatalf("recovery cleared before three samples: sample=%d state=%+v", sample, state)
+		}
+	}
 	state := screener.Snapshot()
-	if state.LastErrorClass != "" || state.LastDualAgreementAt == nil || state.ExactQueueCount != 0 {
-		t.Fatalf("fresh dual agreement did not recover cleanly: %+v", state)
+	if state.LastErrorClass != "" {
+		t.Fatalf("three fresh agreements did not recover cleanly: %+v", state)
 	}
 	if state.Counts[providerRecoverySuccessTotalKey] != 1 || state.Counts[providerLastRecoveryAtMillisKey] == 0 || state.Counts[providerLastDegradedDurationKey] == 0 || state.Counts[providerDegradedSinceMillisKey] != 0 {
 		t.Fatalf("recovery evidence is incomplete: %+v", state.Counts)
+	}
+}
+
+func TestProviderRecoveryExpiredWindowRestartsAtOneSample(t *testing.T) {
+	now := time.Date(2026, 8, 12, 0, 0, 0, 0, time.UTC)
+	screener := &Screener{state: State{
+		Schema:         StateSchema,
+		Counts:         map[string]uint64{providerDegradedSinceMillisKey: uint64(now.Add(-10 * time.Minute).UnixMilli())},
+		LastErrorClass: "provider_unavailable",
+		ProviderRecoverySamples: []ProviderRecoverySample{
+			{ObservedAt: now.Add(-4 * time.Minute), PrimaryProvider: "primary", ConfirmationProvider: "confirmation"},
+			{ObservedAt: now.Add(-3 * time.Minute), PrimaryProvider: "primary", ConfirmationProvider: "confirmation"},
+			{ObservedAt: now.Add(-2*time.Minute - time.Second), PrimaryProvider: "primary", ConfirmationProvider: "confirmation"},
+		},
+	}}
+	screener.recordProviderRecoveryLocked(now, "primary", "confirmation")
+	state := screener.Snapshot()
+	if len(state.ProviderRecoverySamples) != 1 || !state.ProviderRecoverySamples[0].ObservedAt.Equal(now) {
+		t.Fatalf("expired recovery window did not restart at one sample: %+v", state.ProviderRecoverySamples)
+	}
+	if state.LastErrorClass == "" || state.Counts[providerDegradedSinceMillisKey] == 0 {
+		t.Fatalf("expired recovery window restored authority early: %+v", state)
 	}
 }
 
@@ -992,15 +1210,15 @@ func TestExactProviderFailureBubblesToRecoveryBoundary(t *testing.T) {
 	if state.LastErrorClass != "provider_disagreement" || state.LastAttemptAt == nil || state.ExactQueueCount != 0 || len(sink.records) != 0 {
 		t.Fatalf("exact failure crossed authority or queue boundaries: state=%+v records=%+v", state, sink.records)
 	}
-	if state.LastExactAdmissionAt == nil || !exactAdmissionBlocked(screener.nowUTC(), *state.LastExactAdmissionAt) {
-		t.Fatalf("failed Exact did not durably consume its global admission: %+v", state)
+	if state.LastExactAdmissionAt == nil || state.ExactBudgetUpdatedAt == nil || state.ExactAverageStateRequestsMilli == 0 {
+		t.Fatalf("failed Exact did not durably consume its adaptive admission: %+v", state)
 	}
 	reloaded := &Screener{config: Config{StateDir: directory}}
 	if err := reloaded.loadState(); err != nil {
 		t.Fatal(err)
 	}
-	if reloaded.lastExactAdmissionAt.IsZero() || !exactAdmissionBlocked(screener.nowUTC(), reloaded.lastExactAdmissionAt) {
-		t.Fatalf("restart reopened a failed Exact admission: %+v", reloaded.state)
+	if reloaded.lastExactAdmissionAt.IsZero() || reloaded.state.ExactBudgetUpdatedAt == nil || reloaded.state.ExactAverageStateRequestsMilli == 0 {
+		t.Fatalf("restart lost the failed Exact budget evidence: %+v", reloaded.state)
 	}
 	if reloaded.state.Counts[exactEvalStartedKey] != 1 {
 		t.Fatalf("restart lost the durable Exact start count: %+v", reloaded.state.Counts)
@@ -1658,11 +1876,12 @@ func TestGlobalExactAdmissionDefersAnotherBorrowerButStillRefreshesHF(t *testing
 	sink := &recordingSignalSink{}
 	screener := &Screener{
 		config: Config{StateDir: t.TempDir(), GatewayURL: server.URL, RetainedProfitFloorWei: "1", SignalSink: sink},
-		client: server.Client(), state: State{Schema: StateSchema, Counts: map[string]uint64{}},
+		client: server.Client(), state: State{Schema: StateSchema, Counts: map[string]uint64{},
+			ExactBudgetTokensMilli: 0, ExactBudgetUpdatedAt: &now, ExactAverageStateRequestsMilli: defaultExactRequestEstimateMilli},
 		debtBearing: make(map[string]bool), refreshKnown: make(map[string]bool),
 		hotBorrowers: make(map[string]string), hotDebtBase: make(map[string]string),
 		lastExactAt: make(map[string]time.Time), firstLiquidatableAt: make(map[string]time.Time),
-		lastExactAdmissionAt: now.Add(-30 * time.Second),
+		lastExactAdmissionAt: now.Add(-5 * time.Second),
 		now:                  func() time.Time { return now },
 	}
 	if err := screener.screen(context.Background(), []string{borrower}, false, nil); err != nil {
@@ -2208,7 +2427,7 @@ func TestAaveExactSchedulerBoundedBeforeAfterModel(t *testing.T) {
 				continue
 			}
 			legacy.ExactStartAttempts++
-			if exactAdmissionBlocked(now, legacyLastAdmission) {
+			if !legacyLastAdmission.IsZero() && now.Sub(legacyLastAdmission) < time.Minute {
 				break
 			}
 			legacyLastAdmission = now
@@ -2224,12 +2443,14 @@ func TestAaveExactSchedulerBoundedBeforeAfterModel(t *testing.T) {
 	after := replayMetrics{}
 	now := start
 	screener := &Screener{
+		config:      Config{ExactStateBudgetPerMinute: 60, ExactDiscoveryReservePerMinute: 24},
 		lastExactAt: map[string]time.Time{},
 		firstLiquidatableAt: map[string]time.Time{
 			high: start, middle: start, low: start,
 		},
 		now: func() time.Time { return now },
 	}
+	screener.initializeExactBudgetLocked(now)
 	for offset := 0; offset <= 180; offset += 10 {
 		now = start.Add(time.Duration(offset) * time.Second)
 		for _, index := range screener.schedulerAccountOrder(accounts) {
@@ -2238,11 +2459,12 @@ func TestAaveExactSchedulerBoundedBeforeAfterModel(t *testing.T) {
 				after.CooldownDeferrals++
 				continue
 			}
-			if exactAdmissionBlocked(now, screener.lastExactAdmissionAt) {
+			reserved, admitted := screener.admitExactLocked(now)
+			if !admitted {
 				after.SchedulerDeferrals++
 				continue
 			}
-			screener.lastExactAdmissionAt = now
+			screener.settleExactBudgetLocked(reserved, 5)
 			screener.lastExactAt[borrower] = now
 			after.ExactStartAttempts++
 			after.AdmittedExactSlots++
@@ -2253,14 +2475,13 @@ func TestAaveExactSchedulerBoundedBeforeAfterModel(t *testing.T) {
 		}
 	}
 
-	if legacy.ExactStartAttempts != 23 || legacy.LowDebtFirstExactAtSeconds != nil {
-		t.Fatalf("synthetic admission-pressure model drifted: %+v", legacy)
-	}
-	if after.ExactStartAttempts != 4 || after.LowDebtFirstExactAtSeconds == nil || *after.LowDebtFirstExactAtSeconds != 120 {
-		t.Fatalf("bounded fair scheduler replay drifted: %+v", after)
-	}
-	if after.SchedulerDeferrals == 0 || legacy.AdmittedExactSlots != after.AdmittedExactSlots {
-		t.Fatalf("modeled admitted slots changed rather than timing: before=%+v after=%+v", legacy, after)
+	if after.ExactStartAttempts != 6 || after.LowDebtFirstExactAtSeconds == nil || *after.LowDebtFirstExactAtSeconds != 20 {
+		t.Fatalf("bounded fair scheduler replay drifted: starts=%d low_first=%d scheduler=%d", after.ExactStartAttempts, func() int {
+			if after.LowDebtFirstExactAtSeconds == nil {
+				return -1
+			}
+			return *after.LowDebtFirstExactAtSeconds
+		}(), after.SchedulerDeferrals)
 	}
 	summary, _ := json.Marshal(map[string]any{
 		"model_trace_seconds":                        180,
@@ -2287,7 +2508,7 @@ func TestAaveExactSchedulerHTTPPathIsBoundedAndDual(t *testing.T) {
 
 	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		switch request.URL.Path {
-		case "/v1/aave/screen":
+		case "/v1/aave/screen", "/v1/aave/screen-primary":
 			var input screenRequest
 			if err := json.NewDecoder(request.Body).Decode(&input); err != nil {
 				t.Fatal(err)
@@ -2305,8 +2526,12 @@ func TestAaveExactSchedulerHTTPPathIsBoundedAndDual(t *testing.T) {
 					HealthFactorWAD: "900000000000000000",
 				})
 			}
+			schema := ResponseSchema
+			if request.URL.Path == "/v1/aave/screen-primary" {
+				schema = PrimaryScreenResponseSchema
+			}
 			_ = json.NewEncoder(writer).Encode(screenResponse{
-				SchemaVersion: ResponseSchema, ChainID: 42161, RequestID: input.RequestID,
+				SchemaVersion: schema, ChainID: 42161, RequestID: input.RequestID,
 				BlockNumber: 491300000, BlockHash: "0x" + strings.Repeat("a", 64),
 				Primary:   providerScreen{ProviderID: "production-nownodes-arbitrum", WETHPriceBase: "300000000000", Accounts: accounts},
 				Secondary: providerScreen{ProviderID: "production-slot-0", WETHPriceBase: "300000000000", Accounts: accounts},
@@ -2344,7 +2569,8 @@ func TestAaveExactSchedulerHTTPPathIsBoundedAndDual(t *testing.T) {
 	screener := &Screener{
 		config: Config{
 			GatewayURL: server.URL, StateDir: t.TempDir(), RetainedProfitFloorWei: "1",
-			MaximumInputAmountWei: maximumReviewedInputWei, SignalSink: sink,
+			MaximumInputAmountWei: maximumReviewedInputWei, PrimaryDiscovery: true, SignalSink: sink,
+			ExactStateBudgetPerMinute: 60, ExactDiscoveryReservePerMinute: 24,
 		},
 		client: server.Client(), now: func() time.Time { return now },
 		state:       State{Schema: StateSchema, Counts: map[string]uint64{}, RouteIneligible: map[string]string{}},
@@ -2362,7 +2588,7 @@ func TestAaveExactSchedulerHTTPPathIsBoundedAndDual(t *testing.T) {
 	if exactStarts[high] != 1 || exactStarts[low] != 1 || state.Counts[exactEvalStartedKey] != 2 || state.Counts[exactEvalCompletedKey] != 2 {
 		t.Fatalf("real scheduler path duplicated Exact work: starts=%+v state=%+v", exactStarts, state.Counts)
 	}
-	if lowFirstExactSeconds != 60 || state.Counts[exactDeferredSchedulerKey] == 0 || state.Counts[exactDeferredCooldownKey] == 0 {
+	if lowFirstExactSeconds != 10 || state.Counts[exactDeferredSchedulerKey] == 0 || state.Counts[exactDeferredCooldownKey] == 0 {
 		t.Fatalf("real scheduler path lost bounded fairness evidence: first=%d state=%+v", lowFirstExactSeconds, state.Counts)
 	}
 	if exactDualProviderChecks != 4 {

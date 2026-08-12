@@ -564,9 +564,13 @@ impl AtlasRevenueExecutor {
 
     async fn lane_enabled(&self) -> Result<bool, RevenueError> {
         Ok(sqlx::query_scalar(
-            "SELECT armed AND NOT kill_switch
-             FROM live_canary.revenue_lane_controls
-             WHERE lane = 'atlas_solver'",
+            "SELECT lane.armed AND NOT lane.kill_switch AND provider.exact_execution_ready
+                    AND economic.phase = 'DISARMED_EVIDENCE'
+                    AND economic.current_size_level = 'MAX_REVIEWED'
+             FROM live_canary.revenue_lane_controls lane
+             CROSS JOIN live_canary.revenue_provider_authority provider
+             CROSS JOIN live_canary.economic_control economic
+             WHERE lane.lane = 'atlas_solver' AND provider.singleton AND economic.singleton",
         )
         .fetch_one(&self.pool)
         .await?)
@@ -578,15 +582,25 @@ impl AtlasRevenueExecutor {
             .execute(&mut *transaction)
             .await?;
         let lane = sqlx::query(
-            "SELECT armed, kill_switch, maximum_input_amount::text, maximum_gas_limit,
+            "SELECT lane.armed, lane.kill_switch, lane.maximum_input_amount::text, lane.maximum_gas_limit,
                     maximum_fee_per_gas::text, maximum_atlas_bid::text,
-                    daily_loss_limit::text, retained_profit_floor::text
-             FROM live_canary.revenue_lane_controls
-             WHERE lane = 'atlas_solver' FOR UPDATE",
+                    daily_loss_limit::text, retained_profit_floor::text,
+                    provider.exact_execution_ready, provider.request_evidence_not_before,
+                    economic.phase, economic.current_size_level
+             FROM live_canary.revenue_lane_controls lane
+             CROSS JOIN live_canary.revenue_provider_authority provider
+             CROSS JOIN live_canary.economic_control economic
+             WHERE lane.lane = 'atlas_solver' AND provider.singleton AND economic.singleton
+             FOR UPDATE OF lane, provider, economic",
         )
         .fetch_one(&mut *transaction)
         .await?;
-        if !lane.try_get::<bool, _>("armed")? || lane.try_get::<bool, _>("kill_switch")? {
+        if !lane.try_get::<bool, _>("armed")?
+            || lane.try_get::<bool, _>("kill_switch")?
+            || !lane.try_get::<bool, _>("exact_execution_ready")?
+            || lane.try_get::<String, _>("phase")? != "DISARMED_EVIDENCE"
+            || lane.try_get::<String, _>("current_size_level")? != "MAX_REVIEWED"
+        {
             transaction.rollback().await?;
             return Ok(None);
         }
@@ -599,6 +613,8 @@ impl AtlasRevenueExecutor {
             daily_loss_limit: parse_u128(lane.try_get::<String, _>("daily_loss_limit")?)?,
             retained_profit_floor: parse_u128(lane.try_get::<String, _>("retained_profit_floor")?)?,
         };
+        let request_evidence_not_before: DateTime<Utc> =
+            lane.try_get("request_evidence_not_before")?;
         let lock = sqlx::query(
             "SELECT active_lane FROM live_canary.global_revenue_submission_lock
              WHERE singleton FOR UPDATE",
@@ -657,6 +673,7 @@ impl AtlasRevenueExecutor {
              JOIN live_canary.revenue_hunting_signals s ON s.signal_id = r.signal_id
              JOIN live_canary.atlas_auction_ingress i ON i.auction_id = r.auction_id
              WHERE r.status = 'ready'
+               AND r.created_at >= $3
                AND s.source_lane = 'atlas_solver'
                AND s.auction_id = r.auction_id
                AND i.relevant_aave
@@ -672,6 +689,7 @@ impl AtlasRevenueExecutor {
         )
         .bind(lane_limits.retained_profit_floor.to_string())
         .bind(lane_limits.maximum_atlas_bid.to_string())
+        .bind(request_evidence_not_before)
         .fetch_optional(&mut *transaction)
         .await?;
         let Some(row) = row else {

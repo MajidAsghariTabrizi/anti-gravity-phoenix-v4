@@ -26,63 +26,67 @@ import (
 )
 
 const (
-	StateSchema                     = "phoenix.atlas-aave-hunter-state.v1"
-	RequestSchema                   = "phoenix.rpc.aave-screen-request.v1"
-	ResponseSchema                  = "phoenix.rpc.aave-screen-response.v1"
-	DefaultBatch                    = 100
-	MaximumBatch                    = 100
-	watchHF                         = uint64(1_100_000_000_000_000_000)
-	urgentHF                        = uint64(1_020_000_000_000_000_000)
-	liquidatableHF                  = uint64(1_000_000_000_000_000_000)
-	maximumResponse                 = 2 << 20
-	gatewayReadyTimeout             = 90 * time.Second
-	gatewayReadyPoll                = 5 * time.Second
-	initialScreenOffset             = 10 * time.Second
-	startupRetryTimeout             = 90 * time.Second
-	maximumStartupRetries           = 3
-	providerDegradationTotalKey     = "provider_retryable_degradation_total"
-	providerDisagreementTotalKey    = "provider_disagreement_degradation_total"
-	providerUnavailableTotalKey     = "provider_unavailable_degradation_total"
-	providerTimeoutTotalKey         = "provider_timeout_degradation_total"
-	providerRateLimitedTotalKey     = "provider_rate_limited_degradation_total"
-	providerRecoveryAttemptTotalKey = "provider_recovery_attempt_total"
-	providerRecoverySuccessTotalKey = "provider_recovery_success_total"
-	providerDegradedSinceMillisKey  = "provider_degraded_since_unix_millis"
-	providerLastDegradedAtMillisKey = "provider_last_degraded_at_unix_millis"
-	providerLastRecoveryAtMillisKey = "provider_last_recovery_at_unix_millis"
-	providerLastDegradedDurationKey = "provider_last_degraded_duration_millis"
-	providerCurrentFailureStreakKey = "provider_current_class_failure_streak"
-	providerCircuitOpenTotalKey     = "provider_circuit_open_total"
-	providerCircuitSkippedTotalKey  = "provider_circuit_skipped_total"
-	providerCircuitCooldown         = 5 * time.Minute
-	gatewayBudgetCircuitCooldown    = 30 * time.Second
-	hotRevisitCadence               = 10 * time.Second
-	aaveSimulationBatchTimeout      = 55 * time.Second
-	exactBorrowerCooldown           = 2 * time.Minute
-	exactAdmissionCadence           = time.Minute
-	directForkEvidenceMode          = "DUAL_PROVIDER_FORK_VERIFIED"
-	counterfactualForkEvidenceMode  = "DUAL_PROVIDER_COUNTERFACTUAL_FORK_VERIFIED"
-	atlasCallbackEvidenceMode       = "DUAL_PROVIDER_ATLAS_CALLBACK_FORK_VERIFIED"
-	maximumReviewedInputWei         = "10000000000000000"
-	exactDeferredCooldownKey        = "exact_deferred_cooldown_total"
-	exactDeferredRouteIneligibleKey = "exact_deferred_route_ineligible_total"
-	exactDeferredSchedulerKey       = "exact_deferred_scheduler_capacity_total"
-	exactRouteIneligibleObservedKey = "exact_route_ineligible_observed_total"
-	atlasCallbackUnavailableKey     = "atlas_callback_evidence_unavailable_total"
-	hotRecheckTotalKey              = "hot_recheck_total"
-	hotRecheckDeferredBudgetKey     = "hot_recheck_deferred_budget_total"
-	exactEvalStartedKey             = "exact_eval_started_total"
-	exactEvalCompletedKey           = "exact_eval_completed_total"
-	exactEvalLatencySumKey          = "exact_eval_latency_millis_sum"
-	exactEvalLatencyCountKey        = "exact_eval_latency_millis_count"
-	liquidatableToExactSumKey       = "liquidatable_to_exact_millis_sum"
-	liquidatableToExactCountKey     = "liquidatable_to_exact_millis_count"
-	routeIneligibleRechecksKey      = "route_ineligible_rechecks_total"
-	aavePoolAddress                 = "0x794a61358d6845594f94dc1db02a252b5b4814ad"
-	wethAddress                     = "0x82af49447d8a07e3bd95bd0d56f35241523fbab1"
-	nativeUSDCAddress               = "0xaf88d065e77c8cc2239327c5edb3a432268e5831"
-	zeroAddress                     = "0x0000000000000000000000000000000000000000"
-	uniswapFactoryAddress           = "0x1f98431c8ad98523631ae4a59f267346ea31f984"
+	StateSchema                      = "phoenix.atlas-aave-hunter-state.v1"
+	RequestSchema                    = "phoenix.rpc.aave-screen-request.v1"
+	ResponseSchema                   = "phoenix.rpc.aave-screen-response.v1"
+	PrimaryScreenResponseSchema      = "phoenix.rpc.aave-primary-screen-response.v1"
+	DefaultBatch                     = 100
+	MaximumBatch                     = 100
+	watchHF                          = uint64(1_100_000_000_000_000_000)
+	urgentHF                         = uint64(1_020_000_000_000_000_000)
+	liquidatableHF                   = uint64(1_000_000_000_000_000_000)
+	maximumResponse                  = 2 << 20
+	gatewayReadyTimeout              = 90 * time.Second
+	gatewayReadyPoll                 = 5 * time.Second
+	initialScreenOffset              = 10 * time.Second
+	startupRetryTimeout              = 90 * time.Second
+	maximumStartupRetries            = 3
+	providerDegradationTotalKey      = "provider_retryable_degradation_total"
+	providerDisagreementTotalKey     = "provider_disagreement_degradation_total"
+	providerUnavailableTotalKey      = "provider_unavailable_degradation_total"
+	providerTimeoutTotalKey          = "provider_timeout_degradation_total"
+	providerRateLimitedTotalKey      = "provider_rate_limited_degradation_total"
+	providerRecoveryAttemptTotalKey  = "provider_recovery_attempt_total"
+	providerRecoverySuccessTotalKey  = "provider_recovery_success_total"
+	providerDegradedSinceMillisKey   = "provider_degraded_since_unix_millis"
+	providerLastDegradedAtMillisKey  = "provider_last_degraded_at_unix_millis"
+	providerLastRecoveryAtMillisKey  = "provider_last_recovery_at_unix_millis"
+	providerLastDegradedDurationKey  = "provider_last_degraded_duration_millis"
+	providerCurrentFailureStreakKey  = "provider_current_class_failure_streak"
+	providerCircuitOpenTotalKey      = "provider_circuit_open_total"
+	providerCircuitSkippedTotalKey   = "provider_circuit_skipped_total"
+	providerCircuitCooldown          = 5 * time.Minute
+	inMemoryProviderRecoveryWindow   = 2 * time.Minute
+	gatewayBudgetCircuitCooldown     = 30 * time.Second
+	hotRevisitCadence                = 10 * time.Second
+	aaveSimulationBatchTimeout       = 55 * time.Second
+	exactBorrowerCooldown            = 2 * time.Minute
+	defaultExactStateBudgetPerMinute = uint64(12)
+	defaultExactDiscoveryReserve     = uint64(7)
+	defaultExactRequestEstimateMilli = uint64(5_000)
+	directForkEvidenceMode           = "DUAL_PROVIDER_FORK_VERIFIED"
+	counterfactualForkEvidenceMode   = "DUAL_PROVIDER_COUNTERFACTUAL_FORK_VERIFIED"
+	atlasCallbackEvidenceMode        = "DUAL_PROVIDER_ATLAS_CALLBACK_FORK_VERIFIED"
+	maximumReviewedInputWei          = "10000000000000000"
+	exactDeferredCooldownKey         = "exact_deferred_cooldown_total"
+	exactDeferredRouteIneligibleKey  = "exact_deferred_route_ineligible_total"
+	exactDeferredSchedulerKey        = "exact_deferred_scheduler_capacity_total"
+	exactRouteIneligibleObservedKey  = "exact_route_ineligible_observed_total"
+	atlasCallbackUnavailableKey      = "atlas_callback_evidence_unavailable_total"
+	hotRecheckTotalKey               = "hot_recheck_total"
+	hotRecheckDeferredBudgetKey      = "hot_recheck_deferred_budget_total"
+	exactEvalStartedKey              = "exact_eval_started_total"
+	exactEvalCompletedKey            = "exact_eval_completed_total"
+	exactEvalLatencySumKey           = "exact_eval_latency_millis_sum"
+	exactEvalLatencyCountKey         = "exact_eval_latency_millis_count"
+	liquidatableToExactSumKey        = "liquidatable_to_exact_millis_sum"
+	liquidatableToExactCountKey      = "liquidatable_to_exact_millis_count"
+	routeIneligibleRechecksKey       = "route_ineligible_rechecks_total"
+	aavePoolAddress                  = "0x794a61358d6845594f94dc1db02a252b5b4814ad"
+	wethAddress                      = "0x82af49447d8a07e3bd95bd0d56f35241523fbab1"
+	nativeUSDCAddress                = "0xaf88d065e77c8cc2239327c5edb3a432268e5831"
+	zeroAddress                      = "0x0000000000000000000000000000000000000000"
+	uniswapFactoryAddress            = "0x1f98431c8ad98523631ae4a59f267346ea31f984"
 )
 
 const (
@@ -115,11 +119,27 @@ type Config struct {
 	CallerAddress          string
 	ReleaseSHA             string
 	MaximumPriorityFeeWei  string
-	SignalSink             SignalSink
+	// PrimaryDiscovery uses the discovery-only gateway endpoint in Production.
+	// Tests and pre-existing callers retain the fully dual screen endpoint.
+	PrimaryDiscovery               bool
+	ExactStateBudgetPerMinute      uint64
+	ExactDiscoveryReservePerMinute uint64
+	SignalSink                     SignalSink
 }
 
 type SignalSink interface {
 	RecordAaveSignal(context.Context, signal) (signal, error)
+}
+
+type ProviderAuthoritySink interface {
+	RecordProviderFailure(context.Context, string, time.Time) error
+	ResetProviderRecoveryEvidence(context.Context, string, time.Time) error
+}
+
+type ProviderRecoverySample struct {
+	ObservedAt           time.Time `json:"observed_at"`
+	PrimaryProvider      string    `json:"primary_provider"`
+	ConfirmationProvider string    `json:"confirmation_provider"`
 }
 
 type AtlasAuctionDispositionSink interface {
@@ -135,43 +155,47 @@ type LiveSizeAuthority interface {
 }
 
 type State struct {
-	Schema                             string            `json:"schema"`
-	DiscoverySHA256                    string            `json:"discovery_sha256"`
-	SourceAddressCount                 uint64            `json:"source_address_count"`
-	Cursor                             uint64            `json:"cursor"`
-	LastBlockNumber                    uint64            `json:"last_block_number"`
-	LastBlockHash                      string            `json:"last_block_hash"`
-	LastProviderPrimary                string            `json:"last_provider_primary"`
-	LastProviderSecond                 string            `json:"last_provider_secondary"`
-	LastBatchAt                        *time.Time        `json:"last_batch_at"`
-	LastTailAt                         *time.Time        `json:"last_tail_at"`
-	LastDualAgreementAt                *time.Time        `json:"last_dual_agreement_at,omitempty"`
-	TailNextBlock                      uint64            `json:"tail_next_block"`
-	DebtBearingCount                   uint64            `json:"debt_bearing_count"`
-	Counts                             map[string]uint64 `json:"counts"`
-	RouteIneligible                    map[string]string `json:"route_ineligible,omitempty"`
-	TailInvalidatedBlock               map[string]uint64 `json:"tail_invalidated_block,omitempty"`
-	ExactQueueCount                    uint64            `json:"exact_queue_count"`
-	LastExactAdmissionAt               *time.Time        `json:"last_exact_admission_at,omitempty"`
-	IncompleteCount                    uint64            `json:"incomplete_count"`
-	LastErrorClass                     string            `json:"last_error_class,omitempty"`
-	LastAttemptAt                      *time.Time        `json:"last_attempt_at,omitempty"`
-	StartupRetryCount                  uint64            `json:"startup_retry_count,omitempty"`
-	ProviderCircuitOpenTotal           uint64            `json:"provider_circuit_open_total"`
-	ProviderCircuitSkippedTotal        uint64            `json:"provider_circuit_skipped_total"`
-	ProviderCircuitOpenUntilUnixMillis int64             `json:"provider_circuit_open_until_unix_millis"`
-	HotQueueSize                       uint64            `json:"hot_queue_size"`
-	LiquidatableHotCount               uint64            `json:"liquidatable_hot_count"`
-	UrgentHotCount                     uint64            `json:"urgent_hot_count"`
-	ExactEligibleNowCount              uint64            `json:"-"`
-	SchedulerBlockedCount              uint64            `json:"-"`
-	CooldownBlockedCount               uint64            `json:"-"`
-	RouteIneligibleCount               uint64            `json:"-"`
-	ProviderBlockedCount               uint64            `json:"-"`
-	AuthorityBlockedCount              uint64            `json:"-"`
-	ExactEvaluationsInFlight           uint64            `json:"-"`
-	OldestExactEligibleAgeMillis       uint64            `json:"-"`
-	ActiveForkPendingCount             uint64            `json:"-"`
+	Schema                             string                   `json:"schema"`
+	DiscoverySHA256                    string                   `json:"discovery_sha256"`
+	SourceAddressCount                 uint64                   `json:"source_address_count"`
+	Cursor                             uint64                   `json:"cursor"`
+	LastBlockNumber                    uint64                   `json:"last_block_number"`
+	LastBlockHash                      string                   `json:"last_block_hash"`
+	LastProviderPrimary                string                   `json:"last_provider_primary"`
+	LastProviderSecond                 string                   `json:"last_provider_secondary"`
+	ProviderRecoverySamples            []ProviderRecoverySample `json:"provider_recovery_samples,omitempty"`
+	LastBatchAt                        *time.Time               `json:"last_batch_at"`
+	LastTailAt                         *time.Time               `json:"last_tail_at"`
+	LastDualAgreementAt                *time.Time               `json:"last_dual_agreement_at,omitempty"`
+	TailNextBlock                      uint64                   `json:"tail_next_block"`
+	DebtBearingCount                   uint64                   `json:"debt_bearing_count"`
+	Counts                             map[string]uint64        `json:"counts"`
+	RouteIneligible                    map[string]string        `json:"route_ineligible,omitempty"`
+	TailInvalidatedBlock               map[string]uint64        `json:"tail_invalidated_block,omitempty"`
+	ExactQueueCount                    uint64                   `json:"exact_queue_count"`
+	LastExactAdmissionAt               *time.Time               `json:"last_exact_admission_at,omitempty"`
+	ExactBudgetTokensMilli             uint64                   `json:"exact_budget_tokens_milli,omitempty"`
+	ExactBudgetUpdatedAt               *time.Time               `json:"exact_budget_updated_at,omitempty"`
+	ExactAverageStateRequestsMilli     uint64                   `json:"exact_average_state_requests_milli,omitempty"`
+	IncompleteCount                    uint64                   `json:"incomplete_count"`
+	LastErrorClass                     string                   `json:"last_error_class,omitempty"`
+	LastAttemptAt                      *time.Time               `json:"last_attempt_at,omitempty"`
+	StartupRetryCount                  uint64                   `json:"startup_retry_count,omitempty"`
+	ProviderCircuitOpenTotal           uint64                   `json:"provider_circuit_open_total"`
+	ProviderCircuitSkippedTotal        uint64                   `json:"provider_circuit_skipped_total"`
+	ProviderCircuitOpenUntilUnixMillis int64                    `json:"provider_circuit_open_until_unix_millis"`
+	HotQueueSize                       uint64                   `json:"hot_queue_size"`
+	LiquidatableHotCount               uint64                   `json:"liquidatable_hot_count"`
+	UrgentHotCount                     uint64                   `json:"urgent_hot_count"`
+	ExactEligibleNowCount              uint64                   `json:"-"`
+	SchedulerBlockedCount              uint64                   `json:"-"`
+	CooldownBlockedCount               uint64                   `json:"-"`
+	RouteIneligibleCount               uint64                   `json:"-"`
+	ProviderBlockedCount               uint64                   `json:"-"`
+	AuthorityBlockedCount              uint64                   `json:"-"`
+	ExactEvaluationsInFlight           uint64                   `json:"-"`
+	OldestExactEligibleAgeMillis       uint64                   `json:"-"`
+	ActiveForkPendingCount             uint64                   `json:"-"`
 }
 
 type Screener struct {
@@ -194,6 +218,7 @@ type Screener struct {
 	lastExactAdmissionAt time.Time
 	hasDurableAdmission  bool
 	exactInFlight        uint64
+	exactStateRequests   uint64
 	wait                 func(context.Context, time.Duration) bool
 	now                  func() time.Time
 }
@@ -246,6 +271,18 @@ type screenResponse struct {
 	BlockHash     string         `json:"block_hash"`
 	Primary       providerScreen `json:"primary"`
 	Secondary     providerScreen `json:"secondary"`
+}
+
+// primaryScreenResponse is discovery-only.  A primary screen can enqueue an
+// Exact evaluation but it can never provide Candidate authority; resolveExact
+// always obtains fresh independent provider evidence first.
+type primaryScreenResponse struct {
+	SchemaVersion string         `json:"schema_version"`
+	ChainID       uint64         `json:"chain_id"`
+	RequestID     string         `json:"request_id"`
+	BlockNumber   uint64         `json:"block_number"`
+	BlockHash     string         `json:"block_hash"`
+	Primary       providerScreen `json:"primary"`
 }
 
 type exactRequest struct {
@@ -375,6 +412,8 @@ type signal struct {
 	AuthorityRejectionReason    string                  `json:"authority_rejection_reason,omitempty"`
 	SizeDiagnostics             []sizeDiagnostic        `json:"reviewed_size_diagnostics,omitempty"`
 	ExactDiagnostics            *exactDiagnosticSummary `json:"exact_diagnostics,omitempty"`
+	ExactPrimaryProvider        string                  `json:"exact_primary_provider,omitempty"`
+	ExactSecondaryProvider      string                  `json:"exact_secondary_provider,omitempty"`
 	ExecutionCandidate          *executionCandidate     `json:"-"`
 	AtlasCandidate              *atlasCandidate         `json:"-"`
 }
@@ -666,6 +705,15 @@ type approvalBody struct {
 }
 
 func New(config Config) (*Screener, error) {
+	if config.ExactStateBudgetPerMinute == 0 {
+		config.ExactStateBudgetPerMinute = defaultExactStateBudgetPerMinute
+	}
+	if config.ExactDiscoveryReservePerMinute == 0 {
+		config.ExactDiscoveryReservePerMinute = defaultExactDiscoveryReserve
+	}
+	if config.ExactDiscoveryReservePerMinute >= config.ExactStateBudgetPerMinute {
+		return nil, errors.New("hunter Exact RPC budget is invalid")
+	}
 	if !filepath.IsAbs(config.DiscoveryPath) || !filepath.IsAbs(config.StateDir) {
 		return nil, errors.New("hunter paths must be absolute")
 	}
@@ -721,6 +769,9 @@ func New(config Config) (*Screener, error) {
 	if err := s.loadHotSignals(); err != nil {
 		return nil, err
 	}
+	s.mu.Lock()
+	s.initializeExactBudgetLocked(s.nowUTC())
+	s.mu.Unlock()
 	return s, nil
 }
 
@@ -933,7 +984,7 @@ func (s *Screener) Snapshot() State {
 				copy.AuthorityBlockedCount++
 				continue
 			}
-			if exactAdmissionBlocked(now, s.lastExactAdmissionAt) {
+			if s.exactAdmissionBlockedLocked(now) {
 				copy.SchedulerBlockedCount++
 				continue
 			}
@@ -1190,6 +1241,9 @@ func (s *Screener) openProviderCircuitLocked(now time.Time, class string, cooldo
 		}
 	}
 	s.state.ProviderCircuitOpenUntilUnixMillis = now.Add(cooldown).UnixMilli()
+	s.state.ProviderRecoverySamples = nil
+	s.state.LastDualAgreementAt = nil
+	s.state.LastProviderSecond = ""
 	return s.recordProviderDegradationLocked(now, class)
 }
 
@@ -1205,7 +1259,37 @@ func (s *Screener) RecordRetryableGatewayError(err error) (bool, error) {
 	if err := s.openProviderCircuit(class, cooldown); err != nil {
 		return false, err
 	}
+	if sink, ok := s.config.SignalSink.(ProviderAuthoritySink); ok {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := sink.RecordProviderFailure(ctx, class, s.nowUTC()); err != nil {
+			return false, err
+		}
+	}
 	return true, nil
+}
+
+// ResetProviderRecoveryEvidence is called on every process start. Agreement
+// samples from a previous process can never satisfy a new recovery window.
+func (s *Screener) ResetProviderRecoveryEvidence(ctx context.Context) error {
+	now := s.nowUTC()
+	s.mu.Lock()
+	s.state.ProviderRecoverySamples = nil
+	s.state.LastDualAgreementAt = nil
+	s.state.LastProviderSecond = ""
+	if s.state.LastErrorClass == "" {
+		s.state.LastErrorClass = "observer_restart"
+	}
+	s.state.LastAttemptAt = &now
+	err := s.persistStateLocked()
+	s.mu.Unlock()
+	if err != nil {
+		return err
+	}
+	if sink, ok := s.config.SignalSink.(ProviderAuthoritySink); ok {
+		return sink.ResetProviderRecoveryEvidence(ctx, "observer_restart", now)
+	}
+	return nil
 }
 
 func retryableProviderError(err error) (string, time.Duration, bool) {
@@ -1485,9 +1569,80 @@ func exactEligibleSince(firstLiquidatableAt, lastExactAt time.Time, served bool)
 	return eligibleSince
 }
 
-func exactAdmissionBlocked(now, lastAdmission time.Time) bool {
-	return !lastAdmission.IsZero() &&
-		(now.Before(lastAdmission) || now.Sub(lastAdmission) < exactAdmissionCadence)
+func (s *Screener) initializeExactBudgetLocked(now time.Time) {
+	if s.state.ExactAverageStateRequestsMilli == 0 {
+		s.state.ExactAverageStateRequestsMilli = defaultExactRequestEstimateMilli
+	}
+	if s.state.ExactBudgetUpdatedAt == nil || now.Before(s.state.ExactBudgetUpdatedAt.UTC()) {
+		s.state.ExactBudgetUpdatedAt = &now
+		s.state.ExactBudgetTokensMilli = s.state.ExactAverageStateRequestsMilli
+	}
+	s.refillExactBudgetLocked(now)
+}
+
+func (s *Screener) refillExactBudgetLocked(now time.Time) {
+	if s.state.ExactAverageStateRequestsMilli == 0 {
+		s.state.ExactAverageStateRequestsMilli = defaultExactRequestEstimateMilli
+	}
+	if s.state.ExactBudgetUpdatedAt == nil {
+		s.state.ExactBudgetUpdatedAt = &now
+		s.state.ExactBudgetTokensMilli = s.state.ExactAverageStateRequestsMilli
+		return
+	}
+	last := s.state.ExactBudgetUpdatedAt.UTC()
+	if now.Before(last) {
+		s.state.ExactBudgetTokensMilli = 0
+		s.state.ExactBudgetUpdatedAt = &now
+		return
+	}
+	total := s.config.ExactStateBudgetPerMinute
+	reserve := s.config.ExactDiscoveryReservePerMinute
+	if total == 0 {
+		total = defaultExactStateBudgetPerMinute
+	}
+	if reserve == 0 {
+		reserve = defaultExactDiscoveryReserve
+	}
+	if reserve >= total {
+		reserve = total - 1
+	}
+	effective := total - reserve
+	elapsedMillis := uint64(now.Sub(last) / time.Millisecond)
+	added := elapsedMillis * effective * 1_000 / 60_000
+	capacity := s.state.ExactAverageStateRequestsMilli
+	s.state.ExactBudgetTokensMilli = min(s.state.ExactBudgetTokensMilli+added, capacity)
+	s.state.ExactBudgetUpdatedAt = &now
+}
+
+func (s *Screener) exactAdmissionBlockedLocked(now time.Time) bool {
+	s.refillExactBudgetLocked(now)
+	return s.state.ExactBudgetTokensMilli < s.state.ExactAverageStateRequestsMilli
+}
+
+func (s *Screener) admitExactLocked(now time.Time) (uint64, bool) {
+	if s.exactAdmissionBlockedLocked(now) {
+		return 0, false
+	}
+	reserved := s.state.ExactAverageStateRequestsMilli
+	s.state.ExactBudgetTokensMilli -= reserved
+	s.lastExactAdmissionAt = now
+	s.hasDurableAdmission = true
+	s.state.LastExactAdmissionAt = &now
+	return reserved, true
+}
+
+func (s *Screener) settleExactBudgetLocked(reservedMilli, actualRequests uint64) {
+	actualMilli := max(actualRequests, 1) * 1_000
+	if actualMilli > reservedMilli {
+		s.state.ExactBudgetTokensMilli = s.state.ExactBudgetTokensMilli - min(s.state.ExactBudgetTokensMilli, actualMilli-reservedMilli)
+	}
+	s.state.ExactAverageStateRequestsMilli = (3*s.state.ExactAverageStateRequestsMilli + actualMilli) / 4
+}
+
+func (s *Screener) recordExactStateRequest() {
+	s.mu.Lock()
+	s.exactStateRequests++
+	s.mu.Unlock()
 }
 
 func (s *Screener) schedulerAccountOrder(accounts []account) []int {
@@ -1577,10 +1732,12 @@ func (s *Screener) nextHotBatch() []string {
 			}
 			if !entries[i].eligibleSince.Equal(entries[j].eligibleSince) {
 				if entries[i].eligibleSince.IsZero() {
-					return true
+					// A newly arrived borrower has no durable wait epoch yet.
+					// Never let it jump an already-waiting never-served borrower.
+					return false
 				}
 				if entries[j].eligibleSince.IsZero() {
-					return false
+					return true
 				}
 				return entries[i].eligibleSince.Before(entries[j].eligibleSince)
 			}
@@ -1610,7 +1767,11 @@ func (s *Screener) screen(ctx context.Context, borrowers []string, advanceSeed b
 	cursor := s.Snapshot().Cursor
 	requestID := fmt.Sprintf("aave-%d-%d", cursor, time.Now().UnixMilli())
 	body, _ := json.Marshal(screenRequest{SchemaVersion: RequestSchema, ChainID: 42161, RequestID: requestID, Borrowers: borrowers})
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, s.config.GatewayURL+"/v1/aave/screen", bytes.NewReader(body))
+	discoveryPath := "/v1/aave/screen"
+	if s.config.PrimaryDiscovery {
+		discoveryPath = "/v1/aave/screen-primary"
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, s.config.GatewayURL+discoveryPath, bytes.NewReader(body))
 	if err != nil {
 		return err
 	}
@@ -1623,12 +1784,36 @@ func (s *Screener) screen(ctx context.Context, borrowers []string, advanceSeed b
 	if response.StatusCode != http.StatusOK {
 		return decodeGatewayError(response)
 	}
-	var result screenResponse
-	if err := json.NewDecoder(io.LimitReader(response.Body, maximumResponse)).Decode(&result); err != nil {
-		return err
-	}
-	if result.SchemaVersion != ResponseSchema || result.ChainID != 42161 || result.RequestID != requestID || result.BlockNumber == 0 || len(result.BlockHash) != 66 || result.Primary.ProviderID == result.Secondary.ProviderID || result.Primary.WETHPriceBase != result.Secondary.WETHPriceBase || len(result.Primary.Accounts) != len(borrowers) || len(result.Secondary.Accounts) != len(borrowers) {
-		return errors.New("gateway Aave evidence is incomplete")
+	var screenBlockNumber uint64
+	var screenBlockHash string
+	var primaryEvidence providerScreen
+	var fullDiscoveryEvidence bool
+	var discoverySecondaryProvider string
+	if s.config.PrimaryDiscovery {
+		var result primaryScreenResponse
+		if err := json.NewDecoder(io.LimitReader(response.Body, maximumResponse)).Decode(&result); err != nil {
+			return err
+		}
+		if result.SchemaVersion != PrimaryScreenResponseSchema || result.ChainID != 42161 || result.RequestID != requestID || result.BlockNumber == 0 || len(result.BlockHash) != 66 || result.Primary.ProviderID == "" || result.Primary.WETHPriceBase == "0" || len(result.Primary.Accounts) != len(borrowers) {
+			return errors.New("gateway Aave primary discovery evidence is incomplete")
+		}
+		screenBlockNumber, screenBlockHash, primaryEvidence = result.BlockNumber, result.BlockHash, result.Primary
+	} else {
+		var result screenResponse
+		if err := json.NewDecoder(io.LimitReader(response.Body, maximumResponse)).Decode(&result); err != nil {
+			return err
+		}
+		if result.SchemaVersion != ResponseSchema || result.ChainID != 42161 || result.RequestID != requestID || result.BlockNumber == 0 || len(result.BlockHash) != 66 || result.Primary.ProviderID == result.Secondary.ProviderID || result.Primary.WETHPriceBase != result.Secondary.WETHPriceBase || len(result.Primary.Accounts) != len(borrowers) || len(result.Secondary.Accounts) != len(borrowers) {
+			return errors.New("gateway Aave evidence is incomplete")
+		}
+		for index := range result.Primary.Accounts {
+			if result.Primary.Accounts[index] != result.Secondary.Accounts[index] {
+				return errors.New("gateway Aave providers disagree")
+			}
+		}
+		screenBlockNumber, screenBlockHash, primaryEvidence = result.BlockNumber, result.BlockHash, result.Primary
+		discoverySecondaryProvider = result.Secondary.ProviderID
+		fullDiscoveryEvidence = true
 	}
 	previousAuthorityDiverged := s.Snapshot().LastErrorClass == revenueLaneAuthorityDivergedClass
 	authorityDiverged := false
@@ -1640,11 +1825,26 @@ func (s *Screener) screen(ctx context.Context, borrowers []string, advanceSeed b
 			authorityDiverged = true
 		}
 	}
+	if authorityDiverged {
+		if sink, ok := s.config.SignalSink.(ProviderAuthoritySink); ok {
+			if err := sink.RecordProviderFailure(ctx, revenueLaneAuthorityDivergedClass, s.nowUTC()); err != nil {
+				return err
+			}
+		}
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.ensureHotMapsLocked()
+	if previousAuthorityDiverged && !authorityDiverged {
+		// The control pair is coherent again, so discovery can be healthy, but
+		// only three subsequent authority-bearing Exact agreements may reopen
+		// execution authority.
+		s.state.LastErrorClass = "provider_recovery_requires_exact"
+	}
+	var exactPrimaryProvider, exactSecondaryProvider string
+	var exactRecoveryAt time.Time
 	for _, borrower := range borrowers {
-		if invalidatedBlock := s.state.TailInvalidatedBlock[borrower]; invalidatedBlock > result.BlockNumber {
+		if invalidatedBlock := s.state.TailInvalidatedBlock[borrower]; invalidatedBlock > screenBlockNumber {
 			return errors.New("gateway Aave screen predates tail invalidation")
 		}
 	}
@@ -1653,10 +1853,10 @@ func (s *Screener) screen(ctx context.Context, borrowers []string, advanceSeed b
 	if authorityDiverged && !previousAuthorityDiverged {
 		s.state.Counts[revenueLaneAuthorityDivergedKey]++
 	}
-	for _, index := range s.schedulerAccountOrder(result.Primary.Accounts) {
-		primary := result.Primary.Accounts[index]
-		if primary != result.Secondary.Accounts[index] || primary.Borrower != borrowers[index] {
-			return errors.New("gateway Aave providers disagree")
+	for _, index := range s.schedulerAccountOrder(primaryEvidence.Accounts) {
+		primary := primaryEvidence.Accounts[index]
+		if primary.Borrower != borrowers[index] {
+			return errors.New("gateway Aave primary discovery is incomplete")
 		}
 		bucket := classify(primary.TotalDebtBase, primary.HealthFactorWAD)
 		if bucket == "liquidatable" || bucket == "urgent" || bucket == "watch" {
@@ -1681,12 +1881,12 @@ func (s *Screener) screen(ctx context.Context, borrowers []string, advanceSeed b
 		if err := s.updateBorrowerActivityLocked(primary.Borrower, primary.TotalDebtBase != "0"); err != nil {
 			return err
 		}
-		record := signal{Schema: "phoenix.atlas-aave-hunting-signal.v1", ObservedAt: s.nowUTC(), Cursor: cursor + uint64(index), Block: result.BlockNumber, BlockHash: result.BlockHash, Borrower: primary.Borrower, DebtBase: primary.TotalDebtBase, HF: primary.HealthFactorWAD, Bucket: bucket, Authority: false, TerminalOutcome: "prefiltered"}
+		record := signal{Schema: "phoenix.atlas-aave-hunting-signal.v1", ObservedAt: s.nowUTC(), Cursor: cursor + uint64(index), Block: screenBlockNumber, BlockHash: screenBlockHash, Borrower: primary.Borrower, DebtBase: primary.TotalDebtBase, HF: primary.HealthFactorWAD, Bucket: bucket, Authority: false, TerminalOutcome: "prefiltered"}
 		if bucket != "liquidatable" {
 			delete(s.hotUpperPositive, primary.Borrower)
 		}
 		if bucket == "liquidatable" {
-			upper, upperErr := generousUpperBound(primary, result.Primary.WETHPriceBase)
+			upper, upperErr := generousUpperBound(primary, primaryEvidence.WETHPriceBase)
 			if upperErr != nil {
 				s.hotUpperPositive[primary.Borrower] = false
 				bucket = "incomplete"
@@ -1706,10 +1906,10 @@ func (s *Screener) screen(ctx context.Context, borrowers []string, advanceSeed b
 		}
 		if record.TerminalOutcome == "exact_pending" && authorityDiverged {
 			record.ExactDeferredReason = revenueLaneAuthorityDivergedClass
-		} else if record.TerminalOutcome == "exact_pending" && exactAuthorityWasDegraded {
+		} else if record.TerminalOutcome == "exact_pending" && exactAuthorityWasDegraded && !s.config.PrimaryDiscovery {
 			record.ExactDeferredReason = "provider_recovery_requires_fresh_screen"
 		}
-		if record.TerminalOutcome == "exact_pending" && !exactAuthorityWasDegraded && !authorityDiverged {
+		if record.TerminalOutcome == "exact_pending" && !authorityDiverged && (!exactAuthorityWasDegraded || s.config.PrimaryDiscovery) {
 			now := s.nowUTC()
 			routeReason, knownRouteIneligible := s.state.RouteIneligible[primary.Borrower]
 			lastExact, recentlyResolved := s.lastExactAt[primary.Borrower]
@@ -1729,7 +1929,7 @@ func (s *Screener) screen(ctx context.Context, borrowers []string, advanceSeed b
 					s.state.Counts = make(map[string]uint64)
 				}
 				s.state.Counts[exactDeferredCooldownKey]++
-			} else if exactAdmissionBlocked(now, s.lastExactAdmissionAt) {
+			} else if s.exactAdmissionBlockedLocked(now) {
 				record.ExactDeferredReason = "scheduler_capacity"
 				s.state.Counts[exactDeferredSchedulerKey]++
 			} else {
@@ -1741,9 +1941,13 @@ func (s *Screener) screen(ctx context.Context, borrowers []string, advanceSeed b
 					s.state.Counts[routeIneligibleRechecksKey]++
 				}
 				exactStartedAt := s.nowUTC()
-				s.lastExactAdmissionAt = exactStartedAt
-				s.hasDurableAdmission = true
-				s.state.LastExactAdmissionAt = &exactStartedAt
+				reservedMilli, admitted := s.admitExactLocked(exactStartedAt)
+				if !admitted {
+					record.ExactDeferredReason = "scheduler_capacity"
+					s.state.Counts[exactDeferredSchedulerKey]++
+					continue
+				}
+				s.exactStateRequests = 0
 				s.state.Counts[exactEvalStartedKey]++
 				// Persist the global admission before issuing any Exact RPC. A
 				// provider error or process restart must not reopen the 60-second
@@ -1757,6 +1961,7 @@ func (s *Screener) screen(ctx context.Context, borrowers []string, advanceSeed b
 				exactRecord, exactErr := s.resolveExact(ctx, record, auction)
 				s.mu.Lock()
 				s.exactInFlight--
+				s.settleExactBudgetLocked(reservedMilli, s.exactStateRequests)
 				if exactErr != nil {
 					if !errors.Is(exactErr, errRevenueLaneAuthorityDiverged) {
 						return exactErr
@@ -1795,6 +2000,12 @@ func (s *Screener) screen(ctx context.Context, borrowers []string, advanceSeed b
 						delete(s.firstLiquidatableAt, primary.Borrower)
 					}
 					record = exactRecord
+					if exactAuthorityWasDegraded {
+						record = withoutCandidateAuthority(record, "provider_recovery_sample")
+					}
+					exactPrimaryProvider = record.ExactPrimaryProvider
+					exactSecondaryProvider = record.ExactSecondaryProvider
+					exactRecoveryAt = exactCompletedAt
 					record.ExactCompletedAt = &exactCompletedAt
 					record.ExactDiagnostics = buildExactDiagnosticSummary(
 						record,
@@ -1868,14 +2079,32 @@ func (s *Screener) screen(ctx context.Context, borrowers []string, advanceSeed b
 	if advanceSeed {
 		s.state.Cursor += uint64(len(borrowers))
 	}
-	s.state.LastBlockNumber = result.BlockNumber
-	s.state.LastBlockHash = result.BlockHash
-	s.state.LastProviderPrimary = result.Primary.ProviderID
-	s.state.LastProviderSecond = result.Secondary.ProviderID
+	s.state.LastBlockNumber = screenBlockNumber
+	s.state.LastBlockHash = screenBlockHash
+	s.state.LastProviderPrimary = primaryEvidence.ProviderID
 	s.state.LastBatchAt = &now
-	s.state.LastDualAgreementAt = &now
-	s.recordProviderRecoveryLocked(now)
+	// A successful primary discovery is deliberately not a provider recovery
+	// signal.  Only a fresh Exact response contains independent final evidence.
+	if exactPrimaryProvider != "" && exactSecondaryProvider != "" && exactPrimaryProvider != exactSecondaryProvider {
+		s.state.LastProviderPrimary = exactPrimaryProvider
+		s.state.LastProviderSecond = exactSecondaryProvider
+		s.state.LastDualAgreementAt = &now
+		s.recordProviderRecoveryLocked(exactRecoveryAt, exactPrimaryProvider, exactSecondaryProvider)
+	} else if fullDiscoveryEvidence && s.state.LastErrorClass == "" {
+		// Compatibility path for existing callers: a fully matched screen is
+		// itself independent evidence only outside a recovery window. Production
+		// recovery always uses the Exact-only branch above.
+		s.state.LastDualAgreementAt = &now
+		s.recordProviderRecoveryLocked(now, primaryEvidence.ProviderID, discoverySecondaryProvider)
+	} else if fullDiscoveryEvidence {
+		// A successful matched discovery closes the transport circuit so Exact
+		// probes may resume, but it never counts toward recovery authority.
+		s.state.ProviderCircuitOpenUntilUnixMillis = 0
+	}
 	if authorityDiverged {
+		s.state.ProviderRecoverySamples = nil
+		s.state.LastDualAgreementAt = nil
+		s.state.LastProviderSecond = ""
 		s.state.LastErrorClass = revenueLaneAuthorityDivergedClass
 		s.state.LastAttemptAt = &now
 	}
@@ -1974,6 +2203,7 @@ func (s *Screener) resolveExact(ctx context.Context, record signal, auction *obs
 		return record, err
 	}
 	req.Header.Set("Content-Type", "application/json")
+	s.recordExactStateRequest()
 	response, err := s.client.Do(req)
 	if err != nil {
 		return record, err
@@ -1992,6 +2222,8 @@ func (s *Screener) resolveExact(ctx context.Context, record signal, auction *obs
 	if result.BlockNumber < record.Block {
 		return record, errors.New("exact Aave evidence predates its dual screen")
 	}
+	record.ExactPrimaryProvider = result.Primary.ProviderID
+	record.ExactSecondaryProvider = result.Secondary.ProviderID
 	record.Block = result.BlockNumber
 	record.BlockHash = result.BlockHash
 	record.StateRoot = result.StateRoot
@@ -2117,6 +2349,7 @@ func (s *Screener) fetchExactSnapshot(ctx context.Context, borrower string) (exa
 		return exactResponse{}, err
 	}
 	req.Header.Set("Content-Type", "application/json")
+	s.recordExactStateRequest()
 	response, err := s.client.Do(req)
 	if err != nil {
 		return exactResponse{}, err
@@ -3153,6 +3386,7 @@ func (s *Screener) simulateExactBatchChunk(ctx context.Context, record signal, s
 	if client == nil {
 		client = s.client
 	}
+	s.recordExactStateRequest()
 	response, err := client.Do(req)
 	if err != nil {
 		return nil, err
@@ -3417,12 +3651,33 @@ func providerDegradationClassKey(class string) string {
 	}
 }
 
-func (s *Screener) recordProviderRecoveryLocked(now time.Time) {
+func (s *Screener) recordProviderRecoveryLocked(now time.Time, primary, confirmation string) {
 	if s.state.Counts == nil {
 		s.state.Counts = make(map[string]uint64)
 	}
+	if primary != "" && confirmation != "" && primary != confirmation {
+		collecting := s.state.LastErrorClass != "" || s.state.Counts[providerDegradedSinceMillisKey] > 0
+		if collecting && len(s.state.ProviderRecoverySamples) > 0 {
+			last := s.state.ProviderRecoverySamples[len(s.state.ProviderRecoverySamples)-1].ObservedAt
+			if !now.After(last) || now.Sub(last) > inMemoryProviderRecoveryWindow {
+				s.state.ProviderRecoverySamples = nil
+			}
+		}
+		s.state.ProviderRecoverySamples = append(s.state.ProviderRecoverySamples, ProviderRecoverySample{
+			ObservedAt: now, PrimaryProvider: primary, ConfirmationProvider: confirmation,
+		})
+		if len(s.state.ProviderRecoverySamples) > 3 {
+			s.state.ProviderRecoverySamples = append([]ProviderRecoverySample(nil), s.state.ProviderRecoverySamples[len(s.state.ProviderRecoverySamples)-3:]...)
+		}
+	}
+	// A successful independent request proves the circuit is currently closed,
+	// but does not restore Exact authority until all three samples exist.
 	s.state.ProviderCircuitOpenUntilUnixMillis = 0
 	degradedSince := s.state.Counts[providerDegradedSinceMillisKey]
+	collecting := s.state.LastErrorClass != "" || degradedSince > 0
+	if collecting && len(s.state.ProviderRecoverySamples) < 3 {
+		return
+	}
 	if degradedSince > 0 {
 		s.state.Counts[providerRecoverySuccessTotalKey]++
 		s.state.Counts[providerLastRecoveryAtMillisKey] = uint64(now.UnixMilli())
