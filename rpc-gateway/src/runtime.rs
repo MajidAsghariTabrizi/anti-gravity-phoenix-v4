@@ -115,6 +115,12 @@ type SharedBundleResult = Option<Result<ProviderBundle, GatewayError>>;
 type SharedVerificationResult = Option<Result<VerificationEvidence, GatewayError>>;
 type SharedHeadResult = Option<Result<HeadSnapshot, GatewayError>>;
 
+type AaveExactProviderResult = (
+    AaveExactProviderState,
+    String,
+    Option<(String, AaveExactStaticContext)>,
+);
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct AaveSimulationEvidence {
     realized_profit: U256,
@@ -144,6 +150,17 @@ struct AaveExactStaticContext {
 struct PinnedBlockState {
     block: PinnedBlock,
     state_root: String,
+}
+
+fn aave_exact_provider_states_equal(
+    first: &AaveExactProviderState,
+    second: &AaveExactProviderState,
+) -> bool {
+    let mut first = first.clone();
+    let mut second = second.clone();
+    first.provider_id.clear();
+    second.provider_id.clear();
+    first == second
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -987,12 +1004,60 @@ impl GatewayRuntime {
         self.ensure_provider_verified_paced(&secondary, pacing_deadline)
             .await
             .map_err(map_call_failure)?;
-        let finalized = self
-            .common_finalized_block_state_paced(&primary, &secondary, pacing_deadline)
+        let primary_finalized = self
+            .provider_block_state_paced(
+                &primary,
+                "finalized",
+                ProviderSlot::Primary,
+                pacing_deadline,
+            )
             .await?;
+        let secondary_finalized = self
+            .provider_block_state_paced(
+                &secondary,
+                "finalized",
+                ProviderSlot::Secondary,
+                pacing_deadline,
+            )
+            .await?;
+        let mut selected_primary = primary.clone();
+        let mut selected_secondary = secondary.clone();
+        let mut finalized = primary_finalized.clone();
+        if primary_finalized != secondary_finalized {
+            self.metrics.provider_disagreement();
+            let availability = self
+                .reserve_provider(&HashSet::from([
+                    primary.provider_id().to_string(),
+                    secondary.provider_id().to_string(),
+                ]))
+                .await
+                .ok_or(GatewayError::ProviderDisagreement)?;
+            self.ensure_provider_verified_paced(&availability, pacing_deadline)
+                .await
+                .map_err(map_call_failure)?;
+            let availability_finalized = self
+                .provider_block_state_paced(
+                    &availability,
+                    "finalized",
+                    ProviderSlot::Secondary,
+                    pacing_deadline,
+                )
+                .await?;
+            if availability_finalized == primary_finalized {
+                self.mark_provider_failure(secondary.provider_id()).await;
+                selected_secondary = availability;
+            } else if availability_finalized == secondary_finalized {
+                self.mark_provider_failure(primary.provider_id()).await;
+                selected_primary = secondary.clone();
+                selected_secondary = availability;
+                finalized = secondary_finalized;
+            } else {
+                return Err(GatewayError::ProviderDisagreement);
+            }
+        }
         let (primary_state, primary_root, primary_pending_context) = self
             .perform_aave_exact(
-                &primary,
+                &selected_primary,
                 &request,
                 &finalized.block,
                 &finalized.state_root,
@@ -1002,7 +1067,7 @@ impl GatewayRuntime {
             .await?;
         let (secondary_state, secondary_root, secondary_pending_context) = self
             .perform_aave_exact(
-                &secondary,
+                &selected_secondary,
                 &request,
                 &finalized.block,
                 &finalized.state_root,
@@ -1010,27 +1075,99 @@ impl GatewayRuntime {
                 pacing_deadline,
             )
             .await?;
-        if primary_root != secondary_root {
+        let mut selected_primary_state = primary_state;
+        let mut selected_primary_root = primary_root;
+        let mut selected_primary_pending_context = primary_pending_context;
+        let mut selected_secondary_state = secondary_state;
+        let mut selected_secondary_root = secondary_root;
+        let mut selected_secondary_pending_context = secondary_pending_context;
+        if selected_primary_root != selected_secondary_root
+            || !aave_exact_provider_states_equal(&selected_primary_state, &selected_secondary_state)
+        {
+            self.metrics.provider_disagreement();
+            if selected_primary.provider_id() != primary.provider_id()
+                || selected_secondary.provider_id() != secondary.provider_id()
+            {
+                return Err(GatewayError::ProviderDisagreement);
+            }
+            let availability = self
+                .reserve_provider(&HashSet::from([
+                    primary.provider_id().to_string(),
+                    secondary.provider_id().to_string(),
+                ]))
+                .await
+                .ok_or(GatewayError::ProviderDisagreement)?;
+            self.ensure_provider_verified_paced(&availability, pacing_deadline)
+                .await
+                .map_err(map_call_failure)?;
+            let availability_finalized = self
+                .provider_block_state_paced(
+                    &availability,
+                    "finalized",
+                    ProviderSlot::Secondary,
+                    pacing_deadline,
+                )
+                .await?;
+            if availability_finalized != finalized {
+                return Err(GatewayError::ProviderDisagreement);
+            }
+            let (availability_state, availability_root, availability_pending_context) = self
+                .perform_aave_exact(
+                    &availability,
+                    &request,
+                    &finalized.block,
+                    &finalized.state_root,
+                    ProviderSlot::Secondary,
+                    pacing_deadline,
+                )
+                .await?;
+            let availability_matches_primary = selected_primary_root == availability_root
+                && aave_exact_provider_states_equal(&selected_primary_state, &availability_state);
+            let availability_matches_secondary = selected_secondary_root == availability_root
+                && aave_exact_provider_states_equal(&selected_secondary_state, &availability_state);
+            if availability_matches_primary {
+                self.mark_provider_failure(secondary.provider_id()).await;
+                selected_secondary = availability;
+                selected_secondary_state = availability_state;
+                selected_secondary_root = availability_root;
+                selected_secondary_pending_context = availability_pending_context;
+            } else if availability_matches_secondary {
+                self.mark_provider_failure(primary.provider_id()).await;
+                selected_primary = secondary.clone();
+                selected_primary_state = selected_secondary_state;
+                selected_primary_root = selected_secondary_root;
+                selected_primary_pending_context = selected_secondary_pending_context;
+                selected_secondary = availability;
+                selected_secondary_state = availability_state;
+                selected_secondary_root = availability_root;
+                selected_secondary_pending_context = availability_pending_context;
+            } else {
+                return Err(GatewayError::ProviderDisagreement);
+            }
+        }
+        if selected_primary_root != selected_secondary_root {
             return Err(GatewayError::ProviderDisagreement);
         }
-        self.mark_provider_success(primary.provider_id()).await;
-        self.mark_provider_success(secondary.provider_id()).await;
+        self.mark_provider_success(selected_primary.provider_id())
+            .await;
+        self.mark_provider_success(selected_secondary.provider_id())
+            .await;
         let response = AaveExactResponse {
             schema_version: AAVE_EXACT_RESPONSE_SCHEMA.to_string(),
             chain_id: ARBITRUM_ONE_CHAIN_ID,
             request_id: request.request_id.clone(),
             block_number: finalized.block.number,
             block_hash: finalized.block.hash,
-            state_root: primary_root,
-            primary: primary_state,
-            secondary: secondary_state,
+            state_root: selected_primary_root,
+            primary: selected_primary_state,
+            secondary: selected_secondary_state,
             resolved_at_unix_ms: unix_time_ms(),
         };
         response
             .validate(&request)
             .map_err(|_| GatewayError::ProviderDisagreement)?;
         let now = Instant::now();
-        if let Some((key, context)) = primary_pending_context {
+        if let Some((key, context)) = selected_primary_pending_context {
             self.aave_exact_static_context_cache.lock().await.insert(
                 key,
                 context,
@@ -1038,7 +1175,7 @@ impl GatewayRuntime {
                 now,
             );
         }
-        if let Some((key, context)) = secondary_pending_context {
+        if let Some((key, context)) = selected_secondary_pending_context {
             self.aave_exact_static_context_cache.lock().await.insert(
                 key,
                 context,
@@ -1501,34 +1638,6 @@ impl GatewayRuntime {
             .await?;
         let secondary_head = self
             .provider_block(secondary, "finalized", ProviderSlot::Secondary)
-            .await?;
-        if primary_head != secondary_head {
-            return Err(GatewayError::ProviderDisagreement);
-        }
-        Ok(primary_head)
-    }
-
-    async fn common_finalized_block_state_paced(
-        &self,
-        primary: &ProviderLease,
-        secondary: &ProviderLease,
-        pacing_deadline: Instant,
-    ) -> Result<PinnedBlockState, GatewayError> {
-        let primary_head = self
-            .provider_block_state_paced(
-                primary,
-                "finalized",
-                ProviderSlot::Primary,
-                pacing_deadline,
-            )
-            .await?;
-        let secondary_head = self
-            .provider_block_state_paced(
-                secondary,
-                "finalized",
-                ProviderSlot::Secondary,
-                pacing_deadline,
-            )
             .await?;
         if primary_head != secondary_head {
             return Err(GatewayError::ProviderDisagreement);
@@ -2051,14 +2160,7 @@ impl GatewayRuntime {
         expected_state_root: &str,
         slot: ProviderSlot,
         pacing_deadline: Instant,
-    ) -> Result<
-        (
-            AaveExactProviderState,
-            String,
-            Option<(String, AaveExactStaticContext)>,
-        ),
-        GatewayError,
-    > {
+    ) -> Result<AaveExactProviderResult, GatewayError> {
         let block_quantity = format_quantity(block.number);
         let supported_assets = [ARBITRUM_WETH, ARBITRUM_NATIVE_USDC];
         let static_key =
@@ -5661,7 +5763,9 @@ mod tests {
         rate_limit_once: StdMutex<HashSet<String>>,
         source_receipt_failure: StdMutex<HashSet<String>>,
         disagreement: AtomicBool,
+        exact_primary_disagreement: AtomicBool,
         exact_disagreement: AtomicBool,
+        exact_availability_disagreement: AtomicBool,
         finalized_disagreement: AtomicBool,
         malformed_multicall: AtomicBool,
         delay_multicall: Duration,
@@ -5679,7 +5783,9 @@ mod tests {
                 rate_limit_once: StdMutex::new(HashSet::new()),
                 source_receipt_failure: StdMutex::new(HashSet::new()),
                 disagreement: AtomicBool::new(false),
+                exact_primary_disagreement: AtomicBool::new(false),
                 exact_disagreement: AtomicBool::new(false),
+                exact_availability_disagreement: AtomicBool::new(false),
                 finalized_disagreement: AtomicBool::new(false),
                 malformed_multicall: AtomicBool::new(false),
                 delay_multicall: Duration::ZERO,
@@ -5708,6 +5814,10 @@ mod tests {
 
         fn calls(&self) -> Vec<CallRecord> {
             self.calls.lock().unwrap().clone()
+        }
+
+        fn clear_calls(&self) {
+            self.calls.lock().unwrap().clear();
         }
 
         fn rate_limit_next_multicall(&self, provider_id: &str) {
@@ -5799,8 +5909,18 @@ mod tests {
                         [0xbf, 0x92, 0x85, 0x7c, ..] => {
                             let mut output = vec![0_u8; 32 * 6];
                             output[31] = 2;
-                            output[63] = if self.exact_disagreement.load(Ordering::Relaxed)
-                                && provider_id == "provider_1"
+                            output[63] = if self.exact_primary_disagreement.load(Ordering::Relaxed)
+                                && matches!(
+                                    provider_id,
+                                    "provider_0" | "production-nownodes-arbitrum"
+                                ) {
+                                2
+                            } else if self.exact_availability_disagreement.load(Ordering::Relaxed)
+                                && provider_id == "availability-slot-1"
+                            {
+                                3
+                            } else if self.exact_disagreement.load(Ordering::Relaxed)
+                                && matches!(provider_id, "provider_1" | "production-slot-0")
                             {
                                 2
                             } else {
@@ -5903,7 +6023,7 @@ mod tests {
                     let tag = params[0].as_str().unwrap();
                     let mut block = self.block_for_tag(tag);
                     if tag == "finalized"
-                        && provider.provider_id() == "provider_1"
+                        && matches!(provider.provider_id(), "provider_1" | "production-slot-0")
                         && self.finalized_disagreement.load(Ordering::Relaxed)
                     {
                         block.number = block.number.saturating_sub(1);
@@ -6290,6 +6410,198 @@ mod tests {
                 "production-nownodes-arbitrum".to_string(),
                 "availability-slot-1".to_string(),
             ])
+        );
+    }
+
+    #[tokio::test]
+    async fn aave_exact_uses_independent_availability_provider_to_resolve_preferred_disagreement() {
+        let client = Arc::new(ModelClient::default());
+        client.exact_disagreement.store(true, Ordering::Relaxed);
+        let config = parse_provider_config_with_ids(
+            "https://primary.example,https://preferred-confirmation.example,https://availability.example",
+            "100,2,1",
+            "production-nownodes-arbitrum,production-slot-0,availability-slot-1",
+        )
+        .unwrap();
+        let runtime = GatewayRuntime::with_limits(
+            config,
+            client.clone(),
+            MethodTimeouts {
+                eth_call: Duration::from_secs(2),
+                state_read: Duration::from_secs(2),
+                logs: Duration::from_secs(5),
+            },
+            RuntimeRpcMetrics::default(),
+            GatewayReadiness::new(true),
+            GatewayLimits {
+                state_requests_per_minute: 1_000,
+                upstream_calls_per_second: 1_000,
+                upstream_call_burst: 1_000,
+            },
+        );
+        mark_test_providers_verified(&runtime).await;
+
+        let exact = runtime
+            .resolve_aave_exact(aave_exact_request("semantic-fallback"))
+            .await
+            .unwrap();
+
+        assert_eq!(exact.primary.provider_id, "production-nownodes-arbitrum");
+        assert_eq!(exact.secondary.provider_id, "availability-slot-1");
+        assert_ne!(exact.primary.provider_id, exact.secondary.provider_id);
+        let providers = client
+            .calls()
+            .into_iter()
+            .map(|call| call.provider_id)
+            .collect::<HashSet<_>>();
+        assert_eq!(
+            providers,
+            HashSet::from([
+                "production-nownodes-arbitrum".to_string(),
+                "production-slot-0".to_string(),
+                "availability-slot-1".to_string(),
+            ])
+        );
+        let rendered = runtime.metrics().render(&runtime.readiness());
+        assert!(rendered.contains("rpc_provider_disagreement_total 1"));
+
+        client.exact_disagreement.store(false, Ordering::Relaxed);
+        client.clear_calls();
+        let retry = runtime
+            .resolve_aave_exact(aave_exact_request("semantic-fallback-retry"))
+            .await
+            .unwrap();
+        assert_eq!(retry.primary.provider_id, "production-nownodes-arbitrum");
+        assert_eq!(retry.secondary.provider_id, "availability-slot-1");
+        assert!(client
+            .calls()
+            .iter()
+            .all(|call| call.provider_id != "production-slot-0"));
+    }
+
+    #[tokio::test]
+    async fn aave_exact_uses_preferred_and_availability_when_primary_disagrees() {
+        let client = Arc::new(ModelClient::default());
+        client
+            .exact_primary_disagreement
+            .store(true, Ordering::Relaxed);
+        let config = parse_provider_config_with_ids(
+            "https://primary.example,https://preferred-confirmation.example,https://availability.example",
+            "100,2,1",
+            "production-nownodes-arbitrum,production-slot-0,availability-slot-1",
+        )
+        .unwrap();
+        let runtime = GatewayRuntime::with_limits(
+            config,
+            client.clone(),
+            MethodTimeouts {
+                eth_call: Duration::from_secs(2),
+                state_read: Duration::from_secs(2),
+                logs: Duration::from_secs(5),
+            },
+            RuntimeRpcMetrics::default(),
+            GatewayReadiness::new(true),
+            GatewayLimits {
+                state_requests_per_minute: 1_000,
+                upstream_calls_per_second: 1_000,
+                upstream_call_burst: 1_000,
+            },
+        );
+        mark_test_providers_verified(&runtime).await;
+
+        let exact = runtime
+            .resolve_aave_exact(aave_exact_request("primary-semantic-fallback"))
+            .await
+            .unwrap();
+
+        assert_eq!(exact.primary.provider_id, "production-slot-0");
+        assert_eq!(exact.secondary.provider_id, "availability-slot-1");
+        assert_ne!(exact.primary.provider_id, exact.secondary.provider_id);
+        assert_eq!(exact.primary.account, exact.secondary.account);
+        assert_eq!(exact.primary.reserves, exact.secondary.reserves);
+    }
+
+    #[tokio::test]
+    async fn aave_exact_resolves_finalized_head_disagreement_with_independent_availability() {
+        let client = Arc::new(ModelClient::default());
+        client.finalized_disagreement.store(true, Ordering::Relaxed);
+        let config = parse_provider_config_with_ids(
+            "https://primary.example,https://preferred-confirmation.example,https://availability.example",
+            "100,2,1",
+            "production-nownodes-arbitrum,production-slot-0,availability-slot-1",
+        )
+        .unwrap();
+        let runtime = GatewayRuntime::with_limits(
+            config,
+            client,
+            MethodTimeouts {
+                eth_call: Duration::from_secs(2),
+                state_read: Duration::from_secs(2),
+                logs: Duration::from_secs(5),
+            },
+            RuntimeRpcMetrics::default(),
+            GatewayReadiness::new(true),
+            GatewayLimits {
+                state_requests_per_minute: 1_000,
+                upstream_calls_per_second: 1_000,
+                upstream_call_burst: 1_000,
+            },
+        );
+        mark_test_providers_verified(&runtime).await;
+
+        let exact = runtime
+            .resolve_aave_exact(aave_exact_request("finalized-fallback"))
+            .await
+            .unwrap();
+
+        assert_eq!(exact.block_number, 100);
+        assert_eq!(exact.block_hash, BLOCK_HASH);
+        assert_eq!(exact.primary.provider_id, "production-nownodes-arbitrum");
+        assert_eq!(exact.secondary.provider_id, "availability-slot-1");
+        let rendered = runtime.metrics().render(&runtime.readiness());
+        assert!(rendered.contains("rpc_provider_disagreement_total 1"));
+    }
+
+    #[tokio::test]
+    async fn aave_exact_rejects_when_three_independent_providers_all_disagree() {
+        let client = Arc::new(ModelClient::default());
+        client.exact_disagreement.store(true, Ordering::Relaxed);
+        client
+            .exact_availability_disagreement
+            .store(true, Ordering::Relaxed);
+        let config = parse_provider_config_with_ids(
+            "https://primary.example,https://preferred-confirmation.example,https://availability.example",
+            "100,2,1",
+            "production-nownodes-arbitrum,production-slot-0,availability-slot-1",
+        )
+        .unwrap();
+        let runtime = GatewayRuntime::with_limits(
+            config,
+            client.clone(),
+            MethodTimeouts {
+                eth_call: Duration::from_secs(2),
+                state_read: Duration::from_secs(2),
+                logs: Duration::from_secs(5),
+            },
+            RuntimeRpcMetrics::default(),
+            GatewayReadiness::new(true),
+            GatewayLimits {
+                state_requests_per_minute: 1_000,
+                upstream_calls_per_second: 1_000,
+                upstream_call_burst: 1_000,
+            },
+        );
+        mark_test_providers_verified(&runtime).await;
+
+        assert_eq!(
+            runtime
+                .resolve_aave_exact(aave_exact_request("three-way-disagreement"))
+                .await,
+            Err(GatewayError::ProviderDisagreement)
+        );
+        assert_eq!(
+            runtime.aave_exact_static_context_cache.lock().await.len(),
+            0
         );
     }
 
