@@ -783,8 +783,7 @@ jobs:
           RPC_UPSTREAM_CALL_BURST=4
           RPC_STATE_REQUESTS_PER_MINUTE=12
           RPC_PROVIDER_PROBE_INTERVAL_SECONDS=60
-          PRODUCTION_RPC_URL=https://primary-rpc-placeholder.invalid
-          SECONDARY_RPC_URL=https://secondary-rpc-placeholder.invalid
+          PRODUCTION_RPC_URL=https://arbitrum.nownodes.io/
           ENGINE_ROUTER_ADDRESSES=0xe592427a0aece92de3edee1f18e0157c05861564,0x68b3465833fb72a70ecdf485e0e4c7bd8665fc45,0xa51afafe0263b40edaef0df8781ea9aa03e381a3
           RECORDER_PERSISTENCE_POLICY=money_path_v1
           WALLET_ADDRESS=
@@ -801,8 +800,8 @@ jobs:
           LIVE_EXECUTOR_EXPECTED_OWNER=0x3333333333333333333333333333333333333333
           LIVE_EXECUTOR_EXPECTED_FLASH_PROVIDER=0x4444444444444444444444444444444444444444
           LIVE_EXECUTOR_PNL_ASSET_ADDRESS=0x82af49447d8a07e3bd95bd0d56f35241523fbab1
-          LIVE_EXECUTOR_RPC_URL=https://primary-rpc-placeholder.invalid
-          LIVE_EXECUTOR_RPC_ALLOWLIST=https://primary-rpc-placeholder.invalid,https://secondary-rpc-placeholder.invalid
+          LIVE_EXECUTOR_RPC_URL=https://arbitrum.nownodes.io/
+          LIVE_EXECUTOR_RPC_ALLOWLIST=https://arbitrum.nownodes.io/
           LIVE_EXECUTOR_MAX_GAS_LIMIT=500000
           LIVE_EXECUTOR_MAX_MAX_FEE_PER_GAS_WEI=1000000000
           LIVE_EXECUTOR_MAX_PRIORITY_FEE_PER_GAS_WEI=100000000
@@ -838,8 +837,6 @@ jobs:
             -e 's/^PHOENIX_MODE=SHADOW$/PHOENIX_MODE=LIVE/' \
             -e 's/^LIVE_EXECUTION=false$/LIVE_EXECUTION=true/' \
             -e 's/^AUTONOMOUS_EXECUTION=false$/AUTONOMOUS_EXECUTION=true/' \
-            -e 's#^RPC_PROVIDER_URLS=.*#RPC_PROVIDER_URLS=https://primary-rpc-placeholder.invalid,https://secondary-rpc-placeholder.invalid#' \
-            -e 's/^RPC_PROVIDER_WEIGHTS=1$/RPC_PROVIDER_WEIGHTS=1,2/' \
             .ci-prod.env > .ci-autonomous-live.env
           docker compose config
           PHOENIX_ENV_FILE=.ci-prod.env docker compose \
