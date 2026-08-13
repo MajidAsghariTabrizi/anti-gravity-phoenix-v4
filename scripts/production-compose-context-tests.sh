@@ -167,7 +167,15 @@ services["recorder"]["environment"] = {
     "ENGINE_ROUTER_ADDRESSES": reviewed_routers,
     "RECORDER_PERSISTENCE_POLICY": "money_path_v1",
 }
-services["rpc-gateway"]["environment"] = {"RPC_STATE_REQUESTS_PER_MINUTE": budget}
+services["rpc-gateway"]["environment"] = {
+    "RPC_AUTHORITY_MODE": "single_primary",
+    "RPC_AUTH_PROVIDER_HEADER_FILE": "/run/secrets/phoenix-rpc-provider-slot-1-api-key",
+    "RPC_AUTH_PROVIDER_HEADER_NAME": "api-key",
+    "RPC_AUTH_PROVIDER_ID": "production-nownodes-arbitrum",
+    "RPC_AUTH_PROVIDER_PRIORITY": "100",
+    "RPC_AUTH_PROVIDER_URL": "https://arbitrum.nownodes.io/",
+    "RPC_STATE_REQUESTS_PER_MINUTE": budget,
+}
 for service in ("atlas-observer", "nitro-feed-relay", "nats", "postgres", "migration-runner", "feed-ingestor", "dashboard", "prometheus"):
     services[service]["environment"] = {}
 with open(output, "w", encoding="utf-8", newline="\n") as handle:

@@ -20,12 +20,15 @@ from pathlib import Path
 from typing import Any, BinaryIO, Iterable
 
 from .chain_reconciliation import (
+    ARBITRUM_CHAIN_ID,
+    PRIMARY_PROVIDER_IDENTITY,
     ReconciliationError,
     build_evidence as build_chain_reconciliation_evidence,
     collect_provider_evidence,
     evidence_digest as chain_reconciliation_digest,
     evidence_path as chain_reconciliation_path,
     read_evidence as read_chain_reconciliation_evidence,
+    observe_contract_pause,
     write_evidence as write_chain_reconciliation_evidence,
 )
 from .model import (
@@ -66,21 +69,33 @@ SENSITIVE_OUTPUT_RE = re.compile(
 )
 CONTROL_EVIDENCE_KEYS = {
     "active_attempts",
+    "active_atlas",
+    "aave_armed",
+    "aave_kill_switch",
     "armed",
+    "atlas_armed",
+    "atlas_kill_switch",
     "execution_mode",
     "kill_switch",
     "open_routes",
     "outbox_ack_pending",
     "outbox_claimable",
     "outbox_pending",
+    "submission_lock_free",
     "unresolved_submissions",
 }
 FAIL_CLOSED_CONTROL_EVIDENCE = {
     "active_attempts": 0,
+    "active_atlas": 0,
+    "aave_armed": False,
+    "aave_kill_switch": True,
     "armed": False,
+    "atlas_armed": False,
+    "atlas_kill_switch": True,
     "execution_mode": "disarmed",
     "kill_switch": True,
     "open_routes": 0,
+    "submission_lock_free": True,
     "unresolved_submissions": 0,
 }
 
@@ -712,15 +727,29 @@ def _control_evidence(
         "'armed', global_control.armed,"
         "'kill_switch', global_control.kill_switch,"
         "'execution_mode', global_control.execution_mode,"
+        "'aave_armed', (SELECT armed FROM "
+        "live_canary.revenue_lane_controls WHERE lane = 'aave_liquidation'),"
+        "'aave_kill_switch', (SELECT kill_switch FROM "
+        "live_canary.revenue_lane_controls WHERE lane = 'aave_liquidation'),"
+        "'atlas_armed', (SELECT armed FROM "
+        "live_canary.revenue_lane_controls WHERE lane = 'atlas_solver'),"
+        "'atlas_kill_switch', (SELECT kill_switch FROM "
+        "live_canary.revenue_lane_controls WHERE lane = 'atlas_solver'),"
         "'open_routes', (SELECT count(*) FROM "
         "live_canary.autonomous_route_controls "
         "WHERE enabled OR NOT kill_switch),"
         "'active_attempts', (SELECT count(*) FROM "
         "live_canary.execution_attempts WHERE status IN "
         "('claimed','nonce_allocated','submission_unknown','pending','timed_out')),"
+        "'active_atlas', (SELECT count(*) FROM "
+        "live_canary.atlas_solver_requests WHERE status IN "
+        "('claimed','signed','submitted','submission_unknown')),"
         "'unresolved_submissions', (SELECT count(*) FROM "
         "live_canary.execution_attempts WHERE status IN "
         "('submission_unknown','pending','timed_out')),"
+        "'submission_lock_free', (SELECT active_lane IS NULL "
+        "AND active_identity IS NULL AND acquired_at IS NULL FROM "
+        "live_canary.global_revenue_submission_lock WHERE singleton),"
         "'outbox_pending', (SELECT count(*) FROM engine_outbox "
         "WHERE published_at IS NULL),"
         "'outbox_ack_pending', (SELECT count(*) FROM engine_outbox "
@@ -2892,49 +2921,122 @@ def evidence(paths: HostPaths, release_sha: str) -> dict[str, Any]:
 
 
 def emergency_pause(paths: HostPaths) -> dict[str, Any]:
-    active = status(paths)
-    release_sha = active["active_release"]
+    initial = status(paths)
+    release_sha = initial["active_release"]
+    release_assets_sha = initial["release_assets_sha"]
     release_env = paths.deploy_dir / "current-release.env"
-    compose = production_compose_command(
+    live_compose = production_compose_command(
         paths, mode="LIVE", release_env=release_env
     )
-    _run(compose + ["stop", "-t", "30", "live-executor"])
-    pause = _run(
-        compose
-        + [
-            "run",
-            "--rm",
-            "--no-deps",
-            "-e",
-            f"PHOENIX_RELEASE_SHA={release_sha}",
-            "-e",
-            "PHOENIX_EXECUTOR_OWNER_PAUSE_ACK=PAUSE_EXECUTOR_AFTER_FAILED_DEPLOY_42161",
-            "--entrypoint",
-            "/usr/local/bin/autonomous-live-control",
-            "live-executor",
-            "owner-pause",
-        ]
+    _require_success(
+        live_compose + ["stop", "-t", "30", "live-executor"],
+        "EMERGENCY_EXECUTOR_STOP_FAILED",
     )
-    if pause.returncode != 0:
-        raise GatewayError(
-            "EMERGENCY_CONTRACT_PAUSE_FAILED",
-            {"exit_code": pause.returncode, "output": _bounded_output(pause.stdout)},
+    _live_executor_stopped()
+    environment = _selected_environment(
+        paths.env_file,
+        {
+            "LIVE_EXECUTOR_EXECUTOR_ADDRESS",
+            "LIVE_EXECUTOR_EXECUTOR_CODE_HASH",
+        },
+    )
+
+    def pause_evidence() -> dict[str, Any]:
+        try:
+            value = observe_contract_pause(
+                environment["LIVE_EXECUTOR_EXECUTOR_ADDRESS"],
+                environment["LIVE_EXECUTOR_EXECUTOR_CODE_HASH"],
+            )
+        except ReconciliationError as exc:
+            raise GatewayError(exc.code) from exc
+        if (
+            not isinstance(value, dict)
+            or set(value)
+            != {
+                "chain_id",
+                "executor_address",
+                "paused",
+                "provider_identity",
+                "runtime_code_hash",
+            }
+            or type(value.get("paused")) is not bool
+            or value.get("chain_id") != ARBITRUM_CHAIN_ID
+            or value.get("executor_address")
+            != environment["LIVE_EXECUTOR_EXECUTOR_ADDRESS"]
+            or value.get("provider_identity") != PRIMARY_PROVIDER_IDENTITY
+            or value.get("runtime_code_hash")
+            != environment["LIVE_EXECUTOR_EXECUTOR_CODE_HASH"]
+        ):
+            raise GatewayError("CHAIN_EVIDENCE_PAUSE_STATE_INVALID")
+        return value
+
+    observed_pause = pause_evidence()
+    pause_action = "already-paused"
+    if observed_pause["paused"] is not True:
+        pause_action = "applied"
+        pause = _run(
+            live_compose
+            + [
+                "run",
+                "--rm",
+                "--no-deps",
+                "-e",
+                f"PHOENIX_RELEASE_SHA={release_sha}",
+                "-e",
+                "PHOENIX_EXECUTOR_OWNER_PAUSE_ACK=PAUSE_EXECUTOR_AFTER_FAILED_DEPLOY_42161",
+                "--entrypoint",
+                "/usr/local/bin/autonomous-live-control",
+                "live-executor",
+                "owner-pause",
+            ]
         )
+        if pause.returncode != 0:
+            raise GatewayError(
+                "EMERGENCY_CONTRACT_PAUSE_FAILED",
+                {
+                    "exit_code": pause.returncode,
+                    "output": _bounded_output(pause.stdout),
+                },
+            )
+        observed_pause = pause_evidence()
+        if observed_pause["paused"] is not True:
+            raise GatewayError("EMERGENCY_CONTRACT_NOT_PAUSED")
+    controls = _control_evidence(paths, initial)
+    _require_fail_closed_controls(controls)
     _require_success(
         [
             "/usr/bin/python3",
-            str(paths.deploy_dir / "production_mode.py"),
+            "-I",
+            "-B",
+            str(paths.libexec / "production_mode.py"),
             "shadow",
             "--env-file",
             str(paths.env_file),
         ],
         "EMERGENCY_SHADOW_RESTORE_FAILED",
     )
+    final = status(paths)
+    if (
+        final["active_release"] != release_sha
+        or final["release_assets_sha"] != release_assets_sha
+        or final["phoenix_mode"] != "SHADOW"
+        or final["live_execution"] is not False
+        or final["autonomous_execution"] is not False
+    ):
+        raise GatewayError("EMERGENCY_SHADOW_POSTCONDITION_FAILED")
+    _live_executor_stopped()
+    final_controls = _control_evidence(paths, final)
+    _require_fail_closed_controls(final_controls)
+    observed_pause = pause_evidence()
+    if observed_pause["paused"] is not True:
+        raise GatewayError("EMERGENCY_CONTRACT_NOT_PAUSED")
     return {
         "schema": "phoenix.release-emergency-pause.v1",
         "status": "paused",
         "release_sha": release_sha,
         "live_executor_stopped": True,
+        "pause_action": pause_action,
+        "pause_evidence": observed_pause,
         "shadow_restored": True,
     }
 

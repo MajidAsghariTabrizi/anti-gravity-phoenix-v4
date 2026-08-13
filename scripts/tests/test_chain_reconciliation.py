@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import os
 import tempfile
@@ -11,10 +12,13 @@ from unittest.mock import patch
 from jsonschema import Draft202012Validator
 
 from scripts.phoenix_release.chain_reconciliation import (
+    PRIMARY_PROVIDER_IDENTITY,
+    PRIMARY_PROVIDER_URL,
     ReconciliationError,
     build_evidence,
     collect_provider_evidence,
     evidence_path,
+    observe_contract_pause,
     read_evidence,
     write_evidence,
 )
@@ -40,13 +44,19 @@ PROVIDERS = [
 ROOT = Path(__file__).resolve().parents[2]
 FAIL_CLOSED_CONTROLS = {
     "active_attempts": 0,
+    "active_atlas": 0,
+    "aave_armed": False,
+    "aave_kill_switch": True,
     "armed": False,
+    "atlas_armed": False,
+    "atlas_kill_switch": True,
     "execution_mode": "disarmed",
     "kill_switch": True,
     "open_routes": 0,
     "outbox_ack_pending": 0,
     "outbox_claimable": 0,
     "outbox_pending": 0,
+    "submission_lock_free": True,
     "unresolved_submissions": 0,
 }
 
@@ -126,6 +136,127 @@ def valid_evidence():
 
 
 class ProviderEvidenceTests(unittest.TestCase):
+    def test_contract_pause_observation_binds_authenticated_runtime(self) -> None:
+        code = bytes.fromhex("6001600055")
+        calls: list[tuple[str, str, list[object]]] = []
+
+        def pause_rpc(url: str, method: str, params: list[object]) -> object:
+            calls.append((url, method, params))
+            if method == "eth_chainId":
+                return "0xa4b1"
+            if method == "eth_getCode":
+                return "0x" + code.hex()
+            if method == "eth_call":
+                return "0x" + "0" * 63 + "1"
+            raise AssertionError(method)
+
+        observed = observe_contract_pause(
+            EXECUTOR,
+            hashlib.sha256(code).hexdigest(),
+            call=pause_rpc,
+        )
+        self.assertEqual(
+            observed,
+            {
+                "chain_id": "0xa4b1",
+                "executor_address": EXECUTOR,
+                "paused": True,
+                "provider_identity": "rpc-bf27592026588e7d",
+                "runtime_code_hash": hashlib.sha256(code).hexdigest(),
+            },
+        )
+        self.assertNotIn("provider_url", observed)
+        self.assertEqual(
+            [(method, params) for _, method, params in calls],
+            [
+                ("eth_chainId", []),
+                ("eth_getCode", [EXECUTOR, "latest"]),
+                (
+                    "eth_call",
+                    [{"to": EXECUTOR, "data": "0x5c975abb"}, "latest"],
+                ),
+            ],
+        )
+        self.assertEqual(len({url for url, _, _ in calls}), 1)
+        self.assertEqual({url for url, _, _ in calls}, {PRIMARY_PROVIDER_URL})
+        self.assertEqual(observed["provider_identity"], PRIMARY_PROVIDER_IDENTITY)
+
+    def test_contract_pause_observation_returns_unpaused(self) -> None:
+        code = b"\x60\x00"
+
+        def unpaused(url: str, method: str, params: list[object]) -> object:
+            del url, params
+            return {
+                "eth_chainId": "0xa4b1",
+                "eth_getCode": "0x" + code.hex(),
+                "eth_call": "0x" + "0" * 64,
+            }[method]
+
+        observed = observe_contract_pause(
+            EXECUTOR,
+            hashlib.sha256(code).hexdigest(),
+            call=unpaused,
+        )
+        self.assertFalse(observed["paused"])
+
+    def test_contract_pause_observation_rejects_identity_and_shape_drift(self) -> None:
+        code = b"\x60\x00"
+        expected = hashlib.sha256(code).hexdigest()
+        cases = (
+            ("eth_chainId", "0x1", "CHAIN_EVIDENCE_CHAIN_ID_INVALID"),
+            ("eth_getCode", "0x", "CHAIN_EVIDENCE_EXECUTOR_IDENTITY_INVALID"),
+            ("eth_getCode", "0x6001", "CHAIN_EVIDENCE_EXECUTOR_IDENTITY_INVALID"),
+            ("eth_call", "0x" + "0" * 63 + "2", "CHAIN_EVIDENCE_PAUSE_STATE_INVALID"),
+            ("eth_call", "0x1", "CHAIN_EVIDENCE_PAUSE_STATE_INVALID"),
+        )
+        for changed_method, changed_value, code_value in cases:
+            def invalid(
+                url: str,
+                method: str,
+                params: list[object],
+                *,
+                changed_method: str = changed_method,
+                changed_value: object = changed_value,
+            ) -> object:
+                del url, params
+                if method == changed_method:
+                    return changed_value
+                return {
+                    "eth_chainId": "0xa4b1",
+                    "eth_getCode": "0x" + code.hex(),
+                    "eth_call": "0x" + "0" * 63 + "1",
+                }[method]
+
+            with self.subTest(method=changed_method, value=changed_value), self.assertRaisesRegex(
+                ReconciliationError,
+                code_value,
+            ):
+                observe_contract_pause(EXECUTOR, expected, call=invalid)
+
+    def test_contract_pause_observation_rejects_noncanonical_inputs(self) -> None:
+        expected = "a" * 64
+        for address, code_hash in (
+            (EXECUTOR.upper(), expected),
+            (EXECUTOR, expected.upper()),
+            (None, expected),
+            (EXECUTOR, None),
+        ):
+            with self.subTest(address=address, code_hash=code_hash), self.assertRaisesRegex(
+                ReconciliationError,
+                "CHAIN_EVIDENCE_INPUT_INVALID",
+            ):
+                observe_contract_pause(address, code_hash, call=lambda *_: None)  # type: ignore[arg-type]
+
+    def test_contract_pause_observation_propagates_bounded_rpc_failure(self) -> None:
+        def unavailable(*_args: object) -> object:
+            raise ReconciliationError("CHAIN_EVIDENCE_RPC_UNAVAILABLE")
+
+        with self.assertRaisesRegex(
+            ReconciliationError,
+            "CHAIN_EVIDENCE_RPC_UNAVAILABLE",
+        ):
+            observe_contract_pause(EXECUTOR, "a" * 64, call=unavailable)
+
     def test_valid_single_primary_paused_reconciliation(self) -> None:
         observed = provider_evidence()
         self.assertEqual(len(observed), 1)

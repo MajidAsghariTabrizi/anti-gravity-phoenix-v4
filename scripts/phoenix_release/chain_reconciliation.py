@@ -26,6 +26,8 @@ RPC_HEADER_SECRET = Path(
     "/etc/phoenix/secrets/phoenix-rpc-provider-slot-1-api-key"
 )
 ARBITRUM_CHAIN_ID = "0xa4b1"
+PRIMARY_PROVIDER_URL = "https://arbitrum.nownodes.io/"
+PRIMARY_PROVIDER_IDENTITY = "rpc-bf27592026588e7d"
 PAUSED_SELECTOR = "0x5c975abb"
 SET_PAUSED_SELECTOR = "0x16c38b3c"
 SHA_RE = re.compile(r"^[0-9a-f]{40}$")
@@ -155,6 +157,56 @@ def _hex_integer(value: object, code: str) -> int:
     if not isinstance(value, str) or not re.fullmatch(r"0x[0-9a-f]+", value):
         raise ReconciliationError(code)
     return int(value, 16)
+
+
+def observe_contract_pause(
+    executor_address: str,
+    expected_code_hash: str,
+    *,
+    call: Callable[[str, str, list[object]], object] = _rpc_call,
+) -> dict[str, Any]:
+    """Return bounded, authenticated pause evidence for the reviewed executor."""
+
+    if (
+        not isinstance(executor_address, str)
+        or not isinstance(expected_code_hash, str)
+        or not ADDRESS_RE.fullmatch(executor_address)
+        or not re.fullmatch(r"[0-9a-f]{64}", expected_code_hash)
+    ):
+        raise ReconciliationError("CHAIN_EVIDENCE_INPUT_INVALID")
+    chain_id = call(PRIMARY_PROVIDER_URL, "eth_chainId", [])
+    if chain_id != ARBITRUM_CHAIN_ID:
+        raise ReconciliationError("CHAIN_EVIDENCE_CHAIN_ID_INVALID")
+    code_raw = call(
+        PRIMARY_PROVIDER_URL,
+        "eth_getCode",
+        [executor_address, "latest"],
+    )
+    if (
+        not isinstance(code_raw, str)
+        or not re.fullmatch(r"0x(?:[0-9a-f]{2})+", code_raw)
+        or hashlib.sha256(bytes.fromhex(code_raw[2:])).hexdigest()
+        != expected_code_hash
+    ):
+        raise ReconciliationError("CHAIN_EVIDENCE_EXECUTOR_IDENTITY_INVALID")
+    paused_raw = call(
+        PRIMARY_PROVIDER_URL,
+        "eth_call",
+        [{"to": executor_address, "data": PAUSED_SELECTOR}, "latest"],
+    )
+    if (
+        not isinstance(paused_raw, str)
+        or not re.fullmatch(r"0x[0-9a-f]{64}", paused_raw)
+        or int(paused_raw, 16) not in {0, 1}
+    ):
+        raise ReconciliationError("CHAIN_EVIDENCE_PAUSE_STATE_INVALID")
+    return {
+        "chain_id": chain_id,
+        "executor_address": executor_address,
+        "paused": int(paused_raw, 16) == 1,
+        "provider_identity": PRIMARY_PROVIDER_IDENTITY,
+        "runtime_code_hash": expected_code_hash,
+    }
 
 
 def _receipt_evidence(

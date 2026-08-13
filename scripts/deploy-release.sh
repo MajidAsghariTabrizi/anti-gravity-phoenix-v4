@@ -537,7 +537,10 @@ if environment.get("RPC_AUTH_PROVIDER_ID") != "production-nownodes-arbitrum":
     raise SystemExit(1)
 if environment.get("RPC_AUTH_PROVIDER_URL") != expected:
     raise SystemExit(1)
-if "RPC_PROVIDER_URLS" in environment or "RPC_PROVIDER_WEIGHTS" in environment:
+if any(
+    name in environment
+    for name in ("RPC_PROVIDER_URLS", "RPC_PROVIDER_WEIGHTS", "RPC_PROVIDER_IDS")
+):
     raise SystemExit(1)
 if live.get("LIVE_EXECUTOR_RPC_URL") != expected or live.get("LIVE_EXECUTOR_RPC_ALLOWLIST") != expected:
     raise SystemExit(1)
