@@ -65,8 +65,8 @@ class LiveExecutorSafetyTests(unittest.TestCase):
             'AUTONOMOUS_EXECUTION: "true"',
             'LIVE_EXECUTOR_ARMED: "true"',
             'LIVE_EXECUTOR_KILL_SWITCH: "false"',
-            "PRODUCTION_RPC_URL: ${PRODUCTION_RPC_URL:?PRODUCTION_RPC_URL is required}",
-            "SECONDARY_RPC_URL: ${SECONDARY_RPC_URL:?SECONDARY_RPC_URL is required}",
+            "PRODUCTION_RPC_URL: https://arbitrum.nownodes.io/",
+            "LIVE_EXECUTOR_RPC_ALLOWLIST: https://arbitrum.nownodes.io/",
             "LIVE_EXECUTOR_EXPECTED_OWNER: ${LIVE_EXECUTOR_EXPECTED_OWNER:?LIVE_EXECUTOR_EXPECTED_OWNER is required}",
             "LIVE_EXECUTOR_EXPECTED_FLASH_PROVIDER: ${LIVE_EXECUTOR_EXPECTED_FLASH_PROVIDER:?LIVE_EXECUTOR_EXPECTED_FLASH_PROVIDER is required}",
             "SIGNER_PRIVATE_KEY_FILE: /run/secrets/phoenix-live-executor-signer",
@@ -79,6 +79,22 @@ class LiveExecutorSafetyTests(unittest.TestCase):
             "no-new-privileges:true",
         ):
             self.assertIn(required, overlay)
+        self.assertNotIn("SECONDARY_RPC_URL:", overlay)
+        self.assertEqual(
+            overlay.count("PRODUCTION_RPC_URL: https://arbitrum.nownodes.io/"), 3
+        )
+        self.assertEqual(
+            overlay.count("LIVE_EXECUTOR_RPC_ALLOWLIST: https://arbitrum.nownodes.io/"),
+            3,
+        )
+        production = (ROOT / "compose.prod.yml").read_text(encoding="utf-8")
+        self.assertIn("RPC_AUTHORITY_MODE: single_primary", production)
+        self.assertIn(
+            "RPC_AUTH_PROVIDER_ID: production-nownodes-arbitrum", production
+        )
+        self.assertIn("RPC_AUTH_PROVIDER_URL: https://arbitrum.nownodes.io/", production)
+        self.assertNotIn("RPC_AUTH_CONFIRMATION_PROVIDER", production)
+        self.assertNotIn("SECONDARY_RPC_URL:", production)
         self.assertNotRegex(overlay, r"(?m)^\s+SIGNER_PRIVATE_KEY\s*:")
         self.assertNotRegex(overlay, r"ports:\s*\n")
 
