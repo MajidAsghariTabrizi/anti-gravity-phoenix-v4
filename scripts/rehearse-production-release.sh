@@ -516,16 +516,43 @@ database_container=
 database_network=
 
 # Exercise the candidate health implementation against the immutable active
-# release topology. A LIVE release may have its executor running or stopped;
-# select the matching strict health contract from the observed topology.
-active_runtime_mode=$(awk -F= '
-  $1 == "PHOENIX_MODE" { print $2; found += 1 }
-  END { if (found != 1) exit 1 }
+# release topology. An emergency pause changes the declared operator mode
+# without recreating the already-running engine, so bind the health contract to
+# both the declared mode and the engine process identity. The only inherited
+# topology allowed is a LIVE engine with a stopped executor under SHADOW.
+active_declared_runtime_identity=$(awk -F= '
+  $1 == "PHOENIX_MODE" {
+    mode = $2
+    mode_found += 1
+  }
+  $1 == "LIVE_EXECUTION" {
+    live = $2
+    live_found += 1
+  }
+  $1 == "AUTONOMOUS_EXECUTION" {
+    autonomous = $2
+    autonomous_found += 1
+  }
+  END {
+    if (mode_found != 1 || live_found != 1 || autonomous_found != 1) exit 1
+    printf "%s:%s:%s\n", mode, live, autonomous
+  }
 ' "$candidate_active_env") || fail active_health_mode_invalid
-active_health_mode=$active_runtime_mode
+active_health_mode=
 active_health_allow_stopped_standby=false
 active_live_executor_id=
-active_compose() {
+active_live_executor_recheck_required=false
+active_engine_compose() {
+  /usr/bin/timeout --signal=TERM --kill-after=2s 15s \
+    python3 "$compose_runner" \
+    --mode SHADOW \
+    --env-file "$candidate_active_env" \
+    --release-env "$active_release_env" \
+    --compose-file "$compose_file" \
+    --project-directory "$deploy_dir" \
+    -- "$@"
+}
+active_live_compose() {
   /usr/bin/timeout --signal=TERM --kill-after=2s 15s \
     python3 "$compose_runner" \
     --mode LIVE \
@@ -536,24 +563,44 @@ active_compose() {
     --project-directory "$deploy_dir" \
     -- "$@"
 }
-case "$active_runtime_mode" in
-  SHADOW) ;;
-  LIVE)
-    active_live_executor_id=$(active_compose ps --no-trunc -q live-executor) ||
-      fail active_live_executor_probe_failed
-    case "$active_live_executor_id" in
-      "")
+probe_active_live_executor() {
+  active_live_executor_id=$(active_live_compose ps --no-trunc -q live-executor) ||
+    fail active_live_executor_probe_failed
+  case "$active_live_executor_id" in
+    "") ;;
+    *[!0-9a-f]*) fail active_live_executor_identity_invalid ;;
+    *)
+      [ "${#active_live_executor_id}" -eq 64 ] ||
+        fail active_live_executor_identity_invalid
+      ;;
+  esac
+}
+active_engine_runtime_identity=$(
+  active_engine_compose exec -T phoenix-engine /bin/sh -c \
+    'printf "%s:%s:%s\n" "$PHOENIX_MODE" "$LIVE_EXECUTION" "$AUTONOMOUS_EXECUTION"'
+) || fail active_runtime_identity_probe_failed
+case "$active_declared_runtime_identity:$active_engine_runtime_identity" in
+  SHADOW:false:false:SHADOW:false:false)
+    active_health_mode=SHADOW
+    ;;
+  LIVE:true:true:LIVE:true:true)
+    probe_active_live_executor
+    active_live_executor_recheck_required=true
+    if [ -z "$active_live_executor_id" ]; then
         active_health_mode=DISARMED_EVIDENCE
         active_health_allow_stopped_standby=true
-        ;;
-      *[!0-9a-f]*) fail active_live_executor_identity_invalid ;;
-      *)
-        [ "${#active_live_executor_id}" -eq 64 ] ||
-          fail active_live_executor_identity_invalid
-        ;;
-    esac
+    else
+      active_health_mode=LIVE
+    fi
     ;;
-  *) fail active_health_mode_invalid ;;
+  SHADOW:false:false:LIVE:true:true)
+    probe_active_live_executor
+    [ -z "$active_live_executor_id" ] || fail active_shadow_executor_present
+    active_health_mode=DISARMED_EVIDENCE
+    active_health_allow_stopped_standby=true
+    active_live_executor_recheck_required=true
+    ;;
+  *) fail active_runtime_identity_invalid ;;
 esac
 PHOENIX_DEPLOY_ROOT="$deploy_root" \
 PHOENIX_ENV_FILE="$candidate_active_env" \
@@ -570,9 +617,9 @@ PHOENIX_HEALTH_SLEEP_SECONDS=0 \
 PHOENIX_HEALTH_COMMAND_TIMEOUT_SECONDS=15 \
   "$candidate_root/scripts/production-healthcheck.sh" ||
   fail candidate_health_contract_failed
-if [ "$active_runtime_mode" = LIVE ]; then
+if [ "$active_live_executor_recheck_required" = true ]; then
   active_live_executor_id_after=$(
-    active_compose ps --no-trunc -q live-executor
+    active_live_compose ps --no-trunc -q live-executor
   ) || fail active_live_executor_recheck_failed
   [ "$active_live_executor_id_after" = "$active_live_executor_id" ] ||
     fail active_live_executor_identity_drift

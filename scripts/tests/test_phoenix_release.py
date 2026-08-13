@@ -3044,15 +3044,15 @@ class WorkflowAndDeploymentContractTests(unittest.TestCase):
             '[ "$actual" = /usr/local/bin/atlas-observer ]',
             self.healthcheck,
         )
-        self.assertIn(
-            "active_health_mode=$active_runtime_mode", health_rehearsal
-        )
+        self.assertIn("active_health_mode=", health_rehearsal)
         self.assertIn(
             "active_health_allow_stopped_standby=false", health_rehearsal
         )
-        self.assertIn("SHADOW) ;;", health_rehearsal)
         self.assertIn(
-            "active_live_executor_id=$(active_compose ps --no-trunc -q "
+            "active_live_executor_recheck_required=false", health_rehearsal
+        )
+        self.assertIn(
+            "active_live_executor_id=$(active_live_compose ps --no-trunc -q "
             "live-executor)",
             health_rehearsal,
         )
@@ -3064,11 +3064,62 @@ class WorkflowAndDeploymentContractTests(unittest.TestCase):
         self.assertIn(
             '[ "${#active_live_executor_id}" -eq 64 ]', health_rehearsal
         )
-        self.assertIn("active_health_mode=DISARMED_EVIDENCE", health_rehearsal)
-        self.assertIn("active_health_allow_stopped_standby=true", health_rehearsal)
+        self.assertIn(
+            "active_engine_compose exec -T phoenix-engine /bin/sh -c",
+            health_rehearsal,
+        )
+        self.assertIn(
+            "'printf \"%s:%s:%s\\n\" \"$PHOENIX_MODE\" "
+            '"$LIVE_EXECUTION" "$AUTONOMOUS_EXECUTION"\'',
+            health_rehearsal,
+        )
+        self.assertIn(
+            "active_runtime_identity_probe_failed", health_rehearsal
+        )
+        topology = health_rehearsal.split(
+            'case "$active_declared_runtime_identity:'
+            '$active_engine_runtime_identity" in',
+            maxsplit=1,
+        )[1].split(
+            'PHOENIX_DEPLOY_ROOT="$deploy_root"', maxsplit=1
+        )[0]
+        native_shadow = topology.split(
+            "SHADOW:false:false:SHADOW:false:false)", maxsplit=1
+        )[1].split("LIVE:true:true:LIVE:true:true)", maxsplit=1)[0]
+        self.assertNotIn("probe_active_live_executor", native_shadow)
+        self.assertIn("active_health_mode=SHADOW", native_shadow)
+        live = topology.split("LIVE:true:true:LIVE:true:true)", maxsplit=1)[1].split(
+            "SHADOW:false:false:LIVE:true:true)", maxsplit=1
+        )[0]
+        self.assertIn("probe_active_live_executor", live)
+        self.assertIn("active_live_executor_recheck_required=true", live)
+        self.assertIn("active_health_mode=LIVE", live)
+        self.assertIn("active_health_mode=DISARMED_EVIDENCE", live)
+        self.assertIn("active_health_allow_stopped_standby=true", live)
+        inherited_shadow = topology.split(
+            "SHADOW:false:false:LIVE:true:true)", maxsplit=1
+        )[1].split(
+            "*) fail active_runtime_identity_invalid", maxsplit=1
+        )[0]
+        self.assertIn("probe_active_live_executor", inherited_shadow)
+        self.assertIn(
+            '[ -z "$active_live_executor_id" ] || '
+            "fail active_shadow_executor_present",
+            inherited_shadow,
+        )
+        self.assertIn(
+            "active_health_mode=DISARMED_EVIDENCE", inherited_shadow
+        )
+        self.assertIn(
+            "active_health_allow_stopped_standby=true", inherited_shadow
+        )
+        self.assertIn(
+            "active_live_executor_recheck_required=true", inherited_shadow
+        )
+        self.assertIn("active_runtime_identity_invalid", topology)
         self.assertIn(
             "active_live_executor_id_after=$(\n"
-            "    active_compose ps --no-trunc -q live-executor\n"
+            "    active_live_compose ps --no-trunc -q live-executor\n"
             "  )",
             health_rehearsal,
         )
@@ -3078,8 +3129,30 @@ class WorkflowAndDeploymentContractTests(unittest.TestCase):
             health_rehearsal,
         )
         self.assertIn("active_live_executor_identity_drift", health_rehearsal)
-        self.assertIn("active_health_mode_invalid", health_rehearsal)
-        self.assertIn("END { if (found != 1) exit 1 }", health_rehearsal)
+        self.assertIn(
+            'if [ "$active_live_executor_recheck_required" = true ]; then',
+            health_rehearsal,
+        )
+        declared_identity = health_rehearsal.split(
+            "active_declared_runtime_identity=$(awk", maxsplit=1
+        )[1].split("active_health_mode=", maxsplit=1)[0]
+        self.assertIn('$1 == "PHOENIX_MODE"', declared_identity)
+        self.assertIn('$1 == "LIVE_EXECUTION"', declared_identity)
+        self.assertIn('$1 == "AUTONOMOUS_EXECUTION"', declared_identity)
+        self.assertIn(
+            "mode_found != 1 || live_found != 1 || autonomous_found != 1",
+            declared_identity,
+        )
+        engine_compose = health_rehearsal.split(
+            "active_engine_compose()", maxsplit=1
+        )[1].split("active_live_compose()", maxsplit=1)[0]
+        self.assertIn("--mode SHADOW", engine_compose)
+        self.assertNotIn("--overlay-file", engine_compose)
+        live_compose = health_rehearsal.split(
+            "active_live_compose()", maxsplit=1
+        )[1].split("probe_active_live_executor()", maxsplit=1)[0]
+        self.assertIn("--mode LIVE", live_compose)
+        self.assertIn('--overlay-file "$overlay_file"', live_compose)
         self.assertIn(
             'operator_env_digest_after=$(sha256sum "$env_file"', health_rehearsal
         )
