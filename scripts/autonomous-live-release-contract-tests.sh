@@ -29,6 +29,7 @@ for path in \
   scripts/deploy-release.sh \
   scripts/rollback-release.sh \
   scripts/activate-economic-canary.sh \
+  scripts/monitor-post-arm-revenue.sh \
   scripts/economic_activation_runner.py \
   scripts/economic-dashboard-loop.sh \
   deploy/phoenix-economic-activation.path \
@@ -67,6 +68,7 @@ compose = read("compose.live-autonomous.yml")
 deploy = read("scripts/deploy-release.sh")
 rollback = read("scripts/rollback-release.sh")
 activate = read("scripts/activate-economic-canary.sh")
+post_arm_monitor = read("scripts/monitor-post-arm-revenue.sh")
 control = read("live-executor/src/autonomous_live_control_main.rs")
 executor_store = read("live-executor/src/store.rs")
 revenue_executor = read("live-executor/src/revenue.rs")
@@ -152,6 +154,11 @@ for forbidden in ("SIGNER_PRIVATE_KEY", "SIGNER_PRIVATE_KEY_FILE", "LIVE_EXECUTO
     require(forbidden not in control_service, f"signerless_control_contains:{forbidden}")
 require("autonomous-live-control" in control_service, "control_entrypoint_missing")
 require('restart: "no"' in control_service, "control_service_must_be_one_shot")
+for required in (
+    "PHOENIX_ACTIVATION_REQUEST_OUTBOX: /activation-outbox",
+    "source: /opt/phoenix/evidence/activation-requests",
+):
+    require(required in control_service, f"post_arm_recovery_control_binding_missing:{required}")
 
 live_service = re.search(
     r"(?ms)^  live-executor:\s*\n(?P<body>.*?)(?=^  [a-zA-Z0-9_-]+:\s*\n|\Z)",
@@ -161,6 +168,32 @@ require(live_service is not None, "live_executor_service_missing")
 require(
     "phoenix-live-executor-signer" in live_service.group("body"),
     "authorized_executor_signer_mount_missing",
+)
+for required in (
+    "PHOENIX_RELEASE_SHA: ${PHOENIX_RELEASE_SHA:?PHOENIX_RELEASE_SHA is required}",
+):
+    require(required in live_service.group("body"), f"owner_live_preflight_binding_missing:{required}")
+
+for required in (
+    "owner-live-preflight",
+    "reconciliation-status",
+    "post_arm_acceptance_failed",
+    "owner-pause",
+    "autonomous-control disarm",
+    'production_mode.py" shadow',
+    "duration_seconds=${2:-900}",
+    "monitor duration must be between 600 and 900 seconds",
+):
+    require(required in post_arm_monitor, f"post_arm_monitor_contract_missing:{required}")
+require(
+    "owner-configured-preflight" not in post_arm_monitor,
+    "post_arm_monitor_uses_paused_only_preflight",
+)
+require(
+    post_arm_monitor.index("autonomous-control disarm")
+    < post_arm_monitor.index("live-executor owner-pause")
+    < post_arm_monitor.index('production_mode.py" shadow'),
+    "post_arm_monitor_fail_close_order_invalid",
 )
 require("economic-monitor:" in compose, "economic_monitor_service_missing")
 require("economic-supervisor:" in compose, "economic_supervisor_service_missing")

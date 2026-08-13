@@ -424,6 +424,38 @@ pub async fn runtime_preflight_from_environment() -> Result<Value, OwnerBootstra
     runtime_preflight(&context, &rpc).await
 }
 
+// Validates the exact configured executor and signer without submitting a
+// transaction. This is the post-unpause counterpart to configured_preflight.
+pub async fn live_preflight_from_environment() -> Result<Value, OwnerBootstrapError> {
+    let context = OwnerBootstrapContext::from_environment()?;
+    let signer = context.load_signer()?;
+    let rpc = production_rpc(&context)?;
+    live_preflight(&context, &rpc, &signer).await
+}
+
+async fn live_preflight<R: OwnerBootstrapRpc>(
+    context: &OwnerBootstrapContext,
+    rpc: &R,
+    signer: &TransactionSigner,
+) -> Result<Value, OwnerBootstrapError> {
+    if signer.address() != context.wallet || signer.address() != context.expected_owner {
+        return Err(OwnerBootstrapError::SignerWalletOwnerMismatch);
+    }
+    let mut evidence = runtime_preflight(context, rpc).await?;
+    if evidence
+        .get("final_state")
+        .and_then(|state| state.get("paused"))
+        .and_then(Value::as_bool)
+        != Some(false)
+    {
+        return Err(OwnerBootstrapError::LivePreflightRequiresUnpaused);
+    }
+    evidence["command"] = Value::String("live-preflight".to_string());
+    evidence["status"] = Value::String("ready-unpaused".to_string());
+    evidence["signer_matches_owner"] = Value::Bool(true);
+    Ok(evidence)
+}
+
 pub async fn execute_from_environment(
     mutation: OwnerMutation,
 ) -> Result<Value, OwnerBootstrapError> {
@@ -1313,6 +1345,8 @@ pub enum OwnerBootstrapError {
     ConfigurationIncomplete,
     #[error("configured preflight requires the executor to remain paused")]
     ConfiguredPreflightRequiresPaused,
+    #[error("live preflight requires the executor to be unpaused")]
+    LivePreflightRequiresUnpaused,
     #[error("unpaused executor has incomplete configuration")]
     UnpausedConfigurationIncomplete,
     #[error("owner configure cannot unpause the executor")]
@@ -1913,6 +1947,39 @@ mod tests {
             assert_eq!(evidence["final_state"]["configuration_complete"], true);
             assert_eq!(rpc.submit_calls.load(Ordering::SeqCst), 0);
         }
+    }
+
+    #[tokio::test]
+    async fn live_preflight_requires_unpaused_and_matching_signer_without_mutation() {
+        let context = context();
+        let signer = test_signer();
+        let paused = MockRpc::new(complete_snapshot(&context, true));
+        assert_eq!(
+            live_preflight(&context, &paused, &signer)
+                .await
+                .expect_err("paused"),
+            OwnerBootstrapError::LivePreflightRequiresUnpaused
+        );
+        assert_eq!(paused.submit_calls.load(Ordering::SeqCst), 0);
+
+        let rpc = MockRpc::new(complete_snapshot(&context, false));
+        let evidence = live_preflight(&context, &rpc, &signer)
+            .await
+            .expect("live preflight");
+        assert_eq!(evidence["command"], "live-preflight");
+        assert_eq!(evidence["status"], "ready-unpaused");
+        assert_eq!(evidence["final_state"]["paused"], false);
+        assert_eq!(evidence["signer_matches_owner"], true);
+        assert_eq!(rpc.submit_calls.load(Ordering::SeqCst), 0);
+
+        let other = TransactionSigner::from_secret(&hex::encode([8_u8; 32]), ARBITRUM_ONE_CHAIN_ID)
+            .expect("other signer");
+        assert_eq!(
+            live_preflight(&context, &rpc, &other)
+                .await
+                .expect_err("signer mismatch"),
+            OwnerBootstrapError::SignerWalletOwnerMismatch
+        );
     }
 
     #[tokio::test]

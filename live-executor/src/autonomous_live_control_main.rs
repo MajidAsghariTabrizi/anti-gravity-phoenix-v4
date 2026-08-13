@@ -13,7 +13,8 @@ use phoenix_live_executor::economic_control::{
 };
 use phoenix_live_executor::model::{CanonicalAddress, ExecutionRequest, ValidatedLeg};
 use phoenix_live_executor::owner_bootstrap::{
-    configured_preflight_from_environment, execute_from_environment, owner_plan_from_environment,
+    configured_preflight_from_environment, execute_from_environment,
+    live_preflight_from_environment, owner_plan_from_environment,
     runtime_preflight_from_environment, OwnerBootstrapError, OwnerMutation,
 };
 use phoenix_live_executor::rpc::{ExecutionRpc, HttpExecutionRpc};
@@ -84,6 +85,10 @@ const MIGRATIONS: [(&str, &str); 9] = [
 const ACTIVATE_ACK: &str = "ACTIVATE_READY_MIN_CANARY_42161";
 const ARM_REVENUE_LANES_ACK: &str = "ARM_ATLAS_AAVE_LIVE_42161";
 const SET_REVENUE_SIZE_MAX_REVIEWED_ACK: &str = "SET_MAX_REVIEWED_LIVE_SIZE_42161";
+const RECOVER_POST_ARM_ACCEPTANCE_ACK: &str = "RECOVER_POST_ARM_ACCEPTANCE_FAILURE_42161";
+const POST_ARM_ACCEPTANCE_FAILURE_REASON: &str = "post_arm_acceptance_failed";
+const POST_ARM_RECOVERY_REASON: &str = "operator_recovered_post_arm_monitor_failure";
+const RETAINED_PROFIT_FLOOR_WEI: u128 = 1_000_000_000_000;
 const DISARM_ACK: &str = "DISARM_AUTONOMOUS_LIVE_42161";
 const DISARMED_DEPLOY_ACK: &str = "INSTALL_DISARMED_EVIDENCE_RELEASE_42161";
 const EVIDENCE_START_ACK: &str = "START_DISARMED_EVIDENCE_42161";
@@ -190,6 +195,7 @@ async fn run() -> ControlResult<()> {
         "owner-plan" => owner_plan().await?,
         "owner-configure" => owner_mutation(OwnerMutation::Configure).await?,
         "owner-configured-preflight" => owner_configured_preflight().await?,
+        "owner-live-preflight" => owner_live_preflight().await?,
         "owner-unpause" => owner_mutation(OwnerMutation::Unpause).await?,
         "owner-pause" => owner_mutation(OwnerMutation::Pause).await?,
         "migrate" => migrate(&database_pool().await?).await?,
@@ -201,6 +207,7 @@ async fn run() -> ControlResult<()> {
         "activate-ready-canary" => activate(&database_pool().await?).await?,
         "set-revenue-size-max-reviewed" => set_revenue_size_max_reviewed().await?,
         "arm-revenue-lanes" => arm_revenue_lanes().await?,
+        "recover-post-arm-acceptance-failure" => recover_post_arm_acceptance_failure().await?,
         "activate" => return Err("direct activation is disabled; use activate-ready-canary".into()),
         "evaluate-economic-control" => evaluate_economic_control(&database_pool().await?).await?,
         "supervise-economic-control" => supervise_economic_control().await?,
@@ -386,6 +393,178 @@ async fn owner_configured_preflight() -> ControlResult<()> {
             .map_err(|_| "owner preflight evidence serialization failed")?
     );
     println!("EXECUTOR_OWNER_CONFIGURED_PREFLIGHT_OK");
+    Ok(())
+}
+
+#[derive(Clone, Debug)]
+struct LivePreflightFacts {
+    phase: EconomicPhase,
+    level: SizeLevel,
+    release_sha: Option<String>,
+    current_input_wei: u128,
+    maximum_reviewed_input_wei: u128,
+    revenue_lanes: Vec<(String, bool, bool, u128, u128)>,
+    generic_closed: bool,
+    active_attempts: i64,
+    unresolved_submissions: i64,
+    active_atlas: i64,
+    lock_free: bool,
+}
+
+fn validate_live_preflight_facts(
+    facts: &LivePreflightFacts,
+    release_sha: &str,
+) -> ControlResult<()> {
+    let expected_lanes = ["aave_liquidation", "atlas_solver"];
+    if facts.phase != EconomicPhase::DisarmedEvidence
+        || facts.level != SizeLevel::MaxReviewed
+        || facts.release_sha.as_deref() != Some(release_sha)
+        || facts.current_input_wei != MAXIMUM_REVIEWED_INPUT_WEI
+        || facts.maximum_reviewed_input_wei != MAXIMUM_REVIEWED_INPUT_WEI
+        || facts.revenue_lanes.len() != expected_lanes.len()
+        || facts.revenue_lanes.iter().zip(expected_lanes).any(
+            |((lane, armed, kill_switch, maximum, floor), expected)| {
+                lane != expected
+                    || !*armed
+                    || *kill_switch
+                    || *maximum != MAXIMUM_REVIEWED_INPUT_WEI
+                    || *floor != RETAINED_PROFIT_FLOOR_WEI
+            },
+        )
+        || !facts.generic_closed
+        || facts.active_attempts != 0
+        || facts.unresolved_submissions != 0
+        || facts.active_atlas != 0
+        || !facts.lock_free
+    {
+        return Err("live owner authority is not coherent".into());
+    }
+    Ok(())
+}
+
+async fn live_preflight_facts(pool: &PgPool) -> ControlResult<LivePreflightFacts> {
+    let economic = economic_state(pool).await?;
+    let current: (String, String) = sqlx::query_as(
+        "SELECT current_input_wei::text, maximum_reviewed_input_wei::text
+         FROM live_canary.economic_control WHERE singleton",
+    )
+    .fetch_one(pool)
+    .await
+    .map_err(|_| "live economic authority is unavailable")?;
+    let lanes = sqlx::query(
+        "SELECT lane, armed, kill_switch,
+                maximum_input_amount::text AS maximum_input_amount,
+                retained_profit_floor::text AS retained_profit_floor
+         FROM live_canary.revenue_lane_controls
+         WHERE lane IN ('aave_liquidation','atlas_solver') ORDER BY lane",
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(|_| "live revenue lane authority is unavailable")?
+    .iter()
+    .map(|row| {
+        Ok((
+            row.try_get("lane")
+                .map_err(|_| "live revenue lane authority is invalid")?,
+            row.try_get("armed")
+                .map_err(|_| "live revenue lane authority is invalid")?,
+            row.try_get("kill_switch")
+                .map_err(|_| "live revenue lane authority is invalid")?,
+            row.try_get::<String, _>("maximum_input_amount")
+                .map_err(|_| "live revenue lane authority is invalid")?
+                .parse()
+                .map_err(|_| "live revenue lane authority is invalid")?,
+            row.try_get::<String, _>("retained_profit_floor")
+                .map_err(|_| "live revenue lane authority is invalid")?
+                .parse()
+                .map_err(|_| "live revenue lane authority is invalid")?,
+        ))
+    })
+    .collect::<ControlResult<Vec<_>>>()?;
+    let runtime = sqlx::query(
+        "SELECT NOT legacy.armed AND legacy.kill_switch
+                    AND NOT global.armed AND global.kill_switch
+                    AND global.execution_mode='disarmed'
+                    AND EXISTS (SELECT 1 FROM live_canary.autonomous_route_controls)
+                    AND NOT EXISTS (SELECT 1 FROM live_canary.autonomous_route_controls
+                                    WHERE enabled OR NOT kill_switch)
+                    AND EXISTS (SELECT 1 FROM live_canary.revenue_lane_controls
+                                WHERE lane='phoenix_dex' AND NOT armed AND kill_switch)
+                    AS generic_closed,
+                (SELECT count(*) FROM live_canary.execution_attempts
+                 WHERE status IN ('claimed','nonce_allocated','submission_unknown','pending','timed_out')) AS active_attempts,
+                (SELECT count(*) FROM live_canary.execution_attempts
+                 WHERE status IN ('submission_unknown','pending','timed_out')) AS unresolved_submissions,
+                (SELECT count(*) FROM live_canary.atlas_solver_requests
+                 WHERE status IN ('claimed','signed','submitted','submission_unknown')) AS active_atlas,
+                lock.active_lane IS NULL AND lock.active_identity IS NULL
+                    AND lock.acquired_at IS NULL AS lock_free
+         FROM live_canary.control legacy
+         CROSS JOIN live_canary.autonomous_global_control global
+         CROSS JOIN live_canary.global_revenue_submission_lock lock
+         WHERE legacy.singleton AND global.singleton AND lock.singleton",
+    )
+    .fetch_one(pool)
+    .await
+    .map_err(|_| "live runtime authority is unavailable")?;
+    Ok(LivePreflightFacts {
+        phase: economic.phase,
+        level: economic.level,
+        release_sha: economic.release_sha,
+        current_input_wei: current
+            .0
+            .parse()
+            .map_err(|_| "live economic authority is invalid")?,
+        maximum_reviewed_input_wei: current
+            .1
+            .parse()
+            .map_err(|_| "live economic authority is invalid")?,
+        revenue_lanes: lanes,
+        generic_closed: runtime
+            .try_get("generic_closed")
+            .map_err(|_| "live runtime authority is invalid")?,
+        active_attempts: runtime
+            .try_get("active_attempts")
+            .map_err(|_| "live runtime authority is invalid")?,
+        unresolved_submissions: runtime
+            .try_get("unresolved_submissions")
+            .map_err(|_| "live runtime authority is invalid")?,
+        active_atlas: runtime
+            .try_get("active_atlas")
+            .map_err(|_| "live runtime authority is invalid")?,
+        lock_free: runtime
+            .try_get("lock_free")
+            .map_err(|_| "live runtime authority is invalid")?,
+    })
+}
+
+async fn owner_live_preflight() -> ControlResult<()> {
+    let release_sha = configured_release_identity()?;
+    let initial = live_preflight_from_environment().await?;
+    if initial.get("release_sha").and_then(Value::as_str) != Some(release_sha.as_str())
+        || initial
+            .get("final_state")
+            .and_then(|state| state.get("maximum_input_amount"))
+            .and_then(Value::as_str)
+            .and_then(|value| value.parse::<u128>().ok())
+            != Some(MAXIMUM_REVIEWED_INPUT_WEI)
+        || initial.get("signer_matches_owner").and_then(Value::as_bool) != Some(true)
+    {
+        return Err("live owner evidence is invalid".into());
+    }
+    let pool = database_pool().await?;
+    require_schema(&pool).await?;
+    validate_live_preflight_facts(&live_preflight_facts(&pool).await?, &release_sha)?;
+    let final_evidence = live_preflight_from_environment().await?;
+    if final_evidence != initial {
+        return Err("live owner evidence changed during preflight".into());
+    }
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&final_evidence)
+            .map_err(|_| "live owner evidence serialization failed")?
+    );
+    println!("EXECUTOR_OWNER_LIVE_PREFLIGHT_OK");
     Ok(())
 }
 
@@ -1795,14 +1974,6 @@ async fn converge_revenue_provider_authority(pool: &PgPool) -> ControlResult<()>
             };
             fail_close_provider_execution_gate(pool, gate_reason).await?;
         }
-        if matches!(
-            degraded_reason,
-            "provider_disagreement"
-                | "provider_unavailable"
-                | "provider_timeout"
-                | "provider_rate_limited"
-                | "revenue_lane_authority_diverged"
-        ) {}
         if degraded_reason == "revenue_lane_authority_diverged" {
             "revenue_lane_authority_diverged"
         } else if persistent_hunter_provider_failure(&payload, Utc::now().timestamp_millis())? {
@@ -1869,7 +2040,10 @@ async fn converge_revenue_provider_authority(pool: &PgPool) -> ControlResult<()>
     Ok(())
 }
 
-fn provider_recovery_samples(payload: &Value) -> ControlResult<Vec<(DateTime<Utc>, String)>> {
+fn provider_recovery_samples_at(
+    payload: &Value,
+    now: DateTime<Utc>,
+) -> ControlResult<Vec<(DateTime<Utc>, String)>> {
     if payload.get("hunting_health").and_then(Value::as_bool) != Some(true)
         || payload
             .get("exact_execution_readiness")
@@ -1884,11 +2058,17 @@ fn provider_recovery_samples(payload: &Value) -> ControlResult<Vec<(DateTime<Utc
             .get("provider_circuit_open_until_unix_millis")
             .and_then(Value::as_i64)
             .unwrap_or_default()
-            > Utc::now().timestamp_millis()
+            > now.timestamp_millis()
         || payload.get("degraded_reason").and_then(Value::as_str) != Some("")
+        || payload.get("rpc_authority_mode").and_then(Value::as_str) != Some("single_primary")
         || payload.get("primary").and_then(Value::as_str) != Some("production-nownodes-arbitrum")
         || !payload.get("confirmation").is_some_and(Value::is_null)
         || payload.get("quorum").and_then(Value::as_u64) != Some(1)
+        || payload.get("provider_quorum").and_then(Value::as_u64) != Some(1)
+        || payload
+            .get("provider_recovery_sample_count")
+            .and_then(Value::as_u64)
+            != Some(3)
     {
         return Err("provider recovery readiness is not green".into());
     }
@@ -1920,11 +2100,17 @@ fn provider_recovery_samples(payload: &Value) -> ControlResult<Vec<(DateTime<Utc
         samples.push((observed, primary.to_string()));
     }
     if !(samples[0].0 < samples[1].0 && samples[1].0 < samples[2].0)
-        || Utc::now().signed_duration_since(samples[2].0) > ChronoDuration::minutes(10)
+        || samples.iter().any(|(observed, _)| {
+            *observed > now || now.signed_duration_since(*observed) > ChronoDuration::minutes(10)
+        })
     {
         return Err("provider recovery samples are stale or unordered".into());
     }
     Ok(samples)
+}
+
+fn provider_recovery_samples(payload: &Value) -> ControlResult<Vec<(DateTime<Utc>, String)>> {
+    provider_recovery_samples_at(payload, Utc::now())
 }
 
 #[derive(Clone, Debug)]
@@ -2029,10 +2215,7 @@ fn provider_recovery_owner_state<'a>(
 }
 
 fn exact_release_identity() -> ControlResult<String> {
-    let expected = required("PHOENIX_RELEASE_SHA")?;
-    if !canonical_hex(&expected, 40) {
-        return Err("release SHA is invalid".into());
-    }
+    let expected = configured_release_identity()?;
     for environment_name in [
         "PHOENIX_CURRENT_RELEASE_PATH",
         "PHOENIX_RELEASE_ASSETS_PATH",
@@ -2043,6 +2226,14 @@ fn exact_release_identity() -> ControlResult<String> {
         if value.trim() != expected {
             return Err("protected release identity diverged".into());
         }
+    }
+    Ok(expected)
+}
+
+fn configured_release_identity() -> ControlResult<String> {
+    let expected = required("PHOENIX_RELEASE_SHA")?;
+    if !canonical_hex(&expected, 40) {
+        return Err("release SHA is invalid".into());
     }
     Ok(expected)
 }
@@ -3929,6 +4120,7 @@ fn validate_hunter_readiness(payload: &Value, now_millis: i64) -> ControlResult<
             .and_then(Value::as_str)
             != Some("ready")
         || payload.get("degraded_reason").and_then(Value::as_str) != Some("")
+        || payload.get("rpc_authority_mode").and_then(Value::as_str) != Some("single_primary")
     {
         return Err("exact Aave/Atlas readiness is not green".into());
     }
@@ -3950,6 +4142,7 @@ fn validate_hunter_readiness(payload: &Value, now_millis: i64) -> ControlResult<
             .get("confirmation_provider_id")
             .is_some_and(Value::is_null)
         || payload.get("quorum").and_then(Value::as_u64) != Some(1)
+        || payload.get("provider_quorum").and_then(Value::as_u64) != Some(1)
         || payload
             .get("last_primary_exact_at")
             .and_then(Value::as_str)
@@ -4414,6 +4607,279 @@ async fn arm_revenue_lanes_in_pool(pool: &PgPool) -> ControlResult<()> {
     Ok(())
 }
 
+#[derive(Clone, Debug)]
+struct PostArmRecoveryFacts {
+    previous: EconomicState,
+    revenue_lanes: Vec<(String, bool, bool, u128, u128)>,
+    generic_closed: bool,
+    active_attempts: i64,
+    unresolved_submissions: i64,
+    active_atlas: i64,
+    lock_free: bool,
+    activation_outbox_empty: bool,
+    samples: Vec<(DateTime<Utc>, String)>,
+}
+
+fn validate_post_arm_recovery_owner_evidence(
+    evidence: &Value,
+    release_sha: &str,
+) -> ControlResult<()> {
+    if evidence.get("chain_id").and_then(Value::as_u64) != Some(42_161)
+        || evidence.get("release_sha").and_then(Value::as_str) != Some(release_sha)
+        || evidence.get("status").and_then(Value::as_str) != Some("ready-paused")
+        || evidence
+            .get("final_state")
+            .and_then(|state| state.get("paused"))
+            .and_then(Value::as_bool)
+            != Some(true)
+        || evidence
+            .get("final_state")
+            .and_then(|state| state.get("configuration_complete"))
+            .and_then(Value::as_bool)
+            != Some(true)
+        || evidence
+            .get("final_state")
+            .and_then(|state| state.get("maximum_input_amount"))
+            .and_then(Value::as_str)
+            .and_then(|value| value.parse::<u128>().ok())
+            != Some(MAXIMUM_REVIEWED_INPUT_WEI)
+    {
+        return Err("post-arm recovery owner evidence is invalid".into());
+    }
+    Ok(())
+}
+
+fn post_arm_recovery_samples(
+    payload: &Value,
+    now: DateTime<Utc>,
+) -> ControlResult<Vec<(DateTime<Utc>, String)>> {
+    validate_hunter_readiness(payload, now.timestamp_millis())?;
+    if payload
+        .get("provider_current_class_failure_streak")
+        .and_then(Value::as_u64)
+        != Some(0)
+    {
+        return Err("post-arm recovery provider failure streak is not zero".into());
+    }
+    provider_recovery_samples_at(payload, now)
+}
+
+fn validate_post_arm_recovery_facts(
+    facts: &PostArmRecoveryFacts,
+    release_sha: &str,
+) -> ControlResult<()> {
+    let expected_lanes = ["aave_liquidation", "atlas_solver"];
+    if facts.previous.phase != EconomicPhase::DisarmedFailure
+        || facts.previous.level != SizeLevel::MaxReviewed
+        || facts.previous.current_input_wei != MAXIMUM_REVIEWED_INPUT_WEI
+        || facts.previous.maximum_reviewed_input_wei != MAXIMUM_REVIEWED_INPUT_WEI
+        || facts.previous.release_sha.as_deref() != Some(release_sha)
+        || facts.previous.last_transition_reason != POST_ARM_ACCEPTANCE_FAILURE_REASON
+        || facts.revenue_lanes.len() != expected_lanes.len()
+        || facts.revenue_lanes.iter().zip(expected_lanes).any(
+            |((lane, armed, kill_switch, maximum, floor), expected)| {
+                lane != expected
+                    || *armed
+                    || !*kill_switch
+                    || *maximum != MAXIMUM_REVIEWED_INPUT_WEI
+                    || *floor != RETAINED_PROFIT_FLOOR_WEI
+            },
+        )
+        || !facts.generic_closed
+        || facts.active_attempts != 0
+        || facts.unresolved_submissions != 0
+        || facts.active_atlas != 0
+        || !facts.lock_free
+        || !facts.activation_outbox_empty
+        || facts.samples.len() != 3
+        || facts.samples.iter().any(|(at, primary)| {
+            *at <= facts.previous.updated_at || primary != "production-nownodes-arbitrum"
+        })
+    {
+        return Err("post-arm acceptance recovery preconditions are not satisfied".into());
+    }
+    Ok(())
+}
+
+fn activation_outbox_empty() -> ControlResult<bool> {
+    let outbox = PathBuf::from(required(ACTIVATION_REQUEST_OUTBOX_ENV)?);
+    let metadata =
+        fs::symlink_metadata(&outbox).map_err(|_| "activation request outbox is unavailable")?;
+    if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
+        return Err("activation request outbox is unsafe".into());
+    }
+    let entries = fs::read_dir(&outbox).map_err(|_| "activation request outbox is unavailable")?;
+    for entry in entries {
+        let entry = entry.map_err(|_| "activation request outbox is unavailable")?;
+        let name = entry
+            .file_name()
+            .into_string()
+            .map_err(|_| "activation request outbox is invalid")?;
+        if name.starts_with("activation-request-") && name.ends_with(".json") {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+async fn recover_post_arm_acceptance_failure() -> ControlResult<()> {
+    if required("PHOENIX_POST_ARM_RECOVERY_ACK")? != RECOVER_POST_ARM_ACCEPTANCE_ACK {
+        return Err("post-arm acceptance recovery acknowledgement is invalid".into());
+    }
+    require_signerless_control()?;
+    let release_sha = configured_release_identity()?;
+    let owner_evidence = configured_preflight_from_environment().await?;
+    validate_post_arm_recovery_owner_evidence(&owner_evidence, &release_sha)?;
+    require_max_reviewed_runtime_readiness().await?;
+    let payload = hunter_readiness_payload().await?;
+    let samples = post_arm_recovery_samples(&payload, Utc::now())?;
+    let outbox_empty = activation_outbox_empty()?;
+
+    let pool = database_pool().await?;
+    let next_epoch =
+        apply_post_arm_acceptance_recovery(&pool, &release_sha, samples, outbox_empty).await?;
+    println!(
+        "POST_ARM_ACCEPTANCE_RECOVERY_OK: release_sha={release_sha} phase=DISARMED_EVIDENCE size=MAX_REVIEWED control_epoch={next_epoch} lanes_armed=false contract_paused=true"
+    );
+    Ok(())
+}
+
+async fn apply_post_arm_acceptance_recovery(
+    pool: &PgPool,
+    release_sha: &str,
+    samples: Vec<(DateTime<Utc>, String)>,
+    outbox_empty: bool,
+) -> ControlResult<i64> {
+    require_schema(pool).await?;
+    let mut transaction = pool
+        .begin()
+        .await
+        .map_err(|_| "post-arm recovery transaction failed")?;
+    let previous = economic_state_for_update(&mut transaction).await?;
+    let lanes = sqlx::query(
+        "SELECT lane, armed, kill_switch,
+                maximum_input_amount::text AS maximum_input_amount,
+                retained_profit_floor::text AS retained_profit_floor
+         FROM live_canary.revenue_lane_controls
+         WHERE lane IN ('aave_liquidation','atlas_solver') ORDER BY lane FOR UPDATE",
+    )
+    .fetch_all(&mut *transaction)
+    .await
+    .map_err(|_| "post-arm recovery lane authority is unavailable")?
+    .iter()
+    .map(|row| {
+        Ok((
+            row.try_get("lane")
+                .map_err(|_| "post-arm recovery lane authority is invalid")?,
+            row.try_get("armed")
+                .map_err(|_| "post-arm recovery lane authority is invalid")?,
+            row.try_get("kill_switch")
+                .map_err(|_| "post-arm recovery lane authority is invalid")?,
+            row.try_get::<String, _>("maximum_input_amount")
+                .map_err(|_| "post-arm recovery lane authority is invalid")?
+                .parse()
+                .map_err(|_| "post-arm recovery lane authority is invalid")?,
+            row.try_get::<String, _>("retained_profit_floor")
+                .map_err(|_| "post-arm recovery lane authority is invalid")?
+                .parse()
+                .map_err(|_| "post-arm recovery lane authority is invalid")?,
+        ))
+    })
+    .collect::<ControlResult<Vec<_>>>()?;
+    let runtime = sqlx::query(
+        "SELECT NOT legacy.armed AND legacy.kill_switch
+                    AND NOT global.armed AND global.kill_switch
+                    AND global.execution_mode='disarmed'
+                    AND EXISTS (SELECT 1 FROM live_canary.autonomous_route_controls)
+                    AND NOT EXISTS (SELECT 1 FROM live_canary.autonomous_route_controls
+                                    WHERE enabled OR NOT kill_switch)
+                    AND EXISTS (SELECT 1 FROM live_canary.revenue_lane_controls
+                                WHERE lane='phoenix_dex' AND NOT armed AND kill_switch)
+                    AS generic_closed,
+                (SELECT count(*) FROM live_canary.execution_attempts
+                 WHERE status IN ('claimed','nonce_allocated','submission_unknown','pending','timed_out')) AS active_attempts,
+                (SELECT count(*) FROM live_canary.execution_attempts
+                 WHERE status IN ('submission_unknown','pending','timed_out')) AS unresolved_submissions,
+                (SELECT count(*) FROM live_canary.atlas_solver_requests
+                 WHERE status IN ('claimed','signed','submitted','submission_unknown')) AS active_atlas,
+                lock.active_lane IS NULL AND lock.active_identity IS NULL
+                    AND lock.acquired_at IS NULL AS lock_free
+         FROM live_canary.control legacy
+         CROSS JOIN live_canary.autonomous_global_control global
+         CROSS JOIN live_canary.global_revenue_submission_lock lock
+         WHERE legacy.singleton AND global.singleton AND lock.singleton
+         FOR UPDATE OF legacy, global, lock",
+    )
+    .fetch_one(&mut *transaction)
+    .await
+    .map_err(|_| "post-arm recovery runtime authority is unavailable")?;
+    let facts = PostArmRecoveryFacts {
+        previous,
+        revenue_lanes: lanes,
+        generic_closed: runtime
+            .try_get("generic_closed")
+            .map_err(|_| "post-arm recovery runtime authority is invalid")?,
+        active_attempts: runtime
+            .try_get("active_attempts")
+            .map_err(|_| "post-arm recovery runtime authority is invalid")?,
+        unresolved_submissions: runtime
+            .try_get("unresolved_submissions")
+            .map_err(|_| "post-arm recovery runtime authority is invalid")?,
+        active_atlas: runtime
+            .try_get("active_atlas")
+            .map_err(|_| "post-arm recovery runtime authority is invalid")?,
+        lock_free: runtime
+            .try_get("lock_free")
+            .map_err(|_| "post-arm recovery runtime authority is invalid")?,
+        activation_outbox_empty: outbox_empty,
+        samples,
+    };
+    validate_post_arm_recovery_facts(&facts, release_sha)?;
+    let next_epoch = facts.previous.control_epoch + 1;
+    let transitioned_at = Utc::now();
+    let updated = sqlx::query(
+        "UPDATE live_canary.economic_control
+         SET phase='DISARMED_EVIDENCE', readiness_id=NULL, authorization_id=NULL,
+             cooldown_until=NULL, control_epoch=$1, last_transition_reason=$2,
+             state_hash=NULL, updated_at=$3
+         WHERE singleton AND phase='DISARMED_FAILURE'
+           AND current_size_level='MAX_REVIEWED'
+           AND current_input_wei=$4::numeric
+           AND maximum_reviewed_input_wei=$4::numeric
+           AND release_sha=$5 AND control_epoch=$6 AND last_transition_reason=$7",
+    )
+    .bind(next_epoch)
+    .bind(POST_ARM_RECOVERY_REASON)
+    .bind(transitioned_at)
+    .bind(MAXIMUM_REVIEWED_INPUT_WEI.to_string())
+    .bind(release_sha)
+    .bind(facts.previous.control_epoch)
+    .bind(POST_ARM_ACCEPTANCE_FAILURE_REASON)
+    .execute(&mut *transaction)
+    .await
+    .map_err(|_| "post-arm recovery economic update failed")?;
+    if updated.rows_affected() != 1 {
+        return Err("post-arm recovery authority changed concurrently".into());
+    }
+    insert_transition_at(
+        &mut transaction,
+        &facts.previous,
+        EconomicPhase::DisarmedEvidence,
+        SizeLevel::MaxReviewed,
+        POST_ARM_RECOVERY_REASON,
+        None,
+        Some(release_sha),
+        next_epoch,
+        transitioned_at,
+    )
+    .await?;
+    transaction
+        .commit()
+        .await
+        .map_err(|_| "post-arm recovery commit failed")?;
+    Ok(next_epoch)
+}
+
 async fn status(pool: &PgPool) -> Result<(), &'static str> {
     require_schema(pool).await?;
     let row = sqlx::query(
@@ -4616,6 +5082,9 @@ async fn require_schema(pool: &PgPool) -> Result<(), &'static str> {
 struct EconomicState {
     phase: EconomicPhase,
     level: SizeLevel,
+    current_input_wei: u128,
+    maximum_reviewed_input_wei: u128,
+    last_transition_reason: String,
     route_fingerprint: Option<String>,
     release_sha: Option<String>,
     engine_image_digest: Option<String>,
@@ -4703,7 +5172,10 @@ fn validate_readiness_against_evidence(
 
 async fn economic_state(pool: &PgPool) -> ControlResult<EconomicState> {
     let row = sqlx::query(
-        "SELECT phase, current_size_level, route_fingerprint, release_sha,
+        "SELECT phase, current_size_level,
+                current_input_wei::text AS current_input_wei,
+                maximum_reviewed_input_wei::text AS maximum_reviewed_input_wei,
+                last_transition_reason, route_fingerprint, release_sha,
                 engine_image_digest, route_universe_hash, route_policy_hash,
                 risk_policy_hash, executor_code_hash,
                 readiness_id, authorization_id,
@@ -4722,7 +5194,10 @@ async fn economic_state_for_update(
     transaction: &mut Transaction<'_, Postgres>,
 ) -> ControlResult<EconomicState> {
     let row = sqlx::query(
-        "SELECT phase, current_size_level, route_fingerprint, release_sha,
+        "SELECT phase, current_size_level,
+                current_input_wei::text AS current_input_wei,
+                maximum_reviewed_input_wei::text AS maximum_reviewed_input_wei,
+                last_transition_reason, route_fingerprint, release_sha,
                 engine_image_digest, route_universe_hash, route_policy_hash,
                 risk_policy_hash, executor_code_hash,
                 readiness_id, authorization_id,
@@ -4751,6 +5226,19 @@ fn economic_state_from_row(row: &sqlx::postgres::PgRow) -> ControlResult<Economi
     Ok(EconomicState {
         phase,
         level,
+        current_input_wei: row
+            .try_get::<String, _>("current_input_wei")
+            .map_err(|_| "economic control is invalid")?
+            .parse()
+            .map_err(|_| "economic control is invalid")?,
+        maximum_reviewed_input_wei: row
+            .try_get::<String, _>("maximum_reviewed_input_wei")
+            .map_err(|_| "economic control is invalid")?
+            .parse()
+            .map_err(|_| "economic control is invalid")?,
+        last_transition_reason: row
+            .try_get("last_transition_reason")
+            .map_err(|_| "economic control is invalid")?,
         route_fingerprint: row
             .try_get("route_fingerprint")
             .map_err(|_| "economic control is invalid")?,
@@ -4948,7 +5436,7 @@ fn require_signerless_control() -> ControlResult<()> {
         "LIVE_EXECUTOR_SIGNER_FILE",
     ] {
         if env::var_os(name).is_some() {
-            return Err("evidence-start requires a signerless control process".into());
+            return Err("this command requires a signerless control process".into());
         }
     }
     Ok(())
@@ -5068,6 +5556,9 @@ mod tests {
         EconomicState {
             phase,
             level: SizeLevel::Min,
+            current_input_wei: SizeLevel::Min.amount_wei(),
+            maximum_reviewed_input_wei: MAXIMUM_REVIEWED_INPUT_WEI,
+            last_transition_reason: "test_transition".to_string(),
             route_fingerprint: Some("route".to_string()),
             release_sha: Some("a".repeat(40)),
             engine_image_digest: Some(format!("sha256:{}", "b".repeat(64))),
@@ -5131,13 +5622,16 @@ mod tests {
             "hunting_health": true,
             "exact_execution_readiness": true,
             "atlas_connected": true,
+            "rpc_authority_mode": "single_primary",
             "provider_recovery_state": "ready",
+            "provider_recovery_sample_count": 3,
             "provider_current_class_failure_streak": 0,
             "degraded_reason": "",
             "provider_circuit_open_until_unix_millis": 0,
             "primary": "production-nownodes-arbitrum",
             "confirmation": null,
             "quorum": 1,
+            "provider_quorum": 1,
             "primary_provider_id": "production-nownodes-arbitrum",
             "confirmation_provider_id": null,
             "last_primary_exact_at": "2026-08-10T00:00:00Z"
@@ -5451,6 +5945,46 @@ mod tests {
     }
 
     #[test]
+    fn post_arm_recovery_requires_exact_fresh_single_primary_evidence_and_zero_streak() {
+        let now = Utc::now();
+        let mut valid = hunter_readiness();
+        valid["provider_recovery_samples"] = json!([
+            {"observed_at": (now-ChronoDuration::seconds(3)).to_rfc3339(), "primary_provider":"production-nownodes-arbitrum", "confirmation":null, "quorum":1},
+            {"observed_at": (now-ChronoDuration::seconds(2)).to_rfc3339(), "primary_provider":"production-nownodes-arbitrum", "confirmation":null, "quorum":1},
+            {"observed_at": (now-ChronoDuration::seconds(1)).to_rfc3339(), "primary_provider":"production-nownodes-arbitrum", "confirmation":null, "quorum":1}
+        ]);
+        assert_eq!(post_arm_recovery_samples(&valid, now).unwrap().len(), 3);
+
+        let mut variants = Vec::new();
+        let mut wrong_mode = valid.clone();
+        wrong_mode["rpc_authority_mode"] = json!("dual_provider");
+        variants.push(wrong_mode);
+        let mut wrong_quorum = valid.clone();
+        wrong_quorum["provider_quorum"] = json!(2);
+        variants.push(wrong_quorum);
+        let mut wrong_sample_count = valid.clone();
+        wrong_sample_count["provider_recovery_sample_count"] = json!(2);
+        variants.push(wrong_sample_count);
+        let mut failed_sample = valid.clone();
+        failed_sample["provider_recovery_samples"][1]["primary_provider"] = json!("failed");
+        variants.push(failed_sample);
+        let mut stale_sample = valid.clone();
+        stale_sample["provider_recovery_samples"][0]["observed_at"] =
+            json!((now - ChronoDuration::minutes(11)).to_rfc3339());
+        variants.push(stale_sample);
+        let mut future_sample = valid.clone();
+        future_sample["provider_recovery_samples"][2]["observed_at"] =
+            json!((now + ChronoDuration::seconds(1)).to_rfc3339());
+        variants.push(future_sample);
+        let mut failed_streak = valid.clone();
+        failed_streak["provider_current_class_failure_streak"] = json!(1);
+        variants.push(failed_streak);
+        assert!(variants
+            .iter()
+            .all(|payload| post_arm_recovery_samples(payload, now).is_err()));
+    }
+
+    #[test]
     fn repeated_current_provider_failures_require_an_open_circuit_before_fail_close() {
         let now_millis = Utc::now().timestamp_millis();
         for reason in [
@@ -5684,5 +6218,390 @@ mod tests {
             }
             assert!(provider_recovery_owner_state(&invalid, &"a".repeat(40)).is_err());
         }
+    }
+
+    fn post_arm_recovery_facts() -> PostArmRecoveryFacts {
+        let mut previous = state(EconomicPhase::DisarmedFailure);
+        previous.level = SizeLevel::MaxReviewed;
+        previous.current_input_wei = MAXIMUM_REVIEWED_INPUT_WEI;
+        previous.last_transition_reason = POST_ARM_ACCEPTANCE_FAILURE_REASON.to_string();
+        let samples = (1..=3)
+            .map(|offset| {
+                (
+                    previous.updated_at + ChronoDuration::seconds(offset),
+                    "production-nownodes-arbitrum".to_string(),
+                )
+            })
+            .collect();
+        PostArmRecoveryFacts {
+            previous,
+            revenue_lanes: vec![
+                (
+                    "aave_liquidation".to_string(),
+                    false,
+                    true,
+                    MAXIMUM_REVIEWED_INPUT_WEI,
+                    RETAINED_PROFIT_FLOOR_WEI,
+                ),
+                (
+                    "atlas_solver".to_string(),
+                    false,
+                    true,
+                    MAXIMUM_REVIEWED_INPUT_WEI,
+                    RETAINED_PROFIT_FLOOR_WEI,
+                ),
+            ],
+            generic_closed: true,
+            active_attempts: 0,
+            unresolved_submissions: 0,
+            active_atlas: 0,
+            lock_free: true,
+            activation_outbox_empty: true,
+            samples,
+        }
+    }
+
+    #[test]
+    fn post_arm_recovery_requires_paused_configured_exact_owner_evidence() {
+        let valid = json!({
+            "chain_id": 42_161,
+            "release_sha": "a".repeat(40),
+            "status": "ready-paused",
+            "final_state": {
+                "paused": true,
+                "configuration_complete": true,
+                "maximum_input_amount": MAXIMUM_REVIEWED_INPUT_WEI.to_string()
+            }
+        });
+        assert!(validate_post_arm_recovery_owner_evidence(&valid, &"a".repeat(40)).is_ok());
+        let mut variants = Vec::new();
+        let mut unpaused = valid.clone();
+        unpaused["final_state"]["paused"] = json!(false);
+        variants.push(unpaused);
+        let mut incomplete = valid.clone();
+        incomplete["final_state"]["configuration_complete"] = json!(false);
+        variants.push(incomplete);
+        let mut wrong_chain = valid.clone();
+        wrong_chain["chain_id"] = json!(1);
+        variants.push(wrong_chain);
+        assert!(variants.iter().all(|evidence| {
+            validate_post_arm_recovery_owner_evidence(evidence, &"a".repeat(40)).is_err()
+        }));
+    }
+
+    #[test]
+    fn post_arm_recovery_is_exact_reason_release_phase_size_and_post_failure_bound() {
+        let valid = post_arm_recovery_facts();
+        assert!(validate_post_arm_recovery_facts(&valid, &"a".repeat(40)).is_ok());
+
+        let mut variants = Vec::new();
+        for reason in [
+            "provider_timeout",
+            "daily_loss_budget",
+            "canary_activation_failure",
+            "rpc_timeout",
+        ] {
+            let mut facts = post_arm_recovery_facts();
+            facts.previous.last_transition_reason = reason.to_string();
+            variants.push(facts);
+        }
+        let mut wrong_phase = post_arm_recovery_facts();
+        wrong_phase.previous.phase = EconomicPhase::DisarmedEvidence;
+        variants.push(wrong_phase);
+        let mut wrong_size = post_arm_recovery_facts();
+        wrong_size.previous.level = SizeLevel::Min;
+        variants.push(wrong_size);
+        let mut wrong_input = post_arm_recovery_facts();
+        wrong_input.previous.current_input_wei -= 1;
+        variants.push(wrong_input);
+        let mut wrong_maximum = post_arm_recovery_facts();
+        wrong_maximum.previous.maximum_reviewed_input_wei -= 1;
+        variants.push(wrong_maximum);
+        let mut stale = post_arm_recovery_facts();
+        stale.samples[0].0 = stale.previous.updated_at;
+        variants.push(stale);
+        let mut wrong_primary = post_arm_recovery_facts();
+        wrong_primary.samples[2].1 = "other-provider".to_string();
+        variants.push(wrong_primary);
+        let mut wrong_count = post_arm_recovery_facts();
+        wrong_count.samples.pop();
+        variants.push(wrong_count);
+        assert!(variants
+            .iter()
+            .all(|facts| validate_post_arm_recovery_facts(facts, &"a".repeat(40)).is_err()));
+        assert!(validate_post_arm_recovery_facts(&valid, &"b".repeat(40)).is_err());
+    }
+
+    #[test]
+    fn post_arm_recovery_rejects_every_open_authority_work_lock_or_outbox_gate() {
+        let mut variants = Vec::new();
+        let mut missing_lane = post_arm_recovery_facts();
+        missing_lane.revenue_lanes.pop();
+        variants.push(missing_lane);
+        let mut armed = post_arm_recovery_facts();
+        armed.revenue_lanes[0].1 = true;
+        variants.push(armed);
+        let mut kill_open = post_arm_recovery_facts();
+        kill_open.revenue_lanes[1].2 = false;
+        variants.push(kill_open);
+        let mut lane_maximum = post_arm_recovery_facts();
+        lane_maximum.revenue_lanes[0].3 -= 1;
+        variants.push(lane_maximum);
+        let mut floor = post_arm_recovery_facts();
+        floor.revenue_lanes[1].4 -= 1;
+        variants.push(floor);
+        let mut generic = post_arm_recovery_facts();
+        generic.generic_closed = false;
+        variants.push(generic);
+        let mut attempt = post_arm_recovery_facts();
+        attempt.active_attempts = 1;
+        variants.push(attempt);
+        let mut unresolved = post_arm_recovery_facts();
+        unresolved.unresolved_submissions = 1;
+        variants.push(unresolved);
+        let mut atlas = post_arm_recovery_facts();
+        atlas.active_atlas = 1;
+        variants.push(atlas);
+        let mut locked = post_arm_recovery_facts();
+        locked.lock_free = false;
+        variants.push(locked);
+        let mut outbox = post_arm_recovery_facts();
+        outbox.activation_outbox_empty = false;
+        variants.push(outbox);
+        assert!(variants
+            .iter()
+            .all(|facts| validate_post_arm_recovery_facts(facts, &"a".repeat(40)).is_err()));
+    }
+
+    fn live_facts() -> LivePreflightFacts {
+        LivePreflightFacts {
+            phase: EconomicPhase::DisarmedEvidence,
+            level: SizeLevel::MaxReviewed,
+            release_sha: Some("a".repeat(40)),
+            current_input_wei: MAXIMUM_REVIEWED_INPUT_WEI,
+            maximum_reviewed_input_wei: MAXIMUM_REVIEWED_INPUT_WEI,
+            revenue_lanes: vec![
+                (
+                    "aave_liquidation".to_string(),
+                    true,
+                    false,
+                    MAXIMUM_REVIEWED_INPUT_WEI,
+                    RETAINED_PROFIT_FLOOR_WEI,
+                ),
+                (
+                    "atlas_solver".to_string(),
+                    true,
+                    false,
+                    MAXIMUM_REVIEWED_INPUT_WEI,
+                    RETAINED_PROFIT_FLOOR_WEI,
+                ),
+            ],
+            generic_closed: true,
+            active_attempts: 0,
+            unresolved_submissions: 0,
+            active_atlas: 0,
+            lock_free: true,
+        }
+    }
+
+    #[test]
+    fn live_preflight_requires_exact_armed_pair_closed_generic_and_coherent_work() {
+        let valid = live_facts();
+        assert!(validate_live_preflight_facts(&valid, &"a".repeat(40)).is_ok());
+        let mut variants = Vec::new();
+        let mut paused_lane = live_facts();
+        paused_lane.revenue_lanes[0].1 = false;
+        variants.push(paused_lane);
+        let mut generic = live_facts();
+        generic.generic_closed = false;
+        variants.push(generic);
+        let mut attempt = live_facts();
+        attempt.active_attempts = 1;
+        variants.push(attempt);
+        let mut unresolved = live_facts();
+        unresolved.unresolved_submissions = 1;
+        variants.push(unresolved);
+        let mut atlas = live_facts();
+        atlas.active_atlas = 1;
+        variants.push(atlas);
+        let mut lock = live_facts();
+        lock.lock_free = false;
+        variants.push(lock);
+        let mut economics = live_facts();
+        economics.current_input_wei -= 1;
+        variants.push(economics);
+        assert!(variants
+            .iter()
+            .all(|facts| validate_live_preflight_facts(facts, &"a".repeat(40)).is_err()));
+    }
+
+    async fn reset_post_arm_recovery_schema(pool: &PgPool) {
+        sqlx::raw_sql("DROP SCHEMA IF EXISTS live_canary CASCADE")
+            .execute(pool)
+            .await
+            .expect("reset post-arm recovery schema");
+        for migration in MIGRATIONS {
+            sqlx::raw_sql(migration.1)
+                .execute(pool)
+                .await
+                .expect("apply post-arm recovery schema");
+        }
+    }
+
+    #[tokio::test]
+    async fn post_arm_recovery_postgres_transition_is_atomic_and_economically_unchanged() {
+        let Some(dsn) = env::var("PHOENIX_POST_ARM_RECOVERY_TEST_DSN").ok() else {
+            eprintln!(
+                "PHOENIX_POST_ARM_RECOVERY_TEST_DSN is unset; skipping PostgreSQL integration"
+            );
+            return;
+        };
+        let pool = PgPool::connect(&dsn).await.expect("connect test database");
+        reset_post_arm_recovery_schema(&pool).await;
+        let release_sha = "a".repeat(40);
+        let failure_at = Utc::now() - ChronoDuration::minutes(1);
+
+        sqlx::query(
+            "INSERT INTO live_canary.autonomous_route_controls(
+                route_fingerprint, route_policy_hash, enabled, kill_switch,
+                current_size_level, maximum_permitted_size, control_epoch,
+                disarm_reason, control_hash, control_contract, updated_at
+             ) VALUES ($1, $2, false, true, 'MAX_REVIEWED', $3::numeric, 8,
+                       'post_arm_acceptance_failed', NULL, NULL, $4)",
+        )
+        .bind(CURRENT_ROUTE_FINGERPRINT)
+        .bind("b".repeat(64))
+        .bind(MAXIMUM_REVIEWED_INPUT_WEI.to_string())
+        .bind(failure_at)
+        .execute(&pool)
+        .await
+        .expect("insert closed route control");
+        sqlx::query(
+            "UPDATE live_canary.control
+             SET armed=false, kill_switch=true, disarm_reason='post_arm_acceptance_failed', updated_at=$1",
+        )
+        .bind(failure_at)
+        .execute(&pool)
+        .await
+        .expect("close legacy control");
+        sqlx::query(
+            "UPDATE live_canary.autonomous_global_control
+             SET armed=false, kill_switch=true, execution_mode='disarmed',
+                 disarm_reason='post_arm_acceptance_failed', control_epoch=8, updated_at=$1",
+        )
+        .bind(failure_at)
+        .execute(&pool)
+        .await
+        .expect("close global control");
+        sqlx::query(
+            "UPDATE live_canary.economic_control
+             SET phase='DISARMED_FAILURE', current_size_level='MAX_REVIEWED',
+                 current_input_wei=$1::numeric, release_sha=$2, control_epoch=8,
+                 last_transition_reason='post_arm_acceptance_failed', updated_at=$3",
+        )
+        .bind(MAXIMUM_REVIEWED_INPUT_WEI.to_string())
+        .bind(&release_sha)
+        .bind(failure_at)
+        .execute(&pool)
+        .await
+        .expect("install post-arm failure state");
+        sqlx::query(
+            "UPDATE live_canary.revenue_lane_controls
+             SET armed=false, kill_switch=true,
+                 maximum_input_amount=$1::numeric,
+                 retained_profit_floor=$2::numeric,
+                 disarm_reason='post_arm_acceptance_failed', control_epoch=8, updated_at=$3
+             WHERE lane IN ('aave_liquidation','atlas_solver')",
+        )
+        .bind(MAXIMUM_REVIEWED_INPUT_WEI.to_string())
+        .bind(RETAINED_PROFIT_FLOOR_WEI.to_string())
+        .bind(failure_at)
+        .execute(&pool)
+        .await
+        .expect("close exact revenue lanes");
+
+        let samples = (1..=3)
+            .map(|offset| {
+                (
+                    failure_at + ChronoDuration::seconds(offset),
+                    "production-nownodes-arbitrum".to_string(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            apply_post_arm_acceptance_recovery(&pool, &release_sha, samples, true)
+                .await
+                .expect("apply exact post-arm recovery"),
+            9
+        );
+
+        let proof: (String, String, String, i64, String, i64, bool, bool, String, String, i64, bool) =
+            sqlx::query_as(
+                "SELECT economic.phase, economic.current_size_level,
+                        economic.current_input_wei::text, economic.control_epoch,
+                        economic.last_transition_reason,
+                        (SELECT count(*) FROM live_canary.economic_transitions transition
+                         WHERE transition.from_phase='DISARMED_FAILURE'
+                           AND transition.to_phase='DISARMED_EVIDENCE'
+                           AND transition.from_size_level='MAX_REVIEWED'
+                           AND transition.to_size_level='MAX_REVIEWED'
+                           AND transition.reason=$1
+                           AND transition.release_sha=$2
+                           AND transition.control_epoch=economic.control_epoch
+                           AND transition.transitioned_at=economic.updated_at),
+                        bool_and(NOT lane.armed), bool_and(lane.kill_switch),
+                        min(lane.maximum_input_amount)::text,
+                        min(lane.retained_profit_floor)::text,
+                        count(*),
+                        NOT legacy.armed AND legacy.kill_switch
+                          AND NOT global.armed AND global.kill_switch
+                          AND global.execution_mode='disarmed'
+                          AND lock.active_lane IS NULL AND lock.active_identity IS NULL
+                          AND lock.acquired_at IS NULL
+                 FROM live_canary.economic_control economic
+                 CROSS JOIN live_canary.control legacy
+                 CROSS JOIN live_canary.autonomous_global_control global
+                 CROSS JOIN live_canary.global_revenue_submission_lock lock
+                 JOIN live_canary.revenue_lane_controls lane
+                   ON lane.lane IN ('aave_liquidation','atlas_solver')
+                 WHERE economic.singleton AND legacy.singleton AND global.singleton AND lock.singleton
+                 GROUP BY economic.singleton, economic.phase, economic.current_size_level,
+                          economic.current_input_wei, economic.control_epoch,
+                          economic.last_transition_reason, legacy.armed, legacy.kill_switch,
+                          global.armed, global.kill_switch, global.execution_mode,
+                          lock.active_lane, lock.active_identity, lock.acquired_at",
+            )
+            .bind(POST_ARM_RECOVERY_REASON)
+            .bind(&release_sha)
+            .fetch_one(&pool)
+            .await
+            .expect("read post-arm recovery proof");
+        assert_eq!(
+            proof,
+            (
+                "DISARMED_EVIDENCE".to_string(),
+                "MAX_REVIEWED".to_string(),
+                MAXIMUM_REVIEWED_INPUT_WEI.to_string(),
+                9,
+                POST_ARM_RECOVERY_REASON.to_string(),
+                1,
+                true,
+                true,
+                MAXIMUM_REVIEWED_INPUT_WEI.to_string(),
+                RETAINED_PROFIT_FLOOR_WEI.to_string(),
+                2,
+                true,
+            )
+        );
+
+        assert!(
+            apply_post_arm_acceptance_recovery(&pool, &release_sha, Vec::new(), true)
+                .await
+                .is_err()
+        );
+        sqlx::raw_sql("DROP SCHEMA live_canary CASCADE")
+            .execute(&pool)
+            .await
+            .expect("drop post-arm recovery schema");
     }
 }

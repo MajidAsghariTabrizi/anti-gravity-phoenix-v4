@@ -60,6 +60,7 @@ STATIC_PATHS = (
     "prometheus/prometheus.yml",
     "scripts/bootstrap-production.sh",
     "scripts/activate-economic-canary.sh",
+    "scripts/monitor-post-arm-revenue.sh",
     "scripts/deploy-release.sh",
     "scripts/economic_activation_runner.py",
     "scripts/economic-dashboard-loop.sh",
