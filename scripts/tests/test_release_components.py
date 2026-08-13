@@ -738,7 +738,15 @@ class ReleaseRoundTripTests(unittest.TestCase):
             "RECORDER_PERSISTENCE_POLICY": "money_path_v1",
         }
         services["rpc-gateway"]["environment"] = {
-            "RPC_STATE_REQUESTS_PER_MINUTE": "12"
+            "RPC_AUTHORITY_MODE": "single_primary",
+            "RPC_AUTH_PROVIDER_HEADER_FILE": (
+                "/run/secrets/phoenix-rpc-provider-slot-1-api-key"
+            ),
+            "RPC_AUTH_PROVIDER_HEADER_NAME": "api-key",
+            "RPC_AUTH_PROVIDER_ID": "production-nownodes-arbitrum",
+            "RPC_AUTH_PROVIDER_PRIORITY": "100",
+            "RPC_AUTH_PROVIDER_URL": "https://arbitrum.nownodes.io/",
+            "RPC_STATE_REQUESTS_PER_MINUTE": "12",
         }
         if mode != "SHADOW":
             executor_address = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
@@ -1053,6 +1061,35 @@ class ReleaseRoundTripTests(unittest.TestCase):
                     }
                 )
             )
+
+        for name, invalid in (
+            ("RPC_AUTHORITY_MODE", "dual_provider"),
+            ("RPC_AUTH_PROVIDER_ID", "production-slot-0"),
+            ("RPC_AUTH_PROVIDER_URL", "https://legacy-primary.invalid/"),
+            ("RPC_AUTH_PROVIDER_PRIORITY", "99"),
+            ("RPC_AUTH_PROVIDER_HEADER_NAME", "authorization"),
+            ("RPC_AUTH_PROVIDER_HEADER_FILE", "/tmp/unsafe"),
+            ("RPC_PROVIDER_URLS", "https://legacy-primary.invalid/"),
+            ("RPC_PROVIDER_WEIGHTS", "1"),
+            ("RPC_PROVIDER_IDS", "production-slot-0"),
+        ):
+            invalid_render = self._rendered_compose(release_values, route_raw)
+            invalid_render["services"]["rpc-gateway"]["environment"][name] = invalid
+            compose_path.write_text(json.dumps(invalid_render), encoding="utf-8")
+            with self.subTest(name=name), self.assertRaisesRegex(
+                production_context.ContextError,
+                "RPC_AUTHORITY_RENDER_INVALID",
+            ):
+                production_context.validate_render(
+                    argparse.Namespace(
+                        compose_config=str(compose_path),
+                        env_file=str(operator_env),
+                        release_env=str(release_env),
+                        manifest=str(manifest_path),
+                        expected_mode=None,
+                        metadata_output=str(metadata),
+                    )
+                )
 
     def test_release_only_manifest_inherits_every_schema_valid_image(self) -> None:
         rollback, _, rollback_manifest_path, rollback_provenance_path = (

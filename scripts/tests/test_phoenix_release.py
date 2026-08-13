@@ -54,6 +54,7 @@ from scripts.phoenix_release.gateway import (
     state_file,
     validate_request,
     buffer_rpc_provider_secret,
+    emergency_pause,
 )
 from scripts.phoenix_release.rpc_provider_secret import (
     SecretError as RpcProviderSecretError,
@@ -63,6 +64,7 @@ from scripts.phoenix_release.rpc_provider_secret import (
     read_existing_secret,
     read_secret_once,
 )
+from scripts.phoenix_release.chain_reconciliation import ReconciliationError
 from scripts.production_context import (
     ContextError,
     validate_active as validate_active_context,
@@ -1813,6 +1815,484 @@ class BoundedTransportContinuationTests(unittest.TestCase):
         )
         self.assertNotIn("install_protected_file", context_installer)
 
+    @staticmethod
+    def emergency_status(*, shadow: bool = False) -> dict[str, object]:
+        return {
+            "active_build_run_id": 1,
+            "active_release": RELEASE_SHA,
+            "autonomous_execution": False if shadow else True,
+            "live_execution": False if shadow else True,
+            "phoenix_mode": "SHADOW" if shadow else "LIVE",
+            "protocol_version": PROTOCOL_VERSION,
+            "release_assets_sha": RELEASE_SHA,
+            "schema": "phoenix.release-status.v1",
+        }
+
+    @staticmethod
+    def pause_observation(paused: bool) -> dict[str, object]:
+        return {
+            "chain_id": "0xa4b1",
+            "executor_address": "0x" + "1" * 40,
+            "paused": paused,
+            "provider_identity": "rpc-bf27592026588e7d",
+            "runtime_code_hash": "a" * 64,
+        }
+
+    def emergency_paths(self, temporary: Path) -> HostPaths:
+        paths = self.paths(temporary)
+        paths.env_file.write_text(
+            "LIVE_EXECUTOR_EXECUTOR_ADDRESS=0x" + "1" * 40 + "\n"
+            "LIVE_EXECUTOR_EXECUTOR_CODE_HASH=" + "a" * 64 + "\n",
+            encoding="utf-8",
+        )
+        return paths
+
+    @staticmethod
+    def emergency_controls() -> dict[str, object]:
+        return {
+            "active_attempts": 0,
+            "active_atlas": 0,
+            "aave_armed": False,
+            "aave_kill_switch": True,
+            "armed": False,
+            "atlas_armed": False,
+            "atlas_kill_switch": True,
+            "execution_mode": "disarmed",
+            "kill_switch": True,
+            "open_routes": 0,
+            "outbox_ack_pending": 0,
+            "outbox_claimable": 0,
+            "outbox_pending": 0,
+            "submission_lock_free": True,
+            "unresolved_submissions": 0,
+        }
+
+    def test_emergency_pause_uses_authenticated_already_paused_path(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            paths = self.emergency_paths(Path(temporary))
+            initial = self.emergency_status()
+            final = self.emergency_status(shadow=True)
+            controls = self.emergency_controls()
+            with (
+                patch(
+                    "scripts.phoenix_release.gateway.status",
+                    side_effect=[initial, final],
+                ),
+                patch(
+                    "scripts.phoenix_release.gateway._require_success",
+                    return_value="",
+                ) as require_success,
+                patch(
+                    "scripts.phoenix_release.gateway._live_executor_stopped",
+                    return_value={"running_container_ids": [], "stopped": True},
+                ) as stopped,
+                patch(
+                    "scripts.phoenix_release.gateway._control_evidence",
+                    side_effect=[controls, controls],
+                ) as control_evidence,
+                patch(
+                    "scripts.phoenix_release.gateway.observe_contract_pause",
+                    side_effect=[
+                        self.pause_observation(True),
+                        self.pause_observation(True),
+                    ],
+                ) as observe_pause,
+                patch("scripts.phoenix_release.gateway._run") as owner_pause,
+            ):
+                observed = emergency_pause(paths)
+
+            owner_pause.assert_not_called()
+            self.assertEqual(stopped.call_count, 2)
+            self.assertEqual(control_evidence.call_args_list[0].args, (paths, initial))
+            self.assertEqual(control_evidence.call_args_list[1].args, (paths, final))
+            self.assertEqual(observe_pause.call_count, 2)
+            self.assertEqual(observed["pause_action"], "already-paused")
+            self.assertTrue(observed["pause_evidence"]["paused"])
+            self.assertEqual(require_success.call_args_list[0].args[1], "EMERGENCY_EXECUTOR_STOP_FAILED")
+            self.assertEqual(
+                require_success.call_args_list[1].args,
+                (
+                    [
+                        "/usr/bin/python3",
+                        "-I",
+                        "-B",
+                        str(paths.libexec / "production_mode.py"),
+                        "shadow",
+                        "--env-file",
+                        str(paths.env_file),
+                    ],
+                    "EMERGENCY_SHADOW_RESTORE_FAILED",
+                ),
+            )
+
+    def test_emergency_pause_applies_owner_pause_before_shadow(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            paths = self.emergency_paths(Path(temporary))
+            initial = self.emergency_status()
+            final = self.emergency_status(shadow=True)
+            controls = self.emergency_controls()
+            with (
+                patch("scripts.phoenix_release.gateway.status", side_effect=[initial, final]),
+                patch("scripts.phoenix_release.gateway._require_success", return_value=""),
+                patch("scripts.phoenix_release.gateway._live_executor_stopped"),
+                patch("scripts.phoenix_release.gateway._control_evidence", side_effect=[controls, controls]),
+                patch(
+                    "scripts.phoenix_release.gateway.observe_contract_pause",
+                    side_effect=[
+                        self.pause_observation(False),
+                        self.pause_observation(True),
+                        self.pause_observation(True),
+                    ],
+                ),
+                patch(
+                    "scripts.phoenix_release.gateway._run",
+                    return_value=subprocess.CompletedProcess([], 0, "", ""),
+                ) as owner_pause,
+            ):
+                observed = emergency_pause(paths)
+
+            owner_pause.assert_called_once()
+            self.assertEqual(owner_pause.call_args.args[0][-2:], ["live-executor", "owner-pause"])
+            self.assertEqual(observed["pause_action"], "applied")
+
+    def test_emergency_pause_never_shadows_on_failed_proof(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            paths = self.emergency_paths(Path(temporary))
+            initial = self.emergency_status()
+            controls = self.emergency_controls()
+            for failure in ("stop", "controls", "chain"):
+                require_side_effect = (
+                    GatewayError("EMERGENCY_EXECUTOR_STOP_FAILED")
+                    if failure == "stop"
+                    else None
+                )
+                failing_controls = dict(controls)
+                if failure == "controls":
+                    failing_controls["armed"] = True
+                observe_side_effect = (
+                    ReconciliationError("CHAIN_EVIDENCE_RPC_UNAVAILABLE")
+                    if failure == "chain"
+                    else (
+                        [self.pause_observation(False), self.pause_observation(True)]
+                        if failure == "controls"
+                        else self.pause_observation(True)
+                    )
+                )
+                with (
+                    self.subTest(failure=failure),
+                    patch("scripts.phoenix_release.gateway.status", return_value=initial),
+                    patch(
+                        "scripts.phoenix_release.gateway._require_success",
+                        side_effect=require_side_effect,
+                    ) as require_success,
+                    patch("scripts.phoenix_release.gateway._live_executor_stopped"),
+                    patch("scripts.phoenix_release.gateway._control_evidence", return_value=failing_controls),
+                    patch("scripts.phoenix_release.gateway.observe_contract_pause", side_effect=observe_side_effect),
+                    patch(
+                        "scripts.phoenix_release.gateway._run",
+                        return_value=subprocess.CompletedProcess([], 0, "", ""),
+                    ) as owner_pause,
+                    self.assertRaises(GatewayError),
+                ):
+                    emergency_pause(paths)
+                if failure == "controls":
+                    owner_pause.assert_called_once()
+                else:
+                    owner_pause.assert_not_called()
+                self.assertFalse(
+                    any(
+                        call.args[1] == "EMERGENCY_SHADOW_RESTORE_FAILED"
+                        for call in require_success.call_args_list
+                    )
+                )
+
+    def test_emergency_pause_rejects_owner_and_post_owner_failures(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            paths = self.emergency_paths(Path(temporary))
+            initial = self.emergency_status()
+            controls = self.emergency_controls()
+            for case, owner_result, observations, expected_code in (
+                (
+                    "owner-failed",
+                    subprocess.CompletedProcess([], 1, "failed", ""),
+                    [self.pause_observation(False)],
+                    "EMERGENCY_CONTRACT_PAUSE_FAILED",
+                ),
+                (
+                    "still-unpaused",
+                    subprocess.CompletedProcess([], 0, "", ""),
+                    [self.pause_observation(False), self.pause_observation(False)],
+                    "EMERGENCY_CONTRACT_NOT_PAUSED",
+                ),
+                (
+                    "post-owner-proof-failed",
+                    subprocess.CompletedProcess([], 0, "", ""),
+                    [
+                        self.pause_observation(False),
+                        GatewayError("CHAIN_EVIDENCE_RPC_UNAVAILABLE"),
+                    ],
+                    "CHAIN_EVIDENCE_RPC_UNAVAILABLE",
+                ),
+            ):
+                with (
+                    self.subTest(case=case),
+                    patch("scripts.phoenix_release.gateway.status", return_value=initial),
+                    patch(
+                        "scripts.phoenix_release.gateway._require_success",
+                        return_value="",
+                    ) as require_success,
+                    patch("scripts.phoenix_release.gateway._live_executor_stopped"),
+                    patch(
+                        "scripts.phoenix_release.gateway._control_evidence",
+                        return_value=controls,
+                    ),
+                    patch(
+                        "scripts.phoenix_release.gateway.observe_contract_pause",
+                        side_effect=observations,
+                    ),
+                    patch(
+                        "scripts.phoenix_release.gateway._run",
+                        return_value=owner_result,
+                    ),
+                    self.assertRaisesRegex(GatewayError, expected_code),
+                ):
+                    emergency_pause(paths)
+                self.assertFalse(
+                    any(
+                        call.args[1] == "EMERGENCY_SHADOW_RESTORE_FAILED"
+                        for call in require_success.call_args_list
+                    )
+                )
+
+    def test_emergency_pause_rejects_post_shadow_drift(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            paths = self.emergency_paths(Path(temporary))
+            controls = self.emergency_controls()
+            initial = self.emergency_status()
+            cases: tuple[tuple[str, dict[str, object]], ...] = (
+                (
+                    "pointer",
+                    {**self.emergency_status(shadow=True), "active_release": "b" * 40},
+                ),
+                (
+                    "assets",
+                    {
+                        **self.emergency_status(shadow=True),
+                        "release_assets_sha": "b" * 40,
+                    },
+                ),
+                (
+                    "mode",
+                    {**self.emergency_status(shadow=True), "phoenix_mode": "LIVE"},
+                ),
+                (
+                    "live-flag",
+                    {**self.emergency_status(shadow=True), "live_execution": True},
+                ),
+                (
+                    "autonomous-flag",
+                    {
+                        **self.emergency_status(shadow=True),
+                        "autonomous_execution": True,
+                    },
+                ),
+            )
+            for case, final in cases:
+                with (
+                    self.subTest(case=case),
+                    patch(
+                        "scripts.phoenix_release.gateway.status",
+                        side_effect=[initial, final],
+                    ),
+                    patch(
+                        "scripts.phoenix_release.gateway._require_success",
+                        return_value="",
+                    ),
+                    patch("scripts.phoenix_release.gateway._live_executor_stopped"),
+                    patch(
+                        "scripts.phoenix_release.gateway._control_evidence",
+                        return_value=controls,
+                    ),
+                    patch(
+                        "scripts.phoenix_release.gateway.observe_contract_pause",
+                        return_value=self.pause_observation(True),
+                    ),
+                    patch("scripts.phoenix_release.gateway._run") as owner_pause,
+                    self.assertRaisesRegex(
+                        GatewayError,
+                        "EMERGENCY_SHADOW_POSTCONDITION_FAILED",
+                    ),
+                ):
+                    emergency_pause(paths)
+                owner_pause.assert_not_called()
+
+    def test_emergency_pause_requires_every_final_safety_proof(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            paths = self.emergency_paths(Path(temporary))
+            closed = self.emergency_controls()
+            initial = self.emergency_status()
+            final = self.emergency_status(shadow=True)
+            for case in ("executor", "controls", "pause-false", "pause-error"):
+                final_controls = dict(closed)
+                if case == "controls":
+                    final_controls["atlas_armed"] = True
+                stopped_effect: list[object] = [
+                    {"running_container_ids": [], "stopped": True},
+                    (
+                        GatewayError("READINESS_LIVE_EXECUTOR_ACTIVE")
+                        if case == "executor"
+                        else {"running_container_ids": [], "stopped": True}
+                    ),
+                ]
+                pause_effect: list[object] = [self.pause_observation(True)]
+                if case == "pause-false":
+                    pause_effect.append(self.pause_observation(False))
+                elif case == "pause-error":
+                    pause_effect.append(GatewayError("CHAIN_EVIDENCE_RPC_UNAVAILABLE"))
+                else:
+                    pause_effect.append(self.pause_observation(True))
+                with (
+                    self.subTest(case=case),
+                    patch(
+                        "scripts.phoenix_release.gateway.status",
+                        side_effect=[initial, final],
+                    ),
+                    patch(
+                        "scripts.phoenix_release.gateway._require_success",
+                        return_value="",
+                    ),
+                    patch(
+                        "scripts.phoenix_release.gateway._live_executor_stopped",
+                        side_effect=stopped_effect,
+                    ),
+                    patch(
+                        "scripts.phoenix_release.gateway._control_evidence",
+                        side_effect=[closed, final_controls],
+                    ),
+                    patch(
+                        "scripts.phoenix_release.gateway.observe_contract_pause",
+                        side_effect=pause_effect,
+                    ),
+                    patch("scripts.phoenix_release.gateway._run") as owner_pause,
+                    self.assertRaises(GatewayError),
+                ):
+                    emergency_pause(paths)
+                owner_pause.assert_not_called()
+
+    def test_emergency_pause_shadow_command_failure_stops_before_postconditions(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            paths = self.emergency_paths(Path(temporary))
+            closed = self.emergency_controls()
+            with (
+                patch(
+                    "scripts.phoenix_release.gateway.status",
+                    return_value=self.emergency_status(),
+                ) as status_call,
+                patch(
+                    "scripts.phoenix_release.gateway._require_success",
+                    side_effect=["", GatewayError("EMERGENCY_SHADOW_RESTORE_FAILED")],
+                ),
+                patch("scripts.phoenix_release.gateway._live_executor_stopped"),
+                patch(
+                    "scripts.phoenix_release.gateway._control_evidence",
+                    return_value=closed,
+                ),
+                patch(
+                    "scripts.phoenix_release.gateway.observe_contract_pause",
+                    return_value=self.pause_observation(True),
+                ) as observe_pause,
+                patch("scripts.phoenix_release.gateway._run") as owner_pause,
+                self.assertRaisesRegex(
+                    GatewayError,
+                    "EMERGENCY_SHADOW_RESTORE_FAILED",
+                ),
+            ):
+                emergency_pause(paths)
+            self.assertEqual(status_call.call_count, 1)
+            self.assertEqual(observe_pause.call_count, 1)
+            owner_pause.assert_not_called()
+
+    def test_emergency_pause_rejects_forged_pause_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            paths = self.emergency_paths(Path(temporary))
+            controls = self.emergency_controls()
+            for field, value in (
+                ("chain_id", "0x1"),
+                ("executor_address", "0x" + "2" * 40),
+                ("provider_identity", "rpc-0123456789abcdef"),
+                ("runtime_code_hash", "b" * 64),
+                ("paused", 1),
+            ):
+                forged = {**self.pause_observation(True), field: value}
+                with (
+                    self.subTest(field=field),
+                    patch(
+                        "scripts.phoenix_release.gateway.status",
+                        return_value=self.emergency_status(),
+                    ),
+                    patch(
+                        "scripts.phoenix_release.gateway._require_success",
+                        return_value="",
+                    ) as require_success,
+                    patch("scripts.phoenix_release.gateway._live_executor_stopped"),
+                    patch(
+                        "scripts.phoenix_release.gateway._control_evidence",
+                        return_value=controls,
+                    ),
+                    patch(
+                        "scripts.phoenix_release.gateway.observe_contract_pause",
+                        return_value=forged,
+                    ),
+                    patch("scripts.phoenix_release.gateway._run") as owner_pause,
+                    self.assertRaisesRegex(
+                        GatewayError,
+                        "CHAIN_EVIDENCE_PAUSE_STATE_INVALID",
+                    ),
+                ):
+                    emergency_pause(paths)
+                owner_pause.assert_not_called()
+                self.assertFalse(
+                    any(
+                        call.args[1] == "EMERGENCY_SHADOW_RESTORE_FAILED"
+                        for call in require_success.call_args_list
+                    )
+                )
+
+    def test_emergency_pause_is_idempotent_from_shadow(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            paths = self.emergency_paths(Path(temporary))
+            shadow = self.emergency_status(shadow=True)
+            controls = self.emergency_controls()
+            with (
+                patch(
+                    "scripts.phoenix_release.gateway.status",
+                    side_effect=[shadow, shadow],
+                ),
+                patch(
+                    "scripts.phoenix_release.gateway._require_success",
+                    return_value="",
+                ) as require_success,
+                patch("scripts.phoenix_release.gateway._live_executor_stopped"),
+                patch(
+                    "scripts.phoenix_release.gateway._control_evidence",
+                    return_value=controls,
+                ),
+                patch(
+                    "scripts.phoenix_release.gateway.observe_contract_pause",
+                    return_value=self.pause_observation(True),
+                ),
+                patch("scripts.phoenix_release.gateway._run") as owner_pause,
+            ):
+                observed = emergency_pause(paths)
+
+            owner_pause.assert_not_called()
+            self.assertEqual(observed["pause_action"], "already-paused")
+            stop_command = require_success.call_args_list[0].args[0]
+            self.assertIn("--overlay-file", stop_command)
+            self.assertEqual(
+                stop_command[-5:],
+                ["--", "stop", "-t", "30", "live-executor"],
+            )
     def test_candidate_install_failure_rolls_back_in_same_resume(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             paths = self.paths(Path(temporary))

@@ -608,6 +608,26 @@ def validate_render(args: argparse.Namespace) -> None:
                 raise ContextError(code)
 
     rpc_env = service_environment(services, "rpc-gateway")
+    expected_rpc_authority = {
+        "RPC_AUTHORITY_MODE": "single_primary",
+        "RPC_AUTH_PROVIDER_HEADER_FILE": (
+            "/run/secrets/phoenix-rpc-provider-slot-1-api-key"
+        ),
+        "RPC_AUTH_PROVIDER_HEADER_NAME": "api-key",
+        "RPC_AUTH_PROVIDER_ID": "production-nownodes-arbitrum",
+        "RPC_AUTH_PROVIDER_PRIORITY": "100",
+        "RPC_AUTH_PROVIDER_URL": "https://arbitrum.nownodes.io/",
+    }
+    legacy_rpc_authority = {
+        "RPC_PROVIDER_IDS",
+        "RPC_PROVIDER_URLS",
+        "RPC_PROVIDER_WEIGHTS",
+    }
+    if any(
+        str(rpc_env.get(name, "")) != expected
+        for name, expected in expected_rpc_authority.items()
+    ) or legacy_rpc_authority.intersection(rpc_env):
+        raise ContextError("RPC_AUTHORITY_RENDER_INVALID")
     try:
         rpc_budget = int(str(rpc_env.get("RPC_STATE_REQUESTS_PER_MINUTE")))
     except (TypeError, ValueError):

@@ -779,6 +779,7 @@ jobs:
           ARBITRUM_SEQUENCER_FEED_URL=wss://sequencer-feed-placeholder.invalid
           RPC_PROVIDER_URLS=https://rpc-placeholder.invalid
           RPC_PROVIDER_WEIGHTS=1
+          RPC_PROVIDER_IDS=legacy-placeholder
           RPC_UPSTREAM_CALLS_PER_SECOND=1
           RPC_UPSTREAM_CALL_BURST=4
           RPC_STATE_REQUESTS_PER_MINUTE=12
@@ -893,6 +894,29 @@ jobs:
               environment = service.get("environment", {})
               if "SIGNER_PRIVATE_KEY" in environment:
                   raise SystemExit(f"{profile} live-executor render exposes raw signer environment")
+          expected_rpc_authority = {
+              "RPC_AUTHORITY_MODE": "single_primary",
+              "RPC_AUTH_PROVIDER_HEADER_FILE": "/run/secrets/phoenix-rpc-provider-slot-1-api-key",
+              "RPC_AUTH_PROVIDER_HEADER_NAME": "api-key",
+              "RPC_AUTH_PROVIDER_ID": "production-nownodes-arbitrum",
+              "RPC_AUTH_PROVIDER_PRIORITY": "100",
+              "RPC_AUTH_PROVIDER_URL": "https://arbitrum.nownodes.io/",
+          }
+          forbidden_rpc_authority = {
+              "RPC_PROVIDER_IDS",
+              "RPC_PROVIDER_URLS",
+              "RPC_PROVIDER_WEIGHTS",
+          }
+          for path in (".ci-prod-config.json", ".ci-autonomous-live-config.json"):
+              with open(path, encoding="utf-8") as handle:
+                  rpc_environment = json.load(handle)["services"]["rpc-gateway"]["environment"]
+              if any(
+                  str(rpc_environment.get(name, "")) != expected
+                  for name, expected in expected_rpc_authority.items()
+              ):
+                  raise SystemExit(f"{path} lost exact single-primary RPC authority")
+              if forbidden_rpc_authority.intersection(rpc_environment):
+                  raise SystemExit(f"{path} inherited legacy RPC authority")
           signer_target = "/run/secrets/phoenix-live-executor-signer"
           service = rendered_profiles["manual"]
           environment = service.get("environment", {})

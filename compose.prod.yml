@@ -77,7 +77,6 @@ services:
 
   rpc-gateway:
     image: ${RPC_GATEWAY_IMAGE:?RPC_GATEWAY_IMAGE is required}
-    <<: *common-env
     environment:
       PHOENIX_ENV: production
       RPC_GATEWAY_ADDR: 0.0.0.0:9300
@@ -87,12 +86,16 @@ services:
       RPC_AUTH_PROVIDER_PRIORITY: "100"
       RPC_AUTH_PROVIDER_HEADER_NAME: api-key
       RPC_AUTH_PROVIDER_HEADER_FILE: /run/secrets/phoenix-rpc-provider-slot-1-api-key
+      RPC_ETH_CALL_TIMEOUT_MS: "${RPC_ETH_CALL_TIMEOUT_MS:-3000}"
+      RPC_STATE_READ_TIMEOUT_MS: "${RPC_STATE_READ_TIMEOUT_MS:-2000}"
+      RPC_LOGS_TIMEOUT_MS: "${RPC_LOGS_TIMEOUT_MS:-10000}"
       RPC_UPSTREAM_CALLS_PER_SECOND: ${RPC_UPSTREAM_CALLS_PER_SECOND:-1}
       # Cold NOWNodes identity, finalized-head, and bounded Aave calls fit
       # atomically without increasing the sustained rate.
       RPC_UPSTREAM_CALL_BURST: "${RPC_UPSTREAM_CALL_BURST:-16}"
       RPC_STATE_REQUESTS_PER_MINUTE: ${RPC_STATE_REQUESTS_PER_MINUTE:-12}
       RPC_PROVIDER_PROBE_INTERVAL_SECONDS: "${RPC_PROVIDER_PROBE_INTERVAL_SECONDS:-300}"
+      RUST_LOG: "${RUST_LOG:-info}"
     volumes:
       - type: bind
         source: /etc/phoenix/secrets/phoenix-rpc-provider-slot-1-api-key
