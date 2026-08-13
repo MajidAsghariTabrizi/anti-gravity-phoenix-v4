@@ -57,6 +57,11 @@ class ProductionModeTests(unittest.TestCase):
         )
 
     def test_materialize_defaults_is_idempotent_and_preserves_mode(self) -> None:
+        with self.env_file.open("a", encoding="utf-8") as handle:
+            handle.write(
+                "LIVE_EXECUTOR_RPC_ALLOWLIST="
+                "https://legacy-primary.invalid/,https://legacy-secondary.invalid/\n"
+            )
         production_mode.update(
             self.env_file, production_mode.MATERIALIZE_DEFAULTS_ACTION
         )
@@ -73,6 +78,41 @@ class ProductionModeTests(unittest.TestCase):
         self.assertEqual(
             materialized.count("LIVE_EXECUTOR_MAX_ATLAS_BID_WEI="), 1
         )
+        self.assertEqual(
+            materialized.count("LIVE_EXECUTOR_RPC_ALLOWLIST="), 1
+        )
+        self.assertIn(
+            "LIVE_EXECUTOR_RPC_ALLOWLIST=https://arbitrum.nownodes.io/\n",
+            materialized,
+        )
+        self.assertNotIn("legacy-primary.invalid", materialized)
+        self.assertNotIn("legacy-secondary.invalid", materialized)
+
+    def test_mode_transition_preserves_explicit_rpc_allowlist(self) -> None:
+        with self.env_file.open("a", encoding="utf-8") as handle:
+            handle.write(
+                "LIVE_EXECUTOR_RPC_ALLOWLIST=https://operator.invalid/\n"
+            )
+
+        production_mode.update(self.env_file, "live")
+
+        live = self.env_file.read_text(encoding="utf-8")
+        self.assertIn(
+            "LIVE_EXECUTOR_RPC_ALLOWLIST=https://operator.invalid/\n", live
+        )
+
+    def test_duplicate_rpc_allowlist_fails_closed_without_replacement(self) -> None:
+        original = self.env_file.read_text(encoding="utf-8") + (
+            "LIVE_EXECUTOR_RPC_ALLOWLIST=https://one.invalid/\n"
+            "LIVE_EXECUTOR_RPC_ALLOWLIST=https://two.invalid/\n"
+        )
+        self.env_file.write_text(original, encoding="utf-8")
+
+        with self.assertRaisesRegex(production_mode.ModeError, "duplicate"):
+            production_mode.update(
+                self.env_file, production_mode.MATERIALIZE_DEFAULTS_ACTION
+            )
+        self.assertEqual(self.env_file.read_text(encoding="utf-8"), original)
 
     def test_duplicate_atlas_bid_ceiling_fails_closed_without_replacement(self) -> None:
         original = self.env_file.read_text(encoding="utf-8") + (
