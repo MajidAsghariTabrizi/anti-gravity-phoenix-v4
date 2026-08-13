@@ -557,9 +557,10 @@ def validate_render(args: argparse.Namespace) -> None:
             or live_env.get("LIVE_EXECUTOR_EXPECTED_FLASH_PROVIDER")
             != operator_env.get("LIVE_EXECUTOR_EXPECTED_FLASH_PROVIDER")
             or live_env.get("PRODUCTION_RPC_URL")
-            != operator_env.get("PRODUCTION_RPC_URL")
-            or live_env.get("SECONDARY_RPC_URL")
-            != operator_env.get("SECONDARY_RPC_URL")
+            != "https://arbitrum.nownodes.io/"
+            or live_env.get("LIVE_EXECUTOR_RPC_ALLOWLIST")
+            != "https://arbitrum.nownodes.io/"
+            or "SECONDARY_RPC_URL" in live_env
         ):
             raise ContextError("AUTONOMOUS_EXECUTOR_IDENTITY_MISMATCH")
         signer_target = "/run/secrets/phoenix-live-executor-signer"
