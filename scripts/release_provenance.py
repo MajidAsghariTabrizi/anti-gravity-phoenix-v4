@@ -49,6 +49,7 @@ QUARANTINED_CI_RUNS = {
     "29683234024": "NON_CANONICAL_INCOMPLETE_BUILD",
 }
 EXPECTED_IMAGES = release_components.RELEASE_IMAGES
+CURRENT_IMAGES = release_components.CURRENT_RELEASE_IMAGES
 LEGACY_IMAGES = release_components.LEGACY_RELEASE_IMAGES
 PROTECTED_IMAGES = release_components.PROTECTED_IMAGES
 BUILT_IMAGES = release_components.BUILT_IMAGES
@@ -464,10 +465,10 @@ def _validate_legacy_manifest(
         raise ReleaseProvenanceError("release manifest identity is invalid")
     _validate_created_at(manifest["created_at"])
     images = manifest["images"]
-    if not isinstance(images, dict) or tuple(sorted(images)) not in (
-        EXPECTED_IMAGES,
+    if not isinstance(images, dict) or tuple(sorted(images)) not in {
+        CURRENT_IMAGES,
         LEGACY_IMAGES,
-    ):
+    }:
         raise ReleaseProvenanceError("release manifest image set is invalid")
     for name in tuple(sorted(images)):
         image = _require_keys(
@@ -516,10 +517,10 @@ def _validate_inherited_manifest(
         raise ReleaseProvenanceError("protected base SHA matches release SHA")
     _validate_created_at(manifest["created_at"])
     images = manifest["images"]
-    if not isinstance(images, dict) or tuple(sorted(images)) not in (
-        EXPECTED_IMAGES,
+    if not isinstance(images, dict) or tuple(sorted(images)) not in {
+        CURRENT_IMAGES,
         LEGACY_IMAGES,
-    ):
+    }:
         raise ReleaseProvenanceError("release manifest image set is invalid")
     for name in tuple(sorted(images)):
         image = _require_keys(

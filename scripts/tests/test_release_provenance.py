@@ -365,6 +365,21 @@ class ReleaseProvenanceTests(unittest.TestCase):
             f"{base_manifest['images']['recorder']['digest']}",
         )
 
+    def test_legacy_target_accepts_current_generation_protected_base(self) -> None:
+        manifest, _, _, _, _, _, _, _ = self._assemble_inherited()
+        with mock.patch.multiple(
+            release_provenance,
+            EXPECTED_IMAGES=release_provenance.LEGACY_IMAGES,
+            LEGACY_IMAGES=release_provenance.LEGACY_IMAGES,
+        ):
+            validated = release_provenance._validate_inherited_manifest(
+                manifest, RELEASE_SHA, RUN_ID
+            )
+        self.assertEqual(
+            tuple(sorted(validated["images"])),
+            release_provenance.CURRENT_IMAGES,
+        )
+
     def test_release_only_plan_inherits_all_eight_images(self) -> None:
         (
             manifest,
