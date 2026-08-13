@@ -2887,17 +2887,49 @@ class WorkflowAndDeploymentContractTests(unittest.TestCase):
             self.rehearsal,
         )
 
-    def test_deploy_quiesces_observer_before_additive_diagnostic_migration(self) -> None:
+    def test_deploy_quiesces_live_canary_clients_before_schema_migration(self) -> None:
         operation = self.deploy.index("\ncompose pull $pull_services\n")
-        stop = self.deploy.index("compose stop -t 30 atlas-observer", operation)
-        absence = self.deploy.index("compose ps -q atlas-observer", stop)
-        migrate = self.deploy.index("autonomous-control migrate", absence)
+        stop = self.deploy.index("for schema_client in", operation)
+        for service in (
+            "atlas-observer",
+            "economic-monitor",
+            "economic-supervisor",
+        ):
+            self.assertIn(service, self.deploy[stop:])
+        absence = self.deploy.index('compose ps -q "$schema_client"', stop)
+        engine_stop = self.deploy.index(
+            'compose_shadow_with_release_env "$rollback_release_env"', absence
+        )
+        engine_absence = self.deploy.index("ps -q phoenix-engine", engine_stop)
+        migrate = self.deploy.index("autonomous-control migrate", engine_absence)
         restart = self.deploy.index(
             "compose up -d --no-deps atlas-observer", migrate
         )
         self.assertLess(stop, absence)
+        self.assertLess(absence, engine_stop)
+        self.assertLess(engine_stop, engine_absence)
+        self.assertLess(engine_absence, migrate)
         self.assertLess(absence, migrate)
         self.assertLess(migrate, restart)
+        shadow_helper = self.deploy.split(
+            "compose_shadow_with_release_env()", maxsplit=1
+        )[1].split("capture_service_ids()", maxsplit=1)[0]
+        self.assertIn("--mode SHADOW", shadow_helper)
+        self.assertNotIn("--overlay-file", shadow_helper)
+
+    def test_deploy_compensation_shadows_before_rollback_context_install(self) -> None:
+        compensation = self.deploy.split(
+            "rollback_on_failure()", maxsplit=1
+        )[1].split("mutation_started=0", maxsplit=1)[0]
+        shadow = compensation.index(
+            'python3 "$deploy_dir/production_mode.py" shadow --env-file "$env_file"'
+        )
+        context = compensation.index('"$rollback_context_installer"', shadow)
+        rollback = compensation.index('/bin/sh "$rollback_script"', context)
+        self.assertLess(shadow, context)
+        self.assertLess(context, rollback)
+        self.assertNotIn("autonomous-control disarm", compensation)
+        self.assertIn("autonomous-control disarm", self.rollback)
 
     def test_ci_preserves_jobs_and_runs_expensive_suites_only_on_main(
         self,

@@ -324,6 +324,17 @@ compose_with_release_env() {
     -- "$@"
 }
 
+compose_shadow_with_release_env() {
+  selected_release_env=$1
+  shift
+  python3 "$deploy_dir/production_compose.py" \
+    --mode SHADOW \
+    --env-file "$env_file" \
+    --release-env "$selected_release_env" \
+    --compose-file "$compose_file" \
+    -- "$@"
+}
+
 capture_service_ids() {
   capture_release_env=$1
   capture_services=$2
@@ -724,17 +735,12 @@ rollback_on_failure() {
       repause_ok=0
       echo "DEPLOY_COMPENSATION_FAILED: stale live-executor container remains"
     fi
-    set +e
-    disarm_output=$(compose run --rm --no-deps \
-      -e PHOENIX_AUTONOMOUS_DISARM_ACK=DISARM_AUTONOMOUS_LIVE_42161 \
-      -e PHOENIX_AUTONOMOUS_DISARM_REASON=deployment_rollback \
-      autonomous-control disarm 2>&1)
-    disarm_code=$?
-    set -e
-    printf '%s\n' "$disarm_output"
-    if [ "$disarm_code" -ne 0 ]; then
+    if ! python3 "$deploy_dir/production_mode.py" shadow --env-file "$env_file"
+    then
       repause_ok=0
-      echo "DEPLOY_COMPENSATION_FAILED: disarmed-failure state was not proven"
+      echo "DEPLOY_COMPENSATION_FAILED: SHADOW mode could not be restored"
+    else
+      reload_environment
     fi
     echo "DEPLOY_FAILED: invoking rollback"
     set +e
@@ -815,14 +821,20 @@ compose rm -f live-executor >/dev/null ||
   fail "stopped live-executor container could not be removed"
 [ -z "$(compose ps -a -q live-executor | awk 'NF { print; exit }')" ] ||
   fail "live-executor container remained after removal"
-# Quiesce the only writer of the additive Aave/Atlas diagnostic tables before
-# PostgreSQL validates the bounded JSON contract and builds its range indexes.
-# The target observer is recreated below only after both migration runners
-# finish and the candidate RPC gateway is healthy.
-compose stop -t 30 atlas-observer >/dev/null ||
-  fail "atlas-observer could not be quiesced before migration"
-[ -z "$(compose ps -q atlas-observer | awk 'NF { print; exit }')" ] ||
-  fail "atlas-observer remained running during migration"
+# Quiesce every long-lived client of the live_canary schema before its bounded
+# DDL lock timeout begins. The target services are recreated below only after
+# both migration runners finish and the candidate RPC gateway is healthy.
+for schema_client in atlas-observer economic-monitor economic-supervisor; do
+  compose stop -t 30 "$schema_client" >/dev/null 2>&1 || true
+  [ -z "$(compose ps -q "$schema_client" | awk 'NF { print; exit }')" ] ||
+    fail "$schema_client remained running during migration"
+done
+compose_shadow_with_release_env "$rollback_release_env" \
+  stop -t 30 phoenix-engine >/dev/null ||
+  fail "phoenix-engine could not be quiesced before migration"
+[ -z "$(compose_shadow_with_release_env "$rollback_release_env" \
+  ps -q phoenix-engine | awk 'NF { print; exit }')" ] ||
+  fail "phoenix-engine remained running during migration"
 compose run --rm --no-deps autonomous-control migrate
 compose run --rm --no-deps migration-runner
 mark_phase MIGRATIONS_APPLIED
