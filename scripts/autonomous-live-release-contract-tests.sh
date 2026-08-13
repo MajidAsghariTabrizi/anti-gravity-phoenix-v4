@@ -378,7 +378,11 @@ for forbidden in (
     require(forbidden not in deploy, f"normal_deploy_authority_leak:{forbidden}")
 
 operation = deploy.index("\ncompose pull $pull_services\n")
-observer_quiesced = deploy.index("compose stop -t 30 atlas-observer", operation)
+observer_quiesced = deploy.index("for schema_client in atlas-observer", operation)
+engine_quiesced = deploy.index(
+    'compose_shadow_with_release_env "$rollback_release_env"',
+    observer_quiesced,
+)
 migrate = deploy.index("autonomous-control migrate", operation)
 disarmed = deploy.index("autonomous-control disarmed-deploy", operation)
 engine = deploy.index("compose up -d --no-deps phoenix-engine", operation)
@@ -398,6 +402,7 @@ standby_controls = deploy.index(
 )
 require(
     observer_quiesced
+    < engine_quiesced
     < migrate
     < disarmed
     < engine
