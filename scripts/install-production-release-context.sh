@@ -295,7 +295,11 @@ do
   install_source \
     "$source_root/scripts/$script_name" "$deploy_dir/$script_name" 0750
 done
-for script_name in activate-economic-canary.sh economic-dashboard-loop.sh; do
+for script_name in \
+  activate-economic-canary.sh \
+  economic-dashboard-loop.sh \
+  monitor-post-arm-revenue.sh
+do
   install_versioned_source \
     "scripts/$script_name" "$deploy_dir/$script_name" 0750
 done

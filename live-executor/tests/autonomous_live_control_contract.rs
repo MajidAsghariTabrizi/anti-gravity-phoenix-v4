@@ -172,6 +172,37 @@ fn max_reviewed_size_rejects_missing_acknowledgement_before_authority_access() {
 }
 
 #[test]
+fn post_arm_recovery_rejects_missing_acknowledgement_before_authority_access() {
+    let output = control_command("recover-post-arm-acceptance-failure")
+        .output()
+        .expect("run post-arm recovery without acknowledgement");
+    let error = stderr(&output);
+
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    assert!(error.contains(
+        "AUTONOMOUS_CONTROL_FAILED: required environment is missing: PHOENIX_POST_ARM_RECOVERY_ACK"
+    ));
+    assert!(!error.contains("POSTGRES_DSN"));
+    assert!(!error.contains("SIGNER_PRIVATE_KEY"));
+}
+
+#[test]
+fn owner_live_preflight_is_read_only_but_requires_owner_environment() {
+    let output = control_command("owner-live-preflight")
+        .output()
+        .expect("run owner live preflight without environment");
+    let error = stderr(&output);
+
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    assert!(error.contains(
+        "AUTONOMOUS_CONTROL_FAILED: required environment is missing: PHOENIX_RELEASE_SHA"
+    ));
+    assert!(!error.contains("POSTGRES_DSN"));
+}
+
+#[test]
 fn missing_environment_diagnostic_names_variable_without_value() {
     let sensitive_value = "sensitive-wallet-value-must-not-appear";
     let error = control_address_environment_with(|name| match name {

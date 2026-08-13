@@ -163,6 +163,7 @@ for specification in \
   'release_platform.py:0644' \
   'release_provenance.py:0644' \
   'activate-economic-canary.sh:0644' \
+  'monitor-post-arm-revenue.sh:0644' \
   'economic_activation_runner.py:0644' \
   'deploy-release.sh:0644' \
   'install-release-assets.sh:0644' \

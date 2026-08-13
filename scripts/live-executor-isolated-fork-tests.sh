@@ -443,3 +443,13 @@ PHOENIX_TEST_ISOLATED_FORK_SIGNER_KEY="$test_key" \
 PHOENIX_TEST_EXECUTOR_ADDRESS="$executor_address" \
   cargo test --locked --manifest-path live-executor/Cargo.toml \
     --test isolated_fork -- --nocapture
+
+# Run the destructive post-arm recovery SQL regression only after every other
+# isolated database consumer has completed. Its dedicated opt-in variable
+# prevents Cargo's parallel all-targets phase from racing this schema reset
+# against the nonce-recovery integration binary.
+PHOENIX_POST_ARM_RECOVERY_TEST_DSN="$test_dsn" \
+  cargo +1.79.0 test --locked --manifest-path live-executor/Cargo.toml \
+    --bin autonomous-live-control \
+    tests::post_arm_recovery_postgres_transition_is_atomic_and_economically_unchanged \
+    -- --nocapture --test-threads=1

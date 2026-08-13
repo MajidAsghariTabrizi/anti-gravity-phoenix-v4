@@ -59,6 +59,7 @@ services:
       LIVE_EXECUTOR_MAX_ATLAS_BID_WEI: ${LIVE_EXECUTOR_MAX_ATLAS_BID_WEI:-1000000000000000}
       LIVE_EXECUTOR_RECEIPT_TIMEOUT_SECONDS: ${LIVE_EXECUTOR_RECEIPT_TIMEOUT_SECONDS:-180}
       LIVE_EXECUTOR_POLL_INTERVAL_SECONDS: ${LIVE_EXECUTOR_POLL_INTERVAL_SECONDS:-1}
+      PHOENIX_ACTIVATION_REQUEST_OUTBOX: /activation-outbox
     depends_on:
       postgres:
         condition: service_healthy
@@ -72,6 +73,12 @@ services:
       - type: bind
         source: /etc/phoenix/secrets/phoenix-rpc-provider-slot-1-api-key
         target: /run/secrets/phoenix-rpc-provider-slot-1-api-key
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: /opt/phoenix/evidence/activation-requests
+        target: /activation-outbox
         read_only: true
         bind:
           create_host_path: false
@@ -216,6 +223,7 @@ services:
       LIVE_EXECUTOR_ONE_TRANSACTION_AT_A_TIME: "true"
       CHAIN_ID: "42161"
       POSTGRES_DSN: ${POSTGRES_DSN:?POSTGRES_DSN is required}
+      PHOENIX_RELEASE_SHA: ${PHOENIX_RELEASE_SHA:?PHOENIX_RELEASE_SHA is required}
       PRODUCTION_RPC_URL: https://arbitrum.nownodes.io/
       ENGINE_ROUTER_ADDRESSES: ${ENGINE_ROUTER_ADDRESSES:?ENGINE_ROUTER_ADDRESSES is required}
       SIGNER_PRIVATE_KEY_FILE: /run/secrets/phoenix-live-executor-signer
