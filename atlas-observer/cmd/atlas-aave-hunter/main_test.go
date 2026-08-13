@@ -74,6 +74,8 @@ func (s *boundaryScreener) RecordRetryableGatewayError(err error) (bool, error) 
 	return true, nil
 }
 
+func (s *boundaryScreener) FailClosedExactAuthority(string) error { return nil }
+
 func (s *boundaryScreener) Snapshot() hunter.State { return s.state }
 
 func TestAtlasCandidateLoopKeepsSubscriptionActiveForRetryableProviderErrors(t *testing.T) {
@@ -144,7 +146,7 @@ func TestDivergentRevenueAuthorityIsFailClosedWithoutFailingServiceLiveness(t *t
 		Connected: true, LastSubscriptionAt: &now,
 	}, hunter.State{
 		Cursor: 1200, LastBatchAt: &now, LastTailAt: &now, LastAttemptAt: &now,
-		LastDualAgreementAt: &now, LastErrorClass: "revenue_lane_authority_diverged",
+		LastPrimaryExactAt: &now, LastErrorClass: "revenue_lane_authority_diverged",
 		LastBlockNumber: 491273850, LastBlockHash: "0x" + strings.Repeat("a", 64),
 		LastProviderPrimary: "production-primary", LastProviderSecond: "production-secondary",
 	})
@@ -186,46 +188,69 @@ func TestHealthPayloadPublishesCurrentProviderFailureStreak(t *testing.T) {
 	payload := healthPayload(laneHealth{}, hunter.State{Counts: map[string]uint64{
 		"provider_current_class_failure_streak": 2,
 	}}, false)
+	if got := payload["rpc_authority_mode"]; got != "single_primary" {
+		t.Fatalf("rpc authority mode=%v want=single_primary", got)
+	}
+	if payload["primary_provider"] != "" || payload["confirmation_provider"] != nil || payload["provider_quorum"] != 1 {
+		t.Fatalf("single-primary health contract is not truthful: %#v", payload)
+	}
 	if got := payload["provider_current_class_failure_streak"]; got != uint64(2) {
 		t.Fatalf("current provider failure streak=%v want=2", got)
 	}
 }
 
-func TestExactReadinessRequiresFreshDualAgreement(t *testing.T) {
+func TestExactReadinessRequiresFreshPrimaryExact(t *testing.T) {
 	now := time.Now().UTC()
+	samples := []hunter.ProviderRecoverySample{
+		{ObservedAt: now.Add(-3 * time.Second), PrimaryProvider: "production-nownodes-arbitrum", Quorum: 1},
+		{ObservedAt: now.Add(-2 * time.Second), PrimaryProvider: "production-nownodes-arbitrum", Quorum: 1},
+		{ObservedAt: now.Add(-time.Second), PrimaryProvider: "production-nownodes-arbitrum", Quorum: 1},
+	}
 	state := hunter.State{
-		Cursor: 1200, LastBatchAt: &now, LastTailAt: &now, LastDualAgreementAt: &now,
+		Cursor: 1200, LastBatchAt: &now, LastTailAt: &now, LastPrimaryExactAt: &now,
 		LastBlockNumber: 491273850, LastBlockHash: "0x" + strings.Repeat("a", 64),
-		LastProviderPrimary: "production-nownodes-arbitrum",
-		LastProviderSecond:  "production-slot-0",
+		LastProviderPrimary:     "production-nownodes-arbitrum",
+		ProviderRecoverySamples: samples,
 	}
 	health := evaluateLaneHealth(now, observer.LedgerState{
 		Connected: true, LastSubscriptionAt: &now,
 	}, state)
 	if !health.ServiceHealthy || !health.HuntingHealthy || !health.ExactExecutionReady || health.RecoveryState != "ready" {
-		t.Fatalf("fresh independent agreement was not exact-ready: %+v", health)
+		t.Fatalf("fresh primary Exact was not ready: %+v", health)
 	}
-
-	state.LastProviderSecond = state.LastProviderPrimary
+	state.ProviderRecoverySamples = samples[:2]
 	health = evaluateLaneHealth(now, observer.LedgerState{
 		Connected: true, LastSubscriptionAt: &now,
 	}, state)
 	if health.ExactExecutionReady {
-		t.Fatalf("one provider identity granted exact authority: %+v", health)
+		t.Fatalf("fewer than three primary Exact samples granted authority: %+v", health)
+	}
+
+	state.ProviderRecoverySamples = samples
+	state.LastProviderPrimary = "wrong-provider"
+	health = evaluateLaneHealth(now, observer.LedgerState{
+		Connected: true, LastSubscriptionAt: &now,
+	}, state)
+	if health.ExactExecutionReady {
+		t.Fatalf("unreviewed primary identity granted exact authority: %+v", health)
 	}
 }
 
 func TestExactExecutionReadinessFalseWhileProviderCircuitIsOpen(t *testing.T) {
 	now := time.Now().UTC()
 	state := hunter.State{
-		Cursor:                             1200,
-		LastBatchAt:                        &now,
-		LastTailAt:                         &now,
-		LastDualAgreementAt:                &now,
-		LastBlockNumber:                    491273850,
-		LastBlockHash:                      "0x" + strings.Repeat("a", 64),
-		LastProviderPrimary:                "production-nownodes-arbitrum",
-		LastProviderSecond:                 "production-slot-0",
+		Cursor:              1200,
+		LastBatchAt:         &now,
+		LastTailAt:          &now,
+		LastPrimaryExactAt:  &now,
+		LastBlockNumber:     491273850,
+		LastBlockHash:       "0x" + strings.Repeat("a", 64),
+		LastProviderPrimary: "production-nownodes-arbitrum",
+		ProviderRecoverySamples: []hunter.ProviderRecoverySample{
+			{ObservedAt: now.Add(-3 * time.Second), PrimaryProvider: "production-nownodes-arbitrum", Quorum: 1},
+			{ObservedAt: now.Add(-2 * time.Second), PrimaryProvider: "production-nownodes-arbitrum", Quorum: 1},
+			{ObservedAt: now.Add(-time.Second), PrimaryProvider: "production-nownodes-arbitrum", Quorum: 1},
+		},
 		ProviderCircuitOpenUntilUnixMillis: now.Add(2 * time.Minute).UnixMilli(),
 	}
 	health := evaluateLaneHealth(now, observer.LedgerState{

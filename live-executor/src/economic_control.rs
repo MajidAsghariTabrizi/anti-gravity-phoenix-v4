@@ -26,20 +26,16 @@ pub struct EvidenceGate {
     pub ack_pending_bounded: bool,
     pub stale_outbox_rows: u64,
     pub primary_rpc_healthy: bool,
-    pub secondary_rpc_healthy: bool,
-    pub rpc_providers_independent: bool,
-    pub eligible_rpc_disagreements: u64,
     pub maximum_state_age_blocks: u64,
     pub maximum_quote_age_ms: u64,
     pub maximum_candidate_age_ms: u64,
     pub fork_attempts: u64,
     pub fork_passes: u64,
     pub prediction_error_bps: u16,
-    pub secondary_skips: u64,
     pub fork_skips: u64,
     pub execution_requests: u64,
     pub active_attempts: u64,
-    pub positive_independent_fork_candidates: u64,
+    pub positive_exact_candidates: u64,
 }
 
 impl EvidenceGate {
@@ -59,11 +55,7 @@ impl EvidenceGate {
         if self.stale_outbox_rows != 0 {
             return Err(EconomicControlError::Outbox);
         }
-        if !self.primary_rpc_healthy
-            || !self.secondary_rpc_healthy
-            || !self.rpc_providers_independent
-            || self.eligible_rpc_disagreements != 0
-        {
+        if !self.primary_rpc_healthy {
             return Err(EconomicControlError::RpcAgreement);
         }
         if self.maximum_state_age_blocks > MAXIMUM_STATE_AGE_BLOCKS
@@ -78,13 +70,13 @@ impl EvidenceGate {
         if self.prediction_error_bps > MAXIMUM_PREDICTION_ERROR_BPS {
             return Err(EconomicControlError::PredictionError);
         }
-        if self.secondary_skips != 0 || self.fork_skips != 0 {
+        if self.fork_skips != 0 {
             return Err(EconomicControlError::SkippedVerification);
         }
         if self.execution_requests != 0 || self.active_attempts != 0 {
             return Err(EconomicControlError::ExecutionWhileDisarmed);
         }
-        if self.positive_independent_fork_candidates == 0 {
+        if self.positive_exact_candidates == 0 {
             return Err(EconomicControlError::NoPositiveCandidate);
         }
         Ok(())
@@ -413,7 +405,7 @@ pub enum EconomicControlError {
     Backlog,
     #[error("stale outbox rows remain")]
     Outbox,
-    #[error("independent RPC agreement is not proven")]
+    #[error("primary RPC readiness is not proven")]
     RpcAgreement,
     #[error("evidence is stale")]
     StaleEvidence,
@@ -421,11 +413,11 @@ pub enum EconomicControlError {
     ForkRate,
     #[error("prediction error exceeds the bound")]
     PredictionError,
-    #[error("secondary or fork verification was skipped")]
+    #[error("fork verification was skipped")]
     SkippedVerification,
     #[error("execution activity exists while disarmed")]
     ExecutionWhileDisarmed,
-    #[error("no positive independently verified fork candidate exists")]
+    #[error("no positive Exact-verified candidate exists")]
     NoPositiveCandidate,
     #[error("readiness binding is invalid")]
     InvalidBinding,
@@ -463,20 +455,16 @@ mod tests {
             ack_pending_bounded: true,
             stale_outbox_rows: 0,
             primary_rpc_healthy: true,
-            secondary_rpc_healthy: true,
-            rpc_providers_independent: true,
-            eligible_rpc_disagreements: 0,
             maximum_state_age_blocks: 1,
             maximum_quote_age_ms: 2_000,
             maximum_candidate_age_ms: 3_000,
             fork_attempts: 100,
             fork_passes: 95,
             prediction_error_bps: 1_000,
-            secondary_skips: 0,
             fork_skips: 0,
             execution_requests: 0,
             active_attempts: 0,
-            positive_independent_fork_candidates: 1,
+            positive_exact_candidates: 1,
         }
     }
 
@@ -576,13 +564,7 @@ mod tests {
             Err(EconomicControlError::ExecutionWhileDisarmed)
         );
         evidence = gate();
-        evidence.secondary_skips = 1;
-        assert_eq!(
-            evidence.validate(),
-            Err(EconomicControlError::SkippedVerification)
-        );
-        evidence = gate();
-        evidence.positive_independent_fork_candidates = 0;
+        evidence.positive_exact_candidates = 0;
         assert_eq!(
             evidence.validate(),
             Err(EconomicControlError::NoPositiveCandidate)

@@ -14,6 +14,7 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashSet};
 use std::env;
 use std::fmt;
+use std::path::Path;
 use std::time::Duration;
 use thiserror::Error;
 use tokio::time::{sleep, Instant};
@@ -35,6 +36,8 @@ const OWNER_ENVIRONMENT_NAMES: &[&str] = &[
     "EXECUTOR_ADDRESS",
     "PRODUCTION_RPC_URL",
     "LIVE_EXECUTOR_RPC_URL",
+    "LIVE_EXECUTOR_RPC_HEADER_NAME",
+    "LIVE_EXECUTOR_RPC_HEADER_FILE",
     "LIVE_EXECUTOR_RPC_ALLOWLIST",
     "LIVE_EXECUTOR_EXPECTED_OWNER",
     "LIVE_EXECUTOR_EXPECTED_FLASH_PROVIDER",
@@ -102,6 +105,8 @@ struct OwnerBootstrapContext {
     one_transaction_at_a_time: bool,
     rpc_url: Url,
     rpc_allowlist: Vec<Url>,
+    rpc_header_name: String,
+    rpc_header_file: String,
     signer_file: Option<String>,
     release_sha: String,
     policy_hash: String,
@@ -182,6 +187,11 @@ impl OwnerBootstrapContext {
         if rpc_allowlist.is_empty() || !rpc_allowlist.iter().any(|allowed| allowed == &rpc_url) {
             return Err(OwnerBootstrapError::RpcNotAllowlisted);
         }
+        let rpc_header_name = required(values, "LIVE_EXECUTOR_RPC_HEADER_NAME")?.to_string();
+        let rpc_header_file = required(values, "LIVE_EXECUTOR_RPC_HEADER_FILE")?.to_string();
+        if rpc_header_name != "api-key" || !Path::new(&rpc_header_file).is_absolute() {
+            return Err(OwnerBootstrapError::RpcConfigurationMismatch);
+        }
         let maximum_input = positive_u128(values, "LIVE_EXECUTOR_MAX_INPUT_AMOUNT")?;
         let maximum_gas_limit = positive_u64(values, "LIVE_EXECUTOR_MAX_GAS_LIMIT")?;
         let maximum_max_fee_per_gas =
@@ -245,6 +255,8 @@ impl OwnerBootstrapContext {
             one_transaction_at_a_time,
             rpc_url,
             rpc_allowlist,
+            rpc_header_name,
+            rpc_header_file,
             signer_file: values
                 .get("SIGNER_PRIVATE_KEY_FILE")
                 .filter(|value| !value.trim().is_empty())
@@ -425,8 +437,13 @@ pub async fn execute_from_environment(
 fn production_rpc(
     context: &OwnerBootstrapContext,
 ) -> Result<HttpExecutionRpc, OwnerBootstrapError> {
-    HttpExecutionRpc::new_production(context.rpc_url.clone(), &context.rpc_allowlist)
-        .map_err(|_| OwnerBootstrapError::RpcNotAllowlisted)
+    HttpExecutionRpc::new_production_authenticated(
+        context.rpc_url.clone(),
+        &context.rpc_allowlist,
+        &context.rpc_header_name,
+        &context.rpc_header_file,
+    )
+    .map_err(|_| OwnerBootstrapError::RpcNotAllowlisted)
 }
 
 fn require_acknowledgement(
@@ -1485,6 +1502,8 @@ mod tests {
             one_transaction_at_a_time: true,
             rpc_url: Url::parse("https://rpc.example.invalid").expect("url"),
             rpc_allowlist: vec![Url::parse("https://rpc.example.invalid").expect("url")],
+            rpc_header_name: "api-key".to_string(),
+            rpc_header_file: "/run/secrets/test-rpc-key".to_string(),
             signer_file: None,
             release_sha: "a".repeat(40),
             policy_hash: "b".repeat(64),
@@ -1563,6 +1582,17 @@ mod tests {
             (
                 "LIVE_EXECUTOR_RPC_ALLOWLIST".to_string(),
                 "https://rpc.example.invalid".to_string(),
+            ),
+            (
+                "LIVE_EXECUTOR_RPC_HEADER_NAME".to_string(),
+                "api-key".to_string(),
+            ),
+            (
+                "LIVE_EXECUTOR_RPC_HEADER_FILE".to_string(),
+                std::env::temp_dir()
+                    .join("phoenix-test-rpc-key")
+                    .to_string_lossy()
+                    .into_owned(),
             ),
             (
                 "LIVE_EXECUTOR_EXPECTED_OWNER".to_string(),

@@ -111,9 +111,9 @@ func canonicalProviderID(value string) bool {
 	return true
 }
 
-func recordProviderAgreement(ctx context.Context, tx pgx.Tx, observedAt time.Time, primary, confirmation string) error {
-	if observedAt.IsZero() || !canonicalProviderID(primary) || !canonicalProviderID(confirmation) || primary == confirmation {
-		return errors.New("provider agreement evidence is invalid")
+func recordPrimaryProviderSuccess(ctx context.Context, tx pgx.Tx, observedAt time.Time, primary string) error {
+	if observedAt.IsZero() || primary != primaryProviderID {
+		return errors.New("primary provider evidence is invalid")
 	}
 	var failureTransition *time.Time
 	var recoveryStatus string
@@ -121,43 +121,41 @@ func recordProviderAgreement(ctx context.Context, tx pgx.Tx, observedAt time.Tim
 	var count int16
 	var sampleAt [3]*time.Time
 	var samplePrimary [3]*string
-	var sampleConfirmation [3]*string
 	err := tx.QueryRow(ctx, `
 		SELECT failure_transition_at, recovery_status,
 		       request_evidence_not_before, sample_count,
-		       sample_1_at, sample_1_primary_provider, sample_1_confirmation_provider,
-		       sample_2_at, sample_2_primary_provider, sample_2_confirmation_provider,
-		       sample_3_at, sample_3_primary_provider, sample_3_confirmation_provider
+		       sample_1_at, sample_1_primary_provider,
+		       sample_2_at, sample_2_primary_provider,
+		       sample_3_at, sample_3_primary_provider
 		FROM live_canary.revenue_provider_authority
 		WHERE singleton
 		FOR UPDATE
 	`).Scan(
 		&failureTransition, &recoveryStatus, &requestEvidenceNotBefore, &count,
-		&sampleAt[0], &samplePrimary[0], &sampleConfirmation[0],
-		&sampleAt[1], &samplePrimary[1], &sampleConfirmation[1],
-		&sampleAt[2], &samplePrimary[2], &sampleConfirmation[2],
+		&sampleAt[0], &samplePrimary[0],
+		&sampleAt[1], &samplePrimary[1],
+		&sampleAt[2], &samplePrimary[2],
 	)
 	if err != nil || count < 0 || count > 3 {
 		return errors.New("provider recovery state is unavailable")
 	}
 	now := observedAt.UTC()
 	if !now.After(requestEvidenceNotBefore.UTC()) {
-		return errors.New("provider agreement predates the request evidence floor")
+		return errors.New("primary provider evidence predates the request evidence floor")
 	}
 	if failureTransition != nil && !now.After(failureTransition.UTC()) {
-		return errors.New("provider agreement predates the failure transition")
+		return errors.New("primary provider evidence predates the failure transition")
 	}
 	type sample struct {
-		at           time.Time
-		primary      string
-		confirmation string
+		at      time.Time
+		primary string
 	}
 	samples := make([]sample, 0, 3)
 	for index := 0; index < int(count); index++ {
-		if sampleAt[index] == nil || samplePrimary[index] == nil || sampleConfirmation[index] == nil {
+		if sampleAt[index] == nil || samplePrimary[index] == nil || *samplePrimary[index] != primaryProviderID {
 			return errors.New("provider recovery samples are invalid")
 		}
-		samples = append(samples, sample{sampleAt[index].UTC(), *samplePrimary[index], *sampleConfirmation[index]})
+		samples = append(samples, sample{sampleAt[index].UTC(), *samplePrimary[index]})
 	}
 	if len(samples) > 0 && recoveryStatus != "ready" && recoveryStatus != "recovered" {
 		last := samples[len(samples)-1].at
@@ -165,15 +163,14 @@ func recordProviderAgreement(ctx context.Context, tx pgx.Tx, observedAt time.Tim
 			samples = nil
 		}
 	}
-	samples = append(samples, sample{now, primary, confirmation})
+	samples = append(samples, sample{now, primary})
 	if len(samples) > 3 {
 		samples = append([]sample(nil), samples[len(samples)-3:]...)
 	}
 	var at [3]any
 	var first [3]any
-	var second [3]any
 	for index, value := range samples {
-		at[index], first[index], second[index] = value.at, value.primary, value.confirmation
+		at[index], first[index] = value.at, value.primary
 	}
 	status := "collecting"
 	if len(samples) == 3 {
@@ -187,16 +184,16 @@ func recordProviderAgreement(ctx context.Context, tx pgx.Tx, observedAt time.Tim
 	result, err := tx.Exec(ctx, `
 		UPDATE live_canary.revenue_provider_authority
 		SET exact_execution_ready = $13,
-		    gate_reason = 'exact_dual_agreement', gate_updated_at = $1,
+		    gate_reason = 'exact_primary_success', gate_updated_at = $1,
 		    recovery_status = $2, sample_count = $3,
 		    sample_1_at = $4, sample_1_primary_provider = $5, sample_1_confirmation_provider = $6,
 		    sample_2_at = $7, sample_2_primary_provider = $8, sample_2_confirmation_provider = $9,
 		    sample_3_at = $10, sample_3_primary_provider = $11, sample_3_confirmation_provider = $12,
 		    updated_at = now()
 		WHERE singleton
-	`, now, status, len(samples), at[0], first[0], second[0], at[1], first[1], second[1], at[2], first[2], second[2], exactExecutionReady)
+	`, now, status, len(samples), at[0], first[0], nil, at[1], first[1], nil, at[2], first[2], nil, exactExecutionReady)
 	if err != nil || result.RowsAffected() != 1 {
-		return errors.New("provider agreement persistence failed")
+		return errors.New("primary provider evidence persistence failed")
 	}
 	return nil
 }
@@ -387,12 +384,15 @@ func (s *PostgresSignalSink) RecordAaveSignal(ctx context.Context, record signal
 		return record, err
 	}
 	defer tx.Rollback(ctx)
-	if record.ExactPrimaryProvider != "" || record.ExactSecondaryProvider != "" {
+	if record.ExactPrimaryProvider != "" || record.ExactConfirmationProvider != nil {
 		observedAt := record.ObservedAt
 		if record.ExactCompletedAt != nil {
 			observedAt = record.ExactCompletedAt.UTC()
 		}
-		if err := recordProviderAgreement(ctx, tx, observedAt, record.ExactPrimaryProvider, record.ExactSecondaryProvider); err != nil {
+		if record.ExactConfirmationProvider != nil {
+			return record, errors.New("single-primary Exact evidence has a confirmation provider")
+		}
+		if err := recordPrimaryProviderSuccess(ctx, tx, observedAt, record.ExactPrimaryProvider); err != nil {
 			return record, err
 		}
 	}

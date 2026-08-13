@@ -346,6 +346,7 @@ impl RawExecutionRequest {
                 if raw.receive_a_token
                     || raw.evidence_mode != "EIP1186_VERIFIED"
                         && raw.evidence_mode != "DUAL_PROVIDER_FORK_VERIFIED"
+                        && raw.evidence_mode != "SINGLE_PRIMARY_FORK_VERIFIED"
                     || !canonical_block_hash(&raw.state_root)
                     || !canonical_digest(&raw.release_sha)
                 {

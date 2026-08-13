@@ -19,6 +19,7 @@ for path in \
   live-executor/schema/005_closed_loop_economic_control.sql \
   live-executor/schema/007_aave_economic_diagnostics.sql \
   live-executor/schema/008_revenue_provider_authority.sql \
+  live-executor/schema/009_single_primary_provider_authority.sql \
   live-executor/src/economic_control.rs \
   live-executor/src/autonomous_live_control_main.rs \
   live-executor/src/store.rs \
@@ -75,6 +76,7 @@ canonical_state = read("rpc-gateway/src/aave_state.rs")
 schema = read("live-executor/schema/005_closed_loop_economic_control.sql")
 diagnostic_schema = read("live-executor/schema/007_aave_economic_diagnostics.sql")
 provider_schema = read("live-executor/schema/008_revenue_provider_authority.sql")
+single_primary_schema = read("live-executor/schema/009_single_primary_provider_authority.sql")
 health = read("scripts/production-healthcheck.sh")
 monitor = read("scripts/economic-dashboard-loop.sh")
 dashboard_sql = read("scripts/sql/economic-dashboard-snapshot.sql")
@@ -524,9 +526,22 @@ require(
 )
 require("phoenix.live-canary-schema.v7" in control, "schema_v7_not_required")
 require("phoenix.live-canary-schema.v8" in control, "schema_v8_not_required")
+require("phoenix.live-canary-schema.v9" in control, "schema_v9_not_required")
 require("revenue_provider_authority" in provider_schema, "provider_authority_schema_missing")
 require("exact_execution_ready" in provider_schema, "provider_execution_gate_missing")
 require("request_evidence_not_before" in provider_schema, "provider_request_evidence_floor_missing")
+require(
+    "production-nownodes-arbitrum" in single_primary_schema
+    and "sample_1_confirmation_provider IS NULL" in single_primary_schema
+    and "SINGLE_PRIMARY_FORK_VERIFIED" in single_primary_schema,
+    "single_primary_provider_schema_contract_missing",
+)
+require(
+    'RPC_AUTHORITY_MODE: single_primary' in base_compose
+    and '"rpc_authority_mode"' in read("atlas-observer/cmd/atlas-aave-hunter/main.go")
+    and '"single_primary"' in read("atlas-observer/cmd/atlas-aave-hunter/main.go"),
+    "single_primary_health_contract_missing",
+)
 require("provider.exact_execution_ready" in executor_store, "aave_claim_missing_provider_gate")
 require("provider.exact_execution_ready" in revenue_executor, "atlas_claim_missing_provider_gate")
 require("r.created_at >= $9" in executor_store, "aave_claim_missing_post_failure_evidence_floor")
@@ -694,7 +709,6 @@ for required in (
     "result.status = 'passed'",
     "result.simulated_net_pnl > 0",
     "candidate.candidate_expires_at > $4",
-    "eligible_rpc_disagreements",
     "unresolved_submissions",
 ):
     require(required in control, f"activation_request_gate_missing:{required}")
@@ -933,14 +947,14 @@ BEGIN
   UPDATE live_canary.revenue_provider_authority
   SET recovery_status = 'ready', sample_count = 3,
       sample_1_at = now() - interval '3 seconds',
-      sample_1_primary_provider = 'primary-1',
-      sample_1_confirmation_provider = 'confirmation-1',
+      sample_1_primary_provider = 'production-nownodes-arbitrum',
+      sample_1_confirmation_provider = NULL,
       sample_2_at = now() - interval '2 seconds',
-      sample_2_primary_provider = 'primary-2',
-      sample_2_confirmation_provider = 'confirmation-2',
+      sample_2_primary_provider = 'production-nownodes-arbitrum',
+      sample_2_confirmation_provider = NULL,
       sample_3_at = now() - interval '1 second',
-      sample_3_primary_provider = 'primary-3',
-      sample_3_confirmation_provider = 'confirmation-3',
+      sample_3_primary_provider = 'production-nownodes-arbitrum',
+      sample_3_confirmation_provider = NULL,
       exact_execution_ready = true
   WHERE singleton;
 
@@ -958,9 +972,9 @@ BEGIN
   WHERE singleton;
   IF NOT EXISTS (
     SELECT 1 FROM live_canary.schema_contract
-    WHERE version = 'phoenix.live-canary-schema.v8'
+    WHERE version = 'phoenix.live-canary-schema.v9'
   ) THEN
-    RAISE EXCEPTION 'schema v8 marker missing';
+    RAISE EXCEPTION 'schema v9 marker missing';
   END IF;
 END;
 $$;

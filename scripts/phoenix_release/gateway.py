@@ -1705,21 +1705,9 @@ def reconcile_chain_evidence(
         paths.env_file,
         {
             "LIVE_EXECUTOR_EXECUTOR_ADDRESS",
-            "PRODUCTION_RPC_URL",
-            "RPC_PROVIDER_URLS",
-            "SECONDARY_RPC_URL",
         },
     )
-    providers = [
-        value.strip()
-        for value in environment["RPC_PROVIDER_URLS"].split(",")
-        if value.strip()
-    ]
-    if providers != [
-        environment["PRODUCTION_RPC_URL"],
-        environment["SECONDARY_RPC_URL"],
-    ]:
-        raise GatewayError("CHAIN_EVIDENCE_PROVIDER_IDENTITY_INVALID")
+    providers = ["https://arbitrum.nownodes.io/"]
     try:
         provider_evidence = collect_provider_evidence(
             providers,

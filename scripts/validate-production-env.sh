@@ -69,25 +69,6 @@ trim_value() {
   printf '%s' "$1" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//'
 }
 
-csv_contains_exact() {
-  expected=$1
-  rest=$2
-  while :; do
-    case "$rest" in
-      *,*)
-        item=$(trim_value "${rest%%,*}")
-        rest=${rest#*,}
-        ;;
-      *)
-        item=$(trim_value "$rest")
-        rest=
-        ;;
-    esac
-    [ "$item" = "$expected" ] && return 0
-    [ -z "$rest" ] && return 1
-  done
-}
-
 validate_positive_integer() {
   name="$1"
   value="$2"
@@ -100,85 +81,6 @@ validate_positive_integer() {
   if [ "$value" -le 0 ]; then
     fail "$name must be greater than zero"
   fi
-}
-
-validate_rpc_providers() {
-  url_count=$(csv_count "${RPC_PROVIDER_URLS:-}")
-  priority_count=$(csv_count "${RPC_PROVIDER_WEIGHTS:-}")
-  identity_count=$(csv_count "${RPC_PROVIDER_IDS:-}")
-  if [ "$url_count" -eq 0 ]; then
-    fail "RPC_PROVIDER_URLS must contain at least one provider"
-    return
-  fi
-  if [ "$url_count" -ne "$priority_count" ]; then
-    fail "RPC_PROVIDER_URLS count must match RPC_PROVIDER_WEIGHTS count"
-    return
-  fi
-  if [ "$url_count" -ne "$identity_count" ]; then
-    fail "RPC_PROVIDER_URLS count must match RPC_PROVIDER_IDS count"
-    return
-  fi
-
-  index=0
-  rest_urls="${RPC_PROVIDER_URLS:-}"
-  rest_priorities="${RPC_PROVIDER_WEIGHTS:-}"
-  rest_identities="${RPC_PROVIDER_IDS:-}"
-  seen_identities='|'
-  while :; do
-    case "$rest_urls" in
-      *,*)
-        url=$(trim_value "${rest_urls%%,*}")
-        rest_urls=${rest_urls#*,}
-        ;;
-      *)
-        url=$(trim_value "$rest_urls")
-        rest_urls=
-        ;;
-    esac
-    case "$rest_priorities" in
-      *,*)
-        priority=$(trim_value "${rest_priorities%%,*}")
-        rest_priorities=${rest_priorities#*,}
-        ;;
-      *)
-        priority=$(trim_value "$rest_priorities")
-        rest_priorities=
-        ;;
-    esac
-    case "$rest_identities" in
-      *,*)
-        identity=$(trim_value "${rest_identities%%,*}")
-        rest_identities=${rest_identities#*,}
-        ;;
-      *)
-        identity=$(trim_value "$rest_identities")
-        rest_identities=
-        ;;
-    esac
-
-    if [ -z "$url" ]; then
-      fail "RPC provider URL at index $index is empty"
-    fi
-    case "$url" in
-      http://*|https://*) ;;
-      *) fail "RPC provider URL at index $index must be http(s)" ;;
-    esac
-    validate_positive_integer "RPC provider priority at index $index" "$priority"
-    case "$identity" in
-      ''|*[!a-z0-9-]*) fail "RPC provider identity at index $index is invalid" ;;
-    esac
-    [ "${#identity}" -le 64 ] ||
-      fail "RPC provider identity at index $index is invalid"
-    case "$seen_identities" in
-      *"|$identity|"*) fail "RPC provider identities must be unique" ;;
-      *) seen_identities="${seen_identities}${identity}|" ;;
-    esac
-
-    index=$((index + 1))
-    if [ -z "$rest_urls" ] && [ -z "$rest_priorities" ] && [ -z "$rest_identities" ]; then
-      break
-    fi
-  done
 }
 
 validate_engine_routers() {
@@ -245,29 +147,6 @@ validate_postgres_consistency() {
   fi
 }
 
-# Preserve compatibility with the protected two-slot environment while making
-# every runtime provider identity explicit. New environments should set this
-# value directly; an existing environment receives deterministic slot names.
-if [ -z "${RPC_PROVIDER_IDS:-}" ]; then
-  provider_identity_count=$(csv_count "${RPC_PROVIDER_URLS:-}")
-  RPC_PROVIDER_IDS=
-  provider_identity_index=0
-  while [ "$provider_identity_index" -lt "$provider_identity_count" ]; do
-    if [ "$provider_identity_index" -eq 0 ]; then
-      provider_identity=production-slot-0
-    else
-      provider_identity="availability-slot-$provider_identity_index"
-    fi
-    if [ -z "$RPC_PROVIDER_IDS" ]; then
-      RPC_PROVIDER_IDS=$provider_identity
-    else
-      RPC_PROVIDER_IDS="$RPC_PROVIDER_IDS,$provider_identity"
-    fi
-    provider_identity_index=$((provider_identity_index + 1))
-  done
-  export RPC_PROVIDER_IDS
-fi
-
 for name in \
   PHOENIX_ENV \
   PHOENIX_MODE \
@@ -283,9 +162,6 @@ for name in \
   ARBITRUM_SEQUENCER_FEED_URL \
   ARBITRUM_RPC_URL \
   PARENT_CHAIN_RPC_URL \
-  RPC_PROVIDER_URLS \
-  RPC_PROVIDER_WEIGHTS \
-  RPC_PROVIDER_IDS \
   RPC_UPSTREAM_CALLS_PER_SECOND \
   RPC_UPSTREAM_CALL_BURST \
   RPC_STATE_REQUESTS_PER_MINUTE \
@@ -334,15 +210,12 @@ do
   eval "value=\${$name:-}"
   validate_positive_integer "$name" "$value"
 done
-validate_rpc_providers
 validate_engine_routers
 validate_postgres_consistency
 
 if [ "${PHOENIX_MODE:-}" = LIVE ]; then
   for name in \
     AUTONOMOUS_EXECUTION \
-    PRODUCTION_RPC_URL \
-    SECONDARY_RPC_URL \
     LIVE_EXECUTOR_RPC_ALLOWLIST \
     LIVE_EXECUTOR_SIGNER_FILE \
     LIVE_EXECUTOR_WALLET_ADDRESS \
@@ -367,26 +240,10 @@ if [ "${PHOENIX_MODE:-}" = LIVE ]; then
     fail "LIVE_EXECUTION must be true for autonomous LIVE production"
   [ "${AUTONOMOUS_EXECUTION:-}" = true ] ||
     fail "AUTONOMOUS_EXECUTION must be true for autonomous LIVE production"
-  [ "$(csv_count "${RPC_PROVIDER_URLS:-}")" -eq 2 ] ||
-    fail "autonomous LIVE requires exactly two RPC providers"
-  [ "$(csv_count "${RPC_PROVIDER_WEIGHTS:-}")" -eq 2 ] ||
-    fail "autonomous LIVE requires exactly two RPC provider priorities"
-  [ "$(csv_count "${RPC_PROVIDER_IDS:-}")" -eq 2 ] ||
-    fail "autonomous LIVE requires exactly two explicit RPC provider identities"
-  [ "${PRODUCTION_RPC_URL:-}" != "${SECONDARY_RPC_URL:-}" ] ||
-    fail "primary and secondary RPC URLs must be independent"
-  csv_contains_exact "$PRODUCTION_RPC_URL" "$RPC_PROVIDER_URLS" ||
-    fail "RPC_PROVIDER_URLS must contain PRODUCTION_RPC_URL exactly"
-  csv_contains_exact "$SECONDARY_RPC_URL" "$RPC_PROVIDER_URLS" ||
-    fail "RPC_PROVIDER_URLS must contain SECONDARY_RPC_URL exactly"
-  csv_contains_exact "$PRODUCTION_RPC_URL" "$LIVE_EXECUTOR_RPC_ALLOWLIST" ||
-    fail "LIVE_EXECUTOR_RPC_ALLOWLIST must contain PRODUCTION_RPC_URL exactly"
-  csv_contains_exact "$SECONDARY_RPC_URL" "$LIVE_EXECUTOR_RPC_ALLOWLIST" ||
-    fail "LIVE_EXECUTOR_RPC_ALLOWLIST must contain SECONDARY_RPC_URL exactly"
+  [ "${LIVE_EXECUTOR_RPC_ALLOWLIST:-}" = "https://arbitrum.nownodes.io/" ] ||
+    fail "autonomous LIVE must allowlist only the reviewed NOWNodes primary"
   [ -z "${SIGNER_PRIVATE_KEY:-}" ] ||
     fail "SIGNER_PRIVATE_KEY must be empty in autonomous LIVE production"
-  require_shape PRODUCTION_RPC_URL '^https://.+'
-  require_shape SECONDARY_RPC_URL '^https://.+'
   require_shape LIVE_EXECUTOR_SIGNER_FILE '^/.+'
   require_shape LIVE_EXECUTOR_WALLET_ADDRESS '^0x[0-9a-f]{40}$'
   require_shape LIVE_EXECUTOR_EXECUTOR_ADDRESS '^0x[0-9a-f]{40}$'
@@ -428,8 +285,7 @@ ok "Live execution: ${LIVE_EXECUTION}"
 ok "Chain ID: 42161"
 ok "Feed source: relay"
 ok "Sequencer feed configured"
-ok "$(csv_count "${RPC_PROVIDER_URLS:-}") RPC providers configured"
-ok "RPC priority values valid"
+ok "Authenticated single-primary RPC configured"
 ok "Upstream RPC budget: ${RPC_UPSTREAM_CALLS_PER_SECOND} calls/s, burst ${RPC_UPSTREAM_CALL_BURST}"
 ok "RPC state request budget: ${RPC_STATE_REQUESTS_PER_MINUTE}/minute"
 ok "RPC provider probe interval: ${RPC_PROVIDER_PROBE_INTERVAL_SECONDS}s"

@@ -22,6 +22,9 @@ MAX_EVIDENCE_BYTES = 64 * 1024
 MAX_RPC_RESPONSE_BYTES = 1024 * 1024
 RPC_TIMEOUT_SECONDS = 30
 RPC_USER_AGENT = "anti-gravity-phoenix-rpc-gateway/4"
+RPC_HEADER_SECRET = Path(
+    "/etc/phoenix/secrets/phoenix-rpc-provider-slot-1-api-key"
+)
 ARBITRUM_CHAIN_ID = "0xa4b1"
 PAUSED_SELECTOR = "0x5c975abb"
 SET_PAUSED_SELECTOR = "0x16c38b3c"
@@ -101,12 +104,27 @@ def _rpc_call(url: str, method: str, params: list[object]) -> object:
         },
         separators=(",", ":"),
     ).encode()
+    try:
+        metadata = RPC_HEADER_SECRET.lstat()
+        if (
+            stat.S_ISLNK(metadata.st_mode)
+            or not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_size < 1
+            or metadata.st_size > 4096
+        ):
+            raise OSError
+        header_value = RPC_HEADER_SECRET.read_text(encoding="utf-8").strip()
+        if not header_value or "\n" in header_value or "\r" in header_value:
+            raise OSError
+    except (OSError, UnicodeError) as exc:
+        raise ReconciliationError("CHAIN_EVIDENCE_RPC_CREDENTIAL_INVALID") from exc
     request = urllib.request.Request(
         url,
         data=body,
         headers={
             "Content-Type": "application/json",
             "User-Agent": RPC_USER_AGENT,
+            "api-key": header_value,
         },
         method="POST",
     )
@@ -286,8 +304,7 @@ def collect_provider_evidence(
     executor_address = executor_address.lower()
     transaction_hash = transaction_hash.lower()
     if (
-        len(providers) != 2
-        or len(set(providers)) != 2
+        len(providers) != 1
         or not ADDRESS_RE.fullmatch(executor_address)
         or not TRANSACTION_RE.fullmatch(transaction_hash)
     ):
@@ -301,22 +318,6 @@ def collect_provider_evidence(
         )
         for provider in providers
     ]
-    if observations[0]["provider_identity"] == observations[1][
-        "provider_identity"
-    ]:
-        raise ReconciliationError("CHAIN_EVIDENCE_PROVIDERS_NOT_INDEPENDENT")
-    comparable = {
-        key: value
-        for key, value in observations[0].items()
-        if key not in {"provider_identity", "receipt_source"}
-    }
-    second = {
-        key: value
-        for key, value in observations[1].items()
-        if key not in {"provider_identity", "receipt_source"}
-    }
-    if comparable != second:
-        raise ReconciliationError("CHAIN_EVIDENCE_PROVIDER_DISAGREEMENT")
     return observations
 
 
@@ -341,7 +342,7 @@ def build_evidence(
         },
         "owner_transaction_hash": owner_transaction_hash.lower(),
         "protected_main_sha": protected_main_sha,
-        "provider_agreement": True,
+        "provider_agreement": False,
         "providers": providers,
         "release_assets_sha": release_assets_sha,
         "release_platform_manifest_sha256": (
@@ -382,7 +383,7 @@ def validate_evidence(
         )
         or not ADDRESS_RE.fullmatch(str(value["executor_address"]))
         or not TRANSACTION_RE.fullmatch(str(value["owner_transaction_hash"]))
-        or value["provider_agreement"] is not True
+        or value["provider_agreement"] is not False
     ):
         raise ReconciliationError("CHAIN_EVIDENCE_SCHEMA_INVALID")
     historical = value["historical_release_evidence"]
@@ -410,7 +411,7 @@ def validate_evidence(
     if runtime != expected_runtime:
         raise ReconciliationError("CHAIN_EVIDENCE_RUNTIME_NOT_FAIL_CLOSED")
     providers = value["providers"]
-    if not isinstance(providers, list) or len(providers) != 2:
+    if not isinstance(providers, list) or len(providers) != 1:
         raise ReconciliationError("CHAIN_EVIDENCE_SCHEMA_INVALID")
     provider_keys = {
         "block_hash",
@@ -452,20 +453,6 @@ def validate_evidence(
             or provider["classification"] != "unpause"
         ):
             raise ReconciliationError("CHAIN_EVIDENCE_SCHEMA_INVALID")
-    if providers[0]["provider_identity"] == providers[1]["provider_identity"]:
-        raise ReconciliationError("CHAIN_EVIDENCE_PROVIDERS_NOT_INDEPENDENT")
-    comparable = {
-        key: value
-        for key, value in providers[0].items()
-        if key not in {"provider_identity", "receipt_source"}
-    }
-    second = {
-        key: value
-        for key, value in providers[1].items()
-        if key not in {"provider_identity", "receipt_source"}
-    }
-    if comparable != second:
-        raise ReconciliationError("CHAIN_EVIDENCE_PROVIDER_DISAGREEMENT")
     if expected is not None:
         for key, expected_value in expected.items():
             if value.get(key) != expected_value:

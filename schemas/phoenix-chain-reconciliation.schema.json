@@ -47,12 +47,12 @@
       "$ref": "#/$defs/sha"
     },
     "provider_agreement": {
-      "const": true
+      "const": false
     },
     "providers": {
       "type": "array",
-      "minItems": 2,
-      "maxItems": 2,
+      "minItems": 1,
+      "maxItems": 1,
       "items": {
         "$ref": "#/$defs/provider"
       }

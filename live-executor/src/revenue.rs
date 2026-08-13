@@ -24,7 +24,7 @@ use thiserror::Error;
 
 const ACTIVE_ATTEMPT_STATUSES: &str =
     "'claimed','nonce_allocated','submission_unknown','pending','timed_out'";
-const ATLAS_ACTUAL_PATH_EVIDENCE_MODE: &str = "DUAL_PROVIDER_ATLAS_CALLBACK_FORK_VERIFIED";
+const ATLAS_ACTUAL_PATH_EVIDENCE_MODE: &str = "SINGLE_PRIMARY_ATLAS_CALLBACK_FORK_VERIFIED";
 const ATLAS_SUBMISSION_MARGIN_SECONDS: u64 = 15;
 
 #[derive(Clone, Debug, PartialEq, Eq)]

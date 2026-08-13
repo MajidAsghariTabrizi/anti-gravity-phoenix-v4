@@ -28,7 +28,7 @@ import (
 const (
 	StateSchema                      = "phoenix.atlas-aave-hunter-state.v1"
 	RequestSchema                    = "phoenix.rpc.aave-screen-request.v1"
-	ResponseSchema                   = "phoenix.rpc.aave-screen-response.v1"
+	ResponseSchema                   = "phoenix.rpc.aave-screen-response.v2"
 	PrimaryScreenResponseSchema      = "phoenix.rpc.aave-primary-screen-response.v1"
 	DefaultBatch                     = 100
 	MaximumBatch                     = 100
@@ -64,9 +64,10 @@ const (
 	defaultExactStateBudgetPerMinute = uint64(12)
 	defaultExactDiscoveryReserve     = uint64(7)
 	defaultExactRequestEstimateMilli = uint64(5_000)
-	directForkEvidenceMode           = "DUAL_PROVIDER_FORK_VERIFIED"
-	counterfactualForkEvidenceMode   = "DUAL_PROVIDER_COUNTERFACTUAL_FORK_VERIFIED"
-	atlasCallbackEvidenceMode        = "DUAL_PROVIDER_ATLAS_CALLBACK_FORK_VERIFIED"
+	directForkEvidenceMode           = "SINGLE_PRIMARY_FORK_VERIFIED"
+	counterfactualForkEvidenceMode   = "SINGLE_PRIMARY_COUNTERFACTUAL_FORK_VERIFIED"
+	atlasCallbackEvidenceMode        = "SINGLE_PRIMARY_ATLAS_CALLBACK_FORK_VERIFIED"
+	primaryProviderID                = "production-nownodes-arbitrum"
 	maximumReviewedInputWei          = "10000000000000000"
 	exactDeferredCooldownKey         = "exact_deferred_cooldown_total"
 	exactDeferredRouteIneligibleKey  = "exact_deferred_route_ineligible_total"
@@ -120,7 +121,7 @@ type Config struct {
 	ReleaseSHA             string
 	MaximumPriorityFeeWei  string
 	// PrimaryDiscovery uses the discovery-only gateway endpoint in Production.
-	// Tests and pre-existing callers retain the fully dual screen endpoint.
+	// Both endpoints are bound to the same reviewed single primary.
 	PrimaryDiscovery               bool
 	ExactStateBudgetPerMinute      uint64
 	ExactDiscoveryReservePerMinute uint64
@@ -139,7 +140,9 @@ type ProviderAuthoritySink interface {
 type ProviderRecoverySample struct {
 	ObservedAt           time.Time `json:"observed_at"`
 	PrimaryProvider      string    `json:"primary_provider"`
-	ConfirmationProvider string    `json:"confirmation_provider"`
+	Confirmation         *string   `json:"confirmation"`
+	Quorum               uint8     `json:"quorum"`
+	ConfirmationProvider string    `json:"-"`
 }
 
 type AtlasAuctionDispositionSink interface {
@@ -162,11 +165,12 @@ type State struct {
 	LastBlockNumber                    uint64                   `json:"last_block_number"`
 	LastBlockHash                      string                   `json:"last_block_hash"`
 	LastProviderPrimary                string                   `json:"last_provider_primary"`
-	LastProviderSecond                 string                   `json:"last_provider_secondary"`
+	LastProviderSecond                 string                   `json:"last_provider_secondary,omitempty"`
 	ProviderRecoverySamples            []ProviderRecoverySample `json:"provider_recovery_samples,omitempty"`
 	LastBatchAt                        *time.Time               `json:"last_batch_at"`
 	LastTailAt                         *time.Time               `json:"last_tail_at"`
-	LastDualAgreementAt                *time.Time               `json:"last_dual_agreement_at,omitempty"`
+	LastPrimaryExactAt                 *time.Time               `json:"last_primary_exact_at,omitempty"`
+	LastDualAgreementAt                *time.Time               `json:"-"`
 	TailNextBlock                      uint64                   `json:"tail_next_block"`
 	DebtBearingCount                   uint64                   `json:"debt_bearing_count"`
 	Counts                             map[string]uint64        `json:"counts"`
@@ -264,13 +268,15 @@ type providerScreen struct {
 }
 
 type screenResponse struct {
-	SchemaVersion string         `json:"schema_version"`
-	ChainID       uint64         `json:"chain_id"`
-	RequestID     string         `json:"request_id"`
-	BlockNumber   uint64         `json:"block_number"`
-	BlockHash     string         `json:"block_hash"`
-	Primary       providerScreen `json:"primary"`
-	Secondary     providerScreen `json:"secondary"`
+	SchemaVersion string          `json:"schema_version"`
+	ChainID       uint64          `json:"chain_id"`
+	RequestID     string          `json:"request_id"`
+	BlockNumber   uint64          `json:"block_number"`
+	BlockHash     string          `json:"block_hash"`
+	Primary       providerScreen  `json:"primary"`
+	Confirmation  *providerScreen `json:"confirmation"`
+	Quorum        uint8           `json:"quorum"`
+	Secondary     providerScreen  `json:"-"`
 }
 
 // primaryScreenResponse is discovery-only.  A primary screen can enqueue an
@@ -310,7 +316,9 @@ type tailResponse struct {
 	ToBlock              uint64   `json:"to_block"`
 	NextBlock            uint64   `json:"next_block"`
 	PrimaryProviderID    string   `json:"primary_provider_id"`
-	SecondaryProviderID  string   `json:"secondary_provider_id"`
+	ConfirmationProvider *string  `json:"confirmation_provider_id"`
+	Quorum               uint8    `json:"quorum"`
+	SecondaryProviderID  string   `json:"-"`
 	Borrowers            []string `json:"borrowers"`
 }
 
@@ -375,14 +383,16 @@ type exactProvider struct {
 }
 
 type exactResponse struct {
-	SchemaVersion string        `json:"schema_version"`
-	ChainID       uint64        `json:"chain_id"`
-	RequestID     string        `json:"request_id"`
-	BlockNumber   uint64        `json:"block_number"`
-	BlockHash     string        `json:"block_hash"`
-	StateRoot     string        `json:"state_root"`
-	Primary       exactProvider `json:"primary"`
-	Secondary     exactProvider `json:"secondary"`
+	SchemaVersion string         `json:"schema_version"`
+	ChainID       uint64         `json:"chain_id"`
+	RequestID     string         `json:"request_id"`
+	BlockNumber   uint64         `json:"block_number"`
+	BlockHash     string         `json:"block_hash"`
+	StateRoot     string         `json:"state_root"`
+	Primary       exactProvider  `json:"primary"`
+	Confirmation  *exactProvider `json:"confirmation"`
+	Quorum        uint8          `json:"quorum"`
+	Secondary     exactProvider  `json:"-"`
 }
 
 type signal struct {
@@ -413,7 +423,8 @@ type signal struct {
 	SizeDiagnostics             []sizeDiagnostic        `json:"reviewed_size_diagnostics,omitempty"`
 	ExactDiagnostics            *exactDiagnosticSummary `json:"exact_diagnostics,omitempty"`
 	ExactPrimaryProvider        string                  `json:"exact_primary_provider,omitempty"`
-	ExactSecondaryProvider      string                  `json:"exact_secondary_provider,omitempty"`
+	ExactConfirmationProvider   *string                 `json:"exact_confirmation_provider"`
+	ExactSecondaryProvider      string                  `json:"-"`
 	ExecutionCandidate          *executionCandidate     `json:"-"`
 	AtlasCandidate              *atlasCandidate         `json:"-"`
 }
@@ -528,27 +539,29 @@ type simulationRequest struct {
 }
 
 type simulationResponse struct {
-	SchemaVersion             string `json:"schema_version"`
-	ChainID                   uint64 `json:"chain_id"`
-	RequestID                 string `json:"request_id"`
-	BlockNumber               uint64 `json:"block_number"`
-	BlockHash                 string `json:"block_hash"`
-	StateRoot                 string `json:"state_root"`
-	PrimaryProviderID         string `json:"primary_provider_id"`
-	SecondaryProviderID       string `json:"secondary_provider_id"`
-	EvidenceMode              string `json:"evidence_mode"`
-	RouteID                   string `json:"route_id"`
-	CalldataHex               string `json:"calldata_hex"`
-	CalldataHash              string `json:"calldata_hash"`
-	SimulationResultHash      string `json:"simulation_result_hash"`
-	RealizedProfit            string `json:"realized_profit"`
-	ConservativeNetPnL        string `json:"conservative_net_pnl"`
-	EstimatedGasLimit         uint64 `json:"estimated_gas_limit"`
-	EstimatedMaxFeePerGasWei  string `json:"estimated_max_fee_per_gas_wei"`
-	EstimatedExecutionCostWei string `json:"estimated_execution_cost_wei"`
-	EstimatedL1CostWei        string `json:"estimated_l1_cost_wei"`
-	FlashPremiumWei           string `json:"flash_premium_wei"`
-	DeadlineUnixSeconds       uint64 `json:"deadline_unix_seconds"`
+	SchemaVersion             string  `json:"schema_version"`
+	ChainID                   uint64  `json:"chain_id"`
+	RequestID                 string  `json:"request_id"`
+	BlockNumber               uint64  `json:"block_number"`
+	BlockHash                 string  `json:"block_hash"`
+	StateRoot                 string  `json:"state_root"`
+	PrimaryProviderID         string  `json:"primary_provider_id"`
+	ConfirmationProviderID    *string `json:"confirmation_provider_id"`
+	Quorum                    uint8   `json:"quorum"`
+	SecondaryProviderID       string  `json:"-"`
+	EvidenceMode              string  `json:"evidence_mode"`
+	RouteID                   string  `json:"route_id"`
+	CalldataHex               string  `json:"calldata_hex"`
+	CalldataHash              string  `json:"calldata_hash"`
+	SimulationResultHash      string  `json:"simulation_result_hash"`
+	RealizedProfit            string  `json:"realized_profit"`
+	ConservativeNetPnL        string  `json:"conservative_net_pnl"`
+	EstimatedGasLimit         uint64  `json:"estimated_gas_limit"`
+	EstimatedMaxFeePerGasWei  string  `json:"estimated_max_fee_per_gas_wei"`
+	EstimatedExecutionCostWei string  `json:"estimated_execution_cost_wei"`
+	EstimatedL1CostWei        string  `json:"estimated_l1_cost_wei"`
+	FlashPremiumWei           string  `json:"flash_premium_wei"`
+	DeadlineUnixSeconds       uint64  `json:"deadline_unix_seconds"`
 }
 
 type simulationBatchRequest struct {
@@ -565,16 +578,18 @@ type simulationBatchResult struct {
 }
 
 type simulationBatchResponse struct {
-	SchemaVersion       string                  `json:"schema_version"`
-	ChainID             uint64                  `json:"chain_id"`
-	RequestID           string                  `json:"request_id"`
-	BlockNumber         uint64                  `json:"block_number"`
-	BlockHash           string                  `json:"block_hash"`
-	StateRoot           string                  `json:"state_root"`
-	PrimaryProviderID   string                  `json:"primary_provider_id"`
-	SecondaryProviderID string                  `json:"secondary_provider_id"`
-	EvidenceMode        string                  `json:"evidence_mode"`
-	Results             []simulationBatchResult `json:"results"`
+	SchemaVersion          string                  `json:"schema_version"`
+	ChainID                uint64                  `json:"chain_id"`
+	RequestID              string                  `json:"request_id"`
+	BlockNumber            uint64                  `json:"block_number"`
+	BlockHash              string                  `json:"block_hash"`
+	StateRoot              string                  `json:"state_root"`
+	PrimaryProviderID      string                  `json:"primary_provider_id"`
+	ConfirmationProviderID *string                 `json:"confirmation_provider_id"`
+	Quorum                 uint8                   `json:"quorum"`
+	SecondaryProviderID    string                  `json:"-"`
+	EvidenceMode           string                  `json:"evidence_mode"`
+	Results                []simulationBatchResult `json:"results"`
 }
 
 type simulationBatchOutcome struct {
@@ -788,7 +803,9 @@ func (s *Screener) Run(ctx context.Context) error {
 	}
 	if s.Snapshot().LastBatchAt == nil {
 		if err := s.waitForGatewayStartup(ctx); err != nil {
-			s.recordError("rpc_gateway_not_ready")
+			if gateErr := s.recordError("rpc_gateway_not_ready"); gateErr != nil {
+				return gateErr
+			}
 			return err
 		}
 	}
@@ -840,7 +857,9 @@ func (s *Screener) Run(ctx context.Context) error {
 					return recordErr
 				}
 				if !retryable {
-					s.recordError(gatewayErrorClass(screenErr, "rpc_gateway_screen_failure"))
+					if gateErr := s.recordError(gatewayErrorClass(screenErr, "rpc_gateway_screen_failure")); gateErr != nil {
+						return gateErr
+					}
 					return screenErr
 				}
 				continue
@@ -860,7 +879,9 @@ func (s *Screener) Run(ctx context.Context) error {
 				return recordErr
 			}
 			if !retryable {
-				s.recordError(gatewayErrorClass(err, "rpc_gateway_priority_failure"))
+				if gateErr := s.recordError(gatewayErrorClass(err, "rpc_gateway_priority_failure")); gateErr != nil {
+					return gateErr
+				}
 				return err
 			}
 			continue
@@ -1242,7 +1263,7 @@ func (s *Screener) openProviderCircuitLocked(now time.Time, class string, cooldo
 	}
 	s.state.ProviderCircuitOpenUntilUnixMillis = now.Add(cooldown).UnixMilli()
 	s.state.ProviderRecoverySamples = nil
-	s.state.LastDualAgreementAt = nil
+	s.state.LastPrimaryExactAt = nil
 	s.state.LastProviderSecond = ""
 	return s.recordProviderDegradationLocked(now, class)
 }
@@ -1269,13 +1290,13 @@ func (s *Screener) RecordRetryableGatewayError(err error) (bool, error) {
 	return true, nil
 }
 
-// ResetProviderRecoveryEvidence is called on every process start. Agreement
+// ResetProviderRecoveryEvidence is called on every process start. Exact
 // samples from a previous process can never satisfy a new recovery window.
 func (s *Screener) ResetProviderRecoveryEvidence(ctx context.Context) error {
 	now := s.nowUTC()
 	s.mu.Lock()
 	s.state.ProviderRecoverySamples = nil
-	s.state.LastDualAgreementAt = nil
+	s.state.LastPrimaryExactAt = nil
 	s.state.LastProviderSecond = ""
 	if s.state.LastErrorClass == "" {
 		s.state.LastErrorClass = "observer_restart"
@@ -1404,7 +1425,7 @@ func (s *Screener) pollTail(ctx context.Context) ([]string, error) {
 	if err := json.NewDecoder(io.LimitReader(response.Body, maximumResponse)).Decode(&result); err != nil {
 		return nil, err
 	}
-	if result.SchemaVersion != "phoenix.rpc.aave-tail-response.v1" || result.ChainID != 42161 || result.RequestID != requestID || result.FinalizedBlockNumber == 0 || len(result.FinalizedBlockHash) != 66 || result.PrimaryProviderID == "" || result.PrimaryProviderID == result.SecondaryProviderID || result.NextBlock != result.ToBlock+1 || len(result.Borrowers) > 1024 {
+	if result.SchemaVersion != "phoenix.rpc.aave-tail-response.v2" || result.ChainID != 42161 || result.RequestID != requestID || result.FinalizedBlockNumber == 0 || len(result.FinalizedBlockHash) != 66 || result.PrimaryProviderID != primaryProviderID || result.ConfirmationProvider != nil || result.Quorum != 1 || result.NextBlock != result.ToBlock+1 || len(result.Borrowers) > 1024 {
 		return nil, errors.New("Aave tail evidence is incomplete")
 	}
 	if fromBlock == 0 {
@@ -1787,14 +1808,12 @@ func (s *Screener) screen(ctx context.Context, borrowers []string, advanceSeed b
 	var screenBlockNumber uint64
 	var screenBlockHash string
 	var primaryEvidence providerScreen
-	var fullDiscoveryEvidence bool
-	var discoverySecondaryProvider string
 	if s.config.PrimaryDiscovery {
 		var result primaryScreenResponse
 		if err := json.NewDecoder(io.LimitReader(response.Body, maximumResponse)).Decode(&result); err != nil {
 			return err
 		}
-		if result.SchemaVersion != PrimaryScreenResponseSchema || result.ChainID != 42161 || result.RequestID != requestID || result.BlockNumber == 0 || len(result.BlockHash) != 66 || result.Primary.ProviderID == "" || result.Primary.WETHPriceBase == "0" || len(result.Primary.Accounts) != len(borrowers) {
+		if result.SchemaVersion != PrimaryScreenResponseSchema || result.ChainID != 42161 || result.RequestID != requestID || result.BlockNumber == 0 || len(result.BlockHash) != 66 || result.Primary.ProviderID != primaryProviderID || result.Primary.WETHPriceBase == "0" || len(result.Primary.Accounts) != len(borrowers) {
 			return errors.New("gateway Aave primary discovery evidence is incomplete")
 		}
 		screenBlockNumber, screenBlockHash, primaryEvidence = result.BlockNumber, result.BlockHash, result.Primary
@@ -1803,17 +1822,10 @@ func (s *Screener) screen(ctx context.Context, borrowers []string, advanceSeed b
 		if err := json.NewDecoder(io.LimitReader(response.Body, maximumResponse)).Decode(&result); err != nil {
 			return err
 		}
-		if result.SchemaVersion != ResponseSchema || result.ChainID != 42161 || result.RequestID != requestID || result.BlockNumber == 0 || len(result.BlockHash) != 66 || result.Primary.ProviderID == result.Secondary.ProviderID || result.Primary.WETHPriceBase != result.Secondary.WETHPriceBase || len(result.Primary.Accounts) != len(borrowers) || len(result.Secondary.Accounts) != len(borrowers) {
+		if result.SchemaVersion != ResponseSchema || result.ChainID != 42161 || result.RequestID != requestID || result.BlockNumber == 0 || len(result.BlockHash) != 66 || result.Primary.ProviderID != primaryProviderID || result.Primary.WETHPriceBase == "0" || len(result.Primary.Accounts) != len(borrowers) || result.Confirmation != nil || result.Quorum != 1 {
 			return errors.New("gateway Aave evidence is incomplete")
 		}
-		for index := range result.Primary.Accounts {
-			if result.Primary.Accounts[index] != result.Secondary.Accounts[index] {
-				return errors.New("gateway Aave providers disagree")
-			}
-		}
 		screenBlockNumber, screenBlockHash, primaryEvidence = result.BlockNumber, result.BlockHash, result.Primary
-		discoverySecondaryProvider = result.Secondary.ProviderID
-		fullDiscoveryEvidence = true
 	}
 	previousAuthorityDiverged := s.Snapshot().LastErrorClass == revenueLaneAuthorityDivergedClass
 	authorityDiverged := false
@@ -1837,11 +1849,11 @@ func (s *Screener) screen(ctx context.Context, borrowers []string, advanceSeed b
 	s.ensureHotMapsLocked()
 	if previousAuthorityDiverged && !authorityDiverged {
 		// The control pair is coherent again, so discovery can be healthy, but
-		// only three subsequent authority-bearing Exact agreements may reopen
+		// only three subsequent authority-bearing Exact samples may reopen
 		// execution authority.
 		s.state.LastErrorClass = "provider_recovery_requires_exact"
 	}
-	var exactPrimaryProvider, exactSecondaryProvider string
+	var exactPrimaryProvider string
 	var exactRecoveryAt time.Time
 	for _, borrower := range borrowers {
 		if invalidatedBlock := s.state.TailInvalidatedBlock[borrower]; invalidatedBlock > screenBlockNumber {
@@ -2004,7 +2016,6 @@ func (s *Screener) screen(ctx context.Context, borrowers []string, advanceSeed b
 						record = withoutCandidateAuthority(record, "provider_recovery_sample")
 					}
 					exactPrimaryProvider = record.ExactPrimaryProvider
-					exactSecondaryProvider = record.ExactSecondaryProvider
 					exactRecoveryAt = exactCompletedAt
 					record.ExactCompletedAt = &exactCompletedAt
 					record.ExactDiagnostics = buildExactDiagnosticSummary(
@@ -2083,58 +2094,22 @@ func (s *Screener) screen(ctx context.Context, borrowers []string, advanceSeed b
 	s.state.LastBlockHash = screenBlockHash
 	s.state.LastProviderPrimary = primaryEvidence.ProviderID
 	s.state.LastBatchAt = &now
-	// A successful primary discovery is deliberately not a provider recovery
-	// signal.  Only a fresh Exact response contains independent final evidence.
-	if exactPrimaryProvider != "" && exactSecondaryProvider != "" && exactPrimaryProvider != exactSecondaryProvider {
+	// Discovery does not count toward recovery. Only a fresh Exact response from
+	// the reviewed primary is an authority-bearing sample.
+	if exactPrimaryProvider == primaryProviderID {
 		s.state.LastProviderPrimary = exactPrimaryProvider
-		s.state.LastProviderSecond = exactSecondaryProvider
-		s.state.LastDualAgreementAt = &now
-		s.recordProviderRecoveryLocked(exactRecoveryAt, exactPrimaryProvider, exactSecondaryProvider)
-	} else if fullDiscoveryEvidence && s.state.LastErrorClass == "" {
-		// Compatibility path for existing callers: a fully matched screen is
-		// itself independent evidence only outside a recovery window. Production
-		// recovery always uses the Exact-only branch above.
-		s.state.LastDualAgreementAt = &now
-		s.recordProviderRecoveryLocked(now, primaryEvidence.ProviderID, discoverySecondaryProvider)
-	} else if fullDiscoveryEvidence {
-		// A successful matched discovery closes the transport circuit so Exact
-		// probes may resume, but it never counts toward recovery authority.
-		s.state.ProviderCircuitOpenUntilUnixMillis = 0
+		s.state.LastProviderSecond = ""
+		s.state.LastPrimaryExactAt = &exactRecoveryAt
+		s.recordProviderRecoveryLocked(exactRecoveryAt, exactPrimaryProvider)
 	}
 	if authorityDiverged {
 		s.state.ProviderRecoverySamples = nil
-		s.state.LastDualAgreementAt = nil
+		s.state.LastPrimaryExactAt = nil
 		s.state.LastProviderSecond = ""
 		s.state.LastErrorClass = revenueLaneAuthorityDivergedClass
 		s.state.LastAttemptAt = &now
 	}
 	return s.persistStateLocked()
-}
-
-func equalExactReserves(first, second []exactReserve) bool {
-	if len(first) != len(second) {
-		return false
-	}
-	for index := range first {
-		if first[index] != second[index] {
-			return false
-		}
-	}
-	return true
-}
-
-func equalExactProviders(first, second exactProvider) bool {
-	return first.PoolCodeHash == second.PoolCodeHash &&
-		first.PoolImplementation == second.PoolImplementation &&
-		first.PoolImplementationCodeHash == second.PoolImplementationCodeHash &&
-		first.UserConfiguration == second.UserConfiguration &&
-		first.UserEModeCategory == second.UserEModeCategory &&
-		first.EModeCollateralBitmap == second.EModeCollateralBitmap &&
-		first.EModeLiquidationBonusBPS == second.EModeLiquidationBonusBPS &&
-		first.FlashPremiumBPS == second.FlashPremiumBPS &&
-		first.Account == second.Account &&
-		equalExactReserves(first.Reserves, second.Reserves) &&
-		equalLiquidations(first.Liquidations, second.Liquidations)
 }
 
 func exactRouteIneligibleReason(reserves []exactReserve) string {
@@ -2216,14 +2191,14 @@ func (s *Screener) resolveExact(ctx context.Context, record signal, auction *obs
 	if err := json.NewDecoder(io.LimitReader(response.Body, maximumResponse)).Decode(&result); err != nil {
 		return record, err
 	}
-	if result.SchemaVersion != "phoenix.rpc.aave-exact-response.v3" || result.ChainID != 42161 || result.RequestID != requestID || result.BlockNumber == 0 || result.BlockHash == "" || result.StateRoot == "" || result.Primary.ProviderID == result.Secondary.ProviderID || !equalExactProviders(result.Primary, result.Secondary) {
+	if result.SchemaVersion != "phoenix.rpc.aave-exact-response.v4" || result.ChainID != 42161 || result.RequestID != requestID || result.BlockNumber == 0 || result.BlockHash == "" || result.StateRoot == "" || result.Primary.ProviderID != primaryProviderID || result.Confirmation != nil || result.Quorum != 1 {
 		return record, errors.New("exact Aave provider evidence is incomplete")
 	}
 	if result.BlockNumber < record.Block {
-		return record, errors.New("exact Aave evidence predates its dual screen")
+		return record, errors.New("exact Aave evidence predates its primary screen")
 	}
 	record.ExactPrimaryProvider = result.Primary.ProviderID
-	record.ExactSecondaryProvider = result.Secondary.ProviderID
+	record.ExactConfirmationProvider = nil
 	record.Block = result.BlockNumber
 	record.BlockHash = result.BlockHash
 	record.StateRoot = result.StateRoot
@@ -2362,7 +2337,7 @@ func (s *Screener) fetchExactSnapshot(ctx context.Context, borrower string) (exa
 	if err := json.NewDecoder(io.LimitReader(response.Body, maximumResponse)).Decode(&result); err != nil {
 		return exactResponse{}, err
 	}
-	if result.SchemaVersion != "phoenix.rpc.aave-exact-response.v3" || result.ChainID != 42161 || result.RequestID != requestID || result.BlockNumber == 0 || result.BlockHash == "" || result.StateRoot == "" || result.Primary.ProviderID == result.Secondary.ProviderID || !equalExactProviders(result.Primary, result.Secondary) {
+	if result.SchemaVersion != "phoenix.rpc.aave-exact-response.v4" || result.ChainID != 42161 || result.RequestID != requestID || result.BlockNumber == 0 || result.BlockHash == "" || result.StateRoot == "" || result.Primary.ProviderID != primaryProviderID || result.Confirmation != nil || result.Quorum != 1 {
 		return exactResponse{}, errors.New("fresh exact Aave provider evidence is incomplete")
 	}
 	return result, nil
@@ -3399,7 +3374,7 @@ func (s *Screener) simulateExactBatchChunk(ctx context.Context, record signal, s
 	if err := json.NewDecoder(io.LimitReader(response.Body, maximumResponse)).Decode(&result); err != nil {
 		return nil, err
 	}
-	if result.SchemaVersion != "phoenix.rpc.aave-simulate-batch-response.v2" || result.ChainID != 42161 || result.RequestID != requestID || result.BlockNumber != record.Block || result.BlockHash != record.BlockHash || result.StateRoot != record.StateRoot || result.PrimaryProviderID == "" || result.PrimaryProviderID == result.SecondaryProviderID || result.EvidenceMode != expectedBatchEvidenceMode || len(result.Results) != len(simulations) {
+	if result.SchemaVersion != "phoenix.rpc.aave-simulate-batch-response.v3" || result.ChainID != 42161 || result.RequestID != requestID || result.BlockNumber != record.Block || result.BlockHash != record.BlockHash || result.StateRoot != record.StateRoot || result.PrimaryProviderID != primaryProviderID || result.ConfirmationProviderID != nil || result.Quorum != 1 || result.EvidenceMode != expectedBatchEvidenceMode || len(result.Results) != len(simulations) {
 		return nil, errors.New("simulation batch evidence is incomplete")
 	}
 	outcomes := make([]simulationBatchOutcome, len(simulations))
@@ -3433,7 +3408,7 @@ func (s *Screener) simulateExactBatchChunk(ctx context.Context, record signal, s
 }
 
 func validateSimulationResponse(result *simulationResponse, request *simulationRequest, record signal, expectedEvidenceMode string) error {
-	if result == nil || request == nil || result.SchemaVersion != "phoenix.rpc.aave-simulate-response.v3" || result.ChainID != 42161 || result.RequestID != request.RequestID || result.BlockNumber != record.Block || result.BlockHash != record.BlockHash || result.StateRoot != record.StateRoot || result.PrimaryProviderID == "" || result.PrimaryProviderID == result.SecondaryProviderID || result.EvidenceMode != expectedEvidenceMode || len(result.RouteID) != 66 || len(result.CalldataHash) != 64 || len(result.SimulationResultHash) != 64 || result.DeadlineUnixSeconds != request.DeadlineUnixSeconds {
+	if result == nil || request == nil || result.SchemaVersion != "phoenix.rpc.aave-simulate-response.v4" || result.ChainID != 42161 || result.RequestID != request.RequestID || result.BlockNumber != record.Block || result.BlockHash != record.BlockHash || result.StateRoot != record.StateRoot || result.PrimaryProviderID != primaryProviderID || result.ConfirmationProviderID != nil || result.Quorum != 1 || result.EvidenceMode != expectedEvidenceMode || len(result.RouteID) != 66 || len(result.CalldataHash) != 64 || len(result.SimulationResultHash) != 64 || result.DeadlineUnixSeconds != request.DeadlineUnixSeconds {
 		return errors.New("simulation evidence is incomplete")
 	}
 	calldata, err := hex.DecodeString(strings.TrimPrefix(result.CalldataHex, "0x"))
@@ -3599,15 +3574,33 @@ func newBigUint(value string) (*big.Int, bool) {
 	return result, ok && result.Sign() >= 0
 }
 
-func (s *Screener) recordError(class string) {
+// FailClosedExactAuthority revokes the durable Exact gate before a fatal
+// observer boundary returns. It is intentionally narrower than a full
+// Aave+Atlas disarm; the supervisor owns sustained-failure convergence.
+func (s *Screener) FailClosedExactAuthority(class string) error {
+	return s.recordError(class)
+}
+
+func (s *Screener) recordError(class string) error {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	now := s.nowUTC()
 	s.state.ProviderCircuitOpenUntilUnixMillis = 0
+	s.state.ProviderRecoverySamples = nil
+	s.state.LastPrimaryExactAt = nil
 	s.state.IncompleteCount++
 	s.state.LastErrorClass = class
 	s.state.LastAttemptAt = &now
-	_ = s.persistStateLocked()
+	err := s.persistStateLocked()
+	s.mu.Unlock()
+	if err != nil {
+		return err
+	}
+	if sink, ok := s.config.SignalSink.(ProviderAuthoritySink); ok {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		return sink.RecordProviderFailure(ctx, class, now)
+	}
+	return nil
 }
 
 func (s *Screener) recordProviderDegradation(class string) error {
@@ -3651,11 +3644,11 @@ func providerDegradationClassKey(class string) string {
 	}
 }
 
-func (s *Screener) recordProviderRecoveryLocked(now time.Time, primary, confirmation string) {
+func (s *Screener) recordProviderRecoveryLocked(now time.Time, primary string, _ ...string) {
 	if s.state.Counts == nil {
 		s.state.Counts = make(map[string]uint64)
 	}
-	if primary != "" && confirmation != "" && primary != confirmation {
+	if primary == primaryProviderID {
 		collecting := s.state.LastErrorClass != "" || s.state.Counts[providerDegradedSinceMillisKey] > 0
 		if collecting && len(s.state.ProviderRecoverySamples) > 0 {
 			last := s.state.ProviderRecoverySamples[len(s.state.ProviderRecoverySamples)-1].ObservedAt
@@ -3664,13 +3657,13 @@ func (s *Screener) recordProviderRecoveryLocked(now time.Time, primary, confirma
 			}
 		}
 		s.state.ProviderRecoverySamples = append(s.state.ProviderRecoverySamples, ProviderRecoverySample{
-			ObservedAt: now, PrimaryProvider: primary, ConfirmationProvider: confirmation,
+			ObservedAt: now, PrimaryProvider: primary, Confirmation: nil, Quorum: 1,
 		})
 		if len(s.state.ProviderRecoverySamples) > 3 {
 			s.state.ProviderRecoverySamples = append([]ProviderRecoverySample(nil), s.state.ProviderRecoverySamples[len(s.state.ProviderRecoverySamples)-3:]...)
 		}
 	}
-	// A successful independent request proves the circuit is currently closed,
+	// A successful primary Exact proves the circuit is currently closed,
 	// but does not restore Exact authority until all three samples exist.
 	s.state.ProviderCircuitOpenUntilUnixMillis = 0
 	degradedSince := s.state.Counts[providerDegradedSinceMillisKey]

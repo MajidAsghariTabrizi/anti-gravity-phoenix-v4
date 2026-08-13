@@ -2,15 +2,21 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 pub const AAVE_SCREEN_REQUEST_SCHEMA: &str = "phoenix.rpc.aave-screen-request.v1";
-pub const AAVE_SCREEN_RESPONSE_SCHEMA: &str = "phoenix.rpc.aave-screen-response.v1";
+pub const AAVE_SCREEN_RESPONSE_SCHEMA: &str = "phoenix.rpc.aave-screen-response.v2";
 pub const AAVE_EXACT_REQUEST_SCHEMA: &str = "phoenix.rpc.aave-exact-request.v3";
-pub const AAVE_EXACT_RESPONSE_SCHEMA: &str = "phoenix.rpc.aave-exact-response.v3";
+pub const AAVE_EXACT_RESPONSE_SCHEMA: &str = "phoenix.rpc.aave-exact-response.v4";
 pub const AAVE_SIMULATE_REQUEST_SCHEMA: &str = "phoenix.rpc.aave-simulate-request.v3";
-pub const AAVE_SIMULATE_RESPONSE_SCHEMA: &str = "phoenix.rpc.aave-simulate-response.v3";
+pub const AAVE_SIMULATE_RESPONSE_SCHEMA: &str = "phoenix.rpc.aave-simulate-response.v4";
 pub const AAVE_SIMULATE_BATCH_REQUEST_SCHEMA: &str = "phoenix.rpc.aave-simulate-batch-request.v2";
-pub const AAVE_SIMULATE_BATCH_RESPONSE_SCHEMA: &str = "phoenix.rpc.aave-simulate-batch-response.v2";
+pub const AAVE_SIMULATE_BATCH_RESPONSE_SCHEMA: &str = "phoenix.rpc.aave-simulate-batch-response.v3";
 pub const AAVE_TAIL_REQUEST_SCHEMA: &str = "phoenix.rpc.aave-tail-request.v1";
-pub const AAVE_TAIL_RESPONSE_SCHEMA: &str = "phoenix.rpc.aave-tail-response.v1";
+pub const AAVE_TAIL_RESPONSE_SCHEMA: &str = "phoenix.rpc.aave-tail-response.v2";
+pub const AAVE_PRIMARY_PROVIDER_ID: &str = "production-nownodes-arbitrum";
+pub const SINGLE_PRIMARY_FORK_EVIDENCE: &str = "SINGLE_PRIMARY_FORK_VERIFIED";
+pub const SINGLE_PRIMARY_COUNTERFACTUAL_FORK_EVIDENCE: &str =
+    "SINGLE_PRIMARY_COUNTERFACTUAL_FORK_VERIFIED";
+pub const SINGLE_PRIMARY_ATLAS_CALLBACK_FORK_EVIDENCE: &str =
+    "SINGLE_PRIMARY_ATLAS_CALLBACK_FORK_VERIFIED";
 pub const AAVE_V3_POOL_ARBITRUM: &str = "0x794a61358d6845594f94dc1db02a252b5b4814ad";
 pub const MAX_AAVE_SCREEN_ADDRESSES: usize = 100;
 pub const MAX_AAVE_SIMULATION_BATCH: usize = 8;
@@ -209,7 +215,8 @@ pub struct AaveScreenResponse {
     pub block_number: u64,
     pub block_hash: String,
     pub primary: AaveProviderScreen,
-    pub secondary: AaveProviderScreen,
+    pub confirmation: Option<AaveProviderScreen>,
+    pub quorum: u8,
     pub resolved_at_unix_ms: u64,
 }
 
@@ -314,7 +321,8 @@ pub struct AaveExactResponse {
     pub block_hash: String,
     pub state_root: String,
     pub primary: AaveExactProviderState,
-    pub secondary: AaveExactProviderState,
+    pub confirmation: Option<AaveExactProviderState>,
+    pub quorum: u8,
     pub resolved_at_unix_ms: u64,
 }
 
@@ -365,7 +373,8 @@ pub struct AaveSimulateResponse {
     pub block_hash: String,
     pub state_root: String,
     pub primary_provider_id: String,
-    pub secondary_provider_id: String,
+    pub confirmation_provider_id: Option<String>,
+    pub quorum: u8,
     pub evidence_mode: String,
     pub route_id: String,
     pub calldata_hex: String,
@@ -416,7 +425,8 @@ pub struct AaveSimulateBatchResponse {
     pub block_hash: String,
     pub state_root: String,
     pub primary_provider_id: String,
-    pub secondary_provider_id: String,
+    pub confirmation_provider_id: Option<String>,
+    pub quorum: u8,
     pub evidence_mode: String,
     pub results: Vec<AaveSimulateBatchResult>,
     pub resolved_at_unix_ms: u64,
@@ -443,7 +453,8 @@ pub struct AaveTailResponse {
     pub to_block: u64,
     pub next_block: u64,
     pub primary_provider_id: String,
-    pub secondary_provider_id: String,
+    pub confirmation_provider_id: Option<String>,
+    pub quorum: u8,
     pub borrowers: Vec<String>,
     pub resolved_at_unix_ms: u64,
 }
@@ -472,9 +483,9 @@ impl AaveTailResponse {
             || !canonical_block_hash(&self.finalized_block_hash)
             || self.next_block != self.to_block.saturating_add(1)
             || self.to_block > self.finalized_block_number
-            || self.primary_provider_id.is_empty()
-            || self.secondary_provider_id.is_empty()
-            || self.primary_provider_id == self.secondary_provider_id
+            || self.primary_provider_id != AAVE_PRIMARY_PROVIDER_ID
+            || self.confirmation_provider_id.is_some()
+            || self.quorum != 1
             || self.borrowers.len() > 1_024
             || self.borrowers.iter().any(|value| !canonical_address(value))
             || self
@@ -645,10 +656,12 @@ fn canonical_release_sha(value: &str) -> bool {
 impl AaveSimulateResponse {
     pub fn validate(&self, request: &AaveSimulateRequest) -> Result<(), AaveStateError> {
         request.validate()?;
-        let expected_evidence_mode = if request.counterfactual {
-            "DUAL_PROVIDER_COUNTERFACTUAL_FORK_VERIFIED"
+        let expected_evidence_mode = if request.atlas_mode {
+            SINGLE_PRIMARY_ATLAS_CALLBACK_FORK_EVIDENCE
+        } else if request.counterfactual {
+            SINGLE_PRIMARY_COUNTERFACTUAL_FORK_EVIDENCE
         } else {
-            "DUAL_PROVIDER_FORK_VERIFIED"
+            SINGLE_PRIMARY_FORK_EVIDENCE
         };
         if self.schema_version != AAVE_SIMULATE_RESPONSE_SCHEMA
             || self.chain_id != request.chain_id
@@ -656,9 +669,9 @@ impl AaveSimulateResponse {
             || self.block_number != request.block_number
             || self.block_hash != request.block_hash
             || self.state_root != request.state_root
-            || self.primary_provider_id.is_empty()
-            || self.secondary_provider_id.is_empty()
-            || self.primary_provider_id == self.secondary_provider_id
+            || self.primary_provider_id != AAVE_PRIMARY_PROVIDER_ID
+            || self.confirmation_provider_id.is_some()
+            || self.quorum != 1
             || self.evidence_mode != expected_evidence_mode
             || !canonical_block_hash(&self.route_id)
             || !canonical_data(&self.calldata_hex)
@@ -751,16 +764,23 @@ impl AaveSimulateBatchResponse {
     pub fn validate(&self, request: &AaveSimulateBatchRequest) -> Result<(), AaveStateError> {
         request.validate()?;
         let first = &request.simulations[0];
+        let expected_evidence_mode = if first.atlas_mode {
+            SINGLE_PRIMARY_ATLAS_CALLBACK_FORK_EVIDENCE
+        } else if first.counterfactual {
+            SINGLE_PRIMARY_COUNTERFACTUAL_FORK_EVIDENCE
+        } else {
+            SINGLE_PRIMARY_FORK_EVIDENCE
+        };
         if self.schema_version != AAVE_SIMULATE_BATCH_RESPONSE_SCHEMA
             || self.chain_id != request.chain_id
             || self.request_id != request.request_id
             || self.block_number != first.block_number
             || self.block_hash != first.block_hash
             || self.state_root != first.state_root
-            || self.primary_provider_id.is_empty()
-            || self.secondary_provider_id.is_empty()
-            || self.primary_provider_id == self.secondary_provider_id
-            || self.evidence_mode != "DUAL_PROVIDER_FORK_VERIFIED"
+            || self.primary_provider_id != AAVE_PRIMARY_PROVIDER_ID
+            || self.confirmation_provider_id.is_some()
+            || self.quorum != 1
+            || self.evidence_mode != expected_evidence_mode
             || self.results.len() != request.simulations.len()
         {
             return Err(AaveStateError::ProviderDisagreement);
@@ -792,20 +812,15 @@ impl AaveExactResponse {
             .maximum_input_amount
             .parse::<u128>()
             .map_err(|_| AaveStateError::Invalid)?;
-        let mut primary = self.primary.clone();
-        let mut secondary = self.secondary.clone();
-        primary.provider_id.clear();
-        secondary.provider_id.clear();
         if self.schema_version != AAVE_EXACT_RESPONSE_SCHEMA
             || self.chain_id != request.chain_id
             || self.request_id != request.request_id
             || self.block_number == 0
             || !canonical_block_hash(&self.block_hash)
             || !canonical_block_hash(&self.state_root)
-            || self.primary.provider_id.is_empty()
-            || self.secondary.provider_id.is_empty()
-            || self.primary.provider_id == self.secondary.provider_id
-            || primary != secondary
+            || self.primary.provider_id != AAVE_PRIMARY_PROVIDER_ID
+            || self.confirmation.is_some()
+            || self.quorum != 1
             || self.primary.account.borrower != request.borrower
             || self.primary.reserves.len() != 2
             || self.primary.liquidations.len() > SizeLevel::ALL.len() * 2
@@ -908,13 +923,10 @@ impl AaveScreenResponse {
             || self.request_id != request.request_id
             || self.block_number == 0
             || !canonical_block_hash(&self.block_hash)
-            || self.primary.provider_id.is_empty()
-            || self.secondary.provider_id.is_empty()
-            || self.primary.provider_id == self.secondary.provider_id
+            || self.primary.provider_id != AAVE_PRIMARY_PROVIDER_ID
+            || self.confirmation.is_some()
+            || self.quorum != 1
             || self.primary.accounts.len() != request.borrowers.len()
-            || self.secondary.accounts.len() != request.borrowers.len()
-            || self.primary.accounts != self.secondary.accounts
-            || self.primary.weth_price_base != self.secondary.weth_price_base
             || self.primary.weth_price_base == "0"
             || self
                 .primary
@@ -1049,5 +1061,75 @@ mod tests {
         assert_eq!(request.validate(), Ok(()));
         request.executor_code_hash = format!("0x{}", "3".repeat(64));
         assert_eq!(request.validate(), Err(AaveStateError::Invalid));
+    }
+
+    #[test]
+    fn atlas_callback_evidence_is_single_primary() {
+        let mut request = AaveSimulateRequest {
+            schema_version: AAVE_SIMULATE_REQUEST_SCHEMA.to_string(),
+            chain_id: 42_161,
+            request_id: "atlas-candidate-1".to_string(),
+            block_number: 49_000_000,
+            block_hash: format!("0x{}", "1".repeat(64)),
+            state_root: format!("0x{}", "2".repeat(64)),
+            executor_address: "0x1111111111111111111111111111111111111111".to_string(),
+            executor_code_hash: "3".repeat(64),
+            caller_address: "0x2222222222222222222222222222222222222222".to_string(),
+            release_sha: "4".repeat(40),
+            borrower: "0x3333333333333333333333333333333333333333".to_string(),
+            debt_asset: "0x82af49447d8a07e3bd95bd0d56f35241523fbab1".to_string(),
+            collateral_asset: "0xaf88d065e77c8cc2239327c5edb3a432268e5831".to_string(),
+            repay_amount: "1000000".to_string(),
+            maximum_input_amount: "2000000".to_string(),
+            live_maximum_input_amount: "2000000".to_string(),
+            counterfactual: false,
+            minimum_collateral_received: "2000000".to_string(),
+            minimum_unwind_output: "1100000".to_string(),
+            minimum_profit: "10000".to_string(),
+            expected_profit: "20000".to_string(),
+            retained_profit_floor: "1000".to_string(),
+            selected_pool: "0xc6962004f452be9203591991d15f6b388e09e8d0".to_string(),
+            selected_factory: "0x1f98431c8ad98523631ae4a59f267346ea31f984".to_string(),
+            selected_fee: 500,
+            zero_for_one: false,
+            gas_limit: 500_000,
+            max_fee_per_gas: "100".to_string(),
+            max_priority_fee_per_gas: "10".to_string(),
+            deadline_unix_seconds: 1_900_000_000,
+            atlas_mode: true,
+            atlas_bid: "1".to_string(),
+        };
+        let response = AaveSimulateResponse {
+            schema_version: AAVE_SIMULATE_RESPONSE_SCHEMA.to_string(),
+            chain_id: request.chain_id,
+            request_id: request.request_id.clone(),
+            block_number: request.block_number,
+            block_hash: request.block_hash.clone(),
+            state_root: request.state_root.clone(),
+            primary_provider_id: AAVE_PRIMARY_PROVIDER_ID.to_string(),
+            confirmation_provider_id: None,
+            quorum: 1,
+            evidence_mode: SINGLE_PRIMARY_ATLAS_CALLBACK_FORK_EVIDENCE.to_string(),
+            route_id: format!("0x{}", "5".repeat(64)),
+            calldata_hex: "0x12345678".to_string(),
+            calldata_hash: "6".repeat(64),
+            simulation_result_hash: "7".repeat(64),
+            realized_profit: "20000".to_string(),
+            conservative_net_pnl: "15000".to_string(),
+            estimated_gas_limit: 100_000,
+            estimated_max_fee_per_gas_wei: "100".to_string(),
+            estimated_execution_cost_wei: "10000000".to_string(),
+            estimated_l1_cost_wei: "1000".to_string(),
+            flash_premium_wei: "500".to_string(),
+            deadline_unix_seconds: request.deadline_unix_seconds,
+            resolved_at_unix_ms: 1,
+        };
+        assert_eq!(response.validate(&request), Ok(()));
+        request.atlas_mode = false;
+        request.atlas_bid = "0".to_string();
+        assert_eq!(
+            response.validate(&request),
+            Err(AaveStateError::ProviderDisagreement)
+        );
     }
 }

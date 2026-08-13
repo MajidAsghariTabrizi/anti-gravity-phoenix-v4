@@ -4,9 +4,11 @@ use crate::aave_state::{
     AaveProviderScreen, AaveScreenRequest, AaveScreenResponse, AaveSimulateBatchError,
     AaveSimulateBatchRequest, AaveSimulateBatchResponse, AaveSimulateBatchResult,
     AaveSimulateRequest, AaveSimulateResponse, AaveTailRequest, AaveTailResponse, SizeLevel,
-    AAVE_EXACT_RESPONSE_SCHEMA, AAVE_PRIMARY_SCREEN_RESPONSE_SCHEMA, AAVE_SCREEN_RESPONSE_SCHEMA,
-    AAVE_SIMULATE_BATCH_RESPONSE_SCHEMA, AAVE_SIMULATE_RESPONSE_SCHEMA, AAVE_TAIL_RESPONSE_SCHEMA,
-    AAVE_V3_POOL_ARBITRUM, MAXIMUM_REVIEWED_INPUT_WEI,
+    AAVE_EXACT_RESPONSE_SCHEMA, AAVE_PRIMARY_PROVIDER_ID, AAVE_PRIMARY_SCREEN_RESPONSE_SCHEMA,
+    AAVE_SCREEN_RESPONSE_SCHEMA, AAVE_SIMULATE_BATCH_RESPONSE_SCHEMA,
+    AAVE_SIMULATE_RESPONSE_SCHEMA, AAVE_TAIL_RESPONSE_SCHEMA, AAVE_V3_POOL_ARBITRUM,
+    MAXIMUM_REVIEWED_INPUT_WEI, SINGLE_PRIMARY_ATLAS_CALLBACK_FORK_EVIDENCE,
+    SINGLE_PRIMARY_COUNTERFACTUAL_FORK_EVIDENCE, SINGLE_PRIMARY_FORK_EVIDENCE,
 };
 use crate::budget::GlobalBudget;
 use crate::cache::TtlCache;
@@ -150,17 +152,6 @@ struct AaveExactStaticContext {
 struct PinnedBlockState {
     block: PinnedBlock,
     state_root: String,
-}
-
-fn aave_exact_provider_states_equal(
-    first: &AaveExactProviderState,
-    second: &AaveExactProviderState,
-) -> bool {
-    let mut first = first.clone();
-    let mut second = second.clone();
-    first.provider_id.clear();
-    second.provider_id.clear();
-    first == second
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -791,9 +782,6 @@ impl GatewayRuntime {
         }
 
         let _operation_guard = self.upstream_operation_lock.lock().await;
-        if self.provider_count().await < 2 {
-            return Err(GatewayError::ProviderUnavailable);
-        }
         let primary = self
             .reserve_named_provider(&head.provider_id)
             .await
@@ -817,7 +805,6 @@ impl GatewayRuntime {
             .perform_hunter_state_bundle(&secondary, &request, &head.block, ProviderSlot::Secondary)
             .await?;
         self.mark_provider_success(primary.provider_id()).await;
-        self.mark_provider_success(secondary.provider_id()).await;
 
         let agreements = primary_states
             .into_iter()
@@ -865,40 +852,24 @@ impl GatewayRuntime {
             return Err(GatewayError::RequestBudgetExhausted);
         }
         let _operation_guard = self.upstream_operation_lock.lock().await;
-        if self.provider_count().await < 2 {
-            return Err(GatewayError::ProviderUnavailable);
-        }
         let primary = self
-            .reserve_provider(&HashSet::new())
+            .reserve_named_provider(AAVE_PRIMARY_PROVIDER_ID)
             .await
             .ok_or(GatewayError::ProviderUnavailable)?;
-        let secondary = self
-            .reserve_provider(&HashSet::from([primary.provider_id().to_string()]))
-            .await
-            .ok_or(GatewayError::ProviderUnavailable)?;
-        let required_calls = self.provider_setup_call_count(primary.provider_id()).await
-            + self
-                .provider_setup_call_count(secondary.provider_id())
-                .await
-            + 4;
+        let required_calls = self.provider_setup_call_count(primary.provider_id()).await + 2;
         if !self.admit_upstream_sequence(required_calls).await {
             return Err(GatewayError::UpstreamBudgetExhausted);
         }
         self.ensure_provider_verified(&primary)
             .await
             .map_err(map_call_failure)?;
-        self.ensure_provider_verified(&secondary)
-            .await
-            .map_err(map_call_failure)?;
-        let block = self.common_finalized_block(&primary, &secondary).await?;
+        let block = self
+            .provider_block(&primary, "finalized", ProviderSlot::Primary)
+            .await?;
         let (primary_accounts, primary_weth_price) = self
             .perform_aave_screen(&primary, &request, &block, ProviderSlot::Primary)
             .await?;
-        let (secondary_accounts, secondary_weth_price) = self
-            .perform_aave_screen(&secondary, &request, &block, ProviderSlot::Secondary)
-            .await?;
         self.mark_provider_success(primary.provider_id()).await;
-        self.mark_provider_success(secondary.provider_id()).await;
         let response = AaveScreenResponse {
             schema_version: AAVE_SCREEN_RESPONSE_SCHEMA.to_string(),
             chain_id: ARBITRUM_ONE_CHAIN_ID,
@@ -910,11 +881,8 @@ impl GatewayRuntime {
                 weth_price_base: primary_weth_price,
                 accounts: primary_accounts,
             },
-            secondary: AaveProviderScreen {
-                provider_id: secondary.provider_id().to_string(),
-                weth_price_base: secondary_weth_price,
-                accounts: secondary_accounts,
-            },
+            confirmation: None,
+            quorum: 1,
             resolved_at_unix_ms: unix_time_ms(),
         };
         response
@@ -925,7 +893,7 @@ impl GatewayRuntime {
 
     /// Returns bounded discovery data from the highest-priority healthy
     /// provider only.  This endpoint has no execution authority: callers must
-    /// obtain a fresh dual-provider Aave Exact result before a candidate can be
+    /// obtain a fresh single-primary Aave Exact result before a candidate can be
     /// persisted or submitted.
     pub async fn resolve_aave_primary_screen(
         &self,
@@ -939,7 +907,7 @@ impl GatewayRuntime {
         }
         let _operation_guard = self.upstream_operation_lock.lock().await;
         let primary = self
-            .reserve_provider(&HashSet::new())
+            .reserve_named_provider(AAVE_PRIMARY_PROVIDER_ID)
             .await
             .ok_or(GatewayError::ProviderUnavailable)?;
         let required_calls = self.provider_setup_call_count(primary.provider_id()).await + 2;
@@ -986,25 +954,15 @@ impl GatewayRuntime {
             return Err(GatewayError::RequestBudgetExhausted);
         }
         let _operation_guard = self.upstream_operation_lock.lock().await;
-        if self.provider_count().await < 2 {
-            return Err(GatewayError::ProviderUnavailable);
-        }
         let pacing_deadline = Instant::now() + MAX_STATE_RESOLUTION;
         let primary = self
-            .reserve_provider(&HashSet::new())
+            .reserve_named_provider(AAVE_PRIMARY_PROVIDER_ID)
             .await
             .ok_or(GatewayError::ProviderUnavailable)?;
         self.ensure_provider_verified_paced(&primary, pacing_deadline)
             .await
             .map_err(map_call_failure)?;
-        let secondary = self
-            .reserve_provider(&HashSet::from([primary.provider_id().to_string()]))
-            .await
-            .ok_or(GatewayError::ProviderUnavailable)?;
-        self.ensure_provider_verified_paced(&secondary, pacing_deadline)
-            .await
-            .map_err(map_call_failure)?;
-        let primary_finalized = self
+        let finalized = self
             .provider_block_state_paced(
                 &primary,
                 "finalized",
@@ -1012,52 +970,9 @@ impl GatewayRuntime {
                 pacing_deadline,
             )
             .await?;
-        let secondary_finalized = self
-            .provider_block_state_paced(
-                &secondary,
-                "finalized",
-                ProviderSlot::Secondary,
-                pacing_deadline,
-            )
-            .await?;
-        let mut selected_primary = primary.clone();
-        let mut selected_secondary = secondary.clone();
-        let mut finalized = primary_finalized.clone();
-        if primary_finalized != secondary_finalized {
-            self.metrics.provider_disagreement();
-            let availability = self
-                .reserve_provider(&HashSet::from([
-                    primary.provider_id().to_string(),
-                    secondary.provider_id().to_string(),
-                ]))
-                .await
-                .ok_or(GatewayError::ProviderDisagreement)?;
-            self.ensure_provider_verified_paced(&availability, pacing_deadline)
-                .await
-                .map_err(map_call_failure)?;
-            let availability_finalized = self
-                .provider_block_state_paced(
-                    &availability,
-                    "finalized",
-                    ProviderSlot::Secondary,
-                    pacing_deadline,
-                )
-                .await?;
-            if availability_finalized == primary_finalized {
-                self.mark_provider_failure(secondary.provider_id()).await;
-                selected_secondary = availability;
-            } else if availability_finalized == secondary_finalized {
-                self.mark_provider_failure(primary.provider_id()).await;
-                selected_primary = secondary.clone();
-                selected_secondary = availability;
-                finalized = secondary_finalized;
-            } else {
-                return Err(GatewayError::ProviderDisagreement);
-            }
-        }
         let (primary_state, primary_root, primary_pending_context) = self
             .perform_aave_exact(
-                &selected_primary,
+                &primary,
                 &request,
                 &finalized.block,
                 &finalized.state_root,
@@ -1065,117 +980,24 @@ impl GatewayRuntime {
                 pacing_deadline,
             )
             .await?;
-        let (secondary_state, secondary_root, secondary_pending_context) = self
-            .perform_aave_exact(
-                &selected_secondary,
-                &request,
-                &finalized.block,
-                &finalized.state_root,
-                ProviderSlot::Secondary,
-                pacing_deadline,
-            )
-            .await?;
-        let mut selected_primary_state = primary_state;
-        let mut selected_primary_root = primary_root;
-        let mut selected_primary_pending_context = primary_pending_context;
-        let mut selected_secondary_state = secondary_state;
-        let mut selected_secondary_root = secondary_root;
-        let mut selected_secondary_pending_context = secondary_pending_context;
-        if selected_primary_root != selected_secondary_root
-            || !aave_exact_provider_states_equal(&selected_primary_state, &selected_secondary_state)
-        {
-            self.metrics.provider_disagreement();
-            if selected_primary.provider_id() != primary.provider_id()
-                || selected_secondary.provider_id() != secondary.provider_id()
-            {
-                return Err(GatewayError::ProviderDisagreement);
-            }
-            let availability = self
-                .reserve_provider(&HashSet::from([
-                    primary.provider_id().to_string(),
-                    secondary.provider_id().to_string(),
-                ]))
-                .await
-                .ok_or(GatewayError::ProviderDisagreement)?;
-            self.ensure_provider_verified_paced(&availability, pacing_deadline)
-                .await
-                .map_err(map_call_failure)?;
-            let availability_finalized = self
-                .provider_block_state_paced(
-                    &availability,
-                    "finalized",
-                    ProviderSlot::Secondary,
-                    pacing_deadline,
-                )
-                .await?;
-            if availability_finalized != finalized {
-                return Err(GatewayError::ProviderDisagreement);
-            }
-            let (availability_state, availability_root, availability_pending_context) = self
-                .perform_aave_exact(
-                    &availability,
-                    &request,
-                    &finalized.block,
-                    &finalized.state_root,
-                    ProviderSlot::Secondary,
-                    pacing_deadline,
-                )
-                .await?;
-            let availability_matches_primary = selected_primary_root == availability_root
-                && aave_exact_provider_states_equal(&selected_primary_state, &availability_state);
-            let availability_matches_secondary = selected_secondary_root == availability_root
-                && aave_exact_provider_states_equal(&selected_secondary_state, &availability_state);
-            if availability_matches_primary {
-                self.mark_provider_failure(secondary.provider_id()).await;
-                selected_secondary = availability;
-                selected_secondary_state = availability_state;
-                selected_secondary_root = availability_root;
-                selected_secondary_pending_context = availability_pending_context;
-            } else if availability_matches_secondary {
-                self.mark_provider_failure(primary.provider_id()).await;
-                selected_primary = secondary.clone();
-                selected_primary_state = selected_secondary_state;
-                selected_primary_root = selected_secondary_root;
-                selected_primary_pending_context = selected_secondary_pending_context;
-                selected_secondary = availability;
-                selected_secondary_state = availability_state;
-                selected_secondary_root = availability_root;
-                selected_secondary_pending_context = availability_pending_context;
-            } else {
-                return Err(GatewayError::ProviderDisagreement);
-            }
-        }
-        if selected_primary_root != selected_secondary_root {
-            return Err(GatewayError::ProviderDisagreement);
-        }
-        self.mark_provider_success(selected_primary.provider_id())
-            .await;
-        self.mark_provider_success(selected_secondary.provider_id())
-            .await;
+        self.mark_provider_success(primary.provider_id()).await;
         let response = AaveExactResponse {
             schema_version: AAVE_EXACT_RESPONSE_SCHEMA.to_string(),
             chain_id: ARBITRUM_ONE_CHAIN_ID,
             request_id: request.request_id.clone(),
             block_number: finalized.block.number,
             block_hash: finalized.block.hash,
-            state_root: selected_primary_root,
-            primary: selected_primary_state,
-            secondary: selected_secondary_state,
+            state_root: primary_root,
+            primary: primary_state,
+            confirmation: None,
+            quorum: 1,
             resolved_at_unix_ms: unix_time_ms(),
         };
         response
             .validate(&request)
             .map_err(|_| GatewayError::ProviderDisagreement)?;
         let now = Instant::now();
-        if let Some((key, context)) = selected_primary_pending_context {
-            self.aave_exact_static_context_cache.lock().await.insert(
-                key,
-                context,
-                AAVE_EXACT_STATIC_CONTEXT_TTL,
-                now,
-            );
-        }
-        if let Some((key, context)) = selected_secondary_pending_context {
+        if let Some((key, context)) = primary_pending_context {
             self.aave_exact_static_context_cache.lock().await.insert(
                 key,
                 context,
@@ -1197,24 +1019,16 @@ impl GatewayRuntime {
             return Err(GatewayError::RequestBudgetExhausted);
         }
         let _operation_guard = self.upstream_operation_lock.lock().await;
-        if self.provider_count().await < 2 {
-            return Err(GatewayError::ProviderUnavailable);
-        }
         let primary = self
-            .reserve_provider(&HashSet::new())
+            .reserve_named_provider(AAVE_PRIMARY_PROVIDER_ID)
             .await
             .ok_or(GatewayError::ProviderUnavailable)?;
         self.ensure_provider_verified(&primary)
             .await
             .map_err(map_call_failure)?;
-        let secondary = self
-            .reserve_provider(&HashSet::from([primary.provider_id().to_string()]))
-            .await
-            .ok_or(GatewayError::ProviderUnavailable)?;
-        self.ensure_provider_verified(&secondary)
-            .await
-            .map_err(map_call_failure)?;
-        let finalized = self.common_finalized_block(&primary, &secondary).await?;
+        let finalized = self
+            .provider_block(&primary, "finalized", ProviderSlot::Primary)
+            .await?;
         let (from_block, to_block, borrowers) = if request.from_block == 0
             || request.from_block == finalized.number.saturating_add(1)
         {
@@ -1236,17 +1050,6 @@ impl GatewayRuntime {
                     ProviderSlot::Primary,
                 )
                 .await?;
-            let secondary_logs = self
-                .aave_tail_logs(
-                    &secondary,
-                    request.from_block,
-                    to_block,
-                    ProviderSlot::Secondary,
-                )
-                .await?;
-            if primary_logs != secondary_logs {
-                return Err(GatewayError::ProviderDisagreement);
-            }
             let mut borrowers = primary_logs
                 .into_iter()
                 .map(|event| event.borrower)
@@ -1256,7 +1059,6 @@ impl GatewayRuntime {
             (request.from_block, to_block, borrowers)
         };
         self.mark_provider_success(primary.provider_id()).await;
-        self.mark_provider_success(secondary.provider_id()).await;
         let response = AaveTailResponse {
             schema_version: AAVE_TAIL_RESPONSE_SCHEMA.to_string(),
             chain_id: ARBITRUM_ONE_CHAIN_ID,
@@ -1267,7 +1069,8 @@ impl GatewayRuntime {
             to_block,
             next_block: to_block.saturating_add(1),
             primary_provider_id: primary.provider_id().to_string(),
-            secondary_provider_id: secondary.provider_id().to_string(),
+            confirmation_provider_id: None,
+            quorum: 1,
             borrowers,
             resolved_at_unix_ms: unix_time_ms(),
         };
@@ -1289,28 +1092,17 @@ impl GatewayRuntime {
             return Err(GatewayError::RequestBudgetExhausted);
         }
         let _operation_guard = self.upstream_operation_lock.lock().await;
-        if self.provider_count().await < 2 {
-            return Err(GatewayError::ProviderUnavailable);
-        }
         let expected_block = PinnedBlock {
             number: request.block_number,
             hash: request.block_hash.clone(),
         };
         let primary = self
-            .reserve_provider(&HashSet::new())
+            .reserve_named_provider(AAVE_PRIMARY_PROVIDER_ID)
             .await
             .ok_or(GatewayError::ProviderUnavailable)?;
         self.ensure_provider_verified(&primary)
             .await
             .map_err(map_call_failure)?;
-        let secondary = self
-            .reserve_provider(&HashSet::from([primary.provider_id().to_string()]))
-            .await
-            .ok_or(GatewayError::ProviderUnavailable)?;
-        self.ensure_provider_verified(&secondary)
-            .await
-            .map_err(map_call_failure)?;
-
         let route_id = aave_simulation_route_id(&request)?;
         let calldata = encode_aave_liquidation_call(&request, &route_id)?;
         let primary_evidence = self
@@ -1322,18 +1114,6 @@ impl GatewayRuntime {
                 ProviderSlot::Primary,
             )
             .await?;
-        let secondary_evidence = self
-            .perform_aave_simulation(
-                &secondary,
-                &request,
-                &expected_block,
-                &calldata,
-                ProviderSlot::Secondary,
-            )
-            .await?;
-        if primary_evidence != secondary_evidence {
-            return Err(GatewayError::ProviderDisagreement);
-        }
         let maximum_fee = decimal_u256(&request.max_fee_per_gas)?;
         let priority_fee = decimal_u256(&request.max_priority_fee_per_gas)?;
         let (
@@ -1362,7 +1142,6 @@ impl GatewayRuntime {
             decimal_u256(&request.atlas_bid)?,
         )?;
         self.mark_provider_success(primary.provider_id()).await;
-        self.mark_provider_success(secondary.provider_id()).await;
         let calldata_hex = format!("0x{}", hex::encode(&calldata));
         let calldata_hash = canonical_hash_bytes(&calldata);
         let simulation_result_hash = canonical_hash_bytes(
@@ -1379,7 +1158,7 @@ impl GatewayRuntime {
                 "flash_premium_wei": flash_premium.to_string(),
                 "atlas_mode": request.atlas_mode,
                 "atlas_bid": request.atlas_bid,
-                "providers": [primary.provider_id(), secondary.provider_id()]
+                "provider": primary.provider_id()
             }))
             .map_err(|_| GatewayError::ProviderIntegrity)?,
         );
@@ -1391,8 +1170,15 @@ impl GatewayRuntime {
             block_hash: request.block_hash.clone(),
             state_root: request.state_root.clone(),
             primary_provider_id: primary.provider_id().to_string(),
-            secondary_provider_id: secondary.provider_id().to_string(),
-            evidence_mode: "DUAL_PROVIDER_FORK_VERIFIED".to_string(),
+            confirmation_provider_id: None,
+            quorum: 1,
+            evidence_mode: if request.atlas_mode {
+                SINGLE_PRIMARY_ATLAS_CALLBACK_FORK_EVIDENCE.to_string()
+            } else if request.counterfactual {
+                SINGLE_PRIMARY_COUNTERFACTUAL_FORK_EVIDENCE.to_string()
+            } else {
+                SINGLE_PRIMARY_FORK_EVIDENCE.to_string()
+            },
             route_id,
             calldata_hex,
             calldata_hash,
@@ -1428,9 +1214,6 @@ impl GatewayRuntime {
             return Err(GatewayError::RequestBudgetExhausted);
         }
         let _operation_guard = self.upstream_operation_lock.lock().await;
-        if self.provider_count().await < 2 {
-            return Err(GatewayError::ProviderUnavailable);
-        }
         let first = &request.simulations[0];
         let remaining = first
             .deadline_unix_seconds
@@ -1444,33 +1227,17 @@ impl GatewayRuntime {
             hash: first.block_hash.clone(),
         };
         let primary = self
-            .reserve_provider(&HashSet::new())
+            .reserve_named_provider(AAVE_PRIMARY_PROVIDER_ID)
             .await
             .ok_or(GatewayError::ProviderUnavailable)?;
         self.ensure_provider_verified_paced(&primary, pacing_deadline)
             .await
             .map_err(map_call_failure)?;
-        let secondary = self
-            .reserve_provider(&HashSet::from([primary.provider_id().to_string()]))
-            .await
-            .ok_or(GatewayError::ProviderUnavailable)?;
-        self.ensure_provider_verified_paced(&secondary, pacing_deadline)
-            .await
-            .map_err(map_call_failure)?;
-
         self.verify_aave_simulation_pin(
             &primary,
             first,
             &expected_block,
             ProviderSlot::Primary,
-            pacing_deadline,
-        )
-        .await?;
-        self.verify_aave_simulation_pin(
-            &secondary,
-            first,
-            &expected_block,
-            ProviderSlot::Secondary,
             pacing_deadline,
         )
         .await?;
@@ -1483,29 +1250,14 @@ impl GatewayRuntime {
                 pacing_deadline,
             )
             .await?;
-        let (secondary_context, secondary_pending_key) = self
-            .aave_simulation_context(
-                &secondary,
-                first,
-                &expected_block,
-                ProviderSlot::Secondary,
-                pacing_deadline,
-            )
-            .await?;
-        if primary_context != secondary_context {
-            return Err(GatewayError::ProviderDisagreement);
-        }
-
         let mut results = Vec::with_capacity(request.simulations.len());
         for simulation in &request.simulations {
             let result = self
                 .simulate_aave_batch_item(
                     &primary,
-                    &secondary,
                     simulation,
                     &expected_block,
                     &primary_context,
-                    &secondary_context,
                     pacing_deadline,
                 )
                 .await;
@@ -1534,14 +1286,6 @@ impl GatewayRuntime {
             pacing_deadline,
         )
         .await?;
-        self.verify_aave_simulation_pin(
-            &secondary,
-            first,
-            &expected_block,
-            ProviderSlot::Secondary,
-            pacing_deadline,
-        )
-        .await?;
         let now = Instant::now();
         if let Some(key) = primary_pending_key {
             self.aave_simulation_context_cache.lock().await.insert(
@@ -1551,16 +1295,7 @@ impl GatewayRuntime {
                 now,
             );
         }
-        if let Some(key) = secondary_pending_key {
-            self.aave_simulation_context_cache.lock().await.insert(
-                key,
-                secondary_context,
-                AAVE_SIMULATION_CONTEXT_TTL,
-                now,
-            );
-        }
         self.mark_provider_success(primary.provider_id()).await;
-        self.mark_provider_success(secondary.provider_id()).await;
         let response = AaveSimulateBatchResponse {
             schema_version: AAVE_SIMULATE_BATCH_RESPONSE_SCHEMA.to_string(),
             chain_id: ARBITRUM_ONE_CHAIN_ID,
@@ -1569,8 +1304,15 @@ impl GatewayRuntime {
             block_hash: first.block_hash.clone(),
             state_root: first.state_root.clone(),
             primary_provider_id: primary.provider_id().to_string(),
-            secondary_provider_id: secondary.provider_id().to_string(),
-            evidence_mode: "DUAL_PROVIDER_FORK_VERIFIED".to_string(),
+            confirmation_provider_id: None,
+            quorum: 1,
+            evidence_mode: if first.atlas_mode {
+                SINGLE_PRIMARY_ATLAS_CALLBACK_FORK_EVIDENCE.to_string()
+            } else if first.counterfactual {
+                SINGLE_PRIMARY_COUNTERFACTUAL_FORK_EVIDENCE.to_string()
+            } else {
+                SINGLE_PRIMARY_FORK_EVIDENCE.to_string()
+            },
             results,
             resolved_at_unix_ms: unix_time_ms(),
         };
@@ -1584,11 +1326,9 @@ impl GatewayRuntime {
     async fn simulate_aave_batch_item(
         &self,
         primary: &ProviderLease,
-        secondary: &ProviderLease,
         request: &AaveSimulateRequest,
         block: &PinnedBlock,
         primary_context: &AaveSimulationContext,
-        secondary_context: &AaveSimulationContext,
         pacing_deadline: Instant,
     ) -> Result<AaveSimulateResponse, GatewayError> {
         let route_id = aave_simulation_route_id(request)?;
@@ -1604,45 +1344,13 @@ impl GatewayRuntime {
                 pacing_deadline,
             )
             .await?;
-        let secondary_evidence = self
-            .perform_aave_simulation_with_context(
-                secondary,
-                request,
-                block,
-                &calldata,
-                secondary_context,
-                ProviderSlot::Secondary,
-                pacing_deadline,
-            )
-            .await?;
-        if primary_evidence != secondary_evidence {
-            return Err(GatewayError::ProviderDisagreement);
-        }
         build_aave_simulation_response(
             request,
             &route_id,
             &calldata,
             primary.provider_id(),
-            secondary.provider_id(),
             primary_evidence,
         )
-    }
-
-    async fn common_finalized_block(
-        &self,
-        primary: &ProviderLease,
-        secondary: &ProviderLease,
-    ) -> Result<PinnedBlock, GatewayError> {
-        let primary_head = self
-            .provider_block(primary, "finalized", ProviderSlot::Primary)
-            .await?;
-        let secondary_head = self
-            .provider_block(secondary, "finalized", ProviderSlot::Secondary)
-            .await?;
-        if primary_head != secondary_head {
-            return Err(GatewayError::ProviderDisagreement);
-        }
-        Ok(primary_head)
     }
 
     async fn provider_block(
@@ -2694,7 +2402,7 @@ impl GatewayRuntime {
         // The exact finalized number and hash were already read and required to
         // agree independently before either pinned call. Re-reading that same
         // finalized block after each eth_call adds no identity evidence, while
-        // making the minimum dual-provider screen exceed the reviewed four-call
+        // making the minimum single-primary screen exceed the reviewed call
         // transport burst (two heads plus two Multicalls).
         Ok((accounts, weth_price))
     }
@@ -4357,7 +4065,6 @@ fn build_aave_simulation_response(
     route_id: &str,
     calldata: &[u8],
     primary_provider_id: &str,
-    secondary_provider_id: &str,
     evidence: AaveSimulationEvidence,
 ) -> Result<AaveSimulateResponse, GatewayError> {
     let maximum_fee = decimal_u256(&request.max_fee_per_gas)?;
@@ -4403,7 +4110,7 @@ fn build_aave_simulation_response(
             "flash_premium_wei": flash_premium.to_string(),
             "atlas_mode": request.atlas_mode,
             "atlas_bid": request.atlas_bid,
-            "providers": [primary_provider_id, secondary_provider_id]
+            "provider": primary_provider_id
         }))
         .map_err(|_| GatewayError::ProviderIntegrity)?,
     );
@@ -4415,11 +4122,14 @@ fn build_aave_simulation_response(
         block_hash: request.block_hash.clone(),
         state_root: request.state_root.clone(),
         primary_provider_id: primary_provider_id.to_string(),
-        secondary_provider_id: secondary_provider_id.to_string(),
-        evidence_mode: if request.counterfactual {
-            "DUAL_PROVIDER_COUNTERFACTUAL_FORK_VERIFIED".to_string()
+        confirmation_provider_id: None,
+        quorum: 1,
+        evidence_mode: if request.atlas_mode {
+            SINGLE_PRIMARY_ATLAS_CALLBACK_FORK_EVIDENCE.to_string()
+        } else if request.counterfactual {
+            SINGLE_PRIMARY_COUNTERFACTUAL_FORK_EVIDENCE.to_string()
         } else {
-            "DUAL_PROVIDER_FORK_VERIFIED".to_string()
+            SINGLE_PRIMARY_FORK_EVIDENCE.to_string()
         },
         route_id: route_id.to_string(),
         calldata_hex,
@@ -5735,7 +5445,7 @@ fn unix_time_seconds() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::providers::{parse_provider_config, parse_provider_config_with_ids};
+    use crate::providers::parse_provider_config;
     use crate::shadow_state::{PoolStateRequest, SHADOW_STATE_SCHEMA_VERSION};
     use async_trait::async_trait;
     use ethabi::{decode, encode, ParamType, Token};
@@ -5814,10 +5524,6 @@ mod tests {
 
         fn calls(&self) -> Vec<CallRecord> {
             self.calls.lock().unwrap().clone()
-        }
-
-        fn clear_calls(&self) {
-            self.calls.lock().unwrap().clear();
         }
 
         fn rate_limit_next_multicall(&self, provider_id: &str) {
@@ -6194,9 +5900,10 @@ mod tests {
     }
 
     fn runtime_with_limits(client: Arc<ModelClient>, limits: GatewayLimits) -> GatewayRuntime {
-        let config =
+        let mut config =
             parse_provider_config("https://primary.example,https://secondary.example", "2,1")
                 .unwrap();
+        config.providers[0].name = AAVE_PRIMARY_PROVIDER_ID.to_string();
         GatewayRuntime::with_limits(
             config,
             client,
@@ -6212,16 +5919,14 @@ mod tests {
     }
 
     async fn mark_test_providers_verified(runtime: &GatewayRuntime) {
-        runtime
-            .chain_verified
-            .lock()
-            .await
-            .extend(["provider_0".to_string(), "provider_1".to_string()]);
-        runtime
-            .multicall_verified
-            .lock()
-            .await
-            .extend(["provider_0".to_string(), "provider_1".to_string()]);
+        runtime.chain_verified.lock().await.extend([
+            AAVE_PRIMARY_PROVIDER_ID.to_string(),
+            "provider_1".to_string(),
+        ]);
+        runtime.multicall_verified.lock().await.extend([
+            AAVE_PRIMARY_PROVIDER_ID.to_string(),
+            "provider_1".to_string(),
+        ]);
     }
 
     fn aave_screen_request() -> AaveScreenRequest {
@@ -6291,32 +5996,36 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn aave_exact_static_context_same_state_hit_reduces_calls() {
-        let baseline_client = Arc::new(ModelClient::default());
-        let baseline_first_runtime = runtime(baseline_client.clone());
-        mark_test_providers_verified(&baseline_first_runtime).await;
-        let baseline_first = baseline_first_runtime
-            .resolve_aave_exact(aave_exact_request("baseline-first"))
-            .await
-            .unwrap();
-        let baseline_second_runtime = runtime(baseline_client.clone());
-        mark_test_providers_verified(&baseline_second_runtime).await;
-        let baseline_second = baseline_second_runtime
-            .resolve_aave_exact(aave_exact_request("baseline-second"))
-            .await
-            .unwrap();
-        assert_eq!(baseline_client.calls().len(), 28);
-        assert_ne!(
-            baseline_first.primary.provider_id,
-            baseline_first.secondary.provider_id
-        );
-        assert_ne!(
-            baseline_second.primary.provider_id,
-            baseline_second.secondary.provider_id
-        );
-
+    async fn aave_exact_uses_only_the_named_primary_and_reuses_static_context() {
         let client = Arc::new(ModelClient::default());
-        let runtime = runtime(client.clone());
+        let mut config = ProviderConfig {
+            providers: Vec::new(),
+        };
+        crate::providers::append_header_authenticated_provider(
+            &mut config,
+            AAVE_PRIMARY_PROVIDER_ID,
+            "https://primary.example",
+            100,
+            "api-key",
+            "test-only",
+        )
+        .unwrap();
+        let runtime = GatewayRuntime::with_limits(
+            config,
+            client.clone(),
+            MethodTimeouts {
+                eth_call: Duration::from_secs(2),
+                state_read: Duration::from_secs(2),
+                logs: Duration::from_secs(5),
+            },
+            RuntimeRpcMetrics::default(),
+            GatewayReadiness::new(true),
+            GatewayLimits {
+                state_requests_per_minute: 1_000,
+                upstream_calls_per_second: 1_000,
+                upstream_call_burst: 1_000,
+            },
+        );
         mark_test_providers_verified(&runtime).await;
 
         let first = runtime
@@ -6324,285 +6033,33 @@ mod tests {
             .await
             .unwrap();
         let cold_calls = client.calls();
-        assert_eq!(cold_calls.len(), 14);
         assert_eq!(
             runtime.aave_exact_static_context_cache.lock().await.len(),
-            2
+            1
         );
+        assert!(cold_calls
+            .iter()
+            .all(|call| call.provider_id == AAVE_PRIMARY_PROVIDER_ID));
+        assert_eq!(first.primary.provider_id, AAVE_PRIMARY_PROVIDER_ID);
+        assert_eq!(first.confirmation, None);
+        assert_eq!(first.quorum, 1);
 
         let second = runtime
             .resolve_aave_exact(aave_exact_request("warm"))
             .await
             .unwrap();
         let all_calls = client.calls();
-        assert_eq!(all_calls.len(), 20);
         let warm_calls = &all_calls[cold_calls.len()..];
-        assert_eq!(warm_calls.len(), 6);
-        assert_eq!(multicall_inner_counts(warm_calls), vec![16, 16]);
         assert!(warm_calls.iter().all(|call| !matches!(
             call.method,
             RpcMethod::EthGetCode | RpcMethod::EthGetStorageAt
         )));
+        assert!(all_calls
+            .iter()
+            .all(|call| call.provider_id == AAVE_PRIMARY_PROVIDER_ID));
         assert_eq!(first.block_number, second.block_number);
         assert_eq!(first.block_hash, second.block_hash);
         assert_eq!(first.state_root, second.state_root);
-        assert_ne!(second.primary.provider_id, second.secondary.provider_id);
-    }
-
-    #[tokio::test]
-    async fn aave_exact_uses_healthy_independent_availability_provider_when_preferred_peer_cools_down(
-    ) {
-        let client = Arc::new(ModelClient::default());
-        let config = parse_provider_config_with_ids(
-            "https://primary.example,https://preferred-confirmation.example,https://availability.example",
-            "100,2,1",
-            "production-nownodes-arbitrum,production-slot-0,availability-slot-1",
-        )
-        .unwrap();
-        let runtime = GatewayRuntime::with_limits(
-            config,
-            client.clone(),
-            MethodTimeouts {
-                eth_call: Duration::from_secs(2),
-                state_read: Duration::from_secs(2),
-                logs: Duration::from_secs(5),
-            },
-            RuntimeRpcMetrics::default(),
-            GatewayReadiness::new(true),
-            GatewayLimits {
-                state_requests_per_minute: 1_000,
-                upstream_calls_per_second: 1_000,
-                upstream_call_burst: 1_000,
-            },
-        );
-        runtime.chain_verified.lock().await.extend([
-            "production-nownodes-arbitrum".to_string(),
-            "production-slot-0".to_string(),
-            "availability-slot-1".to_string(),
-        ]);
-        runtime.multicall_verified.lock().await.extend([
-            "production-nownodes-arbitrum".to_string(),
-            "production-slot-0".to_string(),
-            "availability-slot-1".to_string(),
-        ]);
-        assert!(runtime
-            .providers
-            .lock()
-            .await
-            .record_failure("production-slot-0", Instant::now()));
-
-        let exact = runtime
-            .resolve_aave_exact(aave_exact_request("availability-fallback"))
-            .await
-            .unwrap();
-
-        assert_eq!(exact.primary.provider_id, "production-nownodes-arbitrum");
-        assert_eq!(exact.secondary.provider_id, "availability-slot-1");
-        assert_ne!(exact.primary.provider_id, exact.secondary.provider_id);
-        let providers = client
-            .calls()
-            .into_iter()
-            .map(|call| call.provider_id)
-            .collect::<HashSet<_>>();
-        assert_eq!(
-            providers,
-            HashSet::from([
-                "production-nownodes-arbitrum".to_string(),
-                "availability-slot-1".to_string(),
-            ])
-        );
-    }
-
-    #[tokio::test]
-    async fn aave_exact_uses_independent_availability_provider_to_resolve_preferred_disagreement() {
-        let client = Arc::new(ModelClient::default());
-        client.exact_disagreement.store(true, Ordering::Relaxed);
-        let config = parse_provider_config_with_ids(
-            "https://primary.example,https://preferred-confirmation.example,https://availability.example",
-            "100,2,1",
-            "production-nownodes-arbitrum,production-slot-0,availability-slot-1",
-        )
-        .unwrap();
-        let runtime = GatewayRuntime::with_limits(
-            config,
-            client.clone(),
-            MethodTimeouts {
-                eth_call: Duration::from_secs(2),
-                state_read: Duration::from_secs(2),
-                logs: Duration::from_secs(5),
-            },
-            RuntimeRpcMetrics::default(),
-            GatewayReadiness::new(true),
-            GatewayLimits {
-                state_requests_per_minute: 1_000,
-                upstream_calls_per_second: 1_000,
-                upstream_call_burst: 1_000,
-            },
-        );
-        mark_test_providers_verified(&runtime).await;
-
-        let exact = runtime
-            .resolve_aave_exact(aave_exact_request("semantic-fallback"))
-            .await
-            .unwrap();
-
-        assert_eq!(exact.primary.provider_id, "production-nownodes-arbitrum");
-        assert_eq!(exact.secondary.provider_id, "availability-slot-1");
-        assert_ne!(exact.primary.provider_id, exact.secondary.provider_id);
-        let providers = client
-            .calls()
-            .into_iter()
-            .map(|call| call.provider_id)
-            .collect::<HashSet<_>>();
-        assert_eq!(
-            providers,
-            HashSet::from([
-                "production-nownodes-arbitrum".to_string(),
-                "production-slot-0".to_string(),
-                "availability-slot-1".to_string(),
-            ])
-        );
-        let rendered = runtime.metrics().render(&runtime.readiness());
-        assert!(rendered.contains("rpc_provider_disagreement_total 1"));
-
-        client.exact_disagreement.store(false, Ordering::Relaxed);
-        client.clear_calls();
-        let retry = runtime
-            .resolve_aave_exact(aave_exact_request("semantic-fallback-retry"))
-            .await
-            .unwrap();
-        assert_eq!(retry.primary.provider_id, "production-nownodes-arbitrum");
-        assert_eq!(retry.secondary.provider_id, "availability-slot-1");
-        assert!(client
-            .calls()
-            .iter()
-            .all(|call| call.provider_id != "production-slot-0"));
-    }
-
-    #[tokio::test]
-    async fn aave_exact_uses_preferred_and_availability_when_primary_disagrees() {
-        let client = Arc::new(ModelClient::default());
-        client
-            .exact_primary_disagreement
-            .store(true, Ordering::Relaxed);
-        let config = parse_provider_config_with_ids(
-            "https://primary.example,https://preferred-confirmation.example,https://availability.example",
-            "100,2,1",
-            "production-nownodes-arbitrum,production-slot-0,availability-slot-1",
-        )
-        .unwrap();
-        let runtime = GatewayRuntime::with_limits(
-            config,
-            client.clone(),
-            MethodTimeouts {
-                eth_call: Duration::from_secs(2),
-                state_read: Duration::from_secs(2),
-                logs: Duration::from_secs(5),
-            },
-            RuntimeRpcMetrics::default(),
-            GatewayReadiness::new(true),
-            GatewayLimits {
-                state_requests_per_minute: 1_000,
-                upstream_calls_per_second: 1_000,
-                upstream_call_burst: 1_000,
-            },
-        );
-        mark_test_providers_verified(&runtime).await;
-
-        let exact = runtime
-            .resolve_aave_exact(aave_exact_request("primary-semantic-fallback"))
-            .await
-            .unwrap();
-
-        assert_eq!(exact.primary.provider_id, "production-slot-0");
-        assert_eq!(exact.secondary.provider_id, "availability-slot-1");
-        assert_ne!(exact.primary.provider_id, exact.secondary.provider_id);
-        assert_eq!(exact.primary.account, exact.secondary.account);
-        assert_eq!(exact.primary.reserves, exact.secondary.reserves);
-    }
-
-    #[tokio::test]
-    async fn aave_exact_resolves_finalized_head_disagreement_with_independent_availability() {
-        let client = Arc::new(ModelClient::default());
-        client.finalized_disagreement.store(true, Ordering::Relaxed);
-        let config = parse_provider_config_with_ids(
-            "https://primary.example,https://preferred-confirmation.example,https://availability.example",
-            "100,2,1",
-            "production-nownodes-arbitrum,production-slot-0,availability-slot-1",
-        )
-        .unwrap();
-        let runtime = GatewayRuntime::with_limits(
-            config,
-            client,
-            MethodTimeouts {
-                eth_call: Duration::from_secs(2),
-                state_read: Duration::from_secs(2),
-                logs: Duration::from_secs(5),
-            },
-            RuntimeRpcMetrics::default(),
-            GatewayReadiness::new(true),
-            GatewayLimits {
-                state_requests_per_minute: 1_000,
-                upstream_calls_per_second: 1_000,
-                upstream_call_burst: 1_000,
-            },
-        );
-        mark_test_providers_verified(&runtime).await;
-
-        let exact = runtime
-            .resolve_aave_exact(aave_exact_request("finalized-fallback"))
-            .await
-            .unwrap();
-
-        assert_eq!(exact.block_number, 100);
-        assert_eq!(exact.block_hash, BLOCK_HASH);
-        assert_eq!(exact.primary.provider_id, "production-nownodes-arbitrum");
-        assert_eq!(exact.secondary.provider_id, "availability-slot-1");
-        let rendered = runtime.metrics().render(&runtime.readiness());
-        assert!(rendered.contains("rpc_provider_disagreement_total 1"));
-    }
-
-    #[tokio::test]
-    async fn aave_exact_rejects_when_three_independent_providers_all_disagree() {
-        let client = Arc::new(ModelClient::default());
-        client.exact_disagreement.store(true, Ordering::Relaxed);
-        client
-            .exact_availability_disagreement
-            .store(true, Ordering::Relaxed);
-        let config = parse_provider_config_with_ids(
-            "https://primary.example,https://preferred-confirmation.example,https://availability.example",
-            "100,2,1",
-            "production-nownodes-arbitrum,production-slot-0,availability-slot-1",
-        )
-        .unwrap();
-        let runtime = GatewayRuntime::with_limits(
-            config,
-            client.clone(),
-            MethodTimeouts {
-                eth_call: Duration::from_secs(2),
-                state_read: Duration::from_secs(2),
-                logs: Duration::from_secs(5),
-            },
-            RuntimeRpcMetrics::default(),
-            GatewayReadiness::new(true),
-            GatewayLimits {
-                state_requests_per_minute: 1_000,
-                upstream_calls_per_second: 1_000,
-                upstream_call_burst: 1_000,
-            },
-        );
-        mark_test_providers_verified(&runtime).await;
-
-        assert_eq!(
-            runtime
-                .resolve_aave_exact(aave_exact_request("three-way-disagreement"))
-                .await,
-            Err(GatewayError::ProviderDisagreement)
-        );
-        assert_eq!(
-            runtime.aave_exact_static_context_cache.lock().await.len(),
-            0
-        );
     }
 
     #[tokio::test]
@@ -6629,13 +6086,13 @@ mod tests {
                 .unwrap();
             let all_calls = client.calls();
             let miss_calls = &all_calls[initial_call_count..];
-            assert_eq!(miss_calls.len(), 14, "identity={identity}");
+            assert_eq!(miss_calls.len(), 7, "identity={identity}");
             assert_eq!(
                 miss_calls
                     .iter()
                     .filter(|call| call.method == RpcMethod::EthGetCode)
                     .count(),
-                4,
+                2,
                 "identity={identity}"
             );
             assert_eq!(
@@ -6643,47 +6100,45 @@ mod tests {
                     .iter()
                     .filter(|call| call.method == RpcMethod::EthGetStorageAt)
                     .count(),
-                2,
+                1,
                 "identity={identity}"
             );
             assert_eq!(
                 multicall_inner_counts(miss_calls),
-                vec![1, 16, 1, 16],
+                vec![1, 16],
                 "identity={identity}"
             );
         }
     }
 
     #[tokio::test]
-    async fn aave_exact_static_context_disagreement_does_not_populate() {
+    async fn secondary_exact_disagreement_does_not_affect_single_primary_cache() {
         let client = Arc::new(ModelClient::default());
         let runtime = runtime(client.clone());
         mark_test_providers_verified(&runtime).await;
         client.exact_disagreement.store(true, Ordering::Relaxed);
 
-        assert_eq!(
-            runtime
-                .resolve_aave_exact(aave_exact_request("disagreed"))
-                .await,
-            Err(GatewayError::ProviderDisagreement)
-        );
-        assert!(runtime
-            .aave_exact_static_context_cache
-            .lock()
+        let response = runtime
+            .resolve_aave_exact(aave_exact_request("secondary-noise"))
             .await
-            .is_empty());
-        let failed_call_count = client.calls().len();
-
-        client.exact_disagreement.store(false, Ordering::Relaxed);
+            .unwrap();
+        assert_eq!(response.primary.provider_id, AAVE_PRIMARY_PROVIDER_ID);
+        assert_eq!(response.confirmation, None);
+        assert_eq!(response.quorum, 1);
+        assert_eq!(
+            runtime.aave_exact_static_context_cache.lock().await.len(),
+            1
+        );
+        let first_call_count = client.calls().len();
         runtime
             .resolve_aave_exact(aave_exact_request("retry"))
             .await
             .unwrap();
         let all_calls = client.calls();
-        assert_eq!(all_calls[failed_call_count..].len(), 14);
+        assert_eq!(all_calls[first_call_count..].len(), 3);
         assert_eq!(
             runtime.aave_exact_static_context_cache.lock().await.len(),
-            2
+            1
         );
     }
 
@@ -6717,20 +6172,20 @@ mod tests {
             .iter()
             .all(|result| result.response.is_some() && result.error.is_none()));
         let cold_calls = client.calls();
-        assert_eq!(cold_calls.len(), 48);
+        assert_eq!(cold_calls.len(), 24);
         assert_eq!(
             cold_calls
                 .iter()
                 .filter(|call| call.method == RpcMethod::EthGetBlockByNumber)
                 .count(),
-            4
+            2
         );
         assert_eq!(
             cold_calls
                 .iter()
                 .filter(|call| call.method == RpcMethod::EthGetStorageAt)
                 .count(),
-            4
+            2
         );
 
         let second = runtime
@@ -6743,13 +6198,13 @@ mod tests {
             .all(|result| result.response.is_some() && result.error.is_none()));
         let all_calls = client.calls();
         let warm_calls = &all_calls[cold_calls.len()..];
-        assert_eq!(warm_calls.len(), 36);
+        assert_eq!(warm_calls.len(), 18);
         assert_eq!(
             warm_calls
                 .iter()
                 .filter(|call| call.method == RpcMethod::EthGetBlockByNumber)
                 .count(),
-            4,
+            2,
             "a context-cache hit must still verify the pin before and after"
         );
         assert_eq!(
@@ -6807,32 +6262,32 @@ mod tests {
         assert_eq!(response.block_number, 100);
         assert_eq!(response.block_hash, BLOCK_HASH);
         let calls = client.calls();
-        assert_eq!(calls.len(), 4);
+        assert_eq!(calls.len(), 2);
         assert_eq!(
             calls
                 .iter()
                 .filter(|call| call.method == RpcMethod::EthGetBlockByNumber)
                 .count(),
-            2
+            1
         );
         assert_eq!(
             calls
                 .iter()
                 .filter(|call| call.method == RpcMethod::EthCall)
                 .count(),
-            2
+            1
         );
     }
 
     #[tokio::test]
-    async fn cold_aave_screen_atomically_admits_the_reviewed_eight_call_burst() {
+    async fn cold_single_primary_aave_screen_atomically_admits_four_calls() {
         let client = Arc::new(ModelClient::default());
         let runtime = runtime_with_limits(
             client.clone(),
             GatewayLimits {
                 state_requests_per_minute: 100,
                 upstream_calls_per_second: 1,
-                upstream_call_burst: 8,
+                upstream_call_burst: 4,
             },
         );
 
@@ -6844,34 +6299,34 @@ mod tests {
         assert_eq!(response.block_number, 100);
         assert_eq!(response.block_hash, BLOCK_HASH);
         let calls = client.calls();
-        assert_eq!(calls.len(), 8);
+        assert_eq!(calls.len(), 4);
         assert_eq!(
             calls
                 .iter()
                 .filter(|call| call.method == RpcMethod::EthChainId)
                 .count(),
-            2
+            1
         );
         assert_eq!(
             calls
                 .iter()
                 .filter(|call| call.method == RpcMethod::EthGetCode)
                 .count(),
-            2
+            1
         );
         assert_eq!(
             calls
                 .iter()
                 .filter(|call| call.method == RpcMethod::EthGetBlockByNumber)
                 .count(),
-            2
+            1
         );
         assert_eq!(
             calls
                 .iter()
                 .filter(|call| call.method == RpcMethod::EthCall)
                 .count(),
-            2
+            1
         );
     }
 
@@ -6883,7 +6338,7 @@ mod tests {
             GatewayLimits {
                 state_requests_per_minute: 100,
                 upstream_calls_per_second: 1,
-                upstream_call_burst: 7,
+                upstream_call_burst: 3,
             },
         );
 
@@ -6895,16 +6350,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn aave_screen_rejects_different_finalized_provider_heads() {
+    async fn secondary_finalized_head_noise_does_not_affect_single_primary_screen() {
         let client = Arc::new(ModelClient::default());
         client.finalized_disagreement.store(true, Ordering::Relaxed);
         let runtime = runtime(client);
         mark_test_providers_verified(&runtime).await;
 
-        assert_eq!(
-            runtime.resolve_aave_screen(aave_screen_request()).await,
-            Err(GatewayError::ProviderDisagreement)
-        );
+        let response = runtime
+            .resolve_aave_screen(aave_screen_request())
+            .await
+            .unwrap();
+        assert_eq!(response.primary.provider_id, AAVE_PRIMARY_PROVIDER_ID);
+        assert_eq!(response.confirmation, None);
+        assert_eq!(response.quorum, 1);
     }
 
     #[tokio::test]
@@ -7153,7 +6611,7 @@ mod tests {
     #[tokio::test]
     async fn http_429_cools_provider_and_fails_over_without_same_provider_retry() {
         let client = Arc::new(ModelClient::default());
-        client.rate_limit_next_multicall("provider_0");
+        client.rate_limit_next_multicall(AAVE_PRIMARY_PROVIDER_ID);
         let runtime = runtime(client.clone());
         let response = runtime.resolve_shadow_state(request()).await.unwrap();
         assert_eq!(response.primary_provider_id, "provider_1");
@@ -7162,7 +6620,8 @@ mod tests {
             calls
                 .iter()
                 .filter(|call| {
-                    call.provider_id == "provider_0" && call.method == RpcMethod::EthCall
+                    call.provider_id == AAVE_PRIMARY_PROVIDER_ID
+                        && call.method == RpcMethod::EthCall
                 })
                 .count(),
             1
@@ -7482,7 +6941,7 @@ mod tests {
     #[tokio::test]
     async fn source_inclusion_fails_over_as_one_bounded_provider_sequence() {
         let client = Arc::new(ModelClient::default());
-        client.fail_source_receipt_for("provider_0");
+        client.fail_source_receipt_for(AAVE_PRIMARY_PROVIDER_ID);
         let runtime = runtime(client.clone());
         let mut request = source_evidence_request_fixture();
         request.state_reconstruction_required = false;
@@ -7503,7 +6962,10 @@ mod tests {
             .filter(|call| call.method == RpcMethod::EthGetTransactionReceipt)
             .map(|call| call.provider_id)
             .collect::<Vec<_>>();
-        assert_eq!(receipt_providers, vec!["provider_0", "provider_1"]);
+        assert_eq!(
+            receipt_providers,
+            vec![AAVE_PRIMARY_PROVIDER_ID, "provider_1"]
+        );
     }
 
     #[test]

@@ -90,6 +90,12 @@ async fn nonce_allocation_and_pending_state_survive_restart() {
         .execute(&pool)
         .await
         .expect("apply revenue provider authority schema");
+    sqlx::raw_sql(include_str!(
+        "../schema/009_single_primary_provider_authority.sql"
+    ))
+    .execute(&pool)
+    .await
+    .expect("apply single-primary provider authority schema");
 
     let signer = TransactionSigner::from_secret(&hex::encode([13_u8; 32]), ARBITRUM_ONE_CHAIN_ID)
         .expect("signer");
@@ -581,9 +587,9 @@ async fn nonce_allocation_and_pending_state_survive_restart() {
         "UPDATE live_canary.revenue_provider_authority
          SET exact_execution_ready=true, gate_reason='fixture_exact_ready', gate_updated_at=now(),
              recovery_status='ready', sample_count=3,
-             sample_1_at=now()-interval '3 seconds', sample_1_primary_provider='primary-1', sample_1_confirmation_provider='confirmation-1',
-             sample_2_at=now()-interval '2 seconds', sample_2_primary_provider='primary-2', sample_2_confirmation_provider='confirmation-2',
-             sample_3_at=now()-interval '1 second', sample_3_primary_provider='primary-3', sample_3_confirmation_provider='confirmation-3'
+             sample_1_at=now()-interval '3 seconds', sample_1_primary_provider='production-nownodes-arbitrum', sample_1_confirmation_provider=NULL,
+             sample_2_at=now()-interval '2 seconds', sample_2_primary_provider='production-nownodes-arbitrum', sample_2_confirmation_provider=NULL,
+             sample_3_at=now()-interval '1 second', sample_3_primary_provider='production-nownodes-arbitrum', sample_3_confirmation_provider=NULL
          WHERE singleton",
     )
     .execute(&pool)
@@ -1130,6 +1136,8 @@ fn test_config(dsn: &str, wallet_address: CanonicalAddress) -> ExecutorConfig {
         postgres_dsn: dsn.to_string(),
         rpc_url: rpc_url.clone(),
         rpc_allowlist: vec![rpc_url],
+        rpc_header_name: "api-key".to_string(),
+        rpc_header_file: "/run/secrets/test-rpc-key".to_string(),
         wallet_address,
         executor_address: CanonicalAddress::parse("0x3333333333333333333333333333333333333333")
             .expect("executor"),

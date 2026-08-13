@@ -23,9 +23,6 @@ PHOENIX_FEED_FIXTURE=
 ARBITRUM_SEQUENCER_FEED_URL=wss://arb1-feed.arbitrum.io/feed
 ARBITRUM_RPC_URL=https://arbitrum.drpc.org
 PARENT_CHAIN_RPC_URL=https://eth.drpc.org
-RPC_PROVIDER_URLS=https://credential-bearing-rpc.example/private-token,https://arbitrum.drpc.org
-RPC_PROVIDER_WEIGHTS=4,3
-RPC_PROVIDER_IDS=production-slot-0,availability-slot-1
 RPC_UPSTREAM_CALLS_PER_SECOND=1
 RPC_UPSTREAM_CALL_BURST=4
 RPC_STATE_REQUESTS_PER_MINUTE=12
@@ -51,31 +48,6 @@ assert_redacted() {
 output=$("$validator" "$valid_env" 2>&1)
 assert_redacted "$output"
 printf '%s' "$output" | grep -q 'ENV_VALID'
-
-legacy_ids="$tmp_dir/legacy-provider-ids.env"
-sed '/^RPC_PROVIDER_IDS=/d' "$valid_env" >"$legacy_ids"
-output=$("$validator" "$legacy_ids" 2>&1)
-assert_redacted "$output"
-printf '%s' "$output" | grep -q 'ENV_VALID'
-
-duplicate_ids="$tmp_dir/duplicate-provider-ids.env"
-sed 's/RPC_PROVIDER_IDS=production-slot-0,availability-slot-1/RPC_PROVIDER_IDS=duplicate,duplicate/' \
-  "$valid_env" >"$duplicate_ids"
-if output=$("$validator" "$duplicate_ids" 2>&1); then
-  echo "expected duplicate RPC provider identities to fail"
-  exit 1
-fi
-assert_redacted "$output"
-printf '%s' "$output" | grep -q 'RPC provider identities must be unique'
-
-bad_rpc="$tmp_dir/bad-rpc.env"
-sed 's/RPC_PROVIDER_WEIGHTS=4,3/RPC_PROVIDER_WEIGHTS=4/' "$valid_env" >"$bad_rpc"
-if output=$("$validator" "$bad_rpc" 2>&1); then
-  echo "expected RPC provider/priority mismatch to fail"
-  exit 1
-fi
-assert_redacted "$output"
-printf '%s' "$output" | grep -q 'RPC_PROVIDER_URLS count must match RPC_PROVIDER_WEIGHTS count'
 
 bad_budget="$tmp_dir/bad-budget.env"
 sed 's/RPC_UPSTREAM_CALLS_PER_SECOND=1/RPC_UPSTREAM_CALLS_PER_SECOND=0/' "$valid_env" >"$bad_budget"
@@ -122,9 +94,7 @@ sed \
   "$valid_env" >"$live_env"
 cat >>"$live_env" <<'ENV'
 AUTONOMOUS_EXECUTION=true
-PRODUCTION_RPC_URL=https://credential-bearing-rpc.example/private-token
-SECONDARY_RPC_URL=https://arbitrum.drpc.org
-LIVE_EXECUTOR_RPC_ALLOWLIST=https://credential-bearing-rpc.example/private-token,https://arbitrum.drpc.org
+LIVE_EXECUTOR_RPC_ALLOWLIST=https://arbitrum.nownodes.io/
 LIVE_EXECUTOR_SIGNER_FILE=/run/secrets/phoenix-live-executor-signer
 LIVE_EXECUTOR_WALLET_ADDRESS=0x1111111111111111111111111111111111111111
 LIVE_EXECUTOR_EXECUTOR_ADDRESS=0x2222222222222222222222222222222222222222
@@ -135,7 +105,7 @@ LIVE_EXECUTOR_PNL_ASSET_ADDRESS=0x82af49447d8a07e3bd95bd0d56f35241523fbab1
 LIVE_EXECUTOR_MAX_GAS_LIMIT=500000
 LIVE_EXECUTOR_MAX_MAX_FEE_PER_GAS_WEI=10000000000
 LIVE_EXECUTOR_MAX_PRIORITY_FEE_PER_GAS_WEI=2000000000
-LIVE_EXECUTOR_MAX_INPUT_AMOUNT=100000000000000
+LIVE_EXECUTOR_MAX_INPUT_AMOUNT=10000000000000000
 LIVE_EXECUTOR_MAX_ATLAS_BID_WEI=1000000000000000
 LIVE_EXECUTOR_MIN_EXPECTED_PROFIT=1000000000000
 LIVE_EXECUTOR_MAX_DAILY_LOSS_WEI=10000000000000000
@@ -146,28 +116,16 @@ output=$("$validator" "$live_env" 2>&1)
 assert_redacted "$output"
 printf '%s' "$output" | grep -q 'required autonomous LIVE variables'
 
-too_many_live_providers="$tmp_dir/live-too-many-providers.env"
-sed \
-  -e 's#^RPC_PROVIDER_URLS=.*#RPC_PROVIDER_URLS=https://credential-bearing-rpc.example/private-token,https://secondary.invalid,https://third.invalid#' \
-  -e 's/^RPC_PROVIDER_WEIGHTS=4,3$/RPC_PROVIDER_WEIGHTS=4,3,1/' \
-  "$live_env" >"$too_many_live_providers"
-if output=$("$validator" "$too_many_live_providers" 2>&1); then
-  echo "expected more than two autonomous LIVE RPC providers to fail"
-  exit 1
-fi
-assert_redacted "$output"
-printf '%s' "$output" | grep -q 'autonomous LIVE requires exactly two RPC providers'
-
 bad_allowlist="$tmp_dir/live-bad-allowlist.env"
 sed \
-  's#LIVE_EXECUTOR_RPC_ALLOWLIST=.*#LIVE_EXECUTOR_RPC_ALLOWLIST=https://credential-bearing-rpc.example/private-token#' \
+  's#LIVE_EXECUTOR_RPC_ALLOWLIST=.*#LIVE_EXECUTOR_RPC_ALLOWLIST=https://secondary.invalid/#' \
   "$live_env" >"$bad_allowlist"
 if output=$("$validator" "$bad_allowlist" 2>&1); then
-  echo "expected incomplete autonomous RPC allowlist to fail"
+  echo "expected non-NOWNodes autonomous RPC allowlist to fail"
   exit 1
 fi
 assert_redacted "$output"
-printf '%s' "$output" | grep -q 'must contain SECONDARY_RPC_URL exactly'
+printf '%s' "$output" | grep -q 'must allowlist only the reviewed NOWNodes primary'
 
 zero_atlas_bid="$tmp_dir/live-zero-atlas-bid.env"
 sed \
