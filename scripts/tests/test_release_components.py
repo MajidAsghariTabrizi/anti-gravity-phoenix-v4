@@ -766,8 +766,8 @@ class ReleaseRoundTripTests(unittest.TestCase):
                         "LIVE_EXECUTOR_EXECUTOR_CODE_HASH": "0x" + "c" * 64,
                         "LIVE_EXECUTOR_EXPECTED_OWNER": "0x" + "d" * 40,
                         "LIVE_EXECUTOR_EXPECTED_FLASH_PROVIDER": "0x" + "e" * 40,
-                        "PRODUCTION_RPC_URL": "https://primary.invalid",
-                        "SECONDARY_RPC_URL": "https://secondary.invalid",
+                        "PRODUCTION_RPC_URL": "https://arbitrum.nownodes.io/",
+                        "LIVE_EXECUTOR_RPC_ALLOWLIST": "https://arbitrum.nownodes.io/",
                     },
                     "volumes": [
                         {
@@ -1011,6 +1011,48 @@ class ReleaseRoundTripTests(unittest.TestCase):
         self.assertEqual(rendered["mode"], "LIVE")
         self.assertTrue(rendered["live_execution"])
         self.assertTrue(rendered["autonomous_execution"])
+
+        rendered_live = self._rendered_compose(
+            release_values, route_raw, "DISARMED_EVIDENCE"
+        )
+        rendered_live["services"]["live-executor"]["environment"][
+            "SECONDARY_RPC_URL"
+        ] = "https://legacy-secondary.invalid/"
+        compose_path.write_text(json.dumps(rendered_live), encoding="utf-8")
+        with self.assertRaisesRegex(
+            production_context.ContextError,
+            "AUTONOMOUS_EXECUTOR_IDENTITY_MISMATCH",
+        ):
+            production_context.validate_render(
+                argparse.Namespace(
+                    **{
+                        **vars(disarmed_args),
+                        "env_file": str(live_operator),
+                        "expected_mode": "LIVE",
+                    }
+                )
+            )
+
+        rendered_live["services"]["live-executor"]["environment"].pop(
+            "SECONDARY_RPC_URL"
+        )
+        rendered_live["services"]["live-executor"]["environment"][
+            "LIVE_EXECUTOR_RPC_ALLOWLIST"
+        ] = "https://legacy-secondary.invalid/"
+        compose_path.write_text(json.dumps(rendered_live), encoding="utf-8")
+        with self.assertRaisesRegex(
+            production_context.ContextError,
+            "AUTONOMOUS_EXECUTOR_IDENTITY_MISMATCH",
+        ):
+            production_context.validate_render(
+                argparse.Namespace(
+                    **{
+                        **vars(disarmed_args),
+                        "env_file": str(live_operator),
+                        "expected_mode": "LIVE",
+                    }
+                )
+            )
 
     def test_release_only_manifest_inherits_every_schema_valid_image(self) -> None:
         rollback, _, rollback_manifest_path, rollback_provenance_path = (
