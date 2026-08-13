@@ -185,11 +185,36 @@ class ReleaseComponentRegistryTests(unittest.TestCase):
             [name for name in EXPECTED_IMAGES if name != "dashboard"],
         )
 
+    def test_generation_contraction_drops_only_the_non_target_image(self) -> None:
+        with mock.patch.dict(
+            release_components.__dict__,
+            {"RELEASE_IMAGES": PREVIOUS_IMAGES},
+        ):
+            resolved = release_components.resolve_protected_build_plan(
+                {
+                    "schema": "phoenix.change-impact.v1",
+                    "built_images": ["atlas-observer", "rpc-gateway"],
+                    "inherited_images": [
+                        name
+                        for name in EXPECTED_IMAGES
+                        if name not in {"atlas-observer", "rpc-gateway"}
+                    ],
+                },
+                PREVIOUS_IMAGES,
+            )
+        self.assertEqual(resolved["built_images"], ["rpc-gateway"])
+        self.assertEqual(
+            resolved["inherited_images"],
+            [name for name in PREVIOUS_IMAGES if name != "rpc-gateway"],
+        )
+
     def test_incomplete_or_overlapping_build_plan_fails_closed(self) -> None:
         for plan in (
             {
                 "built_images": [],
-                "inherited_images": list(PREVIOUS_IMAGES),
+                "inherited_images": [
+                    name for name in PREVIOUS_IMAGES if name != "dashboard"
+                ],
             },
             {
                 "built_images": ["atlas-observer"],

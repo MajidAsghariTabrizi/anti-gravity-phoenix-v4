@@ -423,12 +423,17 @@ def resolve_protected_build_plan(
     built = set(plan.get("built_images", []))
     inherited = set(plan.get("inherited_images", []))
     expected = set(RELEASE_IMAGES)
-    if built & inherited or built | inherited != expected:
+    if built & inherited:
         raise ReleaseComponentError("build plan does not cover the release image set")
+    generation_for_images(built | inherited)
     missing_from_base = expected - base
     resolved = dict(plan)
-    resolved["built_images"] = sorted(built | missing_from_base)
-    resolved["inherited_images"] = sorted(inherited & base)
+    resolved_built = (built & expected) | missing_from_base
+    resolved_inherited = inherited & base & expected
+    if resolved_built & resolved_inherited or resolved_built | resolved_inherited != expected:
+        raise ReleaseComponentError("build plan does not cover the release image set")
+    resolved["built_images"] = sorted(resolved_built)
+    resolved["inherited_images"] = sorted(resolved_inherited)
     return resolved
 
 
