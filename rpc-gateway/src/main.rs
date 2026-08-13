@@ -5,9 +5,7 @@ use rpc_gateway::aave_state::{
 use rpc_gateway::economic::MethodTimeouts;
 use rpc_gateway::hunter_state::{HunterStateRequest, HUNTER_STATE_REQUEST_SCHEMA};
 use rpc_gateway::metrics::RuntimeRpcMetrics;
-use rpc_gateway::providers::{
-    append_header_authenticated_provider, parse_provider_config_with_ids,
-};
+use rpc_gateway::providers::{append_header_authenticated_provider, ProviderConfig};
 use rpc_gateway::runtime::{GatewayError, GatewayLimits, GatewayRuntime};
 use rpc_gateway::runtime_state::GatewayReadiness;
 use rpc_gateway::shadow_state::{
@@ -41,28 +39,29 @@ struct Config {
 
 impl Config {
     fn from_env() -> Result<Self, &'static str> {
-        let urls = required_env("RPC_PROVIDER_URLS")?;
-        let priorities = required_env("RPC_PROVIDER_WEIGHTS")?;
-        let identities = required_env("RPC_PROVIDER_IDS")?;
-        let mut providers = parse_provider_config_with_ids(&urls, &priorities, &identities)
-            .map_err(|_| "invalid RPC provider configuration")?;
+        if required_env("RPC_AUTHORITY_MODE")? != "single_primary" {
+            return Err("RPC single-primary mode is required");
+        }
+        let identity = required_env("RPC_AUTH_PROVIDER_ID")?;
+        if identity != "production-nownodes-arbitrum" {
+            return Err("authenticated RPC primary identity is invalid");
+        }
+        let mut providers = ProviderConfig {
+            providers: Vec::new(),
+        };
         let authenticated_secret =
             read_header_secret(required_env("RPC_AUTH_PROVIDER_HEADER_FILE")?)?;
         append_header_authenticated_provider(
             &mut providers,
-            &required_env("RPC_AUTH_PROVIDER_ID")?,
+            &identity,
             &required_env("RPC_AUTH_PROVIDER_URL")?,
             positive_u32_from_env("RPC_AUTH_PROVIDER_PRIORITY", 100)?,
             &required_env("RPC_AUTH_PROVIDER_HEADER_NAME")?,
             &authenticated_secret,
         )
         .map_err(|_| "invalid authenticated RPC provider configuration")?;
-        if std::env::var("AUTONOMOUS_EXECUTION")
-            .map(|value| value.eq_ignore_ascii_case("true"))
-            .unwrap_or(false)
-            && providers.providers.len() < 2
-        {
-            return Err("autonomous execution requires two independent RPC providers");
+        if providers.providers.len() != 1 {
+            return Err("single-primary RPC configuration is invalid");
         }
         Ok(Self {
             address: std::env::var("RPC_GATEWAY_ADDR")

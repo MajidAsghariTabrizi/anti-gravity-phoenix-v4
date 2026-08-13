@@ -43,7 +43,7 @@ use uuid::Uuid;
 
 const POLICY: &str = include_str!("../../config/phoenix-route-policy-v1.json");
 const UNIVERSE: &str = include_str!("../../config/phoenix-route-universe-v1.json");
-const MIGRATIONS: [(&str, &str); 8] = [
+const MIGRATIONS: [(&str, &str); 9] = [
     (
         "phoenix.live-canary-schema.v1",
         include_str!("../schema/001_live_canary.sql"),
@@ -75,6 +75,10 @@ const MIGRATIONS: [(&str, &str); 8] = [
     (
         "phoenix.live-canary-schema.v8",
         include_str!("../schema/008_revenue_provider_authority.sql"),
+    ),
+    (
+        "phoenix.live-canary-schema.v9",
+        include_str!("../schema/009_single_primary_provider_authority.sql"),
     ),
 ];
 const ACTIVATE_ACK: &str = "ACTIVATE_READY_MIN_CANARY_42161";
@@ -226,29 +230,22 @@ async fn preflight() -> ControlResult<()> {
         .map_err(|_| "executor address is invalid")?;
     let primary_url =
         Url::parse(&required("PRODUCTION_RPC_URL")?).map_err(|_| "primary RPC URL is invalid")?;
-    let secondary_url =
-        Url::parse(&required("SECONDARY_RPC_URL")?).map_err(|_| "secondary RPC URL is invalid")?;
-    if primary_url == secondary_url {
-        return Err("primary and secondary RPC providers are not independent".into());
-    }
     let allowlist = required("LIVE_EXECUTOR_RPC_ALLOWLIST")?
         .split(',')
         .map(|value| Url::parse(value).map_err(|_| "RPC allowlist is invalid"))
         .collect::<Result<Vec<_>, _>>()?;
-    let primary = HttpExecutionRpc::new_production(primary_url, &allowlist)
-        .map_err(|_| "primary RPC is not allowlisted")?;
-    let secondary = HttpExecutionRpc::new_production(secondary_url, &allowlist)
-        .map_err(|_| "secondary RPC is not allowlisted")?;
+    let primary = HttpExecutionRpc::new_production_authenticated(
+        primary_url,
+        &allowlist,
+        &required("LIVE_EXECUTOR_RPC_HEADER_NAME")?,
+        &required("LIVE_EXECUTOR_RPC_HEADER_FILE")?,
+    )
+    .map_err(|_| "primary RPC is not allowlisted")?;
     if primary
         .chain_id()
         .await
         .map_err(|_| "primary chain identity is unavailable")?
         != 42_161
-        || secondary
-            .chain_id()
-            .await
-            .map_err(|_| "secondary chain identity is unavailable")?
-            != 42_161
     {
         return Err("RPC chain identity mismatch".into());
     }
@@ -484,7 +481,7 @@ async fn migrate(pool: &PgPool) -> Result<(), &'static str> {
         }
     }
     require_schema(pool).await?;
-    println!("AUTONOMOUS_MIGRATION_OK: phoenix.live-canary-schema.v8");
+    println!("AUTONOMOUS_MIGRATION_OK: phoenix.live-canary-schema.v9");
     Ok(())
 }
 
@@ -1709,6 +1706,37 @@ async fn hunter_readiness_payload() -> ControlResult<Value> {
     serde_json::from_slice(&bytes).map_err(|_| "Aave/Atlas hunter readiness is invalid".into())
 }
 
+async fn fail_close_provider_execution_gate(pool: &PgPool, reason: &str) -> ControlResult<()> {
+    let gate = sqlx::query(
+        "UPDATE live_canary.revenue_provider_authority
+         SET exact_execution_ready=false, gate_reason=$1, gate_updated_at=now(),
+             request_evidence_not_before=now(), recovery_status='collecting', sample_count=0,
+             sample_1_at=NULL, sample_1_primary_provider=NULL, sample_1_confirmation_provider=NULL,
+             sample_2_at=NULL, sample_2_primary_provider=NULL, sample_2_confirmation_provider=NULL,
+             sample_3_at=NULL, sample_3_primary_provider=NULL, sample_3_confirmation_provider=NULL,
+             updated_at=now()
+         WHERE singleton",
+    )
+    .bind(reason)
+    .execute(pool)
+    .await
+    .map_err(|_| "provider execution gate update failed")?;
+    if gate.rows_affected() != 1 {
+        return Err("provider execution gate is unavailable".into());
+    }
+    Ok(())
+}
+
+async fn hunter_readiness_or_fail_closed(pool: &PgPool) -> ControlResult<Value> {
+    match hunter_readiness_payload().await {
+        Ok(payload) => Ok(payload),
+        Err(error) => {
+            fail_close_provider_execution_gate(pool, "hunter_readiness_unavailable").await?;
+            Err(error)
+        }
+    }
+}
+
 async fn converge_revenue_provider_authority(pool: &PgPool) -> ControlResult<()> {
     let rows = sqlx::query(
         "SELECT lane, armed, kill_switch
@@ -1738,16 +1766,35 @@ async fn converge_revenue_provider_authority(pool: &PgPool) -> ControlResult<()>
         .collect::<ControlResult<Vec<_>>>()?;
     let both_closed = states.iter().all(|(armed, kill)| !armed && *kill);
     if both_closed {
-        let payload = hunter_readiness_payload().await?;
+        let payload = hunter_readiness_or_fail_closed(pool).await?;
         return attempt_provider_authority_recovery(pool, &payload).await;
     }
     let both_active = states.iter().all(|(armed, kill)| *armed && !kill);
     let reason = if both_active {
-        let payload = hunter_readiness_payload().await?;
+        let payload = hunter_readiness_or_fail_closed(pool).await?;
         let degraded_reason = payload
             .get("degraded_reason")
             .and_then(Value::as_str)
             .ok_or("Aave/Atlas degraded reason is invalid")?;
+        let exact_ready = payload
+            .get("exact_execution_readiness")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        if !exact_ready {
+            let gate_reason = if matches!(
+                degraded_reason,
+                "provider_disagreement"
+                    | "provider_unavailable"
+                    | "provider_timeout"
+                    | "provider_rate_limited"
+                    | "revenue_lane_authority_diverged"
+            ) {
+                degraded_reason
+            } else {
+                "exact_state_stale_or_incomplete"
+            };
+            fail_close_provider_execution_gate(pool, gate_reason).await?;
+        }
         if matches!(
             degraded_reason,
             "provider_disagreement"
@@ -1755,25 +1802,7 @@ async fn converge_revenue_provider_authority(pool: &PgPool) -> ControlResult<()>
                 | "provider_timeout"
                 | "provider_rate_limited"
                 | "revenue_lane_authority_diverged"
-        ) {
-            let gate = sqlx::query(
-                "UPDATE live_canary.revenue_provider_authority
-                 SET exact_execution_ready=false, gate_reason=$1, gate_updated_at=now(),
-                     request_evidence_not_before=now(),
-                     sample_count=0,
-                     sample_1_at=NULL, sample_1_primary_provider=NULL, sample_1_confirmation_provider=NULL,
-                     sample_2_at=NULL, sample_2_primary_provider=NULL, sample_2_confirmation_provider=NULL,
-                     sample_3_at=NULL, sample_3_primary_provider=NULL, sample_3_confirmation_provider=NULL,
-                     updated_at=now() WHERE singleton",
-            )
-            .bind(degraded_reason)
-            .execute(pool)
-            .await
-            .map_err(|_| "provider execution gate update failed")?;
-            if gate.rows_affected() != 1 {
-                return Err("provider execution gate is unavailable".into());
-            }
-        }
+        ) {}
         if degraded_reason == "revenue_lane_authority_diverged" {
             "revenue_lane_authority_diverged"
         } else if persistent_hunter_provider_failure(&payload, Utc::now().timestamp_millis())? {
@@ -1840,9 +1869,7 @@ async fn converge_revenue_provider_authority(pool: &PgPool) -> ControlResult<()>
     Ok(())
 }
 
-fn provider_recovery_samples(
-    payload: &Value,
-) -> ControlResult<Vec<(DateTime<Utc>, String, String)>> {
+fn provider_recovery_samples(payload: &Value) -> ControlResult<Vec<(DateTime<Utc>, String)>> {
     if payload.get("hunting_health").and_then(Value::as_bool) != Some(true)
         || payload
             .get("exact_execution_readiness")
@@ -1859,6 +1886,9 @@ fn provider_recovery_samples(
             .unwrap_or_default()
             > Utc::now().timestamp_millis()
         || payload.get("degraded_reason").and_then(Value::as_str) != Some("")
+        || payload.get("primary").and_then(Value::as_str) != Some("production-nownodes-arbitrum")
+        || !payload.get("confirmation").is_some_and(Value::is_null)
+        || payload.get("quorum").and_then(Value::as_u64) != Some(1)
     {
         return Err("provider recovery readiness is not green".into());
     }
@@ -1880,14 +1910,14 @@ fn provider_recovery_samples(
         let primary = value
             .get("primary_provider")
             .and_then(Value::as_str)
-            .filter(|value| !value.is_empty() && value.len() <= 64)
+            .filter(|value| *value == "production-nownodes-arbitrum")
             .ok_or("provider recovery primary identity is invalid")?;
-        let confirmation = value
-            .get("confirmation_provider")
-            .and_then(Value::as_str)
-            .filter(|value| !value.is_empty() && value.len() <= 64 && *value != primary)
-            .ok_or("provider recovery confirmation identity is invalid")?;
-        samples.push((observed, primary.to_string(), confirmation.to_string()));
+        if !value.get("confirmation").is_some_and(Value::is_null)
+            || value.get("quorum").and_then(Value::as_u64) != Some(1)
+        {
+            return Err("provider recovery single-primary evidence is invalid".into());
+        }
+        samples.push((observed, primary.to_string()));
     }
     if !(samples[0].0 < samples[1].0 && samples[1].0 < samples[2].0)
         || Utc::now().signed_duration_since(samples[2].0) > ChronoDuration::minutes(10)
@@ -1906,14 +1936,14 @@ struct ProviderRecoveryTransitionBinding {
     restore_phase: String,
     restore_size: String,
     durable_sample_count: i16,
-    durable_samples: Vec<(DateTime<Utc>, String, String)>,
+    durable_samples: Vec<(DateTime<Utc>, String)>,
 }
 
 fn validate_provider_recovery_transition_binding(
     previous: &EconomicState,
     release_sha: &str,
     binding: &ProviderRecoveryTransitionBinding,
-    samples: &[(DateTime<Utc>, String, String)],
+    samples: &[(DateTime<Utc>, String)],
 ) -> ControlResult<()> {
     if previous.phase != EconomicPhase::DisarmedFailure
         || previous.level != SizeLevel::MaxReviewed
@@ -1931,7 +1961,7 @@ fn validate_provider_recovery_transition_binding(
         || binding.restore_size != "MAX_REVIEWED"
         || binding.durable_sample_count != 3
         || binding.durable_samples != samples
-        || samples.iter().any(|(at, _, _)| *at <= binding.failure_at)
+        || samples.iter().any(|(at, _)| *at <= binding.failure_at)
     {
         return Err("provider recovery transition binding is invalid".into());
     }
@@ -2082,10 +2112,11 @@ async fn attempt_provider_authority_recovery_inner(
     let evidence_value = json!({
         "schema": "phoenix.revenue-provider-recovery.v1",
         "release_sha": release_sha,
-        "samples": samples.iter().map(|(at, primary, confirmation)| json!({
+        "samples": samples.iter().map(|(at, primary)| json!({
             "observed_at": at.to_rfc3339_opts(SecondsFormat::Micros, true),
             "primary_provider": primary,
-            "confirmation_provider": confirmation,
+            "confirmation": null,
+            "quorum": 1,
         })).collect::<Vec<_>>(),
         "maximum_input_amount": MAXIMUM_REVIEWED_INPUT_WEI.to_string(),
         "owner_state": owner_state,
@@ -2140,6 +2171,14 @@ async fn attempt_provider_authority_recovery_inner(
     let durable_samples = [1, 2, 3]
         .iter()
         .map(|index| {
+            let confirmation = recovery
+                .try_get::<Option<String>, _>(
+                    format!("sample_{index}_confirmation_provider").as_str(),
+                )
+                .map_err(|_| "provider recovery sample confirmation is invalid")?;
+            if confirmation.is_some() {
+                return Err("provider recovery sample confirmation is invalid".into());
+            }
             Ok((
                 recovery
                     .try_get::<DateTime<Utc>, _>(format!("sample_{index}_at").as_str())
@@ -2147,9 +2186,6 @@ async fn attempt_provider_authority_recovery_inner(
                 recovery
                     .try_get::<String, _>(format!("sample_{index}_primary_provider").as_str())
                     .map_err(|_| "provider recovery sample primary is invalid")?,
-                recovery
-                    .try_get::<String, _>(format!("sample_{index}_confirmation_provider").as_str())
-                    .map_err(|_| "provider recovery sample confirmation is invalid")?,
             ))
         })
         .collect::<ControlResult<Vec<_>>>()?;
@@ -2906,20 +2942,16 @@ WHERE legacy.singleton AND global.singleton
         ack_pending_bounded: nonnegative_u64(&controls, "stale")? == 0,
         stale_outbox_rows: nonnegative_u64(&controls, "stale")?,
         primary_rpc_healthy: true,
-        secondary_rpc_healthy: true,
-        rpc_providers_independent: true,
-        eligible_rpc_disagreements: nonnegative_u64(&controls, "rpc_disagreements")?,
         maximum_state_age_blocks: 0,
         maximum_quote_age_ms: candidate_age_ms,
         maximum_candidate_age_ms: candidate_age_ms,
         fork_attempts: 1,
         fork_passes: 1,
         prediction_error_bps: assessment.prediction_error_bps,
-        secondary_skips: 0,
         fork_skips: 0,
         execution_requests: nonnegative_u64(&controls, "execution_requests")?,
         active_attempts: nonnegative_u64(&controls, "active_attempts")?,
-        positive_independent_fork_candidates: 1,
+        positive_exact_candidates: 1,
     };
     if evidence.validate().is_err() {
         return Ok(None);
@@ -3438,11 +3470,16 @@ async fn wallet_gas_reserve() -> ControlResult<u128> {
         .split(',')
         .map(|value| Url::parse(value).map_err(|_| "RPC allowlist is invalid"))
         .collect::<Result<Vec<_>, _>>()?;
-    HttpExecutionRpc::new_production(url, &allowlist)
-        .map_err(|_| "primary RPC is not allowlisted")?
-        .wallet_balance(wallet)
-        .await
-        .map_err(|_| "wallet gas reserve is unavailable".into())
+    HttpExecutionRpc::new_production_authenticated(
+        url,
+        &allowlist,
+        &required("LIVE_EXECUTOR_RPC_HEADER_NAME")?,
+        &required("LIVE_EXECUTOR_RPC_HEADER_FILE")?,
+    )
+    .map_err(|_| "primary RPC is not allowlisted")?
+    .wallet_balance(wallet)
+    .await
+    .map_err(|_| "wallet gas reserve is unavailable".into())
 }
 
 fn nonnegative_milliseconds(duration: chrono::Duration) -> ControlResult<u64> {
@@ -3905,21 +3942,21 @@ fn validate_hunter_readiness(payload: &Value, now_millis: i64) -> ControlResult<
     let primary = payload
         .get("primary_provider_id")
         .and_then(Value::as_str)
-        .filter(|value| !value.is_empty())
-        .ok_or("dual-provider readiness evidence is invalid")?;
-    let secondary = payload
-        .get("secondary_provider_id")
-        .and_then(Value::as_str)
-        .filter(|value| !value.is_empty())
-        .ok_or("dual-provider readiness evidence is invalid")?;
-    if primary == secondary
+        .filter(|value| *value == "production-nownodes-arbitrum")
+        .ok_or("single-primary readiness evidence is invalid")?;
+    if payload.get("primary").and_then(Value::as_str) != Some(primary)
+        || !payload.get("confirmation").is_some_and(Value::is_null)
+        || !payload
+            .get("confirmation_provider_id")
+            .is_some_and(Value::is_null)
+        || payload.get("quorum").and_then(Value::as_u64) != Some(1)
         || payload
-            .get("last_dual_agreement_at")
+            .get("last_primary_exact_at")
             .and_then(Value::as_str)
             .filter(|value| !value.is_empty())
             .is_none()
     {
-        return Err("dual-provider readiness evidence is invalid".into());
+        return Err("single-primary readiness evidence is invalid".into());
     }
     Ok(())
 }
@@ -4454,10 +4491,8 @@ async fn status(pool: &PgPool) -> Result<(), &'static str> {
                 .try_get::<Option<String>, _>(format!("sample_{index}_primary_provider").as_str())
                 .ok()
                 .flatten(),
-            "confirmation_provider": provider_authority
-                .try_get::<Option<String>, _>(format!("sample_{index}_confirmation_provider").as_str())
-                .ok()
-                .flatten(),
+            "confirmation": null,
+            "quorum": 1,
         })
     };
     let provider_sample_count = provider_authority
@@ -4565,14 +4600,14 @@ async fn require_schema(pool: &PgPool) -> Result<(), &'static str> {
     let installed: bool = sqlx::query_scalar(
         "SELECT EXISTS(
              SELECT 1 FROM live_canary.schema_contract
-             WHERE version = 'phoenix.live-canary-schema.v8'
+             WHERE version = 'phoenix.live-canary-schema.v9'
          )",
     )
     .fetch_one(pool)
     .await
     .map_err(|_| "schema inspection failed")?;
     if !installed {
-        return Err("phoenix.live-canary-schema.v8 is not installed");
+        return Err("phoenix.live-canary-schema.v9 is not installed");
     }
     Ok(())
 }
@@ -5100,9 +5135,12 @@ mod tests {
             "provider_current_class_failure_streak": 0,
             "degraded_reason": "",
             "provider_circuit_open_until_unix_millis": 0,
-            "primary_provider_id": "primary",
-            "secondary_provider_id": "secondary",
-            "last_dual_agreement_at": "2026-08-10T00:00:00Z"
+            "primary": "production-nownodes-arbitrum",
+            "confirmation": null,
+            "quorum": 1,
+            "primary_provider_id": "production-nownodes-arbitrum",
+            "confirmation_provider_id": null,
+            "last_primary_exact_at": "2026-08-10T00:00:00Z"
         })
     }
 
@@ -5382,7 +5420,7 @@ mod tests {
     }
 
     #[test]
-    fn max_reviewed_operator_requires_fresh_exact_dual_provider_readiness() {
+    fn max_reviewed_operator_requires_fresh_exact_single_primary_readiness() {
         let now_millis = 1_800_000_000_000;
         let valid = hunter_readiness();
         assert!(validate_hunter_readiness(&valid, now_millis).is_ok());
@@ -5404,12 +5442,12 @@ mod tests {
         let mut recovering = valid.clone();
         recovering["provider_recovery_state"] = Value::String("recovering".to_string());
         assert!(validate_hunter_readiness(&recovering, now_millis).is_err());
-        let mut same_provider = valid.clone();
-        same_provider["secondary_provider_id"] = Value::String("primary".to_string());
-        assert!(validate_hunter_readiness(&same_provider, now_millis).is_err());
-        let mut no_agreement = valid;
-        no_agreement["last_dual_agreement_at"] = Value::Null;
-        assert!(validate_hunter_readiness(&no_agreement, now_millis).is_err());
+        let mut confirmation = valid.clone();
+        confirmation["confirmation_provider_id"] = Value::String("forbidden".to_string());
+        assert!(validate_hunter_readiness(&confirmation, now_millis).is_err());
+        let mut no_primary = valid;
+        no_primary["last_primary_exact_at"] = Value::Null;
+        assert!(validate_hunter_readiness(&no_primary, now_millis).is_err());
     }
 
     #[test]
@@ -5450,21 +5488,21 @@ mod tests {
     }
 
     #[test]
-    fn provider_recovery_requires_three_fresh_ordered_independent_samples() {
+    fn provider_recovery_requires_three_fresh_ordered_primary_samples() {
         let now = Utc::now();
         let mut payload = hunter_readiness();
         payload["degraded_reason"] = Value::String(String::new());
         payload["provider_recovery_state"] = Value::String("ready".to_string());
         payload["provider_circuit_open_until_unix_millis"] = json!(0);
         payload["provider_recovery_samples"] = json!([
-            {"observed_at": (now-ChronoDuration::seconds(3)).to_rfc3339(), "primary_provider":"primary", "confirmation_provider":"availability-slot-1"},
-            {"observed_at": (now-ChronoDuration::seconds(2)).to_rfc3339(), "primary_provider":"primary", "confirmation_provider":"availability-slot-1"},
-            {"observed_at": (now-ChronoDuration::seconds(1)).to_rfc3339(), "primary_provider":"primary", "confirmation_provider":"production-slot-0"}
+            {"observed_at": (now-ChronoDuration::seconds(3)).to_rfc3339(), "primary_provider":"production-nownodes-arbitrum", "confirmation":null, "quorum":1},
+            {"observed_at": (now-ChronoDuration::seconds(2)).to_rfc3339(), "primary_provider":"production-nownodes-arbitrum", "confirmation":null, "quorum":1},
+            {"observed_at": (now-ChronoDuration::seconds(1)).to_rfc3339(), "primary_provider":"production-nownodes-arbitrum", "confirmation":null, "quorum":1}
         ]);
         assert_eq!(provider_recovery_samples(&payload).unwrap().len(), 3);
 
-        payload["provider_recovery_samples"][2]["confirmation_provider"] =
-            Value::String("primary".to_string());
+        payload["provider_recovery_samples"][2]["confirmation"] =
+            Value::String("forbidden".to_string());
         assert!(provider_recovery_samples(&payload).is_err());
         payload["provider_recovery_samples"] = json!([]);
         assert!(provider_recovery_samples(&payload).is_err());
@@ -5472,7 +5510,7 @@ mod tests {
 
     fn valid_provider_recovery_binding(
         failure_at: DateTime<Utc>,
-        samples: &[(DateTime<Utc>, String, String)],
+        samples: &[(DateTime<Utc>, String)],
     ) -> (EconomicState, ProviderRecoveryTransitionBinding) {
         let mut previous = state(EconomicPhase::DisarmedFailure);
         previous.level = SizeLevel::MaxReviewed;
@@ -5498,8 +5536,7 @@ mod tests {
             .map(|offset| {
                 (
                     failure_at + ChronoDuration::seconds(offset),
-                    "primary".to_string(),
-                    "availability-slot-1".to_string(),
+                    "production-nownodes-arbitrum".to_string(),
                 )
             })
             .collect::<Vec<_>>();

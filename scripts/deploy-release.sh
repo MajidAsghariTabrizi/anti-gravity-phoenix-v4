@@ -241,8 +241,7 @@ assert_live_environment() {
 
 "$deploy_dir/validate-production-env.sh" "$env_file"
 reload_environment
-if [ -z "${PRODUCTION_RPC_URL:-}" ] || [ -z "${SECONDARY_RPC_URL:-}" ] ||
-  [ -z "${LIVE_EXECUTOR_RPC_ALLOWLIST:-}" ]
+if [ -z "${LIVE_EXECUTOR_RPC_ALLOWLIST:-}" ]
 then
   echo EXTERNAL_RPC_CREDENTIAL_REQUIRED
   exit 1
@@ -502,22 +501,7 @@ transition_mutable_protected() {
 }
 
 validate_live_rpc_inputs() {
-  python3 -I -B - \
-    "$RPC_PROVIDER_URLS" "$RPC_PROVIDER_WEIGHTS" \
-    "$PRODUCTION_RPC_URL" "$SECONDARY_RPC_URL" <<'PY'
-import sys
-
-urls = [item.strip() for item in sys.argv[1].split(",")]
-priorities = [item.strip() for item in sys.argv[2].split(",")]
-
-if urls != [sys.argv[3], sys.argv[4]] or len(set(urls)) != 2:
-    raise SystemExit(1)
-if len(priorities) != 2 or any(
-    not value.isdigit() or int(value) <= 0
-    for value in priorities
-):
-    raise SystemExit(1)
-PY
+  [ "$LIVE_EXECUTOR_RPC_ALLOWLIST" = "https://arbitrum.nownodes.io/" ]
 }
 
 production_environment_identity() {
@@ -535,8 +519,7 @@ production_environment_identity() {
 }
 
 validate_live_rpc_rendering() {
-  python3 -I -B - \
-    "$rendered_candidate" "$PRODUCTION_RPC_URL" "$SECONDARY_RPC_URL" <<'PY'
+  python3 -I -B - "$rendered_candidate" <<'PY'
 import json
 import sys
 from pathlib import Path
@@ -544,15 +527,21 @@ from pathlib import Path
 try:
     rendered = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
     environment = rendered["services"]["rpc-gateway"]["environment"]
-    urls = [item.strip() for item in environment["RPC_PROVIDER_URLS"].split(",")]
-    priorities = [
-        item.strip() for item in environment["RPC_PROVIDER_WEIGHTS"].split(",")
-    ]
+    live = rendered["services"]["live-executor"]["environment"]
 except (OSError, UnicodeError, json.JSONDecodeError, KeyError, TypeError, AttributeError):
     raise SystemExit(1)
-if urls != [sys.argv[2], sys.argv[3]] or len(set(urls)) != 2:
+expected = "https://arbitrum.nownodes.io/"
+if environment.get("RPC_AUTHORITY_MODE") != "single_primary":
     raise SystemExit(1)
-if len(priorities) != 2 or any(not value.isdigit() or int(value) <= 0 for value in priorities):
+if environment.get("RPC_AUTH_PROVIDER_ID") != "production-nownodes-arbitrum":
+    raise SystemExit(1)
+if environment.get("RPC_AUTH_PROVIDER_URL") != expected:
+    raise SystemExit(1)
+if "RPC_PROVIDER_URLS" in environment or "RPC_PROVIDER_WEIGHTS" in environment:
+    raise SystemExit(1)
+if live.get("LIVE_EXECUTOR_RPC_URL") != expected or live.get("LIVE_EXECUTOR_RPC_ALLOWLIST") != expected:
+    raise SystemExit(1)
+if "SECONDARY_RPC_URL" in live:
     raise SystemExit(1)
 PY
 }

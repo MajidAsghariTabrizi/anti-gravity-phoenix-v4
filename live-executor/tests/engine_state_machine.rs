@@ -454,6 +454,8 @@ fn harness(request_count: usize) -> Harness {
         postgres_dsn: "postgres://localhost/test".to_string(),
         rpc_url: Url::parse("https://rpc.example.invalid").expect("url"),
         rpc_allowlist: vec![Url::parse("https://rpc.example.invalid").expect("url")],
+        rpc_header_name: "api-key".to_string(),
+        rpc_header_file: "/run/secrets/test-rpc-key".to_string(),
         wallet_address: signer.address(),
         executor_address,
         executor_code_hash: "a".repeat(64),

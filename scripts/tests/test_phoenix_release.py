@@ -1756,8 +1756,9 @@ class BoundedTransportContinuationTests(unittest.TestCase):
         )
         self.assertIn("RPC_AUTH_PROVIDER_ID: production-nownodes-arbitrum", compose)
         self.assertIn("RPC_AUTH_PROVIDER_HEADER_NAME: api-key", compose)
-        self.assertIn('RPC_PROVIDER_WEIGHTS: "2,1"', compose)
-        self.assertNotIn("RPC_PROVIDER_WEIGHTS: ${RPC_PROVIDER_WEIGHTS", compose)
+        self.assertIn("RPC_AUTHORITY_MODE: single_primary", compose)
+        self.assertNotIn("RPC_PROVIDER_URLS:", compose)
+        self.assertNotIn("RPC_PROVIDER_WEIGHTS:", compose)
 
     def test_platform_installs_every_context_safety_dependency(self) -> None:
         context_installer = (
@@ -1804,6 +1805,10 @@ class BoundedTransportContinuationTests(unittest.TestCase):
         self.assertIn(
             'install_versioned_source \\\n'
             '  "live-executor/schema/008_revenue_provider_authority.sql"',
+            context_installer,
+        )
+        self.assertIn(
+            "live-executor/schema/009_single_primary_provider_authority.sql",
             context_installer,
         )
         self.assertNotIn("install_protected_file", context_installer)

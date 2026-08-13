@@ -35,8 +35,7 @@ EXECUTOR = "0x" + "1" * 40
 OWNER_TRANSACTION = "0x" + "2" * 64
 BLOCK_HASH = "0x" + "3" * 64
 PROVIDERS = [
-    "https://primary.example/rpc/private",
-    "https://secondary.example/rpc/private",
+    "https://arbitrum.nownodes.io/",
 ]
 ROOT = Path(__file__).resolve().parents[2]
 FAIL_CLOSED_CONTROLS = {
@@ -127,13 +126,9 @@ def valid_evidence():
 
 
 class ProviderEvidenceTests(unittest.TestCase):
-    def test_valid_two_provider_paused_reconciliation(self) -> None:
+    def test_valid_single_primary_paused_reconciliation(self) -> None:
         observed = provider_evidence()
-        self.assertEqual(len(observed), 2)
-        self.assertNotEqual(
-            observed[0]["provider_identity"],
-            observed[1]["provider_identity"],
-        )
+        self.assertEqual(len(observed), 1)
         self.assertTrue(observed[0]["paused"])
         self.assertEqual(observed[0]["chain_id"], "0xa4b1")
 
@@ -153,42 +148,25 @@ class ProviderEvidenceTests(unittest.TestCase):
         self.assertEqual(observed[0]["input_selector"], "0x16c38b3c")
         self.assertFalse(observed[0]["set_paused_value"])
 
-    def test_provider_disagreement_rejects(self) -> None:
-        def disagreeing(
-            url: str,
-            method: str,
-            params: list[object],
-        ) -> object:
-            value = rpc_result(url, method, params)
-            if (
-                url == PROVIDERS[1]
-                and method == "eth_getTransactionReceipt"
-            ):
-                value = dict(value)
-                value["blockHash"] = "0x" + "5" * 64
-            return value
-
+    def test_multiple_providers_reject(self) -> None:
         with self.assertRaisesRegex(
             ReconciliationError,
-            "CHAIN_EVIDENCE_PROVIDER_DISAGREEMENT",
+            "CHAIN_EVIDENCE_INPUT_INVALID",
         ):
             collect_provider_evidence(
-                PROVIDERS,
+                PROVIDERS + ["https://secondary.example/rpc"],
                 EXECUTOR,
                 OWNER_TRANSACTION,
-                call=disagreeing,
+                call=rpc_result,
             )
 
-    def test_block_receipts_fallback_preserves_provider_agreement(self) -> None:
+    def test_block_receipts_fallback_preserves_single_primary_evidence(self) -> None:
         def fallback(
             url: str,
             method: str,
             params: list[object],
         ) -> object:
-            if (
-                url == PROVIDERS[1]
-                and method == "eth_getTransactionReceipt"
-            ):
+            if method == "eth_getTransactionReceipt":
                 raise ReconciliationError(
                     "CHAIN_EVIDENCE_RPC_UNAVAILABLE"
                 )
@@ -202,15 +180,7 @@ class ProviderEvidenceTests(unittest.TestCase):
         )
         self.assertEqual(
             observed[0]["receipt_source"],
-            "eth_getTransactionReceipt",
-        )
-        self.assertEqual(
-            observed[1]["receipt_source"],
             "eth_getBlockReceipts",
-        )
-        self.assertEqual(
-            observed[0]["receipt_status"],
-            observed[1]["receipt_status"],
         )
 
     def test_paused_false_rejects(self) -> None:
@@ -345,7 +315,7 @@ class AppendOnlyEvidenceTests(unittest.TestCase):
         self.write()
         os.chmod(self.path, 0o600)
         value = copy.deepcopy(valid_evidence())
-        value["provider_agreement"] = False
+        value["provider_agreement"] = True
         self.path.write_text(str(value), encoding="utf-8")
         os.chmod(self.path, 0o400)
         with self.assertRaises(ReconciliationError):
@@ -607,9 +577,6 @@ class GatewayReconciliationTests(unittest.TestCase):
                     "scripts.phoenix_release.gateway._selected_environment",
                     return_value={
                         "LIVE_EXECUTOR_EXECUTOR_ADDRESS": EXECUTOR,
-                        "PRODUCTION_RPC_URL": PROVIDERS[0],
-                        "RPC_PROVIDER_URLS": ",".join(PROVIDERS),
-                        "SECONDARY_RPC_URL": PROVIDERS[1],
                     },
                 ),
                 patch(

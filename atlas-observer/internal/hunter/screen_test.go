@@ -230,7 +230,7 @@ func TestProviderFailureStreakCountsReopenedCircuitAndResetsOnRecovery(t *testin
 	screener.mu.Lock()
 	for sample := 0; sample < 3; sample++ {
 		now = now.Add(time.Second)
-		screener.recordProviderRecoveryLocked(now, "primary", "confirmation")
+		screener.recordProviderRecoveryLocked(now, primaryProviderID)
 	}
 	screener.mu.Unlock()
 	now = now.Add(time.Second)
@@ -359,11 +359,8 @@ func TestFailedNormalBatchIsRetriedOnceAfterCircuitCooldown(t *testing.T) {
 						WETHPriceBase: "300000000000",
 						Accounts:      []account{{Borrower: input.Borrowers[0], HealthFactorWAD: "1100000000000000000", TotalDebtBase: "1000000000000"}},
 					},
-					Secondary: providerScreen{
-						ProviderID:    "production-slot-0",
-						WETHPriceBase: "300000000000",
-						Accounts:      []account{{Borrower: input.Borrowers[0], HealthFactorWAD: "1100000000000000000", TotalDebtBase: "1000000000000"}},
-					},
+					Confirmation: nil,
+					Quorum:       1,
 				})
 			default:
 				t.Fatalf("unexpected screen call: %d", len(screenBatches))
@@ -374,13 +371,14 @@ func TestFailedNormalBatchIsRetriedOnceAfterCircuitCooldown(t *testing.T) {
 				t.Fatal(err)
 			}
 			_ = json.NewEncoder(writer).Encode(tailResponse{
-				SchemaVersion:        "phoenix.rpc.aave-tail-response.v1",
+				SchemaVersion:        "phoenix.rpc.aave-tail-response.v2",
 				ChainID:              42161,
 				RequestID:            input.RequestID,
 				FinalizedBlockNumber: 491300000,
 				FinalizedBlockHash:   "0x" + strings.Repeat("a", 64),
 				PrimaryProviderID:    "production-nownodes-arbitrum",
-				SecondaryProviderID:  "production-slot-0",
+				ConfirmationProvider: nil,
+				Quorum:               1,
 				FromBlock:            491300001,
 				ToBlock:              491300000,
 				NextBlock:            491300001,
@@ -412,7 +410,7 @@ func TestFailedNormalBatchIsRetriedOnceAfterCircuitCooldown(t *testing.T) {
 		t.Fatalf("failed batch was not preserved: %v", screenBatches)
 	}
 	state := screener.Snapshot()
-	if state.Cursor != 1 || state.ProviderCircuitOpenUntilUnixMillis != 0 {
+	if state.Cursor != 1 || state.ProviderCircuitOpenUntilUnixMillis == 0 || state.LastErrorClass != "provider_unavailable" {
 		t.Fatalf("circuit did not recover correctly after retry: %+v", state)
 	}
 	cooldownWaits := 0
@@ -980,11 +978,10 @@ func TestDivergentRevenueAuthorityDefersExactWithoutStoppingDiscovery(t *testing
 			BlockNumber:   491300000,
 			BlockHash:     "0x" + strings.Repeat("a", 64),
 			Primary: providerScreen{
-				ProviderID: "production-primary", WETHPriceBase: "300000000000", Accounts: []account{borrowerAccount},
+				ProviderID: primaryProviderID, WETHPriceBase: "300000000000", Accounts: []account{borrowerAccount},
 			},
-			Secondary: providerScreen{
-				ProviderID: "production-secondary", WETHPriceBase: "300000000000", Accounts: []account{borrowerAccount},
-			},
+			Confirmation: nil,
+			Quorum:       1,
 		})
 	}))
 	defer server.Close()
@@ -1062,7 +1059,7 @@ func TestCounterfactualPositivePersistsWithinExistingSchemaWithoutAuthority(t *t
 	}
 }
 
-func TestProviderRecoveryRequiresThreeAuthorityFreeAgreements(t *testing.T) {
+func TestProviderRecoveryRequiresThreeAuthorityFreePrimaryExactSamples(t *testing.T) {
 	directory := t.TempDir()
 	borrowerAccount := account{
 		Borrower:                    "0x1111111111111111111111111111111111111111",
@@ -1090,9 +1087,8 @@ func TestProviderRecoveryRequiresThreeAuthorityFreeAgreements(t *testing.T) {
 			Primary: providerScreen{
 				ProviderID: "production-nownodes-arbitrum", WETHPriceBase: "300000000000", Accounts: []account{borrowerAccount},
 			},
-			Secondary: providerScreen{
-				ProviderID: "production-slot-0", WETHPriceBase: "300000000000", Accounts: []account{borrowerAccount},
-			},
+			Confirmation: nil,
+			Quorum:       1,
 		})
 	}))
 	defer server.Close()
@@ -1121,11 +1117,11 @@ func TestProviderRecoveryRequiresThreeAuthorityFreeAgreements(t *testing.T) {
 	for sample := 1; sample <= 3; sample++ {
 		now := time.Now().UTC().Add(time.Duration(sample) * time.Second)
 		screener.mu.Lock()
-		screener.recordProviderRecoveryLocked(now, "production-nownodes-arbitrum", "production-slot-0")
-		screener.state.LastDualAgreementAt = &now
+		screener.recordProviderRecoveryLocked(now, primaryProviderID)
+		screener.state.LastPrimaryExactAt = &now
 		screener.mu.Unlock()
 		state := screener.Snapshot()
-		if len(state.ProviderRecoverySamples) != sample || state.LastDualAgreementAt == nil || state.ExactQueueCount != 0 {
+		if len(state.ProviderRecoverySamples) != sample || state.LastPrimaryExactAt == nil || state.ExactQueueCount != 0 {
 			t.Fatalf("recovery sample %d was not retained exactly: %+v", sample, state)
 		}
 		if sample < 3 && state.LastErrorClass == "" {
@@ -1134,7 +1130,7 @@ func TestProviderRecoveryRequiresThreeAuthorityFreeAgreements(t *testing.T) {
 	}
 	state := screener.Snapshot()
 	if state.LastErrorClass != "" {
-		t.Fatalf("three fresh agreements did not recover cleanly: %+v", state)
+		t.Fatalf("three fresh primary samples did not recover cleanly: %+v", state)
 	}
 	if state.Counts[providerRecoverySuccessTotalKey] != 1 || state.Counts[providerLastRecoveryAtMillisKey] == 0 || state.Counts[providerLastDegradedDurationKey] == 0 || state.Counts[providerDegradedSinceMillisKey] != 0 {
 		t.Fatalf("recovery evidence is incomplete: %+v", state.Counts)
@@ -1148,12 +1144,12 @@ func TestProviderRecoveryExpiredWindowRestartsAtOneSample(t *testing.T) {
 		Counts:         map[string]uint64{providerDegradedSinceMillisKey: uint64(now.Add(-10 * time.Minute).UnixMilli())},
 		LastErrorClass: "provider_unavailable",
 		ProviderRecoverySamples: []ProviderRecoverySample{
-			{ObservedAt: now.Add(-4 * time.Minute), PrimaryProvider: "primary", ConfirmationProvider: "confirmation"},
-			{ObservedAt: now.Add(-3 * time.Minute), PrimaryProvider: "primary", ConfirmationProvider: "confirmation"},
-			{ObservedAt: now.Add(-2*time.Minute - time.Second), PrimaryProvider: "primary", ConfirmationProvider: "confirmation"},
+			{ObservedAt: now.Add(-4 * time.Minute), PrimaryProvider: primaryProviderID, Quorum: 1},
+			{ObservedAt: now.Add(-3 * time.Minute), PrimaryProvider: primaryProviderID, Quorum: 1},
+			{ObservedAt: now.Add(-2*time.Minute - time.Second), PrimaryProvider: primaryProviderID, Quorum: 1},
 		},
 	}}
-	screener.recordProviderRecoveryLocked(now, "primary", "confirmation")
+	screener.recordProviderRecoveryLocked(now, primaryProviderID)
 	state := screener.Snapshot()
 	if len(state.ProviderRecoverySamples) != 1 || !state.ProviderRecoverySamples[0].ObservedAt.Equal(now) {
 		t.Fatalf("expired recovery window did not restart at one sample: %+v", state.ProviderRecoverySamples)
@@ -1184,8 +1180,9 @@ func TestExactProviderFailureBubblesToRecoveryBoundary(t *testing.T) {
 			_ = json.NewEncoder(writer).Encode(screenResponse{
 				SchemaVersion: ResponseSchema, ChainID: 42161, RequestID: input.RequestID,
 				BlockNumber: 491300000, BlockHash: "0x" + strings.Repeat("a", 64),
-				Primary:   providerScreen{ProviderID: "production-nownodes-arbitrum", WETHPriceBase: "300000000000", Accounts: []account{borrowerAccount}},
-				Secondary: providerScreen{ProviderID: "production-slot-0", WETHPriceBase: "300000000000", Accounts: []account{borrowerAccount}},
+				Primary:      providerScreen{ProviderID: primaryProviderID, WETHPriceBase: "300000000000", Accounts: []account{borrowerAccount}},
+				Confirmation: nil,
+				Quorum:       1,
 			})
 		case "/v1/aave/exact":
 			writer.WriteHeader(http.StatusBadGateway)
@@ -1255,12 +1252,13 @@ func TestSuccessfulEmptyTailPersistsProgressWithoutClearingDegradation(t *testin
 			t.Fatal(err)
 		}
 		_ = json.NewEncoder(writer).Encode(tailResponse{
-			SchemaVersion: "phoenix.rpc.aave-tail-response.v1",
+			SchemaVersion: "phoenix.rpc.aave-tail-response.v2",
 			ChainID:       42161, RequestID: input.RequestID,
 			FinalizedBlockNumber: 491218648,
 			FinalizedBlockHash:   "0x" + strings.Repeat("a", 64),
 			PrimaryProviderID:    "production-nownodes-arbitrum",
-			SecondaryProviderID:  "production-slot-0",
+			ConfirmationProvider: nil,
+			Quorum:               1,
 			FromBlock:            491218649, ToBlock: 491218648, NextBlock: 491218649,
 			Borrowers: []string{},
 		})
@@ -1604,9 +1602,9 @@ func TestEmptyTailPriorityWindowAlternatesTailWithHotWork(t *testing.T) {
 				t.Fatal(err)
 			}
 			_ = json.NewEncoder(writer).Encode(tailResponse{
-				SchemaVersion: "phoenix.rpc.aave-tail-response.v1", ChainID: 42161, RequestID: input.RequestID,
+				SchemaVersion: "phoenix.rpc.aave-tail-response.v2", ChainID: 42161, RequestID: input.RequestID,
 				FinalizedBlockNumber: input.FromBlock, FinalizedBlockHash: "0x" + strings.Repeat("a", 64),
-				PrimaryProviderID: "primary", SecondaryProviderID: "secondary",
+				PrimaryProviderID: primaryProviderID, ConfirmationProvider: nil, Quorum: 1,
 				FromBlock: input.FromBlock, ToBlock: input.FromBlock, NextBlock: input.FromBlock + 1,
 			})
 		case "/v1/aave/screen":
@@ -1619,8 +1617,9 @@ func TestEmptyTailPriorityWindowAlternatesTailWithHotWork(t *testing.T) {
 			_ = json.NewEncoder(writer).Encode(screenResponse{
 				SchemaVersion: ResponseSchema, ChainID: 42161, RequestID: input.RequestID,
 				BlockNumber: 100, BlockHash: "0x" + strings.Repeat("b", 64),
-				Primary:   providerScreen{ProviderID: "primary", WETHPriceBase: "100000000", Accounts: accounts},
-				Secondary: providerScreen{ProviderID: "secondary", WETHPriceBase: "100000000", Accounts: accounts},
+				Primary:      providerScreen{ProviderID: primaryProviderID, WETHPriceBase: "100000000", Accounts: accounts},
+				Confirmation: nil,
+				Quorum:       1,
 			})
 		default:
 			t.Fatalf("unexpected path: %s", request.URL.Path)
@@ -1662,9 +1661,9 @@ func TestTailBorrowerPreemptsTheOrdinaryHotBatch(t *testing.T) {
 			var input tailRequest
 			_ = json.NewDecoder(request.Body).Decode(&input)
 			_ = json.NewEncoder(writer).Encode(tailResponse{
-				SchemaVersion: "phoenix.rpc.aave-tail-response.v1", ChainID: 42161, RequestID: input.RequestID,
+				SchemaVersion: "phoenix.rpc.aave-tail-response.v2", ChainID: 42161, RequestID: input.RequestID,
 				FinalizedBlockNumber: 100, FinalizedBlockHash: "0x" + strings.Repeat("a", 64),
-				PrimaryProviderID: "primary", SecondaryProviderID: "secondary",
+				PrimaryProviderID: primaryProviderID, ConfirmationProvider: nil, Quorum: 1,
 				FromBlock: 100, ToBlock: 100, NextBlock: 101, Borrowers: []string{tailBorrower},
 			})
 		case "/v1/aave/screen":
@@ -1675,8 +1674,9 @@ func TestTailBorrowerPreemptsTheOrdinaryHotBatch(t *testing.T) {
 			_ = json.NewEncoder(writer).Encode(screenResponse{
 				SchemaVersion: ResponseSchema, ChainID: 42161, RequestID: input.RequestID,
 				BlockNumber: 100, BlockHash: "0x" + strings.Repeat("b", 64),
-				Primary:   providerScreen{ProviderID: "primary", WETHPriceBase: "100000000", Accounts: accounts},
-				Secondary: providerScreen{ProviderID: "secondary", WETHPriceBase: "100000000", Accounts: accounts},
+				Primary:      providerScreen{ProviderID: primaryProviderID, WETHPriceBase: "100000000", Accounts: accounts},
+				Confirmation: nil,
+				Quorum:       1,
 			})
 		default:
 			t.Fatalf("unexpected path: %s", request.URL.Path)
@@ -1793,11 +1793,8 @@ func TestRecentExactEvidenceDefersDuplicateBorrowerWithoutExactRPC(t *testing.T)
 					WETHPriceBase: "300000000000",
 					Accounts:      []account{borrowerAccount},
 				},
-				Secondary: providerScreen{
-					ProviderID:    "production-slot-0",
-					WETHPriceBase: "300000000000",
-					Accounts:      []account{borrowerAccount},
-				},
+				Confirmation: nil,
+				Quorum:       1,
 			})
 		case "/v1/aave/exact":
 			exactRequests++
@@ -1862,8 +1859,9 @@ func TestGlobalExactAdmissionDefersAnotherBorrowerButStillRefreshesHF(t *testing
 			_ = json.NewEncoder(writer).Encode(screenResponse{
 				SchemaVersion: ResponseSchema, ChainID: 42161, RequestID: input.RequestID,
 				BlockNumber: 491300001, BlockHash: "0x" + strings.Repeat("a", 64),
-				Primary:   providerScreen{ProviderID: "primary", WETHPriceBase: "300000000000", Accounts: []account{borrowerAccount}},
-				Secondary: providerScreen{ProviderID: "secondary", WETHPriceBase: "300000000000", Accounts: []account{borrowerAccount}},
+				Primary:      providerScreen{ProviderID: primaryProviderID, WETHPriceBase: "300000000000", Accounts: []account{borrowerAccount}},
+				Confirmation: nil,
+				Quorum:       1,
 			})
 		case "/v1/aave/exact":
 			exactRequests++
@@ -2172,13 +2170,11 @@ func TestCounterfactualPositiveSizeIsVisibleButCannotMaterializeAuthority(t *tes
 			if err := json.NewDecoder(request.Body).Decode(&input); err != nil {
 				t.Fatal(err)
 			}
-			primary := exactProvider{ProviderID: "primary", FlashPremiumBPS: 5, Liquidations: liquidations}
-			secondary := primary
-			secondary.ProviderID = "secondary"
+			primary := exactProvider{ProviderID: primaryProviderID, FlashPremiumBPS: 5, Liquidations: liquidations}
 			_ = json.NewEncoder(writer).Encode(exactResponse{
-				SchemaVersion: "phoenix.rpc.aave-exact-response.v3", ChainID: 42161, RequestID: input.RequestID,
+				SchemaVersion: "phoenix.rpc.aave-exact-response.v4", ChainID: 42161, RequestID: input.RequestID,
 				BlockNumber: uint64(99 + exactCalls), BlockHash: "0x" + strings.Repeat("a", 64), StateRoot: "0x" + strings.Repeat("b", 64),
-				Primary: primary, Secondary: secondary,
+				Primary: primary, Confirmation: nil, Quorum: 1,
 			})
 		case "/v1/aave/simulate-batch":
 			var input simulationBatchRequest
@@ -2252,13 +2248,11 @@ func TestReviewedFeeRoutesAreComparedAtOnePinAndSelectBestPostCostOutcome(t *tes
 			if err := json.NewDecoder(request.Body).Decode(&input); err != nil {
 				t.Fatal(err)
 			}
-			primary := exactProvider{ProviderID: "primary", FlashPremiumBPS: 5, Liquidations: []exactLiquidation{liquidation}}
-			secondary := primary
-			secondary.ProviderID = "secondary"
+			primary := exactProvider{ProviderID: primaryProviderID, FlashPremiumBPS: 5, Liquidations: []exactLiquidation{liquidation}}
 			_ = json.NewEncoder(writer).Encode(exactResponse{
-				SchemaVersion: "phoenix.rpc.aave-exact-response.v3", ChainID: 42161, RequestID: input.RequestID,
+				SchemaVersion: "phoenix.rpc.aave-exact-response.v4", ChainID: 42161, RequestID: input.RequestID,
 				BlockNumber: 100, BlockHash: "0x" + strings.Repeat("a", 64), StateRoot: "0x" + strings.Repeat("b", 64),
-				Primary: primary, Secondary: secondary,
+				Primary: primary, Confirmation: nil, Quorum: 1,
 			})
 		case "/v1/aave/simulate-batch":
 			simulationBatches++
@@ -2497,13 +2491,13 @@ func TestAaveExactSchedulerBoundedBeforeAfterModel(t *testing.T) {
 	t.Log(string(summary))
 }
 
-func TestAaveExactSchedulerHTTPPathIsBoundedAndDual(t *testing.T) {
+func TestAaveExactSchedulerHTTPPathIsBoundedAndSinglePrimary(t *testing.T) {
 	start := time.Date(2026, 8, 11, 0, 0, 0, 0, time.UTC)
 	now := start
 	high := "0x1111111111111111111111111111111111111111"
 	low := "0x2222222222222222222222222222222222222222"
 	exactStarts := map[string]int{}
-	exactDualProviderChecks := 0
+	exactPrimaryChecks := 0
 	lowFirstExactSeconds := -1
 
 	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
@@ -2533,8 +2527,9 @@ func TestAaveExactSchedulerHTTPPathIsBoundedAndDual(t *testing.T) {
 			_ = json.NewEncoder(writer).Encode(screenResponse{
 				SchemaVersion: schema, ChainID: 42161, RequestID: input.RequestID,
 				BlockNumber: 491300000, BlockHash: "0x" + strings.Repeat("a", 64),
-				Primary:   providerScreen{ProviderID: "production-nownodes-arbitrum", WETHPriceBase: "300000000000", Accounts: accounts},
-				Secondary: providerScreen{ProviderID: "production-slot-0", WETHPriceBase: "300000000000", Accounts: accounts},
+				Primary:      providerScreen{ProviderID: primaryProviderID, WETHPriceBase: "300000000000", Accounts: accounts},
+				Confirmation: nil,
+				Quorum:       1,
 			})
 		case "/v1/aave/exact":
 			var input exactRequest
@@ -2550,14 +2545,12 @@ func TestAaveExactSchedulerHTTPPathIsBoundedAndDual(t *testing.T) {
 				CurrentVariableDebt: "1000", UsageAsCollateralEnabled: true,
 			}
 			primary := exactProvider{ProviderID: "production-nownodes-arbitrum", Reserves: []exactReserve{reserve}, FlashPremiumBPS: 5}
-			secondary := primary
-			secondary.ProviderID = "production-slot-0"
-			exactDualProviderChecks += 2
+			exactPrimaryChecks++
 			_ = json.NewEncoder(writer).Encode(exactResponse{
-				SchemaVersion: "phoenix.rpc.aave-exact-response.v3", ChainID: 42161,
+				SchemaVersion: "phoenix.rpc.aave-exact-response.v4", ChainID: 42161,
 				RequestID: input.RequestID, BlockNumber: 491300000,
 				BlockHash: "0x" + strings.Repeat("b", 64), StateRoot: "0x" + strings.Repeat("c", 64),
-				Primary: primary, Secondary: secondary,
+				Primary: primary, Confirmation: nil, Quorum: 1,
 			})
 		default:
 			t.Fatalf("unexpected path: %s", request.URL.Path)
@@ -2591,8 +2584,8 @@ func TestAaveExactSchedulerHTTPPathIsBoundedAndDual(t *testing.T) {
 	if lowFirstExactSeconds != 10 || state.Counts[exactDeferredSchedulerKey] == 0 || state.Counts[exactDeferredCooldownKey] == 0 {
 		t.Fatalf("real scheduler path lost bounded fairness evidence: first=%d state=%+v", lowFirstExactSeconds, state.Counts)
 	}
-	if exactDualProviderChecks != 4 {
-		t.Fatalf("real Exact path weakened dual evidence: checks=%d", exactDualProviderChecks)
+	if exactPrimaryChecks != 2 {
+		t.Fatalf("real Exact path did not use exactly one primary per evaluation: checks=%d", exactPrimaryChecks)
 	}
 	for _, record := range sink.records {
 		if record.Authority || record.ExecutionCandidate != nil || record.AtlasCandidate != nil {
@@ -2602,8 +2595,8 @@ func TestAaveExactSchedulerHTTPPathIsBoundedAndDual(t *testing.T) {
 	if screener.hotBorrowers[low] != "900000000000000000" {
 		t.Fatalf("HF refresh stopped while Exact was deferred: %+v", screener.hotBorrowers)
 	}
-	t.Logf("actual_path exact_starts=2 scheduler_deferrals=%d cooldown_deferrals=%d low_first_exact_seconds=%d dual_checks=%d candidate_authority=0",
-		state.Counts[exactDeferredSchedulerKey], state.Counts[exactDeferredCooldownKey], lowFirstExactSeconds, exactDualProviderChecks)
+	t.Logf("actual_path exact_starts=2 scheduler_deferrals=%d cooldown_deferrals=%d low_first_exact_seconds=%d primary_checks=%d candidate_authority=0",
+		state.Counts[exactDeferredSchedulerKey], state.Counts[exactDeferredCooldownKey], lowFirstExactSeconds, exactPrimaryChecks)
 }
 
 func TestResolveExactContinuesPastFailedSizeAndBindsSelectedRepay(t *testing.T) {
@@ -2632,13 +2625,11 @@ func TestResolveExactContinuesPastFailedSizeAndBindsSelectedRepay(t *testing.T) 
 			if input.MaximumInputAmount != maximumReviewedInputWei {
 				t.Fatalf("exact maximum input=%s", input.MaximumInputAmount)
 			}
-			primary := exactProvider{ProviderID: "primary", FlashPremiumBPS: 5, Liquidations: liquidations}
-			secondary := primary
-			secondary.ProviderID = "secondary"
+			primary := exactProvider{ProviderID: primaryProviderID, FlashPremiumBPS: 5, Liquidations: liquidations}
 			_ = json.NewEncoder(writer).Encode(exactResponse{
-				SchemaVersion: "phoenix.rpc.aave-exact-response.v3", ChainID: 42161, RequestID: input.RequestID,
+				SchemaVersion: "phoenix.rpc.aave-exact-response.v4", ChainID: 42161, RequestID: input.RequestID,
 				BlockNumber: 100, BlockHash: "0x" + strings.Repeat("a", 64), StateRoot: "0x" + strings.Repeat("b", 64),
-				Primary: primary, Secondary: secondary,
+				Primary: primary, Confirmation: nil, Quorum: 1,
 			})
 		case "/v1/aave/simulate-batch":
 			simulationBatches++
@@ -2746,9 +2737,7 @@ func TestResolveExactRanksConvergedVariantsAndContinuesPastFinalFailure(t *testi
 			if err := json.NewDecoder(request.Body).Decode(&input); err != nil {
 				t.Fatal(err)
 			}
-			primary := exactProvider{ProviderID: "primary", FlashPremiumBPS: 5, Liquidations: liquidations}
-			secondary := primary
-			secondary.ProviderID = "secondary"
+			primary := exactProvider{ProviderID: primaryProviderID, FlashPremiumBPS: 5, Liquidations: liquidations}
 			blockNumber := uint64(100)
 			blockHash := "0x" + strings.Repeat("a", 64)
 			stateRoot := "0x" + strings.Repeat("b", 64)
@@ -2758,9 +2747,9 @@ func TestResolveExactRanksConvergedVariantsAndContinuesPastFinalFailure(t *testi
 				stateRoot = "0x" + strings.Repeat("f", 64)
 			}
 			_ = json.NewEncoder(writer).Encode(exactResponse{
-				SchemaVersion: "phoenix.rpc.aave-exact-response.v3", ChainID: 42161, RequestID: input.RequestID,
+				SchemaVersion: "phoenix.rpc.aave-exact-response.v4", ChainID: 42161, RequestID: input.RequestID,
 				BlockNumber: blockNumber, BlockHash: blockHash, StateRoot: stateRoot,
-				Primary: primary, Secondary: secondary,
+				Primary: primary, Confirmation: nil, Quorum: 1,
 			})
 		case "/v1/aave/simulate-batch":
 			simulationBatches++
@@ -2897,8 +2886,9 @@ func TestSnapshotDoesNotBlockWhileExactResolutionIsInFlight(t *testing.T) {
 			_ = json.NewEncoder(writer).Encode(screenResponse{
 				SchemaVersion: ResponseSchema, ChainID: 42161, RequestID: input.RequestID,
 				BlockNumber: 100, BlockHash: "0x" + strings.Repeat("a", 64),
-				Primary:   providerScreen{ProviderID: "primary", WETHPriceBase: "100000000", Accounts: accounts},
-				Secondary: providerScreen{ProviderID: "secondary", WETHPriceBase: "100000000", Accounts: accounts},
+				Primary:      providerScreen{ProviderID: primaryProviderID, WETHPriceBase: "100000000", Accounts: accounts},
+				Confirmation: nil,
+				Quorum:       1,
 			})
 		case "/v1/aave/exact":
 			var input exactRequest
@@ -2911,13 +2901,11 @@ func TestSnapshotDoesNotBlockWhileExactResolutionIsInFlight(t *testing.T) {
 			case <-request.Context().Done():
 				return
 			}
-			primary := exactProvider{ProviderID: "primary"}
-			secondary := primary
-			secondary.ProviderID = "secondary"
+			primary := exactProvider{ProviderID: primaryProviderID}
 			_ = json.NewEncoder(writer).Encode(exactResponse{
-				SchemaVersion: "phoenix.rpc.aave-exact-response.v3", ChainID: 42161, RequestID: input.RequestID,
+				SchemaVersion: "phoenix.rpc.aave-exact-response.v4", ChainID: 42161, RequestID: input.RequestID,
 				BlockNumber: 100, BlockHash: "0x" + strings.Repeat("a", 64), StateRoot: "0x" + strings.Repeat("b", 64),
-				Primary: primary, Secondary: secondary,
+				Primary: primary, Confirmation: nil, Quorum: 1,
 			})
 		default:
 			t.Fatalf("unexpected path: %s", request.URL.Path)
@@ -2977,13 +2965,11 @@ func TestResolveExactNoProfitableSizeProducesNoCandidate(t *testing.T) {
 		if err := json.NewDecoder(request.Body).Decode(&input); err != nil {
 			t.Fatal(err)
 		}
-		primary := exactProvider{ProviderID: "primary", FlashPremiumBPS: 5, Liquidations: []exactLiquidation{liquidation}}
-		secondary := primary
-		secondary.ProviderID = "secondary"
+		primary := exactProvider{ProviderID: primaryProviderID, FlashPremiumBPS: 5, Liquidations: []exactLiquidation{liquidation}}
 		_ = json.NewEncoder(writer).Encode(exactResponse{
-			SchemaVersion: "phoenix.rpc.aave-exact-response.v3", ChainID: 42161, RequestID: input.RequestID,
+			SchemaVersion: "phoenix.rpc.aave-exact-response.v4", ChainID: 42161, RequestID: input.RequestID,
 			BlockNumber: 100, BlockHash: "0x" + strings.Repeat("a", 64), StateRoot: "0x" + strings.Repeat("b", 64),
-			Primary: primary, Secondary: secondary,
+			Primary: primary, Confirmation: nil, Quorum: 1,
 		})
 	}))
 	defer server.Close()
@@ -3013,13 +2999,11 @@ func TestFreshExactQuoteChangeFailsClosedBeforeAuthority(t *testing.T) {
 			if exactCalls == 2 {
 				liquidation.LiquidatorCollateral = "1202"
 			}
-			primary := exactProvider{ProviderID: "primary", FlashPremiumBPS: 5, Liquidations: []exactLiquidation{liquidation}}
-			secondary := primary
-			secondary.ProviderID = "secondary"
+			primary := exactProvider{ProviderID: primaryProviderID, FlashPremiumBPS: 5, Liquidations: []exactLiquidation{liquidation}}
 			_ = json.NewEncoder(writer).Encode(exactResponse{
-				SchemaVersion: "phoenix.rpc.aave-exact-response.v3", ChainID: 42161, RequestID: input.RequestID,
+				SchemaVersion: "phoenix.rpc.aave-exact-response.v4", ChainID: 42161, RequestID: input.RequestID,
 				BlockNumber: uint64(100 + exactCalls - 1), BlockHash: "0x" + strings.Repeat(strconv.Itoa(exactCalls), 64), StateRoot: "0x" + strings.Repeat(strconv.Itoa(exactCalls+2), 64),
-				Primary: primary, Secondary: secondary,
+				Primary: primary, Confirmation: nil, Quorum: 1,
 			})
 		case "/v1/aave/simulate-batch":
 			simulationBatches++
@@ -3152,9 +3136,9 @@ func TestAtlasCandidateChargesBidAndMaximumSolverExposureOnce(t *testing.T) {
 		result := testSimulationResponse(input, "1000", "50", "20", "1")
 		result.EvidenceMode = atlasCallbackEvidenceMode
 		_ = json.NewEncoder(writer).Encode(simulationBatchResponse{
-			SchemaVersion: "phoenix.rpc.aave-simulate-batch-response.v2", ChainID: 42161, RequestID: batch.RequestID,
+			SchemaVersion: "phoenix.rpc.aave-simulate-batch-response.v3", ChainID: 42161, RequestID: batch.RequestID,
 			BlockNumber: input.BlockNumber, BlockHash: input.BlockHash, StateRoot: input.StateRoot,
-			PrimaryProviderID: "primary", SecondaryProviderID: "secondary", EvidenceMode: atlasCallbackEvidenceMode,
+			PrimaryProviderID: primaryProviderID, ConfirmationProviderID: nil, Quorum: 1, EvidenceMode: atlasCallbackEvidenceMode,
 			Results: []simulationBatchResult{{RequestID: input.RequestID, Response: result}},
 		})
 	}))
@@ -3225,13 +3209,11 @@ func TestAuctionWithDirectWrapperEvidencePersistsNoLaneArtifact(t *testing.T) {
 			if err := json.NewDecoder(request.Body).Decode(&input); err != nil {
 				t.Fatal(err)
 			}
-			primary := exactProvider{ProviderID: "primary", FlashPremiumBPS: 5, Liquidations: []exactLiquidation{liquidation}}
-			secondary := primary
-			secondary.ProviderID = "secondary"
+			primary := exactProvider{ProviderID: primaryProviderID, FlashPremiumBPS: 5, Liquidations: []exactLiquidation{liquidation}}
 			_ = json.NewEncoder(writer).Encode(exactResponse{
-				SchemaVersion: "phoenix.rpc.aave-exact-response.v3", ChainID: 42161, RequestID: input.RequestID,
+				SchemaVersion: "phoenix.rpc.aave-exact-response.v4", ChainID: 42161, RequestID: input.RequestID,
 				BlockNumber: 100, BlockHash: "0x" + strings.Repeat("a", 64), StateRoot: "0x" + strings.Repeat("b", 64),
-				Primary: primary, Secondary: secondary,
+				Primary: primary, Confirmation: nil, Quorum: 1,
 			})
 		case "/v1/aave/simulate-batch":
 			var input simulationBatchRequest
@@ -3317,9 +3299,9 @@ func testSimulationResponse(input simulationRequest, realizedText, costText, l1T
 	routeHash := sha256.Sum256([]byte("route|" + input.RepayAmount + "|" + input.MinimumProfit + "|" + input.AtlasBid))
 	resultHash := sha256.Sum256([]byte("result|" + input.RepayAmount + "|" + input.MinimumProfit + "|" + input.AtlasBid))
 	return &simulationResponse{
-		SchemaVersion: "phoenix.rpc.aave-simulate-response.v3", ChainID: 42161, RequestID: input.RequestID,
+		SchemaVersion: "phoenix.rpc.aave-simulate-response.v4", ChainID: 42161, RequestID: input.RequestID,
 		BlockNumber: input.BlockNumber, BlockHash: input.BlockHash, StateRoot: input.StateRoot,
-		PrimaryProviderID: "primary", SecondaryProviderID: "secondary", EvidenceMode: testEvidenceMode(input),
+		PrimaryProviderID: primaryProviderID, ConfirmationProviderID: nil, Quorum: 1, EvidenceMode: testEvidenceMode(input),
 		RouteID: "0x" + hex.EncodeToString(routeHash[:]), CalldataHex: "0x" + hex.EncodeToString(calldata),
 		CalldataHash: hex.EncodeToString(calldataHash[:]), SimulationResultHash: hex.EncodeToString(resultHash[:]),
 		RealizedProfit: realizedText, ConservativeNetPnL: conservative.String(), EstimatedGasLimit: estimatedGas.Uint64(),
@@ -3338,9 +3320,9 @@ func testEvidenceMode(input simulationRequest) string {
 func writeTestSimulationBatch(writer http.ResponseWriter, input simulationBatchRequest, results []simulationBatchResult) {
 	first := input.Simulations[0]
 	_ = json.NewEncoder(writer).Encode(simulationBatchResponse{
-		SchemaVersion: "phoenix.rpc.aave-simulate-batch-response.v2", ChainID: 42161, RequestID: input.RequestID,
+		SchemaVersion: "phoenix.rpc.aave-simulate-batch-response.v3", ChainID: 42161, RequestID: input.RequestID,
 		BlockNumber: first.BlockNumber, BlockHash: first.BlockHash, StateRoot: first.StateRoot,
-		PrimaryProviderID: "primary", SecondaryProviderID: "secondary", EvidenceMode: "DUAL_PROVIDER_FORK_VERIFIED",
+		PrimaryProviderID: primaryProviderID, ConfirmationProviderID: nil, Quorum: 1, EvidenceMode: directForkEvidenceMode,
 		Results: results,
 	})
 }
@@ -3466,12 +3448,10 @@ func TestStableDebtIsBorrowerScopedAndDoesNotAbortScreenBatch(t *testing.T) {
 				{Borrower: stableBorrower, TotalDebtBase: "100000000", HealthFactorWAD: "900000000000000000"},
 				{Borrower: otherBorrower, TotalDebtBase: "100000000", HealthFactorWAD: "900000000000000000"},
 			}
-			providers := providerScreen{ProviderID: "primary", WETHPriceBase: "100000000", Accounts: accounts}
-			secondary := providers
-			secondary.ProviderID = "secondary"
+			providers := providerScreen{ProviderID: primaryProviderID, WETHPriceBase: "100000000", Accounts: accounts}
 			_ = json.NewEncoder(writer).Encode(screenResponse{
 				SchemaVersion: ResponseSchema, ChainID: 42161, RequestID: input.RequestID,
-				BlockNumber: 100, BlockHash: "0x" + strings.Repeat("a", 64), Primary: providers, Secondary: secondary,
+				BlockNumber: 100, BlockHash: "0x" + strings.Repeat("a", 64), Primary: providers, Confirmation: nil, Quorum: 1,
 			})
 		case "/v1/aave/exact":
 			var input exactRequest
@@ -3485,16 +3465,14 @@ func TestStableDebtIsBorrowerScopedAndDoesNotAbortScreenBatch(t *testing.T) {
 				stable = "1"
 				variable = "10"
 			}
-			primary := exactProvider{ProviderID: "primary", Reserves: []exactReserve{
+			primary := exactProvider{ProviderID: primaryProviderID, Reserves: []exactReserve{
 				{Asset: wethAddress, CurrentATokenBalance: "0", CurrentStableDebt: stable, CurrentVariableDebt: variable},
 				{Asset: nativeUSDCAddress, CurrentATokenBalance: "1000", UsageAsCollateralEnabled: true},
 			}}
-			secondary := primary
-			secondary.ProviderID = "secondary"
 			_ = json.NewEncoder(writer).Encode(exactResponse{
-				SchemaVersion: "phoenix.rpc.aave-exact-response.v3", ChainID: 42161, RequestID: input.RequestID,
+				SchemaVersion: "phoenix.rpc.aave-exact-response.v4", ChainID: 42161, RequestID: input.RequestID,
 				BlockNumber: 100, BlockHash: "0x" + strings.Repeat("a", 64), StateRoot: "0x" + strings.Repeat("b", 64),
-				Primary: primary, Secondary: secondary,
+				Primary: primary, Confirmation: nil, Quorum: 1,
 			})
 		default:
 			t.Fatalf("unexpected path: %s", request.URL.Path)
@@ -3534,20 +3512,16 @@ func TestCollateralRouteIneligibilityExpiresAndSupportedExactClearsIt(t *testing
 				t.Fatal(err)
 			}
 			accounts := []account{{Borrower: borrower, TotalDebtBase: "100000000", HealthFactorWAD: "900000000000000000"}}
-			primary := providerScreen{ProviderID: "primary", WETHPriceBase: "100000000", Accounts: accounts}
-			secondary := primary
-			secondary.ProviderID = "secondary"
-			_ = json.NewEncoder(writer).Encode(screenResponse{SchemaVersion: ResponseSchema, ChainID: 42161, RequestID: input.RequestID, BlockNumber: 100, BlockHash: "0x" + strings.Repeat("a", 64), Primary: primary, Secondary: secondary})
+			primary := providerScreen{ProviderID: primaryProviderID, WETHPriceBase: "100000000", Accounts: accounts}
+			_ = json.NewEncoder(writer).Encode(screenResponse{SchemaVersion: ResponseSchema, ChainID: 42161, RequestID: input.RequestID, BlockNumber: 100, BlockHash: "0x" + strings.Repeat("a", 64), Primary: primary, Confirmation: nil, Quorum: 1})
 		case "/v1/aave/exact":
 			exactCalls++
 			var input exactRequest
 			if err := json.NewDecoder(request.Body).Decode(&input); err != nil {
 				t.Fatal(err)
 			}
-			primary := exactProvider{ProviderID: "primary", FlashPremiumBPS: 5, Liquidations: []exactLiquidation{liquidation}}
-			secondary := primary
-			secondary.ProviderID = "secondary"
-			_ = json.NewEncoder(writer).Encode(exactResponse{SchemaVersion: "phoenix.rpc.aave-exact-response.v3", ChainID: 42161, RequestID: input.RequestID, BlockNumber: 100, BlockHash: "0x" + strings.Repeat("a", 64), StateRoot: "0x" + strings.Repeat("b", 64), Primary: primary, Secondary: secondary})
+			primary := exactProvider{ProviderID: primaryProviderID, FlashPremiumBPS: 5, Liquidations: []exactLiquidation{liquidation}}
+			_ = json.NewEncoder(writer).Encode(exactResponse{SchemaVersion: "phoenix.rpc.aave-exact-response.v4", ChainID: 42161, RequestID: input.RequestID, BlockNumber: 100, BlockHash: "0x" + strings.Repeat("a", 64), StateRoot: "0x" + strings.Repeat("b", 64), Primary: primary, Confirmation: nil, Quorum: 1})
 		case "/v1/aave/simulate-batch":
 			var input simulationBatchRequest
 			if err := json.NewDecoder(request.Body).Decode(&input); err != nil {
@@ -3669,7 +3643,7 @@ func TestRouteIneligibleStatePersistsAndTailInvalidatesDurably(t *testing.T) {
 			t.Fatal(err)
 		}
 		_ = json.NewEncoder(writer).Encode(tailResponse{
-			SchemaVersion:        "phoenix.rpc.aave-tail-response.v1",
+			SchemaVersion:        "phoenix.rpc.aave-tail-response.v2",
 			ChainID:              42161,
 			RequestID:            input.RequestID,
 			FinalizedBlockNumber: 100,
@@ -3678,7 +3652,8 @@ func TestRouteIneligibleStatePersistsAndTailInvalidatesDurably(t *testing.T) {
 			ToBlock:              100,
 			NextBlock:            101,
 			PrimaryProviderID:    "production-nownodes-arbitrum",
-			SecondaryProviderID:  "production-slot-0",
+			ConfirmationProvider: nil,
+			Quorum:               1,
 			Borrowers:            []string{borrower},
 		})
 	}))
@@ -3753,21 +3728,20 @@ func TestRouteIneligibleStatePersistsAndTailInvalidatesDurably(t *testing.T) {
 			_ = json.NewEncoder(writer).Encode(screenResponse{
 				SchemaVersion: ResponseSchema, ChainID: 42161, RequestID: input.RequestID,
 				BlockNumber: screenBlock, BlockHash: "0x" + strings.Repeat("d", 64),
-				Primary:   providerScreen{ProviderID: "primary", WETHPriceBase: "300000000000", Accounts: []account{borrowerAccount}},
-				Secondary: providerScreen{ProviderID: "secondary", WETHPriceBase: "300000000000", Accounts: []account{borrowerAccount}},
+				Primary:      providerScreen{ProviderID: primaryProviderID, WETHPriceBase: "300000000000", Accounts: []account{borrowerAccount}},
+				Confirmation: nil,
+				Quorum:       1,
 			})
 		case "/v1/aave/exact":
 			exactRequests++
 			var input exactRequest
 			_ = json.NewDecoder(request.Body).Decode(&input)
-			primary := exactProvider{ProviderID: "primary"}
-			secondary := primary
-			secondary.ProviderID = "secondary"
+			primary := exactProvider{ProviderID: primaryProviderID}
 			_ = json.NewEncoder(writer).Encode(exactResponse{
-				SchemaVersion: "phoenix.rpc.aave-exact-response.v3", ChainID: 42161,
+				SchemaVersion: "phoenix.rpc.aave-exact-response.v4", ChainID: 42161,
 				RequestID: input.RequestID, BlockNumber: 99,
 				BlockHash: "0x" + strings.Repeat("e", 64), StateRoot: "0x" + strings.Repeat("f", 64),
-				Primary: primary, Secondary: secondary,
+				Primary: primary, Confirmation: nil, Quorum: 1,
 			})
 		default:
 			t.Fatalf("unexpected path: %s", request.URL.Path)

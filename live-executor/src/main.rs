@@ -57,8 +57,12 @@ async fn main() {
         );
         std::process::exit(1);
     }
-    let rpc = match HttpExecutionRpc::new_production(config.rpc_url.clone(), &config.rpc_allowlist)
-    {
+    let rpc = match HttpExecutionRpc::new_production_authenticated(
+        config.rpc_url.clone(),
+        &config.rpc_allowlist,
+        &config.rpc_header_name,
+        &config.rpc_header_file,
+    ) {
         Ok(rpc) => rpc,
         Err(_) => {
             let _ = store.disarm("rpc_allowlist_failure").await;

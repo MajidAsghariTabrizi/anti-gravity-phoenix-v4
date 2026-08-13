@@ -2,6 +2,7 @@ use crate::abi::RpcLog;
 use crate::model::{CanonicalAddress, ExecutionRequest, TransactionHash, ValidatedLeg};
 use crate::{ARBITRUM_AAVE_V3_POOL_ADDRESS, ARBITRUM_ATLAS_V1_6_4_ADDRESS, ARBITRUM_WETH_ADDRESS};
 use async_trait::async_trait;
+use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use reqwest::redirect::Policy;
 use reqwest::Client;
 use serde_json::{json, Value};
@@ -9,6 +10,7 @@ use sha2::{Digest, Sha256};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
+use std::{fs, path::Path};
 use thiserror::Error;
 use url::Url;
 
@@ -135,6 +137,46 @@ impl HttpExecutionRpc {
         Self::new(endpoint)
     }
 
+    pub fn new_production_authenticated(
+        endpoint: Url,
+        allowlist: &[Url],
+        header_name: &str,
+        header_file: &str,
+    ) -> Result<Self, RpcError> {
+        if endpoint.scheme() != "https"
+            || endpoint.host_str().is_none()
+            || endpoint.fragment().is_some()
+            || !endpoint.username().is_empty()
+            || endpoint.password().is_some()
+            || !allowlist.iter().any(|allowed| allowed == &endpoint)
+        {
+            return Err(RpcError::new(RpcErrorKind::Transport));
+        }
+        let path = Path::new(header_file);
+        let metadata =
+            fs::symlink_metadata(path).map_err(|_| RpcError::new(RpcErrorKind::Transport))?;
+        if !path.is_absolute()
+            || metadata.file_type().is_symlink()
+            || !metadata.is_file()
+            || metadata.len() > 4096
+        {
+            return Err(RpcError::new(RpcErrorKind::Transport));
+        }
+        let header_text =
+            fs::read_to_string(path).map_err(|_| RpcError::new(RpcErrorKind::Transport))?;
+        let header_text = header_text.trim();
+        let name = HeaderName::from_bytes(header_name.as_bytes())
+            .map_err(|_| RpcError::new(RpcErrorKind::Transport))?;
+        let value = HeaderValue::from_str(header_text)
+            .map_err(|_| RpcError::new(RpcErrorKind::Transport))?;
+        if header_text.is_empty() {
+            return Err(RpcError::new(RpcErrorKind::Transport));
+        }
+        let mut headers = HeaderMap::new();
+        headers.insert(name, value);
+        Self::new_with_headers(endpoint, headers)
+    }
+
     pub fn new_isolated_fork(endpoint: Url, marker: &str) -> Result<Self, RpcError> {
         let loopback = endpoint
             .host_str()
@@ -152,11 +194,16 @@ impl HttpExecutionRpc {
     }
 
     fn new(endpoint: Url) -> Result<Self, RpcError> {
+        Self::new_with_headers(endpoint, HeaderMap::new())
+    }
+
+    fn new_with_headers(endpoint: Url, headers: HeaderMap) -> Result<Self, RpcError> {
         let client = Client::builder()
             .timeout(Duration::from_secs(RPC_TIMEOUT_SECONDS))
             .https_only(endpoint.scheme() == "https")
             .redirect(Policy::none())
             .no_proxy()
+            .default_headers(headers)
             .build()
             .map_err(|_| RpcError::new(RpcErrorKind::Transport))?;
         Ok(Self {

@@ -30,6 +30,8 @@ const ENVIRONMENT_NAMES: &[&str] = &[
     "SIGNER_PRIVATE_KEY_FILE",
     "LIVE_EXECUTOR_RPC_URL",
     "LIVE_EXECUTOR_RPC_ALLOWLIST",
+    "LIVE_EXECUTOR_RPC_HEADER_NAME",
+    "LIVE_EXECUTOR_RPC_HEADER_FILE",
     "LIVE_EXECUTOR_MAX_GAS_LIMIT",
     "LIVE_EXECUTOR_MAX_MAX_FEE_PER_GAS_WEI",
     "LIVE_EXECUTOR_MAX_PRIORITY_FEE_PER_GAS_WEI",
@@ -63,6 +65,8 @@ pub struct ExecutorConfig {
     pub postgres_dsn: String,
     pub rpc_url: Url,
     pub rpc_allowlist: Vec<Url>,
+    pub rpc_header_name: String,
+    pub rpc_header_file: String,
     pub wallet_address: CanonicalAddress,
     pub executor_address: CanonicalAddress,
     pub executor_code_hash: String,
@@ -177,6 +181,11 @@ impl Bootstrap {
         {
             return Err(ConfigError::InvalidRpcUrl);
         }
+        let rpc_header_name = required(&values, "LIVE_EXECUTOR_RPC_HEADER_NAME")?.to_string();
+        let rpc_header_file = required(&values, "LIVE_EXECUTOR_RPC_HEADER_FILE")?.to_string();
+        if rpc_header_name != "api-key" || !Path::new(&rpc_header_file).is_absolute() {
+            return Err(ConfigError::InvalidRpcUrl);
+        }
 
         let maximum_gas_limit = positive_u64(&values, "LIVE_EXECUTOR_MAX_GAS_LIMIT")?;
         let maximum_max_fee_per_gas =
@@ -232,6 +241,8 @@ impl Bootstrap {
                 postgres_dsn,
                 rpc_url,
                 rpc_allowlist,
+                rpc_header_name,
+                rpc_header_file,
                 wallet_address,
                 executor_address,
                 executor_code_hash,
@@ -483,6 +494,17 @@ mod tests {
             (
                 "LIVE_EXECUTOR_RPC_ALLOWLIST".to_string(),
                 "https://rpc.example.invalid/path".to_string(),
+            ),
+            (
+                "LIVE_EXECUTOR_RPC_HEADER_NAME".to_string(),
+                "api-key".to_string(),
+            ),
+            (
+                "LIVE_EXECUTOR_RPC_HEADER_FILE".to_string(),
+                std::env::temp_dir()
+                    .join("phoenix-test-rpc-key")
+                    .to_string_lossy()
+                    .into_owned(),
             ),
             (
                 "LIVE_EXECUTOR_MAX_GAS_LIMIT".to_string(),

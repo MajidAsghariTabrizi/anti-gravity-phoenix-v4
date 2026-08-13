@@ -151,6 +151,7 @@ func bindFinancialCeilingFlags(flags *flag.FlagSet, maximumInputAmount, maximumA
 type atlasCandidateScreener interface {
 	HandleAtlasAuction(context.Context, *observer.LedgerRecord) error
 	RecordRetryableGatewayError(error) (bool, error)
+	FailClosedExactAuthority(string) error
 	Snapshot() hunter.State
 }
 
@@ -174,6 +175,9 @@ func runAtlasCandidateLoop(ctx context.Context, auctions <-chan *observer.Ledger
 				if retryable {
 					logger.Printf("Atlas candidate deferred error_class=%s exact_execution_ready=false", screener.Snapshot().LastErrorClass)
 					continue
+				}
+				if gateErr := screener.FailClosedExactAuthority("atlas_candidate_incomplete"); gateErr != nil {
+					return gateErr
 				}
 				return err
 			}
@@ -240,15 +244,17 @@ func evaluateLaneHealth(now time.Time, atlas observer.LedgerState, aave hunter.S
 	batchFresh := timestampFresh(now, aave.LastBatchAt)
 	tailFresh := timestampFresh(now, aave.LastTailAt)
 	attemptFresh := timestampFresh(now, aave.LastAttemptAt)
-	dualFresh := timestampFresh(now, aave.LastDualAgreementAt)
+	primaryFresh := timestampFresh(now, aave.LastPrimaryExactAt)
 	circuitOpen := aave.ProviderCircuitOpenUntilUnixMillis > 0 && aave.ProviderCircuitOpenUntilUnixMillis > now.UnixMilli()
 	serviceHealthy := aave.Cursor >= 1100
 	atlasHealthy := atlas.Connected && atlas.LastSubscriptionAt != nil && atlas.InvalidCount == 0 && !atlas.Completed
 	authorityDiverged := aave.LastErrorClass == "revenue_lane_authority_diverged"
 	huntingHealthy := serviceHealthy && atlasHealthy && (batchFresh || tailFresh || attemptFresh) && !authorityDiverged
-	exactReady := huntingHealthy && batchFresh && tailFresh && dualFresh && aave.LastErrorClass == "" && !circuitOpen &&
-		aave.LastBlockNumber > 0 && len(aave.LastBlockHash) == 66 && aave.LastProviderPrimary != "" &&
-		aave.LastProviderSecond != "" && aave.LastProviderPrimary != aave.LastProviderSecond
+	exactReady := huntingHealthy && batchFresh && tailFresh && primaryFresh &&
+		freshPrimaryRecoverySamples(now, aave.ProviderRecoverySamples) &&
+		aave.LastErrorClass == "" && !circuitOpen &&
+		aave.LastBlockNumber > 0 && len(aave.LastBlockHash) == 66 &&
+		aave.LastProviderPrimary == "production-nownodes-arbitrum"
 	reason := ""
 	recovery := "ready"
 	if aave.LastErrorClass != "" {
@@ -265,6 +271,20 @@ func evaluateLaneHealth(now time.Time, atlas observer.LedgerState, aave hunter.S
 		DegradedReason:      reason,
 		RecoveryState:       recovery,
 	}
+}
+
+func freshPrimaryRecoverySamples(now time.Time, samples []hunter.ProviderRecoverySample) bool {
+	if len(samples) != 3 {
+		return false
+	}
+	for index, sample := range samples {
+		if sample.PrimaryProvider != "production-nownodes-arbitrum" || sample.Confirmation != nil || sample.Quorum != 1 ||
+			!timestampFresh(now, &sample.ObservedAt) ||
+			(index > 0 && !sample.ObservedAt.After(samples[index-1].ObservedAt)) {
+			return false
+		}
+	}
+	return true
 }
 
 func timestampFresh(now time.Time, observed *time.Time) bool {
@@ -299,9 +319,16 @@ func healthPayload(health laneHealth, state hunter.State, atlasConnected bool) m
 		"aave_exact_budget_tokens_milli":          state.ExactBudgetTokensMilli,
 		"aave_exact_average_state_requests_milli": state.ExactAverageStateRequestsMilli,
 		"aave_active_fork_pending":                state.ActiveForkPendingCount,
+		"rpc_authority_mode":                      "single_primary",
+		"primary":                                 state.LastProviderPrimary,
+		"confirmation":                            nil,
+		"quorum":                                  1,
+		"primary_provider":                        state.LastProviderPrimary,
+		"confirmation_provider":                   nil,
+		"provider_quorum":                         1,
 		"primary_provider_id":                     state.LastProviderPrimary,
-		"secondary_provider_id":                   state.LastProviderSecond,
-		"last_dual_agreement_at":                  state.LastDualAgreementAt,
+		"confirmation_provider_id":                nil,
+		"last_primary_exact_at":                   state.LastPrimaryExactAt,
 		"last_recovery_attempt_at":                state.LastAttemptAt,
 		"provider_retryable_degradation_total":    state.Counts["provider_retryable_degradation_total"],
 		"provider_current_class_failure_streak":   state.Counts["provider_current_class_failure_streak"],
