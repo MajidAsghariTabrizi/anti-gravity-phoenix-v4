@@ -30,6 +30,13 @@ VALUES = {
 RELEASE_COMPATIBILITY_DEFAULTS = {
     "LIVE_EXECUTOR_MAX_ATLAS_BID_WEI": "1000000000000000",
 }
+# The Single-Primary release intentionally replaces the legacy multi-provider
+# allowlist.  Apply this one-way compatibility migration only during explicit
+# release-default materialization; ordinary mode transitions continue to
+# preserve the operator environment verbatim.
+RELEASE_COMPATIBILITY_REPLACEMENTS = {
+    "LIVE_EXECUTOR_RPC_ALLOWLIST": "https://arbitrum.nownodes.io/",
+}
 MATERIALIZE_DEFAULTS_ACTION = "materialize-release-defaults"
 
 
@@ -42,8 +49,16 @@ def update(path: Path, mode: str) -> None:
     raw = path.read_text(encoding="utf-8")
     if "\x00" in raw:
         raise ModeError("production environment content is invalid")
-    replacements = {} if mode == MATERIALIZE_DEFAULTS_ACTION else VALUES[mode]
-    managed_names = replacements.keys() | RELEASE_COMPATIBILITY_DEFAULTS.keys()
+    replacements = (
+        dict(RELEASE_COMPATIBILITY_REPLACEMENTS)
+        if mode == MATERIALIZE_DEFAULTS_ACTION
+        else VALUES[mode]
+    )
+    managed_names = (
+        replacements.keys()
+        | RELEASE_COMPATIBILITY_DEFAULTS.keys()
+        | RELEASE_COMPATIBILITY_REPLACEMENTS.keys()
+    )
     seen: set[str] = set()
     output: list[str] = []
     for line in raw.splitlines():
