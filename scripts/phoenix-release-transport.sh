@@ -32,6 +32,13 @@ case "$command_name:$#" in
     esac
     [ "${#2}" -eq 40 ] || deny
     ;;
+  enter-post-recovery-live-mode:3)
+    case "${2:-}" in
+      *[!0-9a-f]*|"") deny ;;
+    esac
+    [ "${#2}" -eq 40 ] || deny
+    [ "${3:-}" = enter-recovered-live-mode-42161 ] || deny
+    ;;
   *)
     deny
     ;;

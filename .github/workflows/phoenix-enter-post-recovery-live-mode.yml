@@ -1,0 +1,140 @@
+name: Phoenix Enter Post-Recovery LIVE Mode
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_sha:
+        description: Exact current protected-main and active Production release SHA
+        required: true
+        type: string
+      acknowledgement:
+        description: Explicit guarded LIVE-mode transition acknowledgement
+        required: true
+        type: string
+
+permissions:
+  actions: read
+  contents: read
+
+concurrency:
+  group: phoenix-production-release
+  cancel-in-progress: false
+
+jobs:
+  enter-live-mode:
+    name: enter-post-recovery-live-mode
+    if: ${{ vars.PHOENIX_AUTORELEASE_ENABLED == 'false' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    environment: production-live
+    steps:
+      - name: Checkout exact protected main
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          ref: ${{ inputs.release_sha }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Verify protected admission
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_SHA: ${{ inputs.release_sha }}
+          ACKNOWLEDGEMENT: ${{ inputs.acknowledgement }}
+        run: |
+          set -euo pipefail
+          [[ "$RELEASE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [ "$ACKNOWLEDGEMENT" = ENTER_RECOVERED_LIVE_MODE_42161 ]
+          current_main="$(
+            gh api "repos/${GITHUB_REPOSITORY}/git/ref/heads/main" \
+              --jq '.object.sha'
+          )"
+          [ "$RELEASE_SHA" = "$current_main" ]
+          [ "$(git rev-parse HEAD)" = "$RELEASE_SHA" ]
+          [ "$(
+            gh api "repos/${GITHUB_REPOSITORY}/actions/variables/PHOENIX_AUTORELEASE_ENABLED" \
+              --jq '.value'
+          )" = false ]
+          active_controllers="$(
+            gh api \
+              "repos/${GITHUB_REPOSITORY}/actions/workflows/phoenix-release-controller.yml/runs?per_page=100" \
+              --jq '[.workflow_runs[] | select(.status == "queued" or .status == "in_progress")] | length'
+          )"
+          [ "$active_controllers" -eq 0 ]
+
+      - name: Install restricted SSH identity
+        shell: bash
+        env:
+          PROD_SSH_PRIVATE_KEY: ${{ secrets.PROD_SSH_PRIVATE_KEY }}
+          PROD_KNOWN_HOSTS: ${{ secrets.PROD_KNOWN_HOSTS }}
+        run: |
+          set -euo pipefail
+          [ -n "$PROD_SSH_PRIVATE_KEY" ] && [ -n "$PROD_KNOWN_HOSTS" ]
+          install -d -m 0700 "$HOME/.ssh"
+          printf '%s\n' "$PROD_SSH_PRIVATE_KEY" >"$HOME/.ssh/id_ed25519"
+          printf '%s\n' "$PROD_KNOWN_HOSTS" >"$HOME/.ssh/known_hosts"
+          chmod 0600 "$HOME/.ssh/id_ed25519" "$HOME/.ssh/known_hosts"
+
+      - name: Enter guarded LIVE mode
+        shell: bash
+        env:
+          PROD_HOST: ${{ secrets.PROD_HOST }}
+          PROD_PORT: ${{ secrets.PROD_PORT }}
+          PROD_USER: ${{ secrets.PROD_USER }}
+          RELEASE_SHA: ${{ inputs.release_sha }}
+        run: |
+          set -euo pipefail
+          [ "$PROD_USER" = phoenix-deploy ]
+          [[ "$PROD_HOST" =~ ^[A-Za-z0-9._-]+$ ]]
+          [[ "$PROD_PORT" =~ ^[1-9][0-9]{0,4}$ ]]
+          ssh_opts=(
+            -n
+            -i "$HOME/.ssh/id_ed25519"
+            -p "$PROD_PORT"
+            -o BatchMode=yes
+            -o IdentitiesOnly=yes
+            -o StrictHostKeyChecking=yes
+            -o UserKnownHostsFile="$HOME/.ssh/known_hosts"
+            -o ConnectTimeout=20
+          )
+          ssh "${ssh_opts[@]}" "${PROD_USER}@${PROD_HOST}" \
+            "enter-post-recovery-live-mode ${RELEASE_SHA} enter-recovered-live-mode-42161" \
+            >post-recovery-live-mode.json
+          jq -e --arg sha "$RELEASE_SHA" '
+            .schema == "phoenix.post-recovery-live-mode.v1"
+            and .status == "live-mode-ready"
+            and .release_sha == $sha
+            and .phoenix_mode == "LIVE"
+            and .live_execution == true
+            and .autonomous_execution == true
+            and .contract_paused == true
+            and .live_executor_stopped == true
+            and .aave_armed == false
+            and .atlas_armed == false
+            and .generic_closed == true
+            and .active_attempts == 0
+            and .active_atlas == 0
+            and .unresolved_submissions == 0
+            and .submission_lock_free == true
+          ' post-recovery-live-mode.json >/dev/null
+
+      - name: Verify autorelease remains disabled
+        if: ${{ always() }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          [ "$(
+            gh api "repos/${GITHUB_REPOSITORY}/actions/variables/PHOENIX_AUTORELEASE_ENABLED" \
+              --jq '.value'
+          )" = false ]
+
+      - name: Upload bounded transition evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: phoenix-post-recovery-live-mode-${{ inputs.release_sha }}
+          path: post-recovery-live-mode.json
+          if-no-files-found: warn
+          retention-days: 30

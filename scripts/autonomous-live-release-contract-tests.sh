@@ -30,6 +30,10 @@ for path in \
   scripts/rollback-release.sh \
   scripts/activate-economic-canary.sh \
   scripts/monitor-post-arm-revenue.sh \
+  scripts/phoenix-release-gateway.sh \
+  scripts/phoenix-release-transport.sh \
+  scripts/phoenix_release/gateway.py \
+  .github/workflows/phoenix-enter-post-recovery-live-mode.yml \
   scripts/economic_activation_runner.py \
   scripts/economic-dashboard-loop.sh \
   deploy/phoenix-economic-activation.path \
@@ -91,6 +95,10 @@ activation_path = read("deploy/phoenix-economic-activation.path")
 activation_service = read("deploy/phoenix-economic-activation.service")
 release_model = read("scripts/phoenix_release/model.py")
 release_gateway = read("scripts/phoenix_release/gateway.py")
+production_compose = read("scripts/production_compose.py")
+release_gateway_wrapper = read("scripts/phoenix-release-gateway.sh")
+release_transport = read("scripts/phoenix-release-transport.sh")
+live_mode_workflow = read(".github/workflows/phoenix-enter-post-recovery-live-mode.yml")
 assets = read("scripts/release_assets.py")
 installer = read("scripts/install-production-release-context.sh")
 
@@ -471,10 +479,92 @@ for command in (
     '"install-authorization"',
     '"activate-ready-canary"',
     '"arm-revenue-lanes"',
+    '"preflight-post-recovery-live-mode"',
+    '"owner-configured-signer-preflight"',
     '"evaluate-economic-control"',
     '"supervise-economic-control"',
 ):
     require(command in control, f"control_command_missing:{command}")
+operator_tuple = (
+    "PHOENIX_OPERATOR_MODE: ${PHOENIX_MODE:?PHOENIX_MODE is required}",
+    "PHOENIX_OPERATOR_LIVE_EXECUTION: ${LIVE_EXECUTION:?LIVE_EXECUTION is required}",
+    "PHOENIX_OPERATOR_AUTONOMOUS_EXECUTION: ${AUTONOMOUS_EXECUTION:?AUTONOMOUS_EXECUTION is required}",
+)
+for field in operator_tuple:
+    require(compose.count(field) == 2, f"operator_mode_binding_invalid:{field}")
+for field in ("PHOENIX_MODE", "LIVE_EXECUTION", "AUTONOMOUS_EXECUTION"):
+    require(
+        f'"{field}",' in production_compose,
+        f"operator_mode_parent_precedence_not_removed:{field}",
+    )
+owner_mutation = control.split("async fn owner_mutation", 1)[1].split(
+    "fn preflight_request", 1
+)[0]
+require(
+    owner_mutation.index("require_live_operator_mode()?")
+    < owner_mutation.index("execute_from_environment(mutation).await?"),
+    "owner_unpause_must_require_operator_live_mode",
+)
+arm_revenue = control.split("async fn arm_revenue_lanes()", 1)[1].split(
+    "async fn arm_revenue_lanes_in_pool", 1
+)[0]
+require(
+    arm_revenue.index("require_live_operator_mode()?")
+    < arm_revenue.index("database_pool().await?"),
+    "revenue_arm_must_require_operator_live_mode",
+)
+require(
+    'identity=$(operator_mode_identity) ||' in post_arm_monitor
+    and '[ "$identity" = "LIVE:true:true" ]' in post_arm_monitor
+    and post_arm_monitor.split("while :; do", 1)[1].count(
+        "require_operator_live_mode"
+    )
+    >= 2,
+    "post_arm_monitor_must_continuously_require_operator_live_mode",
+)
+live_transition = release_gateway.split(
+    "def enter_post_recovery_live_mode", 1
+)[1].split("def rollback_release", 1)[0]
+require(
+    live_transition.index("POST_RECOVERY_LIVE_PREFLIGHT_FAILED")
+    < live_transition.index("POST_RECOVERY_LIVE_SIGNER_PREFLIGHT_FAILED")
+    < live_transition.index('"live"')
+    < live_transition.index("POST_RECOVERY_LIVE_FINAL_PREFLIGHT_FAILED")
+    < live_transition.index("POST_RECOVERY_LIVE_FINAL_SIGNER_PREFLIGHT_FAILED"),
+    "guarded_live_transition_order_invalid",
+)
+require(
+    '"live-executor",\n        "owner-configured-signer-preflight"'
+    in live_transition,
+    "guarded_live_transition_signer_proof_missing",
+)
+require(
+    '"shadow"' in live_transition
+    and "POST_RECOVERY_LIVE_SHADOW_RESTORE_FAILED" in live_transition,
+    "guarded_live_transition_compensation_missing",
+)
+guarded_wrapper = release_gateway_wrapper.split(
+    'if [ "$1" = enter-post-recovery-live-mode ]; then', 1
+)[1].split("fi", 1)[0]
+require(
+    guarded_wrapper.index("/run/lock/phoenix-release.lock")
+    < guarded_wrapper.index("/run/lock/phoenix-economic-activation.lock")
+    and guarded_wrapper.count("/usr/bin/flock -n") == 2,
+    "guarded_live_transition_lock_order_invalid",
+)
+require(
+    "enter-post-recovery-live-mode:3" in release_transport
+    and "enter-recovered-live-mode-42161" in release_transport,
+    "guarded_live_transition_transport_missing",
+)
+for value in (
+    "environment: production-live",
+    "group: phoenix-production-release",
+    "vars.PHOENIX_AUTORELEASE_ENABLED == 'false'",
+    "phoenix-release-controller.yml/runs?per_page=100",
+    "ENTER_RECOVERED_LIVE_MODE_42161",
+):
+    require(value in live_mode_workflow, f"guarded_live_workflow_missing:{value}")
 require(
     '"activate" => return Err(' in control,
     "legacy_direct_activation_not_disabled",

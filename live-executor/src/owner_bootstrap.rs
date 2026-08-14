@@ -415,6 +415,13 @@ pub async fn configured_preflight_from_environment() -> Result<Value, OwnerBoots
     configured_preflight(&context, &rpc).await
 }
 
+pub async fn configured_signer_preflight_from_environment() -> Result<Value, OwnerBootstrapError> {
+    let context = OwnerBootstrapContext::from_environment()?;
+    let signer = context.load_signer()?;
+    let rpc = production_rpc(&context)?;
+    configured_signer_preflight(&context, &rpc, &signer).await
+}
+
 // runtime_preflight validates the exact executor identity and configuration
 // without requiring a pause transition. Provider-only recovery consumes this
 // read-only evidence and is explicitly forbidden from unpausing the contract.
@@ -559,6 +566,20 @@ async fn configured_preflight<R: OwnerBootstrapRpc>(
         "status": "ready-paused",
         "final_state": snapshot_evidence(context, &snapshots)
     }))
+}
+
+async fn configured_signer_preflight<R: OwnerBootstrapRpc>(
+    context: &OwnerBootstrapContext,
+    rpc: &R,
+    signer: &TransactionSigner,
+) -> Result<Value, OwnerBootstrapError> {
+    if signer.address() != context.wallet || signer.address() != context.expected_owner {
+        return Err(OwnerBootstrapError::SignerWalletOwnerMismatch);
+    }
+    let mut evidence = configured_preflight(context, rpc).await?;
+    evidence["command"] = Value::String("configured-signer-preflight".to_string());
+    evidence["signer_matches_owner"] = Value::Bool(true);
+    Ok(evidence)
 }
 
 async fn runtime_preflight<R: OwnerBootstrapRpc>(
@@ -1930,6 +1951,35 @@ mod tests {
             configured_preflight(&context, &MockRpc::new(complete_snapshot(&context, false)))
                 .await
                 .expect_err("unpaused"),
+            OwnerBootstrapError::ConfiguredPreflightRequiresPaused
+        );
+    }
+
+    #[tokio::test]
+    async fn configured_signer_preflight_requires_paused_matching_owner_without_mutation() {
+        let context = context();
+        let signer = test_signer();
+        let rpc = MockRpc::new(complete_snapshot(&context, true));
+        let evidence = configured_signer_preflight(&context, &rpc, &signer)
+            .await
+            .expect("paused signer preflight");
+        assert_eq!(evidence["status"], "ready-paused");
+        assert_eq!(evidence["signer_matches_owner"], true);
+        assert_eq!(rpc.submit_calls.load(Ordering::SeqCst), 0);
+
+        let other = TransactionSigner::from_secret(&hex::encode([8_u8; 32]), ARBITRUM_ONE_CHAIN_ID)
+            .expect("other signer");
+        assert_eq!(
+            configured_signer_preflight(&context, &rpc, &other)
+                .await
+                .expect_err("signer mismatch"),
+            OwnerBootstrapError::SignerWalletOwnerMismatch
+        );
+        let unpaused = MockRpc::new(complete_snapshot(&context, false));
+        assert_eq!(
+            configured_signer_preflight(&context, &unpaused, &signer)
+                .await
+                .expect_err("paused contract required"),
             OwnerBootstrapError::ConfiguredPreflightRequiresPaused
         );
     }

@@ -90,7 +90,13 @@ def compose_environment(
     source: Mapping[str, str] | None = None,
 ) -> dict[str, str]:
     environment = dict(os.environ if source is None else source)
-    environment.pop("ENGINE_ROUTE_REGISTRY_JSON", None)
+    for protected_name in (
+        "ENGINE_ROUTE_REGISTRY_JSON",
+        "PHOENIX_MODE",
+        "LIVE_EXECUTION",
+        "AUTONOMOUS_EXECUTION",
+    ):
+        environment.pop(protected_name, None)
     environment["PHOENIX_ENV_FILE"] = str(env_file)
     environment["PHOENIX_RELEASE_ENV"] = str(release_env)
     return environment

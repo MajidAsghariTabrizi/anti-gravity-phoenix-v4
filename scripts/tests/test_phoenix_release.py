@@ -55,6 +55,7 @@ from scripts.phoenix_release.gateway import (
     validate_request,
     buffer_rpc_provider_secret,
     emergency_pause,
+    enter_post_recovery_live_mode,
 )
 from scripts.phoenix_release.rpc_provider_secret import (
     SecretError as RpcProviderSecretError,
@@ -629,16 +630,25 @@ class ReleaseStateTests(unittest.TestCase):
 
 
 class CanonicalComposeAndPlatformTests(unittest.TestCase):
-    def test_route_registry_cannot_bypass_exact_env_file_precedence(self) -> None:
+    def test_protected_authority_cannot_bypass_exact_env_file_precedence(self) -> None:
         environment = compose_environment(
             Path("/etc/phoenix/phoenix.env"),
             Path("/opt/phoenix/deploy/current-release.env"),
             {
                 "ENGINE_ROUTE_REGISTRY_JSON": '[{"route_id":"stale"}]',
+                "PHOENIX_MODE": "LIVE",
+                "LIVE_EXECUTION": "true",
+                "AUTONOMOUS_EXECUTION": "true",
                 "UNRELATED_PARENT_VALUE": "preserved",
             },
         )
-        self.assertNotIn("ENGINE_ROUTE_REGISTRY_JSON", environment)
+        for protected_name in (
+            "ENGINE_ROUTE_REGISTRY_JSON",
+            "PHOENIX_MODE",
+            "LIVE_EXECUTION",
+            "AUTONOMOUS_EXECUTION",
+        ):
+            self.assertNotIn(protected_name, environment)
         self.assertEqual(environment["UNRELATED_PARENT_VALUE"], "preserved")
         self.assertEqual(
             environment["PHOENIX_RELEASE_ENV"],
@@ -1710,8 +1720,44 @@ class BoundedTransportContinuationTests(unittest.TestCase):
             "evidence",
             "reconcile-active-context",
             "reconcile-chain-evidence",
+            "enter-post-recovery-live-mode",
         ):
             self.assertIn(command, transport)
+
+    def test_post_recovery_live_cli_and_transport_require_exact_ack(self) -> None:
+        arguments = release_parser().parse_args(
+            [
+                "enter-post-recovery-live-mode",
+                RELEASE_SHA,
+                "enter-recovered-live-mode-42161",
+            ]
+        )
+        self.assertEqual(arguments.release_sha, RELEASE_SHA)
+        self.assertEqual(
+            arguments.acknowledgement,
+            "enter-recovered-live-mode-42161",
+        )
+        transport = (
+            ROOT / "scripts/phoenix-release-transport.sh"
+        ).read_text()
+        self.assertIn("enter-post-recovery-live-mode:3", transport)
+        self.assertIn(
+            '[ "${3:-}" = enter-recovered-live-mode-42161 ] || deny',
+            transport,
+        )
+        wrapper = (
+            ROOT / "scripts/phoenix-release-gateway.sh"
+        ).read_text()
+        guarded = wrapper.split(
+            'if [ "$1" = enter-post-recovery-live-mode ]; then',
+            maxsplit=1,
+        )[1].split("fi", maxsplit=1)[0]
+        release_lock = guarded.index("/run/lock/phoenix-release.lock")
+        activation_lock = guarded.index(
+            "/run/lock/phoenix-economic-activation.lock"
+        )
+        self.assertLess(release_lock, activation_lock)
+        self.assertEqual(guarded.count("/usr/bin/flock -n"), 2)
 
     def test_permanent_identity_has_forced_command_and_no_forwarding(self) -> None:
         installer = (ROOT / "scripts/install-phoenix-release-platform.sh").read_text()
@@ -2293,6 +2339,214 @@ class BoundedTransportContinuationTests(unittest.TestCase):
                 stop_command[-5:],
                 ["--", "stop", "-t", "30", "live-executor"],
             )
+
+    def test_post_recovery_live_mode_changes_only_operator_mode(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            paths = self.emergency_paths(Path(temporary))
+            shadow = self.emergency_status(shadow=True)
+            live = self.emergency_status()
+            controls = self.emergency_controls()
+            with (
+                patch(
+                    "scripts.phoenix_release.gateway.status",
+                    side_effect=[shadow, live],
+                ),
+                patch(
+                    "scripts.phoenix_release.gateway._require_success",
+                    return_value="",
+                ) as require_success,
+                patch(
+                    "scripts.phoenix_release.gateway._live_executor_stopped"
+                ) as stopped,
+                patch(
+                    "scripts.phoenix_release.gateway._control_evidence",
+                    side_effect=[controls, controls],
+                ) as control_evidence,
+            ):
+                observed = enter_post_recovery_live_mode(
+                    paths,
+                    RELEASE_SHA,
+                    "enter-recovered-live-mode-42161",
+                )
+
+            self.assertEqual(observed["status"], "live-mode-ready")
+            self.assertEqual(observed["phoenix_mode"], "LIVE")
+            self.assertTrue(observed["contract_paused"])
+            self.assertFalse(observed["aave_armed"])
+            self.assertFalse(observed["atlas_armed"])
+            self.assertTrue(observed["generic_closed"])
+            self.assertEqual(stopped.call_count, 2)
+            self.assertEqual(control_evidence.call_count, 2)
+            self.assertEqual(require_success.call_count, 5)
+            preflight_before = require_success.call_args_list[0].args[0]
+            signer_before = require_success.call_args_list[1].args[0]
+            live_mutation = require_success.call_args_list[2].args[0]
+            preflight_after = require_success.call_args_list[3].args[0]
+            signer_after = require_success.call_args_list[4].args[0]
+            self.assertEqual(preflight_before, preflight_after)
+            self.assertEqual(signer_before, signer_after)
+            self.assertEqual(
+                preflight_before[-2:],
+                ["autonomous-control", "preflight-post-recovery-live-mode"],
+            )
+            self.assertIn(
+                "PHOENIX_ENTER_LIVE_MODE_ACK=ENTER_RECOVERED_LIVE_MODE_42161",
+                preflight_before,
+            )
+            self.assertEqual(
+                signer_before[-3:],
+                [
+                    "/usr/local/bin/autonomous-live-control",
+                    "live-executor",
+                    "owner-configured-signer-preflight",
+                ],
+            )
+            self.assertEqual(
+                live_mutation,
+                [
+                    "/usr/bin/python3",
+                    "-I",
+                    "-B",
+                    str(paths.libexec / "production_mode.py"),
+                    "live",
+                    "--env-file",
+                    str(paths.env_file),
+                ],
+            )
+            self.assertFalse(
+                any("owner-unpause" in call.args[0] for call in require_success.call_args_list)
+            )
+            self.assertFalse(
+                any("arm-revenue-lanes" in call.args[0] for call in require_success.call_args_list)
+            )
+
+    def test_post_recovery_live_mode_rejects_non_shadow_or_open_authority(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            paths = self.emergency_paths(Path(temporary))
+            shadow = self.emergency_status(shadow=True)
+            cases = (
+                ("wrong-ack", shadow, self.emergency_controls()),
+                ("already-live", self.emergency_status(), self.emergency_controls()),
+                (
+                    "release-mismatch",
+                    {**shadow, "active_release": "b" * 40},
+                    self.emergency_controls(),
+                ),
+                (
+                    "assets-mismatch",
+                    {**shadow, "release_assets_sha": "b" * 40},
+                    self.emergency_controls(),
+                ),
+                (
+                    "open-aave",
+                    shadow,
+                    {**self.emergency_controls(), "aave_armed": True},
+                ),
+            )
+            for case, initial, controls in cases:
+                acknowledgement = (
+                    "wrong" if case == "wrong-ack" else "enter-recovered-live-mode-42161"
+                )
+                with (
+                    self.subTest(case=case),
+                    patch(
+                        "scripts.phoenix_release.gateway.status",
+                        return_value=initial,
+                    ),
+                    patch(
+                        "scripts.phoenix_release.gateway._live_executor_stopped"
+                    ),
+                    patch(
+                        "scripts.phoenix_release.gateway._control_evidence",
+                        return_value=controls,
+                    ),
+                    patch(
+                        "scripts.phoenix_release.gateway._require_success"
+                    ) as require_success,
+                    self.assertRaises(GatewayError),
+                ):
+                    enter_post_recovery_live_mode(
+                        paths,
+                        RELEASE_SHA,
+                        acknowledgement,
+                    )
+                require_success.assert_not_called()
+
+    def test_post_recovery_live_mode_restores_shadow_after_mutation_failure(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            paths = self.emergency_paths(Path(temporary))
+            shadow = self.emergency_status(shadow=True)
+            live = self.emergency_status()
+            controls = self.emergency_controls()
+            for case, effects, statuses in (
+                (
+                    "mutation-command",
+                    [
+                        "",
+                        "",
+                        GatewayError("POST_RECOVERY_LIVE_MODE_MUTATION_FAILED"),
+                        "",
+                    ],
+                    [shadow, shadow],
+                ),
+                (
+                    "final-preflight",
+                    [
+                        "",
+                        "",
+                        "",
+                        GatewayError("POST_RECOVERY_LIVE_FINAL_PREFLIGHT_FAILED"),
+                        "",
+                    ],
+                    [shadow, live, shadow],
+                ),
+            ):
+                with (
+                    self.subTest(case=case),
+                    patch(
+                        "scripts.phoenix_release.gateway.status",
+                        side_effect=statuses,
+                    ),
+                    patch(
+                        "scripts.phoenix_release.gateway._require_success",
+                        side_effect=effects,
+                    ) as require_success,
+                    patch(
+                        "scripts.phoenix_release.gateway._live_executor_stopped"
+                    ),
+                    patch(
+                        "scripts.phoenix_release.gateway._control_evidence",
+                        return_value=controls,
+                    ),
+                    self.assertRaises(GatewayError),
+                ):
+                    enter_post_recovery_live_mode(
+                        paths,
+                        RELEASE_SHA,
+                        "enter-recovered-live-mode-42161",
+                    )
+                shadow_commands = [
+                    call.args[0]
+                    for call in require_success.call_args_list
+                    if "shadow" in call.args[0]
+                ]
+                self.assertEqual(len(shadow_commands), 1)
+                self.assertEqual(
+                    shadow_commands[0],
+                    [
+                        "/usr/bin/python3",
+                        "-I",
+                        "-B",
+                        str(paths.libexec / "production_mode.py"),
+                        "shadow",
+                        "--env-file",
+                        str(paths.env_file),
+                    ],
+                )
     def test_candidate_install_failure_rolls_back_in_same_resume(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             paths = self.paths(Path(temporary))
@@ -2763,6 +3017,16 @@ class WorkflowAndDeploymentContractTests(unittest.TestCase):
         self.dashboard_sql = (
             ROOT / "scripts/sql/economic-dashboard-snapshot.sql"
         ).read_text()
+        self.live_mode_workflow = (
+            ROOT
+            / ".github/workflows/phoenix-enter-post-recovery-live-mode.yml"
+        ).read_text()
+        self.post_arm_monitor = (
+            ROOT / "scripts/monitor-post-arm-revenue.sh"
+        ).read_text()
+        self.live_control = (
+            ROOT / "live-executor/src/autonomous_live_control_main.rs"
+        ).read_text()
 
     def test_controller_is_automatic_resumable_and_serialized(self) -> None:
         self.assertIn('workflows: ["Phoenix CI"]', self.workflow)
@@ -2779,6 +3043,68 @@ class WorkflowAndDeploymentContractTests(unittest.TestCase):
         self.assertIn("exact protected main tip", self.workflow)
         self.assertIn("verify-source-ci", self.workflow)
         self.assertIn("docs-only", self.workflow)
+
+    def test_post_recovery_live_workflow_is_exact_protected_and_serialized(
+        self,
+    ) -> None:
+        workflow = self.live_mode_workflow
+        self.assertIn("workflow_dispatch:", workflow)
+        self.assertNotIn("workflow_run:", workflow)
+        self.assertNotIn("schedule:", workflow)
+        self.assertIn("environment: production-live", workflow)
+        self.assertIn("group: phoenix-production-release", workflow)
+        self.assertIn("cancel-in-progress: false", workflow)
+        self.assertIn(
+            "vars.PHOENIX_AUTORELEASE_ENABLED == 'false'", workflow
+        )
+        self.assertIn("ENTER_RECOVERED_LIVE_MODE_42161", workflow)
+        self.assertIn("git/ref/heads/main", workflow)
+        self.assertIn("phoenix-release-controller.yml/runs?per_page=100", workflow)
+        self.assertIn('.status == "queued" or .status == "in_progress"', workflow)
+        self.assertIn("PROD_SSH_PRIVATE_KEY", workflow)
+        self.assertIn("StrictHostKeyChecking=yes", workflow)
+        self.assertIn(
+            '"enter-post-recovery-live-mode ${RELEASE_SHA} '
+            'enter-recovered-live-mode-42161"',
+            workflow,
+        )
+        self.assertIn(".contract_paused == true", workflow)
+        self.assertIn(".aave_armed == false", workflow)
+        self.assertIn(".atlas_armed == false", workflow)
+        self.assertIn(".generic_closed == true", workflow)
+        self.assertEqual(
+            workflow.count(
+                "actions/variables/PHOENIX_AUTORELEASE_ENABLED"
+            ),
+            2,
+        )
+
+    def test_arm_unpause_and_monitor_require_exact_operator_live_mode(self) -> None:
+        control = self.live_control
+        owner = control.split(
+            "async fn owner_mutation", maxsplit=1
+        )[1].split("fn preflight_request", maxsplit=1)[0]
+        self.assertLess(
+            owner.index("require_live_operator_mode()?"),
+            owner.index("execute_from_environment(mutation).await?"),
+        )
+        arm = control.split(
+            "async fn arm_revenue_lanes()", maxsplit=1
+        )[1].split("async fn arm_revenue_lanes_in_pool", maxsplit=1)[0]
+        self.assertLess(
+            arm.index("require_live_operator_mode()?"),
+            arm.index("database_pool().await?"),
+        )
+        self.assertIn(
+            'identity=$(operator_mode_identity) ||', self.post_arm_monitor
+        )
+        self.assertIn(
+            '[ "$identity" = "LIVE:true:true" ]', self.post_arm_monitor
+        )
+        loop = self.post_arm_monitor.split("while :; do", maxsplit=1)[1]
+        self.assertGreaterEqual(loop.count("require_operator_live_mode"), 2)
+        self.assertIn("live-executor owner-live-preflight", loop)
+        self.assertNotIn("owner-configured-preflight", loop)
 
     def test_controller_uses_no_powershell_or_general_scp(self) -> None:
         self.assertNotIn("powershell", self.workflow.lower())

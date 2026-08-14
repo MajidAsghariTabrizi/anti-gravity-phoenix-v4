@@ -24,6 +24,13 @@ if [ "$1" = reconcile-chain-evidence ]; then
     /usr/local/libexec/phoenix-release/phoenix_release/cli.py "$@"
 fi
 
+if [ "$1" = enter-post-recovery-live-mode ]; then
+  exec /usr/bin/flock -n /run/lock/phoenix-release.lock \
+    /usr/bin/flock -n /run/lock/phoenix-economic-activation.lock \
+    /usr/bin/python3 -I -B \
+    /usr/local/libexec/phoenix-release/phoenix_release/cli.py "$@"
+fi
+
 exec /usr/bin/flock -w 30 /run/lock/phoenix-release.lock \
   /usr/bin/python3 -I -B \
   /usr/local/libexec/phoenix-release/phoenix_release/cli.py "$@"

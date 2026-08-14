@@ -41,6 +41,39 @@ compose() {
     -- "$@"
 }
 
+operator_mode_identity() {
+  awk -F= '
+    $1 == "PHOENIX_MODE" {
+      mode_count += 1
+      mode = $2
+      next
+    }
+    $1 == "LIVE_EXECUTION" {
+      live_count += 1
+      live = $2
+      next
+    }
+    $1 == "AUTONOMOUS_EXECUTION" {
+      autonomous_count += 1
+      autonomous = $2
+      next
+    }
+    END {
+      if (mode_count != 1 || live_count != 1 || autonomous_count != 1) {
+        exit 2
+      }
+      printf "%s:%s:%s\n", mode, live, autonomous
+    }
+  ' "$env_file"
+}
+
+require_operator_live_mode() {
+  identity=$(operator_mode_identity) ||
+    fail "operator LIVE-mode evidence is unavailable"
+  [ "$identity" = "LIVE:true:true" ] ||
+    fail "operator environment left exact LIVE mode"
+}
+
 fail_closed=0
 compensate() {
   code=$?
@@ -68,6 +101,7 @@ compensate() {
 trap compensate EXIT
 trap 'exit 1' HUP INT TERM
 
+require_operator_live_mode
 baseline_executor=$(compose ps --status running -q live-executor)
 [ -n "$baseline_executor" ] || fail "live-executor is not running"
 [ "$(printf '%s\n' "$baseline_executor" | awk 'NF { count += 1 } END { print count + 0 }')" -eq 1 ] ||
@@ -82,6 +116,7 @@ while :; do
     fail "active release changed during monitoring"
   [ "$(tr -d '\r\n' <"$deploy_dir/release-assets.sha")" = "$release_sha" ] ||
     fail "release assets changed during monitoring"
+  require_operator_live_mode
 
   compose run --rm --no-deps \
     -e PHOENIX_RELEASE_SHA="$release_sha" \
@@ -94,6 +129,7 @@ while :; do
     fail "live-executor identity changed during monitoring"
   [ "$(docker inspect -f '{{.RestartCount}}' "$current_executor")" = "$baseline_restarts" ] ||
     fail "live-executor restarted during monitoring"
+  require_operator_live_mode
 
   now=$(date +%s)
   [ "$now" -lt "$deadline" ] || break
