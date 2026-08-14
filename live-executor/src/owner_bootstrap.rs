@@ -466,11 +466,17 @@ async fn live_preflight<R: OwnerBootstrapRpc>(
 pub async fn execute_from_environment(
     mutation: OwnerMutation,
 ) -> Result<Value, OwnerBootstrapError> {
-    require_acknowledgement(mutation, |name| env::var(name).ok())?;
+    require_acknowledgement_from_environment(mutation)?;
     let context = OwnerBootstrapContext::from_environment()?;
     let signer = context.load_signer()?;
     let rpc = production_rpc(&context)?;
     execute_mutation(&context, &rpc, &signer, mutation).await
+}
+
+pub fn require_acknowledgement_from_environment(
+    mutation: OwnerMutation,
+) -> Result<(), OwnerBootstrapError> {
+    require_acknowledgement(mutation, |name| env::var(name).ok())
 }
 
 fn production_rpc(

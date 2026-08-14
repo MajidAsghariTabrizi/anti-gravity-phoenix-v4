@@ -15,7 +15,8 @@ use phoenix_live_executor::model::{CanonicalAddress, ExecutionRequest, Validated
 use phoenix_live_executor::owner_bootstrap::{
     configured_preflight_from_environment, configured_signer_preflight_from_environment,
     execute_from_environment, live_preflight_from_environment, owner_plan_from_environment,
-    runtime_preflight_from_environment, OwnerBootstrapError, OwnerMutation,
+    require_acknowledgement_from_environment, runtime_preflight_from_environment,
+    OwnerBootstrapError, OwnerMutation,
 };
 use phoenix_live_executor::rpc::{ExecutionRpc, HttpExecutionRpc};
 use phoenix_live_executor::store::fail_close_execution_authority;
@@ -583,6 +584,7 @@ async fn owner_live_preflight() -> ControlResult<()> {
 }
 
 async fn owner_mutation(mutation: OwnerMutation) -> ControlResult<()> {
+    require_acknowledgement_from_environment(mutation)?;
     if mutation == OwnerMutation::Unpause {
         require_live_operator_mode()?;
     }
