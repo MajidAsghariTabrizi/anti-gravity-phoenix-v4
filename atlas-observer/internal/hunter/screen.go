@@ -2220,10 +2220,6 @@ func (s *Screener) screen(ctx context.Context, borrowers []string, advanceSeed b
 					} else {
 						tracker := &exactEvaluationTracker{}
 						s.state.Counts[exactEvalStartedKey]++
-						if err := s.persistStateLocked(); err != nil {
-							s.state.Counts[exactEvalStartedKey]--
-							return err
-						}
 						s.exactInFlight++
 						s.exactInFlightBorrowers[primary.Borrower] = true
 						result := make(chan exactEvaluationResult, 1)
@@ -2236,26 +2232,6 @@ func (s *Screener) screen(ctx context.Context, borrowers []string, advanceSeed b
 							signalToPrefilter: signalToPrefilter,
 						}
 						pendingExact = append(pendingExact, work)
-						exactCtx := context.WithValue(ctx, exactEvaluationTrackerKey{}, tracker)
-						go func(
-							workerCtx context.Context,
-							evaluationTracker *exactEvaluationTracker,
-							input signal,
-							output chan<- exactEvaluationResult,
-						) {
-							select {
-							case s.exactWorkerSlots <- struct{}{}:
-							case <-workerCtx.Done():
-								output <- exactEvaluationResult{record: input, err: workerCtx.Err(), completedAt: s.nowUTC(), completedMonotonic: time.Now()}
-								return
-							}
-							s.exactWorkerStarts.Add(1)
-							evaluationTracker.workerStartedUnixNanos.Store(s.nowUTC().UnixNano())
-							evaluationTracker.workerStartedMonotonic = time.Now()
-							defer func() { <-s.exactWorkerSlots }()
-							exactRecord, exactErr := s.resolveExact(workerCtx, input, auction)
-							output <- exactEvaluationResult{record: exactRecord, err: exactErr, completedAt: s.nowUTC(), completedMonotonic: time.Now()}
-						}(exactCtx, tracker, record, result)
 						continue
 					}
 				}
@@ -2265,6 +2241,38 @@ func (s *Screener) screen(ctx context.Context, borrowers []string, advanceSeed b
 			order: order, record: record, borrower: primary.Borrower, bucket: bucket,
 			signalToPrefilter: signalToPrefilter,
 		})
+	}
+	if len(pendingExact) > 0 {
+		// Persist the complete bounded admission batch once before issuing any
+		// Exact RPC. This preserves restart-safe token accounting without making
+		// every independent borrower wait behind its own state-file fsync.
+		if err := s.persistStateLocked(); err != nil {
+			s.state.Counts[exactEvalStartedKey] -= uint64(len(pendingExact))
+			return err
+		}
+		for index := range pendingExact {
+			work := &pendingExact[index]
+			exactCtx := context.WithValue(ctx, exactEvaluationTrackerKey{}, work.tracker)
+			go func(
+				workerCtx context.Context,
+				evaluationTracker *exactEvaluationTracker,
+				input signal,
+				output chan<- exactEvaluationResult,
+			) {
+				select {
+				case s.exactWorkerSlots <- struct{}{}:
+				case <-workerCtx.Done():
+					output <- exactEvaluationResult{record: input, err: workerCtx.Err(), completedAt: s.nowUTC(), completedMonotonic: time.Now()}
+					return
+				}
+				s.exactWorkerStarts.Add(1)
+				evaluationTracker.workerStartedUnixNanos.Store(s.nowUTC().UnixNano())
+				evaluationTracker.workerStartedMonotonic = time.Now()
+				defer func() { <-s.exactWorkerSlots }()
+				exactRecord, exactErr := s.resolveExact(workerCtx, input, auction)
+				output <- exactEvaluationResult{record: exactRecord, err: exactErr, completedAt: s.nowUTC(), completedMonotonic: time.Now()}
+			}(exactCtx, work.tracker, work.record, work.result)
+		}
 	}
 	exactResults := make([]exactEvaluationResult, len(pendingExact))
 	var exactBatchErr error

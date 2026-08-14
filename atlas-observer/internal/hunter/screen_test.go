@@ -3047,6 +3047,16 @@ func TestAaveExactSanitizedLoadProfilesDrainWithBoundedBackpressure(t *testing.T
 				hotBorrowers: make(map[string]string), hotDebtBase: make(map[string]string),
 				lastExactAt: make(map[string]time.Time), firstLiquidatableAt: make(map[string]time.Time),
 			}
+			// Production Exact work comes from the durable debt-bearing cohort.
+			// Seed that already-persisted identity here so this benchmark measures
+			// scheduler/worker dispatch rather than test-host filesystem fsync time
+			// for first-ever borrower discovery.
+			for _, borrower := range addresses {
+				screener.debtBearing[borrower] = true
+				screener.refreshKnown[borrower] = true
+				screener.refreshOrder = append(screener.refreshOrder, borrower)
+			}
+			screener.state.DebtBearingCount = uint64(len(addresses))
 			latencyMu.Lock()
 			dispatchLatencies = nil
 			latencyMu.Unlock()
