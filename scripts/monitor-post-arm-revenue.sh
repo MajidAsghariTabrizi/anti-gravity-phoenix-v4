@@ -186,62 +186,143 @@ if document.get("provider_current_class_failure_streak") != 0:
 }
 
 require_latency_gauges() {
-  printf '%s' "$1" | python3 -c '
-import re, sys
-text = sys.stdin.read()
-def value(name):
+  printf '%s\n# PHOENIX_MONITOR_GAUGE_BOUNDARY\n%s' "$1" "$2" | python3 -c '
+import json, re, sys
+documents = sys.stdin.read().split("\n# PHOENIX_MONITOR_GAUGE_BOUNDARY\n")
+sample_count = int(sys.argv[1])
+timestamp = sys.argv[2]
+evidence = {
+    "metric_name": None,
+    "previous_value": None,
+    "current_value": None,
+    "delta": None,
+    "configured_threshold": None,
+    "sample_count": sample_count,
+    "actionable_queue_depth": None,
+    "in_flight_count": None,
+    "worker_queued_count": None,
+    "permit_availability": None,
+    "oldest_actionable_age_seconds": None,
+    "exact_completed_delta": None,
+    "timestamp": timestamp,
+}
+def reject(metric, previous, current, threshold, reason):
+    evidence.update({
+        "metric_name": metric,
+        "previous_value": previous,
+        "current_value": current,
+        "delta": None if previous is None or current is None else current - previous,
+        "configured_threshold": threshold,
+        "reason": reason,
+    })
+    print("POST_ARM_LATENCY_GAUGE_FAILED: " + json.dumps(evidence, sort_keys=True, separators=(",", ":")), file=sys.stderr)
+    raise SystemExit(1)
+if len(documents) != 2:
+    reject("monitor_gauge_documents", None, len(documents), 2, "invalid_interval_boundary")
+previous_text, current_text = documents
+def value(text, name):
     matches = re.findall(r"^" + re.escape(name) + r" ([0-9.eE+-]+)$", text, re.M)
     if len(matches) != 1:
-        raise SystemExit(1)
+        reject(name, None, len(matches), 1, "missing_or_duplicate_metric")
     return float(matches[0])
-depth = value("phoenix_exact_queue_depth")
-oldest = value("phoenix_exact_oldest_actionable_age_seconds")
-available = value("phoenix_exact_worker_permits_available")
-if oldest > 1.0:
-    raise SystemExit(1)
-if depth > 0 and available > 0:
-    raise SystemExit(1)
-' || fail "Exact queue progress/age SLO regressed"
+names = {
+    "actionable": "phoenix_aave_exact_eligible_now",
+    "in_flight": "phoenix_aave_exact_evaluations_in_flight",
+    "worker_queued": "phoenix_aave_exact_worker_queue_depth",
+    "legacy_worker_queued": "phoenix_exact_queue_depth",
+    "available": "phoenix_exact_worker_permits_available",
+    "oldest": "phoenix_exact_oldest_actionable_age_seconds",
+    "completed": "phoenix_aave_exact_eval_completed_total",
+}
+previous = {key: value(previous_text, name) for key, name in names.items()}
+current = {key: value(current_text, name) for key, name in names.items()}
+completed_delta = current["completed"] - previous["completed"]
+evidence.update({
+    "actionable_queue_depth": current["actionable"],
+    "in_flight_count": current["in_flight"],
+    "worker_queued_count": current["worker_queued"],
+    "permit_availability": current["available"],
+    "oldest_actionable_age_seconds": current["oldest"],
+    "exact_completed_delta": completed_delta,
+})
+if completed_delta < 0:
+    reject(names["completed"], previous["completed"], current["completed"], 0.0, "exact_completed_counter_reset")
+if current["legacy_worker_queued"] != current["worker_queued"]:
+    reject(names["legacy_worker_queued"], previous["legacy_worker_queued"], current["legacy_worker_queued"], current["worker_queued"], "worker_queue_export_mismatch")
+if current["actionable"] == 0 and current["oldest"] != 0:
+    reject(names["oldest"], previous["oldest"], current["oldest"], 0.0, "idle_actionable_age_not_reset")
+if current["worker_queued"] > 0 and current["available"] > 0:
+    reject(names["worker_queued"], previous["worker_queued"], current["worker_queued"], 0.0, "worker_queue_present_with_available_permit")
+persistent = previous["actionable"] > 0 and current["actionable"] > 0
+age_growing = current["oldest"] > previous["oldest"]
+if persistent and age_growing and current["oldest"] > 1.0:
+    reason = "actionable_age_grew_with_available_permit" if current["available"] > 0 else "actionable_age_grew_without_completion"
+    if current["available"] > 0 or completed_delta <= 0:
+        reject(names["oldest"], previous["oldest"], current["oldest"], 1.0, reason)
+print("POST_ARM_LATENCY_GAUGE_OK: " + json.dumps(evidence, sort_keys=True, separators=(",", ":")))
+' "$3" "$4" || fail "Exact queue progress/age SLO regressed; detailed scalar evidence emitted above"
 }
 
 require_latency_histograms() {
   printf '%s\n# PHOENIX_MONITOR_INTERVAL_BOUNDARY\n%s' "$1" "$2" | python3 -c '
 import json, math, re, sys
 documents = sys.stdin.read().split("\n# PHOENIX_MONITOR_INTERVAL_BOUNDARY\n")
-if len(documents) != 2:
+sample_count = int(sys.argv[1])
+timestamp = sys.argv[2]
+def reject(metric, previous, current, delta, threshold, reason):
+    evidence = {
+        "metric_name": metric,
+        "previous_value": previous,
+        "current_value": current,
+        "delta": delta,
+        "configured_threshold": threshold,
+        "sample_count": sample_count,
+        "timestamp": timestamp,
+        "reason": reason,
+    }
+    print("POST_ARM_LATENCY_HISTOGRAM_FAILED: " + json.dumps(evidence, sort_keys=True, separators=(",", ":")), file=sys.stderr)
     raise SystemExit(1)
+if len(documents) != 2:
+    reject("monitor_histogram_documents", None, len(documents), None, 2, "invalid_interval_boundary")
 baseline, final = documents
 def cumulative_histogram(text, name):
     count_match = re.findall(r"^" + re.escape(name) + r"_count ([0-9]+)$", text, re.M)
     if len(count_match) != 1:
-        raise SystemExit(1)
+        reject(name + "_count", None, len(count_match), None, 1, "missing_or_duplicate_metric")
     count = int(count_match[0])
     buckets = {}
     pattern = r"^" + re.escape(name) + r"_bucket\{le=\"([^\"]+)\"\} ([0-9]+)$"
     for label, value in re.findall(pattern, text, re.M):
-        if label != "+Inf":
-            buckets[float(label)] = int(value)
+        buckets[label] = int(value)
     return count, buckets
+histograms = {}
 def histogram(name):
+    if name in histograms:
+        return histograms[name]
     baseline_count, baseline_buckets = cumulative_histogram(baseline, name)
     final_count, final_buckets = cumulative_histogram(final, name)
-    if final_count <= baseline_count or set(final_buckets) != set(baseline_buckets):
-        raise SystemExit(1)
+    if final_count < baseline_count:
+        reject(name + "_count", baseline_count, final_count, final_count - baseline_count, 0, "histogram_counter_reset")
+    if set(final_buckets) != set(baseline_buckets):
+        reject(name + "_bucket", len(baseline_buckets), len(final_buckets), None, 0, "histogram_bucket_shape_changed")
     count = final_count - baseline_count
     buckets = {}
-    for boundary, final_value in final_buckets.items():
-        baseline_value = baseline_buckets[boundary]
+    for label, final_value in final_buckets.items():
+        baseline_value = baseline_buckets[label]
         if final_value < baseline_value:
-            raise SystemExit(1)
-        buckets[boundary] = final_value - baseline_value
-    return count, buckets
-def quantile(name, q):
-    count, buckets = histogram(name)
+            reject(name + "_bucket", baseline_value, final_value, final_value - baseline_value, 0, "histogram_bucket_reset")
+        buckets[label] = final_value - baseline_value
+    if buckets.get("+Inf") != count:
+        reject(name + "_bucket", baseline_count, final_count, count, count, "histogram_interval_count_mismatch")
+    histograms[name] = (count, buckets)
+    return histograms[name]
+def quantile(name, q, count, buckets):
     target = math.ceil(count * q)
-    for boundary in sorted(buckets):
-        if buckets[boundary] >= target:
+    finite = sorted((float(label), value) for label, value in buckets.items() if label != "+Inf")
+    for boundary, value in finite:
+        if value >= target:
             return boundary
-    raise SystemExit(1)
+    reject(name, None, None, count, q, "quantile_outside_finite_buckets")
 limits = {
     "phoenix_signal_to_prefilter_seconds": (0.025, 0.050),
     "phoenix_liquidatable_to_exact_enqueue_seconds": (0.020, 0.050),
@@ -251,19 +332,44 @@ limits = {
     "phoenix_exact_compute_seconds": (0.100, 0.250),
     "phoenix_exact_end_to_end_seconds": (2.000, 5.000),
 }
+minimum_observations = 5
 evidence = {}
+core = {name: histogram(name) for name in limits}
+if not any(count for count, _ in core.values()):
+    print("POST_ARM_LATENCY_INTERVAL_IDLE: " + json.dumps({"sample_count": sample_count, "timestamp": timestamp}, sort_keys=True, separators=(",", ":")))
+    raise SystemExit(0)
 for name, (p95_limit, p99_limit) in limits.items():
-    p95 = quantile(name, 0.95)
-    p99 = quantile(name, 0.99)
+    count, buckets = core[name]
+    if count < minimum_observations:
+        reject(name + "_count", 0, count, count, minimum_observations, "insufficient_interval_observations")
+    p50 = quantile(name, 0.50, count, buckets)
+    p95 = quantile(name, 0.95, count, buckets)
+    p99 = quantile(name, 0.99, count, buckets)
     if p95 > p95_limit or p99 > p99_limit:
-        raise SystemExit(1)
-    count, buckets = histogram(name)
-    evidence[name] = {"count": count, "p95_upper_bound_seconds": p95, "p99_upper_bound_seconds": p99}
+        reject(name, p95, p99, p99 - p95, {"p95": p95_limit, "p99": p99_limit}, "interval_quantile_slo_regressed")
+    evidence[name] = {"count": count, "p50_upper_bound_seconds": p50, "p95_upper_bound_seconds": p95, "p99_upper_bound_seconds": p99, "status": "observed"}
 count, buckets = histogram("phoenix_exact_end_to_end_seconds")
-if buckets.get(5.0, -1) != count:
-    raise SystemExit(1)
+if buckets.get("5", buckets.get("5.0", -1)) != count:
+    reject("phoenix_exact_end_to_end_seconds_bucket", None, buckets.get("5", buckets.get("5.0")), None, count, "end_to_end_exceeded_five_seconds")
+for name, thresholds in {
+    "phoenix_fork_queue_wait_seconds": (0.050, 0.250),
+    "phoenix_fork_runtime_seconds": None,
+}.items():
+    count, buckets = histogram(name)
+    if count == 0:
+        evidence[name] = {"count": 0, "status": "idle"}
+        continue
+    if count < minimum_observations:
+        evidence[name] = {"count": count, "minimum_observations": minimum_observations, "status": "insufficient_observations"}
+        continue
+    p50 = quantile(name, 0.50, count, buckets)
+    p95 = quantile(name, 0.95, count, buckets)
+    p99 = quantile(name, 0.99, count, buckets)
+    if thresholds is not None and (p95 > thresholds[0] or p99 > thresholds[1]):
+        reject(name, p95, p99, p99 - p95, {"p95": thresholds[0], "p99": thresholds[1]}, "interval_quantile_slo_regressed")
+    evidence[name] = {"count": count, "p50_upper_bound_seconds": p50, "p95_upper_bound_seconds": p95, "p99_upper_bound_seconds": p99, "status": "observed"}
 print("POST_ARM_LATENCY_SLO_OK: " + json.dumps(evidence, sort_keys=True, separators=(",", ":")))
-' || fail "Exact latency histogram SLO regressed"
+' "$3" "$4" || fail "Exact latency histogram SLO regressed; detailed interval evidence emitted above"
 }
 
 require_disarmed_controls() {
@@ -373,6 +479,8 @@ baseline_provider_gateway=$(provider_gateway_counter_vector "$baseline_gateway_m
 baseline_primary_exact=$(printf '%s' "$baseline_hunter_health" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("last_primary_exact_at") or "")') ||
   fail "primary Exact sample evidence is unavailable"
 [ -n "$baseline_primary_exact" ] || fail "primary Exact sample evidence is empty"
+previous_hunter_metrics=$baseline_hunter_metrics
+latency_sample_count=0
 
 started_at=$(date +%s)
 deadline=$((started_at + duration_seconds))
@@ -404,7 +512,12 @@ while :; do
   require_hunter_ready "$current_hunter_health"
   current_hunter_metrics=$(hunter_metrics) || fail "hunter metrics evidence is unavailable"
   current_gateway_metrics=$(gateway_metrics) || fail "gateway metrics evidence is unavailable"
-  require_latency_gauges "$current_hunter_metrics"
+  latency_sample_count=$((latency_sample_count + 1))
+  latency_sample_timestamp=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+  require_latency_gauges \
+    "$previous_hunter_metrics" "$current_hunter_metrics" \
+    "$latency_sample_count" "$latency_sample_timestamp"
+  previous_hunter_metrics=$current_hunter_metrics
   [ "$(provider_health_counter_vector "$current_hunter_health")" = "$baseline_provider_health" ] ||
     fail "hunter provider failure/recovery counters regressed"
   [ "$(provider_gateway_counter_vector "$current_gateway_metrics")" = "$baseline_provider_gateway" ] ||
@@ -431,7 +544,9 @@ final_primary_exact=$(printf '%s' "$current_hunter_health" | python3 -c 'import 
   fail "final primary Exact sample evidence is unavailable"
 [ -n "$final_primary_exact" ] && [ "$final_primary_exact" != "$baseline_primary_exact" ] ||
   fail "primary Exact samples did not advance during monitoring"
-require_latency_histograms "$baseline_hunter_metrics" "$current_hunter_metrics"
+require_latency_histograms \
+  "$baseline_hunter_metrics" "$current_hunter_metrics" \
+  "$latency_sample_count" "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
 trap - EXIT
 echo "POST_ARM_REVENUE_MONITOR_OK: release=$release_sha duration_seconds=$duration_seconds authority_state=$authority_state"

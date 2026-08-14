@@ -1009,22 +1009,101 @@ func (s *Screener) runPriorityRecheckWindow(ctx context.Context, window time.Dur
 		return err
 	}
 	elapsed := time.Duration(0)
-	for elapsed+hotRevisitCadence < window {
-		if !s.waitDuration(ctx, hotRevisitCadence) {
+	nextTailAt := hotRevisitCadence
+	nextHotAt := hotRevisitCadence
+	for elapsed < window {
+		waitFor := window - elapsed
+		if nextTailAt < window && nextTailAt-elapsed < waitFor {
+			waitFor = nextTailAt - elapsed
+		}
+		if nextHotAt < window && nextHotAt-elapsed < waitFor {
+			waitFor = nextHotAt - elapsed
+		}
+		if eligibilityDelay, present := s.nextExactEligibilityWakeDelay(); present && eligibilityDelay < waitFor {
+			waitFor = eligibilityDelay
+		}
+		if waitFor > 0 && !s.waitDuration(ctx, waitFor) {
 			return errPriorityWindowStopped
 		}
-		elapsed += hotRevisitCadence
-		if _, err := s.runTailPriority(ctx); err != nil {
-			return err
+		elapsed += waitFor
+		if elapsed >= window {
+			break
 		}
-		if _, err := s.runHotPriority(ctx); err != nil {
-			return err
+
+		tailDue := elapsed >= nextTailAt
+		if tailDue {
+			if _, err := s.runTailPriority(ctx); err != nil {
+				return err
+			}
+			for nextTailAt <= elapsed {
+				nextTailAt += hotRevisitCadence
+			}
 		}
-	}
-	if remaining := window - elapsed; remaining > 0 && !s.waitDuration(ctx, remaining) {
-		return errPriorityWindowStopped
+
+		periodicHotDue := elapsed >= nextHotAt
+		hotDue := periodicHotDue
+		if !hotDue {
+			eligibilityDelay, present := s.nextExactEligibilityWakeDelay()
+			hotDue = present && eligibilityDelay <= 0
+		}
+		if hotDue {
+			if _, err := s.runHotPriority(ctx); err != nil {
+				return err
+			}
+			for nextHotAt <= elapsed {
+				nextHotAt += hotRevisitCadence
+			}
+			if !periodicHotDue {
+				// An eligibility wake consumes the next ordinary hot poll rather
+				// than adding a provider request to the priority window.
+				nextHotAt += hotRevisitCadence
+			}
+		}
 	}
 	return nil
+}
+
+// nextExactEligibilityWakeDelay returns the earliest local cooldown boundary
+// for work that can use an Exact worker. It deliberately does not poll a
+// provider or widen the durable state-request budget; it only wakes the
+// existing hot screen at the point where local eligibility changes.
+func (s *Screener) nextExactEligibilityWakeDelay() (time.Duration, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	now := s.nowUTC()
+	providerBlocked := (s.state.LastErrorClass != "" && s.state.LastErrorClass != revenueLaneAuthorityDivergedClass) ||
+		s.providerCircuitIsOpenLocked(now)
+	if providerBlocked || s.state.LastErrorClass == revenueLaneAuthorityDivergedClass {
+		return 0, false
+	}
+	budgetBlocked := s.exactAdmissionBlockedLocked(now)
+	earliest := time.Time{}
+	for borrower, hf := range s.hotBorrowers {
+		if s.exactInFlightBorrowers[borrower] || classify(s.hotDebtBase[borrower], hf) != "liquidatable" ||
+			!s.hotUpperPositive[borrower] || s.state.RouteIneligible[borrower] == "no_weth_debt" {
+			continue
+		}
+		completedAt, served := s.lastExactAt[borrower]
+		eligibleAt := exactEligibleSince(s.firstLiquidatableAt[borrower], completedAt, served)
+		if served && now.Before(completedAt) {
+			// Match screen(): a future completion timestamp does not establish
+			// a valid elapsed cooldown after clock rollback.
+			eligibleAt = time.Time{}
+		}
+		if eligibleAt.IsZero() || !now.Before(eligibleAt) {
+			if !budgetBlocked {
+				return 0, true
+			}
+			continue
+		}
+		if earliest.IsZero() || eligibleAt.Before(earliest) {
+			earliest = eligibleAt
+		}
+	}
+	if earliest.IsZero() {
+		return 0, false
+	}
+	return earliest.Sub(now), true
 }
 
 func (s *Screener) runTailPriority(ctx context.Context) (bool, error) {
@@ -1095,6 +1174,9 @@ func (s *Screener) Snapshot() State {
 				copy.ActiveForkPendingCount++
 			}
 			if !s.hotUpperPositive[borrower] {
+				continue
+			}
+			if s.exactInFlightBorrowers[borrower] {
 				continue
 			}
 			routeReason := s.state.RouteIneligible[borrower]

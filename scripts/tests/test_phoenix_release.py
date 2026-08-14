@@ -3140,6 +3140,24 @@ class WorkflowAndDeploymentContractTests(unittest.TestCase):
         ):
             self.assertIn(required, self.post_arm_monitor)
 
+        for required in (
+            "PHOENIX_MONITOR_GAUGE_BOUNDARY",
+            "POST_ARM_LATENCY_GAUGE_FAILED",
+            "actionable_queue_depth",
+            "in_flight_count",
+            "worker_queued_count",
+            "permit_availability",
+            "oldest_actionable_age_seconds",
+            "exact_completed_delta",
+            "histogram_counter_reset",
+            "insufficient_interval_observations",
+            "POST_ARM_LATENCY_INTERVAL_IDLE",
+            "phoenix_fork_queue_wait_seconds",
+            "phoenix_fork_runtime_seconds",
+            "p50_upper_bound_seconds",
+        ):
+            self.assertIn(required, self.post_arm_monitor)
+
     def test_controller_uses_no_powershell_or_general_scp(self) -> None:
         self.assertNotIn("powershell", self.workflow.lower())
         self.assertNotIn("pwsh", self.workflow.lower())
@@ -4069,6 +4087,184 @@ class WorkflowAndDeploymentContractTests(unittest.TestCase):
         self.assertIn("Never leak paths", (
             ROOT / "scripts/phoenix_release/cli.py"
         ).read_text())
+
+
+class PostArmMonitorSemanticsTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.monitor = (ROOT / "scripts/monitor-post-arm-revenue.sh").read_text()
+        cls.gauge_program = cls._embedded_program(
+            "require_latency_gauges() {", "require_latency_histograms() {"
+        )
+        cls.histogram_program = cls._embedded_program(
+            "require_latency_histograms() {", "require_disarmed_controls() {"
+        )
+
+    @classmethod
+    def _embedded_program(cls, start: str, end: str) -> str:
+        section = cls.monitor.split(start, maxsplit=1)[1].split(end, maxsplit=1)[0]
+        match = re.search(
+            r"python3 -c '\n(?P<body>.*?)\n' \"\$3\" \"\$4\" \|\|",
+            section,
+            re.S,
+        )
+        if match is None:
+            raise AssertionError(f"embedded monitor program not found: {start}")
+        return match.group("body")
+
+    @staticmethod
+    def _gauge_metrics(
+        *,
+        actionable: float = 0,
+        in_flight: float = 0,
+        worker_queued: float = 0,
+        available: float = 12,
+        oldest: float = 0,
+        completed: float = 10,
+        legacy_worker_queued: float | None = None,
+    ) -> str:
+        if legacy_worker_queued is None:
+            legacy_worker_queued = worker_queued
+        return "\n".join(
+            (
+                f"phoenix_aave_exact_eligible_now {actionable}",
+                f"phoenix_aave_exact_evaluations_in_flight {in_flight}",
+                f"phoenix_aave_exact_worker_queue_depth {worker_queued}",
+                f"phoenix_exact_queue_depth {legacy_worker_queued}",
+                f"phoenix_exact_worker_permits_available {available}",
+                f"phoenix_exact_oldest_actionable_age_seconds {oldest}",
+                f"phoenix_aave_exact_eval_completed_total {completed}",
+            )
+        )
+
+    def _run_gauge(self, previous: str, current: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [sys.executable, "-c", self.gauge_program, "2", "2026-08-14T13:00:00Z"],
+            input=previous + "\n# PHOENIX_MONITOR_GAUGE_BOUNDARY\n" + current,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+
+    @staticmethod
+    def _histogram_metrics(count: int, *, bucket_offset: int | None = None) -> str:
+        names = (
+            "phoenix_signal_to_prefilter_seconds",
+            "phoenix_liquidatable_to_exact_enqueue_seconds",
+            "phoenix_exact_queue_wait_seconds",
+            "phoenix_exact_first_rpc_dispatch_seconds",
+            "phoenix_exact_rpc_state_fetch_seconds",
+            "phoenix_exact_compute_seconds",
+            "phoenix_exact_end_to_end_seconds",
+            "phoenix_fork_queue_wait_seconds",
+            "phoenix_fork_runtime_seconds",
+        )
+        bucket_count = count if bucket_offset is None else bucket_offset
+        lines: list[str] = []
+        for name in names:
+            lines.append(f"{name}_count {count}")
+            for boundary in ("0.001", "0.025", "0.05", "0.25", "1", "2.5", "5", "+Inf"):
+                lines.append(f'{name}_bucket{{le="{boundary}"}} {bucket_count}')
+        return "\n".join(lines)
+
+    def _run_histograms(self, baseline: str, current: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [sys.executable, "-c", self.histogram_program, "10", "2026-08-14T13:10:00Z"],
+            input=baseline + "\n# PHOENIX_MONITOR_INTERVAL_BOUNDARY\n" + current,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+
+    def test_idle_and_first_transient_actionable_samples_are_not_starvation(self) -> None:
+        idle = self._gauge_metrics()
+        self.assertEqual(self._run_gauge(idle, idle).returncode, 0)
+        transient = self._run_gauge(
+            idle,
+            self._gauge_metrics(actionable=1, oldest=2),
+        )
+        self.assertEqual(transient.returncode, 0, transient.stderr)
+
+    def test_persistent_actionable_age_emits_complete_scalar_evidence(self) -> None:
+        result = self._run_gauge(
+            self._gauge_metrics(actionable=1, oldest=0.5),
+            self._gauge_metrics(actionable=1, oldest=2),
+        )
+        self.assertEqual(result.returncode, 1)
+        prefix = "POST_ARM_LATENCY_GAUGE_FAILED: "
+        self.assertIn(prefix, result.stderr)
+        evidence = json.loads(result.stderr.split(prefix, maxsplit=1)[1])
+        self.assertEqual(
+            evidence,
+            {
+                "actionable_queue_depth": 1.0,
+                "configured_threshold": 1.0,
+                "current_value": 2.0,
+                "delta": 1.5,
+                "exact_completed_delta": 0.0,
+                "in_flight_count": 0.0,
+                "metric_name": "phoenix_exact_oldest_actionable_age_seconds",
+                "oldest_actionable_age_seconds": 2.0,
+                "permit_availability": 12.0,
+                "previous_value": 0.5,
+                "reason": "actionable_age_grew_with_available_permit",
+                "sample_count": 2,
+                "timestamp": "2026-08-14T13:00:00Z",
+                "worker_queued_count": 0.0,
+            },
+        )
+
+    def test_stale_idle_age_and_worker_queue_permit_contradiction_fail(self) -> None:
+        baseline = self._gauge_metrics()
+        stale = self._run_gauge(baseline, self._gauge_metrics(oldest=2))
+        self.assertEqual(stale.returncode, 1)
+        self.assertIn("idle_actionable_age_not_reset", stale.stderr)
+        contradiction = self._run_gauge(
+            baseline,
+            self._gauge_metrics(in_flight=2, worker_queued=1, available=1),
+        )
+        self.assertEqual(contradiction.returncode, 1)
+        self.assertIn("worker_queue_present_with_available_permit", contradiction.stderr)
+        reset = self._run_gauge(baseline, self._gauge_metrics(completed=9))
+        self.assertEqual(reset.returncode, 1)
+        self.assertIn("exact_completed_counter_reset", reset.stderr)
+
+    def test_saturated_queue_with_completion_progress_is_not_false_starvation(self) -> None:
+        result = self._run_gauge(
+            self._gauge_metrics(actionable=1, in_flight=12, available=0, oldest=0.5),
+            self._gauge_metrics(actionable=1, in_flight=12, available=0, oldest=2, completed=11),
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_histograms_difference_intervals_and_report_p50_p95_p99(self) -> None:
+        result = self._run_histograms(
+            self._histogram_metrics(100),
+            self._histogram_metrics(105),
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        prefix = "POST_ARM_LATENCY_SLO_OK: "
+        evidence = json.loads(result.stdout.split(prefix, maxsplit=1)[1])
+        exact = evidence["phoenix_exact_queue_wait_seconds"]
+        self.assertEqual(exact["count"], 5)
+        self.assertEqual(exact["p50_upper_bound_seconds"], 0.001)
+        self.assertEqual(exact["p95_upper_bound_seconds"], 0.001)
+        self.assertEqual(exact["p99_upper_bound_seconds"], 0.001)
+        self.assertEqual(evidence["phoenix_fork_runtime_seconds"]["status"], "observed")
+
+    def test_idle_histogram_interval_is_not_a_latency_regression(self) -> None:
+        metrics = self._histogram_metrics(100)
+        result = self._run_histograms(metrics, metrics)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("POST_ARM_LATENCY_INTERVAL_IDLE", result.stdout)
+
+    def test_histogram_reset_and_insufficient_samples_are_explicit(self) -> None:
+        baseline = self._histogram_metrics(100)
+        reset = self._run_histograms(baseline, self._histogram_metrics(99))
+        self.assertEqual(reset.returncode, 1)
+        self.assertIn("histogram_counter_reset", reset.stderr)
+        insufficient = self._run_histograms(baseline, self._histogram_metrics(103))
+        self.assertEqual(insufficient.returncode, 1)
+        self.assertIn("insufficient_interval_observations", insufficient.stderr)
 
 
 if __name__ == "__main__":
