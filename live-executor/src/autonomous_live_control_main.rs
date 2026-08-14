@@ -1935,6 +1935,148 @@ async fn hunter_readiness_or_fail_closed(pool: &PgPool) -> ControlResult<Value> 
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum ClosedLaneProviderAction {
+    PreserveReadiness,
+    AwaitRecoveryEvidence,
+    RecoverBoundFailure,
+    FailClosed(String),
+}
+
+fn provider_execution_gate_failure_reason(payload: &Value, now_millis: i64) -> Option<String> {
+    let exact_ready = payload
+        .get("exact_execution_readiness")
+        .and_then(Value::as_bool)
+        == Some(true);
+    let circuit_closed = payload
+        .get("provider_circuit_open_until_unix_millis")
+        .and_then(Value::as_i64)
+        .is_some_and(|until| until <= now_millis);
+    let failure_streak_clear = payload
+        .get("provider_current_class_failure_streak")
+        .and_then(Value::as_u64)
+        == Some(0);
+    let hunting_healthy = payload.get("hunting_health").and_then(Value::as_bool) == Some(true);
+    let atlas_connected = payload.get("atlas_connected").and_then(Value::as_bool) == Some(true);
+    let recovery_state = payload
+        .get("provider_recovery_state")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let degraded_reason = payload
+        .get("degraded_reason")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if exact_ready
+        && circuit_closed
+        && failure_streak_clear
+        && hunting_healthy
+        && atlas_connected
+        && degraded_reason.is_empty()
+    {
+        return None;
+    }
+    if !exact_ready
+        && circuit_closed
+        && failure_streak_clear
+        && hunting_healthy
+        && atlas_connected
+        && degraded_reason.is_empty()
+        && matches!(recovery_state, "recovering" | "collecting")
+    {
+        return None;
+    }
+    Some(
+        if matches!(
+            degraded_reason,
+            "provider_disagreement"
+                | "provider_unavailable"
+                | "provider_timeout"
+                | "provider_rate_limited"
+                | "revenue_lane_authority_diverged"
+        ) {
+            degraded_reason
+        } else {
+            "exact_state_stale_or_incomplete"
+        }
+        .to_string(),
+    )
+}
+
+fn closed_lane_provider_action(
+    state: &EconomicState,
+    payload: &Value,
+    now: DateTime<Utc>,
+) -> ClosedLaneProviderAction {
+    if let Some(reason) = provider_execution_gate_failure_reason(payload, now.timestamp_millis()) {
+        return ClosedLaneProviderAction::FailClosed(reason);
+    }
+    if provider_recovery_samples_at(payload, now).is_err() {
+        return ClosedLaneProviderAction::AwaitRecoveryEvidence;
+    }
+    match (state.phase, state.level) {
+        (EconomicPhase::DisarmedEvidence, SizeLevel::MaxReviewed) => {
+            ClosedLaneProviderAction::PreserveReadiness
+        }
+        (EconomicPhase::DisarmedFailure, SizeLevel::MaxReviewed) => {
+            ClosedLaneProviderAction::RecoverBoundFailure
+        }
+        _ => ClosedLaneProviderAction::AwaitRecoveryEvidence,
+    }
+}
+
+fn exact_revenue_execution_authorized(states: &[(bool, bool)]) -> bool {
+    states.iter().all(|(armed, kill)| *armed && !*kill)
+}
+
+fn provider_recovery_owner_allows_execution(owner_state: &Value) -> bool {
+    owner_state.get("paused").and_then(Value::as_bool) == Some(false)
+}
+
+async fn preserve_intentionally_closed_provider_readiness(pool: &PgPool) -> ControlResult<()> {
+    let preserved = sqlx::query(
+        "UPDATE live_canary.revenue_provider_authority AS provider
+         SET recovery_status = CASE
+                 WHEN provider.recovery_status = 'recovered' THEN 'recovered'
+                 ELSE 'ready'
+             END,
+             last_block_reason = NULL,
+             updated_at = now()
+         FROM live_canary.economic_control AS economic
+         WHERE provider.singleton AND economic.singleton
+           AND economic.phase = 'DISARMED_EVIDENCE'
+           AND economic.current_size_level = 'MAX_REVIEWED'
+           AND economic.current_input_wei = economic.maximum_reviewed_input_wei
+           AND economic.current_input_wei = $1::numeric
+           AND provider.exact_execution_ready
+           AND provider.sample_count = 3
+           AND provider.sample_1_at IS NOT NULL
+           AND provider.sample_2_at > provider.sample_1_at
+           AND provider.sample_3_at > provider.sample_2_at
+           AND provider.sample_3_at >= now() - interval '10 minutes'
+           AND provider.sample_1_primary_provider = 'production-nownodes-arbitrum'
+           AND provider.sample_2_primary_provider = 'production-nownodes-arbitrum'
+           AND provider.sample_3_primary_provider = 'production-nownodes-arbitrum'
+           AND provider.sample_1_confirmation_provider IS NULL
+           AND provider.sample_2_confirmation_provider IS NULL
+           AND provider.sample_3_confirmation_provider IS NULL
+           AND (SELECT count(*) FROM live_canary.revenue_lane_controls
+                WHERE lane IN ('aave_liquidation','atlas_solver')) = 2
+           AND NOT EXISTS (
+               SELECT 1 FROM live_canary.revenue_lane_controls
+               WHERE lane IN ('aave_liquidation','atlas_solver')
+                 AND (armed OR NOT kill_switch)
+           )",
+    )
+    .bind(MAXIMUM_REVIEWED_INPUT_WEI.to_string())
+    .execute(pool)
+    .await
+    .map_err(|_| "intentionally closed provider readiness update failed")?;
+    if preserved.rows_affected() != 1 {
+        return Err("intentionally closed provider readiness changed concurrently".into());
+    }
+    Ok(())
+}
+
 async fn converge_revenue_provider_authority(pool: &PgPool) -> ControlResult<()> {
     let rows = sqlx::query(
         "SELECT lane, armed, kill_switch
@@ -1965,9 +2107,21 @@ async fn converge_revenue_provider_authority(pool: &PgPool) -> ControlResult<()>
     let both_closed = states.iter().all(|(armed, kill)| !armed && *kill);
     if both_closed {
         let payload = hunter_readiness_or_fail_closed(pool).await?;
-        return attempt_provider_authority_recovery(pool, &payload).await;
+        let state = economic_state(pool).await?;
+        return match closed_lane_provider_action(&state, &payload, Utc::now()) {
+            ClosedLaneProviderAction::PreserveReadiness => {
+                preserve_intentionally_closed_provider_readiness(pool).await
+            }
+            ClosedLaneProviderAction::AwaitRecoveryEvidence => Ok(()),
+            ClosedLaneProviderAction::RecoverBoundFailure => {
+                attempt_provider_authority_recovery(pool, &payload).await
+            }
+            ClosedLaneProviderAction::FailClosed(reason) => {
+                fail_close_provider_execution_gate(pool, &reason).await
+            }
+        };
     }
-    let both_active = states.iter().all(|(armed, kill)| *armed && !kill);
+    let both_active = exact_revenue_execution_authorized(&states);
     let reason = if both_active {
         let payload = hunter_readiness_or_fail_closed(pool).await?;
         let degraded_reason = payload
@@ -2073,6 +2227,10 @@ fn provider_recovery_samples_at(
             .get("provider_recovery_state")
             .and_then(Value::as_str)
             != Some("ready")
+        || payload
+            .get("provider_current_class_failure_streak")
+            .and_then(Value::as_u64)
+            != Some(0)
         || payload
             .get("provider_circuit_open_until_unix_millis")
             .and_then(Value::as_i64)
@@ -2299,7 +2457,7 @@ async fn attempt_provider_authority_recovery_inner(
     }
     let owner_evidence = runtime_preflight_from_environment().await?;
     let owner_state = provider_recovery_owner_state(&owner_evidence, &release_sha)?;
-    if owner_state.get("paused").and_then(Value::as_bool) != Some(false) {
+    if !provider_recovery_owner_allows_execution(owner_state) {
         let _ = sqlx::query(
             "UPDATE live_canary.revenue_provider_authority
              SET recovery_blocked_total = recovery_blocked_total + 1,
@@ -2496,7 +2654,7 @@ async fn attempt_provider_authority_recovery_inner(
     })?;
     let final_owner_evidence = runtime_preflight_from_environment().await?;
     let final_owner_state = provider_recovery_owner_state(&final_owner_evidence, &release_sha)?;
-    if final_owner_state.get("paused").and_then(Value::as_bool) != Some(false) {
+    if !provider_recovery_owner_allows_execution(final_owner_state) {
         return Err("final provider recovery executor state diverged".into());
     }
     let updated = sqlx::query(
@@ -4740,7 +4898,7 @@ async fn post_recovery_live_mode_facts(
                  WHERE status IN ('claimed','signed','submitted','submission_unknown')) AS active_atlas,
                 lock.active_lane IS NULL AND lock.active_identity IS NULL
                     AND lock.acquired_at IS NULL AS lock_free,
-                provider.exact_execution_ready AND provider.recovery_status='ready'
+                provider.exact_execution_ready AND provider.recovery_status IN ('ready','recovered')
                     AND provider.sample_count=3 AS provider_ready
          FROM live_canary.control legacy
          CROSS JOIN live_canary.autonomous_global_control global
@@ -5850,6 +6008,16 @@ mod tests {
         })
     }
 
+    fn healthy_provider_recovery_payload(now: DateTime<Utc>) -> Value {
+        let mut payload = hunter_readiness();
+        payload["provider_recovery_samples"] = json!([
+            {"observed_at": (now-ChronoDuration::seconds(3)).to_rfc3339(), "primary_provider":"production-nownodes-arbitrum", "confirmation":null, "quorum":1},
+            {"observed_at": (now-ChronoDuration::seconds(2)).to_rfc3339(), "primary_provider":"production-nownodes-arbitrum", "confirmation":null, "quorum":1},
+            {"observed_at": (now-ChronoDuration::seconds(1)).to_rfc3339(), "primary_provider":"production-nownodes-arbitrum", "confirmation":null, "quorum":1}
+        ]);
+        payload
+    }
+
     fn readiness() -> ReadinessBinding {
         let start = evidence_time();
         ReadinessBinding {
@@ -6252,6 +6420,140 @@ mod tests {
         assert!(provider_recovery_samples(&payload).is_err());
         payload["provider_recovery_samples"] = json!([]);
         assert!(provider_recovery_samples(&payload).is_err());
+    }
+
+    #[test]
+    fn healthy_disarmed_evidence_closed_lanes_remain_ready_for_ten_supervisor_cycles() {
+        let now = Utc::now();
+        let payload = healthy_provider_recovery_payload(now);
+        let mut economic = state(EconomicPhase::DisarmedEvidence);
+        economic.level = SizeLevel::MaxReviewed;
+        economic.current_input_wei = MAXIMUM_REVIEWED_INPUT_WEI;
+        for _ in 0..10 {
+            assert_eq!(
+                closed_lane_provider_action(&economic, &payload, now),
+                ClosedLaneProviderAction::PreserveReadiness
+            );
+        }
+    }
+
+    #[test]
+    fn closed_revenue_lanes_never_grant_execution_authority() {
+        assert!(!exact_revenue_execution_authorized(&[
+            (false, true),
+            (false, true),
+        ]));
+        assert!(!exact_revenue_execution_authorized(&[
+            (true, false),
+            (false, true),
+        ]));
+        assert!(exact_revenue_execution_authorized(&[
+            (true, false),
+            (true, false),
+        ]));
+    }
+
+    #[test]
+    fn paused_contract_never_grants_provider_recovery_execution_authority() {
+        assert!(!provider_recovery_owner_allows_execution(
+            &json!({"paused": true})
+        ));
+        assert!(provider_recovery_owner_allows_execution(
+            &json!({"paused": false})
+        ));
+        assert!(!provider_recovery_owner_allows_execution(&json!({})));
+    }
+
+    #[test]
+    fn real_provider_failures_remain_fail_closed() {
+        let now = Utc::now();
+        let mut economic = state(EconomicPhase::DisarmedEvidence);
+        economic.level = SizeLevel::MaxReviewed;
+        economic.current_input_wei = MAXIMUM_REVIEWED_INPUT_WEI;
+        for reason in [
+            "provider_timeout",
+            "provider_unavailable",
+            "provider_rate_limited",
+            "wrong_chain",
+            "stale_state",
+            "incomplete_state",
+        ] {
+            let mut payload = healthy_provider_recovery_payload(now);
+            payload["exact_execution_readiness"] = json!(false);
+            payload["provider_current_class_failure_streak"] = json!(1);
+            payload["provider_circuit_open_until_unix_millis"] =
+                json!(now.timestamp_millis() + 60_000);
+            payload["degraded_reason"] = json!(reason);
+            assert!(matches!(
+                closed_lane_provider_action(&economic, &payload, now),
+                ClosedLaneProviderAction::FailClosed(_)
+            ));
+        }
+        let mut circuit_open = healthy_provider_recovery_payload(now);
+        circuit_open["provider_circuit_open_until_unix_millis"] =
+            json!(now.timestamp_millis() + 60_000);
+        assert!(matches!(
+            closed_lane_provider_action(&economic, &circuit_open, now),
+            ClosedLaneProviderAction::FailClosed(_)
+        ));
+    }
+
+    #[test]
+    fn provider_recovery_still_requires_three_fresh_samples() {
+        let now = Utc::now();
+        let mut economic = state(EconomicPhase::DisarmedEvidence);
+        economic.level = SizeLevel::MaxReviewed;
+        economic.current_input_wei = MAXIMUM_REVIEWED_INPUT_WEI;
+        let ready = healthy_provider_recovery_payload(now);
+        let mut two_samples = ready.clone();
+        two_samples["provider_recovery_sample_count"] = json!(2);
+        two_samples["provider_recovery_samples"]
+            .as_array_mut()
+            .expect("sample array")
+            .pop();
+        assert_eq!(
+            closed_lane_provider_action(&economic, &two_samples, now),
+            ClosedLaneProviderAction::AwaitRecoveryEvidence
+        );
+        assert_eq!(
+            closed_lane_provider_action(&economic, &ready, now),
+            ClosedLaneProviderAction::PreserveReadiness
+        );
+    }
+
+    #[test]
+    fn post_recovery_live_mode_preflight_remains_stable_across_supervisor_cycles() {
+        let now = Utc::now();
+        let payload = healthy_provider_recovery_payload(now);
+        let mut economic = state(EconomicPhase::DisarmedEvidence);
+        economic.level = SizeLevel::MaxReviewed;
+        economic.current_input_wei = MAXIMUM_REVIEWED_INPUT_WEI;
+        let facts = valid_post_recovery_live_mode_facts();
+        for _ in 0..10 {
+            assert_eq!(
+                closed_lane_provider_action(&economic, &payload, now),
+                ClosedLaneProviderAction::PreserveReadiness
+            );
+            assert!(validate_post_recovery_live_mode_facts(&facts, &"a".repeat(40)).is_ok());
+        }
+    }
+
+    #[test]
+    fn enter_post_recovery_live_mode_needs_no_market_opportunity() {
+        let now = Utc::now();
+        let payload = healthy_provider_recovery_payload(now);
+        let mut economic = state(EconomicPhase::DisarmedEvidence);
+        economic.level = SizeLevel::MaxReviewed;
+        economic.current_input_wei = MAXIMUM_REVIEWED_INPUT_WEI;
+        assert_eq!(
+            closed_lane_provider_action(&economic, &payload, now),
+            ClosedLaneProviderAction::PreserveReadiness
+        );
+        assert!(validate_post_recovery_live_mode_facts(
+            &valid_post_recovery_live_mode_facts(),
+            &"a".repeat(40),
+        )
+        .is_ok());
     }
 
     fn valid_provider_recovery_binding(
