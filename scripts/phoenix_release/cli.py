@@ -18,6 +18,7 @@ from phoenix_release.gateway import (  # noqa: E402
     buffer_rpc_provider_secret,
     evidence,
     emergency_pause,
+    enter_post_recovery_live_mode,
     history,
     host_paths,
     json_error,
@@ -63,6 +64,12 @@ def parser() -> argparse.ArgumentParser:
     rollback = subparsers.add_parser("rollback")
     rollback.add_argument("release_sha", type=_sha)
     subparsers.add_parser("emergency-pause")
+    live_mode = subparsers.add_parser("enter-post-recovery-live-mode")
+    live_mode.add_argument("release_sha", type=_sha)
+    live_mode.add_argument(
+        "acknowledgement",
+        choices=["enter-recovered-live-mode-42161"],
+    )
     evidence_parser = subparsers.add_parser("evidence")
     evidence_parser.add_argument("release_sha", type=_sha)
     subparsers.add_parser("reconcile-active-context")
@@ -131,6 +138,12 @@ def main(argv: list[str] | None = None) -> int:
             result = rollback_release(paths, arguments.release_sha)
         elif arguments.command == "emergency-pause":
             result = emergency_pause(paths)
+        elif arguments.command == "enter-post-recovery-live-mode":
+            result = enter_post_recovery_live_mode(
+                paths,
+                arguments.release_sha,
+                arguments.acknowledgement,
+            )
         else:
             raise GatewayError("COMMAND_UNSUPPORTED")
         print(json_result(result))

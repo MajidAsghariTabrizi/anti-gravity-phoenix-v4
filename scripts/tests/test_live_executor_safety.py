@@ -98,6 +98,28 @@ class LiveExecutorSafetyTests(unittest.TestCase):
         self.assertNotRegex(overlay, r"(?m)^\s+SIGNER_PRIVATE_KEY\s*:")
         self.assertNotRegex(overlay, r"ports:\s*\n")
 
+        for service in ("autonomous-control", "live-executor"):
+            block = re.search(
+                rf"(?ms)^  {service}:\s*\n(?P<body>.*?)(?=^  [a-zA-Z0-9_-]+:\s*\n|\Z)",
+                overlay,
+            )
+            self.assertIsNotNone(block)
+            self.assertIn(
+                "PHOENIX_OPERATOR_MODE: ${PHOENIX_MODE:?PHOENIX_MODE is required}",
+                block.group("body"),
+            )
+            self.assertIn(
+                "PHOENIX_OPERATOR_LIVE_EXECUTION: ${LIVE_EXECUTION:?LIVE_EXECUTION is required}",
+                block.group("body"),
+            )
+            self.assertIn(
+                "PHOENIX_OPERATOR_AUTONOMOUS_EXECUTION: ${AUTONOMOUS_EXECUTION:?AUTONOMOUS_EXECUTION is required}",
+                block.group("body"),
+            )
+        self.assertEqual(overlay.count("PHOENIX_OPERATOR_MODE:"), 2)
+        self.assertEqual(overlay.count("PHOENIX_OPERATOR_LIVE_EXECUTION:"), 2)
+        self.assertEqual(overlay.count("PHOENIX_OPERATOR_AUTONOMOUS_EXECUTION:"), 2)
+
     def test_canary_schema_does_not_change_root_migrations(self) -> None:
         root_migrations = sorted(path.name for path in (ROOT / "migrations").glob("*.sql"))
         self.assertEqual(root_migrations[-1], "015_bounded_economic_view_plans.sql")

@@ -67,6 +67,7 @@ SAFE_CODE_RE = re.compile(r"^[A-Z][A-Z0-9_]{2,63}$")
 SENSITIVE_OUTPUT_RE = re.compile(
     r"(?i)\b(?:https?|wss?|postgres(?:ql)?|nats)://[^\s\"']+"
 )
+POST_RECOVERY_LIVE_MODE_ACK = "enter-recovered-live-mode-42161"
 CONTROL_EVIDENCE_KEYS = {
     "active_attempts",
     "active_atlas",
@@ -3038,6 +3039,157 @@ def emergency_pause(paths: HostPaths) -> dict[str, Any]:
         "pause_action": pause_action,
         "pause_evidence": observed_pause,
         "shadow_restored": True,
+    }
+
+
+def enter_post_recovery_live_mode(
+    paths: HostPaths,
+    release_sha: str,
+    acknowledgement: str,
+) -> dict[str, Any]:
+    if acknowledgement != POST_RECOVERY_LIVE_MODE_ACK:
+        raise GatewayError("POST_RECOVERY_LIVE_ACK_INVALID")
+    initial = status(paths)
+    if (
+        initial["active_release"] != release_sha
+        or initial["release_assets_sha"] != release_sha
+        or initial["phoenix_mode"] != "SHADOW"
+        or initial["live_execution"] is not False
+        or initial["autonomous_execution"] is not False
+    ):
+        raise GatewayError("POST_RECOVERY_LIVE_INITIAL_STATE_INVALID")
+    _live_executor_stopped()
+    initial_controls = _control_evidence(paths, initial)
+    _require_fail_closed_controls(initial_controls)
+
+    release_env = paths.deploy_dir / "current-release.env"
+    live_compose = production_compose_command(
+        paths,
+        mode="LIVE",
+        release_env=release_env,
+    )
+    authority_preflight = live_compose + [
+        "run",
+        "--rm",
+        "--no-deps",
+        "-e",
+        f"PHOENIX_RELEASE_SHA={release_sha}",
+        "-e",
+        "PHOENIX_ENTER_LIVE_MODE_ACK=ENTER_RECOVERED_LIVE_MODE_42161",
+        "autonomous-control",
+        "preflight-post-recovery-live-mode",
+    ]
+    signer_preflight = live_compose + [
+        "run",
+        "--rm",
+        "--no-deps",
+        "-e",
+        f"PHOENIX_RELEASE_SHA={release_sha}",
+        "--entrypoint",
+        "/usr/local/bin/autonomous-live-control",
+        "live-executor",
+        "owner-configured-signer-preflight",
+    ]
+    _require_success(
+        authority_preflight,
+        "POST_RECOVERY_LIVE_PREFLIGHT_FAILED",
+    )
+    _require_success(
+        signer_preflight,
+        "POST_RECOVERY_LIVE_SIGNER_PREFLIGHT_FAILED",
+    )
+
+    mutated = False
+    try:
+        mutated = True
+        _require_success(
+            [
+                "/usr/bin/python3",
+                "-I",
+                "-B",
+                str(paths.libexec / "production_mode.py"),
+                "live",
+                "--env-file",
+                str(paths.env_file),
+            ],
+            "POST_RECOVERY_LIVE_MODE_MUTATION_FAILED",
+        )
+        final = status(paths)
+        if (
+            final["active_release"] != release_sha
+            or final["release_assets_sha"] != release_sha
+            or final["phoenix_mode"] != "LIVE"
+            or final["live_execution"] is not True
+            or final["autonomous_execution"] is not True
+        ):
+            raise GatewayError("POST_RECOVERY_LIVE_POSTCONDITION_FAILED")
+        _live_executor_stopped()
+        final_controls = _control_evidence(paths, final)
+        _require_fail_closed_controls(final_controls)
+        _require_success(
+            authority_preflight,
+            "POST_RECOVERY_LIVE_FINAL_PREFLIGHT_FAILED",
+        )
+        _require_success(
+            signer_preflight,
+            "POST_RECOVERY_LIVE_FINAL_SIGNER_PREFLIGHT_FAILED",
+        )
+    except Exception:
+        if mutated:
+            try:
+                _require_success(
+                    [
+                        "/usr/bin/python3",
+                        "-I",
+                        "-B",
+                        str(paths.libexec / "production_mode.py"),
+                        "shadow",
+                        "--env-file",
+                        str(paths.env_file),
+                    ],
+                    "POST_RECOVERY_LIVE_SHADOW_RESTORE_FAILED",
+                )
+                restored = status(paths)
+                if (
+                    restored["active_release"] != release_sha
+                    or restored["release_assets_sha"] != release_sha
+                    or restored["phoenix_mode"] != "SHADOW"
+                    or restored["live_execution"] is not False
+                    or restored["autonomous_execution"] is not False
+                ):
+                    raise GatewayError(
+                        "POST_RECOVERY_LIVE_SHADOW_RESTORE_FAILED"
+                    )
+                _live_executor_stopped()
+                _require_fail_closed_controls(
+                    _control_evidence(paths, restored)
+                )
+            except Exception as restore_error:
+                if isinstance(
+                    restore_error, GatewayError
+                ) and restore_error.code == "POST_RECOVERY_LIVE_SHADOW_RESTORE_FAILED":
+                    raise
+                raise GatewayError(
+                    "POST_RECOVERY_LIVE_SHADOW_RESTORE_FAILED"
+                ) from restore_error
+        raise
+
+    return {
+        "schema": "phoenix.post-recovery-live-mode.v1",
+        "status": "live-mode-ready",
+        "release_sha": release_sha,
+        "phoenix_mode": "LIVE",
+        "live_execution": True,
+        "autonomous_execution": True,
+        "contract_paused": True,
+        "live_executor_stopped": True,
+        "aave_armed": False,
+        "atlas_armed": False,
+        "generic_closed": True,
+        "active_attempts": 0,
+        "active_atlas": 0,
+        "unresolved_submissions": 0,
+        "submission_lock_free": True,
     }
 
 

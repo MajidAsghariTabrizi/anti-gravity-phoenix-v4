@@ -13,8 +13,8 @@ use phoenix_live_executor::economic_control::{
 };
 use phoenix_live_executor::model::{CanonicalAddress, ExecutionRequest, ValidatedLeg};
 use phoenix_live_executor::owner_bootstrap::{
-    configured_preflight_from_environment, execute_from_environment,
-    live_preflight_from_environment, owner_plan_from_environment,
+    configured_preflight_from_environment, configured_signer_preflight_from_environment,
+    execute_from_environment, live_preflight_from_environment, owner_plan_from_environment,
     runtime_preflight_from_environment, OwnerBootstrapError, OwnerMutation,
 };
 use phoenix_live_executor::rpc::{ExecutionRpc, HttpExecutionRpc};
@@ -86,6 +86,7 @@ const ACTIVATE_ACK: &str = "ACTIVATE_READY_MIN_CANARY_42161";
 const ARM_REVENUE_LANES_ACK: &str = "ARM_ATLAS_AAVE_LIVE_42161";
 const SET_REVENUE_SIZE_MAX_REVIEWED_ACK: &str = "SET_MAX_REVIEWED_LIVE_SIZE_42161";
 const RECOVER_POST_ARM_ACCEPTANCE_ACK: &str = "RECOVER_POST_ARM_ACCEPTANCE_FAILURE_42161";
+const ENTER_RECOVERED_LIVE_MODE_ACK: &str = "ENTER_RECOVERED_LIVE_MODE_42161";
 const POST_ARM_ACCEPTANCE_FAILURE_REASON: &str = "post_arm_acceptance_failed";
 const POST_ARM_RECOVERY_REASON: &str = "operator_recovered_post_arm_monitor_failure";
 const RETAINED_PROFIT_FLOOR_WEI: u128 = 1_000_000_000_000;
@@ -195,6 +196,7 @@ async fn run() -> ControlResult<()> {
         "owner-plan" => owner_plan().await?,
         "owner-configure" => owner_mutation(OwnerMutation::Configure).await?,
         "owner-configured-preflight" => owner_configured_preflight().await?,
+        "owner-configured-signer-preflight" => owner_configured_signer_preflight().await?,
         "owner-live-preflight" => owner_live_preflight().await?,
         "owner-unpause" => owner_mutation(OwnerMutation::Unpause).await?,
         "owner-pause" => owner_mutation(OwnerMutation::Pause).await?,
@@ -208,6 +210,7 @@ async fn run() -> ControlResult<()> {
         "set-revenue-size-max-reviewed" => set_revenue_size_max_reviewed().await?,
         "arm-revenue-lanes" => arm_revenue_lanes().await?,
         "recover-post-arm-acceptance-failure" => recover_post_arm_acceptance_failure().await?,
+        "preflight-post-recovery-live-mode" => preflight_post_recovery_live_mode().await?,
         "activate" => return Err("direct activation is disabled; use activate-ready-canary".into()),
         "evaluate-economic-control" => evaluate_economic_control(&database_pool().await?).await?,
         "supervise-economic-control" => supervise_economic_control().await?,
@@ -396,6 +399,17 @@ async fn owner_configured_preflight() -> ControlResult<()> {
     Ok(())
 }
 
+async fn owner_configured_signer_preflight() -> ControlResult<()> {
+    let evidence = configured_signer_preflight_from_environment().await?;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&evidence)
+            .map_err(|_| "owner signer preflight evidence serialization failed")?
+    );
+    println!("EXECUTOR_OWNER_CONFIGURED_SIGNER_PREFLIGHT_OK");
+    Ok(())
+}
+
 #[derive(Clone, Debug)]
 struct LivePreflightFacts {
     phase: EconomicPhase,
@@ -569,6 +583,9 @@ async fn owner_live_preflight() -> ControlResult<()> {
 }
 
 async fn owner_mutation(mutation: OwnerMutation) -> ControlResult<()> {
+    if mutation == OwnerMutation::Unpause {
+        require_live_operator_mode()?;
+    }
     let evidence = execute_from_environment(mutation).await?;
     println!(
         "{}",
@@ -4435,6 +4452,7 @@ async fn arm_revenue_lanes() -> ControlResult<()> {
         return Err("revenue lane acknowledgement is invalid".into());
     }
     require_signerless_control()?;
+    require_live_operator_mode()?;
     let pool = database_pool().await?;
     arm_revenue_lanes_in_pool(&pool).await
 }
@@ -4603,6 +4621,183 @@ async fn arm_revenue_lanes_in_pool(pool: &PgPool) -> ControlResult<()> {
         maximum_atlas_bid,
         daily_loss_limit,
         retained_profit_floor
+    );
+    Ok(())
+}
+
+#[derive(Clone, Debug)]
+struct PostRecoveryLiveModeFacts {
+    previous: EconomicState,
+    revenue_lanes: Vec<(String, bool, bool, u128, u128)>,
+    generic_closed: bool,
+    active_attempts: i64,
+    unresolved_submissions: i64,
+    active_atlas: i64,
+    lock_free: bool,
+    provider_ready: bool,
+    activation_outbox_empty: bool,
+    samples: Vec<(DateTime<Utc>, String)>,
+}
+
+fn validate_post_recovery_live_mode_facts(
+    facts: &PostRecoveryLiveModeFacts,
+    release_sha: &str,
+) -> ControlResult<()> {
+    let expected_lanes = ["aave_liquidation", "atlas_solver"];
+    if facts.previous.phase != EconomicPhase::DisarmedEvidence
+        || facts.previous.level != SizeLevel::MaxReviewed
+        || facts.previous.current_input_wei != MAXIMUM_REVIEWED_INPUT_WEI
+        || facts.previous.maximum_reviewed_input_wei != MAXIMUM_REVIEWED_INPUT_WEI
+        || facts.previous.release_sha.as_deref() != Some(release_sha)
+        || facts.revenue_lanes.len() != expected_lanes.len()
+        || facts.revenue_lanes.iter().zip(expected_lanes).any(
+            |((lane, armed, kill_switch, maximum, floor), expected)| {
+                lane != expected
+                    || *armed
+                    || !*kill_switch
+                    || *maximum != MAXIMUM_REVIEWED_INPUT_WEI
+                    || *floor != RETAINED_PROFIT_FLOOR_WEI
+            },
+        )
+        || !facts.generic_closed
+        || facts.active_attempts != 0
+        || facts.unresolved_submissions != 0
+        || facts.active_atlas != 0
+        || !facts.lock_free
+        || !facts.provider_ready
+        || !facts.activation_outbox_empty
+        || facts.samples.len() != 3
+        || facts
+            .samples
+            .iter()
+            .any(|(_, primary)| primary != "production-nownodes-arbitrum")
+    {
+        return Err("post-recovery LIVE-mode preconditions are not satisfied".into());
+    }
+    Ok(())
+}
+
+async fn post_recovery_live_mode_facts(
+    pool: &PgPool,
+    release_sha: &str,
+    samples: Vec<(DateTime<Utc>, String)>,
+    outbox_empty: bool,
+) -> ControlResult<PostRecoveryLiveModeFacts> {
+    require_schema(pool).await?;
+    let mut transaction = pool
+        .begin()
+        .await
+        .map_err(|_| "post-recovery LIVE-mode transaction failed")?;
+    let previous = economic_state_for_update(&mut transaction).await?;
+    let lanes = sqlx::query(
+        "SELECT lane, armed, kill_switch,
+                maximum_input_amount::text AS maximum_input_amount,
+                retained_profit_floor::text AS retained_profit_floor
+         FROM live_canary.revenue_lane_controls
+         WHERE lane IN ('aave_liquidation','atlas_solver')
+         ORDER BY lane FOR UPDATE",
+    )
+    .fetch_all(&mut *transaction)
+    .await
+    .map_err(|_| "post-recovery LIVE-mode lane authority is unavailable")?
+    .iter()
+    .map(|row| {
+        Ok((
+            row.try_get("lane")
+                .map_err(|_| "post-recovery LIVE-mode lane authority is invalid")?,
+            row.try_get("armed")
+                .map_err(|_| "post-recovery LIVE-mode lane authority is invalid")?,
+            row.try_get("kill_switch")
+                .map_err(|_| "post-recovery LIVE-mode lane authority is invalid")?,
+            row.try_get::<String, _>("maximum_input_amount")
+                .map_err(|_| "post-recovery LIVE-mode lane authority is invalid")?
+                .parse()
+                .map_err(|_| "post-recovery LIVE-mode lane authority is invalid")?,
+            row.try_get::<String, _>("retained_profit_floor")
+                .map_err(|_| "post-recovery LIVE-mode lane authority is invalid")?
+                .parse()
+                .map_err(|_| "post-recovery LIVE-mode lane authority is invalid")?,
+        ))
+    })
+    .collect::<ControlResult<Vec<_>>>()?;
+    let runtime = sqlx::query(
+        "SELECT NOT legacy.armed AND legacy.kill_switch
+                    AND NOT global.armed AND global.kill_switch
+                    AND global.execution_mode='disarmed'
+                    AND EXISTS (SELECT 1 FROM live_canary.autonomous_route_controls)
+                    AND NOT EXISTS (SELECT 1 FROM live_canary.autonomous_route_controls
+                                    WHERE enabled OR NOT kill_switch)
+                    AND EXISTS (SELECT 1 FROM live_canary.revenue_lane_controls
+                                WHERE lane='phoenix_dex' AND NOT armed AND kill_switch)
+                    AS generic_closed,
+                (SELECT count(*) FROM live_canary.execution_attempts
+                 WHERE status IN ('claimed','nonce_allocated','submission_unknown','pending','timed_out')) AS active_attempts,
+                (SELECT count(*) FROM live_canary.execution_attempts
+                 WHERE status IN ('submission_unknown','pending','timed_out')) AS unresolved_submissions,
+                (SELECT count(*) FROM live_canary.atlas_solver_requests
+                 WHERE status IN ('claimed','signed','submitted','submission_unknown')) AS active_atlas,
+                lock.active_lane IS NULL AND lock.active_identity IS NULL
+                    AND lock.acquired_at IS NULL AS lock_free,
+                provider.exact_execution_ready AND provider.recovery_status='ready'
+                    AND provider.sample_count=3 AS provider_ready
+         FROM live_canary.control legacy
+         CROSS JOIN live_canary.autonomous_global_control global
+         CROSS JOIN live_canary.global_revenue_submission_lock lock
+         CROSS JOIN live_canary.revenue_provider_authority provider
+         WHERE legacy.singleton AND global.singleton AND lock.singleton AND provider.singleton
+         FOR UPDATE OF legacy, global, lock, provider",
+    )
+    .fetch_one(&mut *transaction)
+    .await
+    .map_err(|_| "post-recovery LIVE-mode runtime authority is unavailable")?;
+    let facts = PostRecoveryLiveModeFacts {
+        previous,
+        revenue_lanes: lanes,
+        generic_closed: runtime
+            .try_get("generic_closed")
+            .map_err(|_| "post-recovery LIVE-mode runtime authority is invalid")?,
+        active_attempts: runtime
+            .try_get("active_attempts")
+            .map_err(|_| "post-recovery LIVE-mode runtime authority is invalid")?,
+        unresolved_submissions: runtime
+            .try_get("unresolved_submissions")
+            .map_err(|_| "post-recovery LIVE-mode runtime authority is invalid")?,
+        active_atlas: runtime
+            .try_get("active_atlas")
+            .map_err(|_| "post-recovery LIVE-mode runtime authority is invalid")?,
+        lock_free: runtime
+            .try_get("lock_free")
+            .map_err(|_| "post-recovery LIVE-mode runtime authority is invalid")?,
+        provider_ready: runtime
+            .try_get("provider_ready")
+            .map_err(|_| "post-recovery LIVE-mode runtime authority is invalid")?,
+        activation_outbox_empty: outbox_empty,
+        samples,
+    };
+    validate_post_recovery_live_mode_facts(&facts, release_sha)?;
+    transaction
+        .commit()
+        .await
+        .map_err(|_| "post-recovery LIVE-mode verification commit failed")?;
+    Ok(facts)
+}
+
+async fn preflight_post_recovery_live_mode() -> ControlResult<()> {
+    if required("PHOENIX_ENTER_LIVE_MODE_ACK")? != ENTER_RECOVERED_LIVE_MODE_ACK {
+        return Err("post-recovery LIVE-mode acknowledgement is invalid".into());
+    }
+    require_signerless_control()?;
+    let release_sha = configured_release_identity()?;
+    let owner_evidence = configured_preflight_from_environment().await?;
+    validate_post_arm_recovery_owner_evidence(&owner_evidence, &release_sha)?;
+    require_max_reviewed_runtime_readiness().await?;
+    let payload = hunter_readiness_payload().await?;
+    let samples = post_arm_recovery_samples(&payload, Utc::now())?;
+    let outbox_empty = activation_outbox_empty()?;
+    let pool = database_pool().await?;
+    post_recovery_live_mode_facts(&pool, &release_sha, samples, outbox_empty).await?;
+    println!(
+        "POST_RECOVERY_LIVE_MODE_PREFLIGHT_OK: release_sha={release_sha} phase=DISARMED_EVIDENCE size=MAX_REVIEWED lanes_armed=false contract_paused=true"
     );
     Ok(())
 }
@@ -5440,6 +5635,21 @@ fn require_signerless_control() -> ControlResult<()> {
         }
     }
     Ok(())
+}
+
+fn validate_live_operator_mode(mode: &str, live: &str, autonomous: &str) -> ControlResult<()> {
+    if mode != "LIVE" || live != "true" || autonomous != "true" {
+        return Err("operator environment is not in exact LIVE mode".into());
+    }
+    Ok(())
+}
+
+fn require_live_operator_mode() -> ControlResult<()> {
+    validate_live_operator_mode(
+        &required("PHOENIX_OPERATOR_MODE")?,
+        &required("PHOENIX_OPERATOR_LIVE_EXECUTION")?,
+        &required("PHOENIX_OPERATOR_AUTONOMOUS_EXECUTION")?,
+    )
 }
 
 fn required(name: &'static str) -> ControlResult<String> {
@@ -6373,6 +6583,129 @@ mod tests {
             .all(|facts| validate_post_arm_recovery_facts(facts, &"a".repeat(40)).is_err()));
     }
 
+    fn valid_post_recovery_live_mode_facts() -> PostRecoveryLiveModeFacts {
+        let mut previous = state(EconomicPhase::DisarmedEvidence);
+        previous.level = SizeLevel::MaxReviewed;
+        previous.current_input_wei = MAXIMUM_REVIEWED_INPUT_WEI;
+        PostRecoveryLiveModeFacts {
+            previous,
+            revenue_lanes: vec![
+                (
+                    "aave_liquidation".to_string(),
+                    false,
+                    true,
+                    MAXIMUM_REVIEWED_INPUT_WEI,
+                    RETAINED_PROFIT_FLOOR_WEI,
+                ),
+                (
+                    "atlas_solver".to_string(),
+                    false,
+                    true,
+                    MAXIMUM_REVIEWED_INPUT_WEI,
+                    RETAINED_PROFIT_FLOOR_WEI,
+                ),
+            ],
+            generic_closed: true,
+            active_attempts: 0,
+            unresolved_submissions: 0,
+            active_atlas: 0,
+            lock_free: true,
+            provider_ready: true,
+            activation_outbox_empty: true,
+            samples: vec![
+                (
+                    Utc::now() - ChronoDuration::seconds(3),
+                    "production-nownodes-arbitrum".to_string(),
+                ),
+                (
+                    Utc::now() - ChronoDuration::seconds(2),
+                    "production-nownodes-arbitrum".to_string(),
+                ),
+                (
+                    Utc::now() - ChronoDuration::seconds(1),
+                    "production-nownodes-arbitrum".to_string(),
+                ),
+            ],
+        }
+    }
+
+    #[test]
+    fn post_recovery_live_mode_requires_exact_paused_closed_max_reviewed_authority() {
+        let valid = valid_post_recovery_live_mode_facts();
+        assert!(validate_post_recovery_live_mode_facts(&valid, &"a".repeat(40)).is_ok());
+        let mut variants = Vec::new();
+        let mut phase = valid_post_recovery_live_mode_facts();
+        phase.previous.phase = EconomicPhase::DisarmedFailure;
+        variants.push(phase);
+        let mut size = valid_post_recovery_live_mode_facts();
+        size.previous.level = SizeLevel::Min;
+        variants.push(size);
+        let mut input = valid_post_recovery_live_mode_facts();
+        input.previous.current_input_wei -= 1;
+        variants.push(input);
+        let mut maximum = valid_post_recovery_live_mode_facts();
+        maximum.previous.maximum_reviewed_input_wei -= 1;
+        variants.push(maximum);
+        let mut aave = valid_post_recovery_live_mode_facts();
+        aave.revenue_lanes[0].1 = true;
+        variants.push(aave);
+        let mut atlas = valid_post_recovery_live_mode_facts();
+        atlas.revenue_lanes[1].2 = false;
+        variants.push(atlas);
+        let mut generic = valid_post_recovery_live_mode_facts();
+        generic.generic_closed = false;
+        variants.push(generic);
+        assert!(variants.iter().all(|facts| {
+            validate_post_recovery_live_mode_facts(facts, &"a".repeat(40)).is_err()
+        }));
+        assert!(validate_post_recovery_live_mode_facts(&valid, &"b".repeat(40)).is_err());
+    }
+
+    #[test]
+    fn post_recovery_live_mode_rejects_work_lock_outbox_or_provider_divergence() {
+        let mut variants = Vec::new();
+        let mut attempt = valid_post_recovery_live_mode_facts();
+        attempt.active_attempts = 1;
+        variants.push(attempt);
+        let mut unresolved = valid_post_recovery_live_mode_facts();
+        unresolved.unresolved_submissions = 1;
+        variants.push(unresolved);
+        let mut atlas = valid_post_recovery_live_mode_facts();
+        atlas.active_atlas = 1;
+        variants.push(atlas);
+        let mut lock = valid_post_recovery_live_mode_facts();
+        lock.lock_free = false;
+        variants.push(lock);
+        let mut outbox = valid_post_recovery_live_mode_facts();
+        outbox.activation_outbox_empty = false;
+        variants.push(outbox);
+        let mut provider = valid_post_recovery_live_mode_facts();
+        provider.provider_ready = false;
+        variants.push(provider);
+        let mut count = valid_post_recovery_live_mode_facts();
+        count.samples.pop();
+        variants.push(count);
+        let mut primary = valid_post_recovery_live_mode_facts();
+        primary.samples[2].1 = "other-provider".to_string();
+        variants.push(primary);
+        assert!(variants.iter().all(|facts| {
+            validate_post_recovery_live_mode_facts(facts, &"a".repeat(40)).is_err()
+        }));
+    }
+
+    #[test]
+    fn money_authority_requires_the_exact_operator_live_tuple() {
+        assert!(validate_live_operator_mode("LIVE", "true", "true").is_ok());
+        for tuple in [
+            ("SHADOW", "false", "false"),
+            ("LIVE", "false", "true"),
+            ("LIVE", "true", "false"),
+            ("live", "true", "true"),
+        ] {
+            assert!(validate_live_operator_mode(tuple.0, tuple.1, tuple.2).is_err());
+        }
+    }
+
     fn live_facts() -> LivePreflightFacts {
         LivePreflightFacts {
             phase: EconomicPhase::DisarmedEvidence,
@@ -6593,6 +6926,62 @@ mod tests {
                 true,
             )
         );
+
+        let provider_now = Utc::now();
+        sqlx::query(
+            "UPDATE live_canary.revenue_provider_authority
+             SET exact_execution_ready=true, recovery_status='ready', sample_count=3,
+                 sample_1_at=$1, sample_1_primary_provider='production-nownodes-arbitrum',
+                 sample_2_at=$2, sample_2_primary_provider='production-nownodes-arbitrum',
+                 sample_3_at=$3, sample_3_primary_provider='production-nownodes-arbitrum',
+                 gate_updated_at=$3, updated_at=$3",
+        )
+        .bind(provider_now - ChronoDuration::seconds(3))
+        .bind(provider_now - ChronoDuration::seconds(2))
+        .bind(provider_now - ChronoDuration::seconds(1))
+        .execute(&pool)
+        .await
+        .expect("install ready Single-Primary authority");
+        let immutable_before: (String, i64, bool, bool, String, String) = sqlx::query_as(
+            "SELECT economic.phase, economic.control_epoch,
+                    bool_and(NOT lane.armed), bool_and(lane.kill_switch),
+                    min(lane.maximum_input_amount)::text,
+                    min(lane.retained_profit_floor)::text
+             FROM live_canary.economic_control economic
+             JOIN live_canary.revenue_lane_controls lane
+               ON lane.lane IN ('aave_liquidation','atlas_solver')
+             WHERE economic.singleton
+             GROUP BY economic.phase, economic.control_epoch",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("snapshot post-recovery authority");
+        let mode_samples = (1..=3)
+            .map(|offset| {
+                (
+                    provider_now - ChronoDuration::seconds(4 - offset),
+                    "production-nownodes-arbitrum".to_string(),
+                )
+            })
+            .collect();
+        post_recovery_live_mode_facts(&pool, &release_sha, mode_samples, true)
+            .await
+            .expect("verify post-recovery LIVE-mode preflight");
+        let immutable_after: (String, i64, bool, bool, String, String) = sqlx::query_as(
+            "SELECT economic.phase, economic.control_epoch,
+                    bool_and(NOT lane.armed), bool_and(lane.kill_switch),
+                    min(lane.maximum_input_amount)::text,
+                    min(lane.retained_profit_floor)::text
+             FROM live_canary.economic_control economic
+             JOIN live_canary.revenue_lane_controls lane
+               ON lane.lane IN ('aave_liquidation','atlas_solver')
+             WHERE economic.singleton
+             GROUP BY economic.phase, economic.control_epoch",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("re-read post-recovery authority");
+        assert_eq!(immutable_after, immutable_before);
 
         assert!(
             apply_post_arm_acceptance_recovery(&pool, &release_sha, Vec::new(), true)

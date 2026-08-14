@@ -82,7 +82,8 @@ activation command: both Aave/Atlas revenue lanes and all generic execution
 controls must remain disarmed, the executor must be fully configured and
 paused, the global submission lock and all active/unresolved work must be
 empty, daily loss must remain below its unchanged limit, and the live Gateway
-and Aave/Atlas hunter must report fresh exact dual-provider readiness with a
+and Aave/Atlas hunter must report exact Single-Primary NOWNodes readiness with
+three fresh ordered samples, no confirmation provider, quorum one, and a
 closed provider circuit.
 
 The command atomically changes only `economic_control.current_size_level`,
@@ -91,6 +92,40 @@ The phase deliberately remains `DISARMED_EVIDENCE`; it does not claim that the
 lanes are live. A later, separately acknowledged `arm-revenue-lanes` copies
 the exact economic size into both lane controls. Owner configuration, owner
 unpause, and executor start remain separate explicit operations.
+
+## Post-recovery MAX_REVIEWED activation
+
+After a post-arm acceptance failure, the only reviewed reactivation order is:
+
+1. recover `DISARMED_FAILURE` to `DISARMED_EVIDENCE` when required;
+2. collect three new advancing `production-nownodes-arbitrum` Exact samples;
+3. complete ten uninterrupted minutes of pre-arm acceptance;
+4. set or verify `MAX_REVIEWED` while the contract and every lane stay closed;
+5. dispatch `Phoenix Enter Post-Recovery LIVE Mode` with the exact protected
+   main/active release and acknowledgement
+   `ENTER_RECOVERED_LIVE_MODE_42161`;
+6. require the resulting operator tuple to be exactly `LIVE:true:true` while
+   the contract remains paused, Aave/Atlas/Generic remain disarmed, work is
+   zero, the global submission lock is free, and live-executor is stopped;
+7. atomically arm exactly `aave_liquidation` and `atlas_solver` while keeping
+   Generic DEX closed;
+8. perform the separately acknowledged owner unpause, then
+   `owner-live-preflight`;
+9. start live-executor only if it is not already running, and launch the
+   installed detached post-arm monitor for the full fifteen minutes.
+
+The guarded mode workflow is serialized with the normal release controller,
+requires Production environment protection, requires autorelease to remain
+disabled, and invokes only the forced release gateway. The gateway acquires
+the release lock followed by the economic-activation lock, runs the signerless
+authority preflight and read-only paused-signer preflight before and after the
+existing `production_mode.py live` primitive,
+and restores SHADOW through `production_mode.py shadow` on any post-mutation
+failure. It never arms, unpauses, changes size/provider authority, or starts
+money-moving execution. ARM and owner-unpause independently reject any
+operator tuple other than exact `LIVE:true:true`. The post-arm monitor checks
+that tuple throughout the armed window and uses only `owner-live-preflight`
+after unpause; the controlling SSH session lifetime is not a safety predicate.
 
 ## Rollback
 
