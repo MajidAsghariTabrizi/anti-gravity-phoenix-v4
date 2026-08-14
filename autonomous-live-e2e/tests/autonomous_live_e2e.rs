@@ -383,6 +383,8 @@ impl Fixture {
             postgres_dsn: dsn.clone(),
             rpc_url: Url::parse(&rpc_url)?,
             rpc_allowlist: Vec::new(),
+            rpc_header_name: "api-key".to_string(),
+            rpc_header_file: "/run/secrets/test-rpc-key".to_string(),
             wallet_address: signer.address(),
             executor_address,
             executor_code_hash,
