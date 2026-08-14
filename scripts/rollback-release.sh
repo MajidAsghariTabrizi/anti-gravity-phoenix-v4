@@ -123,7 +123,7 @@ remove_source_only_services() {
       >/dev/null 2>&1 || true
     compose_with_release_env "$source_release_env" rm -f "$service" \
       >/dev/null 2>&1 || true
-    phoenix_wait_required_service_absent current_live_compose "$service" ||
+    phoenix_reconcile_required_service_absent current_live_compose "$service" ||
       return 1
   done
 }
@@ -332,7 +332,7 @@ remove_intentionally_absent_services() {
       return 1
     current_live_compose stop -t 30 "$service" >/dev/null 2>&1 || true
     current_live_compose rm -f "$service" >/dev/null 2>&1 || true
-    phoenix_wait_required_service_absent current_live_compose "$service" ||
+    phoenix_reconcile_required_service_absent current_live_compose "$service" ||
       return 1
   done
 }
@@ -557,7 +557,7 @@ compose up -d --no-deps phoenix-engine
 wait_service_healthy phoenix-engine ||
   fail "phoenix-engine did not become healthy during rollback"
 for service in $absent_services; do
-  phoenix_wait_required_service_absent compose "$service" ||
+  phoenix_reconcile_required_service_absent compose "$service" ||
     fail "a service required to be absent remained after rollback: $service"
 done
 capture_protected_ids "$protected_after" || fail "protected services are not ready after rollback"

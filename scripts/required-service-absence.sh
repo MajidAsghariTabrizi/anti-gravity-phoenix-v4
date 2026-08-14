@@ -2,9 +2,11 @@
 
 # This file is a sourced library. A required-absent service is absent only when
 # a fresh Docker label lookup returns no container for the Compose project and
-# service. A running, stopped, or removing container therefore remains present.
+# service. A running, stopped, created, or removing container therefore remains
+# present. Compose `rm` excludes one-off containers, so this helper reconciles
+# every exact project/service-labelled container before proving fresh absence.
 
-phoenix_wait_required_service_absent() {
+phoenix_reconcile_required_service_absent() {
   [ "$#" -eq 2 ] || return 1
   required_compose_command=$1
   required_service=$2
@@ -73,7 +75,36 @@ print(name)
 $required_ids
 EOF
 
-    [ "$(date +%s)" -lt "$required_deadline" ] || return 1
+    while IFS= read -r required_id; do
+      [ -n "$required_id" ] || continue
+      # A removal result is never proof of absence: the ID can disappear or a
+      # replacement can be created concurrently. Only the next fresh label
+      # lookup can satisfy the postcondition.
+      "$required_docker_bin" container rm --force "$required_id" \
+        >/dev/null 2>&1 || true
+    done <<EOF
+$required_ids
+EOF
+
+    if [ "$(date +%s)" -ge "$required_deadline" ]; then
+      required_ids=$(
+        "$required_docker_bin" ps --all --quiet --no-trunc \
+          --filter "label=com.docker.compose.project=$required_project" \
+          --filter "label=com.docker.compose.service=$required_service"
+      ) || return 1
+      [ -n "$required_ids" ] || return 0
+      while IFS= read -r required_id; do
+        [ -n "$required_id" ] || continue
+        case "$required_id" in
+          *[!0-9a-f]*) return 1 ;;
+        esac
+        [ "${#required_id}" -ge 12 ] && [ "${#required_id}" -le 64 ] ||
+          return 1
+      done <<EOF
+$required_ids
+EOF
+      return 1
+    fi
     sleep "$required_poll_seconds"
   done
 }
