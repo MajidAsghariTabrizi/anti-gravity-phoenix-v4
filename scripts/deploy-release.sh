@@ -2,6 +2,7 @@
 set -eu
 
 release_sha="${1:-}"
+script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 deploy_root="${PHOENIX_DEPLOY_ROOT:-/opt/phoenix}"
 deploy_dir="$deploy_root/deploy"
 release_root="${PHOENIX_RELEASE_ROOT:-$deploy_root/releases}"
@@ -32,6 +33,12 @@ fail() {
   echo "DEPLOY_FAILED: $1"
   exit 1
 }
+
+required_absence_lib=$script_dir/required-service-absence.sh
+[ -f "$required_absence_lib" ] && [ ! -L "$required_absence_lib" ] ||
+  fail "required-service absence helper is missing or unsafe"
+# shellcheck source=required-service-absence.sh
+. "$required_absence_lib"
 
 state_update_raw() {
   operation=$1
@@ -403,14 +410,14 @@ remove_source_only_services() {
     compose_with_release_env "$rollback_release_env" stop -t 30 "$service" \
       >/dev/null 2>&1 || true
     compose_with_release_env "$rollback_release_env" rm -f "$service" \
-      >/dev/null || return 1
+      >/dev/null 2>&1 || true
+    phoenix_wait_required_service_absent compose "$service" || return 1
   done
 }
 
 assert_intentional_absence() {
   for service in $absent_services; do
-    [ -z "$(compose ps -a -q "$service" | awk 'NF { print; exit }')" ] ||
-      return 1
+    phoenix_wait_required_service_absent compose "$service" || return 1
   done
 }
 
@@ -728,10 +735,8 @@ rollback_on_failure() {
     state_update_raw rollback ROLLBACK_STARTED >/dev/null 2>&1 || true
     repause_ok=1
     compose stop -t 30 live-executor >/dev/null 2>&1 || true
-    if ! compose rm -f live-executor >/dev/null 2>&1; then
-      repause_ok=0
-      echo "DEPLOY_COMPENSATION_FAILED: stale live-executor container could not be removed"
-    elif [ -n "$(compose ps -a -q live-executor | awk 'NF { print; exit }')" ]; then
+    compose rm -f live-executor >/dev/null 2>&1 || true
+    if ! phoenix_wait_required_service_absent compose live-executor; then
       repause_ok=0
       echo "DEPLOY_COMPENSATION_FAILED: stale live-executor container remains"
     fi
@@ -817,9 +822,8 @@ validate_live_rpc_rendering ||
 transition_mutable_protected "$rollback_release_env" "$release_env" ||
   fail "mutable protected services could not transition without loss"
 compose stop -t 30 live-executor >/dev/null 2>&1 || true
-compose rm -f live-executor >/dev/null ||
-  fail "stopped live-executor container could not be removed"
-[ -z "$(compose ps -a -q live-executor | awk 'NF { print; exit }')" ] ||
+compose rm -f live-executor >/dev/null 2>&1 || true
+phoenix_wait_required_service_absent compose live-executor ||
   fail "live-executor container remained after removal"
 # Quiesce every long-lived client of the live_canary schema before its bounded
 # DDL lock timeout begins. The target services are recreated below only after

@@ -316,6 +316,7 @@ for safety_script in \
   prelive_protected_maintenance.py \
   prelive-protected-maintenance-launch.sh \
   prelive-protected-maintenance-unit.sh \
+  required-service-absence.sh \
   rollback-release.sh
 do
   install_source "$script_dir/$safety_script" "$deploy_dir/$safety_script" 0750

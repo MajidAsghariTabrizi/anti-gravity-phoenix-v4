@@ -42,6 +42,7 @@ PLATFORM_FILES = (
     ("scripts/release_platform.py", "/usr/local/libexec/phoenix-release/release_platform.py", 0o644),
     ("scripts/release_provenance.py", "/usr/local/libexec/phoenix-release/release_provenance.py", 0o644),
     ("scripts/render-production-compose.sh", "/usr/local/libexec/phoenix-release/render-production-compose.sh", 0o644),
+    ("scripts/required-service-absence.sh", "/usr/local/libexec/phoenix-release/required-service-absence.sh", 0o644),
     ("scripts/rollback-release.sh", "/usr/local/libexec/phoenix-release/rollback-release.sh", 0o644),
     ("scripts/validate-production-env.sh", "/usr/local/libexec/phoenix-release/validate-production-env.sh", 0o644),
     ("scripts/validate-production-release-context.sh", "/usr/local/libexec/phoenix-release/validate-production-release-context.sh", 0o644),

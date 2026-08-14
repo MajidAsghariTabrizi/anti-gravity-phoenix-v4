@@ -3005,6 +3005,9 @@ class WorkflowAndDeploymentContractTests(unittest.TestCase):
         self.ci = (ROOT / ".github/workflows/ci.yml").read_text()
         self.deploy = (ROOT / "scripts/deploy-release.sh").read_text()
         self.rollback = (ROOT / "scripts/rollback-release.sh").read_text()
+        self.required_absence = (
+            ROOT / "scripts/required-service-absence.sh"
+        ).read_text()
         self.rehearsal = (
             ROOT / "scripts/rehearse-production-release.sh"
         ).read_text()
@@ -3803,7 +3806,10 @@ class WorkflowAndDeploymentContractTests(unittest.TestCase):
             "compose stop -t 30 live-executor", deployment_start
         )
         removed = self.deploy.index("compose rm -f live-executor", stopped)
-        absence = self.deploy.index("compose ps -a -q live-executor", removed)
+        absence = self.deploy.index(
+            "phoenix_wait_required_service_absent compose live-executor",
+            removed,
+        )
         start = self.deploy.index("compose up -d --no-deps live-executor")
         standby_phase = self.deploy.index("mark_phase HUNTING_STANDBY_STARTED")
         self.assertLess(stopped, removed)
@@ -3814,13 +3820,57 @@ class WorkflowAndDeploymentContractTests(unittest.TestCase):
             "mutation_started=0", maxsplit=1
         )[0]
         self.assertIn("compose rm -f live-executor", compensation)
-        self.assertIn("compose ps -a -q live-executor", compensation)
+        self.assertIn(
+            "phoenix_wait_required_service_absent compose live-executor",
+            compensation,
+        )
         self.assertIn("state_update_raw failure deployment_failed", self.deploy)
         self.assertIn("state_update_raw rollback ROLLBACK_STARTED", self.deploy)
         self.assertIn(
             'current_live_compose rm -f "$service"', self.rollback
         )
         self.assertIn("for service in $absent_services", self.rollback)
+
+    def test_required_absence_uses_one_fresh_label_poll_contract(self) -> None:
+        self.assertIn(
+            "phoenix_wait_required_service_absent()", self.required_absence
+        )
+        self.assertIn(
+            '"$required_compose_command" config --format json',
+            self.required_absence,
+        )
+        self.assertIn(
+            'label=com.docker.compose.project=$required_project',
+            self.required_absence,
+        )
+        self.assertIn(
+            'label=com.docker.compose.service=$required_service',
+            self.required_absence,
+        )
+        self.assertIn("while :; do", self.required_absence)
+        self.assertIn('[ -n "$required_ids" ] || return 0', self.required_absence)
+        self.assertNotIn("docker inspect", self.required_absence)
+        self.assertNotIn("required_container_id", self.required_absence)
+        self.assertGreaterEqual(
+            self.deploy.count(
+                "phoenix_wait_required_service_absent compose live-executor"
+            ),
+            2,
+        )
+        self.assertGreaterEqual(
+            self.rollback.count("phoenix_wait_required_service_absent"),
+            3,
+        )
+        platform = (ROOT / "scripts/release_platform.py").read_text()
+        platform_installer = (
+            ROOT / "scripts/install-phoenix-release-platform.sh"
+        ).read_text()
+        context_installer = (
+            ROOT / "scripts/install-production-release-context.sh"
+        ).read_text()
+        release_assets = (ROOT / "scripts/release_assets.py").read_text()
+        for source in (platform, platform_installer, context_installer, release_assets):
+            self.assertIn("required-service-absence.sh", source)
 
     def test_rollback_cleanup_preserves_transaction_and_nonce_evidence(self) -> None:
         cleanup = self.rollback.split(

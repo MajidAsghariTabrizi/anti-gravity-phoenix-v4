@@ -93,6 +93,7 @@ for specification in \
   'prelive_protected_maintenance.py:0600' \
   'prelive-protected-maintenance-launch.sh:0700' \
   'prelive-protected-maintenance-unit.sh:0700' \
+  'required-service-absence.sh:0600' \
   'rollback-release.sh:0700'
 do
   name=${specification%%:*}

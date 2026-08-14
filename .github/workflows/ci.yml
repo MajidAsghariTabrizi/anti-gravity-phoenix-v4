@@ -128,6 +128,8 @@ jobs:
             scripts/phoenix-release-platform-tests.sh \
             scripts/phoenix-release-transport.sh \
             scripts/production-healthcheck.sh \
+            scripts/required-service-absence.sh \
+            scripts/required-service-absence-tests.sh \
             scripts/render-production-compose.sh \
             scripts/verify-image-runtime.sh \
             scripts/rollback-release.sh \
@@ -178,6 +180,7 @@ jobs:
             scripts.tests.test_export_aave_borrow_discovery \
             scripts.tests.test_export_aave_checkpoint \
             scripts.tests.test_verify_aave_borrow_archive
+          sh ./scripts/required-service-absence-tests.sh
           sh ./scripts/production-compose-context-tests.sh
           sh ./scripts/phoenix-release-platform-tests.sh
 
@@ -222,6 +225,7 @@ jobs:
           python3 -m unittest scripts.tests.test_shadow_deploy_gateway
           sh ./scripts/shadow-deploy-gateway-tests.sh
           sh ./scripts/production-healthcheck-tests.sh
+          sh ./scripts/required-service-absence-tests.sh
           sh ./scripts/production-release-context-compatibility-tests.sh
           sh ./scripts/prelive-v5-fresh-database-gate-tests.sh
           sh ./scripts/prelive-release-gate-tests.sh

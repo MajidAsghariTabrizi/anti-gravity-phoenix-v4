@@ -1,6 +1,7 @@
 #!/usr/bin/env sh
 set -eu
 
+script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 deploy_root="${PHOENIX_DEPLOY_ROOT:-/opt/phoenix}"
 deploy_dir="$deploy_root/deploy"
 release_root="${PHOENIX_RELEASE_ROOT:-$deploy_root/releases}"
@@ -24,6 +25,12 @@ fail() {
   echo "ROLLBACK_FAILED: $1"
   exit 1
 }
+
+required_absence_lib=$script_dir/required-service-absence.sh
+[ -f "$required_absence_lib" ] && [ ! -L "$required_absence_lib" ] ||
+  fail "required-service absence helper is missing or unsafe"
+# shellcheck source=required-service-absence.sh
+. "$required_absence_lib"
 
 [ -s "$previous_file" ] || fail "previous release is missing"
 release_sha=$(tr -d '\r\n' <"$previous_file")
@@ -115,7 +122,9 @@ remove_source_only_services() {
     compose_with_release_env "$source_release_env" stop -t 30 "$service" \
       >/dev/null 2>&1 || true
     compose_with_release_env "$source_release_env" rm -f "$service" \
-      >/dev/null || return 1
+      >/dev/null 2>&1 || true
+    phoenix_wait_required_service_absent current_live_compose "$service" ||
+      return 1
   done
 }
 
@@ -322,7 +331,9 @@ remove_intentionally_absent_services() {
     printf '%s\n' "$live_services" | grep -F -x "$service" >/dev/null ||
       return 1
     current_live_compose stop -t 30 "$service" >/dev/null 2>&1 || true
-    current_live_compose rm -f "$service" >/dev/null || return 1
+    current_live_compose rm -f "$service" >/dev/null 2>&1 || true
+    phoenix_wait_required_service_absent current_live_compose "$service" ||
+      return 1
   done
 }
 
@@ -546,7 +557,7 @@ compose up -d --no-deps phoenix-engine
 wait_service_healthy phoenix-engine ||
   fail "phoenix-engine did not become healthy during rollback"
 for service in $absent_services; do
-  [ -z "$(compose ps -a -q "$service" | awk 'NF { print; exit }')" ] ||
+  phoenix_wait_required_service_absent compose "$service" ||
     fail "a service required to be absent remained after rollback: $service"
 done
 capture_protected_ids "$protected_after" || fail "protected services are not ready after rollback"
