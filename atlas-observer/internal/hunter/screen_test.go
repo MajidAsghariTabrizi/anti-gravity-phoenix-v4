@@ -1654,6 +1654,107 @@ func TestEmptyTailPriorityWindowPollsTailAndHotOnEveryTick(t *testing.T) {
 	}
 }
 
+func TestPriorityWindowWakesAtExactCooldownWithoutAddingAHotPoll(t *testing.T) {
+	borrower := "0x1111111111111111111111111111111111111111"
+	current := time.Date(2026, 8, 14, 0, 0, 0, 0, time.UTC)
+	sequence := make([]string, 0, 3)
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		switch request.URL.Path {
+		case "/v1/aave/tail":
+			sequence = append(sequence, "tail")
+			var input tailRequest
+			if err := json.NewDecoder(request.Body).Decode(&input); err != nil {
+				t.Fatal(err)
+			}
+			_ = json.NewEncoder(writer).Encode(tailResponse{
+				SchemaVersion: "phoenix.rpc.aave-tail-response.v2", ChainID: 42161, RequestID: input.RequestID,
+				FinalizedBlockNumber: input.FromBlock, FinalizedBlockHash: "0x" + strings.Repeat("a", 64),
+				PrimaryProviderID: primaryProviderID, ConfirmationProvider: nil, Quorum: 1,
+				FromBlock: input.FromBlock, ToBlock: input.FromBlock, NextBlock: input.FromBlock + 1,
+			})
+		case "/v1/aave/screen":
+			sequence = append(sequence, "hot")
+			var input screenRequest
+			if err := json.NewDecoder(request.Body).Decode(&input); err != nil {
+				t.Fatal(err)
+			}
+			_ = json.NewEncoder(writer).Encode(screenResponse{
+				SchemaVersion: ResponseSchema, ChainID: 42161, RequestID: input.RequestID,
+				BlockNumber: 100, BlockHash: "0x" + strings.Repeat("b", 64),
+				Primary: providerScreen{ProviderID: primaryProviderID, WETHPriceBase: "100000000", Accounts: []account{{
+					Borrower: borrower, TotalDebtBase: "1000", HealthFactorWAD: "1050000000000000000",
+				}}},
+				Confirmation: nil, Quorum: 1,
+			})
+		default:
+			t.Fatalf("unexpected path: %s", request.URL.Path)
+		}
+	}))
+	defer server.Close()
+	waits := make([]time.Duration, 0, 3)
+	screener := &Screener{
+		config: Config{GatewayURL: server.URL, StateDir: t.TempDir(), RetainedProfitFloorWei: "1"},
+		client: server.Client(),
+		state: State{
+			Schema: StateSchema, TailNextBlock: 100, Counts: map[string]uint64{}, RouteIneligible: map[string]string{},
+		},
+		hotBorrowers: map[string]string{borrower: "900000000000000000"},
+		hotDebtBase:  map[string]string{borrower: "1000"},
+		hotUpperPositive: map[string]bool{
+			borrower: true,
+		},
+		lastExactAt: map[string]time.Time{
+			borrower: current.Add(-exactBorrowerCooldown + 250*time.Millisecond),
+		},
+		firstLiquidatableAt: map[string]time.Time{borrower: current.Add(-time.Minute)},
+		debtBearing:         map[string]bool{borrower: true}, refreshKnown: map[string]bool{},
+		now: func() time.Time { return current },
+		wait: func(_ context.Context, delay time.Duration) bool {
+			waits = append(waits, delay)
+			current = current.Add(delay)
+			return true
+		},
+	}
+	delay, present := screener.nextExactEligibilityWakeDelay()
+	if !present || delay != 250*time.Millisecond {
+		t.Fatalf("cooldown wake=%s present=%t", delay, present)
+	}
+	if err := screener.runPriorityRecheckWindow(context.Background(), 11*time.Second); err != nil {
+		t.Fatal(err)
+	}
+	if want := []string{"tail", "hot", "tail"}; strings.Join(sequence, ",") != strings.Join(want, ",") {
+		t.Fatalf("eligibility wake added an ordinary hot poll: got=%v want=%v", sequence, want)
+	}
+	if len(waits) != 3 || waits[0] != 250*time.Millisecond || waits[1] != 9750*time.Millisecond || waits[2] != time.Second {
+		t.Fatalf("cooldown was not scheduled at its exact boundary: %v", waits)
+	}
+	if screener.Snapshot().Counts[hotRecheckTotalKey] != 1 {
+		t.Fatalf("eligibility wake count drifted: %+v", screener.Snapshot().Counts)
+	}
+}
+
+func TestSnapshotExcludesBorrowerAlreadyInExactFlight(t *testing.T) {
+	now := time.Date(2026, 8, 14, 0, 0, 0, 0, time.UTC)
+	borrower := "0x1111111111111111111111111111111111111111"
+	screener := &Screener{
+		state:                  State{RouteIneligible: map[string]string{}},
+		hotBorrowers:           map[string]string{borrower: "900000000000000000"},
+		hotDebtBase:            map[string]string{borrower: "1000"},
+		hotUpperPositive:       map[string]bool{borrower: true},
+		firstLiquidatableAt:    map[string]time.Time{borrower: now.Add(-time.Minute)},
+		exactInFlightBorrowers: map[string]bool{borrower: true},
+		exactInFlight:          1,
+		now:                    func() time.Time { return now },
+	}
+	state := screener.Snapshot()
+	if state.ExactEligibleNowCount != 0 || state.OldestExactEligibleAgeMillis != 0 || state.ExactEvaluationsInFlight != 1 {
+		t.Fatalf("in-flight borrower was also reported actionable: %+v", state)
+	}
+	if delay, present := screener.nextExactEligibilityWakeDelay(); present {
+		t.Fatalf("in-flight borrower scheduled a duplicate wake: delay=%s", delay)
+	}
+}
+
 func TestTailBorrowerPreemptsTheOrdinaryHotBatch(t *testing.T) {
 	tailBorrower := "0x1111111111111111111111111111111111111111"
 	hotBorrower := "0x2222222222222222222222222222222222222222"
