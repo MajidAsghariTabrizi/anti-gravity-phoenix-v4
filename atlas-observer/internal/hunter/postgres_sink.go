@@ -111,6 +111,37 @@ func canonicalProviderID(value string) bool {
 	return true
 }
 
+type providerRecoverySample struct {
+	at      time.Time
+	primary string
+}
+
+func advancePrimaryProviderSamples(
+	samples []providerRecoverySample,
+	recoveryStatus string,
+	now time.Time,
+	primary string,
+) ([]providerRecoverySample, bool) {
+	if len(samples) > 0 {
+		last := samples[len(samples)-1].at
+		// Concurrent Exact transactions acquire the singleton row lock in
+		// commit order, which need not match their completion timestamps. A
+		// late transaction must not move or invalidate the durable recovery
+		// window after a newer successful Exact has already committed.
+		if !now.After(last) {
+			return samples, false
+		}
+		if recoveryStatus != "ready" && recoveryStatus != "recovered" && now.Sub(last) > providerRecoverySampleWindow {
+			samples = nil
+		}
+	}
+	samples = append(samples, providerRecoverySample{at: now, primary: primary})
+	if len(samples) > 3 {
+		samples = append([]providerRecoverySample(nil), samples[len(samples)-3:]...)
+	}
+	return samples, true
+}
+
 func recordPrimaryProviderSuccess(ctx context.Context, tx pgx.Tx, observedAt time.Time, primary string) error {
 	if observedAt.IsZero() || primary != primaryProviderID {
 		return errors.New("primary provider evidence is invalid")
@@ -146,26 +177,17 @@ func recordPrimaryProviderSuccess(ctx context.Context, tx pgx.Tx, observedAt tim
 	if failureTransition != nil && !now.After(failureTransition.UTC()) {
 		return errors.New("primary provider evidence predates the failure transition")
 	}
-	type sample struct {
-		at      time.Time
-		primary string
-	}
-	samples := make([]sample, 0, 3)
+	samples := make([]providerRecoverySample, 0, 3)
 	for index := 0; index < int(count); index++ {
 		if sampleAt[index] == nil || samplePrimary[index] == nil || *samplePrimary[index] != primaryProviderID {
 			return errors.New("provider recovery samples are invalid")
 		}
-		samples = append(samples, sample{sampleAt[index].UTC(), *samplePrimary[index]})
+		samples = append(samples, providerRecoverySample{sampleAt[index].UTC(), *samplePrimary[index]})
 	}
-	if len(samples) > 0 && recoveryStatus != "ready" && recoveryStatus != "recovered" {
-		last := samples[len(samples)-1].at
-		if !now.After(last) || now.Sub(last) > providerRecoverySampleWindow {
-			samples = nil
-		}
-	}
-	samples = append(samples, sample{now, primary})
-	if len(samples) > 3 {
-		samples = append([]sample(nil), samples[len(samples)-3:]...)
+	var advanced bool
+	samples, advanced = advancePrimaryProviderSamples(samples, recoveryStatus, now, primary)
+	if !advanced {
+		return nil
 	}
 	var at [3]any
 	var first [3]any
