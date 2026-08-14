@@ -101,6 +101,7 @@ STATIC_PATHS = (
     "scripts/release_components.py",
     "scripts/release_provenance.py",
     "scripts/render-production-compose.sh",
+    "scripts/required-service-absence.sh",
     "scripts/rollback-release.sh",
     "scripts/shadow-engine-isolated-canary.sh",
     "scripts/shadow-positive-route-evidence.sh",

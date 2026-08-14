@@ -63,6 +63,7 @@ TRUSTED_HELPERS = {
     "prelive_protected_maintenance.py": 0o600,
     "prelive-protected-maintenance-launch.sh": 0o700,
     "prelive-protected-maintenance-unit.sh": 0o700,
+    "required-service-absence.sh": 0o600,
     "rollback-release.sh": 0o700,
 }
 

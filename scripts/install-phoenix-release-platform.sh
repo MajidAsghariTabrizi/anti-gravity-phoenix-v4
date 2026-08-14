@@ -180,6 +180,7 @@ for specification in \
   'prelive_protected_maintenance.py:0644' \
   'prelive-protected-maintenance-launch.sh:0644' \
   'prelive-protected-maintenance-unit.sh:0644' \
+  'required-service-absence.sh:0644' \
   'rollback-release.sh:0644'
 do
   name=${specification%%:*}
