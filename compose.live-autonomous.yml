@@ -4,7 +4,7 @@ services:
       AUTONOMOUS_EXECUTION: "true"
       RPC_UPSTREAM_CALLS_PER_SECOND: "16"
       RPC_UPSTREAM_CALL_BURST: "64"
-      RPC_STATE_REQUESTS_PER_MINUTE: "60"
+      RPC_STATE_REQUESTS_PER_MINUTE: "120"
 
   phoenix-engine:
     environment:
@@ -19,10 +19,14 @@ services:
 
   atlas-observer:
     environment:
-      PHOENIX_EXACT_STATE_REQUEST_BUDGET_PER_MINUTE: "60"
-      # The gateway's protected 60/min budget leaves twenty-four requests for
-      # base/hot/tail discovery and thirty-six for observed Exact work.
-      PHOENIX_EXACT_DISCOVERY_RESERVE_PER_MINUTE: "24"
+      PHOENIX_EXACT_STATE_REQUEST_BUDGET_PER_MINUTE: "120"
+      # The reviewed 16/s sustained NOWNodes budget leaves thirty-six requests
+      # for base/hot/tail discovery and eighty-four for bounded Exact work.
+      PHOENIX_EXACT_DISCOVERY_RESERVE_PER_MINUTE: "36"
+      # Twelve I/O-bound workers cover twice the observed six-borrower eligible
+      # cohort. Durable request tokens and the gateway's twelve-permit state
+      # lane remain the authoritative backpressure boundaries.
+      PHOENIX_AAVE_EXACT_WORKERS: "12"
 
   autonomous-control:
     profiles: ["live-autonomous"]

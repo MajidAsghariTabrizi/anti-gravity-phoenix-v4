@@ -20,6 +20,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"anti-gravity-phoenix-v4/atlas-observer/internal/observer"
@@ -64,6 +65,8 @@ const (
 	defaultExactStateBudgetPerMinute = uint64(12)
 	defaultExactDiscoveryReserve     = uint64(7)
 	defaultExactRequestEstimateMilli = uint64(5_000)
+	defaultExactWorkers              = 12
+	defaultExactForkWorkers          = 2
 	directForkEvidenceMode           = "SINGLE_PRIMARY_FORK_VERIFIED"
 	counterfactualForkEvidenceMode   = "SINGLE_PRIMARY_COUNTERFACTUAL_FORK_VERIFIED"
 	atlasCallbackEvidenceMode        = "SINGLE_PRIMARY_ATLAS_CALLBACK_FORK_VERIFIED"
@@ -80,6 +83,27 @@ const (
 	exactEvalCompletedKey            = "exact_eval_completed_total"
 	exactEvalLatencySumKey           = "exact_eval_latency_millis_sum"
 	exactEvalLatencyCountKey         = "exact_eval_latency_millis_count"
+	exactQueueLatencySumKey          = "exact_queue_latency_millis_sum"
+	exactQueueLatencyCountKey        = "exact_queue_latency_millis_count"
+	exactEligibilityLatencySumKey    = "exact_eligibility_latency_millis_sum"
+	exactEligibilityLatencyCountKey  = "exact_eligibility_latency_millis_count"
+	exactDispatchLatencySumKey       = "exact_dispatch_latency_millis_sum"
+	exactDispatchLatencyCountKey     = "exact_dispatch_latency_millis_count"
+	exactInitialLatencySumKey        = "exact_initial_response_latency_millis_sum"
+	exactInitialLatencyCountKey      = "exact_initial_response_latency_millis_count"
+	signalPrefilterLatencySumKey     = "signal_prefilter_latency_millis_sum"
+	signalPrefilterLatencyCountKey   = "signal_prefilter_latency_millis_count"
+	exactFirstRPCLatencySumKey       = "exact_first_rpc_latency_millis_sum"
+	exactFirstRPCLatencyCountKey     = "exact_first_rpc_latency_millis_count"
+	exactComputeLatencySumKey        = "exact_compute_latency_millis_sum"
+	exactComputeLatencyCountKey      = "exact_compute_latency_millis_count"
+	exactForkRuntimeSumKey           = "exact_fork_runtime_millis_sum"
+	exactForkRuntimeCountKey         = "exact_fork_runtime_millis_count"
+	exactForkQueueSumKey             = "exact_fork_queue_millis_sum"
+	exactForkQueueCountKey           = "exact_fork_queue_millis_count"
+	exactCoalescedKey                = "exact_coalesced_total"
+	exactStaleInvalidatedKey         = "exact_stale_invalidated_total"
+	exactDuplicateSuppressedKey      = "exact_duplicate_suppressed_total"
 	liquidatableToExactSumKey        = "liquidatable_to_exact_millis_sum"
 	liquidatableToExactCountKey      = "liquidatable_to_exact_millis_count"
 	routeIneligibleRechecksKey       = "route_ineligible_rechecks_total"
@@ -125,6 +149,7 @@ type Config struct {
 	PrimaryDiscovery               bool
 	ExactStateBudgetPerMinute      uint64
 	ExactDiscoveryReservePerMinute uint64
+	ExactWorkers                   int
 	SignalSink                     SignalSink
 }
 
@@ -198,33 +223,96 @@ type State struct {
 	ProviderBlockedCount               uint64                   `json:"-"`
 	AuthorityBlockedCount              uint64                   `json:"-"`
 	ExactEvaluationsInFlight           uint64                   `json:"-"`
+	ExactWorkersRunning                uint64                   `json:"-"`
+	ExactWorkerQueueDepth              uint64                   `json:"-"`
 	OldestExactEligibleAgeMillis       uint64                   `json:"-"`
 	ActiveForkPendingCount             uint64                   `json:"-"`
 }
 
 type Screener struct {
-	config               Config
-	client               *http.Client
-	batchClient          *http.Client
-	operationMu          sync.Mutex
-	mu                   sync.Mutex
-	state                State
-	debtBearing          map[string]bool
-	refreshKnown         map[string]bool
-	refreshOrder         []string
-	refreshCursor        int
-	hotBorrowers         map[string]string
-	hotDebtBase          map[string]string
-	hotUpperPositive     map[string]bool
-	latestOutcome        map[string]string
-	lastExactAt          map[string]time.Time
-	firstLiquidatableAt  map[string]time.Time
-	lastExactAdmissionAt time.Time
-	hasDurableAdmission  bool
-	exactInFlight        uint64
-	exactStateRequests   uint64
-	wait                 func(context.Context, time.Duration) bool
-	now                  func() time.Time
+	config                 Config
+	client                 *http.Client
+	batchClient            *http.Client
+	operationMu            sync.Mutex
+	mu                     sync.Mutex
+	state                  State
+	debtBearing            map[string]bool
+	refreshKnown           map[string]bool
+	refreshOrder           []string
+	refreshCursor          int
+	hotBorrowers           map[string]string
+	hotDebtBase            map[string]string
+	hotUpperPositive       map[string]bool
+	latestOutcome          map[string]string
+	lastExactAt            map[string]time.Time
+	firstLiquidatableAt    map[string]time.Time
+	firstLiquidatableMono  map[string]time.Time
+	lastExactAdmissionAt   time.Time
+	hasDurableAdmission    bool
+	exactInFlight          uint64
+	exactInFlightBorrowers map[string]bool
+	exactWorkerSlots       chan struct{}
+	exactForkSlots         chan struct{}
+	exactForkSlotsOnce     sync.Once
+	exactWorkerStarts      atomic.Uint64
+	wait                   func(context.Context, time.Duration) bool
+	now                    func() time.Time
+}
+
+type exactEvaluationTracker struct {
+	requests                 atomic.Uint64
+	workerStartedUnixNanos   atomic.Int64
+	firstRequestUnixNanos    atomic.Int64
+	initialResponseUnixNanos atomic.Int64
+	workerStartedMonotonic   time.Time
+	firstRequestMonotonic    time.Time
+	initialResponseMonotonic time.Time
+	forkRuntimeNanos         atomic.Uint64
+	forkQueueNanos           atomic.Uint64
+}
+
+type exactEvaluationTrackerKey struct{}
+
+func exactTrackerFromContext(ctx context.Context) *exactEvaluationTracker {
+	tracker, _ := ctx.Value(exactEvaluationTrackerKey{}).(*exactEvaluationTracker)
+	return tracker
+}
+
+func (s *Screener) exactForkPermits() chan struct{} {
+	s.exactForkSlotsOnce.Do(func() {
+		s.exactForkSlots = make(chan struct{}, defaultExactForkWorkers)
+	})
+	return s.exactForkSlots
+}
+
+type pendingExactEvaluation struct {
+	order                  int
+	primary                account
+	bucket                 string
+	record                 signal
+	admittedAt             time.Time
+	admittedMonotonic      time.Time
+	firstObserved          time.Time
+	firstObservedMonotonic time.Time
+	reservedMilli          uint64
+	signalToPrefilter      time.Duration
+	tracker                *exactEvaluationTracker
+	result                 chan exactEvaluationResult
+}
+
+type completedScreenSignal struct {
+	order             int
+	record            signal
+	borrower          string
+	bucket            string
+	signalToPrefilter time.Duration
+}
+
+type exactEvaluationResult struct {
+	record             signal
+	err                error
+	completedAt        time.Time
+	completedMonotonic time.Time
 }
 
 type gatewayErrorContract struct {
@@ -427,6 +515,8 @@ type signal struct {
 	ExactSecondaryProvider      string                  `json:"-"`
 	ExecutionCandidate          *executionCandidate     `json:"-"`
 	AtlasCandidate              *atlasCandidate         `json:"-"`
+	PrefilterCompletedAt        time.Time               `json:"-"`
+	LiquidatableClassifiedAt    time.Time               `json:"-"`
 }
 
 type sizeDiagnostic struct {
@@ -471,6 +561,19 @@ type exactDiagnosticSummary struct {
 	FailureClass                     string            `json:"failure_class,omitempty"`
 	LiquidatableToExactLatencyMillis uint64            `json:"liquidatable_to_exact_latency_ms"`
 	ExactForkLatencyMillis           uint64            `json:"exact_fork_latency_ms"`
+	QueueToWorkerLatencyMillis       uint64            `json:"queue_to_worker_latency_ms"`
+	EligibilityToAdmissionMillis     uint64            `json:"eligibility_to_admission_latency_ms"`
+	WorkerToGatewayLatencyMillis     uint64            `json:"worker_to_gateway_latency_ms"`
+	InitialGatewayLatencyMillis      uint64            `json:"initial_gateway_response_latency_ms"`
+	ExactStateRequestCount           uint64            `json:"exact_state_request_count"`
+	SignalReceivedAt                 string            `json:"signal_received_at"`
+	PrefilterCompletedAt             string            `json:"prefilter_completed_at"`
+	LiquidatableClassifiedAt         string            `json:"liquidatable_classified_at"`
+	ExactEnqueuedAt                  string            `json:"exact_enqueued_at"`
+	ExactWorkerStartedAt             string            `json:"exact_worker_started_at"`
+	FirstGatewayRequestAt            string            `json:"first_gateway_request_at"`
+	InitialGatewayResponseAt         string            `json:"initial_gateway_response_at"`
+	ExactEvaluationCompletedAt       string            `json:"exact_evaluation_completed_at"`
 }
 
 type atlasPreparedOperation struct {
@@ -729,6 +832,12 @@ func New(config Config) (*Screener, error) {
 	if config.ExactDiscoveryReservePerMinute >= config.ExactStateBudgetPerMinute {
 		return nil, errors.New("hunter Exact RPC budget is invalid")
 	}
+	if config.ExactWorkers == 0 {
+		config.ExactWorkers = defaultExactWorkers
+	}
+	if config.ExactWorkers < 1 || config.ExactWorkers > 16 {
+		return nil, errors.New("hunter Exact worker count is invalid")
+	}
 	if !filepath.IsAbs(config.DiscoveryPath) || !filepath.IsAbs(config.StateDir) {
 		return nil, errors.New("hunter paths must be absolute")
 	}
@@ -768,12 +877,15 @@ func New(config Config) (*Screener, error) {
 		batchClient: &http.Client{Timeout: aaveSimulationBatchTimeout}, state: state,
 		debtBearing: make(map[string]bool), refreshKnown: make(map[string]bool),
 		hotBorrowers: make(map[string]string), hotDebtBase: make(map[string]string),
-		hotUpperPositive:    make(map[string]bool),
-		latestOutcome:       make(map[string]string),
-		lastExactAt:         make(map[string]time.Time),
-		firstLiquidatableAt: make(map[string]time.Time),
-		wait:                waitContext,
-		now:                 func() time.Time { return time.Now().UTC() },
+		hotUpperPositive:       make(map[string]bool),
+		latestOutcome:          make(map[string]string),
+		lastExactAt:            make(map[string]time.Time),
+		firstLiquidatableAt:    make(map[string]time.Time),
+		firstLiquidatableMono:  make(map[string]time.Time),
+		exactInFlightBorrowers: make(map[string]bool),
+		exactWorkerSlots:       make(chan struct{}, config.ExactWorkers),
+		wait:                   waitContext,
+		now:                    func() time.Time { return time.Now().UTC() },
 	}
 	if err := s.loadState(); err != nil {
 		return nil, err
@@ -897,22 +1009,17 @@ func (s *Screener) runPriorityRecheckWindow(ctx context.Context, window time.Dur
 		return err
 	}
 	elapsed := time.Duration(0)
-	hotNext := true
 	for elapsed+hotRevisitCadence < window {
 		if !s.waitDuration(ctx, hotRevisitCadence) {
 			return errPriorityWindowStopped
 		}
 		elapsed += hotRevisitCadence
-		var err error
-		if hotNext {
-			_, err = s.runHotPriority(ctx)
-		} else {
-			_, err = s.runTailPriority(ctx)
-		}
-		if err != nil {
+		if _, err := s.runTailPriority(ctx); err != nil {
 			return err
 		}
-		hotNext = !hotNext
+		if _, err := s.runHotPriority(ctx); err != nil {
+			return err
+		}
 	}
 	if remaining := window - elapsed; remaining > 0 && !s.waitDuration(ctx, remaining) {
 		return errPriorityWindowStopped
@@ -975,6 +1082,8 @@ func (s *Screener) Snapshot() State {
 	copy.LiquidatableHotCount = 0
 	copy.UrgentHotCount = 0
 	copy.ExactEvaluationsInFlight = s.exactInFlight
+	copy.ExactWorkersRunning = uint64(len(s.exactWorkerSlots))
+	copy.ExactWorkerQueueDepth = copy.ExactEvaluationsInFlight - min(copy.ExactEvaluationsInFlight, copy.ExactWorkersRunning)
 	for borrower, hf := range s.hotBorrowers {
 		if s.state.RouteIneligible[borrower] != "" {
 			copy.RouteIneligibleCount++
@@ -1033,7 +1142,7 @@ func (s *Screener) Snapshot() State {
 	return copy
 }
 
-var exactLatencyBucketsMillis = [...]uint64{1_000, 5_000, 15_000, 30_000, 60_000, 120_000, 300_000}
+var exactLatencyBucketsMillis = [...]uint64{1, 5, 10, 25, 50, 100, 250, 500, 1_000, 2_000, 2_500, 5_000, 10_000, 15_000, 30_000, 60_000, 120_000, 300_000}
 
 func (s *Screener) observeDurationLocked(sumKey, countKey, bucketPrefix string, duration time.Duration) {
 	if s.state.Counts == nil {
@@ -1054,6 +1163,11 @@ func (s *Screener) observeDurationLocked(sumKey, countKey, bucketPrefix string, 
 
 func (s *Screener) MetricsText() string {
 	state := s.Snapshot()
+	workerCapacity := s.config.ExactWorkers
+	if workerCapacity == 0 {
+		workerCapacity = defaultExactWorkers
+	}
+	workerPermitsAvailable := max(workerCapacity-int(state.ExactWorkersRunning), 0)
 	lines := []string{
 		"# TYPE phoenix_aave_hot_queue_size gauge",
 		fmt.Sprintf("phoenix_aave_hot_queue_size %d", state.HotQueueSize),
@@ -1075,8 +1189,22 @@ func (s *Screener) MetricsText() string {
 		fmt.Sprintf("phoenix_aave_exact_authority_blocked %d", state.AuthorityBlockedCount),
 		"# TYPE phoenix_aave_exact_evaluations_in_flight gauge",
 		fmt.Sprintf("phoenix_aave_exact_evaluations_in_flight %d", state.ExactEvaluationsInFlight),
+		"# TYPE phoenix_aave_exact_worker_capacity gauge",
+		fmt.Sprintf("phoenix_aave_exact_worker_capacity %d", workerCapacity),
+		"# TYPE phoenix_aave_exact_workers_running gauge",
+		fmt.Sprintf("phoenix_aave_exact_workers_running %d", state.ExactWorkersRunning),
+		"# TYPE phoenix_exact_workers_in_flight gauge",
+		fmt.Sprintf("phoenix_exact_workers_in_flight %d", state.ExactWorkersRunning),
+		"# TYPE phoenix_exact_worker_permits_available gauge",
+		fmt.Sprintf("phoenix_exact_worker_permits_available %d", workerPermitsAvailable),
+		"# TYPE phoenix_aave_exact_worker_queue_depth gauge",
+		fmt.Sprintf("phoenix_aave_exact_worker_queue_depth %d", state.ExactWorkerQueueDepth),
+		"# TYPE phoenix_exact_queue_depth gauge",
+		fmt.Sprintf("phoenix_exact_queue_depth %d", state.ExactWorkerQueueDepth),
 		"# TYPE phoenix_aave_oldest_exact_eligible_age_ms gauge",
 		fmt.Sprintf("phoenix_aave_oldest_exact_eligible_age_ms %d", state.OldestExactEligibleAgeMillis),
+		"# TYPE phoenix_exact_oldest_actionable_age_seconds gauge",
+		fmt.Sprintf("phoenix_exact_oldest_actionable_age_seconds %g", float64(state.OldestExactEligibleAgeMillis)/1_000),
 		"# TYPE phoenix_aave_active_fork_pending gauge",
 		fmt.Sprintf("phoenix_aave_active_fork_pending %d", state.ActiveForkPendingCount),
 		"# TYPE phoenix_aave_exact_queue_ledger_entries_total counter",
@@ -1087,6 +1215,8 @@ func (s *Screener) MetricsText() string {
 		fmt.Sprintf("phoenix_aave_hot_recheck_deferred_budget_total %d", state.Counts[hotRecheckDeferredBudgetKey]),
 		"# TYPE phoenix_aave_exact_eval_started_total counter",
 		fmt.Sprintf("phoenix_aave_exact_eval_started_total %d", state.Counts[exactEvalStartedKey]),
+		"# TYPE phoenix_aave_exact_worker_started_total counter",
+		fmt.Sprintf("phoenix_aave_exact_worker_started_total %d", s.exactWorkerStarts.Load()),
 		"# TYPE phoenix_aave_exact_eval_completed_total counter",
 		fmt.Sprintf("phoenix_aave_exact_eval_completed_total %d", state.Counts[exactEvalCompletedKey]),
 		"# TYPE phoenix_aave_route_ineligible_rechecks_total counter",
@@ -1095,6 +1225,18 @@ func (s *Screener) MetricsText() string {
 		fmt.Sprintf("phoenix_aave_provider_circuit_deferrals_total %d", state.ProviderCircuitSkippedTotal),
 		"# TYPE phoenix_atlas_callback_evidence_unavailable_total counter",
 		fmt.Sprintf("phoenix_atlas_callback_evidence_unavailable_total %d", state.Counts[atlasCallbackUnavailableKey]),
+		"# TYPE phoenix_exact_coalesced_total counter",
+		fmt.Sprintf("phoenix_exact_coalesced_total %d", state.Counts[exactCoalescedKey]),
+		"# TYPE phoenix_exact_stale_invalidated_total counter",
+		fmt.Sprintf("phoenix_exact_stale_invalidated_total %d", state.Counts[exactStaleInvalidatedKey]),
+		"# TYPE phoenix_exact_duplicate_suppressed_total counter",
+		fmt.Sprintf("phoenix_exact_duplicate_suppressed_total %d", state.Counts[exactDuplicateSuppressedKey]),
+		"# TYPE phoenix_exact_provider_blocked_total counter",
+		fmt.Sprintf("phoenix_exact_provider_blocked_total %d", state.ProviderCircuitSkippedTotal),
+		"# TYPE phoenix_exact_scheduler_blocked_total counter",
+		fmt.Sprintf("phoenix_exact_scheduler_blocked_total %d", state.Counts[exactDeferredSchedulerKey]),
+		"# TYPE phoenix_exact_overload_total counter",
+		fmt.Sprintf("phoenix_exact_overload_total %d", state.Counts[hotRecheckDeferredBudgetKey]+state.Counts[exactDeferredSchedulerKey]),
 	}
 	appendHistogram := func(name, sumKey, countKey, bucketPrefix string) {
 		lines = append(lines, fmt.Sprintf("# TYPE %s histogram", name))
@@ -1114,6 +1256,37 @@ func (s *Screener) MetricsText() string {
 	}
 	appendHistogram("phoenix_aave_exact_eval_latency_ms", exactEvalLatencySumKey, exactEvalLatencyCountKey, "exact_eval_latency_millis_bucket_le_")
 	appendHistogram("phoenix_aave_first_liquidatable_to_exact_eval_ms", liquidatableToExactSumKey, liquidatableToExactCountKey, "liquidatable_to_exact_millis_bucket_le_")
+	appendSecondsHistogram := func(name, sumKey, countKey, bucketPrefix string) {
+		lines = append(lines, fmt.Sprintf("# TYPE %s histogram", name))
+		for _, boundary := range exactLatencyBucketsMillis {
+			lines = append(lines, fmt.Sprintf(
+				"%s_bucket{le=\"%g\"} %d",
+				name,
+				float64(boundary)/1_000,
+				state.Counts[fmt.Sprintf("%s%d", bucketPrefix, boundary)],
+			))
+		}
+		lines = append(lines,
+			fmt.Sprintf("%s_bucket{le=\"+Inf\"} %d", name, state.Counts[countKey]),
+			fmt.Sprintf("%s_sum %g", name, float64(state.Counts[sumKey])/1_000),
+			fmt.Sprintf("%s_count %d", name, state.Counts[countKey]),
+		)
+	}
+	appendSecondsHistogram("phoenix_aave_liquidatable_to_exact_admission_seconds", exactEligibilityLatencySumKey, exactEligibilityLatencyCountKey, "exact_eligibility_latency_millis_bucket_le_")
+	appendSecondsHistogram("phoenix_aave_exact_worker_queue_seconds", exactQueueLatencySumKey, exactQueueLatencyCountKey, "exact_queue_latency_millis_bucket_le_")
+	appendSecondsHistogram("phoenix_aave_exact_worker_to_gateway_seconds", exactDispatchLatencySumKey, exactDispatchLatencyCountKey, "exact_dispatch_latency_millis_bucket_le_")
+	appendSecondsHistogram("phoenix_aave_exact_initial_gateway_response_seconds", exactInitialLatencySumKey, exactInitialLatencyCountKey, "exact_initial_response_latency_millis_bucket_le_")
+	appendSecondsHistogram("phoenix_aave_exact_end_to_end_seconds", liquidatableToExactSumKey, liquidatableToExactCountKey, "liquidatable_to_exact_millis_bucket_le_")
+	appendSecondsHistogram("phoenix_signal_to_prefilter_seconds", signalPrefilterLatencySumKey, signalPrefilterLatencyCountKey, "signal_prefilter_latency_millis_bucket_le_")
+	appendSecondsHistogram("phoenix_liquidatable_to_exact_enqueue_seconds", exactEligibilityLatencySumKey, exactEligibilityLatencyCountKey, "exact_eligibility_latency_millis_bucket_le_")
+	appendSecondsHistogram("phoenix_exact_queue_wait_seconds", exactQueueLatencySumKey, exactQueueLatencyCountKey, "exact_queue_latency_millis_bucket_le_")
+	appendSecondsHistogram("phoenix_exact_worker_dispatch_seconds", exactDispatchLatencySumKey, exactDispatchLatencyCountKey, "exact_dispatch_latency_millis_bucket_le_")
+	appendSecondsHistogram("phoenix_exact_first_rpc_dispatch_seconds", exactFirstRPCLatencySumKey, exactFirstRPCLatencyCountKey, "exact_first_rpc_latency_millis_bucket_le_")
+	appendSecondsHistogram("phoenix_exact_rpc_state_fetch_seconds", exactInitialLatencySumKey, exactInitialLatencyCountKey, "exact_initial_response_latency_millis_bucket_le_")
+	appendSecondsHistogram("phoenix_exact_compute_seconds", exactComputeLatencySumKey, exactComputeLatencyCountKey, "exact_compute_latency_millis_bucket_le_")
+	appendSecondsHistogram("phoenix_exact_end_to_end_seconds", liquidatableToExactSumKey, liquidatableToExactCountKey, "liquidatable_to_exact_millis_bucket_le_")
+	appendSecondsHistogram("phoenix_fork_queue_wait_seconds", exactForkQueueSumKey, exactForkQueueCountKey, "exact_fork_queue_millis_bucket_le_")
+	appendSecondsHistogram("phoenix_fork_runtime_seconds", exactForkRuntimeSumKey, exactForkRuntimeCountKey, "exact_fork_runtime_millis_bucket_le_")
 	return strings.Join(lines, "\n") + "\n"
 }
 
@@ -1443,7 +1616,13 @@ func (s *Screener) pollTail(ctx context.Context) ([]string, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.ensureHotMapsLocked()
+	if s.state.Counts == nil {
+		s.state.Counts = make(map[string]uint64)
+	}
 	for _, borrower := range result.Borrowers {
+		if _, wasHot := s.hotBorrowers[borrower]; wasHot || s.exactInFlightBorrowers[borrower] {
+			s.state.Counts[exactStaleInvalidatedKey]++
+		}
 		if err := s.updateBorrowerActivityLocked(borrower, true); err != nil {
 			return nil, err
 		}
@@ -1452,6 +1631,7 @@ func (s *Screener) pollTail(ctx context.Context) ([]string, error) {
 		// route-ineligibility learned from a prior Exact reserve snapshot.
 		delete(s.lastExactAt, borrower)
 		delete(s.firstLiquidatableAt, borrower)
+		delete(s.firstLiquidatableMono, borrower)
 		delete(s.latestOutcome, borrower)
 		delete(s.hotUpperPositive, borrower)
 		delete(s.state.RouteIneligible, borrower)
@@ -1514,47 +1694,13 @@ func liquidationPriorityLess(
 		return leftRank < rightRank
 	}
 
-	leftDebtValue, leftDebtOK := newBigUint(leftDebt)
-	rightDebtValue, rightDebtOK := newBigUint(rightDebt)
 	leftHFValue, leftHFOK := newBigUint(leftHF)
 	rightHFValue, rightHFOK := newBigUint(rightHF)
-
-	compareDebt := func() (bool, bool) {
-		if leftDebtOK != rightDebtOK {
-			return leftDebtOK, true
-		}
-		if leftDebtOK && rightDebtOK && leftDebtValue.Cmp(rightDebtValue) != 0 {
-			return leftDebtValue.Cmp(rightDebtValue) > 0, true
-		}
-		return false, false
+	if leftHFOK != rightHFOK {
+		return leftHFOK
 	}
-	compareHF := func() (bool, bool) {
-		if leftHFOK != rightHFOK {
-			return leftHFOK, true
-		}
-		if leftHFOK && rightHFOK && leftHFValue.Cmp(rightHFValue) != 0 {
-			return leftHFValue.Cmp(rightHFValue) < 0, true
-		}
-		return false, false
-	}
-
-	// Once a borrower is liquidatable, larger repay capacity is the first
-	// economic discriminator. For near-liquidation buckets, health factor
-	// remains the first urgency discriminator.
-	if leftRank == 0 {
-		if result, decided := compareDebt(); decided {
-			return result
-		}
-		if result, decided := compareHF(); decided {
-			return result
-		}
-	} else {
-		if result, decided := compareHF(); decided {
-			return result
-		}
-		if result, decided := compareDebt(); decided {
-			return result
-		}
+	if leftHFOK && rightHFOK && leftHFValue.Cmp(rightHFValue) != 0 {
+		return leftHFValue.Cmp(rightHFValue) < 0
 	}
 	return leftBorrower < rightBorrower
 }
@@ -1596,7 +1742,7 @@ func (s *Screener) initializeExactBudgetLocked(now time.Time) {
 	}
 	if s.state.ExactBudgetUpdatedAt == nil || now.Before(s.state.ExactBudgetUpdatedAt.UTC()) {
 		s.state.ExactBudgetUpdatedAt = &now
-		s.state.ExactBudgetTokensMilli = s.state.ExactAverageStateRequestsMilli
+		s.state.ExactBudgetTokensMilli = s.exactBudgetCapacityMilliLocked()
 	}
 	s.refillExactBudgetLocked(now)
 }
@@ -1607,7 +1753,7 @@ func (s *Screener) refillExactBudgetLocked(now time.Time) {
 	}
 	if s.state.ExactBudgetUpdatedAt == nil {
 		s.state.ExactBudgetUpdatedAt = &now
-		s.state.ExactBudgetTokensMilli = s.state.ExactAverageStateRequestsMilli
+		s.state.ExactBudgetTokensMilli = s.exactBudgetCapacityMilliLocked()
 		return
 	}
 	last := s.state.ExactBudgetUpdatedAt.UTC()
@@ -1630,26 +1776,45 @@ func (s *Screener) refillExactBudgetLocked(now time.Time) {
 	effective := total - reserve
 	elapsedMillis := uint64(now.Sub(last) / time.Millisecond)
 	added := elapsedMillis * effective * 1_000 / 60_000
-	capacity := s.state.ExactAverageStateRequestsMilli
+	capacity := max(effective*1_000, s.state.ExactAverageStateRequestsMilli)
 	s.state.ExactBudgetTokensMilli = min(s.state.ExactBudgetTokensMilli+added, capacity)
 	s.state.ExactBudgetUpdatedAt = &now
 }
 
+func (s *Screener) exactBudgetCapacityMilliLocked() uint64 {
+	total := s.config.ExactStateBudgetPerMinute
+	reserve := s.config.ExactDiscoveryReservePerMinute
+	if total == 0 {
+		total = defaultExactStateBudgetPerMinute
+	}
+	if reserve == 0 {
+		reserve = defaultExactDiscoveryReserve
+	}
+	if reserve >= total {
+		reserve = total - 1
+	}
+	return max((total-reserve)*1_000, s.state.ExactAverageStateRequestsMilli)
+}
+
 func (s *Screener) exactAdmissionBlockedLocked(now time.Time) bool {
 	s.refillExactBudgetLocked(now)
-	return s.state.ExactBudgetTokensMilli < s.state.ExactAverageStateRequestsMilli
+	return s.state.ExactBudgetTokensMilli < s.exactReservationMilliLocked()
 }
 
 func (s *Screener) admitExactLocked(now time.Time) (uint64, bool) {
 	if s.exactAdmissionBlockedLocked(now) {
 		return 0, false
 	}
-	reserved := s.state.ExactAverageStateRequestsMilli
+	reserved := s.exactReservationMilliLocked()
 	s.state.ExactBudgetTokensMilli -= reserved
 	s.lastExactAdmissionAt = now
 	s.hasDurableAdmission = true
 	s.state.LastExactAdmissionAt = &now
 	return reserved, true
+}
+
+func (s *Screener) exactReservationMilliLocked() uint64 {
+	return max(s.state.ExactAverageStateRequestsMilli, defaultExactRequestEstimateMilli)
 }
 
 func (s *Screener) settleExactBudgetLocked(reservedMilli, actualRequests uint64) {
@@ -1660,10 +1825,15 @@ func (s *Screener) settleExactBudgetLocked(reservedMilli, actualRequests uint64)
 	s.state.ExactAverageStateRequestsMilli = (3*s.state.ExactAverageStateRequestsMilli + actualMilli) / 4
 }
 
-func (s *Screener) recordExactStateRequest() {
-	s.mu.Lock()
-	s.exactStateRequests++
-	s.mu.Unlock()
+func (s *Screener) recordExactStateRequest(ctx context.Context) {
+	tracker := exactTrackerFromContext(ctx)
+	if tracker == nil {
+		return
+	}
+	tracker.requests.Add(1)
+	if tracker.firstRequestUnixNanos.CompareAndSwap(0, s.nowUTC().UnixNano()) {
+		tracker.firstRequestMonotonic = time.Now()
+	}
 }
 
 func (s *Screener) schedulerAccountOrder(accounts []account) []int {
@@ -1782,6 +1952,67 @@ func (s *Screener) nextHotBatch() []string {
 	return result
 }
 
+func (s *Screener) persistScreenSignalLocked(
+	ctx context.Context,
+	record signal,
+	borrower string,
+	bucket string,
+	authorityDiverged *bool,
+) error {
+	if *authorityDiverged && record.TerminalOutcome == "exact_pending" {
+		record.ExactDeferredReason = revenueLaneAuthorityDivergedClass
+	}
+	if *authorityDiverged && (record.ExecutionCandidate != nil || record.AtlasCandidate != nil) {
+		record = withoutCandidateAuthority(record, revenueLaneAuthorityDivergedClass)
+	}
+	sinkRecorded := false
+	if s.config.SignalSink != nil && (record.ExecutionCandidate != nil || record.AtlasCandidate != nil) {
+		s.mu.Unlock()
+		normalized, sinkErr := s.config.SignalSink.RecordAaveSignal(ctx, record)
+		s.mu.Lock()
+		if sinkErr != nil {
+			return sinkErr
+		}
+		record = normalized
+		sinkRecorded = true
+		if record.ExactDeferredReason == revenueLaneAuthorityDivergedClass {
+			if !*authorityDiverged {
+				s.state.Counts[revenueLaneAuthorityDivergedKey]++
+			}
+			*authorityDiverged = true
+		}
+	}
+	if _, hot := s.hotBorrowers[borrower]; hot {
+		if record.ExactDeferredReason == "" || s.latestOutcome[borrower] == "" {
+			s.latestOutcome[borrower] = record.TerminalOutcome
+		}
+	} else {
+		delete(s.latestOutcome, borrower)
+	}
+	if err := appendJSON(filepath.Join(s.config.StateDir, "signals.ndjson"), record); err != nil {
+		return err
+	}
+	if invalidatedBlock := s.state.TailInvalidatedBlock[borrower]; invalidatedBlock != 0 && record.Block >= invalidatedBlock {
+		delete(s.state.TailInvalidatedBlock, borrower)
+	}
+	if s.config.SignalSink != nil && !sinkRecorded {
+		s.mu.Unlock()
+		_, sinkErr := s.config.SignalSink.RecordAaveSignal(ctx, record)
+		s.mu.Lock()
+		if sinkErr != nil {
+			return sinkErr
+		}
+	}
+	if bucket == "urgent" || record.TerminalOutcome == "fork_pending" {
+		if err := appendJSON(filepath.Join(s.config.StateDir, "exact-queue.ndjson"), record); err != nil {
+			return err
+		}
+		s.state.ExactQueueCount++
+	}
+	s.state.Counts[bucket]++
+	return nil
+}
+
 func (s *Screener) screen(ctx context.Context, borrowers []string, advanceSeed bool, auction *observer.LedgerRecord) error {
 	s.operationMu.Lock()
 	defer s.operationMu.Unlock()
@@ -1846,6 +2077,18 @@ func (s *Screener) screen(ctx context.Context, borrowers []string, advanceSeed b
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.config.ExactWorkers == 0 {
+		s.config.ExactWorkers = defaultExactWorkers
+	}
+	if s.exactWorkerSlots == nil {
+		s.exactWorkerSlots = make(chan struct{}, s.config.ExactWorkers)
+	}
+	if s.exactInFlightBorrowers == nil {
+		s.exactInFlightBorrowers = make(map[string]bool)
+	}
+	if s.firstLiquidatableMono == nil {
+		s.firstLiquidatableMono = make(map[string]time.Time)
+	}
 	s.ensureHotMapsLocked()
 	if previousAuthorityDiverged && !authorityDiverged {
 		// The control pair is coherent again, so discovery can be healthy, but
@@ -1853,8 +2096,8 @@ func (s *Screener) screen(ctx context.Context, borrowers []string, advanceSeed b
 		// execution authority.
 		s.state.LastErrorClass = "provider_recovery_requires_exact"
 	}
-	var exactPrimaryProvider string
-	var exactRecoveryAt time.Time
+	pendingExact := make([]pendingExactEvaluation, 0, s.config.ExactWorkers)
+	completedSignals := make([]completedScreenSignal, 0, len(primaryEvidence.Accounts))
 	for _, borrower := range borrowers {
 		if invalidatedBlock := s.state.TailInvalidatedBlock[borrower]; invalidatedBlock > screenBlockNumber {
 			return errors.New("gateway Aave screen predates tail invalidation")
@@ -1865,7 +2108,8 @@ func (s *Screener) screen(ctx context.Context, borrowers []string, advanceSeed b
 	if authorityDiverged && !previousAuthorityDiverged {
 		s.state.Counts[revenueLaneAuthorityDivergedKey]++
 	}
-	for _, index := range s.schedulerAccountOrder(primaryEvidence.Accounts) {
+	for order, index := range s.schedulerAccountOrder(primaryEvidence.Accounts) {
+		signalReceivedMonotonic := time.Now()
 		primary := primaryEvidence.Accounts[index]
 		if primary.Borrower != borrowers[index] {
 			return errors.New("gateway Aave primary discovery is incomplete")
@@ -1877,9 +2121,11 @@ func (s *Screener) screen(ctx context.Context, borrowers []string, advanceSeed b
 			if bucket == "liquidatable" {
 				if _, present := s.firstLiquidatableAt[primary.Borrower]; !present {
 					s.firstLiquidatableAt[primary.Borrower] = s.nowUTC()
+					s.firstLiquidatableMono[primary.Borrower] = time.Now()
 				}
 			} else {
 				delete(s.firstLiquidatableAt, primary.Borrower)
+				delete(s.firstLiquidatableMono, primary.Borrower)
 			}
 		} else {
 			delete(s.hotBorrowers, primary.Borrower)
@@ -1888,11 +2134,13 @@ func (s *Screener) screen(ctx context.Context, borrowers []string, advanceSeed b
 			delete(s.latestOutcome, primary.Borrower)
 			delete(s.lastExactAt, primary.Borrower)
 			delete(s.firstLiquidatableAt, primary.Borrower)
+			delete(s.firstLiquidatableMono, primary.Borrower)
 			delete(s.state.RouteIneligible, primary.Borrower)
 		}
 		if err := s.updateBorrowerActivityLocked(primary.Borrower, primary.TotalDebtBase != "0"); err != nil {
 			return err
 		}
+		wasActionable := s.hotUpperPositive[primary.Borrower]
 		record := signal{Schema: "phoenix.atlas-aave-hunting-signal.v1", ObservedAt: s.nowUTC(), Cursor: cursor + uint64(index), Block: screenBlockNumber, BlockHash: screenBlockHash, Borrower: primary.Borrower, DebtBase: primary.TotalDebtBase, HF: primary.HealthFactorWAD, Bucket: bucket, Authority: false, TerminalOutcome: "prefiltered"}
 		if bucket != "liquidatable" {
 			delete(s.hotUpperPositive, primary.Borrower)
@@ -1915,6 +2163,12 @@ func (s *Screener) screen(ctx context.Context, borrowers []string, advanceSeed b
 					record.TerminalOutcome = "exact_pending"
 				}
 			}
+		}
+		record.PrefilterCompletedAt = s.nowUTC()
+		record.LiquidatableClassifiedAt = s.firstLiquidatableAt[primary.Borrower]
+		signalToPrefilter := time.Since(signalReceivedMonotonic)
+		if record.TerminalOutcome == "exact_pending" && wasActionable {
+			s.state.Counts[exactCoalescedKey]++
 		}
 		if record.TerminalOutcome == "exact_pending" && authorityDiverged {
 			record.ExactDeferredReason = revenueLaneAuthorityDivergedClass
@@ -1948,143 +2202,288 @@ func (s *Screener) screen(ctx context.Context, borrowers []string, advanceSeed b
 				// Collateral supply/withdraw and collateral-enable changes are not
 				// present in the debt tail. Re-probe those route reasons after the
 				// normal exact cooldown instead of deferring them forever.
-				if knownRouteIneligible {
-					delete(s.state.RouteIneligible, primary.Borrower)
-					s.state.Counts[routeIneligibleRechecksKey]++
-				}
-				exactStartedAt := s.nowUTC()
-				reservedMilli, admitted := s.admitExactLocked(exactStartedAt)
-				if !admitted {
+				if s.exactInFlightBorrowers[primary.Borrower] {
 					record.ExactDeferredReason = "scheduler_capacity"
 					s.state.Counts[exactDeferredSchedulerKey]++
-					continue
-				}
-				s.exactStateRequests = 0
-				s.state.Counts[exactEvalStartedKey]++
-				// Persist the global admission before issuing any Exact RPC. A
-				// provider error or process restart must not reopen the 60-second
-				// state-request slot and create a restart burst.
-				if err := s.persistStateLocked(); err != nil {
-					s.state.Counts[exactEvalStartedKey]--
-					return err
-				}
-				s.exactInFlight++
-				s.mu.Unlock()
-				exactRecord, exactErr := s.resolveExact(ctx, record, auction)
-				s.mu.Lock()
-				s.exactInFlight--
-				s.settleExactBudgetLocked(reservedMilli, s.exactStateRequests)
-				if exactErr != nil {
-					if !errors.Is(exactErr, errRevenueLaneAuthorityDiverged) {
-						return exactErr
-					}
-					// Divergent revenue authority is a durable fail-closed control state,
-					// not a process-integrity failure. Keep discovery and health serving,
-					// but never materialize Candidate or request authority.
-					record.Authority = false
-					record.ExecutionCandidate = nil
-					record.AtlasCandidate = nil
-					record.TerminalOutcome = "exact_pending"
-					record.ExactDeferredReason = revenueLaneAuthorityDivergedClass
-					if !authorityDiverged {
-						s.state.Counts[revenueLaneAuthorityDivergedKey]++
-					}
-					authorityDiverged = true
+					s.state.Counts[exactDuplicateSuppressedKey]++
 				} else {
-					authorityDiverged = false
-					exactCompletedAt := s.nowUTC()
-					s.state.Counts[exactEvalCompletedKey]++
-					s.observeDurationLocked(
-						exactEvalLatencySumKey,
-						exactEvalLatencyCountKey,
-						"exact_eval_latency_millis_bucket_le_",
-						exactCompletedAt.Sub(exactStartedAt),
-					)
-					liquidatableToExact := time.Duration(0)
-					if firstObserved, present := s.firstLiquidatableAt[primary.Borrower]; present {
-						liquidatableToExact = exactCompletedAt.Sub(firstObserved)
-						s.observeDurationLocked(
-							liquidatableToExactSumKey,
-							liquidatableToExactCountKey,
-							"liquidatable_to_exact_millis_bucket_le_",
-							exactCompletedAt.Sub(firstObserved),
-						)
-						delete(s.firstLiquidatableAt, primary.Borrower)
-					}
-					record = exactRecord
-					if exactAuthorityWasDegraded {
-						record = withoutCandidateAuthority(record, "provider_recovery_sample")
-					}
-					exactPrimaryProvider = record.ExactPrimaryProvider
-					exactRecoveryAt = exactCompletedAt
-					record.ExactCompletedAt = &exactCompletedAt
-					record.ExactDiagnostics = buildExactDiagnosticSummary(
-						record,
-						exactCompletedAt.Sub(exactStartedAt),
-						liquidatableToExact,
-					)
-					s.lastExactAt[primary.Borrower] = exactCompletedAt
-					if record.ExactRouteIneligibleReason != "" {
-						s.state.RouteIneligible[primary.Borrower] = record.ExactRouteIneligibleReason
-						if s.state.Counts == nil {
-							s.state.Counts = make(map[string]uint64)
-						}
-						s.state.Counts[exactRouteIneligibleObservedKey]++
-					} else {
+					if knownRouteIneligible {
 						delete(s.state.RouteIneligible, primary.Borrower)
+						s.state.Counts[routeIneligibleRechecksKey]++
+					}
+					exactAdmittedAt := s.nowUTC()
+					exactAdmittedMonotonic := time.Now()
+					reservedMilli, admitted := s.admitExactLocked(exactAdmittedAt)
+					if !admitted {
+						record.ExactDeferredReason = "scheduler_capacity"
+						s.state.Counts[exactDeferredSchedulerKey]++
+					} else {
+						tracker := &exactEvaluationTracker{}
+						s.state.Counts[exactEvalStartedKey]++
+						if err := s.persistStateLocked(); err != nil {
+							s.state.Counts[exactEvalStartedKey]--
+							return err
+						}
+						s.exactInFlight++
+						s.exactInFlightBorrowers[primary.Borrower] = true
+						result := make(chan exactEvaluationResult, 1)
+						work := pendingExactEvaluation{
+							order: order, primary: primary, bucket: bucket, record: record,
+							admittedAt: exactAdmittedAt, admittedMonotonic: exactAdmittedMonotonic,
+							firstObserved:          s.firstLiquidatableAt[primary.Borrower],
+							firstObservedMonotonic: s.firstLiquidatableMono[primary.Borrower],
+							reservedMilli:          reservedMilli, tracker: tracker, result: result,
+							signalToPrefilter: signalToPrefilter,
+						}
+						pendingExact = append(pendingExact, work)
+						exactCtx := context.WithValue(ctx, exactEvaluationTrackerKey{}, tracker)
+						go func(
+							workerCtx context.Context,
+							evaluationTracker *exactEvaluationTracker,
+							input signal,
+							output chan<- exactEvaluationResult,
+						) {
+							select {
+							case s.exactWorkerSlots <- struct{}{}:
+							case <-workerCtx.Done():
+								output <- exactEvaluationResult{record: input, err: workerCtx.Err(), completedAt: s.nowUTC(), completedMonotonic: time.Now()}
+								return
+							}
+							s.exactWorkerStarts.Add(1)
+							evaluationTracker.workerStartedUnixNanos.Store(s.nowUTC().UnixNano())
+							evaluationTracker.workerStartedMonotonic = time.Now()
+							defer func() { <-s.exactWorkerSlots }()
+							exactRecord, exactErr := s.resolveExact(workerCtx, input, auction)
+							output <- exactEvaluationResult{record: exactRecord, err: exactErr, completedAt: s.nowUTC(), completedMonotonic: time.Now()}
+						}(exactCtx, tracker, record, result)
+						continue
 					}
 				}
 			}
 		}
-		if authorityDiverged && record.TerminalOutcome == "exact_pending" {
+		completedSignals = append(completedSignals, completedScreenSignal{
+			order: order, record: record, borrower: primary.Borrower, bucket: bucket,
+			signalToPrefilter: signalToPrefilter,
+		})
+	}
+	exactResults := make([]exactEvaluationResult, len(pendingExact))
+	var exactBatchErr error
+	s.mu.Unlock()
+	for index := range pendingExact {
+		exactResults[index] = <-pendingExact[index].result
+	}
+	s.mu.Lock()
+	for index := range pendingExact {
+		work := &pendingExact[index]
+		s.exactInFlight--
+		delete(s.exactInFlightBorrowers, work.primary.Borrower)
+		s.settleExactBudgetLocked(work.reservedMilli, work.tracker.requests.Load())
+		if exactResults[index].err != nil &&
+			!errors.Is(exactResults[index].err, errRevenueLaneAuthorityDiverged) && exactBatchErr == nil {
+			exactBatchErr = exactResults[index].err
+		}
+	}
+	if exactBatchErr != nil {
+		return exactBatchErr
+	}
+	recoveryExactTimes := make([]time.Time, 0, len(pendingExact))
+	for index, work := range pendingExact {
+		result := exactResults[index]
+		record := work.record
+		if result.err != nil {
+			record = withoutCandidateAuthority(record, revenueLaneAuthorityDivergedClass)
+			record.TerminalOutcome = "exact_pending"
 			record.ExactDeferredReason = revenueLaneAuthorityDivergedClass
-		}
-		sinkRecorded := false
-		if s.config.SignalSink != nil && (record.ExecutionCandidate != nil || record.AtlasCandidate != nil) {
-			s.mu.Unlock()
-			normalized, sinkErr := s.config.SignalSink.RecordAaveSignal(ctx, record)
-			s.mu.Lock()
-			if sinkErr != nil {
-				return sinkErr
+			if !authorityDiverged {
+				s.state.Counts[revenueLaneAuthorityDivergedKey]++
 			}
-			record = normalized
-			sinkRecorded = true
-			if record.ExactDeferredReason == revenueLaneAuthorityDivergedClass {
-				if !authorityDiverged {
-					s.state.Counts[revenueLaneAuthorityDivergedKey]++
-				}
-				authorityDiverged = true
-			}
-		}
-		if _, hot := s.hotBorrowers[primary.Borrower]; hot {
-			if record.ExactDeferredReason == "" || s.latestOutcome[primary.Borrower] == "" {
-				s.latestOutcome[primary.Borrower] = record.TerminalOutcome
-			}
+			authorityDiverged = true
 		} else {
-			delete(s.latestOutcome, primary.Borrower)
+			exactCompletedAt := result.completedAt
+			workerStartedAt := time.Unix(0, work.tracker.workerStartedUnixNanos.Load()).UTC()
+			exactDuration := result.completedMonotonic.Sub(work.tracker.workerStartedMonotonic)
+			s.state.Counts[exactEvalCompletedKey]++
+			s.observeDurationLocked(
+				exactEvalLatencySumKey,
+				exactEvalLatencyCountKey,
+				"exact_eval_latency_millis_bucket_le_",
+				exactDuration,
+			)
+			liquidatableToExact := time.Duration(0)
+			if !work.firstObservedMonotonic.IsZero() {
+				liquidatableToExact = result.completedMonotonic.Sub(work.firstObservedMonotonic)
+			} else if !work.firstObserved.IsZero() {
+				liquidatableToExact = exactCompletedAt.Sub(work.firstObserved)
+			}
+			if !work.firstObserved.IsZero() {
+				s.observeDurationLocked(
+					liquidatableToExactSumKey,
+					liquidatableToExactCountKey,
+					"liquidatable_to_exact_millis_bucket_le_",
+					liquidatableToExact,
+				)
+				s.observeDurationLocked(
+					exactEligibilityLatencySumKey,
+					exactEligibilityLatencyCountKey,
+					"exact_eligibility_latency_millis_bucket_le_",
+					func() time.Duration {
+						if !work.firstObservedMonotonic.IsZero() {
+							return work.admittedMonotonic.Sub(work.firstObservedMonotonic)
+						}
+						return work.admittedAt.Sub(work.firstObserved)
+					}(),
+				)
+				delete(s.firstLiquidatableAt, work.primary.Borrower)
+				delete(s.firstLiquidatableMono, work.primary.Borrower)
+			}
+			s.observeDurationLocked(
+				exactQueueLatencySumKey,
+				exactQueueLatencyCountKey,
+				"exact_queue_latency_millis_bucket_le_",
+				work.tracker.workerStartedMonotonic.Sub(work.admittedMonotonic),
+			)
+			firstRequestAt := time.Unix(0, work.tracker.firstRequestUnixNanos.Load()).UTC()
+			initialResponseAt := time.Unix(0, work.tracker.initialResponseUnixNanos.Load()).UTC()
+			if work.tracker.firstRequestUnixNanos.Load() > 0 {
+				s.observeDurationLocked(
+					exactDispatchLatencySumKey,
+					exactDispatchLatencyCountKey,
+					"exact_dispatch_latency_millis_bucket_le_",
+					work.tracker.firstRequestMonotonic.Sub(work.tracker.workerStartedMonotonic),
+				)
+				if !work.firstObservedMonotonic.IsZero() && work.tracker.firstRequestMonotonic.After(work.firstObservedMonotonic) {
+					s.observeDurationLocked(
+						exactFirstRPCLatencySumKey,
+						exactFirstRPCLatencyCountKey,
+						"exact_first_rpc_latency_millis_bucket_le_",
+						work.tracker.firstRequestMonotonic.Sub(work.firstObservedMonotonic),
+					)
+				}
+			}
+			if work.tracker.initialResponseUnixNanos.Load() > 0 && !firstRequestAt.IsZero() {
+				s.observeDurationLocked(
+					exactInitialLatencySumKey,
+					exactInitialLatencyCountKey,
+					"exact_initial_response_latency_millis_bucket_le_",
+					work.tracker.initialResponseMonotonic.Sub(work.tracker.firstRequestMonotonic),
+				)
+				if result.completedMonotonic.After(work.tracker.initialResponseMonotonic) {
+					s.observeDurationLocked(
+						exactComputeLatencySumKey,
+						exactComputeLatencyCountKey,
+						"exact_compute_latency_millis_bucket_le_",
+						result.completedMonotonic.Sub(work.tracker.initialResponseMonotonic),
+					)
+				}
+			}
+			if forkRuntime := time.Duration(work.tracker.forkRuntimeNanos.Load()); forkRuntime > 0 {
+				s.observeDurationLocked(
+					exactForkRuntimeSumKey,
+					exactForkRuntimeCountKey,
+					"exact_fork_runtime_millis_bucket_le_",
+					forkRuntime,
+				)
+			}
+			if forkQueue := time.Duration(work.tracker.forkQueueNanos.Load()); forkQueue > 0 {
+				s.observeDurationLocked(
+					exactForkQueueSumKey,
+					exactForkQueueCountKey,
+					"exact_fork_queue_millis_bucket_le_",
+					forkQueue,
+				)
+			}
+			record = result.record
+			if exactAuthorityWasDegraded || authorityDiverged {
+				record = withoutCandidateAuthority(record, "provider_recovery_sample")
+			}
+			record.ExactCompletedAt = &exactCompletedAt
+			record.ExactDiagnostics = buildExactDiagnosticSummary(
+				record,
+				time.Duration(work.tracker.forkRuntimeNanos.Load()),
+				liquidatableToExact,
+			)
+			if record.ExactDiagnostics != nil {
+				record.ExactDiagnostics.SignalReceivedAt = record.ObservedAt.UTC().Format(time.RFC3339Nano)
+				if !record.PrefilterCompletedAt.IsZero() {
+					record.ExactDiagnostics.PrefilterCompletedAt = record.PrefilterCompletedAt.UTC().Format(time.RFC3339Nano)
+				}
+				if !record.LiquidatableClassifiedAt.IsZero() {
+					record.ExactDiagnostics.LiquidatableClassifiedAt = record.LiquidatableClassifiedAt.UTC().Format(time.RFC3339Nano)
+				}
+				record.ExactDiagnostics.ExactEnqueuedAt = work.admittedAt.UTC().Format(time.RFC3339Nano)
+				record.ExactDiagnostics.ExactWorkerStartedAt = workerStartedAt.UTC().Format(time.RFC3339Nano)
+				if work.tracker.firstRequestUnixNanos.Load() > 0 {
+					record.ExactDiagnostics.FirstGatewayRequestAt = firstRequestAt.UTC().Format(time.RFC3339Nano)
+				}
+				if work.tracker.initialResponseUnixNanos.Load() > 0 {
+					record.ExactDiagnostics.InitialGatewayResponseAt = initialResponseAt.UTC().Format(time.RFC3339Nano)
+				}
+				record.ExactDiagnostics.ExactEvaluationCompletedAt = exactCompletedAt.UTC().Format(time.RFC3339Nano)
+				if !work.firstObservedMonotonic.IsZero() && work.admittedMonotonic.After(work.firstObservedMonotonic) {
+					record.ExactDiagnostics.EligibilityToAdmissionMillis = uint64(work.admittedMonotonic.Sub(work.firstObservedMonotonic) / time.Millisecond)
+				} else if !work.firstObserved.IsZero() && work.admittedAt.After(work.firstObserved) {
+					record.ExactDiagnostics.EligibilityToAdmissionMillis = uint64(work.admittedAt.Sub(work.firstObserved) / time.Millisecond)
+				}
+				if work.tracker.workerStartedMonotonic.After(work.admittedMonotonic) {
+					record.ExactDiagnostics.QueueToWorkerLatencyMillis = uint64(work.tracker.workerStartedMonotonic.Sub(work.admittedMonotonic) / time.Millisecond)
+				}
+				if work.tracker.firstRequestUnixNanos.Load() > 0 && work.tracker.firstRequestMonotonic.After(work.tracker.workerStartedMonotonic) {
+					record.ExactDiagnostics.WorkerToGatewayLatencyMillis = uint64(work.tracker.firstRequestMonotonic.Sub(work.tracker.workerStartedMonotonic) / time.Millisecond)
+				}
+				if work.tracker.initialResponseUnixNanos.Load() > 0 && work.tracker.initialResponseMonotonic.After(work.tracker.firstRequestMonotonic) {
+					record.ExactDiagnostics.InitialGatewayLatencyMillis = uint64(work.tracker.initialResponseMonotonic.Sub(work.tracker.firstRequestMonotonic) / time.Millisecond)
+				}
+				record.ExactDiagnostics.ExactStateRequestCount = work.tracker.requests.Load()
+			}
+			s.lastExactAt[work.primary.Borrower] = exactCompletedAt
+			if record.ExactRouteIneligibleReason != "" {
+				s.state.RouteIneligible[work.primary.Borrower] = record.ExactRouteIneligibleReason
+				s.state.Counts[exactRouteIneligibleObservedKey]++
+			} else {
+				delete(s.state.RouteIneligible, work.primary.Borrower)
+			}
+			if record.ExactPrimaryProvider == primaryProviderID {
+				recoveryExactTimes = append(recoveryExactTimes, exactCompletedAt)
+			}
 		}
-		if err := appendJSON(filepath.Join(s.config.StateDir, "signals.ndjson"), record); err != nil {
+		completedSignals = append(completedSignals, completedScreenSignal{
+			order: work.order, record: record, borrower: work.primary.Borrower, bucket: work.bucket,
+			signalToPrefilter: work.signalToPrefilter,
+		})
+	}
+	sort.Slice(completedSignals, func(left, right int) bool {
+		return completedSignals[left].order < completedSignals[right].order
+	})
+	for _, completed := range completedSignals {
+		s.observeDurationLocked(
+			signalPrefilterLatencySumKey,
+			signalPrefilterLatencyCountKey,
+			"signal_prefilter_latency_millis_bucket_le_",
+			completed.signalToPrefilter,
+		)
+		if err := s.persistScreenSignalLocked(
+			ctx,
+			completed.record,
+			completed.borrower,
+			completed.bucket,
+			&authorityDiverged,
+		); err != nil {
 			return err
 		}
-		if invalidatedBlock := s.state.TailInvalidatedBlock[primary.Borrower]; invalidatedBlock != 0 && record.Block >= invalidatedBlock {
-			delete(s.state.TailInvalidatedBlock, primary.Borrower)
-		}
-		if s.config.SignalSink != nil && !sinkRecorded {
-			s.mu.Unlock()
-			normalized, sinkErr := s.config.SignalSink.RecordAaveSignal(ctx, record)
-			s.mu.Lock()
-			if sinkErr != nil {
-				return sinkErr
+	}
+	if !authorityDiverged {
+		sort.Slice(recoveryExactTimes, func(left, right int) bool {
+			return recoveryExactTimes[left].Before(recoveryExactTimes[right])
+		})
+		for _, recoveredAt := range recoveryExactTimes {
+			if s.state.LastPrimaryExactAt != nil && !recoveredAt.After(s.state.LastPrimaryExactAt.UTC()) {
+				recoveredAt = s.state.LastPrimaryExactAt.UTC().Add(time.Nanosecond)
 			}
-			record = normalized
+			s.state.LastProviderPrimary = primaryProviderID
+			s.state.LastProviderSecond = ""
+			s.state.LastPrimaryExactAt = &recoveredAt
+			s.recordProviderRecoveryLocked(recoveredAt, primaryProviderID)
 		}
-		if bucket == "urgent" || record.TerminalOutcome == "fork_pending" {
-			if err := appendJSON(filepath.Join(s.config.StateDir, "exact-queue.ndjson"), record); err != nil {
-				return err
-			}
-			s.state.ExactQueueCount++
-		}
-		s.state.Counts[bucket]++
 	}
 	now := time.Now().UTC()
 	if advanceSeed {
@@ -2094,14 +2493,6 @@ func (s *Screener) screen(ctx context.Context, borrowers []string, advanceSeed b
 	s.state.LastBlockHash = screenBlockHash
 	s.state.LastProviderPrimary = primaryEvidence.ProviderID
 	s.state.LastBatchAt = &now
-	// Discovery does not count toward recovery. Only a fresh Exact response from
-	// the reviewed primary is an authority-bearing sample.
-	if exactPrimaryProvider == primaryProviderID {
-		s.state.LastProviderPrimary = exactPrimaryProvider
-		s.state.LastProviderSecond = ""
-		s.state.LastPrimaryExactAt = &exactRecoveryAt
-		s.recordProviderRecoveryLocked(exactRecoveryAt, exactPrimaryProvider)
-	}
 	if authorityDiverged {
 		s.state.ProviderRecoverySamples = nil
 		s.state.LastPrimaryExactAt = nil
@@ -2178,7 +2569,7 @@ func (s *Screener) resolveExact(ctx context.Context, record signal, auction *obs
 		return record, err
 	}
 	req.Header.Set("Content-Type", "application/json")
-	s.recordExactStateRequest()
+	s.recordExactStateRequest(ctx)
 	response, err := s.client.Do(req)
 	if err != nil {
 		return record, err
@@ -2193,6 +2584,11 @@ func (s *Screener) resolveExact(ctx context.Context, record signal, auction *obs
 	}
 	if result.SchemaVersion != "phoenix.rpc.aave-exact-response.v4" || result.ChainID != 42161 || result.RequestID != requestID || result.BlockNumber == 0 || result.BlockHash == "" || result.StateRoot == "" || result.Primary.ProviderID != primaryProviderID || result.Confirmation != nil || result.Quorum != 1 {
 		return record, errors.New("exact Aave provider evidence is incomplete")
+	}
+	if tracker := exactTrackerFromContext(ctx); tracker != nil {
+		if tracker.initialResponseUnixNanos.CompareAndSwap(0, s.nowUTC().UnixNano()) {
+			tracker.initialResponseMonotonic = time.Now()
+		}
 	}
 	if result.BlockNumber < record.Block {
 		return record, errors.New("exact Aave evidence predates its primary screen")
@@ -2324,7 +2720,7 @@ func (s *Screener) fetchExactSnapshot(ctx context.Context, borrower string) (exa
 		return exactResponse{}, err
 	}
 	req.Header.Set("Content-Type", "application/json")
-	s.recordExactStateRequest()
+	s.recordExactStateRequest(ctx)
 	response, err := s.client.Do(req)
 	if err != nil {
 		return exactResponse{}, err
@@ -3303,6 +3699,23 @@ func (s *Screener) simulateExactBatch(ctx context.Context, record signal, simula
 	if len(simulations) == 0 {
 		return nil, errors.New("simulation batch size is invalid")
 	}
+	queueStarted := time.Now()
+	select {
+	case s.exactForkPermits() <- struct{}{}:
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+	tracker := exactTrackerFromContext(ctx)
+	if tracker != nil {
+		tracker.forkQueueNanos.Add(uint64(time.Since(queueStarted)))
+	}
+	forkStarted := time.Now()
+	defer func() {
+		if tracker != nil {
+			tracker.forkRuntimeNanos.Add(uint64(time.Since(forkStarted)))
+		}
+		<-s.exactForkPermits()
+	}()
 	outcomes := make([]simulationBatchOutcome, 0, len(simulations))
 	for offset := 0; offset < len(simulations); offset += 8 {
 		end := offset + 8
@@ -3361,7 +3774,7 @@ func (s *Screener) simulateExactBatchChunk(ctx context.Context, record signal, s
 	if client == nil {
 		client = s.client
 	}
-	s.recordExactStateRequest()
+	s.recordExactStateRequest(ctx)
 	response, err := client.Do(req)
 	if err != nil {
 		return nil, err
@@ -3943,6 +4356,7 @@ func (s *Screener) applyHotSignal(record signal) {
 			}
 		} else {
 			delete(s.firstLiquidatableAt, record.Borrower)
+			delete(s.firstLiquidatableMono, record.Borrower)
 		}
 		if record.StateRoot != "" {
 			completedAt := record.ObservedAt
@@ -3958,6 +4372,7 @@ func (s *Screener) applyHotSignal(record signal) {
 				s.state.LastExactAdmissionAt = &completedAt
 			}
 			delete(s.firstLiquidatableAt, record.Borrower)
+			delete(s.firstLiquidatableMono, record.Borrower)
 		}
 	} else {
 		delete(s.hotBorrowers, record.Borrower)

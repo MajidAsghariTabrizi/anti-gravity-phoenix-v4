@@ -131,7 +131,7 @@ require(
 for reviewed_budget in (
     'RPC_UPSTREAM_CALLS_PER_SECOND: "16"',
     'RPC_UPSTREAM_CALL_BURST: "64"',
-    'RPC_STATE_REQUESTS_PER_MINUTE: "60"',
+    'RPC_STATE_REQUESTS_PER_MINUTE: "120"',
 ):
     require(
         reviewed_budget in rpc_service.group("body"),
@@ -144,8 +144,9 @@ observer_service = re.search(
 )
 require(observer_service is not None, "atlas_observer_service_missing")
 for reviewed_budget in (
-    'PHOENIX_EXACT_STATE_REQUEST_BUDGET_PER_MINUTE: "60"',
-    'PHOENIX_EXACT_DISCOVERY_RESERVE_PER_MINUTE: "24"',
+    'PHOENIX_EXACT_STATE_REQUEST_BUDGET_PER_MINUTE: "120"',
+    'PHOENIX_EXACT_DISCOVERY_RESERVE_PER_MINUTE: "36"',
+    'PHOENIX_AAVE_EXACT_WORKERS: "12"',
 ):
     require(
         reviewed_budget in observer_service.group("body"),
@@ -191,11 +192,37 @@ for required in (
     'production_mode.py" shadow',
     "duration_seconds=${2:-900}",
     "monitor duration must be between 600 and 900 seconds",
+    "require_hunter_ready",
+    "require_latency_gauges",
+    "require_latency_histograms",
+    "require_disarmed_controls",
+    "require_armed_controls",
+    "authority_state=${3:-armed}",
+    "phoenix_exact_first_rpc_dispatch_seconds",
+    "phoenix_exact_end_to_end_seconds",
+    "PHOENIX_MONITOR_INTERVAL_BOUNDARY",
+    "provider_health_counter_vector",
+    "provider_gateway_counter_vector",
+    "runtime_evidence",
+    "gateway provider/budget/error counters regressed",
+    "exact runtime identity/restart/OOM evidence regressed",
+    "primary Exact samples did not advance during monitoring",
 ):
     require(required in post_arm_monitor, f"post_arm_monitor_contract_missing:{required}")
+monitor_loop = post_arm_monitor.split("while :; do", maxsplit=1)[1]
+preflight_conditional = monitor_loop.split(
+    "current_control_status=", maxsplit=1
+)[0].split('if [ "$authority_state" = "armed" ]; then', maxsplit=1)[1]
+armed_preflight, disarmed_preflight = preflight_conditional.split("else", maxsplit=1)
 require(
-    "owner-configured-preflight" not in post_arm_monitor,
-    "post_arm_monitor_uses_paused_only_preflight",
+    "owner-live-preflight" in armed_preflight
+    and "owner-configured-preflight" not in armed_preflight,
+    "post_arm_monitor_armed_preflight_invalid",
+)
+require(
+    "owner-configured-preflight" in disarmed_preflight
+    and "owner-live-preflight" not in disarmed_preflight,
+    "post_arm_monitor_disarmed_preflight_invalid",
 )
 require(
     post_arm_monitor.index("autonomous-control disarm")
