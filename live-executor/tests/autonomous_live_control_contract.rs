@@ -1,6 +1,7 @@
 use phoenix_live_executor::control_environment::{
     control_address_environment_with, EXECUTOR_ADDRESS_ENV, WALLET_ADDRESS_ENV,
 };
+use phoenix_live_executor::owner_bootstrap::{UNPAUSE_ACK, UNPAUSE_ACK_ENV};
 use std::process::{Command, Output};
 
 const WALLET_ADDRESS: &str = "0x1111111111111111111111111111111111111111";
@@ -120,6 +121,25 @@ fn mutating_owner_commands_reject_missing_acknowledgement_before_environment_acc
         assert!(!error.contains("POSTGRES_DSN"), "{argument}");
         assert!(!error.contains("required owner setting"), "{argument}");
     }
+}
+
+#[test]
+fn owner_unpause_requires_live_mode_after_ack_before_owner_environment_access() {
+    let output = control_command("owner-unpause")
+        .env(UNPAUSE_ACK_ENV, UNPAUSE_ACK)
+        .output()
+        .expect("run owner-unpause with acknowledgement only");
+    let error = stderr(&output);
+
+    assert!(!output.status.success());
+    assert!(
+        error.contains(
+            "AUTONOMOUS_CONTROL_FAILED: required environment is missing: PHOENIX_OPERATOR_MODE"
+        ),
+        "{error}"
+    );
+    assert!(!error.contains("required owner setting"));
+    assert!(!error.contains("SIGNER_PRIVATE_KEY"));
 }
 
 #[test]
