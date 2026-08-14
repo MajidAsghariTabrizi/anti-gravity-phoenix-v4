@@ -411,13 +411,13 @@ remove_source_only_services() {
       >/dev/null 2>&1 || true
     compose_with_release_env "$rollback_release_env" rm -f "$service" \
       >/dev/null 2>&1 || true
-    phoenix_wait_required_service_absent compose "$service" || return 1
+    phoenix_reconcile_required_service_absent compose "$service" || return 1
   done
 }
 
 assert_intentional_absence() {
   for service in $absent_services; do
-    phoenix_wait_required_service_absent compose "$service" || return 1
+    phoenix_reconcile_required_service_absent compose "$service" || return 1
   done
 }
 
@@ -736,7 +736,7 @@ rollback_on_failure() {
     repause_ok=1
     compose stop -t 30 live-executor >/dev/null 2>&1 || true
     compose rm -f live-executor >/dev/null 2>&1 || true
-    if ! phoenix_wait_required_service_absent compose live-executor; then
+    if ! phoenix_reconcile_required_service_absent compose live-executor; then
       repause_ok=0
       echo "DEPLOY_COMPENSATION_FAILED: stale live-executor container remains"
     fi
@@ -823,7 +823,7 @@ transition_mutable_protected "$rollback_release_env" "$release_env" ||
   fail "mutable protected services could not transition without loss"
 compose stop -t 30 live-executor >/dev/null 2>&1 || true
 compose rm -f live-executor >/dev/null 2>&1 || true
-phoenix_wait_required_service_absent compose live-executor ||
+phoenix_reconcile_required_service_absent compose live-executor ||
   fail "live-executor container remained after removal"
 # Quiesce every long-lived client of the live_canary schema before its bounded
 # DDL lock timeout begins. The target services are recreated below only after

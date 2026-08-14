@@ -3807,7 +3807,7 @@ class WorkflowAndDeploymentContractTests(unittest.TestCase):
         )
         removed = self.deploy.index("compose rm -f live-executor", stopped)
         absence = self.deploy.index(
-            "phoenix_wait_required_service_absent compose live-executor",
+            "phoenix_reconcile_required_service_absent compose live-executor",
             removed,
         )
         start = self.deploy.index("compose up -d --no-deps live-executor")
@@ -3821,7 +3821,7 @@ class WorkflowAndDeploymentContractTests(unittest.TestCase):
         )[0]
         self.assertIn("compose rm -f live-executor", compensation)
         self.assertIn(
-            "phoenix_wait_required_service_absent compose live-executor",
+            "phoenix_reconcile_required_service_absent compose live-executor",
             compensation,
         )
         self.assertIn("state_update_raw failure deployment_failed", self.deploy)
@@ -3833,7 +3833,7 @@ class WorkflowAndDeploymentContractTests(unittest.TestCase):
 
     def test_required_absence_uses_one_fresh_label_poll_contract(self) -> None:
         self.assertIn(
-            "phoenix_wait_required_service_absent()", self.required_absence
+            "phoenix_reconcile_required_service_absent()", self.required_absence
         )
         self.assertIn(
             '"$required_compose_command" config --format json',
@@ -3849,16 +3849,29 @@ class WorkflowAndDeploymentContractTests(unittest.TestCase):
         )
         self.assertIn("while :; do", self.required_absence)
         self.assertIn('[ -n "$required_ids" ] || return 0', self.required_absence)
+        self.assertIn(
+            '"$required_docker_bin" container rm --force "$required_id"',
+            self.required_absence,
+        )
+        self.assertGreaterEqual(
+            self.required_absence.count(
+                '"$required_docker_bin" ps --all --quiet --no-trunc'
+            ),
+            2,
+        )
+        self.assertIn(
+            "Only the next fresh label", self.required_absence
+        )
         self.assertNotIn("docker inspect", self.required_absence)
         self.assertNotIn("required_container_id", self.required_absence)
         self.assertGreaterEqual(
             self.deploy.count(
-                "phoenix_wait_required_service_absent compose live-executor"
+                "phoenix_reconcile_required_service_absent compose live-executor"
             ),
             2,
         )
         self.assertGreaterEqual(
-            self.rollback.count("phoenix_wait_required_service_absent"),
+            self.rollback.count("phoenix_reconcile_required_service_absent"),
             3,
         )
         platform = (ROOT / "scripts/release_platform.py").read_text()
