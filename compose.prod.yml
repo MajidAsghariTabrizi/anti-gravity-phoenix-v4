@@ -304,9 +304,9 @@ services:
     cap_drop: [ALL]
     security_opt:
       - no-new-privileges:true
-    pids_limit: 64
-    cpus: "0.25"
-    mem_limit: 192m
+    pids_limit: 128
+    cpus: "1.50"
+    mem_limit: 384m
     stop_grace_period: 15s
     restart: unless-stopped
     logging: *bounded-logging

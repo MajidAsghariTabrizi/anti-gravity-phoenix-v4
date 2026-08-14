@@ -42,9 +42,11 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
-use tokio::sync::{watch, Mutex};
+use tokio::sync::{watch, Mutex, Semaphore};
 
 const ARBITRUM_CHAIN_ID_HEX: &str = "0xa4b1";
+const AAVE_EXACT_OPERATION_CONCURRENCY: usize = 12;
+const AAVE_FORK_OPERATION_CONCURRENCY: usize = 2;
 const AAVE_GET_USER_ACCOUNT_DATA_SELECTOR: &str = "0xbf92857c";
 const AAVE_GET_USER_CONFIGURATION_SELECTOR: &str = "0x4417a583";
 const AAVE_GET_CONFIGURATION_SELECTOR: &str = "0xc44b11f7";
@@ -366,6 +368,22 @@ impl GatewayError {
     }
 }
 
+struct ExactOperationMetricGuard(RuntimeRpcMetrics);
+
+impl Drop for ExactOperationMetricGuard {
+    fn drop(&mut self) {
+        self.0.exact_operation_finished();
+    }
+}
+
+struct ForkOperationMetricGuard(RuntimeRpcMetrics);
+
+impl Drop for ForkOperationMetricGuard {
+    fn drop(&mut self) {
+        self.0.fork_operation_finished();
+    }
+}
+
 #[derive(Clone)]
 pub struct GatewayRuntime {
     providers: Arc<Mutex<ProviderPool>>,
@@ -385,6 +403,8 @@ pub struct GatewayRuntime {
     multicall_verified: Arc<Mutex<HashSet<String>>>,
     provider_verification_locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
     upstream_operation_lock: Arc<Mutex<()>>,
+    aave_exact_operation_permits: Arc<Semaphore>,
+    aave_fork_operation_permits: Arc<Semaphore>,
     client: Arc<dyn JsonRpcClient>,
     timeouts: MethodTimeouts,
     metrics: RuntimeRpcMetrics,
@@ -456,6 +476,10 @@ impl GatewayRuntime {
             multicall_verified: Arc::new(Mutex::new(HashSet::new())),
             provider_verification_locks: Arc::new(Mutex::new(HashMap::new())),
             upstream_operation_lock: Arc::new(Mutex::new(())),
+            aave_exact_operation_permits: Arc::new(Semaphore::new(
+                AAVE_EXACT_OPERATION_CONCURRENCY,
+            )),
+            aave_fork_operation_permits: Arc::new(Semaphore::new(AAVE_FORK_OPERATION_CONCURRENCY)),
             client,
             timeouts,
             metrics,
@@ -953,7 +977,15 @@ impl GatewayRuntime {
         if !self.request_budget.lock().await.admit(Instant::now()) {
             return Err(GatewayError::RequestBudgetExhausted);
         }
-        let _operation_guard = self.upstream_operation_lock.lock().await;
+        let queue_started = Instant::now();
+        let _operation_permit = self
+            .aave_exact_operation_permits
+            .acquire()
+            .await
+            .map_err(|_| GatewayError::ProviderUnavailable)?;
+        self.metrics
+            .exact_operation_started(queue_started.elapsed());
+        let _metric_guard = ExactOperationMetricGuard(self.metrics.clone());
         let pacing_deadline = Instant::now() + MAX_STATE_RESOLUTION;
         let primary = self
             .reserve_named_provider(AAVE_PRIMARY_PROVIDER_ID)
@@ -1213,7 +1245,14 @@ impl GatewayRuntime {
             self.metrics.state_request_budget_rejected();
             return Err(GatewayError::RequestBudgetExhausted);
         }
-        let _operation_guard = self.upstream_operation_lock.lock().await;
+        let queue_started = Instant::now();
+        let _operation_permit = self
+            .aave_fork_operation_permits
+            .acquire()
+            .await
+            .map_err(|_| GatewayError::ProviderUnavailable)?;
+        self.metrics.fork_operation_started(queue_started.elapsed());
+        let _metric_guard = ForkOperationMetricGuard(self.metrics.clone());
         let first = &request.simulations[0];
         let remaining = first
             .deadline_unix_seconds
@@ -3492,6 +3531,7 @@ impl GatewayRuntime {
         if let Some(inner_calls) = multicall_inner {
             self.metrics.multicall_request(inner_calls);
         }
+        let started = Instant::now();
         let result = self
             .client
             .call(provider, method, params, self.timeouts.timeout_for(method))
@@ -3503,6 +3543,12 @@ impl GatewayRuntime {
             Err(_) => UpstreamOutcome::Failure,
         };
         self.metrics.upstream_call(method, outcome, slot);
+        let latency = result
+            .as_ref()
+            .map(|value| Duration::from_nanos(value.latency_ns.min(u64::MAX as u128) as u64))
+            .unwrap_or_else(|_| started.elapsed());
+        self.metrics
+            .upstream_call_latency(method, outcome, slot, latency);
         result.map_err(CallFailure::Transport)
     }
 
@@ -5449,7 +5495,7 @@ mod tests {
     use crate::shadow_state::{PoolStateRequest, SHADOW_STATE_SCHEMA_VERSION};
     use async_trait::async_trait;
     use ethabi::{decode, encode, ParamType, Token};
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::sync::Mutex as StdMutex;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
@@ -5479,6 +5525,8 @@ mod tests {
         finalized_disagreement: AtomicBool,
         malformed_multicall: AtomicBool,
         delay_multicall: Duration,
+        active_eth_calls: AtomicU64,
+        maximum_active_eth_calls: AtomicU64,
     }
 
     impl Default for ModelClient {
@@ -5499,6 +5547,8 @@ mod tests {
                 finalized_disagreement: AtomicBool::new(false),
                 malformed_multicall: AtomicBool::new(false),
                 delay_multicall: Duration::ZERO,
+                active_eth_calls: AtomicU64::new(0),
+                maximum_active_eth_calls: AtomicU64::new(0),
             }
         }
     }
@@ -5538,6 +5588,11 @@ mod tests {
                 .lock()
                 .unwrap()
                 .insert(provider_id.to_string());
+        }
+
+        fn reset_eth_call_concurrency(&self) {
+            self.active_eth_calls.store(0, Ordering::Relaxed);
+            self.maximum_active_eth_calls.store(0, Ordering::Relaxed);
         }
 
         fn block_for_tag(&self, tag: &str) -> PinnedBlock {
@@ -5773,7 +5828,11 @@ mod tests {
                         });
                     }
                     if !self.delay_multicall.is_zero() {
+                        let current = self.active_eth_calls.fetch_add(1, Ordering::Relaxed) + 1;
+                        self.maximum_active_eth_calls
+                            .fetch_max(current, Ordering::Relaxed);
                         tokio::time::sleep(self.delay_multicall).await;
+                        self.active_eth_calls.fetch_sub(1, Ordering::Relaxed);
                     }
                     let destination = params[0]["to"].as_str().unwrap_or_default();
                     if destination.eq_ignore_ascii_case(MULTICALL3_ADDRESS) {
@@ -6063,6 +6122,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn aave_exact_lane_is_bounded_and_work_conserving() {
+        let client = Arc::new(ModelClient::with_delay(Duration::from_millis(20)));
+        let runtime = runtime(client.clone());
+        mark_test_providers_verified(&runtime).await;
+        runtime
+            .resolve_aave_exact(aave_exact_request("warm-concurrency"))
+            .await
+            .unwrap();
+        client.reset_eth_call_concurrency();
+
+        let mut tasks = Vec::new();
+        for index in 0..24_u8 {
+            let runtime = runtime.clone();
+            tasks.push(tokio::spawn(async move {
+                let mut request = aave_exact_request(&format!("concurrent-{index}"));
+                request.borrower = format!("0x{:040x}", u64::from(index) + 1);
+                runtime.resolve_aave_exact(request).await
+            }));
+        }
+        for task in tasks {
+            let response = task.await.unwrap().unwrap();
+            assert_eq!(response.primary.provider_id, AAVE_PRIMARY_PROVIDER_ID);
+            assert_eq!(response.confirmation, None);
+            assert_eq!(response.quorum, 1);
+        }
+
+        let maximum = client.maximum_active_eth_calls.load(Ordering::Relaxed);
+        assert_eq!(maximum, AAVE_EXACT_OPERATION_CONCURRENCY as u64);
+        let metrics = runtime.metrics.render(&runtime.readiness);
+        assert!(metrics.contains("rpc_aave_exact_operations_in_flight 0"));
+        assert!(metrics.contains("rpc_aave_exact_operation_queue_seconds_count 25"));
+    }
+
+    #[tokio::test]
     async fn aave_exact_static_context_misses_on_each_pinned_identity_component() {
         for identity in ["number", "hash", "state_root"] {
             let client = Arc::new(ModelClient::default());
@@ -6215,6 +6308,9 @@ mod tests {
             0,
             "warm static context was unexpectedly fetched again"
         );
+        let metrics = runtime.metrics.render(&runtime.readiness);
+        assert!(metrics.contains("rpc_aave_fork_operations_in_flight 0"));
+        assert!(metrics.contains("rpc_aave_fork_operation_queue_seconds_count 2"));
     }
 
     fn multicall_inner_counts(calls: &[CallRecord]) -> Vec<usize> {

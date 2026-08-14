@@ -70,7 +70,13 @@ struct RuntimeMetricValues {
     provider_disagreement: AtomicU64,
     state_freshness_nanos: AtomicU64,
     state_request_latency: Mutex<LatencyHistogram>,
+    exact_operation_queue_latency: Mutex<LatencyHistogram>,
+    exact_operations_in_flight: AtomicU64,
+    fork_operation_queue_latency: Mutex<LatencyHistogram>,
+    fork_operations_in_flight: AtomicU64,
     upstream_calls: Mutex<BTreeMap<(&'static str, &'static str, &'static str), u64>>,
+    upstream_call_latency:
+        Mutex<BTreeMap<(&'static str, &'static str, &'static str), LatencyHistogram>>,
 }
 
 #[derive(Debug, Default)]
@@ -123,6 +129,32 @@ impl RuntimeRpcMetrics {
         *calls
             .entry((method.as_str(), outcome.as_str(), slot.as_str()))
             .or_insert(0) += 1;
+    }
+
+    pub fn upstream_call_latency(
+        &self,
+        method: RpcMethod,
+        outcome: UpstreamOutcome,
+        slot: ProviderSlot,
+        latency: Duration,
+    ) {
+        let nanos = latency.as_nanos().min(u64::MAX as u128) as u64;
+        let mut histograms = self
+            .inner
+            .upstream_call_latency
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let histogram = histograms
+            .entry((method.as_str(), outcome.as_str(), slot.as_str()))
+            .or_default();
+        histogram.count = histogram.count.saturating_add(1);
+        histogram.sum_nanos = histogram.sum_nanos.saturating_add(nanos as u128);
+        for (index, upper_bound) in LATENCY_BUCKETS_NANOS.iter().enumerate() {
+            if nanos <= *upper_bound {
+                histogram.cumulative_buckets[index] =
+                    histogram.cumulative_buckets[index].saturating_add(1);
+            }
+        }
     }
 
     pub fn multicall_request(&self, inner_calls: usize) {
@@ -228,15 +260,82 @@ impl RuntimeRpcMetrics {
         }
     }
 
+    pub fn exact_operation_started(&self, queue_latency: Duration) {
+        self.inner
+            .exact_operations_in_flight
+            .fetch_add(1, Ordering::Relaxed);
+        let nanos = queue_latency.as_nanos().min(u64::MAX as u128) as u64;
+        let mut histogram = self
+            .inner
+            .exact_operation_queue_latency
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        histogram.count = histogram.count.saturating_add(1);
+        histogram.sum_nanos = histogram.sum_nanos.saturating_add(nanos as u128);
+        for (index, upper_bound) in LATENCY_BUCKETS_NANOS.iter().enumerate() {
+            if nanos <= *upper_bound {
+                histogram.cumulative_buckets[index] =
+                    histogram.cumulative_buckets[index].saturating_add(1);
+            }
+        }
+    }
+
+    pub fn exact_operation_finished(&self) {
+        self.inner
+            .exact_operations_in_flight
+            .fetch_sub(1, Ordering::Relaxed);
+    }
+
+    pub fn fork_operation_started(&self, queue_latency: Duration) {
+        self.inner
+            .fork_operations_in_flight
+            .fetch_add(1, Ordering::Relaxed);
+        let nanos = queue_latency.as_nanos().min(u64::MAX as u128) as u64;
+        let mut histogram = self
+            .inner
+            .fork_operation_queue_latency
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        histogram.count = histogram.count.saturating_add(1);
+        histogram.sum_nanos = histogram.sum_nanos.saturating_add(nanos as u128);
+        for (index, upper_bound) in LATENCY_BUCKETS_NANOS.iter().enumerate() {
+            if nanos <= *upper_bound {
+                histogram.cumulative_buckets[index] =
+                    histogram.cumulative_buckets[index].saturating_add(1);
+            }
+        }
+    }
+
+    pub fn fork_operation_finished(&self) {
+        self.inner
+            .fork_operations_in_flight
+            .fetch_sub(1, Ordering::Relaxed);
+    }
+
     pub fn render(&self, readiness: &GatewayReadiness) -> String {
         let calls = self
             .inner
             .upstream_calls
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let upstream_latency = self
+            .inner
+            .upstream_call_latency
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let latency = self
             .inner
             .state_request_latency
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let exact_queue_latency = self
+            .inner
+            .exact_operation_queue_latency
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let fork_queue_latency = self
+            .inner
+            .fork_operation_queue_latency
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let mut output = String::new();
@@ -259,6 +358,31 @@ impl RuntimeRpcMetrics {
             let _ = writeln!(
                 output,
                 "rpc_upstream_calls_total{{method=\"{method}\",outcome=\"{outcome}\",provider_slot=\"{slot}\"}} {value}"
+            );
+        }
+        output.push_str("# TYPE rpc_upstream_call_latency_seconds histogram\n");
+        for ((method, outcome, slot), histogram) in upstream_latency.iter() {
+            for (index, label) in LATENCY_BUCKET_LABELS.iter().enumerate() {
+                let _ = writeln!(
+                    output,
+                    "rpc_upstream_call_latency_seconds_bucket{{method=\"{method}\",outcome=\"{outcome}\",provider_slot=\"{slot}\",le=\"{label}\"}} {}",
+                    histogram.cumulative_buckets[index]
+                );
+            }
+            let _ = writeln!(
+                output,
+                "rpc_upstream_call_latency_seconds_bucket{{method=\"{method}\",outcome=\"{outcome}\",provider_slot=\"{slot}\",le=\"+Inf\"}} {}",
+                histogram.count
+            );
+            let _ = writeln!(
+                output,
+                "rpc_upstream_call_latency_seconds_sum{{method=\"{method}\",outcome=\"{outcome}\",provider_slot=\"{slot}\"}} {:.9}",
+                histogram.sum_nanos as f64 / 1_000_000_000.0
+            );
+            let _ = writeln!(
+                output,
+                "rpc_upstream_call_latency_seconds_count{{method=\"{method}\",outcome=\"{outcome}\",provider_slot=\"{slot}\"}} {}",
+                histogram.count
             );
         }
         output.push_str("# TYPE rpc_upstream_call_budget_rejected_total counter\n");
@@ -359,6 +483,66 @@ impl RuntimeRpcMetrics {
             "rpc_state_request_latency_seconds_bucket{{le=\"+Inf\"}} {}",
             latency.count
         );
+        output.push_str("# TYPE rpc_aave_exact_operations_in_flight gauge\n");
+        let _ = writeln!(
+            output,
+            "rpc_aave_exact_operations_in_flight {}",
+            self.inner
+                .exact_operations_in_flight
+                .load(Ordering::Relaxed)
+        );
+        output.push_str("# TYPE rpc_aave_exact_operation_queue_seconds histogram\n");
+        for (index, label) in LATENCY_BUCKET_LABELS.iter().enumerate() {
+            let _ = writeln!(
+                output,
+                "rpc_aave_exact_operation_queue_seconds_bucket{{le=\"{label}\"}} {}",
+                exact_queue_latency.cumulative_buckets[index]
+            );
+        }
+        let _ = writeln!(
+            output,
+            "rpc_aave_exact_operation_queue_seconds_bucket{{le=\"+Inf\"}} {}",
+            exact_queue_latency.count
+        );
+        let _ = writeln!(
+            output,
+            "rpc_aave_exact_operation_queue_seconds_sum {:.9}",
+            exact_queue_latency.sum_nanos as f64 / 1_000_000_000.0
+        );
+        let _ = writeln!(
+            output,
+            "rpc_aave_exact_operation_queue_seconds_count {}",
+            exact_queue_latency.count
+        );
+        output.push_str("# TYPE rpc_aave_fork_operations_in_flight gauge\n");
+        let _ = writeln!(
+            output,
+            "rpc_aave_fork_operations_in_flight {}",
+            self.inner.fork_operations_in_flight.load(Ordering::Relaxed)
+        );
+        output.push_str("# TYPE rpc_aave_fork_operation_queue_seconds histogram\n");
+        for (index, label) in LATENCY_BUCKET_LABELS.iter().enumerate() {
+            let _ = writeln!(
+                output,
+                "rpc_aave_fork_operation_queue_seconds_bucket{{le=\"{label}\"}} {}",
+                fork_queue_latency.cumulative_buckets[index]
+            );
+        }
+        let _ = writeln!(
+            output,
+            "rpc_aave_fork_operation_queue_seconds_bucket{{le=\"+Inf\"}} {}",
+            fork_queue_latency.count
+        );
+        let _ = writeln!(
+            output,
+            "rpc_aave_fork_operation_queue_seconds_sum {:.9}",
+            fork_queue_latency.sum_nanos as f64 / 1_000_000_000.0
+        );
+        let _ = writeln!(
+            output,
+            "rpc_aave_fork_operation_queue_seconds_count {}",
+            fork_queue_latency.count
+        );
         let _ = writeln!(
             output,
             "rpc_state_request_latency_seconds_sum {:.9}",
@@ -398,6 +582,7 @@ pub const REQUIRED_RPC_METRICS: &[&str] = &[
     "rpc_state_requests_total",
     "rpc_state_request_budget_rejected_total",
     "rpc_upstream_calls_total",
+    "rpc_upstream_call_latency_seconds",
     "rpc_upstream_call_budget_rejected_total",
     "rpc_multicall_requests_total",
     "rpc_multicall_inner_calls_total",
@@ -417,6 +602,10 @@ pub const REQUIRED_RPC_METRICS: &[&str] = &[
     "rpc_provider_disagreement_total",
     "rpc_state_freshness_seconds",
     "rpc_state_request_latency_seconds",
+    "rpc_aave_exact_operations_in_flight",
+    "rpc_aave_exact_operation_queue_seconds",
+    "rpc_aave_fork_operations_in_flight",
+    "rpc_aave_fork_operation_queue_seconds",
     "rpc_gateway_readiness",
 ];
 
@@ -433,6 +622,12 @@ mod tests {
             UpstreamOutcome::Success,
             ProviderSlot::Primary,
         );
+        metrics.upstream_call_latency(
+            RpcMethod::EthCall,
+            UpstreamOutcome::Success,
+            ProviderSlot::Primary,
+            Duration::from_millis(10),
+        );
         metrics.multicall_request(4);
         metrics.primary_success();
         metrics.secondary_verification();
@@ -440,6 +635,10 @@ mod tests {
         metrics.provider_disagreement();
         metrics.state_freshness(Duration::from_millis(75));
         metrics.state_request_latency(Duration::from_millis(25));
+        metrics.exact_operation_started(Duration::from_millis(5));
+        metrics.exact_operation_finished();
+        metrics.fork_operation_started(Duration::from_millis(7));
+        metrics.fork_operation_finished();
         let readiness = GatewayReadiness::new(true);
         readiness.set_provider_healthy(true);
         let rendered = metrics.render(&readiness);
@@ -455,6 +654,11 @@ mod tests {
         assert!(rendered.contains("rpc_state_freshness_seconds 0.075000000"));
         assert!(rendered.contains("rpc_state_request_latency_seconds_bucket{le=\"0.025\"} 1"));
         assert!(rendered.contains("rpc_state_request_latency_seconds_count 1"));
+        assert!(rendered.contains(
+            "rpc_upstream_call_latency_seconds_bucket{method=\"eth_call\",outcome=\"success\",provider_slot=\"primary\",le=\"0.01\"} 1"
+        ));
+        assert!(rendered.contains("rpc_aave_exact_operation_queue_seconds_count 1"));
+        assert!(rendered.contains("rpc_aave_fork_operation_queue_seconds_count 1"));
         for forbidden in ["provider_url=", "tx_hash=", "pool_address=", "route="] {
             assert!(!rendered.contains(forbidden));
         }

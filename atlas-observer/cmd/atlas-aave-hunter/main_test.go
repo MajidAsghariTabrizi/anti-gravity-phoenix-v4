@@ -185,9 +185,15 @@ func TestDivergentRevenueAuthorityKeepsHealthAliveAndReadinessClosed(t *testing.
 }
 
 func TestHealthPayloadPublishesCurrentProviderFailureStreak(t *testing.T) {
-	payload := healthPayload(laneHealth{}, hunter.State{Counts: map[string]uint64{
-		"provider_current_class_failure_streak": 2,
-	}}, false)
+	payload := healthPayload(laneHealth{}, hunter.State{
+		ExactQueueCount: 42, ExactEligibleNowCount: 3, ExactEvaluationsInFlight: 2,
+		ExactWorkerQueueDepth: 1, SchedulerBlockedCount: 4, CooldownBlockedCount: 5,
+		Counts: map[string]uint64{
+			"provider_current_class_failure_streak": 2,
+			"exact_coalesced_total":                 6, "exact_stale_invalidated_total": 7,
+			"exact_duplicate_suppressed_total": 8,
+		},
+	}, false)
 	if got := payload["rpc_authority_mode"]; got != "single_primary" {
 		t.Fatalf("rpc authority mode=%v want=single_primary", got)
 	}
@@ -196,6 +202,16 @@ func TestHealthPayloadPublishesCurrentProviderFailureStreak(t *testing.T) {
 	}
 	if got := payload["provider_current_class_failure_streak"]; got != uint64(2) {
 		t.Fatalf("current provider failure streak=%v want=2", got)
+	}
+	if payload["aave_exact_queue_ledger_entries_total"] != uint64(42) ||
+		payload["aave_exact_actionable_queue"] != uint64(3) ||
+		payload["aave_exact_in_flight_queue"] != uint64(2) ||
+		payload["aave_exact_worker_queue_depth"] != uint64(1) ||
+		payload["aave_exact_blocked_queue"] != uint64(9) ||
+		payload["aave_exact_coalesced_total"] != uint64(6) ||
+		payload["aave_exact_stale_invalidated_total"] != uint64(7) ||
+		payload["aave_exact_duplicate_suppressed_total"] != uint64(8) {
+		t.Fatalf("actionable/cumulative Exact health evidence is not distinct: %#v", payload)
 	}
 }
 

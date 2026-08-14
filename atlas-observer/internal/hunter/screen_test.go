@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"math/big"
 	"net/http"
@@ -15,6 +16,8 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -1326,7 +1329,7 @@ func TestNewRequiresCanonicalGitReleaseSHA(t *testing.T) {
 	}
 }
 
-func TestLiquidatablePriorityPrefersLargerDebtBeforeLowerHealthFactor(t *testing.T) {
+func TestLiquidatablePriorityUsesHealthFactorWithoutEconomicDebtOrdering(t *testing.T) {
 	small := "0x1111111111111111111111111111111111111111"
 	large := "0x2222222222222222222222222222222222222222"
 	urgent := "0x3333333333333333333333333333333333333333"
@@ -1344,7 +1347,7 @@ func TestLiquidatablePriorityPrefersLargerDebtBeforeLowerHealthFactor(t *testing
 		},
 	}
 	batch := screener.nextHotBatch()
-	if len(batch) != 3 || batch[0] != large || batch[1] != small || batch[2] != urgent {
+	if len(batch) != 3 || batch[0] != small || batch[1] != large || batch[2] != urgent {
 		t.Fatalf("unexpected hot borrower priority: %v", batch)
 	}
 
@@ -1354,7 +1357,7 @@ func TestLiquidatablePriorityPrefersLargerDebtBeforeLowerHealthFactor(t *testing
 		{Borrower: large, TotalDebtBase: "100000", HealthFactorWAD: "990000000000000000"},
 	}
 	order := prioritizedAccountOrder(accounts)
-	if len(order) != 3 || order[0] != 2 || order[1] != 0 || order[2] != 1 {
+	if len(order) != 3 || order[0] != 0 || order[1] != 2 || order[2] != 1 {
 		t.Fatalf("unexpected screen account priority: %v", order)
 	}
 }
@@ -1590,7 +1593,7 @@ func TestCandidateArtifactsRequireAnAcceptedDurableSignalWrite(t *testing.T) {
 	}
 }
 
-func TestEmptyTailPriorityWindowAlternatesTailWithHotWork(t *testing.T) {
+func TestEmptyTailPriorityWindowPollsTailAndHotOnEveryTick(t *testing.T) {
 	borrower := "0x1111111111111111111111111111111111111111"
 	sequence := make([]string, 0, 6)
 	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
@@ -1642,11 +1645,11 @@ func TestEmptyTailPriorityWindowAlternatesTailWithHotWork(t *testing.T) {
 	if err := screener.runPriorityRecheckWindow(context.Background(), time.Minute); err != nil {
 		t.Fatal(err)
 	}
-	want := []string{"tail", "hot", "tail", "hot", "tail", "hot"}
+	want := []string{"tail", "tail", "hot", "tail", "hot", "tail", "hot", "tail", "hot", "tail", "hot"}
 	if strings.Join(sequence, ",") != strings.Join(want, ",") || len(waits) != 6 {
 		t.Fatalf("priority cadence drifted: sequence=%v waits=%v", sequence, waits)
 	}
-	if screener.Snapshot().Counts[hotRecheckTotalKey] != 3 {
+	if screener.Snapshot().Counts[hotRecheckTotalKey] != 5 {
 		t.Fatalf("hot rechecks were not counted: %+v", screener.Snapshot().Counts)
 	}
 }
@@ -1721,6 +1724,7 @@ func TestAaveMetricsExposeHotAndExactLatencyEvidence(t *testing.T) {
 	screener := &Screener{
 		state: State{Schema: StateSchema, Counts: map[string]uint64{
 			hotRecheckTotalKey: 3, exactEvalStartedKey: 2, exactEvalCompletedKey: 2,
+			exactCoalescedKey: 4, exactStaleInvalidatedKey: 5, exactDuplicateSuppressedKey: 6,
 		}, ExactQueueCount: 42, RouteIneligible: map[string]string{urgent: "no_weth_debt"}},
 		hotBorrowers: map[string]string{
 			liquidatable: "900000000000000000",
@@ -1739,6 +1743,15 @@ func TestAaveMetricsExposeHotAndExactLatencyEvidence(t *testing.T) {
 	screener.mu.Lock()
 	screener.observeDurationLocked(exactEvalLatencySumKey, exactEvalLatencyCountKey, "exact_eval_latency_millis_bucket_le_", 4*time.Second)
 	screener.observeDurationLocked(liquidatableToExactSumKey, liquidatableToExactCountKey, "liquidatable_to_exact_millis_bucket_le_", 12*time.Second)
+	screener.observeDurationLocked(signalPrefilterLatencySumKey, signalPrefilterLatencyCountKey, "signal_prefilter_latency_millis_bucket_le_", 10*time.Millisecond)
+	screener.observeDurationLocked(exactEligibilityLatencySumKey, exactEligibilityLatencyCountKey, "exact_eligibility_latency_millis_bucket_le_", 5*time.Millisecond)
+	screener.observeDurationLocked(exactQueueLatencySumKey, exactQueueLatencyCountKey, "exact_queue_latency_millis_bucket_le_", 25*time.Millisecond)
+	screener.observeDurationLocked(exactDispatchLatencySumKey, exactDispatchLatencyCountKey, "exact_dispatch_latency_millis_bucket_le_", 10*time.Millisecond)
+	screener.observeDurationLocked(exactFirstRPCLatencySumKey, exactFirstRPCLatencyCountKey, "exact_first_rpc_latency_millis_bucket_le_", 50*time.Millisecond)
+	screener.observeDurationLocked(exactInitialLatencySumKey, exactInitialLatencyCountKey, "exact_initial_response_latency_millis_bucket_le_", 250*time.Millisecond)
+	screener.observeDurationLocked(exactComputeLatencySumKey, exactComputeLatencyCountKey, "exact_compute_latency_millis_bucket_le_", 25*time.Millisecond)
+	screener.observeDurationLocked(exactForkQueueSumKey, exactForkQueueCountKey, "exact_fork_queue_millis_bucket_le_", 10*time.Millisecond)
+	screener.observeDurationLocked(exactForkRuntimeSumKey, exactForkRuntimeCountKey, "exact_fork_runtime_millis_bucket_le_", time.Second)
 	screener.mu.Unlock()
 	metrics := screener.MetricsText()
 	for _, expected := range []string{
@@ -1757,6 +1770,22 @@ func TestAaveMetricsExposeHotAndExactLatencyEvidence(t *testing.T) {
 		"phoenix_aave_hot_recheck_total 3",
 		"phoenix_aave_exact_eval_latency_ms_bucket{le=\"5000\"} 1",
 		"phoenix_aave_first_liquidatable_to_exact_eval_ms_bucket{le=\"15000\"} 1",
+		"phoenix_exact_worker_permits_available 12",
+		"phoenix_exact_queue_depth 1",
+		"phoenix_exact_oldest_actionable_age_seconds 20",
+		"phoenix_exact_coalesced_total 4",
+		"phoenix_exact_stale_invalidated_total 5",
+		"phoenix_exact_duplicate_suppressed_total 6",
+		"phoenix_signal_to_prefilter_seconds_count 1",
+		"phoenix_liquidatable_to_exact_enqueue_seconds_count 1",
+		"phoenix_exact_queue_wait_seconds_count 1",
+		"phoenix_exact_worker_dispatch_seconds_count 1",
+		"phoenix_exact_first_rpc_dispatch_seconds_count 1",
+		"phoenix_exact_rpc_state_fetch_seconds_count 1",
+		"phoenix_exact_compute_seconds_count 1",
+		"phoenix_exact_end_to_end_seconds_count 1",
+		"phoenix_fork_queue_wait_seconds_count 1",
+		"phoenix_fork_runtime_seconds_count 1",
 	} {
 		if !strings.Contains(metrics, expected) {
 			t.Fatalf("metric %q is missing:\n%s", expected, metrics)
@@ -2469,7 +2498,7 @@ func TestAaveExactSchedulerBoundedBeforeAfterModel(t *testing.T) {
 		}
 	}
 
-	if after.ExactStartAttempts != 6 || after.LowDebtFirstExactAtSeconds == nil || *after.LowDebtFirstExactAtSeconds != 20 {
+	if after.ExactStartAttempts != 6 || after.LowDebtFirstExactAtSeconds == nil || *after.LowDebtFirstExactAtSeconds != 0 {
 		t.Fatalf("bounded fair scheduler replay drifted: starts=%d low_first=%d scheduler=%d", after.ExactStartAttempts, func() int {
 			if after.LowDebtFirstExactAtSeconds == nil {
 				return -1
@@ -2497,6 +2526,7 @@ func TestAaveExactSchedulerHTTPPathIsBoundedAndSinglePrimary(t *testing.T) {
 	high := "0x1111111111111111111111111111111111111111"
 	low := "0x2222222222222222222222222222222222222222"
 	exactStarts := map[string]int{}
+	var exactStartsMu sync.Mutex
 	exactPrimaryChecks := 0
 	lowFirstExactSeconds := -1
 
@@ -2536,10 +2566,12 @@ func TestAaveExactSchedulerHTTPPathIsBoundedAndSinglePrimary(t *testing.T) {
 			if err := json.NewDecoder(request.Body).Decode(&input); err != nil {
 				t.Fatal(err)
 			}
+			exactStartsMu.Lock()
 			exactStarts[input.Borrower]++
 			if input.Borrower == low && lowFirstExactSeconds < 0 {
 				lowFirstExactSeconds = int(now.Sub(start) / time.Second)
 			}
+			exactStartsMu.Unlock()
 			reserve := exactReserve{
 				Asset: wethAddress, CurrentATokenBalance: "1", CurrentStableDebt: "0",
 				CurrentVariableDebt: "1000", UsageAsCollateralEnabled: true,
@@ -2581,7 +2613,7 @@ func TestAaveExactSchedulerHTTPPathIsBoundedAndSinglePrimary(t *testing.T) {
 	if exactStarts[high] != 1 || exactStarts[low] != 1 || state.Counts[exactEvalStartedKey] != 2 || state.Counts[exactEvalCompletedKey] != 2 {
 		t.Fatalf("real scheduler path duplicated Exact work: starts=%+v state=%+v", exactStarts, state.Counts)
 	}
-	if lowFirstExactSeconds != 10 || state.Counts[exactDeferredSchedulerKey] == 0 || state.Counts[exactDeferredCooldownKey] == 0 {
+	if lowFirstExactSeconds != 0 || state.Counts[exactDeferredSchedulerKey] != 0 || state.Counts[exactDeferredCooldownKey] == 0 {
 		t.Fatalf("real scheduler path lost bounded fairness evidence: first=%d state=%+v", lowFirstExactSeconds, state.Counts)
 	}
 	if exactPrimaryChecks != 2 {
@@ -2597,6 +2629,470 @@ func TestAaveExactSchedulerHTTPPathIsBoundedAndSinglePrimary(t *testing.T) {
 	}
 	t.Logf("actual_path exact_starts=2 scheduler_deferrals=%d cooldown_deferrals=%d low_first_exact_seconds=%d primary_checks=%d candidate_authority=0",
 		state.Counts[exactDeferredSchedulerKey], state.Counts[exactDeferredCooldownKey], lowFirstExactSeconds, exactPrimaryChecks)
+}
+
+func TestAaveExactWorkersDrainEligibleCohortWithBoundedConcurrency(t *testing.T) {
+	borrowers := make([]string, 8)
+	for index := range borrowers {
+		borrowers[index] = fmt.Sprintf("0x%040x", index+1)
+	}
+	var active atomic.Int64
+	var maximumActive atomic.Int64
+	var exactCalls atomic.Int64
+	release := make(chan struct{})
+	started := make(chan struct{}, len(borrowers))
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		switch request.URL.Path {
+		case "/v1/aave/screen-primary":
+			var input screenRequest
+			if err := json.NewDecoder(request.Body).Decode(&input); err != nil {
+				t.Error(err)
+				return
+			}
+			accounts := make([]account, len(input.Borrowers))
+			for index, borrower := range input.Borrowers {
+				accounts[index] = account{
+					Borrower: borrower, TotalCollateralBase: "2000000000000",
+					TotalDebtBase: "1000000000000", HealthFactorWAD: "900000000000000000",
+				}
+			}
+			_ = json.NewEncoder(writer).Encode(primaryScreenResponse{
+				SchemaVersion: PrimaryScreenResponseSchema, ChainID: 42161, RequestID: input.RequestID,
+				BlockNumber: 491300000, BlockHash: "0x" + strings.Repeat("a", 64),
+				Primary: providerScreen{ProviderID: primaryProviderID, WETHPriceBase: "300000000000", Accounts: accounts},
+			})
+		case "/v1/aave/exact":
+			var input exactRequest
+			if err := json.NewDecoder(request.Body).Decode(&input); err != nil {
+				t.Error(err)
+				return
+			}
+			exactCalls.Add(1)
+			current := active.Add(1)
+			for current > maximumActive.Load() && !maximumActive.CompareAndSwap(maximumActive.Load(), current) {
+			}
+			started <- struct{}{}
+			<-release
+			active.Add(-1)
+			_ = json.NewEncoder(writer).Encode(exactResponse{
+				SchemaVersion: "phoenix.rpc.aave-exact-response.v4", ChainID: 42161,
+				RequestID: input.RequestID, BlockNumber: 491300001,
+				BlockHash: "0x" + strings.Repeat("b", 64), StateRoot: "0x" + strings.Repeat("c", 64),
+				Primary: exactProvider{ProviderID: primaryProviderID, FlashPremiumBPS: 5}, Quorum: 1,
+			})
+		default:
+			t.Errorf("unexpected path: %s", request.URL.Path)
+		}
+	}))
+	defer server.Close()
+
+	sink := &recordingSignalSink{}
+	screener := &Screener{
+		config: Config{
+			GatewayURL: server.URL, StateDir: t.TempDir(), RetainedProfitFloorWei: "1",
+			MaximumInputAmountWei: maximumReviewedInputWei, PrimaryDiscovery: true, SignalSink: sink,
+			ExactStateBudgetPerMinute: 64, ExactDiscoveryReservePerMinute: 24, ExactWorkers: 4,
+		},
+		client: server.Client(), state: State{
+			Schema:          StateSchema,
+			Counts:          map[string]uint64{providerDegradedSinceMillisKey: uint64(time.Now().Add(-time.Minute).UnixMilli())},
+			RouteIneligible: map[string]string{}, LastErrorClass: "provider_timeout",
+		},
+		debtBearing: make(map[string]bool), refreshKnown: make(map[string]bool),
+		hotBorrowers: make(map[string]string), hotDebtBase: make(map[string]string),
+		lastExactAt: make(map[string]time.Time), firstLiquidatableAt: make(map[string]time.Time),
+	}
+	done := make(chan error, 1)
+	go func() { done <- screener.screen(context.Background(), borrowers, false, nil) }()
+	for index := 0; index < 4; index++ {
+		select {
+		case <-started:
+		case <-time.After(2 * time.Second):
+			t.Fatal("eligible Exact workers did not start immediately")
+		}
+	}
+	select {
+	case <-started:
+		t.Fatal("observer exceeded its configured Exact worker bound")
+	case <-time.After(100 * time.Millisecond):
+	}
+	close(release)
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	state := screener.Snapshot()
+	if exactCalls.Load() != 8 || maximumActive.Load() != 4 || state.Counts[exactEvalStartedKey] != 8 || state.Counts[exactEvalCompletedKey] != 8 {
+		t.Fatalf("work-conserving Exact cohort drifted: calls=%d max=%d state=%+v", exactCalls.Load(), maximumActive.Load(), state.Counts)
+	}
+	if state.ExactEvaluationsInFlight != 0 || state.ExactWorkerQueueDepth != 0 || state.ExactWorkersRunning != 0 {
+		t.Fatalf("Exact worker state did not drain: %+v", state)
+	}
+	if state.LastErrorClass != "" || len(state.ProviderRecoverySamples) != 3 || state.LastPrimaryExactAt == nil {
+		t.Fatalf("concurrent successful Exact samples did not restore authority exactly after three samples: %+v", state)
+	}
+	for _, record := range sink.records {
+		if record.Authority || record.ExecutionCandidate != nil || record.AtlasCandidate != nil {
+			t.Fatalf("concurrency created Candidate authority: %+v", record)
+		}
+	}
+}
+
+func TestAaveExactWorkerReplayImprovesLatencyWithoutSemanticDrift(t *testing.T) {
+	borrowers := make([]string, 8)
+	for index := range borrowers {
+		borrowers[index] = fmt.Sprintf("0x%040x", index+1)
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		switch request.URL.Path {
+		case "/v1/aave/screen-primary":
+			var input screenRequest
+			if err := json.NewDecoder(request.Body).Decode(&input); err != nil {
+				t.Error(err)
+				return
+			}
+			accounts := make([]account, len(input.Borrowers))
+			for index, borrower := range input.Borrowers {
+				accounts[index] = account{
+					Borrower: borrower, TotalCollateralBase: "2000000000000",
+					TotalDebtBase: "1000000000000", HealthFactorWAD: "900000000000000000",
+				}
+			}
+			_ = json.NewEncoder(writer).Encode(primaryScreenResponse{
+				SchemaVersion: PrimaryScreenResponseSchema, ChainID: 42161, RequestID: input.RequestID,
+				BlockNumber: 491300000, BlockHash: "0x" + strings.Repeat("a", 64),
+				Primary: providerScreen{ProviderID: primaryProviderID, WETHPriceBase: "300000000000", Accounts: accounts},
+			})
+		case "/v1/aave/exact":
+			var input exactRequest
+			if err := json.NewDecoder(request.Body).Decode(&input); err != nil {
+				t.Error(err)
+				return
+			}
+			time.Sleep(25 * time.Millisecond)
+			_ = json.NewEncoder(writer).Encode(exactResponse{
+				SchemaVersion: "phoenix.rpc.aave-exact-response.v4", ChainID: 42161,
+				RequestID: input.RequestID, BlockNumber: 491300001,
+				BlockHash: "0x" + strings.Repeat("b", 64), StateRoot: "0x" + strings.Repeat("c", 64),
+				Primary: exactProvider{ProviderID: primaryProviderID, FlashPremiumBPS: 5}, Quorum: 1,
+			})
+		default:
+			t.Errorf("unexpected path: %s", request.URL.Path)
+		}
+	}))
+	defer server.Close()
+
+	type replayResult struct {
+		elapsed time.Duration
+		p95     uint64
+		records []string
+	}
+	run := func(workers int) replayResult {
+		sink := &recordingSignalSink{}
+		screener := &Screener{
+			config: Config{
+				GatewayURL: server.URL, StateDir: t.TempDir(), RetainedProfitFloorWei: "1",
+				MaximumInputAmountWei: maximumReviewedInputWei, PrimaryDiscovery: true, SignalSink: sink,
+				ExactStateBudgetPerMinute: 64, ExactDiscoveryReservePerMinute: 24, ExactWorkers: workers,
+			},
+			client: server.Client(), state: State{Schema: StateSchema, Counts: map[string]uint64{}, RouteIneligible: map[string]string{}},
+			debtBearing: make(map[string]bool), refreshKnown: make(map[string]bool),
+			hotBorrowers: make(map[string]string), hotDebtBase: make(map[string]string),
+			lastExactAt: make(map[string]time.Time), firstLiquidatableAt: make(map[string]time.Time),
+		}
+		started := time.Now()
+		if err := screener.screen(context.Background(), borrowers, false, nil); err != nil {
+			t.Fatal(err)
+		}
+		result := replayResult{elapsed: time.Since(started)}
+		latencies := make([]uint64, 0, len(sink.records))
+		for _, record := range sink.records {
+			result.records = append(result.records, fmt.Sprintf(
+				"%s|%s|%t|%s|%t|%t|%s",
+				record.Borrower,
+				record.TerminalOutcome,
+				record.Authority,
+				record.ExactPrimaryProvider,
+				record.ExactConfirmationProvider == nil,
+				record.ExecutionCandidate == nil && record.AtlasCandidate == nil,
+				record.ExactRouteIneligibleReason,
+			))
+			if record.ExactDiagnostics != nil {
+				latencies = append(latencies, record.ExactDiagnostics.LiquidatableToExactLatencyMillis)
+			}
+		}
+		sort.Strings(result.records)
+		sort.Slice(latencies, func(left, right int) bool { return latencies[left] < latencies[right] })
+		if len(latencies) != len(borrowers) {
+			t.Fatalf("replay lost Exact diagnostics: %+v", sink.records)
+		}
+		result.p95 = latencies[(len(latencies)*95-1)/100]
+		return result
+	}
+
+	before := run(1)
+	after := run(4)
+	if strings.Join(before.records, "\n") != strings.Join(after.records, "\n") {
+		t.Fatalf("bounded worker replay changed economics/authority semantics:\nbefore=%v\nafter=%v", before.records, after.records)
+	}
+	if after.elapsed*5 >= before.elapsed*4 || after.p95*5 >= before.p95*4 {
+		t.Fatalf("bounded workers did not materially reduce latency: before=%s/%dms after=%s/%dms", before.elapsed, before.p95, after.elapsed, after.p95)
+	}
+	evidence, _ := json.Marshal(map[string]any{
+		"borrowers": 8, "before_workers": 1, "after_workers": 4,
+		"before_elapsed_ms": before.elapsed.Milliseconds(), "after_elapsed_ms": after.elapsed.Milliseconds(),
+		"before_p95_liquidatable_to_exact_ms": before.p95, "after_p95_liquidatable_to_exact_ms": after.p95,
+		"semantic_drift": false, "candidate_authority": 0,
+	})
+	t.Log(string(evidence))
+}
+
+func TestForkSaturationDoesNotBlockIndependentExactStateFetch(t *testing.T) {
+	record := signal{
+		Schema: "phoenix.atlas-aave-hunting-signal.v1", Cursor: 1, Block: 491300000,
+		BlockHash: "0x" + strings.Repeat("a", 64), StateRoot: "0x" + strings.Repeat("b", 64),
+		Borrower: "0x1111111111111111111111111111111111111111",
+	}
+	var activeForks atomic.Int64
+	var maximumForks atomic.Int64
+	forkStarted := make(chan struct{}, 3)
+	releaseForks := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		switch request.URL.Path {
+		case "/v1/aave/simulate-batch":
+			var input simulationBatchRequest
+			if err := json.NewDecoder(request.Body).Decode(&input); err != nil {
+				t.Error(err)
+				return
+			}
+			active := activeForks.Add(1)
+			for {
+				current := maximumForks.Load()
+				if active <= current || maximumForks.CompareAndSwap(current, active) {
+					break
+				}
+			}
+			forkStarted <- struct{}{}
+			<-releaseForks
+			activeForks.Add(-1)
+			results := make([]simulationBatchResult, len(input.Simulations))
+			for index := range input.Simulations {
+				results[index] = simulationBatchResult{
+					RequestID: input.Simulations[index].RequestID,
+					Error:     &gatewayErrorContract{ErrorClass: "provider_unavailable", Retryable: true},
+				}
+			}
+			_ = json.NewEncoder(writer).Encode(simulationBatchResponse{
+				SchemaVersion: "phoenix.rpc.aave-simulate-batch-response.v3", ChainID: 42161,
+				RequestID: input.RequestID, BlockNumber: record.Block, BlockHash: record.BlockHash,
+				StateRoot: record.StateRoot, PrimaryProviderID: primaryProviderID, Quorum: 1,
+				EvidenceMode: directForkEvidenceMode, Results: results,
+			})
+		case "/v1/aave/exact":
+			var input exactRequest
+			if err := json.NewDecoder(request.Body).Decode(&input); err != nil {
+				t.Error(err)
+				return
+			}
+			_ = json.NewEncoder(writer).Encode(exactResponse{
+				SchemaVersion: "phoenix.rpc.aave-exact-response.v4", ChainID: 42161,
+				RequestID: input.RequestID, BlockNumber: record.Block, BlockHash: record.BlockHash,
+				StateRoot: record.StateRoot,
+				Primary:   exactProvider{ProviderID: primaryProviderID, FlashPremiumBPS: 5}, Quorum: 1,
+			})
+		default:
+			t.Errorf("unexpected path: %s", request.URL.Path)
+		}
+	}))
+	defer server.Close()
+
+	screener := &Screener{
+		config: Config{
+			GatewayURL: server.URL, MaximumInputAmountWei: maximumReviewedInputWei,
+			RetainedProfitFloorWei: "1",
+		},
+		client: server.Client(), batchClient: server.Client(),
+	}
+	simulation := simulationRequest{RequestID: "fork", AtlasMode: false}
+	forkDone := make(chan error, 3)
+	for index := 0; index < 2; index++ {
+		go func() {
+			_, err := screener.simulateExactBatch(context.Background(), record, []simulationRequest{simulation})
+			forkDone <- err
+		}()
+	}
+	for index := 0; index < 2; index++ {
+		select {
+		case <-forkStarted:
+		case <-time.After(2 * time.Second):
+			t.Fatal("fork permits were not used work-conservingly")
+		}
+	}
+	go func() {
+		_, err := screener.simulateExactBatch(context.Background(), record, []simulationRequest{simulation})
+		forkDone <- err
+	}()
+	select {
+	case <-forkStarted:
+		t.Fatal("fork concurrency exceeded its independent bound")
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	exactDone := make(chan error, 1)
+	go func() {
+		_, err := screener.resolveExact(context.Background(), record, nil)
+		exactDone <- err
+	}()
+	select {
+	case err := <-exactDone:
+		if err != nil {
+			t.Fatalf("independent Exact state fetch failed during fork saturation: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("fork saturation blocked an independent Exact state fetch")
+	}
+
+	close(releaseForks)
+	for index := 0; index < 3; index++ {
+		if err := <-forkDone; err != nil {
+			t.Fatalf("bounded fork did not drain: %v", err)
+		}
+	}
+	if maximumForks.Load() != defaultExactForkWorkers {
+		t.Fatalf("fork concurrency drifted: max=%d", maximumForks.Load())
+	}
+}
+
+func TestAaveExactSanitizedLoadProfilesDrainWithBoundedBackpressure(t *testing.T) {
+	var startedAt atomic.Int64
+	var active atomic.Int64
+	var maximumActive atomic.Int64
+	var latencyMu sync.Mutex
+	var dispatchLatencies []time.Duration
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		switch request.URL.Path {
+		case "/v1/aave/screen-primary":
+			var input screenRequest
+			if err := json.NewDecoder(request.Body).Decode(&input); err != nil {
+				t.Error(err)
+				return
+			}
+			accounts := make([]account, len(input.Borrowers))
+			for index, borrower := range input.Borrowers {
+				accounts[index] = account{
+					Borrower: borrower, TotalCollateralBase: "2000000000000",
+					TotalDebtBase: "1000000000000", HealthFactorWAD: "900000000000000000",
+				}
+			}
+			_ = json.NewEncoder(writer).Encode(primaryScreenResponse{
+				SchemaVersion: PrimaryScreenResponseSchema, ChainID: 42161, RequestID: input.RequestID,
+				BlockNumber: 491300000, BlockHash: "0x" + strings.Repeat("a", 64),
+				Primary: providerScreen{ProviderID: primaryProviderID, WETHPriceBase: "300000000000", Accounts: accounts},
+			})
+		case "/v1/aave/exact":
+			var input exactRequest
+			if err := json.NewDecoder(request.Body).Decode(&input); err != nil {
+				t.Error(err)
+				return
+			}
+			latency := time.Since(time.Unix(0, startedAt.Load()))
+			latencyMu.Lock()
+			dispatchLatencies = append(dispatchLatencies, latency)
+			latencyMu.Unlock()
+			current := active.Add(1)
+			for {
+				maximum := maximumActive.Load()
+				if current <= maximum || maximumActive.CompareAndSwap(maximum, current) {
+					break
+				}
+			}
+			time.Sleep(25 * time.Millisecond)
+			active.Add(-1)
+			_ = json.NewEncoder(writer).Encode(exactResponse{
+				SchemaVersion: "phoenix.rpc.aave-exact-response.v4", ChainID: 42161,
+				RequestID: input.RequestID, BlockNumber: 491300001,
+				BlockHash: "0x" + strings.Repeat("b", 64), StateRoot: "0x" + strings.Repeat("c", 64),
+				Primary: exactProvider{ProviderID: primaryProviderID, FlashPremiumBPS: 5}, Quorum: 1,
+			})
+		default:
+			t.Errorf("unexpected path: %s", request.URL.Path)
+		}
+	}))
+	defer server.Close()
+
+	for _, profile := range []struct {
+		name       string
+		borrowers  int
+		admitted   int
+		maximumP95 time.Duration
+		maximumP99 time.Duration
+	}{
+		{name: "observed", borrowers: 6, admitted: 6, maximumP95: 100 * time.Millisecond, maximumP99: 250 * time.Millisecond},
+		{name: "two_x", borrowers: 12, admitted: 12, maximumP95: 100 * time.Millisecond, maximumP99: 250 * time.Millisecond},
+		{name: "five_x_burst", borrowers: 30, admitted: 16, maximumP95: 250 * time.Millisecond, maximumP99: 500 * time.Millisecond},
+	} {
+		t.Run(profile.name, func(t *testing.T) {
+			addresses := make([]string, profile.borrowers)
+			for index := range addresses {
+				addresses[index] = fmt.Sprintf("0x%040x", index+1)
+			}
+			sink := &recordingSignalSink{}
+			screener := &Screener{
+				config: Config{
+					GatewayURL: server.URL, StateDir: t.TempDir(), RetainedProfitFloorWei: "1",
+					MaximumInputAmountWei: maximumReviewedInputWei, PrimaryDiscovery: true, SignalSink: sink,
+					ExactStateBudgetPerMinute: 120, ExactDiscoveryReservePerMinute: 36, ExactWorkers: 12,
+				},
+				client: server.Client(), state: State{Schema: StateSchema, Counts: map[string]uint64{}, RouteIneligible: map[string]string{}},
+				debtBearing: make(map[string]bool), refreshKnown: make(map[string]bool),
+				hotBorrowers: make(map[string]string), hotDebtBase: make(map[string]string),
+				lastExactAt: make(map[string]time.Time), firstLiquidatableAt: make(map[string]time.Time),
+			}
+			// Production Exact work comes from the durable debt-bearing cohort.
+			// Seed that already-persisted identity here so this benchmark measures
+			// scheduler/worker dispatch rather than test-host filesystem fsync time
+			// for first-ever borrower discovery.
+			for _, borrower := range addresses {
+				screener.debtBearing[borrower] = true
+				screener.refreshKnown[borrower] = true
+				screener.refreshOrder = append(screener.refreshOrder, borrower)
+			}
+			screener.state.DebtBearingCount = uint64(len(addresses))
+			latencyMu.Lock()
+			dispatchLatencies = nil
+			latencyMu.Unlock()
+			maximumActive.Store(0)
+			startedAt.Store(time.Now().UnixNano())
+			if err := screener.screen(context.Background(), addresses, false, nil); err != nil {
+				t.Fatal(err)
+			}
+			state := screener.Snapshot()
+			latencyMu.Lock()
+			latencies := append([]time.Duration(nil), dispatchLatencies...)
+			latencyMu.Unlock()
+			sort.Slice(latencies, func(left, right int) bool { return latencies[left] < latencies[right] })
+			if len(latencies) != profile.admitted || state.Counts[exactEvalCompletedKey] != uint64(profile.admitted) {
+				t.Fatalf("load profile admission drifted: latencies=%d completed=%d state=%+v", len(latencies), state.Counts[exactEvalCompletedKey], state.Counts)
+			}
+			if maximumActive.Load() > 12 || state.ExactEvaluationsInFlight != 0 || state.ExactWorkerQueueDepth != 0 {
+				t.Fatalf("load profile exceeded or failed to drain bounded workers: max=%d state=%+v", maximumActive.Load(), state)
+			}
+			p95 := latencies[(len(latencies)*95-1)/100]
+			p99 := latencies[(len(latencies)*99-1)/100]
+			if p95 > profile.maximumP95 || p99 > profile.maximumP99 {
+				t.Fatalf("controlled dispatch SLO failed: p95=%s p99=%s", p95, p99)
+			}
+			deferred := profile.borrowers - profile.admitted
+			if state.Counts[exactDeferredSchedulerKey] != uint64(deferred) {
+				t.Fatalf("bounded overload evidence drifted: want=%d got=%d", deferred, state.Counts[exactDeferredSchedulerKey])
+			}
+			for _, persisted := range sink.records {
+				if persisted.Authority || persisted.ExecutionCandidate != nil || persisted.AtlasCandidate != nil {
+					t.Fatalf("load replay created authority: %+v", persisted)
+				}
+			}
+			t.Logf("profile=%s borrowers=%d admitted=%d p95_dispatch_ms=%d p99_dispatch_ms=%d deferred=%d", profile.name, profile.borrowers, profile.admitted, p95.Milliseconds(), p99.Milliseconds(), deferred)
+		})
+	}
 }
 
 func TestResolveExactContinuesPastFailedSizeAndBindsSelectedRepay(t *testing.T) {

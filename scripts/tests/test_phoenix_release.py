@@ -3106,8 +3106,39 @@ class WorkflowAndDeploymentContractTests(unittest.TestCase):
         )
         loop = self.post_arm_monitor.split("while :; do", maxsplit=1)[1]
         self.assertGreaterEqual(loop.count("require_operator_live_mode"), 2)
-        self.assertIn("live-executor owner-live-preflight", loop)
-        self.assertNotIn("owner-configured-preflight", loop)
+        preflight_conditional = loop.split(
+            "current_control_status=", maxsplit=1
+        )[0].split('if [ "$authority_state" = "armed" ]; then', maxsplit=1)[1]
+        armed_branch, disarmed_branch = preflight_conditional.split(
+            "else", maxsplit=1
+        )
+        self.assertIn("live-executor owner-live-preflight", armed_branch)
+        self.assertNotIn("owner-configured-preflight", armed_branch)
+        self.assertIn("owner-configured-preflight", disarmed_branch)
+        self.assertNotIn("owner-live-preflight", disarmed_branch)
+        for required in (
+            "require_hunter_ready",
+            "require_latency_gauges",
+            "require_latency_histograms",
+            "require_disarmed_controls",
+            "require_armed_controls",
+            "authority_state=${3:-armed}",
+            "phoenix_signal_to_prefilter_seconds",
+            "phoenix_liquidatable_to_exact_enqueue_seconds",
+            "phoenix_exact_queue_wait_seconds",
+            "phoenix_exact_first_rpc_dispatch_seconds",
+            "phoenix_exact_rpc_state_fetch_seconds",
+            "phoenix_exact_compute_seconds",
+            "phoenix_exact_end_to_end_seconds",
+            "PHOENIX_MONITOR_INTERVAL_BOUNDARY",
+            "provider_health_counter_vector",
+            "provider_gateway_counter_vector",
+            "runtime_evidence",
+            "gateway provider/budget/error counters regressed",
+            "exact runtime identity/restart/OOM evidence regressed",
+            "primary Exact samples did not advance during monitoring",
+        ):
+            self.assertIn(required, self.post_arm_monitor)
 
     def test_controller_uses_no_powershell_or_general_scp(self) -> None:
         self.assertNotIn("powershell", self.workflow.lower())
