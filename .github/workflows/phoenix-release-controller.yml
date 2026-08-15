@@ -224,6 +224,13 @@ jobs:
       rollback_build_run_id: ${{ steps.active.outputs.rollback_build_run_id }}
       already_active: ${{ steps.active.outputs.already_active }}
     steps:
+      - name: Checkout exact protected main host plan
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          ref: ${{ needs.prepare.outputs.release_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
       - name: Install restricted SSH identity
         shell: bash
         env:
@@ -284,7 +291,7 @@ jobs:
             # the executor stopped, safe controls, and Atlas as the sole error.
             [ "$readiness_rc" -eq 1 ]
             [ ! -s production-readiness-output.json ]
-            jq -e \
+            if jq -e \
               --arg sha "$RELEASE_SHA" \
               --arg rollback "$rollback_sha" \
               --arg bootstrap "899daa33b99863f5076bd9b39b6237da19865a5f" \
@@ -342,21 +349,260 @@ jobs:
                   "service": "live-executor",
                   "state": "stopped"
                 }])
-              ' production-readiness-error.json >/dev/null
-            jq \
-              --arg sha "$RELEASE_SHA" \
-              --arg rollback "$rollback_sha" \
-              '{
-                schema: "phoenix.production-readiness-bootstrap.v1",
-                candidate_sha: $sha,
-                status: "passed",
-                failure_count: 0,
-                bootstrap: {
-                  active_release: $rollback,
-                  accepted_false_positive: "atlas-observer",
-                  raw_gateway_evidence: .
-                }
-              }' production-readiness-error.json >production-readiness.json
+              ' production-readiness-error.json >/dev/null; then
+              jq \
+                --arg sha "$RELEASE_SHA" \
+                --arg rollback "$rollback_sha" \
+                '{
+                  schema: "phoenix.production-readiness-bootstrap.v1",
+                  candidate_sha: $sha,
+                  status: "passed",
+                  failure_count: 0,
+                  bootstrap: {
+                    active_release: $rollback,
+                    accepted_false_positive: "atlas-observer",
+                    raw_gateway_evidence: .
+                  }
+                }' production-readiness-error.json >production-readiness.json
+            else
+              # Exact one-time forward-fix bridge for the 3bf hunter-state
+              # compatibility incident. The old 1776 observer cannot load the
+              # forward-written scheduling reasons, while the protected-main
+              # candidate contains the sanitizing fix. No other readiness
+              # defect or runtime topology is accepted.
+              ssh "${ssh_opts[@]}" "${PROD_USER}@${PROD_HOST}" \
+                "evidence 3bf4202cfe8233f301a5c381423774c9c1f7ab56" \
+                >forward-fix-failed-release.json
+              python3 - \
+                "$RELEASE_SHA" \
+                "$rollback_sha" \
+                production-readiness-error.json \
+                forward-fix-failed-release.json \
+                production-readiness.json <<'PY'
+          # FORWARD_FIX_BOOTSTRAP_VALIDATOR_BEGIN
+          import hashlib
+          import json
+          import re
+          import subprocess
+          import sys
+          from pathlib import Path
+
+          CANDIDATE_ANCESTOR = "5f2593a37064bf5dcabd4d9c6341a19bf548322f"
+          ACTIVE_RELEASE = "1776be2f7e9d2921589e4b4eb0faf5fe057e38fb"
+          ACTIVE_BUILD_RUN_ID = 31874086597
+          FAILED_RELEASE = "3bf4202cfe8233f301a5c381423774c9c1f7ab56"
+          OLD_ATLAS_IMAGE = (
+              "ghcr.io/majidasgharitabrizi/atlas-observer@sha256:"
+              "074b9e5ea4ce6cdedac52f3bf462193533521f90d318e8ef335f513feb1c2a58"
+          )
+          OLD_ATLAS_IMAGE_ID = (
+              "sha256:074b9e5ea4ce6cdedac52f3bf462193533521f90d318e8ef335f513feb1c2a58"
+          )
+          EXPECTED_SERVICES = {
+              "atlas-observer",
+              "dashboard",
+              "feed-ingestor",
+              "nats",
+              "nitro-feed-relay",
+              "phoenix-engine",
+              "postgres",
+              "prometheus",
+              "recorder",
+              "rpc-gateway",
+              "shadow-dispatcher",
+          }
+
+          def require(condition, code):
+              if not condition:
+                  raise SystemExit(f"FORWARD_FIX_BOOTSTRAP_REJECTED:{code}")
+
+          def read_json(path):
+              payload = Path(path).read_bytes()
+              require(0 < len(payload) <= 1024 * 1024, "evidence_size")
+              try:
+                  value = json.loads(payload)
+              except (UnicodeDecodeError, json.JSONDecodeError):
+                  require(False, "evidence_json")
+              require(isinstance(value, dict), "evidence_shape")
+              return value, payload
+
+          candidate_sha, rollback_sha, raw_path, failed_path, output_path = sys.argv[1:]
+          require(re.fullmatch(r"[0-9a-f]{40}", candidate_sha), "candidate_sha")
+          require(rollback_sha == ACTIVE_RELEASE, "rollback_release")
+          head = subprocess.run(
+              ["git", "rev-parse", "HEAD"],
+              check=True,
+              capture_output=True,
+              text=True,
+          ).stdout.strip()
+          require(head == candidate_sha, "candidate_not_protected_main")
+          ancestry = subprocess.run(
+              ["git", "merge-base", "--is-ancestor", CANDIDATE_ANCESTOR, candidate_sha],
+              check=False,
+              stdout=subprocess.DEVNULL,
+              stderr=subprocess.DEVNULL,
+          )
+          require(ancestry.returncode == 0, "candidate_missing_forward_fix")
+
+          raw, _ = read_json(raw_path)
+          failed, failed_payload = read_json(failed_path)
+          require(raw.get("code") == "PRODUCTION_READINESS_FAILED", "gateway_code")
+          require(raw.get("phase") == "GATEWAY", "gateway_phase")
+          require(raw.get("status") == "error", "gateway_status")
+          readiness = raw.get("evidence")
+          require(isinstance(readiness, dict), "readiness_shape")
+          require(readiness.get("schema") == "phoenix.production-readiness.v1", "readiness_schema")
+          require(readiness.get("candidate_sha") == candidate_sha, "readiness_candidate")
+          require(readiness.get("status") == "failed", "readiness_status")
+          failures = readiness.get("failures")
+          require(readiness.get("failure_count") == 1, "readiness_failure_count")
+          require(isinstance(failures, list) and len(failures) == 1, "readiness_failures")
+          accepted_failure = failures[0]
+          require(
+              isinstance(accepted_failure, dict)
+              and accepted_failure.get("code") == "READINESS_SERVICE_UNHEALTHY",
+              "accepted_failure_code",
+          )
+
+          checks = readiness.get("checks")
+          require(isinstance(checks, dict), "checks_shape")
+          active = checks.get("active_release")
+          require(
+              active == {
+                  "active_build_run_id": ACTIVE_BUILD_RUN_ID,
+                  "active_release": ACTIVE_RELEASE,
+                  "autonomous_execution": False,
+                  "live_execution": False,
+                  "phoenix_mode": "SHADOW",
+                  "protocol_version": "phoenix-release.v1",
+                  "release_assets_sha": ACTIVE_RELEASE,
+                  "schema": "phoenix.release-status.v1",
+              },
+              "active_release_identity",
+          )
+          require(
+              checks.get("release_platform", {}).get("installed_sha") == FAILED_RELEASE
+              and checks.get("release_platform", {}).get("upgrade_required") is True,
+              "installed_platform_identity",
+          )
+          require(
+              checks.get("contract")
+              == {"contract_paused": True, "owner_transaction_hash": None},
+              "contract_not_historically_safe",
+          )
+          controls = checks.get("controls")
+          required_controls = {
+              "aave_armed": False,
+              "aave_kill_switch": True,
+              "active_atlas": 0,
+              "active_attempts": 0,
+              "armed": False,
+              "atlas_armed": False,
+              "atlas_kill_switch": True,
+              "execution_mode": "disarmed",
+              "kill_switch": True,
+              "open_routes": 0,
+              "submission_lock_free": True,
+              "unresolved_submissions": 0,
+          }
+          require(
+              isinstance(controls, dict)
+              and all(controls.get(key) == value for key, value in required_controls.items()),
+              "controls_not_fail_closed",
+          )
+
+          expected = checks.get("expected_services")
+          services = checks.get("services")
+          require(isinstance(expected, list) and set(expected) == EXPECTED_SERVICES, "expected_services")
+          require(isinstance(services, list), "services_shape")
+          by_name = {
+              item.get("service"): item
+              for item in services
+              if isinstance(item, dict) and isinstance(item.get("service"), str)
+          }
+          require(len(by_name) == len(services), "duplicate_service")
+          require(set(by_name) == EXPECTED_SERVICES, "service_topology")
+          require("live-executor" not in by_name, "live_executor_running")
+          for name, service in by_name.items():
+              configured = service.get("configured_image")
+              image_id = service.get("image_id")
+              require(
+                  isinstance(configured, str)
+                  and "@sha256:" in configured
+                  and configured.rsplit("@", 1)[-1] == image_id,
+                  f"service_identity_{name}",
+              )
+              require(
+                  isinstance(service.get("container_id"), str)
+                  and re.fullmatch(r"[0-9a-f]{64}", service["container_id"]),
+                  f"service_container_{name}",
+              )
+              if name != "atlas-observer":
+                  require(
+                      service.get("running") is True and service.get("health") == "healthy",
+                      f"second_unhealthy_service_{name}",
+                  )
+          atlas = by_name["atlas-observer"]
+          require(atlas.get("configured_image") == OLD_ATLAS_IMAGE, "atlas_configured_image")
+          require(atlas.get("image_id") == OLD_ATLAS_IMAGE_ID, "atlas_image_id")
+          require(atlas.get("running") is True, "atlas_not_restart_loop")
+          require(atlas.get("health") in {"starting", "unhealthy"}, "atlas_health")
+          state_mounts = [
+              mount
+              for mount in atlas.get("mounts", [])
+              if isinstance(mount, dict)
+              and mount.get("destination") == "/var/lib/phoenix-atlas-observer"
+              and mount.get("source") == "/opt/phoenix/evidence/atlas-live"
+              and mount.get("type") == "bind"
+          ]
+          require(len(state_mounts) == 1, "atlas_state_mount")
+          require(accepted_failure.get("evidence") == atlas, "atlas_failure_evidence")
+
+          require(failed.get("release_sha") == FAILED_RELEASE, "failed_release")
+          require(failed.get("current_phase") == "ROLLBACK_FAILED", "failed_release_phase")
+          require(failed.get("rollback_sha") == ACTIVE_RELEASE, "failed_release_rollback")
+          require(failed.get("active_release_pointer") == ACTIVE_RELEASE, "failed_active_pointer")
+          require(failed.get("candidate_pointer") == FAILED_RELEASE, "failed_candidate_pointer")
+          require(failed.get("owner_transaction_hash") is None, "failed_owner_transaction")
+          require(failed.get("contract_paused") is True, "failed_contract_unpaused")
+          require(failed.get("autonomous_armed") is False, "failed_authority_armed")
+          require(failed.get("kill_switch") is True, "failed_kill_switch")
+          require(failed.get("mutation_started") is True, "failed_mutation_identity")
+          require(failed.get("failure_phase") == "POST_DISARMED_VERIFYING", "failed_failure_phase")
+          failure_output = failed.get("failure_evidence", {}).get("output")
+          require(
+              isinstance(failure_output, str)
+              and "existing route-ineligible state is invalid" in failure_output,
+              "poisoned_state_signature",
+          )
+
+          result = {
+              "schema": "phoenix.production-readiness-forward-fix-bootstrap.v1",
+              "candidate_sha": candidate_sha,
+              "status": "passed",
+              "failure_count": 0,
+              "active_release": ACTIVE_RELEASE,
+              "failed_release_sha": FAILED_RELEASE,
+              "failed_release_phase": "ROLLBACK_FAILED",
+              "accepted_service": "atlas-observer",
+              "accepted_failure_code": accepted_failure["code"],
+              "controls_fail_closed": True,
+              "contract_paused": True,
+              "zero_work": True,
+              "owner_transaction_absent": True,
+              "failed_release_evidence_sha256": (
+                  "sha256:" + hashlib.sha256(failed_payload).hexdigest()
+              ),
+              "raw_gateway_evidence": raw,
+          }
+          Path(output_path).write_text(
+              json.dumps(result, sort_keys=True, separators=(",", ":")) + "\n",
+              encoding="utf-8",
+          )
+          # FORWARD_FIX_BOOTSTRAP_VALIDATOR_END
+          PY
+              rm -f forward-fix-failed-release.json
+            fi
           fi
           rm -f production-readiness-output.json production-readiness-error.json
           printf 'rollback_sha=%s\n' "$rollback_sha" >>"$GITHUB_OUTPUT"
