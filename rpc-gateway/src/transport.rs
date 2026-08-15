@@ -33,6 +33,8 @@ pub enum TransportError {
     MethodUnsupported,
     #[error("RPC provider cannot serve the requested historical state")]
     HistoricalStateUnavailable,
+    #[error("EVM execution reverted")]
+    ExecutionReverted,
     #[error("RPC provider returned a JSON-RPC error")]
     ProviderError,
     #[error("RPC provider applied an HTTP rate limit")]
@@ -48,6 +50,7 @@ impl TransportError {
             Self::InvalidResponse => "provider_invalid_response",
             Self::MethodUnsupported => "provider_method_unsupported",
             Self::HistoricalStateUnavailable => "provider_historical_state_unavailable",
+            Self::ExecutionReverted => "execution_reverted",
             Self::ProviderError => "provider_rpc_error",
             Self::RateLimited { .. } => "provider_rate_limited",
         }
@@ -198,7 +201,9 @@ fn classify_provider_error(code: i64, message: &str) -> TransportError {
         .get(..message.len().min(512))
         .unwrap_or(message)
         .to_ascii_lowercase();
-    if [
+    if bounded.trim() == "execution reverted" || bounded.trim().starts_with("execution reverted:") {
+        TransportError::ExecutionReverted
+    } else if [
         "missing trie",
         "historical state",
         "state is not available",
@@ -253,6 +258,7 @@ mod tests {
             TransportError::InvalidResponse,
             TransportError::MethodUnsupported,
             TransportError::HistoricalStateUnavailable,
+            TransportError::ExecutionReverted,
             TransportError::ProviderError,
             TransportError::RateLimited {
                 retry_after: Duration::from_secs(10),
@@ -277,6 +283,14 @@ mod tests {
         );
         assert_eq!(
             classify_provider_error(-32000, "execution reverted"),
+            TransportError::ExecutionReverted
+        );
+        assert_eq!(
+            classify_provider_error(-32000, "execution reverted: bounded reason"),
+            TransportError::ExecutionReverted
+        );
+        assert_eq!(
+            classify_provider_error(-32000, "unknown provider error"),
             TransportError::ProviderError
         );
     }
