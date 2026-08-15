@@ -2234,6 +2234,17 @@ func TestLiquidationVariantBoundsUseReviewedMaximumNotLiveMaximum(t *testing.T) 
 	if err := screener.validateLiquidationVariants(eighthSize, 5); err == nil {
 		t.Fatal("an eighth size crossed the reviewed per-collateral grid bound")
 	}
+
+	terminal := boundedTestLiquidation(wethAddress, 24, 5)
+	terminal.SizeClassification = terminalSizeClassification
+	terminal.TerminalSizeReason = belowMinReviewedSizeReason
+	if err := screener.validateLiquidationVariants([]exactLiquidation{terminal}, 5); err != nil {
+		t.Fatalf("one bounded terminal size was rejected: %v", err)
+	}
+	mixed := []exactLiquidation{boundedTestLiquidation(wethAddress, 25, 5), terminal}
+	if err := screener.validateLiquidationVariants(mixed, 5); err == nil {
+		t.Fatal("terminal size was accepted alongside a fixed reviewed grid")
+	}
 }
 
 func TestAaveFlashPremiumUsesHalfUpPercentageMath(t *testing.T) {
@@ -3551,6 +3562,8 @@ func TestSnapshotDoesNotBlockWhileExactResolutionIsInFlight(t *testing.T) {
 
 func TestResolveExactNoProfitableSizeProducesNoCandidate(t *testing.T) {
 	liquidation := boundedTestLiquidation(wethAddress, 1_000, 5)
+	liquidation.SizeClassification = terminalSizeClassification
+	liquidation.TerminalSizeReason = belowMinReviewedSizeReason
 	liquidation.LiquidatorCollateral = "1050"
 	simulationCalls := 0
 	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
@@ -3574,7 +3587,7 @@ func TestResolveExactNoProfitableSizeProducesNoCandidate(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if simulationCalls != 0 || record.Authority || record.ExecutionCandidate != nil || record.TerminalOutcome != "economic_rejection" {
+	if simulationCalls != 0 || record.Authority || record.ExecutionCandidate != nil || record.TerminalOutcome != "economic_rejection" || len(record.SizeDiagnostics) != 1 || record.SizeDiagnostics[0].FinalRejectionReason != "gross_edge_below_retained_profit_gate" || !record.SizeDiagnostics[0].TerminalSizeUnprofitable {
 		t.Fatalf("unprofitable grid emitted authority: calls=%d record=%+v", simulationCalls, record)
 	}
 }
@@ -3855,6 +3868,7 @@ func boundedTestLiquidation(collateral string, amount int64, premiumBPS uint64) 
 	premium := aavePercentMul(big.NewInt(amount), premiumBPS).String()
 	return exactLiquidation{
 		DebtAsset: wethAddress, CollateralAsset: collateral,
+		SizeClassification:   fixedReviewedSizeClassification,
 		RequestedRepayAmount: repay, ActualRepayAmount: repay, RepayAmount: repay,
 		FlashPremiumAmount: premium, LiquidatorCollateral: strconv.FormatInt(amount+1, 10),
 		OracleUnwindOutputWETH: strconv.FormatInt(amount+1, 10),
