@@ -2569,12 +2569,7 @@ func (s *Screener) screen(ctx context.Context, borrowers []string, advanceSeed b
 				record.ExactDiagnostics.ExactStateRequestCount = work.tracker.requests.Load()
 			}
 			s.lastExactAt[work.primary.Borrower] = exactCompletedAt
-			if record.ExactRouteIneligibleReason != "" {
-				s.state.RouteIneligible[work.primary.Borrower] = record.ExactRouteIneligibleReason
-				s.state.Counts[exactRouteIneligibleObservedKey]++
-			} else {
-				delete(s.state.RouteIneligible, work.primary.Borrower)
-			}
+			s.recordRouteIneligibleLocked(work.primary.Borrower, record.ExactRouteIneligibleReason)
 			if record.ExactPrimaryProvider == primaryProviderID {
 				recoveryExactTimes = append(recoveryExactTimes, exactCompletedAt)
 			}
@@ -2697,6 +2692,37 @@ func exactRouteIneligibleReason(reserves []exactReserve) string {
 		return "supported_collateral_disabled"
 	}
 	return ""
+}
+
+func rollbackCompatibleRouteIneligibleReason(reason string) bool {
+	switch reason {
+	case "no_weth_debt", "no_supported_collateral", "supported_collateral_disabled", "unsupported_stable_weth_debt":
+		return true
+	default:
+		return false
+	}
+}
+
+func transientRouteIneligibleReason(reason string) bool {
+	switch reason {
+	case "no_reviewed_unwind_route", "no_supported_debt_asset", "unsupported_stable_usdc_e_debt":
+		return true
+	default:
+		return false
+	}
+}
+
+func (s *Screener) recordRouteIneligibleLocked(borrower, reason string) {
+	if reason != "" {
+		s.state.Counts[exactRouteIneligibleObservedKey]++
+	}
+	if rollbackCompatibleRouteIneligibleReason(reason) {
+		s.state.RouteIneligible[borrower] = reason
+		return
+	}
+	// Detailed diagnostics remain on the signal, but transient route reasons
+	// must never poison durable state that the rollback release also reads.
+	delete(s.state.RouteIneligible, borrower)
 }
 
 func (s *Screener) resolveExact(ctx context.Context, record signal, auction *observer.LedgerRecord) (signal, error) {
@@ -4526,18 +4552,25 @@ func (s *Screener) loadState() error {
 			return errors.New("existing tail-invalidation state is invalid")
 		}
 	}
+	stateSanitized := false
 	for borrower, reason := range state.RouteIneligible {
 		if !addressPattern.MatchString(borrower) {
 			return errors.New("existing route-ineligible state is invalid")
 		}
-		switch reason {
-		case "no_weth_debt", "no_supported_collateral", "supported_collateral_disabled", "unsupported_stable_weth_debt":
+		switch {
+		case rollbackCompatibleRouteIneligibleReason(reason):
 			// These reasons remain valid under the WETH-identity route universe.
-		case "no_native_usdc_collateral", "native_usdc_not_collateral":
+		case reason == "no_native_usdc_collateral" || reason == "native_usdc_not_collateral":
 			// These legacy reasons were learned when native USDC was the only
 			// supported collateral. Force a fresh exact screen after upgrade so
 			// WETH-collateral borrowers cannot remain incorrectly deprioritized.
 			delete(state.RouteIneligible, borrower)
+			stateSanitized = true
+		case transientRouteIneligibleReason(reason):
+			// These remain precise per-signal diagnostics, but are deliberately
+			// transient so both this release and its rollback re-evaluate them.
+			delete(state.RouteIneligible, borrower)
+			stateSanitized = true
 		default:
 			return errors.New("existing route-ineligible state is invalid")
 		}
@@ -4546,6 +4579,9 @@ func (s *Screener) loadState() error {
 	if state.LastExactAdmissionAt != nil {
 		s.lastExactAdmissionAt = state.LastExactAdmissionAt.UTC()
 		s.hasDurableAdmission = true
+	}
+	if stateSanitized {
+		return s.persistState()
 	}
 	return nil
 }
