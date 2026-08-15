@@ -288,6 +288,8 @@ pub struct AaveExactProviderState {
 pub struct AaveExactLiquidationState {
     pub debt_asset: String,
     pub collateral_asset: String,
+    pub size_classification: String,
+    pub terminal_size_reason: String,
     pub requested_repay_amount: String,
     pub actual_repay_amount: String,
     pub repay_amount: String,
@@ -828,6 +830,8 @@ impl AaveExactResponse {
             return Err(AaveStateError::ProviderDisagreement);
         }
         let mut seen = std::collections::HashSet::new();
+        let mut terminal_collateral = std::collections::HashSet::new();
+        let mut fixed_collateral = std::collections::HashSet::new();
         for liquidation in &self.primary.liquidations {
             let requested = liquidation
                 .requested_repay_amount
@@ -862,10 +866,33 @@ impl AaveExactResponse {
                 .and_then(|value| value.checked_add(5_000))
                 .map(|value| value / 10_000)
                 .ok_or(AaveStateError::ProviderDisagreement)?;
+            let classification_invalid = match liquidation.size_classification.as_str() {
+                "fixed_reviewed_size" => {
+                    let conflicts = terminal_collateral.contains(&liquidation.collateral_asset);
+                    fixed_collateral.insert(liquidation.collateral_asset.clone());
+                    !liquidation.terminal_size_reason.is_empty()
+                        || !SizeLevel::ALL
+                            .iter()
+                            .any(|level| level.amount_wei() == repay)
+                        || conflicts
+                }
+                "terminal_size_required" => {
+                    !matches!(
+                        liquidation.terminal_size_reason.as_str(),
+                        "below_min_reviewed_size" | "dust_partial_invalid"
+                    ) || SizeLevel::ALL
+                        .iter()
+                        .any(|level| level.amount_wei() == repay)
+                        || fixed_collateral.contains(&liquidation.collateral_asset)
+                        || !terminal_collateral.insert(liquidation.collateral_asset.clone())
+                }
+                _ => true,
+            };
             if requested == 0
                 || requested != actual
                 || actual != repay
                 || repay > maximum_input
+                || classification_invalid
                 || liquidation.flash_premium_amount.parse::<u128>().ok() != Some(expected_premium)
                 || !canonical_address(&liquidation.debt_asset)
                 || !canonical_address(&liquidation.collateral_asset)

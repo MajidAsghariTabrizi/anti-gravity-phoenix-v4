@@ -72,6 +72,10 @@ const (
 	atlasCallbackEvidenceMode        = "SINGLE_PRIMARY_ATLAS_CALLBACK_FORK_VERIFIED"
 	primaryProviderID                = "production-nownodes-arbitrum"
 	maximumReviewedInputWei          = "10000000000000000"
+	fixedReviewedSizeClassification  = "fixed_reviewed_size"
+	terminalSizeClassification       = "terminal_size_required"
+	belowMinReviewedSizeReason       = "below_min_reviewed_size"
+	dustPartialInvalidReason         = "dust_partial_invalid"
 	exactDeferredCooldownKey         = "exact_deferred_cooldown_total"
 	exactDeferredRouteIneligibleKey  = "exact_deferred_route_ineligible_total"
 	exactDeferredSchedulerKey        = "exact_deferred_scheduler_capacity_total"
@@ -418,6 +422,8 @@ type borrowerActivity struct {
 type exactLiquidation struct {
 	DebtAsset              string             `json:"debt_asset"`
 	CollateralAsset        string             `json:"collateral_asset"`
+	SizeClassification     string             `json:"size_classification"`
+	TerminalSizeReason     string             `json:"terminal_size_reason"`
 	RequestedRepayAmount   string             `json:"requested_repay_amount"`
 	ActualRepayAmount      string             `json:"actual_repay_amount"`
 	RepayAmount            string             `json:"repay_amount"`
@@ -521,6 +527,9 @@ type signal struct {
 
 type sizeDiagnostic struct {
 	ReviewedSize             string `json:"reviewed_size"`
+	SizeClassification       string `json:"size_classification"`
+	TerminalSizeReason       string `json:"terminal_size_reason,omitempty"`
+	TerminalSizeUnprofitable bool   `json:"terminal_size_unprofitable"`
 	Route                    string `json:"route"`
 	GrossLiquidationEdgeWei  string `json:"gross_liquidation_edge_wei"`
 	FlashPremiumWei          string `json:"flash_premium_wei"`
@@ -2835,7 +2844,8 @@ func (s *Screener) validateLiquidationVariants(liquidations []exactLiquidation, 
 		return errors.New("exact liquidation bounds are invalid")
 	}
 	previousByCollateral := make(map[string]*big.Int)
-	countByCollateral := make(map[string]int)
+	fixedCountByCollateral := make(map[string]int)
+	terminalSeenByCollateral := make(map[string]bool)
 	for index := range liquidations {
 		liquidation := &liquidations[index]
 		collateral := strings.ToLower(liquidation.CollateralAsset)
@@ -2845,6 +2855,23 @@ func (s *Screener) validateLiquidationVariants(liquidations []exactLiquidation, 
 		premium, premiumOK := newBigUint(liquidation.FlashPremiumAmount)
 		if !requestedOK || !actualOK || !repayOK || !premiumOK || requested.Sign() <= 0 || actual.Sign() <= 0 || actual.Cmp(repay) != 0 || actual.Cmp(requested) != 0 || actual.Cmp(maximumInput) > 0 || strings.ToLower(liquidation.DebtAsset) != wethAddress || collateral != wethAddress && collateral != nativeUSDCAddress || !addressPattern.MatchString(collateral) {
 			return errors.New("exact liquidation variant is invalid")
+		}
+		switch liquidation.SizeClassification {
+		case fixedReviewedSizeClassification:
+			if liquidation.TerminalSizeReason != "" || terminalSeenByCollateral[collateral] {
+				return errors.New("fixed reviewed liquidation classification is invalid")
+			}
+			fixedCountByCollateral[collateral]++
+			if fixedCountByCollateral[collateral] > 7 {
+				return errors.New("exact liquidation grid exceeds its collateral bound")
+			}
+		case terminalSizeClassification:
+			if fixedCountByCollateral[collateral] != 0 || terminalSeenByCollateral[collateral] || liquidation.TerminalSizeReason != belowMinReviewedSizeReason && liquidation.TerminalSizeReason != dustPartialInvalidReason {
+				return errors.New("terminal liquidation classification is invalid")
+			}
+			terminalSeenByCollateral[collateral] = true
+		default:
+			return errors.New("exact liquidation size classification is invalid")
 		}
 		if collateral == nativeUSDCAddress && (len(liquidation.UnwindQuotes) == 0 || len(liquidation.UnwindQuotes) > 3) {
 			return errors.New("exact liquidation route count exceeds its reviewed bound")
@@ -2861,10 +2888,6 @@ func (s *Screener) validateLiquidationVariants(liquidations []exactLiquidation, 
 			}
 			fees[quote.Fee] = true
 			pools[pool] = true
-		}
-		countByCollateral[collateral]++
-		if countByCollateral[collateral] > 7 {
-			return errors.New("exact liquidation grid exceeds its collateral bound")
 		}
 		if previous := previousByCollateral[collateral]; previous != nil && actual.Cmp(previous) <= 0 {
 			return errors.New("exact liquidation variants are not strictly increasing")
@@ -2903,6 +2926,9 @@ func (s *Screener) evaluateLiquidationBatch(ctx context.Context, record signal, 
 					floor,
 				).String()
 				diagnostic.FinalRejectionReason = "gross_edge_below_retained_profit_gate"
+				if probe.Liquidation.SizeClassification == terminalSizeClassification {
+					diagnostic.TerminalSizeUnprofitable = true
+				}
 				continue
 			}
 			probes = append(probes, probe)
@@ -3143,6 +3169,9 @@ func setDiagnosticRejection(diagnostics []sizeDiagnostic, liquidation *exactLiqu
 	for index := range diagnostics {
 		if liquidationDiagnosticKeyValues(diagnostics[index].ReviewedSize, diagnostics[index].Route) == key {
 			diagnostics[index].FinalRejectionReason = reason
+			if liquidation != nil && liquidation.SizeClassification == terminalSizeClassification && reason == "conservative_net_pnl_below_threshold" {
+				diagnostics[index].TerminalSizeUnprofitable = true
+			}
 			return
 		}
 	}
@@ -3306,6 +3335,8 @@ func buildExactDiagnosticSummary(record signal, exactForkLatency, liquidatableTo
 func newSizeDiagnostic(probe *liquidationProbe, liveMaximumText string) sizeDiagnostic {
 	diagnostic := sizeDiagnostic{
 		ReviewedSize:             probe.Liquidation.RepayAmount,
+		SizeClassification:       probe.Liquidation.SizeClassification,
+		TerminalSizeReason:       probe.Liquidation.TerminalSizeReason,
 		Route:                    probe.Route.Name,
 		FlashPremiumWei:          probe.Liquidation.FlashPremiumAmount,
 		AtlasExposureWei:         "0",

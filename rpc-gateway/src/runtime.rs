@@ -92,6 +92,10 @@ const DEFAULT_LIQUIDATION_CLOSE_FACTOR_BPS: u64 = 5_000;
 const CLOSE_FACTOR_HF_THRESHOLD_WAD: u128 = 950_000_000_000_000_000;
 const MIN_BASE_MAX_CLOSE_FACTOR_THRESHOLD: u64 = 2_000 * 100_000_000;
 const MIN_LEFTOVER_BASE: u64 = MIN_BASE_MAX_CLOSE_FACTOR_THRESHOLD / 2;
+const FIXED_REVIEWED_SIZE: &str = "fixed_reviewed_size";
+const TERMINAL_SIZE_REQUIRED: &str = "terminal_size_required";
+const BELOW_MIN_REVIEWED_SIZE: &str = "below_min_reviewed_size";
+const DUST_PARTIAL_INVALID: &str = "dust_partial_invalid";
 const GAS_ESTIMATE_HEADROOM_BPS: u64 = 12_000;
 const SLOT0_SELECTOR: &str = "0x3850c7bd";
 const LIQUIDITY_SELECTOR: &str = "0x1a686502";
@@ -4536,7 +4540,7 @@ fn supported_aave_liquidations(
     }
     let debt_reserve_base = mul_div_ceil(total_debt, debt_price, debt_unit)?;
     let total_account_debt_base = decimal_u256(&account.total_debt_base)?;
-    let mut variants = Vec::with_capacity(8);
+    let mut variants = Vec::with_capacity((SizeLevel::ALL.len() + 1) * 2);
 
     for collateral in reserves
         .iter()
@@ -4609,7 +4613,10 @@ fn supported_aave_liquidations(
         if maximum.actual_repay.is_zero() {
             continue;
         }
-        for requested_repay in liquidation_size_grid(maximum.actual_repay)? {
+        let fixed_grid = liquidation_size_grid(maximum.actual_repay)?;
+        let mut fixed_failed_only_for_dust = !fixed_grid.is_empty();
+        let mut accepted_fixed = false;
+        for requested_repay in fixed_grid.iter().copied() {
             let amounts = calculate_aave_liquidation_amounts(
                 requested_repay,
                 collateral_balance,
@@ -4620,41 +4627,124 @@ fn supported_aave_liquidations(
                 liquidation_bonus,
                 protocol_fee,
             )?;
-            if amounts.actual_repay != requested_repay
-                || !aave_liquidation_dust_valid(
-                    total_debt,
-                    collateral_balance,
-                    amounts,
-                    debt_price,
-                    collateral_price,
-                    debt_unit,
-                    collateral_unit,
-                )?
-            {
+            if amounts.actual_repay != requested_repay {
+                fixed_failed_only_for_dust = false;
                 continue;
             }
-            let flash_premium = percent_mul(amounts.actual_repay, U256::from(flash_premium_bps))?;
-            let oracle_unwind_output = mul_div_floor(
-                checked_mul(amounts.liquidator_collateral, collateral_price)?,
+            if !aave_liquidation_dust_valid(
+                total_debt,
+                collateral_balance,
+                amounts,
+                debt_price,
+                collateral_price,
                 debt_unit,
-                checked_mul(collateral_unit, debt_price)?,
-            )?;
-            variants.push(AaveExactLiquidationState {
-                debt_asset: ARBITRUM_WETH.to_string(),
-                collateral_asset: collateral.asset.clone(),
-                requested_repay_amount: requested_repay.to_string(),
-                actual_repay_amount: amounts.actual_repay.to_string(),
-                repay_amount: amounts.actual_repay.to_string(),
-                flash_premium_amount: flash_premium.to_string(),
-                seized_collateral: amounts.seized_before_fee.to_string(),
-                protocol_fee_collateral: amounts.protocol_fee.to_string(),
-                liquidator_collateral: amounts.liquidator_collateral.to_string(),
-                oracle_unwind_output_weth: oracle_unwind_output.to_string(),
-                unwind_quotes: Vec::new(),
-            });
+                collateral_unit,
+            )? {
+                continue;
+            }
+            fixed_failed_only_for_dust = false;
+            accepted_fixed = true;
+            variants.push(aave_liquidation_state(
+                &collateral.asset,
+                requested_repay,
+                amounts,
+                collateral_price,
+                debt_price,
+                collateral_unit,
+                debt_unit,
+                flash_premium_bps,
+                FIXED_REVIEWED_SIZE,
+                "",
+            )?);
+        }
+        let terminal_reason = if fixed_grid.is_empty() {
+            Some(BELOW_MIN_REVIEWED_SIZE)
+        } else if fixed_failed_only_for_dust {
+            Some(DUST_PARTIAL_INVALID)
+        } else {
+            None
+        };
+        if !accepted_fixed {
+            if let Some(reason) = terminal_reason {
+                let terminal_size = maximum
+                    .actual_repay
+                    .min(U256::from(MAXIMUM_REVIEWED_INPUT_WEI));
+                if !terminal_size.is_zero() && !fixed_grid.contains(&terminal_size) {
+                    let amounts = calculate_aave_liquidation_amounts(
+                        terminal_size,
+                        collateral_balance,
+                        debt_price,
+                        collateral_price,
+                        debt_unit,
+                        collateral_unit,
+                        liquidation_bonus,
+                        protocol_fee,
+                    )?;
+                    if amounts.actual_repay == terminal_size
+                        && aave_liquidation_dust_valid(
+                            total_debt,
+                            collateral_balance,
+                            amounts,
+                            debt_price,
+                            collateral_price,
+                            debt_unit,
+                            collateral_unit,
+                        )?
+                    {
+                        variants.push(aave_liquidation_state(
+                            &collateral.asset,
+                            terminal_size,
+                            amounts,
+                            collateral_price,
+                            debt_price,
+                            collateral_unit,
+                            debt_unit,
+                            flash_premium_bps,
+                            TERMINAL_SIZE_REQUIRED,
+                            reason,
+                        )?);
+                    }
+                }
+            }
         }
     }
     Ok(variants)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn aave_liquidation_state(
+    collateral_asset: &str,
+    requested_repay: U256,
+    amounts: AaveLiquidationAmounts,
+    collateral_price: U256,
+    debt_price: U256,
+    collateral_unit: U256,
+    debt_unit: U256,
+    flash_premium_bps: u16,
+    size_classification: &str,
+    terminal_size_reason: &str,
+) -> Result<AaveExactLiquidationState, GatewayError> {
+    let flash_premium = percent_mul(amounts.actual_repay, U256::from(flash_premium_bps))?;
+    let oracle_unwind_output = mul_div_floor(
+        checked_mul(amounts.liquidator_collateral, collateral_price)?,
+        debt_unit,
+        checked_mul(collateral_unit, debt_price)?,
+    )?;
+    Ok(AaveExactLiquidationState {
+        debt_asset: ARBITRUM_WETH.to_string(),
+        collateral_asset: collateral_asset.to_string(),
+        size_classification: size_classification.to_string(),
+        terminal_size_reason: terminal_size_reason.to_string(),
+        requested_repay_amount: requested_repay.to_string(),
+        actual_repay_amount: amounts.actual_repay.to_string(),
+        repay_amount: amounts.actual_repay.to_string(),
+        flash_premium_amount: flash_premium.to_string(),
+        seized_collateral: amounts.seized_before_fee.to_string(),
+        protocol_fee_collateral: amounts.protocol_fee.to_string(),
+        liquidator_collateral: amounts.liquidator_collateral.to_string(),
+        oracle_unwind_output_weth: oracle_unwind_output.to_string(),
+        unwind_quotes: Vec::new(),
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -7729,9 +7819,16 @@ mod tests {
         let variants =
             supported_aave_liquidations(&account, &reserves, cap, U256::zero(), 0, 5).unwrap();
         for collateral in [ARBITRUM_WETH, ARBITRUM_NATIVE_USDC] {
-            let sizes = variants
+            let collateral_variants = variants
                 .iter()
                 .filter(|variant| variant.collateral_asset == collateral)
+                .collect::<Vec<_>>();
+            assert!(collateral_variants.iter().all(|variant| {
+                variant.size_classification == FIXED_REVIEWED_SIZE
+                    && variant.terminal_size_reason.is_empty()
+            }));
+            let sizes = collateral_variants
+                .iter()
                 .map(|variant| decimal_u256(&variant.actual_repay_amount).unwrap())
                 .collect::<Vec<_>>();
             assert_eq!(sizes.len(), SizeLevel::ALL.len());
@@ -7740,6 +7837,48 @@ mod tests {
             assert!(sizes
                 .iter()
                 .all(|size| *size <= U256::from(MAXIMUM_REVIEWED_INPUT_WEI)));
+        }
+    }
+
+    #[test]
+    fn aave_terminal_size_covers_below_minimum_and_dust_full_close() {
+        let maximum_input = U256::from(MAXIMUM_REVIEWED_INPUT_WEI);
+        let below_minimum = U256::from(SizeLevel::Min.amount_wei() / 2);
+        let (account, mut reserves) = exact_aave_fixture(CLOSE_FACTOR_HF_THRESHOLD_WAD);
+        reserves[0].current_variable_debt = below_minimum.to_string();
+        let variants =
+            supported_aave_liquidations(&account, &reserves, maximum_input, U256::zero(), 0, 5)
+                .unwrap();
+        for collateral in [ARBITRUM_WETH, ARBITRUM_NATIVE_USDC] {
+            let terminal = variants
+                .iter()
+                .filter(|variant| variant.collateral_asset == collateral)
+                .collect::<Vec<_>>();
+            assert_eq!(terminal.len(), 1);
+            assert_eq!(terminal[0].actual_repay_amount, below_minimum.to_string());
+            assert_eq!(terminal[0].size_classification, TERMINAL_SIZE_REQUIRED);
+            assert_eq!(terminal[0].terminal_size_reason, BELOW_MIN_REVIEWED_SIZE);
+        }
+
+        let dusty_full_close = U256::from(SizeLevel::Min.amount_wei() + 10_000_000_000_000);
+        let (account, mut reserves) = exact_aave_fixture(CLOSE_FACTOR_HF_THRESHOLD_WAD);
+        reserves[0].current_variable_debt = dusty_full_close.to_string();
+        let variants =
+            supported_aave_liquidations(&account, &reserves, maximum_input, U256::zero(), 0, 5)
+                .unwrap();
+        for collateral in [ARBITRUM_WETH, ARBITRUM_NATIVE_USDC] {
+            let terminal = variants
+                .iter()
+                .filter(|variant| variant.collateral_asset == collateral)
+                .collect::<Vec<_>>();
+            assert_eq!(terminal.len(), 1);
+            assert_eq!(
+                terminal[0].actual_repay_amount,
+                dusty_full_close.to_string()
+            );
+            assert_eq!(terminal[0].size_classification, TERMINAL_SIZE_REQUIRED);
+            assert_eq!(terminal[0].terminal_size_reason, DUST_PARTIAL_INVALID);
+            assert!(decimal_u256(&terminal[0].actual_repay_amount).unwrap() <= maximum_input);
         }
     }
 
@@ -7875,6 +8014,13 @@ mod tests {
     #[test]
     fn aave_reserve_flags_grace_and_dust_fail_closed() {
         let cap = U256::exp10(18);
+        let (healthy, reserves) = exact_aave_fixture(1_000_000_000_000_000_000);
+        assert!(
+            supported_aave_liquidations(&healthy, &reserves, cap, U256::zero(), 0, 5)
+                .unwrap()
+                .is_empty()
+        );
+
         let (account, mut reserves) = exact_aave_fixture(CLOSE_FACTOR_HF_THRESHOLD_WAD);
         reserves[0].configuration_data = aave_configuration(18, 10_500, 1_000, false, false);
         assert!(
@@ -7892,6 +8038,15 @@ mod tests {
             .all(|variant| variant.collateral_asset != ARBITRUM_NATIVE_USDC));
         assert!(aave_liquidation_grace_elapsed(0, 9, 10));
         assert!(!aave_liquidation_grace_elapsed(0, 10, 10));
+
+        let (account, mut reserves) = exact_aave_fixture(CLOSE_FACTOR_HF_THRESHOLD_WAD);
+        reserves[0].current_a_token_balance = "0".to_string();
+        reserves[1].current_a_token_balance = "0".to_string();
+        assert!(
+            supported_aave_liquidations(&account, &reserves, cap, U256::zero(), 0, 5)
+                .unwrap()
+                .is_empty()
+        );
 
         let dusty = AaveLiquidationAmounts {
             actual_repay: U256::from(99),
