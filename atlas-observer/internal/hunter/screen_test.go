@@ -873,7 +873,7 @@ func TestValidatedAaveLiveMaximumAcceptsExplicitMaximumReviewedLaneAuthority(t *
 func TestCandidateAuthorityBindsDirectAndAtlasSizeToLockedMaximum(t *testing.T) {
 	current := "500000000000000"
 	valid := signal{
-		ExecutionCandidate: &executionCandidate{SelectedSize: current, MaximumInputAmount: current},
+		ExecutionCandidate: testWETHExecutionCandidate(current, current),
 		AtlasCandidate:     &atlasCandidate{SelectedSize: current, MaximumInputAmount: current},
 	}
 	if !candidateMatchesCurrentAuthority(valid, current) {
@@ -899,13 +899,27 @@ func TestCandidateAuthorityBindsDirectAndAtlasSizeToLockedMaximum(t *testing.T) 
 	} {
 		t.Run(name, func(t *testing.T) {
 			value := signal{
-				ExecutionCandidate: &executionCandidate{SelectedSize: current, MaximumInputAmount: current},
+				ExecutionCandidate: testWETHExecutionCandidate(current, current),
 				AtlasCandidate:     &atlasCandidate{SelectedSize: current, MaximumInputAmount: current},
 			}
 			if candidateMatchesCurrentAuthority(mutate(value), current) {
 				t.Fatal("stale candidate authority was accepted")
 			}
 		})
+	}
+}
+
+func testWETHExecutionCandidate(selected, maximum string) *executionCandidate {
+	return &executionCandidate{
+		SelectedSize:       selected,
+		MaximumInputAmount: maximum,
+		RoutePayload: aaveRoutePayload{
+			DebtAsset:           wethAddress,
+			DebtAssetDecimals:   18,
+			DebtAssetPriceBase:  "200000000000",
+			WETHPriceBase:       "200000000000",
+			MaximumInputWETHWei: maximum,
+		},
 	}
 }
 
@@ -2201,7 +2215,7 @@ func TestLiquidationVariantBoundsUseReviewedMaximumNotLiveMaximum(t *testing.T) 
 	screener := &Screener{config: Config{MaximumInputAmountWei: "100", FlashPremiumBPS: 5}}
 	variants := make([]exactLiquidation, 0, 8)
 	for _, collateral := range []string{wethAddress, nativeUSDCAddress} {
-		for _, amount := range []int64{25, 50, 75, 100} {
+		for _, amount := range []int64{100_000_000_000_000, 250_000_000_000_000, 500_000_000_000_000, 1_000_000_000_000_000} {
 			variants = append(variants, boundedTestLiquidation(collateral, amount, 5))
 		}
 	}
@@ -2209,9 +2223,7 @@ func TestLiquidationVariantBoundsUseReviewedMaximumNotLiveMaximum(t *testing.T) 
 		t.Fatalf("bounded per-collateral grids were rejected: %v", err)
 	}
 
-	aboveLive := append([]exactLiquidation(nil), variants...)
-	aboveLive[3] = boundedTestLiquidation(wethAddress, 101, 5)
-	if err := screener.validateLiquidationVariants(aboveLive, 5); err != nil {
+	if err := screener.validateLiquidationVariants(variants, 5); err != nil {
 		t.Fatalf("reviewed counterfactual size was incorrectly bounded by the live cap: %v", err)
 	}
 
@@ -2228,7 +2240,7 @@ func TestLiquidationVariantBoundsUseReviewedMaximumNotLiveMaximum(t *testing.T) 
 	}
 
 	eighthSize := append([]exactLiquidation(nil), variants...)
-	for amount := int64(101); amount <= 104; amount++ {
+	for _, amount := range []int64{2_500_000_000_000_000, 5_000_000_000_000_000, 10_000_000_000_000_000, 10_000_000_000_000_000} {
 		eighthSize = append(eighthSize, boundedTestLiquidation(wethAddress, amount, 5))
 	}
 	if err := screener.validateLiquidationVariants(eighthSize, 5); err == nil {
@@ -2241,7 +2253,7 @@ func TestLiquidationVariantBoundsUseReviewedMaximumNotLiveMaximum(t *testing.T) 
 	if err := screener.validateLiquidationVariants([]exactLiquidation{terminal}, 5); err != nil {
 		t.Fatalf("one bounded terminal size was rejected: %v", err)
 	}
-	mixed := []exactLiquidation{boundedTestLiquidation(wethAddress, 25, 5), terminal}
+	mixed := []exactLiquidation{boundedTestLiquidation(wethAddress, 100_000_000_000_000, 5), terminal}
 	if err := screener.validateLiquidationVariants(mixed, 5); err == nil {
 		t.Fatal("terminal size was accepted alongside a fixed reviewed grid")
 	}
@@ -2294,12 +2306,14 @@ func TestUniswapDirectionIsDerivedFromActualTokenOrdering(t *testing.T) {
 }
 
 func TestCounterfactualPositiveSizeIsVisibleButCannotMaterializeAuthority(t *testing.T) {
-	minimum := boundedTestLiquidation(wethAddress, 1_000, 5)
-	minimum.LiquidatorCollateral = "1050"
-	minimum.OracleUnwindOutputWETH = "1050"
-	larger := boundedTestLiquidation(wethAddress, 5_000, 5)
-	larger.LiquidatorCollateral = "5403"
-	larger.OracleUnwindOutputWETH = "5403"
+	minimum := boundedTestLiquidation(wethAddress, 100_000_000_000_000, 5)
+	minimum.LiquidatorCollateral = "100050000000050"
+	minimum.OracleUnwindOutputWETH = minimum.LiquidatorCollateral
+	minimum.OracleUnwindOutputDebt = minimum.LiquidatorCollateral
+	larger := boundedTestLiquidation(wethAddress, 500_000_000_000_000, 5)
+	larger.LiquidatorCollateral = "500250000000400"
+	larger.OracleUnwindOutputWETH = larger.LiquidatorCollateral
+	larger.OracleUnwindOutputDebt = larger.LiquidatorCollateral
 	liquidations := []exactLiquidation{minimum, larger}
 	exactCalls := 0
 	simulationCalls := 0
@@ -2313,7 +2327,7 @@ func TestCounterfactualPositiveSizeIsVisibleButCannotMaterializeAuthority(t *tes
 			}
 			primary := exactProvider{ProviderID: primaryProviderID, FlashPremiumBPS: 5, Liquidations: liquidations}
 			_ = json.NewEncoder(writer).Encode(exactResponse{
-				SchemaVersion: "phoenix.rpc.aave-exact-response.v4", ChainID: 42161, RequestID: input.RequestID,
+				SchemaVersion: "phoenix.rpc.aave-exact-response.v5", ChainID: 42161, RequestID: input.RequestID,
 				BlockNumber: uint64(99 + exactCalls), BlockHash: "0x" + strings.Repeat("a", 64), StateRoot: "0x" + strings.Repeat("b", 64),
 				Primary: primary, Confirmation: nil, Quorum: 1,
 			})
@@ -2325,7 +2339,7 @@ func TestCounterfactualPositiveSizeIsVisibleButCannotMaterializeAuthority(t *tes
 			results := make([]simulationBatchResult, 0, len(input.Simulations))
 			for _, simulation := range input.Simulations {
 				simulationCalls++
-				if !simulation.Counterfactual || simulation.MaximumInputAmount != maximumReviewedInputWei || simulation.LiveMaximumInputAmount != "4000" {
+				if !simulation.Counterfactual || simulation.MaximumInputAmount != maximumReviewedInputWei || simulation.LiveMaximumInputAmount != "400000000000000" {
 					t.Fatalf("counterfactual authority was not separated from live authority: %+v", simulation)
 				}
 				results = append(results, simulationBatchResult{
@@ -2340,7 +2354,9 @@ func TestCounterfactualPositiveSizeIsVisibleButCannotMaterializeAuthority(t *tes
 	}))
 	defer server.Close()
 
-	record, err := economicTestScreener(server).resolveExact(context.Background(), signal{
+	screener := economicTestScreener(server)
+	screener.config.MaximumInputAmountWei = "400000000000000"
+	record, err := screener.resolveExact(context.Background(), signal{
 		Cursor: 1, Borrower: "0x1111111111111111111111111111111111111111",
 	}, nil)
 	if err != nil {
@@ -2354,11 +2370,11 @@ func TestCounterfactualPositiveSizeIsVisibleButCannotMaterializeAuthority(t *tes
 	}
 	for _, diagnostic := range record.SizeDiagnostics {
 		switch diagnostic.ReviewedSize {
-		case "1000":
+		case "100000000000000":
 			if diagnostic.FinalRejectionReason != "gross_edge_below_retained_profit_gate" || !diagnostic.LiveAuthorized {
 				t.Fatalf("minimum-size diagnostic drifted: %+v", diagnostic)
 			}
-		case "5000":
+		case "500000000000000":
 			if diagnostic.LiveAuthorized || diagnostic.FinalRejectionReason != "live_size_authorization_required" || diagnostic.ExecutionCostWei != "10" || diagnostic.MarginToRetainedFloorWei != "251" {
 				t.Fatalf("larger-size diagnostic drifted: %+v", diagnostic)
 			}
@@ -2369,13 +2385,14 @@ func TestCounterfactualPositiveSizeIsVisibleButCannotMaterializeAuthority(t *tes
 }
 
 func TestReviewedFeeRoutesAreComparedAtOnePinAndSelectBestPostCostOutcome(t *testing.T) {
-	liquidation := boundedTestLiquidation(nativeUSDCAddress, 1_000, 5)
+	liquidation := boundedTestLiquidation(nativeUSDCAddress, 100_000_000_000_000, 5)
 	liquidation.LiquidatorCollateral = "1600000"
-	liquidation.OracleUnwindOutputWETH = "1500"
+	liquidation.OracleUnwindOutputWETH = "100050000000500"
+	liquidation.OracleUnwindOutputDebt = liquidation.OracleUnwindOutputWETH
 	liquidation.UnwindQuotes = []exactUnwindQuote{
-		{Pool: "0x1111111111111111111111111111111111111111", Factory: uniswapFactoryAddress, Token0: wethAddress, Token1: nativeUSDCAddress, Fee: 100, ZeroForOne: false, OutputWETH: "1301"},
-		{Pool: "0x2222222222222222222222222222222222222222", Factory: uniswapFactoryAddress, Token0: wethAddress, Token1: nativeUSDCAddress, Fee: 500, ZeroForOne: false, OutputWETH: "1401"},
-		{Pool: "0x3333333333333333333333333333333333333333", Factory: uniswapFactoryAddress, Token0: wethAddress, Token1: nativeUSDCAddress, Fee: 3000, ZeroForOne: false, OutputWETH: "1451"},
+		{Pool: wethNativeUSDCPool100Address, Factory: uniswapFactoryAddress, Token0: wethAddress, Token1: nativeUSDCAddress, Fee: 100, ZeroForOne: false, OutputWETH: "100050000000300", OutputDebt: "100050000000300"},
+		{Pool: wethNativeUSDCPool500Address, Factory: uniswapFactoryAddress, Token0: wethAddress, Token1: nativeUSDCAddress, Fee: 500, ZeroForOne: false, OutputWETH: "100050000000400", OutputDebt: "100050000000400"},
+		{Pool: wethNativeUSDCPool3000Address, Factory: uniswapFactoryAddress, Token0: wethAddress, Token1: nativeUSDCAddress, Fee: 3000, ZeroForOne: false, OutputWETH: "100050000000450", OutputDebt: "100050000000450"},
 	}
 	realizedByFee := map[uint32]string{100: "300", 500: "400", 3000: "450"}
 	costByFee := map[uint32]string{100: "10", 500: "20", 3000: "100"}
@@ -2391,7 +2408,7 @@ func TestReviewedFeeRoutesAreComparedAtOnePinAndSelectBestPostCostOutcome(t *tes
 			}
 			primary := exactProvider{ProviderID: primaryProviderID, FlashPremiumBPS: 5, Liquidations: []exactLiquidation{liquidation}}
 			_ = json.NewEncoder(writer).Encode(exactResponse{
-				SchemaVersion: "phoenix.rpc.aave-exact-response.v4", ChainID: 42161, RequestID: input.RequestID,
+				SchemaVersion: "phoenix.rpc.aave-exact-response.v5", ChainID: 42161, RequestID: input.RequestID,
 				BlockNumber: 100, BlockHash: "0x" + strings.Repeat("a", 64), StateRoot: "0x" + strings.Repeat("b", 64),
 				Primary: primary, Confirmation: nil, Quorum: 1,
 			})
@@ -2432,7 +2449,9 @@ func TestReviewedFeeRoutesAreComparedAtOnePinAndSelectBestPostCostOutcome(t *tes
 	}))
 	defer server.Close()
 
-	record, err := economicTestScreener(server).resolveExact(context.Background(), signal{
+	screener := economicTestScreener(server)
+	screener.config.MaximumInputAmountWei = "100000000000000"
+	record, err := screener.resolveExact(context.Background(), signal{
 		Cursor: 1, Borrower: "0x1111111111111111111111111111111111111111",
 	}, nil)
 	if err != nil {
@@ -2691,7 +2710,7 @@ func TestAaveExactSchedulerHTTPPathIsBoundedAndSinglePrimary(t *testing.T) {
 			primary := exactProvider{ProviderID: "production-nownodes-arbitrum", Reserves: []exactReserve{reserve}, FlashPremiumBPS: 5}
 			exactPrimaryChecks++
 			_ = json.NewEncoder(writer).Encode(exactResponse{
-				SchemaVersion: "phoenix.rpc.aave-exact-response.v4", ChainID: 42161,
+				SchemaVersion: "phoenix.rpc.aave-exact-response.v5", ChainID: 42161,
 				RequestID: input.RequestID, BlockNumber: 491300000,
 				BlockHash: "0x" + strings.Repeat("b", 64), StateRoot: "0x" + strings.Repeat("c", 64),
 				Primary: primary, Confirmation: nil, Quorum: 1,
@@ -2787,7 +2806,7 @@ func TestAaveExactWorkersDrainEligibleCohortWithBoundedConcurrency(t *testing.T)
 			<-release
 			active.Add(-1)
 			_ = json.NewEncoder(writer).Encode(exactResponse{
-				SchemaVersion: "phoenix.rpc.aave-exact-response.v4", ChainID: 42161,
+				SchemaVersion: "phoenix.rpc.aave-exact-response.v5", ChainID: 42161,
 				RequestID: input.RequestID, BlockNumber: 491300001,
 				BlockHash: "0x" + strings.Repeat("b", 64), StateRoot: "0x" + strings.Repeat("c", 64),
 				Primary: exactProvider{ProviderID: primaryProviderID, FlashPremiumBPS: 5}, Quorum: 1,
@@ -2882,7 +2901,7 @@ func TestAaveExactWorkerReplayImprovesLatencyWithoutSemanticDrift(t *testing.T) 
 			}
 			time.Sleep(25 * time.Millisecond)
 			_ = json.NewEncoder(writer).Encode(exactResponse{
-				SchemaVersion: "phoenix.rpc.aave-exact-response.v4", ChainID: 42161,
+				SchemaVersion: "phoenix.rpc.aave-exact-response.v5", ChainID: 42161,
 				RequestID: input.RequestID, BlockNumber: 491300001,
 				BlockHash: "0x" + strings.Repeat("b", 64), StateRoot: "0x" + strings.Repeat("c", 64),
 				Primary: exactProvider{ProviderID: primaryProviderID, FlashPremiumBPS: 5}, Quorum: 1,
@@ -2994,7 +3013,7 @@ func TestForkSaturationDoesNotBlockIndependentExactStateFetch(t *testing.T) {
 				}
 			}
 			_ = json.NewEncoder(writer).Encode(simulationBatchResponse{
-				SchemaVersion: "phoenix.rpc.aave-simulate-batch-response.v3", ChainID: 42161,
+				SchemaVersion: "phoenix.rpc.aave-simulate-batch-response.v4", ChainID: 42161,
 				RequestID: input.RequestID, BlockNumber: record.Block, BlockHash: record.BlockHash,
 				StateRoot: record.StateRoot, PrimaryProviderID: primaryProviderID, Quorum: 1,
 				EvidenceMode: directForkEvidenceMode, Results: results,
@@ -3006,7 +3025,7 @@ func TestForkSaturationDoesNotBlockIndependentExactStateFetch(t *testing.T) {
 				return
 			}
 			_ = json.NewEncoder(writer).Encode(exactResponse{
-				SchemaVersion: "phoenix.rpc.aave-exact-response.v4", ChainID: 42161,
+				SchemaVersion: "phoenix.rpc.aave-exact-response.v5", ChainID: 42161,
 				RequestID: input.RequestID, BlockNumber: record.Block, BlockHash: record.BlockHash,
 				StateRoot: record.StateRoot,
 				Primary:   exactProvider{ProviderID: primaryProviderID, FlashPremiumBPS: 5}, Quorum: 1,
@@ -3120,7 +3139,7 @@ func TestAaveExactSanitizedLoadProfilesDrainWithBoundedBackpressure(t *testing.T
 			time.Sleep(25 * time.Millisecond)
 			active.Add(-1)
 			_ = json.NewEncoder(writer).Encode(exactResponse{
-				SchemaVersion: "phoenix.rpc.aave-exact-response.v4", ChainID: 42161,
+				SchemaVersion: "phoenix.rpc.aave-exact-response.v5", ChainID: 42161,
 				RequestID: input.RequestID, BlockNumber: 491300001,
 				BlockHash: "0x" + strings.Repeat("b", 64), StateRoot: "0x" + strings.Repeat("c", 64),
 				Primary: exactProvider{ProviderID: primaryProviderID, FlashPremiumBPS: 5}, Quorum: 1,
@@ -3209,17 +3228,17 @@ func TestAaveExactSanitizedLoadProfilesDrainWithBoundedBackpressure(t *testing.T
 
 func TestResolveExactContinuesPastFailedSizeAndBindsSelectedRepay(t *testing.T) {
 	liquidations := []exactLiquidation{
-		boundedTestLiquidation(wethAddress, 1_000, 5),
-		boundedTestLiquidation(wethAddress, 2_000, 5),
-		boundedTestLiquidation(wethAddress, 3_000, 5),
-		boundedTestLiquidation(wethAddress, 4_000, 5),
+		boundedTestLiquidation(wethAddress, 100_000_000_000_000, 5),
+		boundedTestLiquidation(wethAddress, 250_000_000_000_000, 5),
+		boundedTestLiquidation(wethAddress, 500_000_000_000_000, 5),
+		boundedTestLiquidation(wethAddress, 1_000_000_000_000_000, 5),
 	}
-	liquidations[0].LiquidatorCollateral = "1111"
-	liquidations[1].LiquidatorCollateral = "2401"
-	liquidations[2].LiquidatorCollateral = "3212"
-	liquidations[3].LiquidatorCollateral = "4152"
-	realized := map[string]string{"1000": "110", "3000": "210", "4000": "150"}
-	flash := map[string]string{"1000": "1", "2000": "1", "3000": "2", "4000": "2"}
+	liquidations[0].LiquidatorCollateral = "100050000000110"
+	liquidations[1].LiquidatorCollateral = "250125000000401"
+	liquidations[2].LiquidatorCollateral = "500250000000210"
+	liquidations[3].LiquidatorCollateral = "1000500000000152"
+	realized := map[string]string{"100000000000000": "110", "500000000000000": "210", "1000000000000000": "150"}
+	flash := map[string]string{"100000000000000": "50000000000", "250000000000000": "125000000000", "500000000000000": "250000000000", "1000000000000000": "500000000000"}
 	simulationCalls := 0
 	simulationBatches := 0
 
@@ -3235,7 +3254,7 @@ func TestResolveExactContinuesPastFailedSizeAndBindsSelectedRepay(t *testing.T) 
 			}
 			primary := exactProvider{ProviderID: primaryProviderID, FlashPremiumBPS: 5, Liquidations: liquidations}
 			_ = json.NewEncoder(writer).Encode(exactResponse{
-				SchemaVersion: "phoenix.rpc.aave-exact-response.v4", ChainID: 42161, RequestID: input.RequestID,
+				SchemaVersion: "phoenix.rpc.aave-exact-response.v5", ChainID: 42161, RequestID: input.RequestID,
 				BlockNumber: 100, BlockHash: "0x" + strings.Repeat("a", 64), StateRoot: "0x" + strings.Repeat("b", 64),
 				Primary: primary, Confirmation: nil, Quorum: 1,
 			})
@@ -3249,7 +3268,7 @@ func TestResolveExactContinuesPastFailedSizeAndBindsSelectedRepay(t *testing.T) 
 			for _, simulation := range input.Simulations {
 				simulationCalls++
 				result := simulationBatchResult{RequestID: simulation.RequestID}
-				if simulation.RepayAmount == "2000" {
+				if simulation.RepayAmount == "250000000000000" {
 					result.Error = &gatewayErrorContract{ErrorClass: "fork_simulation_failed", Retryable: false}
 				} else {
 					result.Response = testSimulationResponse(simulation, realized[simulation.RepayAmount], "10", "3", flash[simulation.RepayAmount])
@@ -3264,23 +3283,24 @@ func TestResolveExactContinuesPastFailedSizeAndBindsSelectedRepay(t *testing.T) 
 	defer server.Close()
 
 	screener := economicTestScreener(server)
+	screener.config.MaximumInputAmountWei = "1000000000000000"
 	record, err := screener.resolveExact(context.Background(), signal{
 		Cursor: 1, Borrower: "0x1111111111111111111111111111111111111111",
 	}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if simulationCalls != 8 || simulationBatches != 3 {
-		t.Fatalf("independent size attempts=%d batches=%d want=8/3", simulationCalls, simulationBatches)
+	if simulationCalls != 6 || simulationBatches != 3 {
+		t.Fatalf("independent size attempts=%d batches=%d want=6/3", simulationCalls, simulationBatches)
 	}
 	if !record.Authority || record.TerminalOutcome != "candidate" || record.ExecutionCandidate == nil {
 		t.Fatalf("winner did not receive Candidate authority: %+v", record)
 	}
 	candidate := record.ExecutionCandidate
-	if candidate.SelectedSize != "3000" || candidate.FlashAmount != "3000" || candidate.MaximumInputAmount != "4000" {
+	if candidate.SelectedSize != "500000000000000" || candidate.FlashAmount != "500000000000000" || candidate.MaximumInputAmount != "1000000000000000" {
 		t.Fatalf("selected repay identity drifted: size=%s flash=%s maximum=%s", candidate.SelectedSize, candidate.FlashAmount, candidate.MaximumInputAmount)
 	}
-	if candidate.MinimumProfit != "111" || candidate.RoutePayload.MinimumUnwindOutput != "3192" || candidate.GasLimit != 1 || candidate.MaxFeePerGas != "10" {
+	if candidate.MinimumProfit != "111" || candidate.RoutePayload.MinimumUnwindOutput != "500250000000190" || candidate.GasLimit != 1 || candidate.MaxFeePerGas != "10" {
 		t.Fatalf("bounded authority was not materialized: min_profit=%s min_unwind=%s gas=%d max_fee=%s", candidate.MinimumProfit, candidate.RoutePayload.MinimumUnwindOutput, candidate.GasLimit, candidate.MaxFeePerGas)
 	}
 	if record.ExpectedNetPnLWei != "200" || record.RiskReserveAmountWei != "20" || record.ConservativeNetPnLWei != "180" {
@@ -3298,14 +3318,14 @@ func TestResolveExactRanksConvergedVariantsAndContinuesPastFinalFailure(t *testi
 		edge       int64
 	}
 	specs := []variantSpec{
-		{wethAddress, 1_000, 200},
-		{wethAddress, 2_000, 250},
-		{wethAddress, 3_000, 300},
-		{wethAddress, 4_000, 500},
-		{nativeUSDCAddress, 1_000, 210},
-		{nativeUSDCAddress, 2_000, 270},
-		{nativeUSDCAddress, 3_000, 290},
-		{nativeUSDCAddress, 4_000, 400},
+		{wethAddress, 100_000_000_000_000, 200},
+		{wethAddress, 250_000_000_000_000, 250},
+		{wethAddress, 500_000_000_000_000, 300},
+		{wethAddress, 1_000_000_000_000_000, 500},
+		{nativeUSDCAddress, 100_000_000_000_000, 210},
+		{nativeUSDCAddress, 250_000_000_000_000, 270},
+		{nativeUSDCAddress, 500_000_000_000_000, 290},
+		{nativeUSDCAddress, 1_000_000_000_000_000, 400},
 	}
 	liquidations := make([]exactLiquidation, 0, len(specs))
 	realizedByVariant := make(map[string]string, len(specs))
@@ -3317,17 +3337,20 @@ func TestResolveExactRanksConvergedVariantsAndContinuesPastFinalFailure(t *testi
 		if spec.collateral == wethAddress {
 			liquidation.LiquidatorCollateral = output
 		} else {
-			liquidation.UnwindQuotes[0].OutputWETH = output
+			for index := range liquidation.UnwindQuotes {
+				liquidation.UnwindQuotes[index].OutputWETH = output
+				liquidation.UnwindQuotes[index].OutputDebt = output
+			}
 		}
 		key := spec.collateral + "|" + liquidation.RepayAmount
 		realizedByVariant[key] = strconv.FormatInt(spec.edge, 10)
 		flashByVariant[key] = liquidation.FlashPremiumAmount
 		liquidations = append(liquidations, liquidation)
 	}
-	probeWinnerKey := wethAddress + "|4000"
-	failedFinalKey := wethAddress + "|3000"
-	finalWinnerKey := nativeUSDCAddress + "|1000"
-	freshSelectedKey := wethAddress + "|1000"
+	probeWinnerKey := wethAddress + "|1000000000000000"
+	failedFinalKey := wethAddress + "|500000000000000"
+	finalWinnerKey := nativeUSDCAddress + "|100000000000000"
+	freshSelectedKey := wethAddress + "|100000000000000"
 	exactCalls := 0
 	simulationCalls := 0
 	simulationBatches := 0
@@ -3355,7 +3378,7 @@ func TestResolveExactRanksConvergedVariantsAndContinuesPastFinalFailure(t *testi
 				stateRoot = "0x" + strings.Repeat("f", 64)
 			}
 			_ = json.NewEncoder(writer).Encode(exactResponse{
-				SchemaVersion: "phoenix.rpc.aave-exact-response.v4", ChainID: 42161, RequestID: input.RequestID,
+				SchemaVersion: "phoenix.rpc.aave-exact-response.v5", ChainID: 42161, RequestID: input.RequestID,
 				BlockNumber: blockNumber, BlockHash: blockHash, StateRoot: stateRoot,
 				Primary: primary, Confirmation: nil, Quorum: 1,
 			})
@@ -3421,6 +3444,7 @@ func TestResolveExactRanksConvergedVariantsAndContinuesPastFinalFailure(t *testi
 	defer server.Close()
 
 	screener := economicTestScreener(server)
+	screener.config.MaximumInputAmountWei = "1000000000000000"
 	baseTime := time.Now().UTC()
 	clockCalls := 0
 	screener.now = func() time.Time {
@@ -3433,7 +3457,7 @@ func TestResolveExactRanksConvergedVariantsAndContinuesPastFinalFailure(t *testi
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !record.Authority || record.ExecutionCandidate == nil || record.ExecutionCandidate.SelectedSize != "1000" || record.SelectedRoute != "WETH_IDENTITY" {
+	if !record.Authority || record.ExecutionCandidate == nil || record.ExecutionCandidate.SelectedSize != "100000000000000" || record.SelectedRoute != "WETH_IDENTITY" {
 		t.Fatalf("converged winner did not receive authority: %+v", record)
 	}
 	if exactCalls != 2 || simulationCalls != 24 || simulationBatches != 4 {
@@ -3460,7 +3484,7 @@ func TestResolveExactRanksConvergedVariantsAndContinuesPastFinalFailure(t *testi
 	if len(materializationCalls) != len(specs) || materializationCalls[failedFinalKey] != 1 {
 		t.Fatalf("viable variants were not independently materialized: %+v", materializationCalls)
 	}
-	if freshSelectedKey != strings.ToLower(record.ExecutionCandidate.RoutePayload.CollateralAsset)+"|"+record.ExecutionCandidate.SelectedSize || record.ExpectedNetPnLWei != "190" || record.ConservativeNetPnLWei != "171" || record.ExecutionCandidate.MinimumProfit != "111" || record.ExecutionCandidate.RoutePayload.MinimumUnwindOutput != "1182" || record.ExecutionCandidate.SimulationResultHash != freshWinnerHash || uint64(record.ExecutionCandidate.Deadline.Unix()) != freshDeadline {
+	if freshSelectedKey != strings.ToLower(record.ExecutionCandidate.RoutePayload.CollateralAsset)+"|"+record.ExecutionCandidate.SelectedSize || record.ExpectedNetPnLWei != "190" || record.ConservativeNetPnLWei != "171" || record.ExecutionCandidate.MinimumProfit != "111" || record.ExecutionCandidate.RoutePayload.MinimumUnwindOutput != "100050000000181" || record.ExecutionCandidate.SimulationResultHash != freshWinnerHash || uint64(record.ExecutionCandidate.Deadline.Unix()) != freshDeadline {
 		t.Fatalf("authority was not ranked and materialized from fresh economics/evidence: %+v", record)
 	}
 	if freshDeadline <= priorDeadline {
@@ -3511,7 +3535,7 @@ func TestSnapshotDoesNotBlockWhileExactResolutionIsInFlight(t *testing.T) {
 			}
 			primary := exactProvider{ProviderID: primaryProviderID}
 			_ = json.NewEncoder(writer).Encode(exactResponse{
-				SchemaVersion: "phoenix.rpc.aave-exact-response.v4", ChainID: 42161, RequestID: input.RequestID,
+				SchemaVersion: "phoenix.rpc.aave-exact-response.v5", ChainID: 42161, RequestID: input.RequestID,
 				BlockNumber: 100, BlockHash: "0x" + strings.Repeat("a", 64), StateRoot: "0x" + strings.Repeat("b", 64),
 				Primary: primary, Confirmation: nil, Quorum: 1,
 			})
@@ -3577,7 +3601,7 @@ func TestResolveExactNoProfitableSizeProducesNoCandidate(t *testing.T) {
 		}
 		primary := exactProvider{ProviderID: primaryProviderID, FlashPremiumBPS: 5, Liquidations: []exactLiquidation{liquidation}}
 		_ = json.NewEncoder(writer).Encode(exactResponse{
-			SchemaVersion: "phoenix.rpc.aave-exact-response.v4", ChainID: 42161, RequestID: input.RequestID,
+			SchemaVersion: "phoenix.rpc.aave-exact-response.v5", ChainID: 42161, RequestID: input.RequestID,
 			BlockNumber: 100, BlockHash: "0x" + strings.Repeat("a", 64), StateRoot: "0x" + strings.Repeat("b", 64),
 			Primary: primary, Confirmation: nil, Quorum: 1,
 		})
@@ -3593,8 +3617,8 @@ func TestResolveExactNoProfitableSizeProducesNoCandidate(t *testing.T) {
 }
 
 func TestFreshExactQuoteChangeFailsClosedBeforeAuthority(t *testing.T) {
-	original := boundedTestLiquidation(wethAddress, 1_000, 5)
-	original.LiquidatorCollateral = "1201"
+	original := boundedTestLiquidation(wethAddress, 100_000_000_000_000, 5)
+	original.LiquidatorCollateral = "100050000000200"
 	exactCalls := 0
 	simulationBatches := 0
 	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
@@ -3607,11 +3631,11 @@ func TestFreshExactQuoteChangeFailsClosedBeforeAuthority(t *testing.T) {
 			}
 			liquidation := original
 			if exactCalls == 2 {
-				liquidation.LiquidatorCollateral = "1202"
+				liquidation.LiquidatorCollateral = "100050000000201"
 			}
 			primary := exactProvider{ProviderID: primaryProviderID, FlashPremiumBPS: 5, Liquidations: []exactLiquidation{liquidation}}
 			_ = json.NewEncoder(writer).Encode(exactResponse{
-				SchemaVersion: "phoenix.rpc.aave-exact-response.v4", ChainID: 42161, RequestID: input.RequestID,
+				SchemaVersion: "phoenix.rpc.aave-exact-response.v5", ChainID: 42161, RequestID: input.RequestID,
 				BlockNumber: uint64(100 + exactCalls - 1), BlockHash: "0x" + strings.Repeat(strconv.Itoa(exactCalls), 64), StateRoot: "0x" + strings.Repeat(strconv.Itoa(exactCalls+2), 64),
 				Primary: primary, Confirmation: nil, Quorum: 1,
 			})
@@ -3623,7 +3647,7 @@ func TestFreshExactQuoteChangeFailsClosedBeforeAuthority(t *testing.T) {
 			}
 			results := make([]simulationBatchResult, 0, len(input.Simulations))
 			for _, simulation := range input.Simulations {
-				results = append(results, simulationBatchResult{RequestID: simulation.RequestID, Response: testSimulationResponse(simulation, "200", "10", "3", "1")})
+				results = append(results, simulationBatchResult{RequestID: simulation.RequestID, Response: testSimulationResponse(simulation, "200", "10", "3", original.FlashPremiumAmount)})
 			}
 			writeTestSimulationBatch(writer, input, results)
 		default:
@@ -3631,7 +3655,9 @@ func TestFreshExactQuoteChangeFailsClosedBeforeAuthority(t *testing.T) {
 		}
 	}))
 	defer server.Close()
-	record, err := economicTestScreener(server).resolveExact(context.Background(), signal{Cursor: 1, Borrower: "0x1111111111111111111111111111111111111111"}, nil)
+	screener := economicTestScreener(server)
+	screener.config.MaximumInputAmountWei = "100000000000000"
+	record, err := screener.resolveExact(context.Background(), signal{Cursor: 1, Borrower: "0x1111111111111111111111111111111111111111"}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -3642,10 +3668,10 @@ func TestFreshExactQuoteChangeFailsClosedBeforeAuthority(t *testing.T) {
 
 func TestBoundedSimulationEconomicsIncludesL1ExactlyOnceAndFailsClosed(t *testing.T) {
 	screener := &Screener{config: Config{MaximumGasLimit: 5, MaximumFeePerGasWei: "10"}}
-	liquidation := &exactLiquidation{FlashPremiumAmount: "1"}
+	liquidation := &exactLiquidation{DebtAsset: wethAddress, DebtAssetDecimals: 18, DebtAssetPriceBase: "1", WETHPriceBase: "1", FlashPremiumAmount: "1"}
 	simulation := &simulationResponse{
-		RealizedProfit: "100", ConservativeNetPnL: "50", EstimatedGasLimit: 5,
-		EstimatedMaxFeePerGasWei: "10", EstimatedExecutionCostWei: "50", EstimatedL1CostWei: "30", FlashPremiumWei: "1",
+		RealizedProfit: "100", RealizedProfitDebtAsset: "100", ConservativeNetPnL: "50", EstimatedGasLimit: 5,
+		EstimatedMaxFeePerGasWei: "10", EstimatedExecutionCostWei: "50", EstimatedL1CostWei: "30", FlashPremiumWei: "1", FlashPremiumDebtAsset: "1",
 	}
 	realized, cost, l1, err := screener.boundedSimulationEconomics(simulation, liquidation)
 	if err != nil {
@@ -3669,10 +3695,10 @@ func TestBoundedSimulationEconomicsIncludesL1ExactlyOnceAndFailsClosed(t *testin
 
 func TestMoneyEquationChargesFlashGasBidAndReserveExactlyOnce(t *testing.T) {
 	screener := &Screener{config: Config{MaximumGasLimit: 5, MaximumFeePerGasWei: "10"}}
-	liquidation := &exactLiquidation{FlashPremiumAmount: "7"}
+	liquidation := &exactLiquidation{DebtAsset: wethAddress, DebtAssetDecimals: 18, DebtAssetPriceBase: "1", WETHPriceBase: "1", FlashPremiumAmount: "7"}
 	direct := &simulationResponse{
-		RealizedProfit: "100", ConservativeNetPnL: "50", EstimatedGasLimit: 5,
-		EstimatedMaxFeePerGasWei: "10", EstimatedExecutionCostWei: "50", EstimatedL1CostWei: "30", FlashPremiumWei: "7",
+		RealizedProfit: "100", RealizedProfitDebtAsset: "100", ConservativeNetPnL: "50", EstimatedGasLimit: 5,
+		EstimatedMaxFeePerGasWei: "10", EstimatedExecutionCostWei: "50", EstimatedL1CostWei: "30", FlashPremiumWei: "7", FlashPremiumDebtAsset: "7",
 	}
 	realized, cost, _, err := screener.boundedSimulationEconomics(direct, liquidation)
 	if err != nil {
@@ -3746,7 +3772,7 @@ func TestAtlasCandidateChargesBidAndMaximumSolverExposureOnce(t *testing.T) {
 		result := testSimulationResponse(input, "1000", "50", "20", "1")
 		result.EvidenceMode = atlasCallbackEvidenceMode
 		_ = json.NewEncoder(writer).Encode(simulationBatchResponse{
-			SchemaVersion: "phoenix.rpc.aave-simulate-batch-response.v3", ChainID: 42161, RequestID: batch.RequestID,
+			SchemaVersion: "phoenix.rpc.aave-simulate-batch-response.v4", ChainID: 42161, RequestID: batch.RequestID,
 			BlockNumber: input.BlockNumber, BlockHash: input.BlockHash, StateRoot: input.StateRoot,
 			PrimaryProviderID: primaryProviderID, ConfirmationProviderID: nil, Quorum: 1, EvidenceMode: atlasCallbackEvidenceMode,
 			Results: []simulationBatchResult{{RequestID: input.RequestID, Response: result}},
@@ -3810,8 +3836,8 @@ func TestAtlasCandidateChargesBidAndMaximumSolverExposureOnce(t *testing.T) {
 }
 
 func TestAuctionWithDirectWrapperEvidencePersistsNoLaneArtifact(t *testing.T) {
-	liquidation := boundedTestLiquidation(wethAddress, 1_000, 5)
-	liquidation.LiquidatorCollateral = "1201"
+	liquidation := boundedTestLiquidation(wethAddress, 100_000_000_000_000, 5)
+	liquidation.LiquidatorCollateral = "100050000000200"
 	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		switch request.URL.Path {
 		case "/v1/aave/exact":
@@ -3821,7 +3847,7 @@ func TestAuctionWithDirectWrapperEvidencePersistsNoLaneArtifact(t *testing.T) {
 			}
 			primary := exactProvider{ProviderID: primaryProviderID, FlashPremiumBPS: 5, Liquidations: []exactLiquidation{liquidation}}
 			_ = json.NewEncoder(writer).Encode(exactResponse{
-				SchemaVersion: "phoenix.rpc.aave-exact-response.v4", ChainID: 42161, RequestID: input.RequestID,
+				SchemaVersion: "phoenix.rpc.aave-exact-response.v5", ChainID: 42161, RequestID: input.RequestID,
 				BlockNumber: 100, BlockHash: "0x" + strings.Repeat("a", 64), StateRoot: "0x" + strings.Repeat("b", 64),
 				Primary: primary, Confirmation: nil, Quorum: 1,
 			})
@@ -3834,7 +3860,7 @@ func TestAuctionWithDirectWrapperEvidencePersistsNoLaneArtifact(t *testing.T) {
 			for _, simulation := range input.Simulations {
 				results = append(results, simulationBatchResult{
 					RequestID: simulation.RequestID,
-					Response:  testSimulationResponse(simulation, "200", "10", "3", "1"),
+					Response:  testSimulationResponse(simulation, "200", "10", "3", liquidation.FlashPremiumAmount),
 				})
 			}
 			writeTestSimulationBatch(writer, input, results)
@@ -3844,6 +3870,7 @@ func TestAuctionWithDirectWrapperEvidencePersistsNoLaneArtifact(t *testing.T) {
 	}))
 	defer server.Close()
 	screener := economicTestScreener(server)
+	screener.config.MaximumInputAmountWei = "100000000000000"
 	record, err := screener.resolveExact(context.Background(), signal{
 		Schema: "phoenix.atlas-aave-hunting-signal.v1", Cursor: 1,
 		Borrower: "0x1111111111111111111111111111111111111111",
@@ -3866,17 +3893,161 @@ func TestAuctionWithDirectWrapperEvidencePersistsNoLaneArtifact(t *testing.T) {
 func boundedTestLiquidation(collateral string, amount int64, premiumBPS uint64) exactLiquidation {
 	repay := strconv.FormatInt(amount, 10)
 	premium := aavePercentMul(big.NewInt(amount), premiumBPS).String()
-	return exactLiquidation{
+	liquidation := exactLiquidation{
 		DebtAsset: wethAddress, CollateralAsset: collateral,
+		DebtAssetDecimals: 18, DebtAssetPriceBase: "200000000000", WETHPriceBase: "200000000000",
+		MaximumRepayAmount: maximumReviewedInputWei, ReviewedSizeWETHWei: repay,
+		DebtAssetReview:      "weth_debt_reviewed",
 		SizeClassification:   fixedReviewedSizeClassification,
 		RequestedRepayAmount: repay, ActualRepayAmount: repay, RepayAmount: repay,
 		FlashPremiumAmount: premium, LiquidatorCollateral: strconv.FormatInt(amount+1, 10),
-		OracleUnwindOutputWETH: strconv.FormatInt(amount+1, 10),
+		OracleUnwindOutputWETH: strconv.FormatInt(amount+1, 10), OracleUnwindOutputDebt: strconv.FormatInt(amount+1, 10),
+	}
+	if collateral == nativeUSDCAddress {
+		liquidation.UnwindQuotes = []exactUnwindQuote{{Pool: wethNativeUSDCPool500Address, Factory: uniswapFactoryAddress, Token0: wethAddress, Token1: nativeUSDCAddress, Fee: 500, ZeroForOne: false, OutputWETH: strconv.FormatInt(amount+1, 10), OutputDebt: strconv.FormatInt(amount+1, 10)}}
+	}
+	return liquidation
+}
+
+func boundedUSDCeWETHLiquidation(outputDebt string) exactLiquidation {
+	const repay = "200000"
+	outputWETH, ok := debtToWETHFloor(outputDebt, &exactLiquidation{
+		DebtAsset: usdcEAddress, DebtAssetDecimals: 6,
+		DebtAssetPriceBase: "100000000", WETHPriceBase: "200000000000",
+	})
+	if !ok {
+		panic("invalid test USDC.e output")
+	}
+	return exactLiquidation{
+		DebtAsset: usdcEAddress, CollateralAsset: wethAddress,
+		DebtAssetDecimals: 6, DebtAssetPriceBase: "100000000", WETHPriceBase: "200000000000",
+		MaximumRepayAmount: "20000000", ReviewedSizeWETHWei: "100000000000000",
+		DebtAssetReview: "usdc_e_debt_reviewed", SizeClassification: fixedReviewedSizeClassification,
+		RequestedRepayAmount: repay, ActualRepayAmount: repay, RepayAmount: repay,
+		FlashPremiumAmount: "100", SeizedCollateral: "110000000000000", ProtocolFeeCollateral: "5000000000000",
+		LiquidatorCollateral: "105000000000000", OracleUnwindOutputWETH: "105000000000000", OracleUnwindOutputDebt: "210000",
 		UnwindQuotes: []exactUnwindQuote{{
-			Pool: "0xc6962004f452be9203591991d15f6b388e09e8d0", Factory: uniswapFactoryAddress,
-			Token0: wethAddress, Token1: nativeUSDCAddress, Fee: 500, ZeroForOne: false,
-			OutputWETH: strconv.FormatInt(amount+1, 10),
+			Pool: wethUSDCePool500Address, Factory: uniswapFactoryAddress,
+			Token0: wethAddress, Token1: usdcEAddress, Fee: 500, ZeroForOne: true,
+			OutputWETH: outputWETH.String(), OutputDebt: outputDebt,
 		}},
+	}
+}
+
+func testUSDCeSimulationResponse(input simulationRequest, realizedDebt, realizedWETH, cost string) *simulationResponse {
+	maximumFee, _ := newBigUint(input.MaxFeePerGas)
+	executionCost, _ := newBigUint(cost)
+	realized, _ := newBigUint(realizedWETH)
+	estimatedGas := new(big.Int).Div(executionCost, maximumFee).Uint64()
+	conservative := new(big.Int).Sub(realized, executionCost)
+	calldata := []byte("usdc-e-bound|" + input.RepayAmount + "|" + input.MinimumProfit)
+	calldataHash := sha256.Sum256(calldata)
+	routeHash := sha256.Sum256([]byte("usdc-e-route|" + input.RepayAmount + "|" + input.MinimumProfit))
+	resultHash := sha256.Sum256([]byte("usdc-e-result|" + input.RepayAmount + "|" + input.MinimumProfit))
+	evidenceMode := directForkEvidenceMode
+	if input.Counterfactual {
+		evidenceMode = counterfactualForkEvidenceMode
+	}
+	return &simulationResponse{
+		SchemaVersion: "phoenix.rpc.aave-simulate-response.v5", ChainID: 42161, RequestID: input.RequestID,
+		BlockNumber: input.BlockNumber, BlockHash: input.BlockHash, StateRoot: input.StateRoot,
+		PrimaryProviderID: primaryProviderID, ConfirmationProviderID: nil, Quorum: 1, EvidenceMode: evidenceMode,
+		RouteID: "0x" + hex.EncodeToString(routeHash[:]), CalldataHex: "0x" + hex.EncodeToString(calldata),
+		CalldataHash: hex.EncodeToString(calldataHash[:]), SimulationResultHash: hex.EncodeToString(resultHash[:]),
+		RealizedProfit: realizedWETH, RealizedProfitDebtAsset: realizedDebt, ConservativeNetPnL: conservative.String(),
+		EstimatedGasLimit: estimatedGas, EstimatedMaxFeePerGasWei: input.MaxFeePerGas,
+		EstimatedExecutionCostWei: cost, EstimatedL1CostWei: "30",
+		FlashPremiumWei: "50000000000", FlashPremiumDebtAsset: "100",
+		DeadlineUnixSeconds: input.DeadlineUnixSeconds,
+	}
+}
+
+func TestUSDCeWETHExactEconomicsAndCandidateAuthorityUseExplicitUnits(t *testing.T) {
+	if reason := exactRouteIneligibleReason([]exactReserve{
+		{Asset: wethAddress, CurrentATokenBalance: "1000000000000000000", CurrentStableDebt: "0", CurrentVariableDebt: "0", UsageAsCollateralEnabled: true},
+		{Asset: usdcEAddress, CurrentStableDebt: "1", CurrentVariableDebt: "200000"},
+	}); reason != "unsupported_stable_usdc_e_debt" {
+		t.Fatalf("stable USDC.e debt diagnostic=%q", reason)
+	}
+
+	for _, test := range []struct {
+		name            string
+		outputDebt      string
+		liveMaximumWETH string
+		wantOutcome     string
+		wantAuthority   bool
+		wantSimulations int
+	}{
+		{name: "negative fully costed", outputDebt: "202000", liveMaximumWETH: "100000000000000", wantOutcome: "economic_rejection"},
+		{name: "counterfactual positive", outputDebt: "204000", liveMaximumWETH: "50000000000000", wantOutcome: "counterfactual_positive", wantSimulations: 3},
+		{name: "live authorized positive", outputDebt: "204000", liveMaximumWETH: "100000000000000", wantOutcome: "candidate", wantAuthority: true, wantSimulations: 3},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			liquidation := boundedUSDCeWETHLiquidation(test.outputDebt)
+			exactCalls := 0
+			simulationCalls := 0
+			server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+				switch request.URL.Path {
+				case "/v1/aave/exact":
+					exactCalls++
+					var input exactRequest
+					if err := json.NewDecoder(request.Body).Decode(&input); err != nil {
+						t.Fatal(err)
+					}
+					primary := exactProvider{ProviderID: primaryProviderID, FlashPremiumBPS: 5, Liquidations: []exactLiquidation{liquidation}}
+					_ = json.NewEncoder(writer).Encode(exactResponse{
+						SchemaVersion: "phoenix.rpc.aave-exact-response.v5", ChainID: 42161, RequestID: input.RequestID,
+						BlockNumber: uint64(100 + exactCalls - 1), BlockHash: "0x" + strings.Repeat(strconv.Itoa(exactCalls), 64), StateRoot: "0x" + strings.Repeat(strconv.Itoa(exactCalls+2), 64),
+						Primary: primary, Confirmation: nil, Quorum: 1,
+					})
+				case "/v1/aave/simulate-batch":
+					var input simulationBatchRequest
+					if err := json.NewDecoder(request.Body).Decode(&input); err != nil {
+						t.Fatal(err)
+					}
+					results := make([]simulationBatchResult, 0, len(input.Simulations))
+					for _, simulation := range input.Simulations {
+						simulationCalls++
+						if simulation.DebtAsset != usdcEAddress || simulation.CollateralAsset != wethAddress || simulation.DebtAssetDecimals != 6 || simulation.LiveMaximumInputWETHWei != test.liveMaximumWETH || simulation.MinimumProfitWETHWei == "" || simulation.Counterfactual != (test.liveMaximumWETH != "100000000000000") {
+							t.Fatalf("USDC.e simulation units drifted: %+v", simulation)
+						}
+						results = append(results, simulationBatchResult{RequestID: simulation.RequestID, Response: testUSDCeSimulationResponse(simulation, "3900", "1950000000000", "100")})
+					}
+					writeTestSimulationBatch(writer, input, results)
+				default:
+					t.Fatalf("unexpected path: %s", request.URL.Path)
+				}
+			}))
+			defer server.Close()
+
+			screener := economicTestScreener(server)
+			screener.config.RetainedProfitFloorWei = "1000000000000"
+			screener.config.MaximumInputAmountWei = test.liveMaximumWETH
+			record, err := screener.resolveExact(context.Background(), signal{Cursor: 1, Borrower: "0x1111111111111111111111111111111111111111"}, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if record.TerminalOutcome != test.wantOutcome || record.Authority != test.wantAuthority || simulationCalls != test.wantSimulations {
+				t.Fatalf("outcome=%s authority=%t exact=%d simulations=%d record=%+v", record.TerminalOutcome, record.Authority, exactCalls, simulationCalls, record)
+			}
+			if !test.wantAuthority {
+				if record.ExecutionCandidate != nil || record.AtlasCandidate != nil {
+					t.Fatalf("non-authoritative USDC.e outcome emitted money artifact: %+v", record)
+				}
+				return
+			}
+			candidate := record.ExecutionCandidate
+			if candidate == nil || candidate.FlashAsset != usdcEAddress || candidate.FlashAmount != "200000" || candidate.MaximumInputAmount != "200000" || candidate.MinimumProfit != "2001" || candidate.ExpectedProfit != "1950000000000" || candidate.RoutePayload.MaximumInputWETHWei != "100000000000000" || candidate.RoutePayload.MinimumProfitWETHWei != "1000000000101" || candidate.TokenPath[0] != wethAddress || candidate.TokenPath[1] != usdcEAddress || len(candidate.Legs) != 1 || candidate.Legs[0].TokenOut != usdcEAddress || candidate.Legs[0].Pool != wethUSDCePool500Address {
+				t.Fatalf("USDC.e Candidate unit/route binding drifted: %+v", candidate)
+			}
+		})
+	}
+
+	screener := &Screener{config: Config{MaximumGasLimit: 10, MaximumFeePerGasWei: "10"}}
+	liquidation := boundedUSDCeWETHLiquidation("204000")
+	mutated := testUSDCeSimulationResponse(simulationRequest{MaxFeePerGas: "10"}, "3900", "1950000000001", "100")
+	if _, _, _, err := screener.boundedSimulationEconomics(mutated, &liquidation); err == nil {
+		t.Fatal("raw USDC.e profit was accepted with mismatched canonical WETH economics")
 	}
 }
 
@@ -3910,14 +4081,15 @@ func testSimulationResponse(input simulationRequest, realizedText, costText, l1T
 	routeHash := sha256.Sum256([]byte("route|" + input.RepayAmount + "|" + input.MinimumProfit + "|" + input.AtlasBid))
 	resultHash := sha256.Sum256([]byte("result|" + input.RepayAmount + "|" + input.MinimumProfit + "|" + input.AtlasBid))
 	return &simulationResponse{
-		SchemaVersion: "phoenix.rpc.aave-simulate-response.v4", ChainID: 42161, RequestID: input.RequestID,
+		SchemaVersion: "phoenix.rpc.aave-simulate-response.v5", ChainID: 42161, RequestID: input.RequestID,
 		BlockNumber: input.BlockNumber, BlockHash: input.BlockHash, StateRoot: input.StateRoot,
 		PrimaryProviderID: primaryProviderID, ConfirmationProviderID: nil, Quorum: 1, EvidenceMode: testEvidenceMode(input),
 		RouteID: "0x" + hex.EncodeToString(routeHash[:]), CalldataHex: "0x" + hex.EncodeToString(calldata),
 		CalldataHash: hex.EncodeToString(calldataHash[:]), SimulationResultHash: hex.EncodeToString(resultHash[:]),
-		RealizedProfit: realizedText, ConservativeNetPnL: conservative.String(), EstimatedGasLimit: estimatedGas.Uint64(),
+		RealizedProfit: realizedText, RealizedProfitDebtAsset: realizedText, ConservativeNetPnL: conservative.String(), EstimatedGasLimit: estimatedGas.Uint64(),
 		EstimatedMaxFeePerGasWei: input.MaxFeePerGas, EstimatedExecutionCostWei: costText, EstimatedL1CostWei: l1Text, FlashPremiumWei: flashText,
-		DeadlineUnixSeconds: input.DeadlineUnixSeconds,
+		FlashPremiumDebtAsset: flashText,
+		DeadlineUnixSeconds:   input.DeadlineUnixSeconds,
 	}
 }
 
@@ -3931,7 +4103,7 @@ func testEvidenceMode(input simulationRequest) string {
 func writeTestSimulationBatch(writer http.ResponseWriter, input simulationBatchRequest, results []simulationBatchResult) {
 	first := input.Simulations[0]
 	_ = json.NewEncoder(writer).Encode(simulationBatchResponse{
-		SchemaVersion: "phoenix.rpc.aave-simulate-batch-response.v3", ChainID: 42161, RequestID: input.RequestID,
+		SchemaVersion: "phoenix.rpc.aave-simulate-batch-response.v4", ChainID: 42161, RequestID: input.RequestID,
 		BlockNumber: first.BlockNumber, BlockHash: first.BlockHash, StateRoot: first.StateRoot,
 		PrimaryProviderID: primaryProviderID, ConfirmationProviderID: nil, Quorum: 1, EvidenceMode: directForkEvidenceMode,
 		Results: results,
@@ -4014,13 +4186,13 @@ func TestRouteAwareExactBudgetLearnsPairIneligibility(t *testing.T) {
 
 	noWETHDebt := append([]exactReserve(nil), eligible...)
 	noWETHDebt[0].CurrentVariableDebt = "0"
-	if got := exactRouteIneligibleReason(noWETHDebt); got != "no_weth_debt" {
+	if got := exactRouteIneligibleReason(noWETHDebt); got != "no_supported_debt_asset" {
 		t.Fatalf("unexpected no-WETH-debt diagnostic: %q", got)
 	}
 
 	noUSDC := append([]exactReserve(nil), eligible...)
 	noUSDC[1].CurrentATokenBalance = "0"
-	if got := exactRouteIneligibleReason(noUSDC); got != "no_supported_collateral" {
+	if got := exactRouteIneligibleReason(noUSDC); got != "no_reviewed_unwind_route" {
 		t.Fatalf("unexpected no-USDC-collateral diagnostic: %q", got)
 	}
 
@@ -4081,7 +4253,7 @@ func TestStableDebtIsBorrowerScopedAndDoesNotAbortScreenBatch(t *testing.T) {
 				{Asset: nativeUSDCAddress, CurrentATokenBalance: "1000", UsageAsCollateralEnabled: true},
 			}}
 			_ = json.NewEncoder(writer).Encode(exactResponse{
-				SchemaVersion: "phoenix.rpc.aave-exact-response.v4", ChainID: 42161, RequestID: input.RequestID,
+				SchemaVersion: "phoenix.rpc.aave-exact-response.v5", ChainID: 42161, RequestID: input.RequestID,
 				BlockNumber: 100, BlockHash: "0x" + strings.Repeat("a", 64), StateRoot: "0x" + strings.Repeat("b", 64),
 				Primary: primary, Confirmation: nil, Quorum: 1,
 			})
@@ -4113,8 +4285,8 @@ func TestCollateralRouteIneligibilityExpiresAndSupportedExactClearsIt(t *testing
 	borrower := "0x1111111111111111111111111111111111111111"
 	now := time.Date(2026, 8, 9, 0, 0, 0, 0, time.UTC)
 	exactCalls := 0
-	liquidation := boundedTestLiquidation(wethAddress, 1_000, 5)
-	liquidation.LiquidatorCollateral = "1200"
+	liquidation := boundedTestLiquidation(wethAddress, 100_000_000_000_000, 5)
+	liquidation.LiquidatorCollateral = "100050000000200"
 	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		switch request.URL.Path {
 		case "/v1/aave/screen":
@@ -4132,7 +4304,7 @@ func TestCollateralRouteIneligibilityExpiresAndSupportedExactClearsIt(t *testing
 				t.Fatal(err)
 			}
 			primary := exactProvider{ProviderID: primaryProviderID, FlashPremiumBPS: 5, Liquidations: []exactLiquidation{liquidation}}
-			_ = json.NewEncoder(writer).Encode(exactResponse{SchemaVersion: "phoenix.rpc.aave-exact-response.v4", ChainID: 42161, RequestID: input.RequestID, BlockNumber: 100, BlockHash: "0x" + strings.Repeat("a", 64), StateRoot: "0x" + strings.Repeat("b", 64), Primary: primary, Confirmation: nil, Quorum: 1})
+			_ = json.NewEncoder(writer).Encode(exactResponse{SchemaVersion: "phoenix.rpc.aave-exact-response.v5", ChainID: 42161, RequestID: input.RequestID, BlockNumber: 100, BlockHash: "0x" + strings.Repeat("a", 64), StateRoot: "0x" + strings.Repeat("b", 64), Primary: primary, Confirmation: nil, Quorum: 1})
 		case "/v1/aave/simulate-batch":
 			var input simulationBatchRequest
 			if err := json.NewDecoder(request.Body).Decode(&input); err != nil {
@@ -4149,6 +4321,7 @@ func TestCollateralRouteIneligibilityExpiresAndSupportedExactClearsIt(t *testing
 	}))
 	defer server.Close()
 	screener := economicTestScreener(server)
+	screener.config.MaximumInputAmountWei = "100000000000000"
 	screener.config.StateDir = t.TempDir()
 	screener.now = func() time.Time { return now }
 	screener.debtBearing = make(map[string]bool)
@@ -4349,7 +4522,7 @@ func TestRouteIneligibleStatePersistsAndTailInvalidatesDurably(t *testing.T) {
 			_ = json.NewDecoder(request.Body).Decode(&input)
 			primary := exactProvider{ProviderID: primaryProviderID}
 			_ = json.NewEncoder(writer).Encode(exactResponse{
-				SchemaVersion: "phoenix.rpc.aave-exact-response.v4", ChainID: 42161,
+				SchemaVersion: "phoenix.rpc.aave-exact-response.v5", ChainID: 42161,
 				RequestID: input.RequestID, BlockNumber: 99,
 				BlockHash: "0x" + strings.Repeat("e", 64), StateRoot: "0x" + strings.Repeat("f", 64),
 				Primary: primary, Confirmation: nil, Quorum: 1,

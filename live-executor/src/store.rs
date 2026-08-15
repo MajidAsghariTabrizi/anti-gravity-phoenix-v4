@@ -295,7 +295,8 @@ impl ExecutorStore for PostgresExecutorStore {
                      AND r.selected_size = $3::numeric)
                     OR
                     (r.route_type = 'AAVE_LIQUIDATION_V1' AND $6 AND NOT $7
-                     AND r.selected_size <= $8::numeric
+                     AND r.selected_size <= r.maximum_input_amount
+                     AND (r.route_payload->>'maximum_input_weth_wei')::numeric = $8::numeric
                      AND r.created_at >= $9)
                  )
              ORDER BY r.approved_at, r.id
@@ -673,7 +674,7 @@ impl ExecutorStore for PostgresExecutorStore {
         }
         if let Some(outcome) = receipt_outcome {
             let fee = i128::try_from(outcome.actual_fee_wei).map_err(|_| StoreError::Invariant)?;
-            let realized_profit = i128::try_from(outcome.settlement.realized_profit)
+            let realized_profit = i128::try_from(outcome.canonical_realized_profit_wei)
                 .map_err(|_| StoreError::Invariant)?;
             let valid_receipt_state = match status {
                 AttemptStatus::Confirmed => {
@@ -686,6 +687,7 @@ impl ExecutorStore for PostgresExecutorStore {
                         && !outcome.settled_event_found
                         && outcome.settlement.premium == 0
                         && outcome.settlement.realized_profit == 0
+                        && outcome.canonical_realized_profit_wei == 0
                         && fee.checked_neg() == Some(outcome.net_pnl_wei)
                 }
                 _ => false,
@@ -1270,7 +1272,7 @@ async fn insert_autonomous_outcome(
         .try_get("candidate_created_at")
         .map_err(StoreError::from)?;
     let realized_gross_profit =
-        i128::try_from(outcome.settlement.realized_profit).map_err(|_| StoreError::Data)?;
+        i128::try_from(outcome.canonical_realized_profit_wei).map_err(|_| StoreError::Data)?;
     let actual_l1_cost = outcome.actual_l1_cost_wei.min(outcome.actual_fee_wei);
     let actual_gas_cost = outcome
         .actual_fee_wei

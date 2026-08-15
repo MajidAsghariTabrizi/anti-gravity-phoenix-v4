@@ -18,6 +18,9 @@ pub mod store;
 pub const ARBITRUM_ONE_CHAIN_ID: u64 = 42_161;
 pub const ARBITRUM_WETH_ADDRESS: &str = "0x82af49447d8a07e3bd95bd0d56f35241523fbab1";
 pub const ARBITRUM_NATIVE_USDC_ADDRESS: &str = "0xaf88d065e77c8cc2239327c5edb3a432268e5831";
+pub const ARBITRUM_USDC_E_ADDRESS: &str = "0xff970a61a04b1ca14834a43f5de4533ebddb5cc8";
+pub const REVIEWED_WETH_USDC_E_POOL_500_ADDRESS: &str =
+    "0xc31e54c7a869b9fcbecc14363cf510d1c41fa443";
 pub const ARBITRUM_UNISWAP_V3_FACTORY_ADDRESS: &str = "0x1f98431c8ad98523631ae4a59f267346ea31f984";
 pub const CURRENT_ROUTE_FINGERPRINT: &str = "arbitrum-weth-usdc-uniswap-v3-500-3000-v1";
 pub const REVERSE_ROUTE_FINGERPRINT: &str = "arbitrum-weth-usdc-uniswap-v3-3000-500-v1";

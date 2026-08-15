@@ -606,8 +606,16 @@ func candidateMatchesCurrentAuthority(record signal, currentMaximum string) bool
 	}
 	if record.ExecutionCandidate != nil {
 		selected, selectedOK := newBigUint(record.ExecutionCandidate.SelectedSize)
-		if !selectedOK || selected.Sign() <= 0 || selected.Cmp(maximum) > 0 ||
-			record.ExecutionCandidate.MaximumInputAmount != currentMaximum {
+		candidateMaximum, candidateMaximumOK := newBigUint(record.ExecutionCandidate.MaximumInputAmount)
+		derivedMaximum, derivedOK := wethToDebtFloor(currentMaximum, &exactLiquidation{
+			DebtAsset:          record.ExecutionCandidate.RoutePayload.DebtAsset,
+			DebtAssetDecimals:  record.ExecutionCandidate.RoutePayload.DebtAssetDecimals,
+			DebtAssetPriceBase: record.ExecutionCandidate.RoutePayload.DebtAssetPriceBase,
+			WETHPriceBase:      record.ExecutionCandidate.RoutePayload.WETHPriceBase,
+		})
+		if !selectedOK || !candidateMaximumOK || !derivedOK || selected.Sign() <= 0 ||
+			selected.Cmp(candidateMaximum) > 0 || candidateMaximum.Cmp(derivedMaximum) != 0 ||
+			record.ExecutionCandidate.RoutePayload.MaximumInputWETHWei != currentMaximum {
 			return false
 		}
 	}

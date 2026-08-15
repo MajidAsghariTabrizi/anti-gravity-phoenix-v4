@@ -2,8 +2,8 @@ use crate::aave::AaveLiquidationRequest;
 use crate::abi::{decode_settlement, encode_execute_opportunity, AbiError};
 use crate::config::ExecutorConfig;
 use crate::model::{
-    ActiveAttempt, AttemptStatus, ExecutionRequest, ExecutionRouteType, ReceiptOutcome, Settlement,
-    TransactionHash,
+    AaveLiquidationRoute, ActiveAttempt, AttemptStatus, ExecutionRequest, ExecutionRouteType,
+    ReceiptOutcome, Settlement, TransactionHash,
 };
 use crate::rpc::{ExecutionRpc, RpcError, RpcErrorKind, TransactionReceipt};
 use crate::signer::{SignerError, TransactionDraft, TransactionSigner};
@@ -459,11 +459,12 @@ where
                 actual_fee_wei,
                 actual_l1_cost_wei: receipt.l1_fee,
                 settlement: Settlement {
-                    asset: self.config.pnl_asset_address,
+                    asset: request.flash_asset,
                     flash_amount: request.flash_amount,
                     premium: 0,
                     realized_profit: 0,
                 },
+                canonical_realized_profit_wei: 0,
                 net_pnl_wei: fee.checked_neg().ok_or(EngineError::Arithmetic)?,
             };
             self.store
@@ -502,8 +503,12 @@ where
                     });
                 }
             };
+        let canonical_realized_profit = canonical_realized_profit_wei(
+            request.aave_liquidation.as_ref(),
+            settlement.realized_profit,
+        )?;
         let realized_profit =
-            i128::try_from(settlement.realized_profit).map_err(|_| EngineError::Arithmetic)?;
+            i128::try_from(canonical_realized_profit).map_err(|_| EngineError::Arithmetic)?;
         let outcome = ReceiptOutcome {
             receipt_status: 1,
             settled_event_found: true,
@@ -513,6 +518,7 @@ where
             actual_fee_wei,
             actual_l1_cost_wei: receipt.l1_fee,
             settlement,
+            canonical_realized_profit_wei: canonical_realized_profit,
             net_pnl_wei: realized_profit
                 .checked_sub(fee)
                 .ok_or(EngineError::Arithmetic)?,
@@ -599,9 +605,22 @@ fn execution_deadline_is_fresh(
     deadline > now + ChronoDuration::seconds(inclusion_margin_seconds)
 }
 
+fn canonical_realized_profit_wei(
+    route: Option<&AaveLiquidationRoute>,
+    realized_profit_raw: u128,
+) -> Result<u128, EngineError> {
+    route.map_or(Ok(realized_profit_raw), |route| {
+        route
+            .debt_to_weth_floor(realized_profit_raw)
+            .map_err(|_| EngineError::Arithmetic)
+    })
+}
+
 #[cfg(test)]
 mod deadline_tests {
-    use super::execution_deadline_is_fresh;
+    use super::{canonical_realized_profit_wei, execution_deadline_is_fresh};
+    use crate::model::CanonicalAddress;
+    use crate::{model::AaveLiquidationRoute, ARBITRUM_USDC_E_ADDRESS, ARBITRUM_WETH_ADDRESS};
     use chrono::{Duration as ChronoDuration, TimeZone, Utc};
 
     #[test]
@@ -634,6 +653,33 @@ mod deadline_tests {
             now,
             0,
         ));
+    }
+
+    #[test]
+    fn usdc_e_settlement_profit_is_normalized_to_canonical_weth() {
+        let route = AaveLiquidationRoute {
+            borrower: CanonicalAddress::parse("0x1111111111111111111111111111111111111111")
+                .unwrap(),
+            debt_asset: CanonicalAddress::parse(ARBITRUM_USDC_E_ADDRESS).unwrap(),
+            collateral_asset: CanonicalAddress::parse(ARBITRUM_WETH_ADDRESS).unwrap(),
+            debt_asset_decimals: 6,
+            debt_asset_price_base: 100_000_000,
+            weth_price_base: 200_000_000_000,
+            maximum_input_weth_wei: 10_000_000_000_000_000,
+            minimum_profit_weth_wei: 1_000_000_000_000,
+            receive_a_token: false,
+            minimum_collateral_received: 1,
+            minimum_unwind_output: 1,
+            maximum_atlas_bid: 1,
+            evidence_mode: "DIRECT_FORK_VERIFIED".to_string(),
+            state_root: format!("0x{}", "1".repeat(64)),
+            release_sha: "2".repeat(40),
+        };
+        assert_eq!(
+            canonical_realized_profit_wei(Some(&route), 3_900).unwrap(),
+            1_950_000_000_000
+        );
+        assert_eq!(canonical_realized_profit_wei(None, 3_900).unwrap(), 3_900);
     }
 }
 
@@ -668,12 +714,7 @@ fn validate_and_encode(
     {
         return Err(PolicyError::ExecutorIdentity);
     }
-    if request.flash_asset != config.pnl_asset_address {
-        return Err(PolicyError::ProfitAsset);
-    }
-    if request.flash_amount > request.maximum_input_amount
-        || request.maximum_input_amount > config.limits.maximum_input_amount
-    {
+    if request.flash_amount > request.maximum_input_amount {
         return Err(PolicyError::InputCap);
     }
     if request.gas_limit > config.limits.maximum_gas_limit
@@ -683,11 +724,37 @@ fn validate_and_encode(
     {
         return Err(PolicyError::GasCap);
     }
-    if request.minimum_profit < config.limits.minimum_expected_profit
-        || request.expected_profit < config.limits.minimum_expected_profit
-        || request.expected_profit < request.minimum_profit
-    {
-        return Err(PolicyError::ProfitFloor);
+    if let Some(route) = request.aave_liquidation.as_ref() {
+        if route.maximum_input_weth_wei > config.limits.maximum_input_amount
+            || request.maximum_input_amount
+                != route
+                    .weth_to_debt_floor(route.maximum_input_weth_wei)
+                    .map_err(|_| PolicyError::InputCap)?
+        {
+            return Err(PolicyError::InputCap);
+        }
+        if route.minimum_profit_weth_wei < config.limits.minimum_expected_profit
+            || request.minimum_profit
+                != route
+                    .weth_to_debt_ceil(route.minimum_profit_weth_wei)
+                    .map_err(|_| PolicyError::ProfitFloor)?
+            || request.expected_profit < route.minimum_profit_weth_wei
+        {
+            return Err(PolicyError::ProfitFloor);
+        }
+    } else {
+        if request.flash_asset != config.pnl_asset_address {
+            return Err(PolicyError::ProfitAsset);
+        }
+        if request.maximum_input_amount > config.limits.maximum_input_amount {
+            return Err(PolicyError::InputCap);
+        }
+        if request.minimum_profit < config.limits.minimum_expected_profit
+            || request.expected_profit < config.limits.minimum_expected_profit
+            || request.expected_profit < request.minimum_profit
+        {
+            return Err(PolicyError::ProfitFloor);
+        }
     }
     let worst_case_fee = u128::from(request.gas_limit)
         .checked_mul(request.max_fee_per_gas)

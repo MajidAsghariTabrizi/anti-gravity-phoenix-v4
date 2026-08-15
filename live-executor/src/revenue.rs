@@ -930,7 +930,13 @@ fn reviewed_atlas_aave_legs(
     let reviewed_route = reviewed_aave_unwind_routes()
         .map_err(|_| RevenueError::Data)?
         .into_iter()
-        .find(|route| route.fee == leg.fee)
+        .find(|route| {
+            route.fee == leg.fee
+                && ((route.token0 == ARBITRUM_WETH_ADDRESS
+                    && route.token1 == ARBITRUM_NATIVE_USDC_ADDRESS)
+                    || (route.token1 == ARBITRUM_WETH_ADDRESS
+                        && route.token0 == ARBITRUM_NATIVE_USDC_ADDRESS))
+        })
         .ok_or(RevenueError::Data)?;
     let expected_pool =
         CanonicalAddress::parse(&reviewed_route.pool).map_err(|_| RevenueError::Data)?;
@@ -1451,7 +1457,14 @@ mod tests {
 
     #[test]
     fn aave_atlas_acceptance_binds_exact_reviewed_collateral_route() {
-        let reviewed = reviewed_aave_unwind_routes().expect("reviewed Aave routes");
+        let reviewed = reviewed_aave_unwind_routes()
+            .expect("reviewed Aave routes")
+            .into_iter()
+            .filter(|route| {
+                route.token0 == ARBITRUM_WETH_ADDRESS
+                    && route.token1 == ARBITRUM_NATIVE_USDC_ADDRESS
+            })
+            .collect::<Vec<_>>();
         assert_eq!(reviewed.len(), 3);
         for route in &reviewed {
             let request = atlas_native_usdc_request(route.fee, &route.pool);

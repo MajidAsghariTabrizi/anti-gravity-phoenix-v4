@@ -114,6 +114,11 @@ const (
 	aavePoolAddress                  = "0x794a61358d6845594f94dc1db02a252b5b4814ad"
 	wethAddress                      = "0x82af49447d8a07e3bd95bd0d56f35241523fbab1"
 	nativeUSDCAddress                = "0xaf88d065e77c8cc2239327c5edb3a432268e5831"
+	usdcEAddress                     = "0xff970a61a04b1ca14834a43f5de4533ebddb5cc8"
+	wethNativeUSDCPool100Address     = "0x6f38e884725a116c9c7fbf208e79fe8828a2595f"
+	wethNativeUSDCPool500Address     = "0xc6962004f452be9203591991d15f6b388e09e8d0"
+	wethNativeUSDCPool3000Address    = "0xc473e2aee3441bf9240be85eb122abb059a3b57c"
+	wethUSDCePool500Address          = "0xc31e54c7a869b9fcbecc14363cf510d1c41fa443"
 	zeroAddress                      = "0x0000000000000000000000000000000000000000"
 	uniswapFactoryAddress            = "0x1f98431c8ad98523631ae4a59f267346ea31f984"
 )
@@ -422,6 +427,12 @@ type borrowerActivity struct {
 type exactLiquidation struct {
 	DebtAsset              string             `json:"debt_asset"`
 	CollateralAsset        string             `json:"collateral_asset"`
+	DebtAssetDecimals      uint8              `json:"debt_asset_decimals"`
+	DebtAssetPriceBase     string             `json:"debt_asset_price_base"`
+	WETHPriceBase          string             `json:"weth_price_base"`
+	MaximumRepayAmount     string             `json:"maximum_repay_amount"`
+	ReviewedSizeWETHWei    string             `json:"reviewed_size_weth_wei"`
+	DebtAssetReview        string             `json:"debt_asset_review"`
 	SizeClassification     string             `json:"size_classification"`
 	TerminalSizeReason     string             `json:"terminal_size_reason"`
 	RequestedRepayAmount   string             `json:"requested_repay_amount"`
@@ -432,6 +443,7 @@ type exactLiquidation struct {
 	ProtocolFeeCollateral  string             `json:"protocol_fee_collateral"`
 	LiquidatorCollateral   string             `json:"liquidator_collateral"`
 	OracleUnwindOutputWETH string             `json:"oracle_unwind_output_weth"`
+	OracleUnwindOutputDebt string             `json:"oracle_unwind_output_debt_asset"`
 	UnwindQuotes           []exactUnwindQuote `json:"unwind_quotes"`
 }
 
@@ -443,6 +455,7 @@ type exactUnwindQuote struct {
 	Fee        uint32 `json:"fee"`
 	ZeroForOne bool   `json:"zero_for_one"`
 	OutputWETH string `json:"output_weth"`
+	OutputDebt string `json:"output_debt_asset"`
 }
 
 type exactReserve struct {
@@ -527,6 +540,9 @@ type signal struct {
 
 type sizeDiagnostic struct {
 	ReviewedSize             string `json:"reviewed_size"`
+	DebtAsset                string `json:"debt_asset"`
+	CollateralAsset          string `json:"collateral_asset"`
+	DebtAssetReview          string `json:"debt_asset_review"`
 	SizeClassification       string `json:"size_classification"`
 	TerminalSizeReason       string `json:"terminal_size_reason,omitempty"`
 	TerminalSizeUnprofitable bool   `json:"terminal_size_unprofitable"`
@@ -629,13 +645,19 @@ type simulationRequest struct {
 	Borrower                  string `json:"borrower"`
 	DebtAsset                 string `json:"debt_asset"`
 	CollateralAsset           string `json:"collateral_asset"`
+	DebtAssetDecimals         uint8  `json:"debt_asset_decimals"`
+	DebtAssetPriceBase        string `json:"debt_asset_price_base"`
+	WETHPriceBase             string `json:"weth_price_base"`
 	RepayAmount               string `json:"repay_amount"`
 	MaximumInputAmount        string `json:"maximum_input_amount"`
 	LiveMaximumInputAmount    string `json:"live_maximum_input_amount"`
+	MaximumInputWETHWei       string `json:"maximum_input_weth_wei"`
+	LiveMaximumInputWETHWei   string `json:"live_maximum_input_weth_wei"`
 	Counterfactual            bool   `json:"counterfactual"`
 	MinimumCollateralReceived string `json:"minimum_collateral_received"`
 	MinimumUnwindOutput       string `json:"minimum_unwind_output"`
 	MinimumProfit             string `json:"minimum_profit"`
+	MinimumProfitWETHWei      string `json:"minimum_profit_weth_wei"`
 	ExpectedProfit            string `json:"expected_profit"`
 	RetainedProfitFloor       string `json:"retained_profit_floor"`
 	SelectedPool              string `json:"selected_pool"`
@@ -667,12 +689,14 @@ type simulationResponse struct {
 	CalldataHash              string  `json:"calldata_hash"`
 	SimulationResultHash      string  `json:"simulation_result_hash"`
 	RealizedProfit            string  `json:"realized_profit"`
+	RealizedProfitDebtAsset   string  `json:"realized_profit_debt_asset"`
 	ConservativeNetPnL        string  `json:"conservative_net_pnl"`
 	EstimatedGasLimit         uint64  `json:"estimated_gas_limit"`
 	EstimatedMaxFeePerGasWei  string  `json:"estimated_max_fee_per_gas_wei"`
 	EstimatedExecutionCostWei string  `json:"estimated_execution_cost_wei"`
 	EstimatedL1CostWei        string  `json:"estimated_l1_cost_wei"`
 	FlashPremiumWei           string  `json:"flash_premium_wei"`
+	FlashPremiumDebtAsset     string  `json:"flash_premium_debt_asset"`
 	DeadlineUnixSeconds       uint64  `json:"deadline_unix_seconds"`
 }
 
@@ -722,26 +746,31 @@ type executionLeg struct {
 type liquidationRoute struct {
 	Name         string
 	Output       *big.Int
+	OutputDebt   *big.Int
 	SelectedPool string
 	Factory      string
 	SelectedFee  uint32
 	ZeroForOne   bool
 	TokenPath    []string
+	TokenIn      string
+	TokenOut     string
 }
 
 type liquidationEvaluation struct {
-	Liquidation       *exactLiquidation
-	Route             liquidationRoute
-	Simulation        *simulationResponse
-	Expected          *big.Int
-	Conservative      *big.Int
-	RiskReserve       *big.Int
-	ExecutionCost     *big.Int
-	EstimatedL1Cost   *big.Int
-	MinimumCollateral string
-	MinimumUnwind     string
-	MinimumProfit     string
-	LiveMaximumInput  string
+	Liquidation          *exactLiquidation
+	Route                liquidationRoute
+	Simulation           *simulationResponse
+	Expected             *big.Int
+	Conservative         *big.Int
+	RiskReserve          *big.Int
+	ExecutionCost        *big.Int
+	EstimatedL1Cost      *big.Int
+	MinimumCollateral    string
+	MinimumUnwind        string
+	MinimumProfit        string
+	MinimumProfitWETH    string
+	LiveMaximumInput     string
+	LiveMaximumInputWETH string
 }
 
 type liquidationProbe struct {
@@ -755,6 +784,11 @@ type aaveRoutePayload struct {
 	Borrower                  string `json:"borrower"`
 	DebtAsset                 string `json:"debt_asset"`
 	CollateralAsset           string `json:"collateral_asset"`
+	DebtAssetDecimals         uint8  `json:"debt_asset_decimals"`
+	DebtAssetPriceBase        string `json:"debt_asset_price_base"`
+	WETHPriceBase             string `json:"weth_price_base"`
+	MaximumInputWETHWei       string `json:"maximum_input_weth_wei"`
+	MinimumProfitWETHWei      string `json:"minimum_profit_weth_wei"`
 	ReceiveAToken             bool   `json:"receive_a_token"`
 	MinimumCollateralReceived string `json:"minimum_collateral_received"`
 	MinimumUnwindOutput       string `json:"minimum_unwind_output"`
@@ -2603,10 +2637,12 @@ func (s *Screener) screen(ctx context.Context, borrowers []string, advanceSeed b
 }
 
 func exactRouteIneligibleReason(reserves []exactReserve) string {
-	var wethDebt *big.Int
+	var wethDebt, usdcEDebt *big.Int
 	stableWETHDebt := false
-	hasSupportedCollateral := false
-	hasEnabledSupportedCollateral := false
+	stableUSDCeDebt := false
+	var wethCollateral, nativeUSDCCollateral *big.Int
+	wethCollateralEnabled := false
+	nativeUSDCCollateralEnabled := false
 
 	for _, reserve := range reserves {
 		switch strings.ToLower(reserve.Asset) {
@@ -2619,32 +2655,45 @@ func exactRouteIneligibleReason(reserves []exactReserve) string {
 			}
 			stableWETHDebt = stable.Sign() > 0
 			wethDebt = variable
-			if balance.Sign() > 0 {
-				hasSupportedCollateral = true
-				hasEnabledSupportedCollateral = hasEnabledSupportedCollateral || reserve.UsageAsCollateralEnabled
-			}
+			wethCollateral = balance
+			wethCollateralEnabled = balance.Sign() > 0 && reserve.UsageAsCollateralEnabled
 		case nativeUSDCAddress:
 			balance, balanceOK := newBigUint(reserve.CurrentATokenBalance)
 			if !balanceOK {
 				return ""
 			}
-			if balance.Sign() > 0 {
-				hasSupportedCollateral = true
-				hasEnabledSupportedCollateral = hasEnabledSupportedCollateral || reserve.UsageAsCollateralEnabled
+			nativeUSDCCollateral = balance
+			nativeUSDCCollateralEnabled = balance.Sign() > 0 && reserve.UsageAsCollateralEnabled
+		case usdcEAddress:
+			stable, stableOK := newBigUint(reserve.CurrentStableDebt)
+			variable, variableOK := newBigUint(reserve.CurrentVariableDebt)
+			if !stableOK || !variableOK {
+				return ""
 			}
+			stableUSDCeDebt = stable.Sign() > 0
+			usdcEDebt = variable
 		}
 	}
 
 	if stableWETHDebt {
 		return "unsupported_stable_weth_debt"
 	}
-	if wethDebt == nil || wethDebt.Sign() == 0 {
-		return "no_weth_debt"
+	if stableUSDCeDebt {
+		return "unsupported_stable_usdc_e_debt"
 	}
-	if !hasSupportedCollateral {
-		return "no_supported_collateral"
+	wethDebtReviewed := wethDebt != nil && wethDebt.Sign() > 0 &&
+		((wethCollateral != nil && wethCollateral.Sign() > 0) ||
+			(nativeUSDCCollateral != nil && nativeUSDCCollateral.Sign() > 0))
+	usdcEDebtReviewed := usdcEDebt != nil && usdcEDebt.Sign() > 0 &&
+		wethCollateral != nil && wethCollateral.Sign() > 0
+	if !wethDebtReviewed && !usdcEDebtReviewed {
+		if (wethDebt != nil && wethDebt.Sign() > 0) || (usdcEDebt != nil && usdcEDebt.Sign() > 0) {
+			return "no_reviewed_unwind_route"
+		}
+		return "no_supported_debt_asset"
 	}
-	if !hasEnabledSupportedCollateral {
+	if wethDebtReviewed && !wethCollateralEnabled && !nativeUSDCCollateralEnabled ||
+		usdcEDebtReviewed && !wethCollateralEnabled {
 		return "supported_collateral_disabled"
 	}
 	return ""
@@ -2681,7 +2730,7 @@ func (s *Screener) resolveExact(ctx context.Context, record signal, auction *obs
 	if err := json.NewDecoder(io.LimitReader(response.Body, maximumResponse)).Decode(&result); err != nil {
 		return record, err
 	}
-	if result.SchemaVersion != "phoenix.rpc.aave-exact-response.v4" || result.ChainID != 42161 || result.RequestID != requestID || result.BlockNumber == 0 || result.BlockHash == "" || result.StateRoot == "" || result.Primary.ProviderID != primaryProviderID || result.Confirmation != nil || result.Quorum != 1 {
+	if result.SchemaVersion != "phoenix.rpc.aave-exact-response.v5" || result.ChainID != 42161 || result.RequestID != requestID || result.BlockNumber == 0 || result.BlockHash == "" || result.StateRoot == "" || result.Primary.ProviderID != primaryProviderID || result.Confirmation != nil || result.Quorum != 1 {
 		return record, errors.New("exact Aave provider evidence is incomplete")
 	}
 	if tracker := exactTrackerFromContext(ctx); tracker != nil {
@@ -2733,9 +2782,9 @@ func (s *Screener) resolveExact(ctx context.Context, record signal, auction *obs
 	record.RiskReserveAmountWei = selected.RiskReserve.String()
 	record.ExecutionCostWei = selected.ExecutionCost.String()
 	record.EstimatedL1CostWei = selected.EstimatedL1Cost.String()
-	record.FlashPremiumWei = selected.Liquidation.FlashPremiumAmount
+	record.FlashPremiumWei = selected.Simulation.FlashPremiumWei
 	selectedRepay, selectedRepayOK := newBigUint(selected.Liquidation.RepayAmount)
-	liveMaximum, liveMaximumOK := newBigUint(liveMaximumInput)
+	liveMaximum, liveMaximumOK := newBigUint(selected.LiveMaximumInput)
 	if !selectedRepayOK || !liveMaximumOK {
 		return record, errors.New("selected liquidation size authority is invalid")
 	}
@@ -2758,7 +2807,7 @@ func (s *Screener) resolveExact(ctx context.Context, record signal, auction *obs
 	if selected.Simulation.EvidenceMode != directForkEvidenceMode {
 		return record, errors.New("live-authorized size lacks direct fork evidence")
 	}
-	if auction != nil {
+	if auction != nil && strings.ToLower(selected.Liquidation.DebtAsset) == wethAddress {
 		atlas, atlasErr := s.buildAtlasCandidate(ctx, record, selected, auction)
 		if atlasErr != nil {
 			return record, atlasErr
@@ -2832,71 +2881,98 @@ func (s *Screener) fetchExactSnapshot(ctx context.Context, borrower string) (exa
 	if err := json.NewDecoder(io.LimitReader(response.Body, maximumResponse)).Decode(&result); err != nil {
 		return exactResponse{}, err
 	}
-	if result.SchemaVersion != "phoenix.rpc.aave-exact-response.v4" || result.ChainID != 42161 || result.RequestID != requestID || result.BlockNumber == 0 || result.BlockHash == "" || result.StateRoot == "" || result.Primary.ProviderID != primaryProviderID || result.Confirmation != nil || result.Quorum != 1 {
+	if result.SchemaVersion != "phoenix.rpc.aave-exact-response.v5" || result.ChainID != 42161 || result.RequestID != requestID || result.BlockNumber == 0 || result.BlockHash == "" || result.StateRoot == "" || result.Primary.ProviderID != primaryProviderID || result.Confirmation != nil || result.Quorum != 1 {
 		return exactResponse{}, errors.New("fresh exact Aave provider evidence is incomplete")
 	}
 	return result, nil
 }
 
 func (s *Screener) validateLiquidationVariants(liquidations []exactLiquidation, flashPremiumBPS uint64) error {
-	maximumInput, maximumOK := newBigUint(maximumReviewedInputWei)
-	if !maximumOK || maximumInput.Sign() <= 0 || flashPremiumBPS == 0 || flashPremiumBPS > s.config.FlashPremiumBPS || len(liquidations) == 0 || len(liquidations) > 14 {
+	if flashPremiumBPS == 0 || flashPremiumBPS > s.config.FlashPremiumBPS || len(liquidations) == 0 || len(liquidations) > 21 {
 		return errors.New("exact liquidation bounds are invalid")
 	}
-	previousByCollateral := make(map[string]*big.Int)
-	fixedCountByCollateral := make(map[string]int)
-	terminalSeenByCollateral := make(map[string]bool)
+	previousByPair := make(map[string]*big.Int)
+	fixedCountByPair := make(map[string]int)
+	terminalSeenByPair := make(map[string]bool)
 	for index := range liquidations {
 		liquidation := &liquidations[index]
+		debt := strings.ToLower(liquidation.DebtAsset)
 		collateral := strings.ToLower(liquidation.CollateralAsset)
+		pair := debt + "|" + collateral
 		requested, requestedOK := newBigUint(liquidation.RequestedRepayAmount)
 		actual, actualOK := newBigUint(liquidation.ActualRepayAmount)
 		repay, repayOK := newBigUint(liquidation.RepayAmount)
 		premium, premiumOK := newBigUint(liquidation.FlashPremiumAmount)
-		if !requestedOK || !actualOK || !repayOK || !premiumOK || requested.Sign() <= 0 || actual.Sign() <= 0 || actual.Cmp(repay) != 0 || actual.Cmp(requested) != 0 || actual.Cmp(maximumInput) > 0 || strings.ToLower(liquidation.DebtAsset) != wethAddress || collateral != wethAddress && collateral != nativeUSDCAddress || !addressPattern.MatchString(collateral) {
+		maximumRepay, maximumOK := newBigUint(liquidation.MaximumRepayAmount)
+		reviewedSize, reviewedOK := newBigUint(liquidation.ReviewedSizeWETHWei)
+		derivedMaximum, conversionOK := wethToDebtFloor(maximumReviewedInputWei, liquidation)
+		expectedReview := "weth_debt_reviewed"
+		supportedPair := debt == wethAddress && (collateral == wethAddress || collateral == nativeUSDCAddress)
+		if debt == usdcEAddress {
+			expectedReview = "usdc_e_debt_reviewed"
+			supportedPair = collateral == wethAddress
+		}
+		if !requestedOK || !actualOK || !repayOK || !premiumOK || !maximumOK || !reviewedOK || !conversionOK || requested.Sign() <= 0 || actual.Sign() <= 0 || actual.Cmp(repay) != 0 || actual.Cmp(requested) != 0 || actual.Cmp(maximumRepay) > 0 || maximumRepay.Cmp(derivedMaximum) != 0 || !supportedPair || liquidation.DebtAssetReview != expectedReview || !addressPattern.MatchString(collateral) {
 			return errors.New("exact liquidation variant is invalid")
 		}
 		switch liquidation.SizeClassification {
 		case fixedReviewedSizeClassification:
-			if liquidation.TerminalSizeReason != "" || terminalSeenByCollateral[collateral] {
+			derivedReviewed, ok := wethToDebtFloor(reviewedSize.String(), liquidation)
+			if !ok || derivedReviewed.Cmp(repay) != 0 || !isReviewedWETHSize(reviewedSize) || liquidation.TerminalSizeReason != "" || terminalSeenByPair[pair] {
 				return errors.New("fixed reviewed liquidation classification is invalid")
 			}
-			fixedCountByCollateral[collateral]++
-			if fixedCountByCollateral[collateral] > 7 {
+			fixedCountByPair[pair]++
+			if fixedCountByPair[pair] > 7 {
 				return errors.New("exact liquidation grid exceeds its collateral bound")
 			}
 		case terminalSizeClassification:
-			if fixedCountByCollateral[collateral] != 0 || terminalSeenByCollateral[collateral] || liquidation.TerminalSizeReason != belowMinReviewedSizeReason && liquidation.TerminalSizeReason != dustPartialInvalidReason {
+			normalized, ok := debtToWETHFloor(repay.String(), liquidation)
+			if !ok || normalized.Cmp(reviewedSize) != 0 || isReviewedWETHSize(reviewedSize) || fixedCountByPair[pair] != 0 || terminalSeenByPair[pair] || liquidation.TerminalSizeReason != belowMinReviewedSizeReason && liquidation.TerminalSizeReason != dustPartialInvalidReason {
 				return errors.New("terminal liquidation classification is invalid")
 			}
-			terminalSeenByCollateral[collateral] = true
+			terminalSeenByPair[pair] = true
 		default:
 			return errors.New("exact liquidation size classification is invalid")
 		}
-		if collateral == nativeUSDCAddress && (len(liquidation.UnwindQuotes) == 0 || len(liquidation.UnwindQuotes) > 3) {
+		minimumRoutes, maximumRoutes := 0, 0
+		if debt == wethAddress && collateral == nativeUSDCAddress {
+			minimumRoutes, maximumRoutes = 1, 3
+		} else if debt == usdcEAddress && collateral == wethAddress {
+			minimumRoutes, maximumRoutes = 1, 1
+		}
+		if len(liquidation.UnwindQuotes) < minimumRoutes || len(liquidation.UnwindQuotes) > maximumRoutes {
 			return errors.New("exact liquidation route count exceeds its reviewed bound")
 		}
 		fees := make(map[uint32]bool, len(liquidation.UnwindQuotes))
 		pools := make(map[string]bool, len(liquidation.UnwindQuotes))
 		for _, quote := range liquidation.UnwindQuotes {
-			if collateral != nativeUSDCAddress {
-				break
-			}
 			pool := strings.ToLower(quote.Pool)
-			if fees[quote.Fee] || pools[pool] {
+			factory := strings.ToLower(quote.Factory)
+			token0 := strings.ToLower(quote.Token0)
+			token1 := strings.ToLower(quote.Token1)
+			zeroForOne, directionOK := uniswapZeroForOne(collateral, token0, token1)
+			outputDebt, outputOK := newBigUint(quote.OutputDebt)
+			outputWETH, outputWETHOK := newBigUint(quote.OutputWETH)
+			normalized, normalizedOK := debtToWETHFloor(quote.OutputDebt, liquidation)
+			reviewedWETHPool := quote.Fee == 100 && pool == wethNativeUSDCPool100Address ||
+				quote.Fee == 500 && pool == wethNativeUSDCPool500Address ||
+				quote.Fee == 3_000 && pool == wethNativeUSDCPool3000Address
+			routeReviewed := debt == wethAddress && reviewedWETHPool ||
+				debt == usdcEAddress && quote.Fee == 500 && pool == wethUSDCePool500Address
+			if fees[quote.Fee] || pools[pool] || factory != uniswapFactoryAddress || !directionOK || quote.ZeroForOne != zeroForOne || !routeReviewed || !outputOK || !outputWETHOK || !normalizedOK || outputDebt.Sign() <= 0 || outputWETH.Cmp(normalized) != 0 {
 				return errors.New("exact liquidation routes are not unique")
 			}
 			fees[quote.Fee] = true
 			pools[pool] = true
 		}
-		if previous := previousByCollateral[collateral]; previous != nil && actual.Cmp(previous) <= 0 {
+		if previous := previousByPair[pair]; previous != nil && actual.Cmp(previous) <= 0 {
 			return errors.New("exact liquidation variants are not strictly increasing")
 		}
 		expectedPremium := aavePercentMul(actual, flashPremiumBPS)
 		if premium.Cmp(expectedPremium) != 0 {
 			return errors.New("exact flash premium is inconsistent")
 		}
-		previousByCollateral[collateral] = new(big.Int).Set(actual)
+		previousByPair[pair] = new(big.Int).Set(actual)
 	}
 	return nil
 }
@@ -2935,7 +3011,7 @@ func (s *Screener) evaluateLiquidationBatch(ctx context.Context, record signal, 
 			requests = append(requests, s.newSimulationRequest(record, probe.Liquidation, simulationRequest{
 				MinimumCollateralReceived: probe.MinimumCollateral,
 				MinimumUnwindOutput:       "1",
-				MinimumProfit:             s.config.RetainedProfitFloorWei,
+				MinimumProfitWETHWei:      s.config.RetainedProfitFloorWei,
 				ExpectedProfit:            probe.ExactEdge.String(),
 				SelectedPool:              probe.Route.SelectedPool,
 				SelectedFactory:           probe.Route.Factory,
@@ -2987,6 +3063,7 @@ func (s *Screener) evaluateLiquidationBatch(ctx context.Context, record signal, 
 				MinimumCollateralReceived: evaluation.MinimumCollateral,
 				MinimumUnwindOutput:       evaluation.MinimumUnwind,
 				MinimumProfit:             evaluation.MinimumProfit,
+				MinimumProfitWETHWei:      evaluation.MinimumProfitWETH,
 				ExpectedProfit:            evaluation.Simulation.RealizedProfit,
 				SelectedPool:              evaluation.Route.SelectedPool,
 				SelectedFactory:           evaluation.Route.Factory,
@@ -3072,6 +3149,7 @@ func (s *Screener) evaluateLiquidationBatch(ctx context.Context, record signal, 
 			MinimumCollateralReceived: evaluation.MinimumCollateral,
 			MinimumUnwindOutput:       evaluation.MinimumUnwind,
 			MinimumProfit:             evaluation.MinimumProfit,
+			MinimumProfitWETHWei:      evaluation.MinimumProfitWETH,
 			ExpectedProfit:            evaluation.Simulation.RealizedProfit,
 			SelectedPool:              evaluation.Route.SelectedPool,
 			SelectedFactory:           evaluation.Route.Factory,
@@ -3143,8 +3221,16 @@ func (s *Screener) prepareLiquidationProbes(liquidation *exactLiquidation) ([]*l
 	}
 	probes := make([]*liquidationProbe, 0, len(routes))
 	for _, route := range routes {
-		exactEdge := new(big.Int).Sub(new(big.Int).Set(route.Output), repay)
-		exactEdge.Sub(exactEdge, flash)
+		exactEdgeDebt := new(big.Int).Sub(new(big.Int).Set(route.OutputDebt), repay)
+		exactEdgeDebt.Sub(exactEdgeDebt, flash)
+		exactEdge := new(big.Int)
+		if exactEdgeDebt.Sign() > 0 {
+			var ok bool
+			exactEdge, ok = debtToWETHFloor(exactEdgeDebt.String(), liquidation)
+			if !ok {
+				return nil, errors.New("exact debt economics normalization is invalid")
+			}
+		}
 		probes = append(probes, &liquidationProbe{
 			Liquidation: liquidation, Route: route, ExactEdge: exactEdge,
 			MinimumCollateral: minimumCollateral.String(),
@@ -3333,12 +3419,19 @@ func buildExactDiagnosticSummary(record signal, exactForkLatency, liquidatableTo
 }
 
 func newSizeDiagnostic(probe *liquidationProbe, liveMaximumText string) sizeDiagnostic {
+	flashWETH, flashWETHOK := debtToWETHFloor(probe.Liquidation.FlashPremiumAmount, probe.Liquidation)
+	if !flashWETHOK {
+		flashWETH = new(big.Int)
+	}
 	diagnostic := sizeDiagnostic{
 		ReviewedSize:             probe.Liquidation.RepayAmount,
+		DebtAsset:                probe.Liquidation.DebtAsset,
+		CollateralAsset:          probe.Liquidation.CollateralAsset,
+		DebtAssetReview:          probe.Liquidation.DebtAssetReview,
 		SizeClassification:       probe.Liquidation.SizeClassification,
 		TerminalSizeReason:       probe.Liquidation.TerminalSizeReason,
 		Route:                    probe.Route.Name,
-		FlashPremiumWei:          probe.Liquidation.FlashPremiumAmount,
+		FlashPremiumWei:          flashWETH.String(),
 		AtlasExposureWei:         "0",
 		AtlasBidWei:              "0",
 		RiskReserveWei:           "0",
@@ -3350,10 +3443,9 @@ func newSizeDiagnostic(probe *liquidationProbe, liveMaximumText string) sizeDiag
 		MarginToRetainedFloorWei: "0",
 	}
 	repay, repayOK := newBigUint(probe.Liquidation.RepayAmount)
-	flash, flashOK := newBigUint(probe.Liquidation.FlashPremiumAmount)
-	liveMaximum, liveOK := newBigUint(liveMaximumText)
-	if repayOK && flashOK {
-		diagnostic.GrossLiquidationEdgeWei = new(big.Int).Add(new(big.Int).Set(probe.ExactEdge), flash).String()
+	liveMaximum, liveOK := wethToDebtFloor(liveMaximumText, probe.Liquidation)
+	if repayOK && flashWETHOK {
+		diagnostic.GrossLiquidationEdgeWei = new(big.Int).Add(new(big.Int).Set(probe.ExactEdge), flashWETH).String()
 	}
 	if repayOK && liveOK {
 		diagnostic.LiveAuthorized = repay.Cmp(liveMaximum) <= 0
@@ -3413,14 +3505,24 @@ func (s *Screener) evaluateLiquidationProbe(probe *liquidationProbe, simulation 
 		return nil, false, err
 	}
 	floor, _ := newBigUint(s.config.RetainedProfitFloorWei)
-	reserve, conservative, minimumUnwind := profitEdgeReserve(expected, probe.Route.Output, s.config.EconomicReserveBPS)
+	reserve, conservative, _ := profitEdgeReserve(expected, probe.Route.Output, s.config.EconomicReserveBPS)
+	minimumUnwind, unwindOK := minimumUnwindForReserve(probe.Route.OutputDebt, reserve, probe.Liquidation)
+	if !unwindOK {
+		return nil, false, errors.New("minimum unwind unit conversion is invalid")
+	}
+	minimumProfitWETH := strictMinimumProfit(floor, cost)
+	minimumProfit, minimumProfitOK := wethToDebtCeil(minimumProfitWETH.String(), probe.Liquidation)
+	liveMaximumRaw, liveMaximumOK := wethToDebtFloor(liveMaximumInput, probe.Liquidation)
+	if !minimumProfitOK || !liveMaximumOK {
+		return nil, false, errors.New("liquidation authority unit conversion is invalid")
+	}
 	evaluation := &liquidationEvaluation{
 		Liquidation: probe.Liquidation, Route: probe.Route, Simulation: simulation,
 		Expected: expected, Conservative: conservative, RiskReserve: reserve,
 		ExecutionCost: cost, EstimatedL1Cost: l1Cost,
 		MinimumCollateral: probe.MinimumCollateral, MinimumUnwind: minimumUnwind.String(),
-		MinimumProfit:    strictMinimumProfit(floor, cost).String(),
-		LiveMaximumInput: liveMaximumInput,
+		MinimumProfit: minimumProfit.String(), MinimumProfitWETH: minimumProfitWETH.String(),
+		LiveMaximumInput: liveMaximumRaw.String(), LiveMaximumInputWETH: liveMaximumInput,
 	}
 	return evaluation, conservative.Cmp(floor) > 0 && minimumUnwind.Sign() > 0, nil
 }
@@ -3447,8 +3549,13 @@ func (s *Screener) advanceLiquidationMaterialization(probe *liquidationEvaluatio
 	if err != nil {
 		return nil, nil, err
 	}
-	finalReserve, finalConservative, finalMinimumUnwind := profitEdgeReserve(finalExpected, probe.Route.Output, s.config.EconomicReserveBPS)
-	requiredMinimumProfit := strictMinimumProfit(floor, finalCost)
+	finalReserve, finalConservative, _ := profitEdgeReserve(finalExpected, probe.Route.Output, s.config.EconomicReserveBPS)
+	finalMinimumUnwind, unwindOK := minimumUnwindForReserve(probe.Route.OutputDebt, finalReserve, probe.Liquidation)
+	requiredMinimumProfitWETH := strictMinimumProfit(floor, finalCost)
+	requiredMinimumProfit, profitConversionOK := wethToDebtCeil(requiredMinimumProfitWETH.String(), probe.Liquidation)
+	if !unwindOK || !profitConversionOK {
+		return nil, nil, errors.New("final liquidation unit conversion is invalid")
+	}
 	if finalConservative.Cmp(floor) <= 0 || finalMinimumUnwind.Sign() <= 0 {
 		return nil, nil, nil
 	}
@@ -3458,31 +3565,35 @@ func (s *Screener) advanceLiquidationMaterialization(probe *liquidationEvaluatio
 			Expected: finalExpected, Conservative: finalConservative, RiskReserve: finalReserve,
 			ExecutionCost: finalCost, EstimatedL1Cost: finalL1Cost,
 			MinimumCollateral: probe.MinimumCollateral, MinimumUnwind: probe.MinimumUnwind,
-			MinimumProfit:    probe.MinimumProfit,
-			LiveMaximumInput: probe.LiveMaximumInput,
+			MinimumProfit: probe.MinimumProfit, MinimumProfitWETH: probe.MinimumProfitWETH,
+			LiveMaximumInput: probe.LiveMaximumInput, LiveMaximumInputWETH: probe.LiveMaximumInputWETH,
 		}, nil, nil
 	}
 	retry := *probe
 	retry.MinimumUnwind = finalMinimumUnwind.String()
 	retry.MinimumProfit = requiredMinimumProfit.String()
+	retry.MinimumProfitWETH = requiredMinimumProfitWETH.String()
 	return nil, &retry, nil
 }
 
 func liquidationRoutesFor(liquidation *exactLiquidation) ([]liquidationRoute, error) {
-	if liquidation == nil || strings.ToLower(liquidation.DebtAsset) != wethAddress {
+	if liquidation == nil {
 		return nil, errors.New("unsupported exact debt route")
 	}
-	if strings.ToLower(liquidation.CollateralAsset) == wethAddress {
+	debt := strings.ToLower(liquidation.DebtAsset)
+	collateral := strings.ToLower(liquidation.CollateralAsset)
+	if debt == wethAddress && collateral == wethAddress {
 		output, ok := newBigUint(liquidation.LiquidatorCollateral)
 		if !ok || output.Sign() <= 0 {
 			return nil, errors.New("exact identity-route output is invalid")
 		}
 		return []liquidationRoute{{
-			Name: "WETH_IDENTITY", Output: output, SelectedPool: zeroAddress,
-			Factory: zeroAddress, TokenPath: []string{wethAddress},
+			Name: "WETH_IDENTITY", Output: output, OutputDebt: new(big.Int).Set(output), SelectedPool: zeroAddress,
+			Factory: zeroAddress, TokenPath: []string{wethAddress}, TokenIn: wethAddress, TokenOut: wethAddress,
 		}}, nil
 	}
-	if strings.ToLower(liquidation.CollateralAsset) != nativeUSDCAddress {
+	if !(debt == wethAddress && collateral == nativeUSDCAddress) &&
+		!(debt == usdcEAddress && collateral == wethAddress) {
 		return nil, errors.New("unsupported exact collateral route")
 	}
 	routes := make([]liquidationRoute, 0, len(liquidation.UnwindQuotes))
@@ -3493,19 +3604,21 @@ func liquidationRoutesFor(liquidation *exactLiquidation) ([]liquidationRoute, er
 		token0 := strings.ToLower(quote.Token0)
 		token1 := strings.ToLower(quote.Token1)
 		output, outputOK := newBigUint(quote.OutputWETH)
-		zeroForOne, directionOK := uniswapZeroForOne(nativeUSDCAddress, token0, token1)
+		outputDebt, outputDebtOK := newBigUint(quote.OutputDebt)
+		zeroForOne, directionOK := uniswapZeroForOne(collateral, token0, token1)
 		identityValid := addressPattern.MatchString(pool) && factory == uniswapFactoryAddress &&
 			directionOK &&
-			(quote.Fee == 100 || quote.Fee == 500 || quote.Fee == 3_000) &&
+			((debt == wethAddress && (quote.Fee == 100 || quote.Fee == 500 || quote.Fee == 3_000)) ||
+				(debt == usdcEAddress && quote.Fee == 500 && pool == wethUSDCePool500Address)) &&
 			quote.ZeroForOne == zeroForOne && !seen[pool]
-		if !identityValid || !outputOK || output.Sign() <= 0 {
+		if !identityValid || !outputOK || !outputDebtOK || output.Sign() <= 0 || outputDebt.Sign() <= 0 {
 			return nil, errors.New("exact route quotation identity is invalid")
 		}
 		seen[pool] = true
 		routes = append(routes, liquidationRoute{
-			Name: fmt.Sprintf("UNISWAP_V3_%d", quote.Fee), Output: output,
+			Name: fmt.Sprintf("UNISWAP_V3_%d", quote.Fee), Output: output, OutputDebt: outputDebt,
 			SelectedPool: pool, Factory: factory, SelectedFee: quote.Fee,
-			ZeroForOne: zeroForOne, TokenPath: []string{nativeUSDCAddress, wethAddress},
+			ZeroForOne: zeroForOne, TokenPath: []string{collateral, debt}, TokenIn: collateral, TokenOut: debt,
 		})
 	}
 	if len(routes) == 0 {
@@ -3531,7 +3644,7 @@ func executionLegsFor(route liquidationRoute, minimumUnwind string) []executionL
 	}
 	return []executionLeg{{
 		Pool: route.SelectedPool, Factory: route.Factory,
-		TokenIn: nativeUSDCAddress, TokenOut: wethAddress,
+		TokenIn: route.TokenIn, TokenOut: route.TokenOut,
 		Fee: route.SelectedFee, ZeroForOne: route.ZeroForOne, MinAmountOut: minimumUnwind,
 	}}
 }
@@ -3541,13 +3654,17 @@ func (s *Screener) boundedSimulationEconomics(simulation *simulationResponse, li
 		return nil, nil, nil, errors.New("bounded simulation gas is invalid")
 	}
 	realized, realizedOK := newBigUint(simulation.RealizedProfit)
+	realizedDebt, realizedDebtOK := newBigUint(simulation.RealizedProfitDebtAsset)
+	expectedRealized, expectedRealizedOK := debtToWETHFloor(simulation.RealizedProfitDebtAsset, liquidation)
 	cost, costOK := newBigUint(simulation.EstimatedExecutionCostWei)
 	l1Cost, l1OK := newBigUint(simulation.EstimatedL1CostWei)
 	flash, flashOK := newBigUint(simulation.FlashPremiumWei)
+	flashDebt, flashDebtOK := newBigUint(simulation.FlashPremiumDebtAsset)
 	expectedFlash, expectedFlashOK := newBigUint(liquidation.FlashPremiumAmount)
+	expectedFlashWETH, expectedFlashWETHOK := debtToWETHFloor(liquidation.FlashPremiumAmount, liquidation)
 	maxFee, maxFeeOK := newBigUint(s.config.MaximumFeePerGasWei)
 	estimatedMaxFee, estimatedMaxFeeOK := newBigUint(simulation.EstimatedMaxFeePerGasWei)
-	if !realizedOK || !costOK || !l1OK || !flashOK || !expectedFlashOK || !maxFeeOK || !estimatedMaxFeeOK || cost.Sign() <= 0 || estimatedMaxFee.Sign() <= 0 || flash.Cmp(expectedFlash) != 0 || l1Cost.Cmp(cost) > 0 || estimatedMaxFee.Cmp(maxFee) > 0 {
+	if !realizedOK || !realizedDebtOK || !expectedRealizedOK || !costOK || !l1OK || !flashOK || !flashDebtOK || !expectedFlashOK || !expectedFlashWETHOK || !maxFeeOK || !estimatedMaxFeeOK || realizedDebt.Sign() <= 0 || realized.Cmp(expectedRealized) != 0 || cost.Sign() <= 0 || estimatedMaxFee.Sign() <= 0 || flashDebt.Cmp(expectedFlash) != 0 || flash.Cmp(expectedFlashWETH) != 0 || l1Cost.Cmp(cost) > 0 || estimatedMaxFee.Cmp(maxFee) > 0 {
 		return nil, nil, nil, errors.New("bounded simulation economics are invalid")
 	}
 	boundCost := new(big.Int).Mul(new(big.Int).SetUint64(simulation.EstimatedGasLimit), estimatedMaxFee)
@@ -3629,6 +3746,9 @@ func (s *Screener) buildAtlasCandidate(
 	if auction == nil || selected == nil || selected.Simulation == nil || !auction.RelevantAaveAuction {
 		return nil, nil
 	}
+	if strings.ToLower(selected.Liquidation.DebtAsset) != wethAddress {
+		return nil, nil
+	}
 	// The current gateway evidence exercises executeAaveLiquidation directly.
 	// It does not prove Atlas caller/solver/bid/reconcile behavior, so an auction
 	// must fail closed until the gateway returns explicit callback-path evidence.
@@ -3686,6 +3806,7 @@ func (s *Screener) buildAtlasCandidate(
 		MinimumCollateralReceived: selected.MinimumCollateral,
 		MinimumUnwindOutput:       atlasMinimumUnwind.String(),
 		MinimumProfit:             minimumProfit.String(),
+		MinimumProfitWETHWei:      minimumProfit.String(),
 		ExpectedProfit:            gross.String(),
 		SelectedPool:              selected.Route.SelectedPool,
 		SelectedFactory:           selected.Route.Factory,
@@ -3782,7 +3903,7 @@ func (s *Screener) simulateExact(ctx context.Context, record signal, liquidation
 }
 
 func (s *Screener) newSimulationRequest(record signal, liquidation *exactLiquidation, partial simulationRequest, deadline uint64, liveMaximumInput string) simulationRequest {
-	partial.SchemaVersion = "phoenix.rpc.aave-simulate-request.v3"
+	partial.SchemaVersion = "phoenix.rpc.aave-simulate-request.v4"
 	partial.ChainID = 42161
 	partial.RequestID = fmt.Sprintf("aave-sim-%d-%s-%s-%d", record.Cursor, liquidation.CollateralAsset, liquidation.RepayAmount, time.Now().UnixNano())
 	partial.BlockNumber = record.Block
@@ -3795,15 +3916,32 @@ func (s *Screener) newSimulationRequest(record signal, liquidation *exactLiquida
 	partial.Borrower = record.Borrower
 	partial.DebtAsset = liquidation.DebtAsset
 	partial.CollateralAsset = liquidation.CollateralAsset
+	partial.DebtAssetDecimals = liquidation.DebtAssetDecimals
+	partial.DebtAssetPriceBase = liquidation.DebtAssetPriceBase
+	partial.WETHPriceBase = liquidation.WETHPriceBase
 	partial.RepayAmount = liquidation.RepayAmount
 	repay, repayOK := newBigUint(liquidation.RepayAmount)
-	liveMaximum, liveOK := newBigUint(liveMaximumInput)
-	partial.LiveMaximumInputAmount = liveMaximumInput
+	liveMaximum, liveOK := wethToDebtFloor(liveMaximumInput, liquidation)
+	if !liveOK {
+		liveMaximum = new(big.Int)
+	}
+	partial.LiveMaximumInputAmount = liveMaximum.String()
+	partial.LiveMaximumInputWETHWei = liveMaximumInput
 	partial.Counterfactual = repayOK && liveOK && repay.Cmp(liveMaximum) > 0
 	if partial.Counterfactual {
-		partial.MaximumInputAmount = maximumReviewedInputWei
+		partial.MaximumInputAmount = liquidation.MaximumRepayAmount
+		partial.MaximumInputWETHWei = maximumReviewedInputWei
 	} else {
-		partial.MaximumInputAmount = liveMaximumInput
+		partial.MaximumInputAmount = liveMaximum.String()
+		partial.MaximumInputWETHWei = liveMaximumInput
+	}
+	if partial.MinimumProfitWETHWei == "" {
+		partial.MinimumProfitWETHWei = partial.MinimumProfit
+	}
+	if minimumProfit, ok := wethToDebtCeil(partial.MinimumProfitWETHWei, liquidation); ok {
+		partial.MinimumProfit = minimumProfit.String()
+	} else {
+		partial.MinimumProfit = "0"
 	}
 	partial.RetainedProfitFloor = s.config.RetainedProfitFloorWei
 	partial.GasLimit = s.config.MaximumGasLimit
@@ -3877,7 +4015,7 @@ func (s *Screener) simulateExactBatchChunk(ctx context.Context, record signal, s
 	}
 	requestID := fmt.Sprintf("aave-sim-batch-%d-%d", record.Cursor, time.Now().UnixNano())
 	batch := simulationBatchRequest{
-		SchemaVersion: "phoenix.rpc.aave-simulate-batch-request.v2",
+		SchemaVersion: "phoenix.rpc.aave-simulate-batch-request.v3",
 		ChainID:       42161,
 		RequestID:     requestID,
 		Simulations:   simulations,
@@ -3908,7 +4046,7 @@ func (s *Screener) simulateExactBatchChunk(ctx context.Context, record signal, s
 	if err := json.NewDecoder(io.LimitReader(response.Body, maximumResponse)).Decode(&result); err != nil {
 		return nil, err
 	}
-	if result.SchemaVersion != "phoenix.rpc.aave-simulate-batch-response.v3" || result.ChainID != 42161 || result.RequestID != requestID || result.BlockNumber != record.Block || result.BlockHash != record.BlockHash || result.StateRoot != record.StateRoot || result.PrimaryProviderID != primaryProviderID || result.ConfirmationProviderID != nil || result.Quorum != 1 || result.EvidenceMode != expectedBatchEvidenceMode || len(result.Results) != len(simulations) {
+	if result.SchemaVersion != "phoenix.rpc.aave-simulate-batch-response.v4" || result.ChainID != 42161 || result.RequestID != requestID || result.BlockNumber != record.Block || result.BlockHash != record.BlockHash || result.StateRoot != record.StateRoot || result.PrimaryProviderID != primaryProviderID || result.ConfirmationProviderID != nil || result.Quorum != 1 || result.EvidenceMode != expectedBatchEvidenceMode || len(result.Results) != len(simulations) {
 		return nil, errors.New("simulation batch evidence is incomplete")
 	}
 	outcomes := make([]simulationBatchOutcome, len(simulations))
@@ -3942,7 +4080,7 @@ func (s *Screener) simulateExactBatchChunk(ctx context.Context, record signal, s
 }
 
 func validateSimulationResponse(result *simulationResponse, request *simulationRequest, record signal, expectedEvidenceMode string) error {
-	if result == nil || request == nil || result.SchemaVersion != "phoenix.rpc.aave-simulate-response.v4" || result.ChainID != 42161 || result.RequestID != request.RequestID || result.BlockNumber != record.Block || result.BlockHash != record.BlockHash || result.StateRoot != record.StateRoot || result.PrimaryProviderID != primaryProviderID || result.ConfirmationProviderID != nil || result.Quorum != 1 || result.EvidenceMode != expectedEvidenceMode || len(result.RouteID) != 66 || len(result.CalldataHash) != 64 || len(result.SimulationResultHash) != 64 || result.DeadlineUnixSeconds != request.DeadlineUnixSeconds {
+	if result == nil || request == nil || result.SchemaVersion != "phoenix.rpc.aave-simulate-response.v5" || result.ChainID != 42161 || result.RequestID != request.RequestID || result.BlockNumber != record.Block || result.BlockHash != record.BlockHash || result.StateRoot != record.StateRoot || result.PrimaryProviderID != primaryProviderID || result.ConfirmationProviderID != nil || result.Quorum != 1 || result.EvidenceMode != expectedEvidenceMode || len(result.RouteID) != 66 || len(result.CalldataHash) != 64 || len(result.SimulationResultHash) != 64 || result.DeadlineUnixSeconds != request.DeadlineUnixSeconds {
 		return errors.New("simulation evidence is incomplete")
 	}
 	calldata, err := hex.DecodeString(strings.TrimPrefix(result.CalldataHex, "0x"))
@@ -3997,7 +4135,7 @@ func (s *Screener) buildExecutionCandidate(record signal, selected *liquidationE
 	candidate := &executionCandidate{
 		RequestID: deterministicUUID(requestDigest), OpportunityID: deterministicUUID(opportunityDigest),
 		RouteID:      simulation.RouteID,
-		RoutePayload: aaveRoutePayload{Borrower: record.Borrower, DebtAsset: liquidation.DebtAsset, CollateralAsset: liquidation.CollateralAsset, ReceiveAToken: false, MinimumCollateralReceived: selected.MinimumCollateral, MinimumUnwindOutput: selected.MinimumUnwind, MaximumAtlasBid: "0", EvidenceMode: simulation.EvidenceMode, StateRoot: record.StateRoot, ReleaseSHA: s.config.ReleaseSHA},
+		RoutePayload: aaveRoutePayload{Borrower: record.Borrower, DebtAsset: liquidation.DebtAsset, CollateralAsset: liquidation.CollateralAsset, DebtAssetDecimals: liquidation.DebtAssetDecimals, DebtAssetPriceBase: liquidation.DebtAssetPriceBase, WETHPriceBase: liquidation.WETHPriceBase, MaximumInputWETHWei: selected.LiveMaximumInputWETH, MinimumProfitWETHWei: selected.MinimumProfitWETH, ReceiveAToken: false, MinimumCollateralReceived: selected.MinimumCollateral, MinimumUnwindOutput: selected.MinimumUnwind, MaximumAtlasBid: "0", EvidenceMode: simulation.EvidenceMode, StateRoot: record.StateRoot, ReleaseSHA: s.config.ReleaseSHA},
 		SelectedSize: liquidation.RepayAmount, TokenPath: selected.Route.TokenPath, OriginRouter: aavePoolAddress,
 		ExecutorAddress: s.config.ExecutorAddress, ExecutorCodeHash: s.config.ExecutorCodeHash,
 		CalldataHash: simulation.CalldataHash, SimulationResultHash: simulation.SimulationResultHash,
@@ -4106,6 +4244,93 @@ func generousUpperBound(value account, wethPriceText string) (*big.Int, error) {
 func newBigUint(value string) (*big.Int, bool) {
 	result, ok := new(big.Int).SetString(value, 10)
 	return result, ok && result.Sign() >= 0
+}
+
+func exactDebtUnit(liquidation *exactLiquidation) (*big.Int, *big.Int, *big.Int, bool) {
+	if liquidation == nil || liquidation.DebtAssetDecimals > 36 {
+		return nil, nil, nil, false
+	}
+	debtPrice, debtOK := newBigUint(liquidation.DebtAssetPriceBase)
+	wethPrice, wethOK := newBigUint(liquidation.WETHPriceBase)
+	unit := new(big.Int).Exp(big.NewInt(10), new(big.Int).SetUint64(uint64(liquidation.DebtAssetDecimals)), nil)
+	if !debtOK || !wethOK || debtPrice.Sign() <= 0 || wethPrice.Sign() <= 0 {
+		return nil, nil, nil, false
+	}
+	debt := strings.ToLower(liquidation.DebtAsset)
+	supported := debt == wethAddress && liquidation.DebtAssetDecimals == 18 && debtPrice.Cmp(wethPrice) == 0 ||
+		debt == usdcEAddress && liquidation.DebtAssetDecimals == 6
+	if !supported {
+		return nil, nil, nil, false
+	}
+	return debtPrice, wethPrice, unit, true
+}
+
+func wethToDebtFloor(wethWei string, liquidation *exactLiquidation) (*big.Int, bool) {
+	weth, wethOK := newBigUint(wethWei)
+	debtPrice, wethPrice, unit, unitOK := exactDebtUnit(liquidation)
+	if !wethOK || !unitOK {
+		return nil, false
+	}
+	numerator := new(big.Int).Mul(weth, wethPrice)
+	numerator.Mul(numerator, unit)
+	denominator := new(big.Int).Mul(big.NewInt(1_000_000_000_000_000_000), debtPrice)
+	return numerator.Div(numerator, denominator), true
+}
+
+func wethToDebtCeil(wethWei string, liquidation *exactLiquidation) (*big.Int, bool) {
+	weth, wethOK := newBigUint(wethWei)
+	debtPrice, wethPrice, unit, unitOK := exactDebtUnit(liquidation)
+	if !wethOK || !unitOK {
+		return nil, false
+	}
+	numerator := new(big.Int).Mul(weth, wethPrice)
+	numerator.Mul(numerator, unit)
+	denominator := new(big.Int).Mul(big.NewInt(1_000_000_000_000_000_000), debtPrice)
+	numerator.Add(numerator, new(big.Int).Sub(new(big.Int).Set(denominator), big.NewInt(1)))
+	return numerator.Div(numerator, denominator), true
+}
+
+func debtToWETHFloor(debtRaw string, liquidation *exactLiquidation) (*big.Int, bool) {
+	debt, debtOK := newBigUint(debtRaw)
+	debtPrice, wethPrice, unit, unitOK := exactDebtUnit(liquidation)
+	if !debtOK || !unitOK {
+		return nil, false
+	}
+	numerator := new(big.Int).Mul(debt, debtPrice)
+	numerator.Mul(numerator, big.NewInt(1_000_000_000_000_000_000))
+	denominator := new(big.Int).Mul(unit, wethPrice)
+	return numerator.Div(numerator, denominator), true
+}
+
+func minimumUnwindForReserve(outputDebt, reserveWETH *big.Int, liquidation *exactLiquidation) (*big.Int, bool) {
+	if outputDebt == nil || reserveWETH == nil {
+		return nil, false
+	}
+	reserveDebt, ok := wethToDebtFloor(reserveWETH.String(), liquidation)
+	if !ok {
+		return nil, false
+	}
+	minimum := new(big.Int).Sub(new(big.Int).Set(outputDebt), reserveDebt)
+	if minimum.Sign() < 0 {
+		minimum.SetInt64(0)
+	}
+	return minimum, true
+}
+
+func isReviewedWETHSize(value *big.Int) bool {
+	if value == nil {
+		return false
+	}
+	for _, size := range []string{
+		"100000000000000", "250000000000000", "500000000000000",
+		"1000000000000000", "2500000000000000", "5000000000000000",
+		maximumReviewedInputWei,
+	} {
+		if value.String() == size {
+			return true
+		}
+	}
+	return false
 }
 
 // FailClosedExactAuthority revokes the durable Exact gate before a fatal

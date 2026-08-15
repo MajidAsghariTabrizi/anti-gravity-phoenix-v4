@@ -47,6 +47,15 @@
       "fee": 10000,
       "tick_spacing": 200,
       "pool_address": "0x42fc852a750ba93d5bf772ecdc857e87a86403a9"
+    },
+    {
+      "token0": "0x82af49447d8a07e3bd95bd0d56f35241523fbab1",
+      "token1": "0xff970a61a04b1ca14834a43f5de4533ebddb5cc8",
+      "token0_decimals": 18,
+      "token1_decimals": 6,
+      "fee": 500,
+      "tick_spacing": 10,
+      "pool_address": "0xc31e54c7a869b9fcbecc14363cf510d1c41fa443"
     }
   ],
   "strategy_templates": [
