@@ -3353,7 +3353,7 @@ class WorkflowAndDeploymentContractTests(unittest.TestCase):
             "contract_paused": True,
             "current_phase": "ROLLBACK_FAILED",
             "failure_evidence": {
-                "output": "existing route-ineligible state is invalid"
+                "stdout": "existing route-ineligible state is invalid"
             },
             "failure_phase": "POST_DISARMED_VERIFYING",
             "kill_switch": True,
@@ -3504,6 +3504,40 @@ class WorkflowAndDeploymentContractTests(unittest.TestCase):
                         }
                     ),
                 ),
+            ),
+            (
+                "signature_only_in_output",
+                lambda readiness, state: state.update(
+                    failure_evidence={
+                        "output": "existing route-ineligible state is invalid"
+                    }
+                ),
+            ),
+            (
+                "missing_failure_stdout",
+                lambda readiness, state: state.update(failure_evidence={}),
+            ),
+            (
+                "null_failure_stdout",
+                lambda readiness, state: state.update(
+                    failure_evidence={"stdout": None}
+                ),
+            ),
+            (
+                "non_string_failure_stdout",
+                lambda readiness, state: state.update(
+                    failure_evidence={"stdout": 7}
+                ),
+            ),
+            (
+                "incorrect_failure_stdout",
+                lambda readiness, state: state.update(
+                    failure_evidence={"stdout": "different rollback failure"}
+                ),
+            ),
+            (
+                "failure_evidence_not_object",
+                lambda readiness, state: state.update(failure_evidence=None),
             ),
         ]
         for lane in ("aave_armed", "atlas_armed", "armed"):

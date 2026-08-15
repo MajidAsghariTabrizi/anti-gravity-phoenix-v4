@@ -569,10 +569,12 @@ jobs:
           require(failed.get("kill_switch") is True, "failed_kill_switch")
           require(failed.get("mutation_started") is True, "failed_mutation_identity")
           require(failed.get("failure_phase") == "POST_DISARMED_VERIFYING", "failed_failure_phase")
-          failure_output = failed.get("failure_evidence", {}).get("output")
+          failure_evidence = failed.get("failure_evidence")
+          require(isinstance(failure_evidence, dict), "failed_failure_evidence")
+          failure_stdout = failure_evidence.get("stdout")
+          require(isinstance(failure_stdout, str), "failed_failure_stdout")
           require(
-              isinstance(failure_output, str)
-              and "existing route-ineligible state is invalid" in failure_output,
+              "existing route-ineligible state is invalid" in failure_stdout,
               "poisoned_state_signature",
           )
 
