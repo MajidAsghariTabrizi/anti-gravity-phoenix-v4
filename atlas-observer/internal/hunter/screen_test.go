@@ -4585,6 +4585,91 @@ func TestCurrentRouteIneligibleReasonsSurviveRestart(t *testing.T) {
 	}
 }
 
+func TestTransientRouteIneligibleDiagnosticsNeverEnterDurableState(t *testing.T) {
+	borrower := "0x1111111111111111111111111111111111111111"
+	for _, reason := range []string{
+		"no_reviewed_unwind_route",
+		"no_supported_debt_asset",
+		"unsupported_stable_usdc_e_debt",
+	} {
+		t.Run(reason, func(t *testing.T) {
+			record := signal{Borrower: borrower, ExactRouteIneligibleReason: reason}
+			screener := &Screener{state: State{
+				Counts:          map[string]uint64{},
+				RouteIneligible: map[string]string{borrower: "no_weth_debt"},
+			}}
+			screener.recordRouteIneligibleLocked(record.Borrower, record.ExactRouteIneligibleReason)
+			if record.ExactRouteIneligibleReason != reason {
+				t.Fatalf("precise signal diagnostic changed: got=%q want=%q", record.ExactRouteIneligibleReason, reason)
+			}
+			if _, exists := screener.state.RouteIneligible[borrower]; exists {
+				t.Fatalf("transient reason entered durable state: %+v", screener.state.RouteIneligible)
+			}
+			if screener.state.Counts[exactRouteIneligibleObservedKey] != 1 {
+				t.Fatalf("transient diagnostic was not counted: %+v", screener.state.Counts)
+			}
+		})
+	}
+}
+
+func TestTransientRouteIneligibleStateIsSanitizedDurablyAndRestartSafe(t *testing.T) {
+	directory := t.TempDir()
+	discoveryHash := strings.Repeat("a", 64)
+	legacyBorrower := "0x1111111111111111111111111111111111111111"
+	transientReasons := []string{
+		"no_reviewed_unwind_route",
+		"no_supported_debt_asset",
+		"unsupported_stable_usdc_e_debt",
+	}
+	routes := map[string]string{legacyBorrower: "no_weth_debt"}
+	for index, reason := range transientReasons {
+		routes[fmt.Sprintf("0x%040x", index+2)] = reason
+	}
+	poisoned := &Screener{
+		config: Config{StateDir: directory, DiscoverySHA256: discoveryHash},
+		state: State{
+			Schema: StateSchema, DiscoverySHA256: discoveryHash, Counts: map[string]uint64{},
+			RouteIneligible: routes,
+		},
+	}
+	if err := poisoned.persistState(); err != nil {
+		t.Fatal(err)
+	}
+
+	loaded := &Screener{config: Config{StateDir: directory, DiscoverySHA256: discoveryHash}}
+	if err := loaded.loadState(); err != nil {
+		t.Fatalf("current loader rejected transient reasons: %v", err)
+	}
+	if len(loaded.state.RouteIneligible) != 1 || loaded.state.RouteIneligible[legacyBorrower] != "no_weth_debt" {
+		t.Fatalf("state was not sanitized without changing legacy semantics: %+v", loaded.state.RouteIneligible)
+	}
+
+	data, err := os.ReadFile(filepath.Join(directory, "state.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var durable State
+	if err := json.Unmarshal(data, &durable); err != nil {
+		t.Fatal(err)
+	}
+	for borrower, reason := range durable.RouteIneligible {
+		if !rollbackCompatibleRouteIneligibleReason(reason) {
+			t.Fatalf("persisted state is not rollback-compatible: borrower=%s reason=%s", borrower, reason)
+		}
+	}
+	if len(durable.RouteIneligible) != 1 || durable.RouteIneligible[legacyBorrower] != "no_weth_debt" {
+		t.Fatalf("sanitized disk state changed legacy route semantics: %+v", durable.RouteIneligible)
+	}
+
+	restarted := &Screener{config: Config{StateDir: directory, DiscoverySHA256: discoveryHash}}
+	if err := restarted.loadState(); err != nil {
+		t.Fatalf("sanitized state did not survive restart: %v", err)
+	}
+	if len(restarted.state.RouteIneligible) != 1 || restarted.state.RouteIneligible[legacyBorrower] != "no_weth_debt" {
+		t.Fatalf("restart changed rollback-compatible state: %+v", restarted.state.RouteIneligible)
+	}
+}
+
 func TestLegacyUSDCCollateralReasonsAreRevalidatedOnRestart(t *testing.T) {
 	directory := t.TempDir()
 	discoveryHash := strings.Repeat("a", 64)
