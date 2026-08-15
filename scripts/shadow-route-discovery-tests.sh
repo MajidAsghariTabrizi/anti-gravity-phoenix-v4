@@ -152,10 +152,20 @@ assert evidence["maximum_reviewed_input_wei"] == "10000000000000000"
 assert evidence["factory"]["address"] == proofs["factory"]
 assert evidence["factory"]["pool_init_code_hash"] == proofs["pool_init_code_hash"]
 assert evidence["evidence"]["chain_id_result"] == "0xa4b1"
-proof_by_fee = {pool["fee"]: pool for pool in proofs["pools"]}
-assert set(proof_by_fee) == {100, 500, 3000, 10000}
+proof_by_identity = {
+    (pool["token0"], pool["token1"], pool["fee"]): pool
+    for pool in proofs["pools"]
+}
+native_usdc_by_fee = {
+    pool["fee"]: pool
+    for pool in proofs["pools"]
+    if pool["token1"] == "0xaf88d065e77c8cc2239327c5edb3a432268e5831"
+}
+assert set(native_usdc_by_fee) == {100, 500, 3000, 10000}
 for pool in evidence["pools"]:
-    reviewed = proof_by_fee[pool["fee"]]
+    reviewed = proof_by_identity[
+        (pool["token0_result"], pool["token1_result"], pool["fee"])
+    ]
     assert pool["factory_result"] == proofs["factory"]
     assert pool["token0_result"] == reviewed["token0"]
     assert pool["token1_result"] == reviewed["token1"]

@@ -72,6 +72,8 @@ const EIP1967_IMPLEMENTATION_SLOT: &str =
     "0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc";
 const ARBITRUM_WETH: &str = "0x82af49447d8a07e3bd95bd0d56f35241523fbab1";
 const ARBITRUM_NATIVE_USDC: &str = "0xaf88d065e77c8cc2239327c5edb3a432268e5831";
+const ARBITRUM_USDC_E: &str = "0xff970a61a04b1ca14834a43f5de4533ebddb5cc8";
+const REVIEWED_WETH_USDC_E_POOL_500: &str = "0xc31e54c7a869b9fcbecc14363cf510d1c41fa443";
 const ARBITRUM_NODE_INTERFACE: &str = "0x00000000000000000000000000000000000000c8";
 const ZERO_ADDRESS: &str = "0x0000000000000000000000000000000000000000";
 const UNISWAP_V3_QUOTER_V2_ARBITRUM: &str = "0x61ffe014ba17989e743c5f6cb21bf9697530b21e";
@@ -243,6 +245,11 @@ pub fn reviewed_aave_unwind_routes() -> Result<Vec<ReviewedAaveUnwindRoute>, Gat
         .pools
         .into_iter()
         .filter(|proof| {
+            if proof.pool_address == REVIEWED_WETH_USDC_E_POOL_500 {
+                return proof.token0 == ARBITRUM_WETH
+                    && proof.token1 == ARBITRUM_USDC_E
+                    && proof.fee == 500;
+            }
             let Some(zero_for_one) =
                 uniswap_zero_for_one(ARBITRUM_NATIVE_USDC, &proof.token0, &proof.token1)
             else {
@@ -256,7 +263,8 @@ pub fn reviewed_aave_unwind_routes() -> Result<Vec<ReviewedAaveUnwindRoute>, Gat
             reviewed_pools.contains(&(proof.pool_address.clone(), proof.fee, direction.to_string()))
         })
         .map(|proof| ReviewedAaveUnwindRoute {
-            zero_for_one: proof.token0 == ARBITRUM_NATIVE_USDC,
+            zero_for_one: proof.token0 == ARBITRUM_NATIVE_USDC
+                || proof.pool_address == REVIEWED_WETH_USDC_E_POOL_500,
             pool: proof.pool_address,
             factory: proofs.factory.clone(),
             token0: proof.token0,
@@ -265,16 +273,14 @@ pub fn reviewed_aave_unwind_routes() -> Result<Vec<ReviewedAaveUnwindRoute>, Gat
         })
         .collect::<Vec<_>>();
     routes.sort_by_key(|route| route.fee);
-    if routes.is_empty()
+    if routes.len() != 4
         || routes.len() > 4
         || routes.iter().any(|route| {
             !matches!(route.fee, 100 | 500 | 3_000)
                 || route.pool.len() != 42
                 || !route.pool.starts_with("0x")
         })
-        || routes
-            .windows(2)
-            .any(|pair| pair[0].fee == pair[1].fee || pair[0].pool == pair[1].pool)
+        || routes.windows(2).any(|pair| pair[0].pool == pair[1].pool)
     {
         return Err(GatewayError::ProviderIntegrity);
     }
@@ -1150,88 +1156,14 @@ impl GatewayRuntime {
                 ProviderSlot::Primary,
             )
             .await?;
-        let maximum_fee = decimal_u256(&request.max_fee_per_gas)?;
-        let priority_fee = decimal_u256(&request.max_priority_fee_per_gas)?;
-        let (
-            estimated_gas_limit,
-            estimated_max_fee_per_gas,
-            estimated_execution_cost,
-            estimated_l1_cost,
-        ) = bounded_aave_gas_quote(
-            primary_evidence.total_gas,
-            primary_evidence.l1_gas,
-            primary_evidence.base_fee_per_gas,
-            maximum_fee,
-            priority_fee,
-            request.gas_limit,
-        )?;
-        let flash_premium = percent_mul(
-            decimal_u256(&request.repay_amount)?,
-            U256::from(primary_evidence.flash_premium_bps),
-        )?;
-        if primary_evidence.realized_profit < decimal_u256(&request.minimum_profit)? {
-            return Err(GatewayError::StateIncomplete);
-        }
-        let conservative_net = aave_conservative_simulation_net(
-            primary_evidence.realized_profit,
-            estimated_execution_cost,
-            decimal_u256(&request.atlas_bid)?,
+        let response = build_aave_simulation_response(
+            &request,
+            &route_id,
+            &calldata,
+            primary.provider_id(),
+            primary_evidence,
         )?;
         self.mark_provider_success(primary.provider_id()).await;
-        let calldata_hex = format!("0x{}", hex::encode(&calldata));
-        let calldata_hash = canonical_hash_bytes(&calldata);
-        let simulation_result_hash = canonical_hash_bytes(
-            &serde_json::to_vec(&json!({
-                "request": request,
-                "route_id": route_id,
-                "calldata_hash": calldata_hash,
-                "realized_profit": primary_evidence.realized_profit.to_string(),
-                "conservative_net_pnl": conservative_net.to_string(),
-                "estimated_gas_limit": estimated_gas_limit,
-                "estimated_max_fee_per_gas_wei": estimated_max_fee_per_gas.to_string(),
-                "estimated_execution_cost_wei": estimated_execution_cost.to_string(),
-                "estimated_l1_cost_wei": estimated_l1_cost.to_string(),
-                "flash_premium_wei": flash_premium.to_string(),
-                "atlas_mode": request.atlas_mode,
-                "atlas_bid": request.atlas_bid,
-                "provider": primary.provider_id()
-            }))
-            .map_err(|_| GatewayError::ProviderIntegrity)?,
-        );
-        let response = AaveSimulateResponse {
-            schema_version: AAVE_SIMULATE_RESPONSE_SCHEMA.to_string(),
-            chain_id: ARBITRUM_ONE_CHAIN_ID,
-            request_id: request.request_id.clone(),
-            block_number: request.block_number,
-            block_hash: request.block_hash.clone(),
-            state_root: request.state_root.clone(),
-            primary_provider_id: primary.provider_id().to_string(),
-            confirmation_provider_id: None,
-            quorum: 1,
-            evidence_mode: if request.atlas_mode {
-                SINGLE_PRIMARY_ATLAS_CALLBACK_FORK_EVIDENCE.to_string()
-            } else if request.counterfactual {
-                SINGLE_PRIMARY_COUNTERFACTUAL_FORK_EVIDENCE.to_string()
-            } else {
-                SINGLE_PRIMARY_FORK_EVIDENCE.to_string()
-            },
-            route_id,
-            calldata_hex,
-            calldata_hash,
-            simulation_result_hash,
-            realized_profit: primary_evidence.realized_profit.to_string(),
-            conservative_net_pnl: conservative_net.to_string(),
-            estimated_gas_limit,
-            estimated_max_fee_per_gas_wei: estimated_max_fee_per_gas.to_string(),
-            estimated_execution_cost_wei: estimated_execution_cost.to_string(),
-            estimated_l1_cost_wei: estimated_l1_cost.to_string(),
-            flash_premium_wei: flash_premium.to_string(),
-            deadline_unix_seconds: request.deadline_unix_seconds,
-            resolved_at_unix_ms: unix_time_ms(),
-        };
-        response
-            .validate(&request)
-            .map_err(|_| GatewayError::ProviderDisagreement)?;
         Ok(response)
     }
 
@@ -1913,7 +1845,7 @@ impl GatewayRuntime {
         pacing_deadline: Instant,
     ) -> Result<AaveExactProviderResult, GatewayError> {
         let block_quantity = format_quantity(block.number);
-        let supported_assets = [ARBITRUM_WETH, ARBITRUM_NATIVE_USDC];
+        let supported_assets = [ARBITRUM_WETH, ARBITRUM_NATIVE_USDC, ARBITRUM_USDC_E];
         let static_key =
             aave_exact_static_context_key(provider.provider_id(), block, expected_state_root);
         let cached_context = self
@@ -2077,7 +2009,7 @@ impl GatewayRuntime {
         let results = self
             .hunter_multicall_paced(provider, block, slot, &calls, pacing_deadline)
             .await?;
-        if results.len() != 16
+        if results.len() != 22
             || results[0].len() != 32 * 6
             || results[1].len() != 32
             || results[2].len() != 32
@@ -2105,7 +2037,7 @@ impl GatewayRuntime {
             .ok()
             .filter(|value| u64::from(*value) <= PERCENTAGE_FACTOR)
             .ok_or(GatewayError::ProviderIntegrity)?;
-        let mut reserves = Vec::with_capacity(2);
+        let mut reserves = Vec::with_capacity(3);
         for (index, asset) in supported_assets.iter().enumerate() {
             let offset = 4 + index * 6;
             if results[offset].len() != 32 * 9
@@ -2206,28 +2138,37 @@ impl GatewayRuntime {
             emode_liquidation_bonus_bps,
             flash_premium_bps,
         )?;
-        let quoted_indices = liquidations
-            .iter()
-            .enumerate()
-            .filter(|(_, opportunity)| opportunity.collateral_asset == ARBITRUM_NATIVE_USDC)
-            .map(|(index, _)| index)
-            .collect::<Vec<_>>();
-        if !quoted_indices.is_empty() {
-            let reviewed_routes = reviewed_aave_unwind_routes()?;
-            let quote_calls = quoted_indices
+        let reviewed_routes = reviewed_aave_unwind_routes()?;
+        let mut quote_specs = Vec::new();
+        for (index, opportunity) in liquidations.iter().enumerate() {
+            if opportunity.collateral_asset == opportunity.debt_asset {
+                continue;
+            }
+            for route in &reviewed_routes {
+                let pair_matches = (route.token0 == opportunity.collateral_asset
+                    && route.token1 == opportunity.debt_asset)
+                    || (route.token1 == opportunity.collateral_asset
+                        && route.token0 == opportunity.debt_asset);
+                if pair_matches {
+                    quote_specs.push((index, route.clone()));
+                }
+            }
+        }
+        if !quote_specs.is_empty() {
+            let quote_calls = quote_specs
                 .iter()
-                .flat_map(|index| {
+                .map(|(index, route)| {
                     let amount = decimal_u256(&liquidations[*index].liquidator_collateral)
                         .expect("validated liquidation collateral");
-                    reviewed_routes.iter().map(move |route| EthCall {
+                    EthCall {
                         target: UNISWAP_V3_QUOTER_V2_ARBITRUM.to_string(),
                         calldata: encode_uniswap_quote(
-                            ARBITRUM_NATIVE_USDC,
-                            ARBITRUM_WETH,
+                            &liquidations[*index].collateral_asset,
+                            &liquidations[*index].debt_asset,
                             amount,
                             route.fee,
                         ),
-                    })
+                    }
                 })
                 .collect::<Vec<_>>();
             let quotes = self
@@ -2236,23 +2177,26 @@ impl GatewayRuntime {
             if quotes.len() != quote_calls.len() || quotes.iter().any(|value| value.len() < 32) {
                 return Err(GatewayError::ProviderIntegrity);
             }
-            for (quote_index, liquidation_index) in quoted_indices.into_iter().enumerate() {
-                liquidations[liquidation_index].unwind_quotes = reviewed_routes
-                    .iter()
-                    .enumerate()
-                    .map(|(route_index, route)| AaveExactUnwindQuoteState {
-                        pool: route.pool.clone(),
-                        factory: route.factory.clone(),
-                        token0: route.token0.clone(),
-                        token1: route.token1.clone(),
+            for (quote_index, (liquidation_index, route)) in quote_specs.into_iter().enumerate() {
+                let output_debt_asset = U256::from_big_endian(&quotes[quote_index][..32]);
+                let debt_price =
+                    decimal_u256(&liquidations[liquidation_index].debt_asset_price_base)?;
+                let weth_price = decimal_u256(&liquidations[liquidation_index].weth_price_base)?;
+                let debt_unit = asset_unit(liquidations[liquidation_index].debt_asset_decimals)?;
+                let output_weth =
+                    debt_to_weth_floor(output_debt_asset, debt_price, weth_price, debt_unit)?;
+                liquidations[liquidation_index]
+                    .unwind_quotes
+                    .push(AaveExactUnwindQuoteState {
+                        pool: route.pool,
+                        factory: route.factory,
+                        token0: route.token0,
+                        token1: route.token1,
                         fee: route.fee,
                         zero_for_one: route.zero_for_one,
-                        output_weth: U256::from_big_endian(
-                            &quotes[quote_index * reviewed_routes.len() + route_index][..32],
-                        )
-                        .to_string(),
-                    })
-                    .collect();
+                        output_weth: output_weth.to_string(),
+                        output_debt_asset: output_debt_asset.to_string(),
+                    });
             }
         }
         let verify = self
@@ -4026,7 +3970,7 @@ fn aave_exact_static_context_key(
     state_root: &str,
 ) -> String {
     format!(
-        "aave-exact:{provider_id}:{}:{}:{state_root}:{AAVE_V3_POOL_ARBITRUM}:{ARBITRUM_WETH}:{ARBITRUM_NATIVE_USDC}",
+        "aave-exact:{provider_id}:{}:{}:{state_root}:{AAVE_V3_POOL_ARBITRUM}:{ARBITRUM_WETH}:{ARBITRUM_NATIVE_USDC}:{ARBITRUM_USDC_E}",
         block.number, block.hash
     )
 }
@@ -4132,15 +4076,22 @@ fn build_aave_simulation_response(
         priority_fee,
         request.gas_limit,
     )?;
-    let flash_premium = percent_mul(
+    let flash_premium_debt_asset = percent_mul(
         decimal_u256(&request.repay_amount)?,
         U256::from(evidence.flash_premium_bps),
     )?;
     if evidence.realized_profit < decimal_u256(&request.minimum_profit)? {
         return Err(GatewayError::StateIncomplete);
     }
+    let debt_price = decimal_u256(&request.debt_asset_price_base)?;
+    let weth_price = decimal_u256(&request.weth_price_base)?;
+    let debt_unit = asset_unit(request.debt_asset_decimals)?;
+    let realized_profit =
+        debt_to_weth_floor(evidence.realized_profit, debt_price, weth_price, debt_unit)?;
+    let flash_premium =
+        debt_to_weth_floor(flash_premium_debt_asset, debt_price, weth_price, debt_unit)?;
     let conservative_net = aave_conservative_simulation_net(
-        evidence.realized_profit,
+        realized_profit,
         estimated_execution_cost,
         decimal_u256(&request.atlas_bid)?,
     )?;
@@ -4151,13 +4102,15 @@ fn build_aave_simulation_response(
             "request": request,
             "route_id": route_id,
             "calldata_hash": calldata_hash,
-            "realized_profit": evidence.realized_profit.to_string(),
+            "realized_profit": realized_profit.to_string(),
+            "realized_profit_debt_asset": evidence.realized_profit.to_string(),
             "conservative_net_pnl": conservative_net.to_string(),
             "estimated_gas_limit": estimated_gas_limit,
             "estimated_max_fee_per_gas_wei": estimated_max_fee_per_gas.to_string(),
             "estimated_execution_cost_wei": estimated_execution_cost.to_string(),
             "estimated_l1_cost_wei": estimated_l1_cost.to_string(),
             "flash_premium_wei": flash_premium.to_string(),
+            "flash_premium_debt_asset": flash_premium_debt_asset.to_string(),
             "atlas_mode": request.atlas_mode,
             "atlas_bid": request.atlas_bid,
             "provider": primary_provider_id
@@ -4185,13 +4138,15 @@ fn build_aave_simulation_response(
         calldata_hex,
         calldata_hash,
         simulation_result_hash,
-        realized_profit: evidence.realized_profit.to_string(),
+        realized_profit: realized_profit.to_string(),
+        realized_profit_debt_asset: evidence.realized_profit.to_string(),
         conservative_net_pnl: conservative_net.to_string(),
         estimated_gas_limit,
         estimated_max_fee_per_gas_wei: estimated_max_fee_per_gas.to_string(),
         estimated_execution_cost_wei: estimated_execution_cost.to_string(),
         estimated_l1_cost_wei: estimated_l1_cost.to_string(),
         flash_premium_wei: flash_premium.to_string(),
+        flash_premium_debt_asset: flash_premium_debt_asset.to_string(),
         deadline_unix_seconds: request.deadline_unix_seconds,
         resolved_at_unix_ms: unix_time_ms(),
     };
@@ -4202,27 +4157,35 @@ fn build_aave_simulation_response(
 }
 
 fn validate_aave_simulation_identity(request: &AaveSimulateRequest) -> Result<(), GatewayError> {
-    let route_valid = if request.collateral_asset == ARBITRUM_WETH {
-        request.selected_pool == ZERO_ADDRESS
-            && request.selected_factory == ZERO_ADDRESS
-            && request.selected_fee == 0
-            && !request.zero_for_one
-    } else if request.collateral_asset == ARBITRUM_NATIVE_USDC {
-        reviewed_aave_unwind_routes()?.iter().any(|route| {
-            request.selected_factory == route.factory
-                && request.selected_pool == route.pool
-                && request.selected_fee == route.fee
-                && request.zero_for_one == route.zero_for_one
-        })
-    } else {
-        false
-    };
+    let route_valid =
+        if request.debt_asset == ARBITRUM_WETH && request.collateral_asset == ARBITRUM_WETH {
+            request.selected_pool == ZERO_ADDRESS
+                && request.selected_factory == ZERO_ADDRESS
+                && request.selected_fee == 0
+                && !request.zero_for_one
+        } else if (request.debt_asset == ARBITRUM_WETH
+            && request.collateral_asset == ARBITRUM_NATIVE_USDC)
+            || (request.debt_asset == ARBITRUM_USDC_E && request.collateral_asset == ARBITRUM_WETH)
+        {
+            reviewed_aave_unwind_routes()?.iter().any(|route| {
+                request.selected_factory == route.factory
+                    && request.selected_pool == route.pool
+                    && request.selected_fee == route.fee
+                    && request.zero_for_one == route.zero_for_one
+                    && ((route.token0 == request.collateral_asset
+                        && route.token1 == request.debt_asset)
+                        || (route.token1 == request.collateral_asset
+                            && route.token0 == request.debt_asset))
+            })
+        } else {
+            false
+        };
     let atlas_bid = decimal_u256(&request.atlas_bid)?;
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_err(|_| GatewayError::InvalidRequest)?
         .as_secs();
-    if request.debt_asset != ARBITRUM_WETH
+    if !matches!(request.debt_asset.as_str(), ARBITRUM_WETH | ARBITRUM_USDC_E)
         || !route_valid
         || request.atlas_mode == atlas_bid.is_zero()
         || request.deadline_unix_seconds <= now
@@ -4244,13 +4207,19 @@ fn aave_simulation_route_id(request: &AaveSimulateRequest) -> Result<String, Gat
         "borrower": request.borrower,
         "debt_asset": request.debt_asset,
         "collateral_asset": request.collateral_asset,
+        "debt_asset_decimals": request.debt_asset_decimals,
+        "debt_asset_price_base": request.debt_asset_price_base,
+        "weth_price_base": request.weth_price_base,
         "repay_amount": request.repay_amount,
         "maximum_input_amount": request.maximum_input_amount,
         "live_maximum_input_amount": request.live_maximum_input_amount,
+        "maximum_input_weth_wei": request.maximum_input_weth_wei,
+        "live_maximum_input_weth_wei": request.live_maximum_input_weth_wei,
         "counterfactual": request.counterfactual,
         "minimum_collateral_received": request.minimum_collateral_received,
         "minimum_unwind_output": request.minimum_unwind_output,
         "minimum_profit": request.minimum_profit,
+        "minimum_profit_weth_wei": request.minimum_profit_weth_wei,
         "selected_pool": request.selected_pool,
         "selected_factory": request.selected_factory,
         "selected_fee": request.selected_fee,
@@ -4500,19 +4469,61 @@ struct AaveLiquidationAmounts {
 fn supported_aave_liquidations(
     account: &AaveAccountData,
     reserves: &[AaveExactReserveState],
-    maximum_input: U256,
+    maximum_input_weth: U256,
+    emode_collateral_bitmap: U256,
+    emode_liquidation_bonus_bps: u16,
+    flash_premium_bps: u16,
+) -> Result<Vec<AaveExactLiquidationState>, GatewayError> {
+    let weth_price = reserves
+        .iter()
+        .find(|reserve| reserve.asset == ARBITRUM_WETH)
+        .ok_or(GatewayError::ProviderIntegrity)
+        .and_then(|reserve| decimal_u256(&reserve.oracle_price_base))?;
+    let mut variants = supported_aave_debt_liquidations(
+        account,
+        reserves,
+        ARBITRUM_WETH,
+        &[ARBITRUM_WETH, ARBITRUM_NATIVE_USDC],
+        maximum_input_weth,
+        weth_price,
+        emode_collateral_bitmap,
+        emode_liquidation_bonus_bps,
+        flash_premium_bps,
+    )?;
+    variants.extend(supported_aave_debt_liquidations(
+        account,
+        reserves,
+        ARBITRUM_USDC_E,
+        &[ARBITRUM_WETH],
+        maximum_input_weth,
+        weth_price,
+        emode_collateral_bitmap,
+        emode_liquidation_bonus_bps,
+        flash_premium_bps,
+    )?);
+    Ok(variants)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn supported_aave_debt_liquidations(
+    account: &AaveAccountData,
+    reserves: &[AaveExactReserveState],
+    debt_asset: &str,
+    collateral_assets: &[&str],
+    maximum_input_weth: U256,
+    weth_price: U256,
     emode_collateral_bitmap: U256,
     emode_liquidation_bonus_bps: u16,
     flash_premium_bps: u16,
 ) -> Result<Vec<AaveExactLiquidationState>, GatewayError> {
     let health_factor = U256::from_dec_str(&account.health_factor_wad)
         .map_err(|_| GatewayError::ProviderIntegrity)?;
-    if health_factor >= U256::exp10(18) || maximum_input.is_zero() {
+    if health_factor >= U256::exp10(18) || maximum_input_weth.is_zero() {
         return Ok(Vec::new());
     }
     let debt = reserves
         .iter()
-        .find(|reserve| reserve.asset == ARBITRUM_WETH)
+        .find(|reserve| reserve.asset == debt_asset)
         .ok_or(GatewayError::ProviderIntegrity)?;
     let debt_configuration = U256::from_dec_str(&debt.configuration_data)
         .map_err(|_| GatewayError::ProviderIntegrity)?;
@@ -4535,16 +4546,20 @@ fn supported_aave_liquidations(
     }
     let debt_price = decimal_u256(&debt.oracle_price_base)?;
     let debt_unit = asset_unit(debt.decimals)?;
-    if debt_price.is_zero() {
+    if debt_price.is_zero() || weth_price.is_zero() {
         return Err(GatewayError::ProviderIntegrity);
+    }
+    let maximum_input = weth_to_debt_floor(maximum_input_weth, weth_price, debt_price, debt_unit)?;
+    if maximum_input.is_zero() {
+        return Ok(Vec::new());
     }
     let debt_reserve_base = mul_div_ceil(total_debt, debt_price, debt_unit)?;
     let total_account_debt_base = decimal_u256(&account.total_debt_base)?;
-    let mut variants = Vec::with_capacity((SizeLevel::ALL.len() + 1) * 2);
+    let mut variants = Vec::with_capacity((SizeLevel::ALL.len() + 1) * collateral_assets.len());
 
     for collateral in reserves
         .iter()
-        .filter(|reserve| reserve.asset == ARBITRUM_WETH || reserve.asset == ARBITRUM_NATIVE_USDC)
+        .filter(|reserve| collateral_assets.contains(&reserve.asset.as_str()))
     {
         let collateral_configuration = U256::from_dec_str(&collateral.configuration_data)
             .map_err(|_| GatewayError::ProviderIntegrity)?;
@@ -4613,7 +4628,8 @@ fn supported_aave_liquidations(
         if maximum.actual_repay.is_zero() {
             continue;
         }
-        let fixed_grid = liquidation_size_grid(maximum.actual_repay)?;
+        let fixed_grid =
+            liquidation_size_grid(maximum.actual_repay, weth_price, debt_price, debt_unit)?;
         let mut fixed_failed_only_for_dust = !fixed_grid.is_empty();
         let mut accepted_fixed = false;
         for requested_repay in fixed_grid.iter().copied() {
@@ -4645,13 +4661,18 @@ fn supported_aave_liquidations(
             fixed_failed_only_for_dust = false;
             accepted_fixed = true;
             variants.push(aave_liquidation_state(
+                debt_asset,
                 &collateral.asset,
                 requested_repay,
+                maximum_input,
+                reviewed_weth_size_for_debt(requested_repay, weth_price, debt_price, debt_unit)?,
                 amounts,
                 collateral_price,
                 debt_price,
+                weth_price,
                 collateral_unit,
                 debt_unit,
+                debt.decimals,
                 flash_premium_bps,
                 FIXED_REVIEWED_SIZE,
                 "",
@@ -4666,9 +4687,7 @@ fn supported_aave_liquidations(
         };
         if !accepted_fixed {
             if let Some(reason) = terminal_reason {
-                let terminal_size = maximum
-                    .actual_repay
-                    .min(U256::from(MAXIMUM_REVIEWED_INPUT_WEI));
+                let terminal_size = maximum.actual_repay.min(maximum_input);
                 if !terminal_size.is_zero() && !fixed_grid.contains(&terminal_size) {
                     let amounts = calculate_aave_liquidation_amounts(
                         terminal_size,
@@ -4692,13 +4711,18 @@ fn supported_aave_liquidations(
                         )?
                     {
                         variants.push(aave_liquidation_state(
+                            debt_asset,
                             &collateral.asset,
                             terminal_size,
+                            maximum_input,
+                            debt_to_weth_floor(terminal_size, debt_price, weth_price, debt_unit)?,
                             amounts,
                             collateral_price,
                             debt_price,
+                            weth_price,
                             collateral_unit,
                             debt_unit,
+                            debt.decimals,
                             flash_premium_bps,
                             TERMINAL_SIZE_REQUIRED,
                             reason,
@@ -4713,13 +4737,18 @@ fn supported_aave_liquidations(
 
 #[allow(clippy::too_many_arguments)]
 fn aave_liquidation_state(
+    debt_asset: &str,
     collateral_asset: &str,
     requested_repay: U256,
+    maximum_repay: U256,
+    reviewed_size_weth: U256,
     amounts: AaveLiquidationAmounts,
     collateral_price: U256,
     debt_price: U256,
+    weth_price: U256,
     collateral_unit: U256,
     debt_unit: U256,
+    debt_decimals: u8,
     flash_premium_bps: u16,
     size_classification: &str,
     terminal_size_reason: &str,
@@ -4730,9 +4759,22 @@ fn aave_liquidation_state(
         debt_unit,
         checked_mul(collateral_unit, debt_price)?,
     )?;
+    let oracle_unwind_output_weth =
+        debt_to_weth_floor(oracle_unwind_output, debt_price, weth_price, debt_unit)?;
     Ok(AaveExactLiquidationState {
-        debt_asset: ARBITRUM_WETH.to_string(),
+        debt_asset: debt_asset.to_string(),
         collateral_asset: collateral_asset.to_string(),
+        debt_asset_decimals: debt_decimals,
+        debt_asset_price_base: debt_price.to_string(),
+        weth_price_base: weth_price.to_string(),
+        maximum_repay_amount: maximum_repay.to_string(),
+        reviewed_size_weth_wei: reviewed_size_weth.to_string(),
+        debt_asset_review: if debt_asset == ARBITRUM_USDC_E {
+            "usdc_e_debt_reviewed"
+        } else {
+            "weth_debt_reviewed"
+        }
+        .to_string(),
         size_classification: size_classification.to_string(),
         terminal_size_reason: terminal_size_reason.to_string(),
         requested_repay_amount: requested_repay.to_string(),
@@ -4742,7 +4784,8 @@ fn aave_liquidation_state(
         seized_collateral: amounts.seized_before_fee.to_string(),
         protocol_fee_collateral: amounts.protocol_fee.to_string(),
         liquidator_collateral: amounts.liquidator_collateral.to_string(),
-        oracle_unwind_output_weth: oracle_unwind_output.to_string(),
+        oracle_unwind_output_weth: oracle_unwind_output_weth.to_string(),
+        oracle_unwind_output_debt_asset: oracle_unwind_output.to_string(),
         unwind_quotes: Vec::new(),
     })
 }
@@ -4833,13 +4876,48 @@ fn aave_liquidation_grace_elapsed(
     debt_grace_period_until < block_timestamp && collateral_grace_period_until < block_timestamp
 }
 
-fn liquidation_size_grid(maximum_repay: U256) -> Result<Vec<U256>, GatewayError> {
-    let bounded_maximum = maximum_repay.min(U256::from(MAXIMUM_REVIEWED_INPUT_WEI));
-    Ok(SizeLevel::ALL
+fn liquidation_size_grid(
+    maximum_repay: U256,
+    weth_price: U256,
+    debt_price: U256,
+    debt_unit: U256,
+) -> Result<Vec<U256>, GatewayError> {
+    SizeLevel::ALL
         .into_iter()
-        .map(|level| U256::from(level.amount_wei()))
-        .filter(|amount| *amount <= bounded_maximum)
-        .collect())
+        .map(|level| {
+            weth_to_debt_floor(
+                U256::from(level.amount_wei()),
+                weth_price,
+                debt_price,
+                debt_unit,
+            )
+        })
+        .filter_map(|result| match result {
+            Ok(amount) if !amount.is_zero() && amount <= maximum_repay => Some(Ok(amount)),
+            Ok(_) => None,
+            Err(error) => Some(Err(error)),
+        })
+        .collect()
+}
+
+fn reviewed_weth_size_for_debt(
+    debt_raw: U256,
+    weth_price: U256,
+    debt_price: U256,
+    debt_unit: U256,
+) -> Result<U256, GatewayError> {
+    for level in SizeLevel::ALL {
+        if weth_to_debt_floor(
+            U256::from(level.amount_wei()),
+            weth_price,
+            debt_price,
+            debt_unit,
+        )? == debt_raw
+        {
+            return Ok(U256::from(level.amount_wei()));
+        }
+    }
+    Err(GatewayError::ProviderIntegrity)
 }
 
 fn asset_unit(decimals: u8) -> Result<U256, GatewayError> {
@@ -4865,6 +4943,32 @@ fn mul_div_ceil(value: U256, multiplier: U256, divisor: U256) -> Result<U256, Ga
         .checked_add(divisor - U256::one())
         .ok_or(GatewayError::ProviderIntegrity)?
         / divisor)
+}
+
+fn weth_to_debt_floor(
+    weth_wei: U256,
+    weth_price: U256,
+    debt_price: U256,
+    debt_unit: U256,
+) -> Result<U256, GatewayError> {
+    mul_div_floor(
+        checked_mul(weth_wei, weth_price)?,
+        debt_unit,
+        checked_mul(U256::exp10(18), debt_price)?,
+    )
+}
+
+fn debt_to_weth_floor(
+    debt_raw: U256,
+    debt_price: U256,
+    weth_price: U256,
+    debt_unit: U256,
+) -> Result<U256, GatewayError> {
+    mul_div_floor(
+        checked_mul(debt_raw, debt_price)?,
+        U256::exp10(18),
+        checked_mul(debt_unit, weth_price)?,
+    )
 }
 
 fn percent_mul(value: U256, percentage: U256) -> Result<U256, GatewayError> {
@@ -5790,6 +5894,7 @@ mod tests {
                         [0xd1, 0x94, 0x6d, 0xbc] => encode(&[Token::Array(vec![
                             Token::Address(ARBITRUM_WETH.parse().unwrap()),
                             Token::Address(ARBITRUM_NATIVE_USDC.parse().unwrap()),
+                            Token::Address(ARBITRUM_USDC_E.parse().unwrap()),
                         ])]),
                         [0x28, 0xdd, 0x2d, 0x01, ..] => vec![0_u8; 32 * 9],
                         [0xc4, 0x4b, 0x11, 0xf7, ..] => {
@@ -5820,8 +5925,10 @@ mod tests {
                         [0x52, 0x75, 0x17, 0x97, ..] => {
                             if calldata[calldata.len() - 1] == 0 {
                                 address_bytes(ARBITRUM_WETH)
-                            } else {
+                            } else if calldata[calldata.len() - 1] == 1 {
                                 address_bytes(ARBITRUM_NATIVE_USDC)
+                            } else {
+                                address_bytes(ARBITRUM_USDC_E)
                             }
                         }
                         _ => panic!("unexpected inner selector"),
@@ -6115,13 +6222,19 @@ mod tests {
                 borrower: "0x4444444444444444444444444444444444444444".to_string(),
                 debt_asset: ARBITRUM_WETH.to_string(),
                 collateral_asset: ARBITRUM_WETH.to_string(),
+                debt_asset_decimals: 18,
+                debt_asset_price_base: "200000000000".to_string(),
+                weth_price_base: "200000000000".to_string(),
                 repay_amount: ((index + 1) * 1_000).to_string(),
                 maximum_input_amount: "10000".to_string(),
                 live_maximum_input_amount: "10000".to_string(),
+                maximum_input_weth_wei: "10000".to_string(),
+                live_maximum_input_weth_wei: "10000".to_string(),
                 counterfactual: false,
                 minimum_collateral_received: "1000".to_string(),
                 minimum_unwind_output: "1".to_string(),
                 minimum_profit: "1".to_string(),
+                minimum_profit_weth_wei: "1".to_string(),
                 expected_profit: "1000000000".to_string(),
                 retained_profit_floor: "1".to_string(),
                 selected_pool: "0x0000000000000000000000000000000000000000".to_string(),
@@ -6288,7 +6401,7 @@ mod tests {
             );
             assert_eq!(
                 multicall_inner_counts(miss_calls),
-                vec![1, 16],
+                vec![1, 22],
                 "identity={identity}"
             );
         }
@@ -7550,13 +7663,19 @@ mod tests {
             borrower: "0x3333333333333333333333333333333333333333".to_string(),
             debt_asset: ARBITRUM_WETH.to_string(),
             collateral_asset: ARBITRUM_NATIVE_USDC.to_string(),
+            debt_asset_decimals: 18,
+            debt_asset_price_base: "200000000000".to_string(),
+            weth_price_base: "200000000000".to_string(),
             repay_amount: "1000000".to_string(),
             maximum_input_amount: "2000000".to_string(),
             live_maximum_input_amount: "2000000".to_string(),
+            maximum_input_weth_wei: "2000000".to_string(),
+            live_maximum_input_weth_wei: "2000000".to_string(),
             counterfactual: false,
             minimum_collateral_received: "2000000".to_string(),
             minimum_unwind_output: "1100000".to_string(),
             minimum_profit: "50001000".to_string(),
+            minimum_profit_weth_wei: "50001000".to_string(),
             expected_profit: "100000000".to_string(),
             retained_profit_floor: "1000".to_string(),
             selected_pool: "0xc6962004f452be9203591991d15f6b388e09e8d0".to_string(),
@@ -7623,6 +7742,7 @@ mod tests {
         let mut counterfactual = request.clone();
         counterfactual.repay_amount = "3000000".to_string();
         counterfactual.maximum_input_amount = MAXIMUM_REVIEWED_INPUT_WEI.to_string();
+        counterfactual.maximum_input_weth_wei = MAXIMUM_REVIEWED_INPUT_WEI.to_string();
         counterfactual.counterfactual = true;
         counterfactual.validate().unwrap();
         let counterfactual_state_diff = aave_executor_simulation_state_diff(
@@ -7688,14 +7808,25 @@ mod tests {
         let routes = reviewed_aave_unwind_routes().unwrap();
         assert_eq!(
             routes.iter().map(|route| route.fee).collect::<Vec<_>>(),
-            vec![100, 500, 3_000]
+            vec![100, 500, 500, 3_000]
         );
-        assert!(routes.iter().all(|route| {
-            route.factory == UNISWAP_V3_FACTORY_ARBITRUM
-                && route.token0 == ARBITRUM_WETH
-                && route.token1 == ARBITRUM_NATIVE_USDC
-                && !route.zero_for_one
-        }));
+        assert!(routes
+            .iter()
+            .filter(|route| route.token1 == ARBITRUM_NATIVE_USDC)
+            .all(|route| {
+                route.factory == UNISWAP_V3_FACTORY_ARBITRUM
+                    && route.token0 == ARBITRUM_WETH
+                    && !route.zero_for_one
+            }));
+        let usdc_e = routes
+            .iter()
+            .find(|route| route.token1 == ARBITRUM_USDC_E)
+            .expect("reviewed USDC.e route");
+        assert_eq!(usdc_e.pool, REVIEWED_WETH_USDC_E_POOL_500);
+        assert_eq!(usdc_e.factory, UNISWAP_V3_FACTORY_ARBITRUM);
+        assert_eq!(usdc_e.token0, ARBITRUM_WETH);
+        assert_eq!(usdc_e.fee, 500);
+        assert!(usdc_e.zero_for_one);
         assert_eq!(
             uniswap_zero_for_one(ARBITRUM_NATIVE_USDC, ARBITRUM_NATIVE_USDC, ARBITRUM_WETH),
             Some(true)
@@ -7807,13 +7938,218 @@ mod tests {
                 10_500,
                 1_000,
             ),
+            aave_reserve(
+                ARBITRUM_USDC_E,
+                2,
+                6,
+                U256::zero(),
+                U256::zero(),
+                U256::zero(),
+                U256::from(100_000_000_u64),
+                10_500,
+                1_000,
+            ),
         ];
         (account, reserves)
     }
 
+    fn usdc_e_weth_exact_fixture(
+        stable_debt: U256,
+    ) -> (AaveAccountData, Vec<AaveExactReserveState>) {
+        let weth_unit = U256::exp10(18);
+        let usdc_e_unit = U256::exp10(6);
+        let weth_price = U256::from(2_000_u64 * 100_000_000);
+        let account = AaveAccountData {
+            borrower: "0x4444444444444444444444444444444444444444".to_string(),
+            total_collateral_base: (U256::from(30_000_u64 * 100_000_000)).to_string(),
+            total_debt_base: (U256::from(20_000_u64 * 100_000_000)).to_string(),
+            available_borrows_base: "0".to_string(),
+            current_liquidation_threshold_bps: "8000".to_string(),
+            loan_to_value_bps: "7500".to_string(),
+            health_factor_wad: (CLOSE_FACTOR_HF_THRESHOLD_WAD - 1).to_string(),
+        };
+        let reserves = vec![
+            aave_reserve(
+                ARBITRUM_WETH,
+                0,
+                18,
+                U256::from(15) * weth_unit,
+                U256::zero(),
+                U256::zero(),
+                weth_price,
+                10_500,
+                1_000,
+            ),
+            aave_reserve(
+                ARBITRUM_NATIVE_USDC,
+                1,
+                6,
+                U256::zero(),
+                U256::zero(),
+                U256::zero(),
+                U256::from(100_000_000_u64),
+                10_500,
+                1_000,
+            ),
+            aave_reserve(
+                ARBITRUM_USDC_E,
+                2,
+                6,
+                U256::zero(),
+                stable_debt,
+                U256::from(100_000) * usdc_e_unit,
+                U256::from(100_000_000_u64),
+                10_500,
+                1_000,
+            ),
+        ];
+        (account, reserves)
+    }
+
+    fn usdc_e_simulation_request() -> AaveSimulateRequest {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        AaveSimulateRequest {
+            schema_version: crate::aave_state::AAVE_SIMULATE_REQUEST_SCHEMA.to_string(),
+            chain_id: ARBITRUM_ONE_CHAIN_ID,
+            request_id: "aave-usdc-e-sim".to_string(),
+            block_number: 100,
+            block_hash: BLOCK_HASH.to_string(),
+            state_root: REORG_HASH.to_string(),
+            executor_address: "0x1111111111111111111111111111111111111111".to_string(),
+            executor_code_hash: "1".repeat(64),
+            caller_address: "0x2222222222222222222222222222222222222222".to_string(),
+            release_sha: "2".repeat(40),
+            borrower: "0x3333333333333333333333333333333333333333".to_string(),
+            debt_asset: ARBITRUM_USDC_E.to_string(),
+            collateral_asset: ARBITRUM_WETH.to_string(),
+            debt_asset_decimals: 6,
+            debt_asset_price_base: "100000000".to_string(),
+            weth_price_base: "200000000000".to_string(),
+            repay_amount: "10000000".to_string(),
+            maximum_input_amount: "20000000".to_string(),
+            live_maximum_input_amount: "20000000".to_string(),
+            maximum_input_weth_wei: MAXIMUM_REVIEWED_INPUT_WEI.to_string(),
+            live_maximum_input_weth_wei: MAXIMUM_REVIEWED_INPUT_WEI.to_string(),
+            counterfactual: false,
+            minimum_collateral_received: "5000000000000000".to_string(),
+            minimum_unwind_output: "10000001".to_string(),
+            minimum_profit: "2000".to_string(),
+            minimum_profit_weth_wei: "1000000000000".to_string(),
+            expected_profit: "1250000000000".to_string(),
+            retained_profit_floor: "1000000000000".to_string(),
+            selected_pool: REVIEWED_WETH_USDC_E_POOL_500.to_string(),
+            selected_factory: UNISWAP_V3_FACTORY_ARBITRUM.to_string(),
+            selected_fee: 500,
+            zero_for_one: true,
+            gas_limit: 500_000,
+            max_fee_per_gas: "100".to_string(),
+            max_priority_fee_per_gas: "10".to_string(),
+            deadline_unix_seconds: now + 60,
+            atlas_mode: false,
+            atlas_bid: "0".to_string(),
+        }
+    }
+
+    #[test]
+    fn usdc_e_variable_debt_weth_collateral_is_bounded_in_weth_value() {
+        let (account, reserves) = usdc_e_weth_exact_fixture(U256::zero());
+        let variants = supported_aave_liquidations(
+            &account,
+            &reserves,
+            U256::from(MAXIMUM_REVIEWED_INPUT_WEI),
+            U256::zero(),
+            0,
+            5,
+        )
+        .unwrap();
+        assert_eq!(variants.len(), SizeLevel::ALL.len());
+        assert!(variants.iter().all(|variant| {
+            variant.debt_asset == ARBITRUM_USDC_E
+                && variant.collateral_asset == ARBITRUM_WETH
+                && variant.debt_asset_decimals == 6
+                && variant.debt_asset_review == "usdc_e_debt_reviewed"
+                && variant.maximum_repay_amount == "20000000"
+        }));
+        assert_eq!(variants.last().unwrap().repay_amount, "20000000");
+        assert_ne!(
+            variants.last().unwrap().repay_amount,
+            MAXIMUM_REVIEWED_INPUT_WEI.to_string()
+        );
+
+        let routes = reviewed_aave_unwind_routes().unwrap();
+        let route = routes
+            .iter()
+            .find(|route| route.pool == REVIEWED_WETH_USDC_E_POOL_500)
+            .expect("reviewed WETH/USDC.e route");
+        assert_eq!(route.factory, UNISWAP_V3_FACTORY_ARBITRUM);
+        assert_eq!(route.token0, ARBITRUM_WETH);
+        assert_eq!(route.token1, ARBITRUM_USDC_E);
+        assert_eq!(route.fee, 500);
+        assert!(route.zero_for_one);
+    }
+
+    #[test]
+    fn stable_usdc_e_debt_and_unit_mixing_fail_closed() {
+        let (account, reserves) = usdc_e_weth_exact_fixture(U256::one());
+        assert!(supported_aave_liquidations(
+            &account,
+            &reserves,
+            U256::from(MAXIMUM_REVIEWED_INPUT_WEI),
+            U256::zero(),
+            0,
+            5,
+        )
+        .unwrap()
+        .is_empty());
+
+        let mut request = usdc_e_simulation_request();
+        request.validate().unwrap();
+        validate_aave_simulation_identity(&request).unwrap();
+        request.maximum_input_amount = MAXIMUM_REVIEWED_INPUT_WEI.to_string();
+        assert!(request.validate().is_err());
+        request = usdc_e_simulation_request();
+        request.minimum_profit = "1999".to_string();
+        assert!(request.validate().is_err());
+    }
+
+    #[test]
+    fn usdc_e_simulation_keeps_raw_flash_and_canonical_weth_economics_separate() {
+        let request = usdc_e_simulation_request();
+        let route_id = aave_simulation_route_id(&request).unwrap();
+        let response = build_aave_simulation_response(
+            &request,
+            &route_id,
+            &[1, 2, 3, 4, 5],
+            AAVE_PRIMARY_PROVIDER_ID,
+            AaveSimulationEvidence {
+                realized_profit: U256::from(2_500),
+                total_gas: 100_000,
+                l1_gas: 1_000,
+                base_fee_per_gas: U256::one(),
+                flash_premium_bps: 5,
+            },
+        )
+        .unwrap();
+        assert_eq!(response.realized_profit_debt_asset, "2500");
+        assert_eq!(response.realized_profit, "1250000000000");
+        assert_eq!(response.flash_premium_debt_asset, "5000");
+        assert_eq!(response.flash_premium_wei, "2500000000000");
+        response.validate(&request).unwrap();
+    }
+
     #[test]
     fn aave_size_grid_is_bounded_deduplicated_and_clamped() {
-        assert!(liquidation_size_grid(U256::from(3)).unwrap().is_empty());
+        assert!(liquidation_size_grid(
+            U256::from(3),
+            U256::from(1),
+            U256::from(1),
+            U256::exp10(18),
+        )
+        .unwrap()
+        .is_empty());
         let (account, reserves) = exact_aave_fixture(CLOSE_FACTOR_HF_THRESHOLD_WAD);
         let cap = U256::from(3) * U256::exp10(18);
         let variants =

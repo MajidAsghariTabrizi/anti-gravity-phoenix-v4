@@ -399,6 +399,7 @@ async fn nonce_allocation_and_pending_state_survive_restart() {
             premium: 1,
             realized_profit: 500,
         },
+        canonical_realized_profit_wei: 500,
         net_pnl_wei: 400,
     };
     second_restart
@@ -480,6 +481,7 @@ async fn nonce_allocation_and_pending_state_survive_restart() {
             premium: 0,
             realized_profit: 0,
         },
+        canonical_realized_profit_wei: 0,
         net_pnl_wei: -100,
     };
     second_restart

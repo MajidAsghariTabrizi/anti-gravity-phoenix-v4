@@ -1,8 +1,9 @@
 use crate::{
     AAVE_LIQUIDATION_ROUTE_FINGERPRINT, ARBITRUM_AAVE_V3_POOL_ADDRESS,
-    ARBITRUM_NATIVE_USDC_ADDRESS, ARBITRUM_ONE_CHAIN_ID, ARBITRUM_WETH_ADDRESS,
-    CURRENT_ROUTE_FINGERPRINT, CURRENT_ROUTE_POOL_3000_ADDRESS, CURRENT_ROUTE_POOL_500_ADDRESS,
-    REQUEST_SCHEMA_VERSION, REVERSE_ROUTE_FINGERPRINT,
+    ARBITRUM_NATIVE_USDC_ADDRESS, ARBITRUM_ONE_CHAIN_ID, ARBITRUM_USDC_E_ADDRESS,
+    ARBITRUM_WETH_ADDRESS, CURRENT_ROUTE_FINGERPRINT, CURRENT_ROUTE_POOL_3000_ADDRESS,
+    CURRENT_ROUTE_POOL_500_ADDRESS, REQUEST_SCHEMA_VERSION, REVERSE_ROUTE_FINGERPRINT,
+    REVIEWED_WETH_USDC_E_POOL_500_ADDRESS,
 };
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -136,6 +137,11 @@ pub struct RawAaveLiquidationRoute {
     pub borrower: String,
     pub debt_asset: String,
     pub collateral_asset: String,
+    pub debt_asset_decimals: u8,
+    pub debt_asset_price_base: String,
+    pub weth_price_base: String,
+    pub maximum_input_weth_wei: String,
+    pub minimum_profit_weth_wei: String,
     pub receive_a_token: bool,
     pub minimum_collateral_received: String,
     pub minimum_unwind_output: String,
@@ -150,6 +156,11 @@ pub struct AaveLiquidationRoute {
     pub borrower: CanonicalAddress,
     pub debt_asset: CanonicalAddress,
     pub collateral_asset: CanonicalAddress,
+    pub debt_asset_decimals: u8,
+    pub debt_asset_price_base: u128,
+    pub weth_price_base: u128,
+    pub maximum_input_weth_wei: u128,
+    pub minimum_profit_weth_wei: u128,
     pub receive_a_token: bool,
     pub minimum_collateral_received: u128,
     pub minimum_unwind_output: u128,
@@ -356,6 +367,11 @@ impl RawExecutionRequest {
                     borrower: CanonicalAddress::parse(&raw.borrower)?,
                     debt_asset: CanonicalAddress::parse(&raw.debt_asset)?,
                     collateral_asset: CanonicalAddress::parse(&raw.collateral_asset)?,
+                    debt_asset_decimals: raw.debt_asset_decimals,
+                    debt_asset_price_base: parse_positive_u128(&raw.debt_asset_price_base)?,
+                    weth_price_base: parse_positive_u128(&raw.weth_price_base)?,
+                    maximum_input_weth_wei: parse_positive_u128(&raw.maximum_input_weth_wei)?,
+                    minimum_profit_weth_wei: parse_positive_u128(&raw.minimum_profit_weth_wei)?,
                     receive_a_token: raw.receive_a_token,
                     minimum_collateral_received: parse_positive_u128(
                         &raw.minimum_collateral_received,
@@ -504,6 +520,11 @@ impl ExecutionRequest {
                     borrower: route.borrower.to_string(),
                     debt_asset: route.debt_asset.to_string(),
                     collateral_asset: route.collateral_asset.to_string(),
+                    debt_asset_decimals: route.debt_asset_decimals,
+                    debt_asset_price_base: route.debt_asset_price_base.to_string(),
+                    weth_price_base: route.weth_price_base.to_string(),
+                    maximum_input_weth_wei: route.maximum_input_weth_wei.to_string(),
+                    minimum_profit_weth_wei: route.minimum_profit_weth_wei.to_string(),
                     receive_a_token: route.receive_a_token,
                     minimum_collateral_received: route.minimum_collateral_received.to_string(),
                     minimum_unwind_output: route.minimum_unwind_output.to_string(),
@@ -555,6 +576,36 @@ fn validate_aave_route(
     if route.receive_a_token || route.debt_asset != flash_asset {
         return Err(ModelError::InvalidLegs);
     }
+    let weth = CanonicalAddress::parse(ARBITRUM_WETH_ADDRESS)?;
+    let usdc_e = CanonicalAddress::parse(ARBITRUM_USDC_E_ADDRESS)?;
+    let unit_valid = (route.debt_asset == weth
+        && route.debt_asset_decimals == 18
+        && route.debt_asset_price_base == route.weth_price_base)
+        || (route.debt_asset == usdc_e && route.debt_asset_decimals == 6);
+    if !unit_valid || route.maximum_input_weth_wei == 0 || route.minimum_profit_weth_wei == 0 {
+        return Err(ModelError::InvalidAmount);
+    }
+    if route.debt_asset == usdc_e {
+        let reviewed_pool = CanonicalAddress::parse(REVIEWED_WETH_USDC_E_POOL_500_ADDRESS)?;
+        let reviewed_factory =
+            CanonicalAddress::parse("0x1f98431c8ad98523631ae4a59f267346ea31f984")?;
+        let [leg] = legs else {
+            return Err(ModelError::InvalidLegs);
+        };
+        if route.collateral_asset != weth
+            || token_path != [weth, usdc_e]
+            || leg.pool != reviewed_pool
+            || leg.factory != Some(reviewed_factory)
+            || leg.token_in != weth
+            || leg.token_out != usdc_e
+            || leg.fee != 500
+            || !leg.zero_for_one
+            || leg.min_amount_out != route.minimum_unwind_output
+        {
+            return Err(ModelError::InvalidLegs);
+        }
+        return Ok(());
+    }
     if route.collateral_asset == route.debt_asset {
         if !legs.is_empty() || token_path != [route.debt_asset] {
             return Err(ModelError::InvalidLegs);
@@ -579,6 +630,137 @@ fn validate_aave_route(
         }
     }
     Ok(())
+}
+
+impl AaveLiquidationRoute {
+    fn debt_unit(&self) -> Result<u128, ModelError> {
+        10_u128
+            .checked_pow(u32::from(self.debt_asset_decimals))
+            .ok_or(ModelError::InvalidAmount)
+    }
+
+    pub fn weth_to_debt_floor(&self, weth_wei: u128) -> Result<u128, ModelError> {
+        if self.debt_asset_decimals == 18 && self.debt_asset_price_base == self.weth_price_base {
+            return Ok(weth_wei);
+        }
+        let numerator = weth_wei
+            .checked_mul(self.weth_price_base)
+            .and_then(|value| value.checked_mul(self.debt_unit().ok()?))
+            .ok_or(ModelError::InvalidAmount)?;
+        let denominator = 1_000_000_000_000_000_000_u128
+            .checked_mul(self.debt_asset_price_base)
+            .ok_or(ModelError::InvalidAmount)?;
+        Ok(numerator / denominator)
+    }
+
+    pub fn weth_to_debt_ceil(&self, weth_wei: u128) -> Result<u128, ModelError> {
+        if self.debt_asset_decimals == 18 && self.debt_asset_price_base == self.weth_price_base {
+            return Ok(weth_wei);
+        }
+        let numerator = weth_wei
+            .checked_mul(self.weth_price_base)
+            .and_then(|value| value.checked_mul(self.debt_unit().ok()?))
+            .ok_or(ModelError::InvalidAmount)?;
+        let denominator = 1_000_000_000_000_000_000_u128
+            .checked_mul(self.debt_asset_price_base)
+            .ok_or(ModelError::InvalidAmount)?;
+        numerator
+            .checked_add(denominator - 1)
+            .map(|value| value / denominator)
+            .ok_or(ModelError::InvalidAmount)
+    }
+
+    pub fn debt_to_weth_floor(&self, debt_raw: u128) -> Result<u128, ModelError> {
+        if self.debt_asset_decimals == 18 && self.debt_asset_price_base == self.weth_price_base {
+            return Ok(debt_raw);
+        }
+        let numerator = debt_raw
+            .checked_mul(self.debt_asset_price_base)
+            .and_then(|value| value.checked_mul(1_000_000_000_000_000_000_u128))
+            .ok_or(ModelError::InvalidAmount)?;
+        let denominator = self
+            .debt_unit()?
+            .checked_mul(self.weth_price_base)
+            .ok_or(ModelError::InvalidAmount)?;
+        Ok(numerator / denominator)
+    }
+}
+
+#[cfg(test)]
+mod aave_unit_tests {
+    use super::*;
+
+    fn usdc_e_weth_route() -> (AaveLiquidationRoute, ValidatedLeg, Vec<CanonicalAddress>) {
+        let weth = CanonicalAddress::parse(ARBITRUM_WETH_ADDRESS).unwrap();
+        let usdc_e = CanonicalAddress::parse(ARBITRUM_USDC_E_ADDRESS).unwrap();
+        let route = AaveLiquidationRoute {
+            borrower: CanonicalAddress::parse("0x1111111111111111111111111111111111111111")
+                .unwrap(),
+            debt_asset: usdc_e,
+            collateral_asset: weth,
+            debt_asset_decimals: 6,
+            debt_asset_price_base: 100_000_000,
+            weth_price_base: 200_000_000_000,
+            maximum_input_weth_wei: 10_000_000_000_000_000,
+            minimum_profit_weth_wei: 1_000_000_000_001,
+            receive_a_token: false,
+            minimum_collateral_received: 1,
+            minimum_unwind_output: 2_001,
+            maximum_atlas_bid: 1,
+            evidence_mode: "DUAL_PROVIDER_FORK_VERIFIED".to_string(),
+            state_root: format!("0x{}", "1".repeat(64)),
+            release_sha: "2".repeat(40),
+        };
+        let leg = ValidatedLeg {
+            pool: CanonicalAddress::parse(REVIEWED_WETH_USDC_E_POOL_500_ADDRESS).unwrap(),
+            factory: Some(
+                CanonicalAddress::parse("0x1f98431c8ad98523631ae4a59f267346ea31f984").unwrap(),
+            ),
+            token_in: weth,
+            token_out: usdc_e,
+            fee: 500,
+            zero_for_one: true,
+            min_amount_out: route.minimum_unwind_output,
+        };
+        (route, leg, vec![weth, usdc_e])
+    }
+
+    #[test]
+    fn usdc_e_route_binds_units_rounding_and_reviewed_pool() {
+        let (route, leg, token_path) = usdc_e_weth_route();
+        assert_eq!(
+            route
+                .weth_to_debt_floor(route.maximum_input_weth_wei)
+                .unwrap(),
+            20_000_000
+        );
+        assert_eq!(
+            route
+                .weth_to_debt_ceil(route.minimum_profit_weth_wei)
+                .unwrap(),
+            2_001
+        );
+        assert_eq!(route.debt_to_weth_floor(3_900).unwrap(), 1_950_000_000_000);
+        validate_aave_route(
+            &route,
+            std::slice::from_ref(&leg),
+            &token_path,
+            route.debt_asset,
+        )
+        .unwrap();
+
+        let mut wrong_pool = leg;
+        wrong_pool.pool = CanonicalAddress::parse(CURRENT_ROUTE_POOL_500_ADDRESS).unwrap();
+        assert_eq!(
+            validate_aave_route(
+                &route,
+                std::slice::from_ref(&wrong_pool),
+                &token_path,
+                route.debt_asset,
+            ),
+            Err(ModelError::InvalidLegs)
+        );
+    }
 }
 
 impl TryFrom<ExecutionLeg> for ValidatedLeg {
@@ -724,6 +906,7 @@ pub struct ReceiptOutcome {
     pub actual_fee_wei: u128,
     pub actual_l1_cost_wei: u128,
     pub settlement: Settlement,
+    pub canonical_realized_profit_wei: u128,
     pub net_pnl_wei: i128,
 }
 

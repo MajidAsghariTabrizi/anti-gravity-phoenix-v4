@@ -1132,7 +1132,7 @@ fn reviewed_owner_assets(
             }
         }
     }
-    if assets.len() != 2 {
+    if assets.len() != 3 {
         return Err(OwnerBootstrapError::InvalidPolicy);
     }
     Ok(assets)
@@ -1163,7 +1163,7 @@ fn reviewed_owner_legs(policy: &RoutePolicy) -> Result<Vec<ValidatedLeg>, OwnerB
             min_amount_out: 1,
         });
     }
-    if legs.len() != 3 {
+    if legs.len() != 4 {
         return Err(OwnerBootstrapError::InvalidPolicy);
     }
     Ok(legs)
@@ -2121,18 +2121,17 @@ mod tests {
     #[test]
     fn owner_context_includes_reviewed_aave_assets_and_all_verified_unwind_pools() {
         let context = OwnerBootstrapContext::from_values(&full_values()).expect("owner context");
-        assert_eq!(context.assets.len(), 2);
+        assert_eq!(context.assets.len(), 3);
         assert!(context
             .assets
             .contains(&address("0x82af49447d8a07e3bd95bd0d56f35241523fbab1")));
         assert!(context
             .assets
             .contains(&address("0xaf88d065e77c8cc2239327c5edb3a432268e5831")));
-        assert_eq!(context.legs.len(), 3);
-        assert_eq!(
-            context.legs.iter().map(|leg| leg.fee).collect::<Vec<_>>(),
-            vec![500, 3_000, 100]
-        );
+        assert!(context
+            .assets
+            .contains(&address("0xff970a61a04b1ca14834a43f5de4533ebddb5cc8")));
+        assert_eq!(context.legs.len(), 4);
         let fee_100 = context
             .legs
             .iter()
@@ -2143,6 +2142,13 @@ mod tests {
             address("0x6f38e884725a116c9c7fbf208e79fe8828a2595f")
         );
         assert!(!fee_100.zero_for_one);
+        let usdc_e = context
+            .legs
+            .iter()
+            .find(|leg| leg.pool == address("0xc31e54c7a869b9fcbecc14363cf510d1c41fa443"))
+            .expect("reviewed WETH/USDC.e fee-500 Aave unwind");
+        assert_eq!(usdc_e.fee, 500);
+        assert!(usdc_e.zero_for_one);
     }
 
     #[test]
