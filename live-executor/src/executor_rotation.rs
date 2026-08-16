@@ -957,7 +957,9 @@ pub fn provenance_with_block(
         tooling_source_sha: normalize(&plan.source_sha),
         base_release_sha: normalize(&plan.base_release_sha),
         chain_id: plan.chain_id,
-        old_executor: normalize(&plan.old_executor),
+        old_executor: CanonicalAddress::parse(&plan.old_executor)
+            .map_err(|_| RotationError::InvalidPlan)?
+            .to_string(),
         new_executor: new_executor.to_string(),
         old_runtime_sha256: normalize(&plan.old_runtime_sha256),
         new_runtime_sha256: normalize(&plan.expected_new_runtime_sha256),
@@ -1386,6 +1388,7 @@ mod tests {
             CanonicalAddress::parse("0x6666666666666666666666666666666666666666").expect("address");
         let mut value =
             provenance(&plan, new_executor, &format!("0x{}", "7".repeat(64))).expect("provenance");
+        assert_eq!(value.old_executor, OLD_EXECUTOR);
         assert_eq!(validate_provenance(&value, &plan), Ok(()));
         value.rollback_completed = true;
         assert_eq!(
