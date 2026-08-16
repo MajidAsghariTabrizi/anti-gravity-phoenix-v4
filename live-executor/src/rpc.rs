@@ -298,6 +298,86 @@ impl HttpExecutionRpc {
         })
     }
 
+    /// PhoenixExecutor-only CREATE quote.  This is deliberately separate
+    /// from the normal call quote and accepts no destination or value.
+    pub async fn quote_contract_creation(
+        &self,
+        from: CanonicalAddress,
+        init_code: &[u8],
+    ) -> Result<TransactionQuote, RpcError> {
+        if init_code.is_empty() || init_code.len() > 512 * 1024 {
+            return Err(malformed());
+        }
+        let block_number = self.latest_block_number().await?;
+        let block_tag = format!("0x{block_number:x}");
+        let block = self
+            .call("eth_getBlockByNumber", json!([block_tag, false]))
+            .await?;
+        let block_hash = block
+            .get("hash")
+            .and_then(Value::as_str)
+            .filter(|value| canonical_hash(value))
+            .ok_or_else(malformed)?
+            .to_string();
+        let base_fee_per_gas = block
+            .get("baseFeePerGas")
+            .and_then(Value::as_str)
+            .ok_or_else(malformed)
+            .and_then(parse_hex_u128)?;
+        let estimate = self
+            .call(
+                "eth_estimateGas",
+                json!([{
+                    "from": from.to_string(),
+                    "data": format!("0x{}", hex::encode(init_code)),
+                    "value": "0x0"
+                }, block_tag]),
+            )
+            .await?
+            .as_str()
+            .ok_or_else(malformed)
+            .and_then(parse_hex_u64)?;
+        let max_priority_fee_per_gas = self
+            .call("eth_maxPriorityFeePerGas", json!([]))
+            .await?
+            .as_str()
+            .ok_or_else(malformed)
+            .and_then(parse_hex_u128)?;
+        let max_fee_per_gas = base_fee_per_gas
+            .checked_mul(2)
+            .and_then(|value| value.checked_add(max_priority_fee_per_gas))
+            .ok_or_else(malformed)?;
+        let gas_limit = estimate
+            .checked_mul(120)
+            .and_then(|value| value.checked_add(99))
+            .map(|value| value / 100)
+            .ok_or_else(malformed)?;
+        Ok(TransactionQuote {
+            block_number,
+            block_hash,
+            gas_limit,
+            l1_gas_units: 0,
+            base_fee_per_gas,
+            max_fee_per_gas,
+            max_priority_fee_per_gas,
+            estimated_l1_cost: 0,
+            endpoint_identity: self.endpoint_identity.clone(),
+        })
+    }
+
+    pub async fn runtime_code_hash(&self, executor: CanonicalAddress) -> Result<String, RpcError> {
+        let code = self
+            .call("eth_getCode", json!([executor.to_string(), "latest"]))
+            .await?
+            .as_str()
+            .and_then(parse_hex_bytes)
+            .ok_or_else(malformed)?;
+        if code.is_empty() {
+            return Err(malformed());
+        }
+        Ok(hex::encode(Sha256::digest(code)))
+    }
+
     pub async fn wallet_balance(&self, wallet: CanonicalAddress) -> Result<u128, RpcError> {
         self.call("eth_getBalance", json!([wallet.to_string(), "latest"]))
             .await?
