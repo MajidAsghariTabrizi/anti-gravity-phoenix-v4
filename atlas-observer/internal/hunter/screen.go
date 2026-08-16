@@ -301,6 +301,8 @@ type pendingExactEvaluation struct {
 	record                 signal
 	admittedAt             time.Time
 	admittedMonotonic      time.Time
+	actionableAt           time.Time
+	actionableMonotonic    time.Time
 	firstObserved          time.Time
 	firstObservedMonotonic time.Time
 	reservedMilli          uint64
@@ -1861,6 +1863,40 @@ func exactEligibleSince(firstLiquidatableAt, lastExactAt time.Time, served bool)
 	return eligibleSince
 }
 
+func exactActionableEnqueueLatency(
+	actionableAt, actionableMonotonic, admittedAt, admittedMonotonic time.Time,
+) (time.Duration, bool) {
+	if actionableAt.IsZero() || admittedAt.Before(actionableAt) {
+		return 0, false
+	}
+	if !actionableMonotonic.IsZero() {
+		if admittedMonotonic.IsZero() || admittedMonotonic.Before(actionableMonotonic) {
+			return 0, false
+		}
+		return admittedMonotonic.Sub(actionableMonotonic), true
+	}
+	return admittedAt.Sub(actionableAt), true
+}
+
+func (s *Screener) observeExactActionableEnqueueLatencyLocked(work pendingExactEvaluation) bool {
+	duration, valid := exactActionableEnqueueLatency(
+		work.actionableAt,
+		work.actionableMonotonic,
+		work.admittedAt,
+		work.admittedMonotonic,
+	)
+	if !valid {
+		return false
+	}
+	s.observeDurationLocked(
+		exactEligibilityLatencySumKey,
+		exactEligibilityLatencyCountKey,
+		"exact_eligibility_latency_millis_bucket_le_",
+		duration,
+	)
+	return true
+}
+
 func (s *Screener) initializeExactBudgetLocked(now time.Time) {
 	if s.state.ExactAverageStateRequestsMilli == 0 {
 		s.state.ExactAverageStateRequestsMilli = defaultExactRequestEstimateMilli
@@ -2304,6 +2340,11 @@ func (s *Screener) screen(ctx context.Context, borrowers []string, advanceSeed b
 			now := s.nowUTC()
 			routeReason, knownRouteIneligible := s.state.RouteIneligible[primary.Borrower]
 			lastExact, recentlyResolved := s.lastExactAt[primary.Borrower]
+			actionableAt := exactEligibleSince(s.firstLiquidatableAt[primary.Borrower], lastExact, recentlyResolved)
+			actionableMonotonic := time.Time{}
+			if actionableAt.Equal(s.firstLiquidatableAt[primary.Borrower]) {
+				actionableMonotonic = s.firstLiquidatableMono[primary.Borrower]
+			}
 			if knownRouteIneligible && routeReason == "no_weth_debt" {
 				record.ExactDeferredReason = "route_ineligible_until_tail"
 				record.ExactRouteIneligibleReason = routeReason
@@ -2351,6 +2392,8 @@ func (s *Screener) screen(ctx context.Context, borrowers []string, advanceSeed b
 						work := pendingExactEvaluation{
 							order: order, primary: primary, bucket: bucket, record: record,
 							admittedAt: exactAdmittedAt, admittedMonotonic: exactAdmittedMonotonic,
+							actionableAt:           actionableAt,
+							actionableMonotonic:    actionableMonotonic,
 							firstObserved:          s.firstLiquidatableAt[primary.Borrower],
 							firstObservedMonotonic: s.firstLiquidatableMono[primary.Borrower],
 							reservedMilli:          reservedMilli, tracker: tracker, result: result,
@@ -2455,17 +2498,7 @@ func (s *Screener) screen(ctx context.Context, borrowers []string, advanceSeed b
 					"liquidatable_to_exact_millis_bucket_le_",
 					liquidatableToExact,
 				)
-				s.observeDurationLocked(
-					exactEligibilityLatencySumKey,
-					exactEligibilityLatencyCountKey,
-					"exact_eligibility_latency_millis_bucket_le_",
-					func() time.Duration {
-						if !work.firstObservedMonotonic.IsZero() {
-							return work.admittedMonotonic.Sub(work.firstObservedMonotonic)
-						}
-						return work.admittedAt.Sub(work.firstObserved)
-					}(),
-				)
+				s.observeExactActionableEnqueueLatencyLocked(work)
 				delete(s.firstLiquidatableAt, work.primary.Borrower)
 				delete(s.firstLiquidatableMono, work.primary.Borrower)
 			}
