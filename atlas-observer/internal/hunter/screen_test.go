@@ -1428,6 +1428,106 @@ func TestExactSchedulerPrefersNeverServedThenOldestEligibleAcrossCooldown(t *tes
 	}
 }
 
+func TestExactActionableEnqueueLatencyStartsAfterCooldown(t *testing.T) {
+	classifiedAt := time.Date(2026, 8, 16, 0, 0, 40, 0, time.UTC)
+	completedAt := classifiedAt.Add(-40 * time.Second)
+	actionableAt := exactEligibleSince(classifiedAt, completedAt, true)
+	if want := completedAt.Add(exactBorrowerCooldown); !actionableAt.Equal(want) {
+		t.Fatalf("actionable epoch=%s want=%s", actionableAt, want)
+	}
+
+	screener := &Screener{state: State{Counts: map[string]uint64{}}}
+	work := pendingExactEvaluation{
+		firstObserved: classifiedAt,
+		actionableAt:  actionableAt,
+		admittedAt:    actionableAt.Add(8 * time.Millisecond),
+	}
+	if !screener.observeExactActionableEnqueueLatencyLocked(work) {
+		t.Fatal("valid post-cooldown actionable epoch was not observed")
+	}
+	if got := screener.state.Counts[exactEligibilityLatencySumKey]; got != 8 {
+		t.Fatalf("actionable enqueue latency=%dms want=8ms", got)
+	}
+	if screener.state.Counts["exact_eligibility_latency_millis_bucket_le_10"] != 1 ||
+		screener.state.Counts["exact_eligibility_latency_millis_bucket_le_120000"] != 1 {
+		t.Fatalf("post-cooldown enqueue populated the wrong buckets: %+v", screener.state.Counts)
+	}
+	if screener.state.Counts[liquidatableToExactCountKey] != 0 ||
+		screener.state.Counts[exactQueueLatencyCountKey] != 0 ||
+		screener.state.Counts[exactFirstRPCLatencyCountKey] != 0 {
+		t.Fatalf("unrelated latency metrics changed: %+v", screener.state.Counts)
+	}
+}
+
+func TestExactActionableEnqueueLatencyPreservesRealWait(t *testing.T) {
+	wallStart := time.Date(2026, 8, 16, 0, 0, 0, 0, time.UTC)
+	monotonicStart := time.Now()
+	screener := &Screener{state: State{Counts: map[string]uint64{}}}
+	work := pendingExactEvaluation{
+		firstObserved:       wallStart,
+		actionableAt:        wallStart,
+		actionableMonotonic: monotonicStart,
+		admittedAt:          wallStart.Add(30 * time.Millisecond),
+		admittedMonotonic:   monotonicStart.Add(30 * time.Millisecond),
+	}
+	if !screener.observeExactActionableEnqueueLatencyLocked(work) {
+		t.Fatal("actionable borrower wait was not observed")
+	}
+	if got := screener.state.Counts[exactEligibilityLatencySumKey]; got != 30 {
+		t.Fatalf("actionable enqueue latency=%dms want=30ms", got)
+	}
+	if screener.state.Counts["exact_eligibility_latency_millis_bucket_le_25"] != 0 ||
+		screener.state.Counts["exact_eligibility_latency_millis_bucket_le_50"] != 1 {
+		t.Fatalf("real actionable regression is no longer detectable: %+v", screener.state.Counts)
+	}
+}
+
+func TestExactActionableEnqueueLatencyDoesNotObserveBlockedOrRegressedEpoch(t *testing.T) {
+	start := time.Date(2026, 8, 16, 0, 0, 0, 0, time.UTC)
+	screener := &Screener{state: State{Counts: map[string]uint64{}}}
+	blocked := pendingExactEvaluation{
+		firstObserved: start,
+		actionableAt:  start.Add(exactBorrowerCooldown),
+		admittedAt:    start.Add(exactBorrowerCooldown - time.Millisecond),
+	}
+	if screener.observeExactActionableEnqueueLatencyLocked(blocked) {
+		t.Fatal("cooldown-blocked borrower emitted an actionable latency sample")
+	}
+	monotonicStart := time.Now()
+	regressedMonotonic := pendingExactEvaluation{
+		firstObserved:       start,
+		actionableAt:        start,
+		actionableMonotonic: monotonicStart,
+		admittedAt:          start.Add(time.Millisecond),
+		admittedMonotonic:   monotonicStart.Add(-time.Second),
+	}
+	if screener.observeExactActionableEnqueueLatencyLocked(regressedMonotonic) {
+		t.Fatal("regressed monotonic epoch emitted an actionable latency sample")
+	}
+	if screener.state.Counts[exactEligibilityLatencyCountKey] != 0 {
+		t.Fatalf("invalid epochs changed the histogram: %+v", screener.state.Counts)
+	}
+}
+
+func TestExactActionableEnqueueLatencyPreservesImmediateBorrowerBehavior(t *testing.T) {
+	wallStart := time.Date(2026, 8, 16, 0, 0, 0, 0, time.UTC)
+	monotonicStart := time.Now()
+	actionableAt := exactEligibleSince(wallStart, time.Time{}, false)
+	screener := &Screener{state: State{Counts: map[string]uint64{}}}
+	if !screener.observeExactActionableEnqueueLatencyLocked(pendingExactEvaluation{
+		firstObserved:       wallStart,
+		actionableAt:        actionableAt,
+		actionableMonotonic: monotonicStart,
+		admittedAt:          wallStart.Add(8 * time.Millisecond),
+		admittedMonotonic:   monotonicStart.Add(8 * time.Millisecond),
+	}) {
+		t.Fatal("immediately actionable borrower was not observed")
+	}
+	if got := screener.state.Counts[exactEligibilityLatencySumKey]; got != 8 {
+		t.Fatalf("immediate actionable latency=%dms want=8ms", got)
+	}
+}
+
 func TestExactSchedulerUsesTheCurrentLiquidationEpochAfterUrgentInterlude(t *testing.T) {
 	now := time.Date(2026, 8, 11, 0, 10, 0, 0, time.UTC)
 	reentered := "0x1111111111111111111111111111111111111111"
@@ -1982,6 +2082,9 @@ func TestRecentExactEvidenceDefersDuplicateBorrowerWithoutExactRPC(t *testing.T)
 	}
 	if screener.Snapshot().Counts[exactDeferredCooldownKey] != 1 {
 		t.Fatalf("duplicate Exact deferral was not counted: %+v", screener.Snapshot().Counts)
+	}
+	if screener.Snapshot().Counts[exactEligibilityLatencyCountKey] != 0 {
+		t.Fatalf("cooldown-blocked borrower emitted an actionable enqueue sample: %+v", screener.Snapshot().Counts)
 	}
 }
 
