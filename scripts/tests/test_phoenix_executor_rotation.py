@@ -135,6 +135,10 @@ class PhoenixExecutorRotationContextTests(unittest.TestCase):
     def test_host_script_has_no_authority_or_shadow_mutation(self) -> None:
         root = Path(__file__).resolve().parents[2]
         source = (root / "scripts" / "rotate-phoenix-executor-live.sh").read_text(encoding="utf-8")
+        self.assertIn("RELEASE_ENV=$DEPLOY_ROOT/current-release.env", source)
+        self.assertNotIn(
+            "RELEASE_ENV=/var/lib/phoenix-release/current-release.env", source
+        )
         self.assertNotIn("production_mode.py shadow", source)
         self.assertNotIn("autonomous-control disarm", source)
         self.assertNotIn("arm-revenue", source)
