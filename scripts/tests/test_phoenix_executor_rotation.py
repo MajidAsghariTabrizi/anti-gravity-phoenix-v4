@@ -150,6 +150,21 @@ class PhoenixExecutorRotationContextTests(unittest.TestCase):
         )
         self.assertIn("command_identity and name not in expected", source)
         self.assertIn("if set(names)!=expected: raise SystemExit(1)", source)
+        self.assertIn(
+            'key in {"LIVE_EXECUTOR_EXECUTOR_ADDRESS","EXECUTOR_ADDRESS"}',
+            source,
+        )
+        self.assertGreaterEqual(source.count("addresses=sorted(set("), 2)
+        self.assertGreaterEqual(source.count("hashes=sorted(set("), 2)
+        self.assertIn("fail identity_consumer_environment_invalid", source)
+        self.assertIn(
+            '[ -z "$address" ] || [ -z "$command_address" ] || [ "$address" = "$command_address" ] || fail mixed_executor_address',
+            source,
+        )
+        self.assertIn(
+            '[ -z "$hash" ] || [ -z "$command_hash" ] || [ "$hash" = "$command_hash" ] || fail mixed_executor_hash',
+            source,
+        )
         self.assertIn("PHOENIX_MODE)\" = LIVE", source)
         self.assertIn("claim-rollback", source)
         self.assertIn("control_snapshot_changed", source)

@@ -134,17 +134,25 @@ verify_consumer_identity() {
     actual_image=$(/usr/bin/docker inspect -f '{{.Config.Image}}' "$id")
     [ "$actual_image" = "$expected_image" ] || fail identity_consumer_image_mismatch
     values=$(/usr/bin/docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$id")
-    address=$(printf '%s\n' "$values" | /usr/bin/awk -F= '$1=="LIVE_EXECUTOR_EXECUTOR_ADDRESS"||$1=="EXECUTOR_ADDRESS"{print $2}')
-    hash=$(printf '%s\n' "$values" | /usr/bin/awk -F= '$1=="LIVE_EXECUTOR_EXECUTOR_CODE_HASH"{print $2}')
+    environment_identity=$(printf '%s\n' "$values" | /usr/bin/python3 -I -B -c '
+import sys
+values=[line.split("=",1) for line in sys.stdin.read().splitlines() if "=" in line]
+addresses=sorted(set(value for key,value in values if key in {"LIVE_EXECUTOR_EXECUTOR_ADDRESS","EXECUTOR_ADDRESS"}))
+hashes=sorted(set(value for key,value in values if key=="LIVE_EXECUTOR_EXECUTOR_CODE_HASH"))
+if len(addresses)>1 or len(hashes)>1: raise SystemExit(1)
+print((addresses or [""])[0]+":"+(hashes or [""])[0])') || fail identity_consumer_environment_invalid
+    address=${environment_identity%%:*}; hash=${environment_identity#*:}
     command=$(/usr/bin/docker inspect -f '{{json .Config.Cmd}}' "$id")
     command_identity=$(printf '%s' "$command" | /usr/bin/python3 -I -B -c '
 import json,sys
 values=json.load(sys.stdin) or []
-addresses=[v.split("=",1)[1] for v in values if isinstance(v,str) and v.startswith("--executor-address=")]
-hashes=[v.split("=",1)[1] for v in values if isinstance(v,str) and v.startswith("--executor-code-hash=")]
+addresses=sorted(set(v.split("=",1)[1] for v in values if isinstance(v,str) and v.startswith("--executor-address=")))
+hashes=sorted(set(v.split("=",1)[1] for v in values if isinstance(v,str) and v.startswith("--executor-code-hash=")))
 if len(addresses)>1 or len(hashes)>1: raise SystemExit(1)
 print((addresses or [""])[0]+":"+(hashes or [""])[0])') || fail identity_consumer_command_invalid
     command_address=${command_identity%%:*}; command_hash=${command_identity#*:}
+    [ -z "$address" ] || [ -z "$command_address" ] || [ "$address" = "$command_address" ] || fail mixed_executor_address
+    [ -z "$hash" ] || [ -z "$command_hash" ] || [ "$hash" = "$command_hash" ] || fail mixed_executor_hash
     [ -n "$address" ] || address=$command_address
     [ -n "$hash" ] || hash=$command_hash
     [ -n "$address" ] && [ "$address" = "$expected_address" ] || fail mixed_executor_address
