@@ -130,6 +130,8 @@ jobs:
             scripts/production-healthcheck.sh \
             scripts/required-service-absence.sh \
             scripts/required-service-absence-tests.sh \
+            scripts/rotate-phoenix-executor-live.sh \
+            scripts/rotate-phoenix-executor-live-tests.sh \
             scripts/render-production-compose.sh \
             scripts/verify-image-runtime.sh \
             scripts/rollback-release.sh \
@@ -149,6 +151,7 @@ jobs:
             scripts/release_components.py \
             scripts/release_platform.py \
             scripts/release_provenance.py \
+            scripts/phoenix_executor_rotation_context.py \
             scripts/production_mode.py \
             scripts/atlas_aave_fork_package.py \
             scripts/atlas_aave_candidate_exact_validator.py \
@@ -169,6 +172,7 @@ jobs:
             scripts.tests.test_release_components \
             scripts.tests.test_release_provenance \
             scripts.tests.test_phoenix_release \
+            scripts.tests.test_phoenix_executor_rotation \
             scripts.tests.test_production_mode \
             scripts.tests.test_atlas_aave_fork_package \
             scripts.tests.test_atlas_aave_candidate_exact_validator \
@@ -202,8 +206,9 @@ jobs:
           python3 -m py_compile scripts/prelive_dashboard_snapshot.py scripts/verify_dashboard_compose.py
           python3 -m py_compile scripts/prelive_shadow_control.py scripts/prelive_dashboard_live.py
           sh ./scripts/prelive-shadow-control-tests.sh
-          python3 -m py_compile scripts/release_assets.py
-          python3 -m unittest scripts.tests.test_release_assets
+          python3 -m py_compile scripts/release_assets.py scripts/phoenix_executor_rotation_context.py
+          python3 -m unittest scripts.tests.test_release_assets scripts.tests.test_phoenix_executor_rotation
+          sh ./scripts/rotate-phoenix-executor-live-tests.sh
           python3 -m py_compile scripts/change_impact.py
           python3 -m unittest scripts.tests.test_change_impact
           python3 -m py_compile scripts/phoenix_release/*.py

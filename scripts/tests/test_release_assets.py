@@ -42,11 +42,38 @@ class ReleaseAssetsTests(unittest.TestCase):
         )
 
     def build(self, output: Path):
+        artifact = output / "PhoenixExecutor.json"
+        artifact.parent.mkdir(parents=True, exist_ok=True)
+        artifact.write_text(
+            json.dumps(
+                {
+                    "abi": json.loads(self.contract_artifact.read_text(encoding="utf-8")),
+                    "bytecode": {"object": "0x6000600055"},
+                    "deployedBytecode": {
+                        "object": "0x" + "00" * (7 * 32),
+                        "immutableReferences": {
+                            "atlas": [
+                                {"start": 0, "length": 32},
+                                {"start": 32, "length": 32},
+                                {"start": 64, "length": 32},
+                                {"start": 96, "length": 32},
+                            ],
+                            "weth": [
+                                {"start": 128, "length": 32},
+                                {"start": 160, "length": 32},
+                                {"start": 192, "length": 32},
+                            ],
+                        },
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
         return release_assets.build_release_assets(
             self.repo_root,
             RELEASE_SHA,
             output,
-            self.contract_artifact,
+            artifact,
         )
 
     def test_bundle_is_deterministic_and_verifies(self) -> None:
@@ -76,6 +103,30 @@ class ReleaseAssetsTests(unittest.TestCase):
             for required in LIVE_CANARY_ASSETS:
                 self.assertIn(required, paths)
             self.assertIn("contracts/PhoenixExecutor.compiled.json", paths)
+            for rotation_asset in (
+                "contracts/PhoenixExecutor.creation.bin",
+                "contracts/PhoenixExecutor.creation.sha256",
+                "contracts/PhoenixExecutor.runtime.bin",
+                "contracts/PhoenixExecutor.runtime.sha256",
+                "config/phoenix-executor-rotation-plan.json",
+                "config/phoenix-executor-rotation-artifacts.json",
+                "scripts/phoenix_executor_rotation_context.py",
+                "scripts/rotate-phoenix-executor-live.sh",
+            ):
+                self.assertIn(rotation_asset, paths)
+            payloads = release_assets._rotation_payloads(
+                Path(raw) / "PhoenixExecutor.json", RELEASE_SHA, RELEASE_SHA
+            )
+            runtime = payloads[release_assets.ROTATION_RUNTIME_TARGET]
+            self.assertEqual(len(runtime), 7 * 32)
+            self.assertIn(
+                bytes.fromhex("8ad1ae9d97c79aa68a0a151e83ff3942f68f86c1"),
+                runtime,
+            )
+            self.assertIn(
+                bytes.fromhex("82af49447d8a07e3bd95bd0d56f35241523fbab1"),
+                runtime,
+            )
             self.assertIn("schemas/phoenix-release-assets.schema.json", paths)
             self.assertIn("scripts/prelive-shadow-control.sh", paths)
             self.assertIn("scripts/prelive-protected-maintenance.sh", paths)

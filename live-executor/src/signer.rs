@@ -67,6 +67,41 @@ impl TransactionSigner {
         })
     }
 
+    /// Signs a contract-creation transaction.  This is intentionally separate
+    /// from `sign`, whose destination is always a normal call target; callers
+    /// cannot accidentally turn an existing execution call into CREATE.
+    pub fn sign_contract_creation(
+        &self,
+        draft: ContractCreationDraft,
+    ) -> Result<SignedTransaction, SignerError> {
+        if draft.chain_id != self.chain_id {
+            return Err(SignerError::WrongChain);
+        }
+        let transaction = TxEip1559 {
+            chain_id: draft.chain_id,
+            nonce: draft.nonce,
+            gas_limit: draft.gas_limit,
+            max_fee_per_gas: draft.max_fee_per_gas,
+            max_priority_fee_per_gas: draft.max_priority_fee_per_gas,
+            to: TxKind::Create,
+            value: U256::ZERO,
+            access_list: AccessList::default(),
+            input: Bytes::from(draft.creation_bytecode),
+        };
+        let signature = self
+            .signer
+            .sign_hash_sync(&transaction.signature_hash())
+            .map_err(|_| SignerError::Signing)?;
+        let signed = transaction.into_signed(signature);
+        let tx_hash = TransactionHash::from_bytes(*signed.hash().as_ref());
+        let mut raw = Vec::with_capacity(signed.eip2718_encoded_length());
+        signed.eip2718_encode(&mut raw);
+        Ok(SignedTransaction {
+            tx_hash,
+            raw: Zeroizing::new(raw),
+        })
+    }
+
     /// Signs an already domain-separated 32-byte operation digest. Atlas v1.6.4
     /// expects the canonical 65-byte `r || s || v` representation with v=27/28.
     pub fn sign_digest(&self, digest: [u8; 32]) -> Result<Zeroizing<Vec<u8>>, SignerError> {
@@ -107,6 +142,16 @@ pub struct TransactionDraft {
     pub max_priority_fee_per_gas: u128,
     pub to: CanonicalAddress,
     pub calldata: Vec<u8>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ContractCreationDraft {
+    pub chain_id: u64,
+    pub nonce: u64,
+    pub gas_limit: u64,
+    pub max_fee_per_gas: u128,
+    pub max_priority_fee_per_gas: u128,
+    pub creation_bytecode: Vec<u8>,
 }
 
 pub struct SignedTransaction {
@@ -169,5 +214,29 @@ mod tests {
         assert!(!signer_debug.contains(&key_material));
         assert!(!signed_debug.contains(&hex::encode(signed.raw_bytes())));
         assert!(signed_debug.contains("<redacted>"));
+    }
+
+    #[test]
+    fn contract_creation_signing_is_distinct_and_chain_bound() {
+        let signer =
+            TransactionSigner::from_secret(&hex::encode([7_u8; 32]), 42_161).expect("test signer");
+        let draft = ContractCreationDraft {
+            chain_id: 42_161,
+            nonce: 2,
+            gas_limit: 500_000,
+            max_fee_per_gas: 10,
+            max_priority_fee_per_gas: 1,
+            creation_bytecode: vec![0x60, 0x00, 0x60, 0x00],
+        };
+        let signed = signer
+            .sign_contract_creation(draft.clone())
+            .expect("creation sign");
+        assert!(!signed.raw_bytes().is_empty());
+        let mut wrong = draft;
+        wrong.chain_id = 1;
+        assert!(matches!(
+            signer.sign_contract_creation(wrong),
+            Err(SignerError::WrongChain)
+        ));
     }
 }

@@ -22,6 +22,7 @@ const ARBITRUM_NODE_INTERFACE: &str = "0x00000000000000000000000000000000000000c
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TransactionReceipt {
     pub transaction_hash: TransactionHash,
+    pub contract_address: Option<CanonicalAddress>,
     pub status: u64,
     pub block_number: u64,
     pub gas_used: u64,
@@ -64,6 +65,25 @@ pub struct ExecutorConfigurationSnapshot {
     pub router_approved: bool,
     pub factories_approved: Vec<bool>,
     pub pools_approved: Vec<bool>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExecutorCoreSnapshot {
+    pub owner: Option<CanonicalAddress>,
+    pub pending_owner: Option<CanonicalAddress>,
+    pub flash_provider: Option<CanonicalAddress>,
+    pub atlas: Option<CanonicalAddress>,
+    pub weth: Option<CanonicalAddress>,
+    pub paused: bool,
+    pub maximum_input_amount: u128,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PhoenixExecutorMapping {
+    Searcher,
+    Asset,
+    Router,
+    Factory,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -298,6 +318,86 @@ impl HttpExecutionRpc {
         })
     }
 
+    /// PhoenixExecutor-only CREATE quote.  This is deliberately separate
+    /// from the normal call quote and accepts no destination or value.
+    pub async fn quote_contract_creation(
+        &self,
+        from: CanonicalAddress,
+        init_code: &[u8],
+    ) -> Result<TransactionQuote, RpcError> {
+        if init_code.is_empty() || init_code.len() > 512 * 1024 {
+            return Err(malformed());
+        }
+        let block_number = self.latest_block_number().await?;
+        let block_tag = format!("0x{block_number:x}");
+        let block = self
+            .call("eth_getBlockByNumber", json!([block_tag, false]))
+            .await?;
+        let block_hash = block
+            .get("hash")
+            .and_then(Value::as_str)
+            .filter(|value| canonical_hash(value))
+            .ok_or_else(malformed)?
+            .to_string();
+        let base_fee_per_gas = block
+            .get("baseFeePerGas")
+            .and_then(Value::as_str)
+            .ok_or_else(malformed)
+            .and_then(parse_hex_u128)?;
+        let estimate = self
+            .call(
+                "eth_estimateGas",
+                json!([{
+                    "from": from.to_string(),
+                    "data": format!("0x{}", hex::encode(init_code)),
+                    "value": "0x0"
+                }, block_tag]),
+            )
+            .await?
+            .as_str()
+            .ok_or_else(malformed)
+            .and_then(parse_hex_u64)?;
+        let max_priority_fee_per_gas = self
+            .call("eth_maxPriorityFeePerGas", json!([]))
+            .await?
+            .as_str()
+            .ok_or_else(malformed)
+            .and_then(parse_hex_u128)?;
+        let max_fee_per_gas = base_fee_per_gas
+            .checked_mul(2)
+            .and_then(|value| value.checked_add(max_priority_fee_per_gas))
+            .ok_or_else(malformed)?;
+        let gas_limit = estimate
+            .checked_mul(120)
+            .and_then(|value| value.checked_add(99))
+            .map(|value| value / 100)
+            .ok_or_else(malformed)?;
+        Ok(TransactionQuote {
+            block_number,
+            block_hash,
+            gas_limit,
+            l1_gas_units: 0,
+            base_fee_per_gas,
+            max_fee_per_gas,
+            max_priority_fee_per_gas,
+            estimated_l1_cost: 0,
+            endpoint_identity: self.endpoint_identity.clone(),
+        })
+    }
+
+    pub async fn runtime_code_hash(&self, executor: CanonicalAddress) -> Result<String, RpcError> {
+        let code = self
+            .call("eth_getCode", json!([executor.to_string(), "latest"]))
+            .await?
+            .as_str()
+            .and_then(parse_hex_bytes)
+            .ok_or_else(malformed)?;
+        if code.is_empty() {
+            return Err(malformed());
+        }
+        Ok(hex::encode(Sha256::digest(code)))
+    }
+
     pub async fn wallet_balance(&self, wallet: CanonicalAddress) -> Result<u128, RpcError> {
         self.call("eth_getBalance", json!([wallet.to_string(), "latest"]))
             .await?
@@ -417,6 +517,74 @@ impl HttpExecutionRpc {
             .await?
             .ok_or_else(malformed)?;
         Ok((owner, flash_provider))
+    }
+
+    pub async fn phoenix_executor_core_snapshot(
+        &self,
+        executor: CanonicalAddress,
+    ) -> Result<ExecutorCoreSnapshot, RpcError> {
+        Ok(ExecutorCoreSnapshot {
+            owner: call_address(self, executor, "owner", &[]).await?,
+            pending_owner: call_address(self, executor, "pendingOwner", &[]).await?,
+            flash_provider: call_address(self, executor, "flashProvider", &[]).await?,
+            atlas: call_address(self, executor, "atlas", &[]).await?,
+            weth: call_address(self, executor, "weth", &[]).await?,
+            paused: call_bool(self, executor, "paused", &[]).await?,
+            maximum_input_amount: call_uint(self, executor, "maximumInputAmount", &[]).await?,
+        })
+    }
+
+    pub async fn phoenix_executor_mapping(
+        &self,
+        executor: CanonicalAddress,
+        mapping: PhoenixExecutorMapping,
+        account: CanonicalAddress,
+    ) -> Result<bool, RpcError> {
+        let name = match mapping {
+            PhoenixExecutorMapping::Searcher => "authorizedSearchers",
+            PhoenixExecutorMapping::Asset => "approvedAssets",
+            PhoenixExecutorMapping::Router => "approvedRouters",
+            PhoenixExecutorMapping::Factory => "approvedFactories",
+        };
+        call_bool(self, executor, name, &[address_token(account)]).await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn phoenix_executor_pool_matches(
+        &self,
+        executor: CanonicalAddress,
+        pool: CanonicalAddress,
+        factory: CanonicalAddress,
+        token0: CanonicalAddress,
+        token1: CanonicalAddress,
+        fee: u32,
+    ) -> Result<bool, RpcError> {
+        let decoded = contract_call(
+            self,
+            executor,
+            "approvedPools",
+            &[address_token(pool)],
+            &[
+                ethabi::ParamType::Address,
+                ethabi::ParamType::Address,
+                ethabi::ParamType::Address,
+                ethabi::ParamType::Uint(24),
+                ethabi::ParamType::Bool,
+            ],
+        )
+        .await?;
+        Ok(decoded.first().and_then(|v| v.clone().into_address())
+            == Some(primitive_types::H160::from_slice(factory.as_bytes()))
+            && decoded.get(1).and_then(|v| v.clone().into_address())
+                == Some(primitive_types::H160::from_slice(token0.as_bytes()))
+            && decoded.get(2).and_then(|v| v.clone().into_address())
+                == Some(primitive_types::H160::from_slice(token1.as_bytes()))
+            && decoded
+                .get(3)
+                .and_then(|v| v.clone().into_uint())
+                .and_then(|v| u32::try_from(v).ok())
+                == Some(fee)
+            && decoded.get(4).and_then(|v| v.clone().into_bool()) == Some(true))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -760,6 +928,14 @@ impl ExecutionRpc for HttpExecutionRpc {
         }
         let object = value.as_object().ok_or_else(malformed)?;
         let returned_hash = parse_hash_field(object, "transactionHash")?;
+        let contract_address = match object.get("contractAddress") {
+            Some(Value::Null) | None => None,
+            Some(Value::String(value)) => Some(
+                CanonicalAddress::parse(value)
+                    .map_err(|_| RpcError::new(RpcErrorKind::MalformedResponse))?,
+            ),
+            Some(_) => return Err(malformed()),
+        };
         let status = parse_u64_field(object, "status")?;
         if status > 1 {
             return Err(malformed());
@@ -782,6 +958,7 @@ impl ExecutionRpc for HttpExecutionRpc {
             .collect::<Result<Vec<_>, _>>()?;
         Ok(Some(TransactionReceipt {
             transaction_hash: returned_hash,
+            contract_address,
             status,
             block_number,
             gas_used,

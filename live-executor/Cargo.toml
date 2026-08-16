@@ -21,6 +21,10 @@ path = "src/approve_execution_request_main.rs"
 name = "autonomous-live-control"
 path = "src/autonomous_live_control_main.rs"
 
+[[bin]]
+name = "phoenix-executor-rotation"
+path = "src/phoenix_executor_rotation_main.rs"
+
 [dependencies]
 alloy-consensus = { version = "=0.6.4", default-features = false, features = ["std", "k256"] }
 alloy-eips = { version = "=0.6.4", default-features = false, features = ["std"] }

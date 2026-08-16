@@ -295,6 +295,13 @@ do
   install_source \
     "$source_root/scripts/$script_name" "$deploy_dir/$script_name" 0750
 done
+for rotation_script in \
+  phoenix_executor_rotation_context.py \
+  rotate-phoenix-executor-live.sh
+do
+  install_versioned_source \
+    "scripts/$rotation_script" "$deploy_dir/$rotation_script" 0750
+done
 for script_name in \
   activate-economic-canary.sh \
   economic-dashboard-loop.sh \
@@ -329,6 +336,17 @@ if [ -n "$release_sha" ]; then
   install_source \
     "$source_root/contracts/PhoenixExecutor.compiled.json" \
     "$deploy_dir/contracts/PhoenixExecutor.compiled.json" 0640
+  for rotation_asset in \
+    contracts/PhoenixExecutor.creation.bin \
+    contracts/PhoenixExecutor.creation.sha256 \
+    contracts/PhoenixExecutor.runtime.bin \
+    contracts/PhoenixExecutor.runtime.sha256 \
+    config/phoenix-executor-rotation-plan.json \
+    config/phoenix-executor-rotation-artifacts.json
+  do
+    install_versioned_source \
+      "$rotation_asset" "$deploy_dir/$rotation_asset" 0640
+  done
   # This one-way compatibility migration makes the legacy overlay's effective
   # ceiling explicit. Rollback preserves the same key and economic policy.
   python3 "$deploy_dir/production_mode.py" materialize-release-defaults \
