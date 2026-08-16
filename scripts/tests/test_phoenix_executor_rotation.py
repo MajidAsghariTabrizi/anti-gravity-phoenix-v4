@@ -142,6 +142,8 @@ class PhoenixExecutorRotationContextTests(unittest.TestCase):
         self.assertNotIn("production_mode.py shadow", source)
         self.assertNotIn("autonomous-control disarm", source)
         self.assertNotIn("arm-revenue", source)
+        self.assertIn('$1=="RPC_AUTH_PROVIDER_ID"', source)
+        self.assertNotIn('$1=="RPC_PRIMARY_PROVIDER_ID"', source)
         self.assertIn("PHOENIX_MODE)\" = LIVE", source)
         self.assertIn("claim-rollback", source)
         self.assertIn("control_snapshot_changed", source)

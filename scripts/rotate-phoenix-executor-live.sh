@@ -167,7 +167,7 @@ verify_support_services() {
   gateway_id=$(compose ps -q rpc-gateway)
   gateway_env=$(/usr/bin/docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$gateway_id")
   [ "$(printf '%s\n' "$gateway_env" | /usr/bin/awk -F= '$1=="RPC_AUTHORITY_MODE"{print $2}')" = single_primary ] || fail rpc_authority_mode
-  [ "$(printf '%s\n' "$gateway_env" | /usr/bin/awk -F= '$1=="RPC_PRIMARY_PROVIDER_ID"{print $2}')" = production-nownodes-arbitrum ] || fail rpc_primary_identity
+  [ "$(printf '%s\n' "$gateway_env" | /usr/bin/awk -F= '$1=="RPC_AUTH_PROVIDER_ID"{print $2}')" = production-nownodes-arbitrum ] || fail rpc_primary_identity
   compose exec -T atlas-observer wget -q -O - http://127.0.0.1:9700/readyz | /usr/bin/python3 -I -B -c '
 import json,sys
 v=json.load(sys.stdin)
