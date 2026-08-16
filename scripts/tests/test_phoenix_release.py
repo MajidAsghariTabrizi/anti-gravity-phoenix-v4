@@ -4493,6 +4493,9 @@ class PostArmMonitorSemanticsTests(unittest.TestCase):
         cls.histogram_program = cls._embedded_program(
             "require_latency_histograms() {", "require_disarmed_controls() {"
         )
+        cls.provider_gateway_program = cls._embedded_counter_program(
+            "provider_gateway_counter_vector() {", "require_hunter_ready() {"
+        )
 
     @classmethod
     def _embedded_program(cls, start: str, end: str) -> str:
@@ -4504,6 +4507,14 @@ class PostArmMonitorSemanticsTests(unittest.TestCase):
         )
         if match is None:
             raise AssertionError(f"embedded monitor program not found: {start}")
+        return match.group("body")
+
+    @classmethod
+    def _embedded_counter_program(cls, start: str, end: str) -> str:
+        section = cls.monitor.split(start, maxsplit=1)[1].split(end, maxsplit=1)[0]
+        match = re.search(r"python3 -c '\n(?P<body>.*?)\n' \|\|", section, re.S)
+        if match is None:
+            raise AssertionError(f"embedded monitor counter not found: {start}")
         return match.group("body")
 
     @staticmethod
@@ -4569,6 +4580,77 @@ class PostArmMonitorSemanticsTests(unittest.TestCase):
             capture_output=True,
             check=False,
         )
+
+    @staticmethod
+    def _provider_gateway_metrics(
+        *,
+        scalar_delta: str | None = None,
+        outcome: str | None = None,
+    ) -> str:
+        scalar_names = (
+            "rpc_state_request_budget_rejected_total",
+            "rpc_upstream_call_budget_rejected_total",
+            "rpc_provider_unavailable_total",
+            "rpc_provider_rate_limited_total",
+            "rpc_provider_cooldown_total",
+            "rpc_provider_disagreement_total",
+        )
+        lines = [
+            f"{name} {1 if name == scalar_delta else 0}" for name in scalar_names
+        ]
+        lines.append(
+            'rpc_upstream_calls_total{method="eth_call",outcome="success",provider_slot="primary"} 185'
+        )
+        if outcome is not None:
+            lines.append(
+                'rpc_upstream_calls_total{method="eth_call",'
+                f'outcome="{outcome}",provider_slot="primary"}} 1'
+            )
+        return "\n".join(lines)
+
+    def _provider_gateway_vector(self, metrics: str) -> str:
+        result = subprocess.run(
+            [sys.executable, "-c", self.provider_gateway_program],
+            input=metrics,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return result.stdout.strip()
+
+    def test_provider_gateway_vector_ignores_reverts_but_not_failures(self) -> None:
+        baseline = self._provider_gateway_vector(self._provider_gateway_metrics())
+        self.assertEqual(baseline, "0:0:0:0:0:0:0")
+        self.assertEqual(
+            self._provider_gateway_vector(
+                self._provider_gateway_metrics(outcome="reverted")
+            ),
+            baseline,
+        )
+        for outcome in ("failure", "timeout", "rate_limited"):
+            with self.subTest(outcome=outcome):
+                self.assertNotEqual(
+                    self._provider_gateway_vector(
+                        self._provider_gateway_metrics(outcome=outcome)
+                    ),
+                    baseline,
+                )
+        for scalar in (
+            "rpc_state_request_budget_rejected_total",
+            "rpc_upstream_call_budget_rejected_total",
+            "rpc_provider_unavailable_total",
+            "rpc_provider_rate_limited_total",
+            "rpc_provider_cooldown_total",
+            "rpc_provider_disagreement_total",
+        ):
+            with self.subTest(scalar=scalar):
+                self.assertNotEqual(
+                    self._provider_gateway_vector(
+                        self._provider_gateway_metrics(scalar_delta=scalar)
+                    ),
+                    baseline,
+                )
 
     def test_idle_and_first_transient_actionable_samples_are_not_starvation(self) -> None:
         idle = self._gauge_metrics()

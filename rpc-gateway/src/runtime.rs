@@ -3484,12 +3484,7 @@ impl GatewayRuntime {
             .client
             .call(provider, method, params, self.timeouts.timeout_for(method))
             .await;
-        let outcome = match result {
-            Ok(_) => UpstreamOutcome::Success,
-            Err(TransportError::Timeout) => UpstreamOutcome::Timeout,
-            Err(TransportError::RateLimited { .. }) => UpstreamOutcome::RateLimited,
-            Err(_) => UpstreamOutcome::Failure,
-        };
+        let outcome = classify_upstream_outcome(&result);
         self.metrics.upstream_call(method, outcome, slot);
         let latency = result
             .as_ref()
@@ -3813,6 +3808,16 @@ impl GatewayRuntime {
             .lock()
             .await
             .record_failure(provider_id, Instant::now());
+    }
+}
+
+fn classify_upstream_outcome(result: &Result<RpcCallResult, TransportError>) -> UpstreamOutcome {
+    match result {
+        Ok(_) => UpstreamOutcome::Success,
+        Err(TransportError::ExecutionReverted) => UpstreamOutcome::Reverted,
+        Err(TransportError::Timeout) => UpstreamOutcome::Timeout,
+        Err(TransportError::RateLimited { .. }) => UpstreamOutcome::RateLimited,
+        Err(_) => UpstreamOutcome::Failure,
     }
 }
 
@@ -5697,6 +5702,45 @@ mod tests {
     const BLOCK_HASH: &str = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     const REORG_HASH: &str = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
     const NEXT_HASH: &str = "0xcccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+
+    #[test]
+    fn upstream_outcomes_distinguish_reverts_without_weakening_failures() {
+        let success = Ok(RpcCallResult {
+            value: Value::Null,
+            latency_ns: 1,
+        });
+        assert_eq!(
+            classify_upstream_outcome(&success),
+            UpstreamOutcome::Success
+        );
+        assert_eq!(
+            classify_upstream_outcome(&Err(TransportError::ExecutionReverted)),
+            UpstreamOutcome::Reverted
+        );
+        assert_eq!(
+            classify_upstream_outcome(&Err(TransportError::Timeout)),
+            UpstreamOutcome::Timeout
+        );
+        assert_eq!(
+            classify_upstream_outcome(&Err(TransportError::RateLimited {
+                retry_after: Duration::from_secs(1),
+            })),
+            UpstreamOutcome::RateLimited
+        );
+        for failure in [
+            TransportError::Http,
+            TransportError::Oversized,
+            TransportError::InvalidResponse,
+            TransportError::MethodUnsupported,
+            TransportError::HistoricalStateUnavailable,
+            TransportError::ProviderError,
+        ] {
+            assert_eq!(
+                classify_upstream_outcome(&Err(failure)),
+                UpstreamOutcome::Failure
+            );
+        }
+    }
 
     #[derive(Clone, Debug)]
     struct CallRecord {

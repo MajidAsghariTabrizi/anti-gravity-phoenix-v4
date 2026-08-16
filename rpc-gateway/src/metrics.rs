@@ -27,6 +27,7 @@ impl ProviderSlot {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum UpstreamOutcome {
     Success,
+    Reverted,
     Timeout,
     RateLimited,
     Failure,
@@ -36,6 +37,7 @@ impl UpstreamOutcome {
     const fn as_str(self) -> &'static str {
         match self {
             Self::Success => "success",
+            Self::Reverted => "reverted",
             Self::Timeout => "timeout",
             Self::RateLimited => "rate_limited",
             Self::Failure => "failure",
@@ -622,6 +624,11 @@ mod tests {
             UpstreamOutcome::Success,
             ProviderSlot::Primary,
         );
+        metrics.upstream_call(
+            RpcMethod::EthCall,
+            UpstreamOutcome::Reverted,
+            ProviderSlot::Primary,
+        );
         metrics.upstream_call_latency(
             RpcMethod::EthCall,
             UpstreamOutcome::Success,
@@ -647,6 +654,12 @@ mod tests {
         }
         assert!(
             rendered.contains("method=\"eth_call\",outcome=\"success\",provider_slot=\"primary\"")
+        );
+        assert!(
+            rendered.contains("method=\"eth_call\",outcome=\"reverted\",provider_slot=\"primary\"")
+        );
+        assert!(
+            !rendered.contains("method=\"eth_call\",outcome=\"failure\",provider_slot=\"primary\"")
         );
         assert!(rendered.contains("rpc_secondary_requested_total 1"));
         assert!(rendered.contains("rpc_secondary_agreed_total 1"));
