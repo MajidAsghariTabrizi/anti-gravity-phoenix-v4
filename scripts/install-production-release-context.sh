@@ -164,6 +164,7 @@ for context_directory in \
   "$deploy_dir/prometheus" \
   "$deploy_dir/sql" \
   "$deploy_dir/schemas" \
+  "$deploy_dir/config" \
   "$deploy_dir/routes" \
   "$deploy_dir/contracts" \
   "$deploy_dir/docs" \
