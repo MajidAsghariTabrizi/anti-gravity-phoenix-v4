@@ -75,6 +75,112 @@ pub enum RotationError {
     BytecodeMismatch,
     #[error("creation bytecode could not be read")]
     BytecodeUnreadable,
+    #[error("rotation lifecycle guard rejected the operation")]
+    LifecycleRejected,
+}
+
+/// Narrow host-operation boundary.  The implementation is intentionally
+/// injected: production transport, compose/context orchestration, and signer
+/// material stay outside this state machine and cannot be replaced by a
+/// generic deployer.
+pub trait RotationBackend {
+    type Error;
+
+    fn deploy(&mut self) -> Result<(), Self::Error>;
+    fn mirror(&mut self) -> Result<(), Self::Error>;
+    fn verify(&mut self) -> Result<(), Self::Error>;
+    fn spl_gate(&mut self) -> Result<bool, Self::Error>;
+    fn drain_old_bound_work(&mut self) -> Result<bool, Self::Error>;
+    fn cutover_live_identity(&mut self) -> Result<(), Self::Error>;
+    fn reconcile(&mut self) -> Result<bool, Self::Error>;
+    fn rollback_identity_once(&mut self) -> Result<(), Self::Error>;
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RotationMode {
+    Validate,
+    Prepare,
+    Execute,
+    Rollback,
+}
+
+pub struct RotationOperator<B> {
+    backend: B,
+    rollback_used: bool,
+}
+
+impl<B> RotationOperator<B> {
+    pub fn new(backend: B) -> Self {
+        Self {
+            backend,
+            rollback_used: false,
+        }
+    }
+
+    pub fn into_backend(self) -> B {
+        self.backend
+    }
+}
+
+impl<B: RotationBackend> RotationOperator<B> {
+    pub fn execute(&mut self) -> Result<(), RotationError> {
+        self.backend
+            .deploy()
+            .map_err(|_| RotationError::LifecycleRejected)?;
+        self.backend
+            .mirror()
+            .map_err(|_| RotationError::LifecycleRejected)?;
+        self.backend
+            .verify()
+            .map_err(|_| RotationError::LifecycleRejected)?;
+        if !self
+            .backend
+            .spl_gate()
+            .map_err(|_| RotationError::LifecycleRejected)?
+        {
+            return Err(RotationError::LifecycleRejected);
+        }
+        if !self
+            .backend
+            .drain_old_bound_work()
+            .map_err(|_| RotationError::LifecycleRejected)?
+        {
+            return Err(RotationError::LifecycleRejected);
+        }
+        self.backend
+            .cutover_live_identity()
+            .map_err(|_| RotationError::LifecycleRejected)?;
+        if !self
+            .backend
+            .reconcile()
+            .map_err(|_| RotationError::LifecycleRejected)?
+        {
+            self.rollback_once()?;
+        }
+        Ok(())
+    }
+
+    pub fn rollback_once(&mut self) -> Result<(), RotationError> {
+        if self.rollback_used {
+            return Err(RotationError::LifecycleRejected);
+        }
+        self.rollback_used = true;
+        self.backend
+            .rollback_identity_once()
+            .map_err(|_| RotationError::LifecycleRejected)
+    }
+
+    pub fn prepare(&mut self) -> Result<(), RotationError> {
+        self.backend
+            .deploy()
+            .map_err(|_| RotationError::LifecycleRejected)?;
+        self.backend
+            .mirror()
+            .map_err(|_| RotationError::LifecycleRejected)?;
+        self.backend
+            .verify()
+            .map_err(|_| RotationError::LifecycleRejected)
+    }
 }
 
 pub fn validate_plan(plan: &RotationPlan) -> Result<(), RotationError> {
@@ -214,5 +320,106 @@ mod tests {
         let mut value = plan();
         value.old_executor = REVIEWED_OWNER.to_string();
         assert_eq!(validate_plan(&value), Err(RotationError::InvalidPlan));
+    }
+
+    #[derive(Default)]
+    struct FakeBackend {
+        calls: Vec<&'static str>,
+        spl: bool,
+        drained: bool,
+        reconciled: bool,
+        rollbacks: u8,
+    }
+
+    impl RotationBackend for FakeBackend {
+        type Error = ();
+        fn deploy(&mut self) -> Result<(), Self::Error> {
+            self.calls.push("deploy");
+            Ok(())
+        }
+        fn mirror(&mut self) -> Result<(), Self::Error> {
+            self.calls.push("mirror");
+            Ok(())
+        }
+        fn verify(&mut self) -> Result<(), Self::Error> {
+            self.calls.push("verify");
+            Ok(())
+        }
+        fn spl_gate(&mut self) -> Result<bool, Self::Error> {
+            self.calls.push("spl");
+            Ok(self.spl)
+        }
+        fn drain_old_bound_work(&mut self) -> Result<bool, Self::Error> {
+            self.calls.push("drain");
+            Ok(self.drained)
+        }
+        fn cutover_live_identity(&mut self) -> Result<(), Self::Error> {
+            self.calls.push("cutover");
+            Ok(())
+        }
+        fn reconcile(&mut self) -> Result<bool, Self::Error> {
+            self.calls.push("reconcile");
+            Ok(self.reconciled)
+        }
+        fn rollback_identity_once(&mut self) -> Result<(), Self::Error> {
+            self.calls.push("rollback");
+            self.rollbacks += 1;
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn lifecycle_requires_spl_and_drain_before_cutover() {
+        let backend = FakeBackend {
+            spl: true,
+            drained: true,
+            reconciled: true,
+            ..Default::default()
+        };
+        let mut operator = RotationOperator::new(backend);
+        operator.execute().expect("execute");
+        let backend = operator.into_backend();
+        assert_eq!(
+            backend.calls,
+            [
+                "deploy",
+                "mirror",
+                "verify",
+                "spl",
+                "drain",
+                "cutover",
+                "reconcile"
+            ]
+        );
+        assert_eq!(backend.rollbacks, 0);
+    }
+
+    #[test]
+    fn reconciliation_failure_performs_exactly_one_identity_rollback() {
+        let backend = FakeBackend {
+            spl: true,
+            drained: true,
+            reconciled: false,
+            ..Default::default()
+        };
+        let mut operator = RotationOperator::new(backend);
+        operator.execute().expect("rollback");
+        assert!(operator.rollback_once().is_err());
+        let backend = operator.into_backend();
+        assert_eq!(backend.rollbacks, 1);
+    }
+
+    #[test]
+    fn spl_failure_blocks_cutover_and_drain() {
+        let backend = FakeBackend {
+            spl: false,
+            drained: true,
+            reconciled: true,
+            ..Default::default()
+        };
+        let mut operator = RotationOperator::new(backend);
+        assert_eq!(operator.execute(), Err(RotationError::LifecycleRejected));
+        let backend = operator.into_backend();
+        assert_eq!(backend.calls, ["deploy", "mirror", "verify", "spl"]);
     }
 }
