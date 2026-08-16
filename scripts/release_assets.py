@@ -298,14 +298,19 @@ def _materialize_phoenix_runtime(artifact: dict[str, object], atlas: str, weth: 
 
 
 def _rotation_payloads(
-    contract_artifact: Path, release_sha: str, base_release_sha: str
+    contract_artifact: Path,
+    release_sha: str,
+    base_release_sha: str,
+    required: bool,
 ) -> dict[str, bytes]:
     try:
         artifact = json.loads(_read_bounded(contract_artifact))
     except (UnicodeError, json.JSONDecodeError) as exc:
         raise ReleaseAssetError("PhoenixExecutor artifact is invalid") from exc
     if not isinstance(artifact, dict):
-        raise ReleaseAssetError("PhoenixExecutor artifact is invalid")
+        if required:
+            raise ReleaseAssetError("PhoenixExecutor artifact is invalid")
+        return {}
     creation = _artifact_bytecode(artifact, "bytecode")
     owner = "0x9f30c00b68f7c0edb4b4117b9f04e0ca2eb2c17a"
     weth = "0x82af49447d8a07e3bd95bd0d56f35241523fbab1"
@@ -414,13 +419,21 @@ def build_release_assets(
     output_dir: Path,
     contract_artifact: Path,
     base_release_sha: str | None = None,
+    require_rotation_assets: bool = False,
 ) -> tuple[Path, Path, Path]:
     release_sha = _validate_release_sha(release_sha)
     base_release_sha = _validate_release_sha(base_release_sha or release_sha)
     repo_root = repo_root.resolve(strict=True)
     contract_artifact = contract_artifact.resolve(strict=True)
     payloads = _collect_sources(repo_root, contract_artifact)
-    payloads.update(_rotation_payloads(contract_artifact, release_sha, base_release_sha))
+    payloads.update(
+        _rotation_payloads(
+            contract_artifact,
+            release_sha,
+            base_release_sha,
+            require_rotation_assets,
+        )
+    )
     manifest_bytes = _canonical_json(_manifest(release_sha, payloads))
     root_name = f"phoenix-release-{release_sha}"
     archive_name = f"phoenix-release-assets-{release_sha}.tar.gz"
@@ -609,6 +622,7 @@ def _parser() -> argparse.ArgumentParser:
     build.add_argument("--output-dir", required=True, type=Path)
     build.add_argument("--contract-artifact", required=True, type=Path)
     build.add_argument("--base-release-sha")
+    build.add_argument("--require-executor-rotation-assets", action="store_true")
 
     verify = subcommands.add_parser("verify")
     verify.add_argument("--archive", required=True, type=Path)
@@ -628,8 +642,12 @@ def main() -> None:
     try:
         if args.command == "build":
             archive, manifest, checksums = build_release_assets(
-                args.repo_root, args.release_sha, args.output_dir, args.contract_artifact,
+                args.repo_root,
+                args.release_sha,
+                args.output_dir,
+                args.contract_artifact,
                 args.base_release_sha,
+                args.require_executor_rotation_assets,
             )
             print(
                 json.dumps(

@@ -74,6 +74,7 @@ class ReleaseAssetsTests(unittest.TestCase):
             RELEASE_SHA,
             output,
             artifact,
+            require_rotation_assets=True,
         )
 
     def test_bundle_is_deterministic_and_verifies(self) -> None:
@@ -115,7 +116,7 @@ class ReleaseAssetsTests(unittest.TestCase):
             ):
                 self.assertIn(rotation_asset, paths)
             payloads = release_assets._rotation_payloads(
-                Path(raw) / "PhoenixExecutor.json", RELEASE_SHA, RELEASE_SHA
+                Path(raw) / "PhoenixExecutor.json", RELEASE_SHA, RELEASE_SHA, True
             )
             runtime = payloads[release_assets.ROTATION_RUNTIME_TARGET]
             self.assertEqual(len(runtime), 7 * 32)
@@ -127,6 +128,7 @@ class ReleaseAssetsTests(unittest.TestCase):
                 bytes.fromhex("82af49447d8a07e3bd95bd0d56f35241523fbab1"),
                 runtime,
             )
+
             self.assertIn("schemas/phoenix-release-assets.schema.json", paths)
             self.assertIn("scripts/prelive-shadow-control.sh", paths)
             self.assertIn("scripts/prelive-protected-maintenance.sh", paths)
@@ -187,6 +189,20 @@ class ReleaseAssetsTests(unittest.TestCase):
                 )
             )
             release_assets.verify_release_assets(archive, manifest_path, checksums, RELEASE_SHA)
+
+    def test_protected_build_rejects_an_abi_only_rotation_artifact(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            with self.assertRaisesRegex(
+                release_assets.ReleaseAssetError,
+                "PhoenixExecutor artifact is invalid",
+            ):
+                release_assets.build_release_assets(
+                    self.repo_root,
+                    RELEASE_SHA,
+                    Path(raw),
+                    self.contract_artifact,
+                    require_rotation_assets=True,
+                )
 
     def test_live_canary_assets_have_exact_bytes_hashes_modes_and_archive_paths(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
