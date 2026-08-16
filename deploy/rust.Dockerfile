@@ -31,6 +31,7 @@ RUN set -eux; \
     printf 'fn main() {}\n' >live-executor/src/main.rs; \
     printf 'fn main() {}\n' >live-executor/src/approve_execution_request_main.rs; \
     printf 'fn main() {}\n' >live-executor/src/autonomous_live_control_main.rs; \
+    printf 'fn main() {}\n' >live-executor/src/phoenix_executor_rotation_main.rs; \
     printf 'pub fn dependency_cache() {}\n' >fork-sandbox/src/lib.rs; \
     printf 'fn main() {}\n' >fork-sandbox/src/main.rs; \
     printf 'pub fn dependency_cache() {}\n' >money-path-classifier/src/lib.rs; \
