@@ -92,6 +92,8 @@ RUN set -eux; \
       cp target/release/approve-execution-request /out/approve-execution-request; \
       cargo build --release --bin autonomous-live-control; \
       cp target/release/autonomous-live-control /out/autonomous-live-control; \
+      cargo build --release --bin phoenix-executor-rotation; \
+      cp target/release/phoenix-executor-rotation /out/phoenix-executor-rotation; \
     fi; \
     test -x /out/service; \
     if [ "${CRATE}" = "live-executor" ]; then \
@@ -111,6 +113,7 @@ RUN set -eux; \
     if [ "${CRATE}" = "live-executor" ]; then \
       test -x /usr/local/bin/approve-execution-request; \
       test -x /usr/local/bin/autonomous-live-control; \
+      test -x /usr/local/bin/phoenix-executor-rotation; \
       probe_stderr="$(mktemp)"; \
       probe_output="$(/usr/local/bin/autonomous-live-control __image_runtime_probe__ 2>"$probe_stderr")"; \
       [ ! -s "$probe_stderr" ]; \

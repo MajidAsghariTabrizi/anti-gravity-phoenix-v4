@@ -1,0 +1,46 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "phoenix.executor-rotation.v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema", "chain_id", "source_sha", "base_release_sha",
+    "old_executor", "old_runtime_sha256", "expected_new_runtime_sha256",
+    "creation_bytecode_sha256", "config_digest", "owner", "flash_provider",
+    "atlas", "weth", "maximum_input_amount", "searcher", "assets",
+    "routers", "factory", "pools"
+  ],
+  "properties": {
+    "schema": {"const": "phoenix.executor-rotation.v1"},
+    "chain_id": {"const": 42161},
+    "source_sha": {"type": "string", "pattern": "^[0-9a-fA-F]{64}$"},
+    "base_release_sha": {"type": "string", "pattern": "^[0-9a-fA-F]{64}$"},
+    "old_executor": {"type": "string", "pattern": "^0x[0-9a-f]{40}$"},
+    "old_runtime_sha256": {"type": "string", "pattern": "^[0-9a-fA-F]{64}$"},
+    "expected_new_runtime_sha256": {"type": "string", "pattern": "^[0-9a-fA-F]{64}$"},
+    "creation_bytecode_sha256": {"type": "string", "pattern": "^[0-9a-fA-F]{64}$"},
+    "config_digest": {"type": "string", "pattern": "^[0-9a-fA-F]{64}$"},
+    "owner": {"type": "string", "pattern": "^0x[0-9a-f]{40}$"},
+    "flash_provider": {"type": "string", "pattern": "^0x[0-9a-f]{40}$"},
+    "atlas": {"type": "string", "pattern": "^0x[0-9a-f]{40}$"},
+    "weth": {"type": "string", "pattern": "^0x[0-9a-f]{40}$"},
+    "maximum_input_amount": {"const": 10000000000000000},
+    "searcher": {"type": "string", "pattern": "^0x[0-9a-f]{40}$"},
+    "assets": {"type": "array", "minItems": 1, "items": {"type": "string", "pattern": "^0x[0-9a-f]{40}$"}},
+    "routers": {"type": "array", "minItems": 1, "items": {"type": "string", "pattern": "^0x[0-9a-f]{40}$"}},
+    "factory": {"type": "string", "pattern": "^0x[0-9a-f]{40}$"},
+    "pools": {
+      "type": "array", "minItems": 1,
+      "items": {
+        "type": "object", "additionalProperties": false,
+        "required": ["address", "fee", "token0", "token1"],
+        "properties": {
+          "address": {"type": "string", "pattern": "^0x[0-9a-f]{40}$"},
+          "fee": {"type": "integer", "minimum": 1, "maximum": 16777215},
+          "token0": {"type": "string", "pattern": "^0x[0-9a-f]{40}$"},
+          "token1": {"type": "string", "pattern": "^0x[0-9a-f]{40}$"}
+        }
+      }
+    }
+  }
+}
