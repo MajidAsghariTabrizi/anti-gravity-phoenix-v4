@@ -117,6 +117,70 @@ pub struct RotationOperator<B> {
     rollback_used: bool,
 }
 
+/// Production-facing PhoenixExecutor adapter boundary.  The transport is
+/// intentionally PhoenixExecutor-specific: it owns the authenticated RPC,
+/// protected artifact, canonical compose/context and DB drain checks.  No
+/// arbitrary destination, bytecode, authority, or economics parameters are
+/// exposed here.
+pub trait PhoenixExecutorRotationTransport {
+    type Error;
+    fn deploy_phoenix_executor(&mut self, plan: &RotationPlan) -> Result<(), Self::Error>;
+    fn mirror_phoenix_config(&mut self, plan: &RotationPlan) -> Result<(), Self::Error>;
+    fn verify_phoenix_pair(&mut self, plan: &RotationPlan) -> Result<(), Self::Error>;
+    fn prove_spl_absent(&mut self, plan: &RotationPlan) -> Result<bool, Self::Error>;
+    fn prove_old_bound_work_drained(&mut self) -> Result<bool, Self::Error>;
+    fn cutover_phoenix_identity(&mut self, plan: &RotationPlan) -> Result<(), Self::Error>;
+    fn reconcile_phoenix_identity(&mut self, plan: &RotationPlan) -> Result<bool, Self::Error>;
+    fn rollback_phoenix_identity_once(&mut self, plan: &RotationPlan) -> Result<(), Self::Error>;
+}
+
+pub struct ProductionPhoenixExecutorRotationBackend<T> {
+    plan: RotationPlan,
+    transport: T,
+}
+
+impl<T> ProductionPhoenixExecutorRotationBackend<T> {
+    pub fn new(plan: RotationPlan, transport: T) -> Result<Self, RotationError> {
+        validate_plan(&plan)?;
+        Ok(Self { plan, transport })
+    }
+
+    pub fn into_transport(self) -> T {
+        self.transport
+    }
+}
+
+impl<T: PhoenixExecutorRotationTransport> RotationBackend
+    for ProductionPhoenixExecutorRotationBackend<T>
+{
+    type Error = T::Error;
+
+    fn deploy(&mut self) -> Result<(), Self::Error> {
+        self.transport.deploy_phoenix_executor(&self.plan)
+    }
+    fn mirror(&mut self) -> Result<(), Self::Error> {
+        self.transport.mirror_phoenix_config(&self.plan)
+    }
+    fn verify(&mut self) -> Result<(), Self::Error> {
+        self.transport.verify_phoenix_pair(&self.plan)
+    }
+    fn spl_gate(&mut self) -> Result<bool, Self::Error> {
+        self.transport.prove_spl_absent(&self.plan)
+    }
+    fn drain_old_bound_work(&mut self) -> Result<bool, Self::Error> {
+        self.transport.prove_old_bound_work_drained()
+    }
+    fn cutover_live_identity(&mut self) -> Result<(), Self::Error> {
+        self.transport.cutover_phoenix_identity(&self.plan)
+    }
+    fn reconcile(&mut self) -> Result<bool, Self::Error> {
+        self.transport.reconcile_phoenix_identity(&self.plan)
+    }
+    fn rollback_identity_once(&mut self) -> Result<(), Self::Error> {
+        self.transport.rollback_phoenix_identity_once(&self.plan)
+    }
+}
+
 impl<B> RotationOperator<B> {
     pub fn new(backend: B) -> Self {
         Self {
