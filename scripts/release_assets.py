@@ -61,6 +61,8 @@ STATIC_PATHS = (
     "scripts/bootstrap-production.sh",
     "scripts/activate-economic-canary.sh",
     "scripts/monitor-post-arm-revenue.sh",
+    "scripts/phoenix_executor_rotation_context.py",
+    "scripts/rotate-phoenix-executor-live.sh",
     "scripts/deploy-release.sh",
     "scripts/economic_activation_runner.py",
     "scripts/economic-dashboard-loop.sh",
@@ -123,6 +125,12 @@ GLOB_PATHS = (
     "scripts/phoenix_release/*.py",
 )
 CONTRACT_TARGET = "contracts/PhoenixExecutor.compiled.json"
+ROTATION_CREATION_TARGET = "contracts/PhoenixExecutor.creation.bin"
+ROTATION_CREATION_DIGEST_TARGET = "contracts/PhoenixExecutor.creation.sha256"
+ROTATION_RUNTIME_TARGET = "contracts/PhoenixExecutor.runtime.bin"
+ROTATION_RUNTIME_DIGEST_TARGET = "contracts/PhoenixExecutor.runtime.sha256"
+ROTATION_PLAN_TARGET = "config/phoenix-executor-rotation-plan.json"
+ROTATION_METADATA_TARGET = "config/phoenix-executor-rotation-artifacts.json"
 MANIFEST_NAME = "release-assets-manifest.json"
 
 
@@ -239,6 +247,132 @@ def _collect_sources(repo_root: Path, contract_artifact: Path) -> dict[str, byte
     return payloads
 
 
+def _artifact_bytecode(artifact: dict[str, object], field: str) -> bytes:
+    value = artifact.get(field)
+    if not isinstance(value, dict) or set(value) < {"object"}:
+        raise ReleaseAssetError(f"PhoenixExecutor {field} is unavailable")
+    encoded = value.get("object")
+    if not isinstance(encoded, str):
+        raise ReleaseAssetError(f"PhoenixExecutor {field} is invalid")
+    body = encoded.removeprefix("0x")
+    if not body or len(body) % 2 or any(character not in "0123456789abcdefABCDEF" for character in body):
+        raise ReleaseAssetError(f"PhoenixExecutor {field} is invalid")
+    return bytes.fromhex(body)
+
+
+def _materialize_phoenix_runtime(artifact: dict[str, object], atlas: str, weth: str) -> bytes:
+    runtime = bytearray(_artifact_bytecode(artifact, "deployedBytecode"))
+    deployed = artifact.get("deployedBytecode")
+    references = deployed.get("immutableReferences") if isinstance(deployed, dict) else None
+    if not isinstance(references, dict) or len(references) != 2:
+        raise ReleaseAssetError("PhoenixExecutor immutable references are invalid")
+    by_count: dict[int, list[object]] = {}
+    for entries in references.values():
+        if not isinstance(entries, list) or len(entries) not in (3, 4) or len(entries) in by_count:
+            raise ReleaseAssetError("PhoenixExecutor immutable references are invalid")
+        by_count[len(entries)] = entries
+    if set(by_count) != {3, 4}:
+        raise ReleaseAssetError("PhoenixExecutor immutable references are invalid")
+    occupied: set[int] = set()
+    for entries, address in ((by_count[4], atlas), (by_count[3], weth)):
+        encoded = bytes.fromhex(address.removeprefix("0x"))
+        if len(encoded) != 20:
+            raise ReleaseAssetError("PhoenixExecutor immutable address is invalid")
+        word = b"\x00" * 12 + encoded
+        for reference in entries:
+            if not isinstance(reference, dict) or set(reference) != {"start", "length"}:
+                raise ReleaseAssetError("PhoenixExecutor immutable references are invalid")
+            start, length = reference.get("start"), reference.get("length")
+            if (
+                not isinstance(start, int)
+                or isinstance(start, bool)
+                or length != 32
+                or start < 0
+                or start + length > len(runtime)
+                or any(offset in occupied for offset in range(start, start + length))
+            ):
+                raise ReleaseAssetError("PhoenixExecutor immutable references are invalid")
+            occupied.update(range(start, start + length))
+            runtime[start : start + length] = word
+    return bytes(runtime)
+
+
+def _rotation_payloads(
+    contract_artifact: Path, release_sha: str, base_release_sha: str
+) -> dict[str, bytes]:
+    try:
+        artifact = json.loads(_read_bounded(contract_artifact))
+    except (UnicodeError, json.JSONDecodeError) as exc:
+        raise ReleaseAssetError("PhoenixExecutor artifact is invalid") from exc
+    if not isinstance(artifact, dict):
+        raise ReleaseAssetError("PhoenixExecutor artifact is invalid")
+    creation = _artifact_bytecode(artifact, "bytecode")
+    owner = "0x9f30c00b68f7c0edb4b4117b9f04e0ca2eb2c17a"
+    weth = "0x82af49447d8a07e3bd95bd0d56f35241523fbab1"
+    native_usdc = "0xaf88d065e77c8cc2239327c5edb3a432268e5831"
+    usdc_e = "0xff970a61a04b1ca14834a43f5de4533ebddb5cc8"
+    factory = "0x1f98431c8ad98523631ae4a59f267346ea31f984"
+    runtime = _materialize_phoenix_runtime(
+        artifact, "0x8ad1ae9d97c79aa68a0a151e83ff3942f68f86c1", weth
+    )
+    creation_digest = hashlib.sha256(creation).hexdigest()
+    runtime_digest = hashlib.sha256(runtime).hexdigest()
+    pools = [
+        {"address": "0x6f38e884725a116c9c7fbf208e79fe8828a2595f", "fee": 100, "token0": weth, "token1": native_usdc},
+        {"address": "0xc6962004f452be9203591991d15f6b388e09e8d0", "fee": 500, "token0": weth, "token1": native_usdc},
+        {"address": "0xc473e2aee3441bf9240be85eb122abb059a3b57c", "fee": 3000, "token0": weth, "token1": native_usdc},
+        {"address": "0xc31e54c7a869b9fcbecc14363cf510d1c41fa443", "fee": 500, "token0": weth, "token1": usdc_e},
+    ]
+    config = {
+        "assets": [weth, native_usdc, usdc_e],
+        "atlas": "0x8ad1ae9d97c79aa68a0a151e83ff3942f68f86c1",
+        "factory": factory,
+        "flash_provider": "0x794a61358d6845594f94dc1db02a252b5b4814ad",
+        "maximum_input_amount": 10_000_000_000_000_000,
+        "owner": owner,
+        "pools": pools,
+        "routers": [
+            "0x68b3465833fb72a70ecdf485e0e4c7bd8665fc45",
+            "0xa51afafe0263b40edaef0df8781ea9aa03e381a3",
+            "0xe592427a0aece92de3edee1f18e0157c05861564",
+        ],
+        "searcher": owner,
+        "weth": weth,
+    }
+    config_digest = hashlib.sha256(
+        json.dumps(config, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    plan = {
+        "schema": "phoenix.executor-rotation.v1",
+        "chain_id": 42161,
+        "source_sha": release_sha,
+        "base_release_sha": base_release_sha,
+        "old_executor": "0x634f62d7cd28d1c4dcf503d901b88d666c2626ad",
+        "old_runtime_sha256": "99a485d5a711180b4455028620bf4d5374558f85ef185ba00a51481c7c239c58",
+        "expected_new_runtime_sha256": runtime_digest,
+        "creation_bytecode_sha256": creation_digest,
+        "config_digest": config_digest,
+        **config,
+    }
+    metadata = {
+        "schema": "phoenix.executor-rotation-artifacts.v1",
+        "source_sha": release_sha,
+        "base_release_sha": base_release_sha,
+        "creation_bytecode_sha256": creation_digest,
+        "runtime_bytecode_sha256": runtime_digest,
+        "config_digest": config_digest,
+        "rotation_plan_sha256": hashlib.sha256(_canonical_json(plan)).hexdigest(),
+    }
+    return {
+        ROTATION_CREATION_TARGET: creation,
+        ROTATION_CREATION_DIGEST_TARGET: f"{creation_digest}  PhoenixExecutor.creation.bin\n".encode("ascii"),
+        ROTATION_RUNTIME_TARGET: runtime,
+        ROTATION_RUNTIME_DIGEST_TARGET: f"{runtime_digest}  PhoenixExecutor.runtime.bin\n".encode("ascii"),
+        ROTATION_PLAN_TARGET: _canonical_json(plan),
+        ROTATION_METADATA_TARGET: _canonical_json(metadata),
+    }
+
+
 def _manifest(release_sha: str, payloads: dict[str, bytes]) -> dict[str, object]:
     return {
         "schema": SCHEMA,
@@ -279,11 +413,14 @@ def build_release_assets(
     release_sha: str,
     output_dir: Path,
     contract_artifact: Path,
+    base_release_sha: str | None = None,
 ) -> tuple[Path, Path, Path]:
     release_sha = _validate_release_sha(release_sha)
+    base_release_sha = _validate_release_sha(base_release_sha or release_sha)
     repo_root = repo_root.resolve(strict=True)
     contract_artifact = contract_artifact.resolve(strict=True)
     payloads = _collect_sources(repo_root, contract_artifact)
+    payloads.update(_rotation_payloads(contract_artifact, release_sha, base_release_sha))
     manifest_bytes = _canonical_json(_manifest(release_sha, payloads))
     root_name = f"phoenix-release-{release_sha}"
     archive_name = f"phoenix-release-assets-{release_sha}.tar.gz"
@@ -471,6 +608,7 @@ def _parser() -> argparse.ArgumentParser:
     build.add_argument("--release-sha", required=True)
     build.add_argument("--output-dir", required=True, type=Path)
     build.add_argument("--contract-artifact", required=True, type=Path)
+    build.add_argument("--base-release-sha")
 
     verify = subcommands.add_parser("verify")
     verify.add_argument("--archive", required=True, type=Path)
@@ -490,7 +628,8 @@ def main() -> None:
     try:
         if args.command == "build":
             archive, manifest, checksums = build_release_assets(
-                args.repo_root, args.release_sha, args.output_dir, args.contract_artifact
+                args.repo_root, args.release_sha, args.output_dir, args.contract_artifact,
+                args.base_release_sha,
             )
             print(
                 json.dumps(

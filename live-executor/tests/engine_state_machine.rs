@@ -602,6 +602,7 @@ fn successful_receipt(
     ]);
     TransactionReceipt {
         transaction_hash: tx_hash,
+        contract_address: None,
         status: 1,
         block_number: 100,
         gas_used: 10,
@@ -751,6 +752,7 @@ async fn known_revert_records_loss_without_global_disarm() {
     let tx_hash = harness.rpc.last_hash();
     harness.rpc.set_receipt(TransactionReceipt {
         transaction_hash: tx_hash,
+        contract_address: None,
         status: 0,
         block_number: 100,
         gas_used: 10,
@@ -776,6 +778,7 @@ async fn invalid_settlement_disarms_and_preserves_the_submitted_hash() {
     let tx_hash = harness.rpc.last_hash();
     harness.rpc.set_receipt(TransactionReceipt {
         transaction_hash: tx_hash,
+        contract_address: None,
         status: 1,
         block_number: 100,
         gas_used: 10,

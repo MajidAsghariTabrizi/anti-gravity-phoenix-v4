@@ -440,6 +440,7 @@ jobs:
         shell: bash
         env:
           RELEASE_SHA: ${{ inputs.release_sha }}
+          PROTECTED_BASE_SHA: ${{ inputs.protected_base_sha }}
         run: |
           set -euo pipefail
           forge build --root contracts
@@ -447,6 +448,7 @@ jobs:
           python3 scripts/release_assets.py build \
             --repo-root . \
             --release-sha "$RELEASE_SHA" \
+            --base-release-sha "$PROTECTED_BASE_SHA" \
             --contract-artifact contracts/out/PhoenixExecutor.sol/PhoenixExecutor.json \
             --output-dir release-assets
           python3 scripts/release_assets.py verify \

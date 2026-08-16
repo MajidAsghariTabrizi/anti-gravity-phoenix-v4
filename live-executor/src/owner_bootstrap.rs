@@ -330,6 +330,16 @@ struct ActionEvidence {
     receipt_status: Option<u64>,
 }
 
+#[derive(Clone, Copy)]
+struct OwnerTransactionLimits {
+    chain_id: u64,
+    maximum_gas_limit: u64,
+    maximum_max_fee_per_gas: u128,
+    maximum_priority_fee_per_gas: u128,
+    receipt_timeout: Duration,
+    poll_interval: Duration,
+}
+
 #[async_trait]
 trait OwnerBootstrapRpc: Send + Sync {
     async fn chain_id(&self) -> Result<u64, RpcError>;
@@ -401,6 +411,92 @@ impl OwnerBootstrapRpc for HttpExecutionRpc {
     async fn transaction_known(&self, tx_hash: TransactionHash) -> Result<bool, RpcError> {
         ExecutionRpc::transaction_known(self, tx_hash).await
     }
+}
+
+async fn submit_owner_action<R: OwnerBootstrapRpc>(
+    rpc: &R,
+    signer: &TransactionSigner,
+    wallet: CanonicalAddress,
+    executor: CanonicalAddress,
+    calldata: Vec<u8>,
+    limits: OwnerTransactionLimits,
+) -> Result<TransactionReceipt, OwnerBootstrapError> {
+    if signer.address() != wallet {
+        return Err(OwnerBootstrapError::SignerWalletOwnerMismatch);
+    }
+    let quote = rpc
+        .quote(wallet, executor, &calldata)
+        .await
+        .map_err(map_rpc)?;
+    if quote.gas_limit > limits.maximum_gas_limit {
+        return Err(OwnerBootstrapError::GasLimitExceeded);
+    }
+    if quote.max_fee_per_gas > limits.maximum_max_fee_per_gas {
+        return Err(OwnerBootstrapError::MaximumFeeExceeded);
+    }
+    if quote.max_priority_fee_per_gas > limits.maximum_priority_fee_per_gas {
+        return Err(OwnerBootstrapError::PriorityFeeExceeded);
+    }
+    let nonce = rpc.pending_nonce(wallet).await.map_err(map_rpc)?;
+    let signed = signer
+        .sign(TransactionDraft {
+            chain_id: limits.chain_id,
+            nonce,
+            gas_limit: quote.gas_limit,
+            max_fee_per_gas: quote.max_fee_per_gas,
+            max_priority_fee_per_gas: quote.max_priority_fee_per_gas,
+            to: executor,
+            calldata,
+        })
+        .map_err(|_| OwnerBootstrapError::SigningFailed)?;
+    let returned_hash = rpc
+        .submit(signed.raw_bytes())
+        .await
+        .map_err(map_submission_rpc)?;
+    if returned_hash != signed.tx_hash() {
+        return Err(OwnerBootstrapError::TransactionHashMismatch);
+    }
+    let receipt = wait_for_receipt(
+        rpc,
+        returned_hash,
+        limits.receipt_timeout,
+        limits.poll_interval,
+    )
+    .await?;
+    if receipt.transaction_hash != returned_hash {
+        return Err(OwnerBootstrapError::RpcDisagreement);
+    }
+    if receipt.status != 1 {
+        return Err(OwnerBootstrapError::TransactionReverted);
+    }
+    Ok(receipt)
+}
+
+/// PhoenixExecutor rotation uses the same quote/nonce/sign/single-submit/hash
+/// equality/receipt machinery as normal owner bootstrap, with stricter fixed
+/// ceilings.  The raw transaction and signer material never leave this API.
+pub(crate) async fn submit_rotation_owner_call(
+    rpc: &HttpExecutionRpc,
+    signer: &TransactionSigner,
+    executor: CanonicalAddress,
+    calldata: Vec<u8>,
+) -> Result<TransactionReceipt, OwnerBootstrapError> {
+    submit_owner_action(
+        rpc,
+        signer,
+        signer.address(),
+        executor,
+        calldata,
+        OwnerTransactionLimits {
+            chain_id: 42_161,
+            maximum_gas_limit: 5_000_000,
+            maximum_max_fee_per_gas: 10_000_000_000,
+            maximum_priority_fee_per_gas: 10_000_000_000,
+            receipt_timeout: Duration::from_secs(120),
+            poll_interval: Duration::from_secs(2),
+        },
+    )
+    .await
 }
 
 pub async fn owner_plan_from_environment() -> Result<Value, OwnerBootstrapError> {
@@ -675,37 +771,22 @@ async fn execute_mutation<R: OwnerBootstrapRpc>(
         if mutation == OwnerMutation::Unpause && !configuration_complete(context, &before) {
             return Err(OwnerBootstrapError::ConfigurationIncomplete);
         }
-        let quote = rpc
-            .quote(context.wallet, context.executor, &candidate.calldata)
-            .await
-            .map_err(map_rpc)?;
-        enforce_quote(context, &quote)?;
-        let nonce = rpc.pending_nonce(context.wallet).await.map_err(map_rpc)?;
-        let signed = signer
-            .sign(TransactionDraft {
+        let receipt = submit_owner_action(
+            rpc,
+            signer,
+            context.wallet,
+            context.executor,
+            candidate.calldata.clone(),
+            OwnerTransactionLimits {
                 chain_id: context.chain_id,
-                nonce,
-                gas_limit: quote.gas_limit,
-                max_fee_per_gas: quote.max_fee_per_gas,
-                max_priority_fee_per_gas: quote.max_priority_fee_per_gas,
-                to: context.executor,
-                calldata: candidate.calldata.clone(),
-            })
-            .map_err(|_| OwnerBootstrapError::SigningFailed)?;
-        let returned_hash = rpc
-            .submit(signed.raw_bytes())
-            .await
-            .map_err(map_submission_rpc)?;
-        if returned_hash != signed.tx_hash() {
-            return Err(OwnerBootstrapError::TransactionHashMismatch);
-        }
-        let receipt = wait_for_receipt(context, rpc, returned_hash).await?;
-        if receipt.transaction_hash != returned_hash {
-            return Err(OwnerBootstrapError::RpcDisagreement);
-        }
-        if receipt.status != 1 {
-            return Err(OwnerBootstrapError::TransactionReverted);
-        }
+                maximum_gas_limit: context.maximum_gas_limit,
+                maximum_max_fee_per_gas: context.maximum_max_fee_per_gas,
+                maximum_priority_fee_per_gas: context.maximum_priority_fee_per_gas,
+                receipt_timeout: context.receipt_timeout,
+                poll_interval: context.poll_interval,
+            },
+        )
+        .await?;
         let after = read_validated_snapshots(context, rpc).await?;
         if action_needed(&candidate, context, &after) {
             return Err(OwnerBootstrapError::StateTransitionMismatch);
@@ -717,7 +798,7 @@ async fn execute_mutation<R: OwnerBootstrapRpc>(
             description: candidate.description,
             calldata_hash: candidate.calldata_hash(),
             status: "applied",
-            transaction_hash: Some(returned_hash),
+            transaction_hash: Some(receipt.transaction_hash),
             block_number: Some(receipt.block_number),
             receipt_status: Some(receipt.status),
         });
@@ -956,6 +1037,7 @@ fn action_needed(
     }
 }
 
+#[cfg(test)]
 fn enforce_quote(
     context: &OwnerBootstrapContext,
     quote: &TransactionQuote,
@@ -973,11 +1055,12 @@ fn enforce_quote(
 }
 
 async fn wait_for_receipt<R: OwnerBootstrapRpc>(
-    context: &OwnerBootstrapContext,
     rpc: &R,
     transaction_hash: TransactionHash,
+    receipt_timeout: Duration,
+    poll_interval: Duration,
 ) -> Result<TransactionReceipt, OwnerBootstrapError> {
-    let deadline = Instant::now() + context.receipt_timeout;
+    let deadline = Instant::now() + receipt_timeout;
     loop {
         if let Some(receipt) = rpc.receipt(transaction_hash).await.map_err(map_rpc)? {
             return Ok(receipt);
@@ -993,7 +1076,7 @@ async fn wait_for_receipt<R: OwnerBootstrapRpc>(
                 Err(OwnerBootstrapError::SubmissionUnknown)
             };
         }
-        sleep(context.poll_interval).await;
+        sleep(poll_interval).await;
     }
 }
 
@@ -1520,6 +1603,7 @@ mod tests {
                 .expect("submitted transaction");
             Ok(Some(TransactionReceipt {
                 transaction_hash,
+                contract_address: None,
                 status: self.receipt_status,
                 block_number: 99,
                 gas_used: 21_000,

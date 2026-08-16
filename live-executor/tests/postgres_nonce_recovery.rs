@@ -767,6 +767,122 @@ async fn nonce_allocation_and_pending_state_survive_restart() {
     .await
     .expect("release preserved runtime fail-close lock fixture");
 
+    let rotation_request = request(Uuid::from_u128(15), now, config.pnl_asset_address);
+    insert_approved(&pool, &rotation_request).await;
+    let rotation_signal_id = Uuid::from_u128(61);
+    sqlx::query(
+        "INSERT INTO live_canary.revenue_hunting_signals(
+            signal_id, signal_identity, source_lane, auction_id, block_number,
+            block_hash, retained_profit_floor, terminal_outcome, evidence_hash,
+            observed_at, updated_at
+         ) VALUES (
+            $1, 'rotation-atlas-signal', 'atlas_solver', 'rotation-auction', 1,
+            $2, 1, 'candidate', $3, $4, $4
+         )",
+    )
+    .bind(rotation_signal_id)
+    .bind(format!("0x{}", "7".repeat(64)))
+    .bind("8".repeat(64))
+    .bind(now)
+    .execute(&pool)
+    .await
+    .expect("seed rotation Atlas signal");
+    sqlx::query(
+        "INSERT INTO live_canary.atlas_solver_requests(
+            auction_id, signal_id, user_operation_hash, solver_operation_hash,
+            solver_operation, maximum_bid, selected_bid, status, created_at, updated_at
+         ) VALUES (
+            'rotation-auction', $1, $2, $3,
+            jsonb_build_object('from', $4::text), 1, 1, 'ready', $5, $5
+         )",
+    )
+    .bind(rotation_signal_id)
+    .bind(format!("0x{}", "9".repeat(64)))
+    .bind("a".repeat(64))
+    .bind(config.executor_address.to_string())
+    .bind(now)
+    .execute(&pool)
+    .await
+    .expect("seed rotation Atlas request");
+    let rotation_drain = second_restart
+        .drain_executor_identity(&config.executor_address.to_string())
+        .await
+        .expect("fence old-bound direct and Atlas work");
+    assert_eq!(rotation_drain.fenced_requests, 1);
+    assert_eq!(rotation_drain.fenced_atlas_requests, 1);
+    assert_eq!(rotation_drain.active_attempts, 0);
+    assert_eq!(rotation_drain.active_atlas_requests, 0);
+    assert!(rotation_drain.submission_lock_free);
+    let fenced_statuses: (String, String) = sqlx::query_as(
+        "SELECT
+            (SELECT status FROM live_canary.execution_requests WHERE id=$1),
+            (SELECT status FROM live_canary.atlas_solver_requests WHERE auction_id='rotation-auction')",
+    )
+    .bind(rotation_request.id)
+    .fetch_one(&pool)
+    .await
+    .expect("load fenced rotation statuses");
+    assert_eq!(
+        fenced_statuses,
+        ("failed".to_string(), "expired".to_string())
+    );
+
+    let lock_blocked = request(Uuid::from_u128(16), now, config.pnl_asset_address);
+    insert_approved(&pool, &lock_blocked).await;
+    sqlx::query(
+        "UPDATE live_canary.global_revenue_submission_lock
+         SET active_lane='aave_liquidation', active_identity='rotation-lock-test', acquired_at=$1
+         WHERE singleton",
+    )
+    .bind(now)
+    .execute(&pool)
+    .await
+    .expect("hold rotation lock fixture");
+    assert_eq!(
+        second_restart
+            .drain_executor_identity(&config.executor_address.to_string())
+            .await,
+        Err(StoreError::Invariant)
+    );
+    let blocked_status: String =
+        sqlx::query_scalar("SELECT status FROM live_canary.execution_requests WHERE id=$1")
+            .bind(lock_blocked.id)
+            .fetch_one(&pool)
+            .await
+            .expect("load lock-blocked rotation status");
+    assert_eq!(blocked_status, "approved");
+    sqlx::query(
+        "UPDATE live_canary.global_revenue_submission_lock
+         SET active_lane=NULL, active_identity=NULL, acquired_at=NULL, control_epoch=control_epoch+1
+         WHERE singleton AND active_identity='rotation-lock-test'",
+    )
+    .execute(&pool)
+    .await
+    .expect("release rotation lock fixture");
+    sqlx::query(
+        "UPDATE live_canary.global_revenue_submission_lock
+         SET active_lane=NULL, active_identity='rotation-identity-only-lock', acquired_at=$1
+         WHERE singleton",
+    )
+    .bind(now)
+    .execute(&pool)
+    .await
+    .expect("hold identity-only rotation lock fixture");
+    assert_eq!(
+        second_restart
+            .drain_executor_identity(&config.executor_address.to_string())
+            .await,
+        Err(StoreError::Invariant)
+    );
+    sqlx::query(
+        "UPDATE live_canary.global_revenue_submission_lock
+         SET active_lane=NULL, active_identity=NULL, acquired_at=NULL, control_epoch=control_epoch+1
+         WHERE singleton AND active_identity='rotation-identity-only-lock'",
+    )
+    .execute(&pool)
+    .await
+    .expect("release identity-only rotation lock fixture");
+
     prepare_fork_approval_fixture(&pool).await;
     sqlx::query(
         "UPDATE live_canary.control

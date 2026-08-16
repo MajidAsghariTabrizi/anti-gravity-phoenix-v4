@@ -7,6 +7,7 @@ use crate::model::{
 };
 use async_trait::async_trait;
 use chrono::{DateTime, SecondsFormat, Utc};
+use serde::Serialize;
 use serde_json::{json, Value};
 use sqlx::postgres::PgPoolOptions;
 use sqlx::types::Json;
@@ -105,6 +106,161 @@ impl PostgresExecutorStore {
     pub fn pool(&self) -> PgPool {
         self.pool.clone()
     }
+
+    /// Fence every not-yet-submitted request bound to an executor identity and
+    /// prove that no submitted/leased work can survive an identity cutover.
+    ///
+    /// This deliberately does not update any revenue-lane, Generic, economic,
+    /// or provider-authority row.  The global submission advisory lock and row
+    /// lock serialize it with `claim_approved`, so an OLD-bound approval cannot
+    /// be claimed after the final zero-work proof.
+    pub async fn drain_executor_identity(
+        &self,
+        executor_address: &str,
+    ) -> Result<ExecutorIdentityDrain, StoreError> {
+        let canonical = crate::model::CanonicalAddress::parse(executor_address)
+            .map_err(|_| StoreError::Data)?
+            .to_string();
+        let mut transaction = self.pool.begin().await.map_err(StoreError::from)?;
+        sqlx::query(
+            "SELECT pg_advisory_xact_lock(hashtextextended('phoenix-global-revenue-submission', 0))",
+        )
+        .execute(&mut *transaction)
+        .await
+        .map_err(StoreError::from)?;
+
+        let submission_lock_free: bool = sqlx::query_scalar(
+            "SELECT active_lane IS NULL AND active_identity IS NULL
+             FROM live_canary.global_revenue_submission_lock
+             WHERE singleton FOR UPDATE",
+        )
+        .fetch_one(&mut *transaction)
+        .await
+        .map_err(StoreError::from)?;
+        if !submission_lock_free {
+            return Err(StoreError::Invariant);
+        }
+
+        let active_attempts: i64 = sqlx::query_scalar(&format!(
+            "SELECT count(*)
+             FROM live_canary.execution_attempts a
+             JOIN live_canary.execution_requests r ON r.id = a.request_id
+             WHERE lower(r.executor_address) = $1 AND a.status IN ({ACTIVE_STATUSES})"
+        ))
+        .bind(&canonical)
+        .fetch_one(&mut *transaction)
+        .await
+        .map_err(StoreError::from)?;
+        if active_attempts != 0 {
+            return Err(StoreError::Invariant);
+        }
+
+        let unresolved_submissions: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM live_canary.execution_requests
+             WHERE lower(executor_address) = $1
+               AND status IN ('claimed','nonce_allocated','submission_unknown','pending','timed_out')",
+        )
+        .bind(&canonical)
+        .fetch_one(&mut *transaction)
+        .await
+        .map_err(StoreError::from)?;
+        if unresolved_submissions != 0 {
+            return Err(StoreError::Invariant);
+        }
+
+        let active_atlas_requests: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM live_canary.atlas_solver_requests
+             WHERE lower(solver_operation->>'from') = $1
+               AND status IN ('claimed','signed','submitted','submission_unknown')",
+        )
+        .bind(&canonical)
+        .fetch_one(&mut *transaction)
+        .await
+        .map_err(StoreError::from)?;
+        if active_atlas_requests != 0 {
+            return Err(StoreError::Invariant);
+        }
+
+        let fenced = sqlx::query_scalar::<_, Uuid>(
+            "UPDATE live_canary.execution_requests
+             SET status = 'failed', updated_at = now()
+             WHERE lower(executor_address) = $1 AND status IN ('draft','approved')
+             RETURNING id",
+        )
+        .bind(&canonical)
+        .fetch_all(&mut *transaction)
+        .await
+        .map_err(StoreError::from)?;
+        if !fenced.is_empty() {
+            sqlx::query(
+                "UPDATE live_canary.autonomous_candidates
+                 SET status = 'disarmed', updated_at = now()
+                 WHERE execution_request_id = ANY($1)
+                   AND status IN ('materialized','approval_pending','approved','request_materialized')",
+            )
+            .bind(&fenced)
+            .execute(&mut *transaction)
+            .await
+            .map_err(StoreError::from)?;
+        }
+
+        let fenced_atlas = sqlx::query_scalar::<_, String>(
+            "UPDATE live_canary.atlas_solver_requests
+             SET status = 'expired', updated_at = now()
+             WHERE lower(solver_operation->>'from') = $1 AND status = 'ready'
+             RETURNING auction_id",
+        )
+        .bind(&canonical)
+        .fetch_all(&mut *transaction)
+        .await
+        .map_err(StoreError::from)?;
+
+        let materialized_old_work: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM live_canary.execution_requests
+             WHERE lower(executor_address) = $1
+               AND status IN ('draft','approved','claimed','nonce_allocated',
+                              'submission_unknown','pending','timed_out')",
+        )
+        .bind(&canonical)
+        .fetch_one(&mut *transaction)
+        .await
+        .map_err(StoreError::from)?;
+        if materialized_old_work != 0 {
+            return Err(StoreError::Invariant);
+        }
+        let materialized_old_atlas: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM live_canary.atlas_solver_requests
+             WHERE lower(solver_operation->>'from') = $1
+               AND status IN ('ready','claimed','signed','submitted','submission_unknown')",
+        )
+        .bind(&canonical)
+        .fetch_one(&mut *transaction)
+        .await
+        .map_err(StoreError::from)?;
+        if materialized_old_atlas != 0 {
+            return Err(StoreError::Invariant);
+        }
+        transaction.commit().await.map_err(StoreError::from)?;
+        Ok(ExecutorIdentityDrain {
+            fenced_requests: u64::try_from(fenced.len()).map_err(|_| StoreError::Invariant)?,
+            fenced_atlas_requests: u64::try_from(fenced_atlas.len())
+                .map_err(|_| StoreError::Invariant)?,
+            active_attempts: 0,
+            unresolved_submissions: 0,
+            active_atlas_requests: 0,
+            submission_lock_free: true,
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub struct ExecutorIdentityDrain {
+    pub fenced_requests: u64,
+    pub fenced_atlas_requests: u64,
+    pub active_attempts: u64,
+    pub unresolved_submissions: u64,
+    pub active_atlas_requests: u64,
+    pub submission_lock_free: bool,
 }
 
 #[async_trait]

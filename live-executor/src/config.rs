@@ -359,7 +359,10 @@ fn read_signer_file(path_value: &str) -> Result<Zeroizing<String>, ConfigError> 
     Ok(Zeroizing::new(trimmed.to_owned()))
 }
 
-pub(crate) fn transaction_signer_from_file(
+/// Load the canonical file-backed transaction signer without ever exposing
+/// the key material.  PhoenixExecutor rotation reuses this exact production
+/// signer boundary rather than introducing a second key loader.
+pub fn transaction_signer_from_file(
     path_value: &str,
     chain_id: u64,
 ) -> Result<TransactionSigner, ConfigError> {
