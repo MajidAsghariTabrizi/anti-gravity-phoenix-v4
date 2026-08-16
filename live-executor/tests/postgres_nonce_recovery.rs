@@ -859,7 +859,7 @@ async fn nonce_allocation_and_pending_state_survive_restart() {
     .execute(&pool)
     .await
     .expect("release rotation lock fixture");
-    sqlx::query(
+    let invalid_identity_only_lock = sqlx::query(
         "UPDATE live_canary.global_revenue_submission_lock
          SET active_lane=NULL, active_identity='rotation-identity-only-lock', acquired_at=$1
          WHERE singleton",
@@ -867,21 +867,22 @@ async fn nonce_allocation_and_pending_state_survive_restart() {
     .bind(now)
     .execute(&pool)
     .await
-    .expect("hold identity-only rotation lock fixture");
+    .expect_err("identity-only rotation lock must violate the paired lock constraint");
     assert_eq!(
-        second_restart
-            .drain_executor_identity(&config.executor_address.to_string())
-            .await,
-        Err(StoreError::Invariant)
+        invalid_identity_only_lock
+            .as_database_error()
+            .and_then(|error| error.code()),
+        Some(std::borrow::Cow::Borrowed("23514"))
     );
-    sqlx::query(
-        "UPDATE live_canary.global_revenue_submission_lock
-         SET active_lane=NULL, active_identity=NULL, acquired_at=NULL, control_epoch=control_epoch+1
-         WHERE singleton AND active_identity='rotation-identity-only-lock'",
+    let submission_lock_free: bool = sqlx::query_scalar(
+        "SELECT active_lane IS NULL AND active_identity IS NULL AND acquired_at IS NULL
+         FROM live_canary.global_revenue_submission_lock
+         WHERE singleton",
     )
-    .execute(&pool)
+    .fetch_one(&pool)
     .await
-    .expect("release identity-only rotation lock fixture");
+    .expect("prove invalid identity-only lock did not mutate the durable lock");
+    assert!(submission_lock_free);
 
     prepare_fork_approval_fixture(&pool).await;
     sqlx::query(
