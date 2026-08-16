@@ -18,6 +18,14 @@ pub const REVIEWED_OWNER: &str = "0x9f30c00b68f7c0edb4b4117b9f04e0ca2eb2c17a";
 pub const REVIEWED_FLASH_PROVIDER: &str = "0x794a61358d6845594f94dc1db02a252b5b4814ad";
 pub const REVIEWED_ATLAS: &str = "0x8ad1ae9d97c79aa68a0a151e83ff3942f68f86c1";
 pub const REVIEWED_WETH: &str = "0x82af49447d8a07e3bd95bd0d56f35241523fbab1";
+pub const REVIEWED_NATIVE_USDC: &str = "0xaf88d065e77c8cc2239327c5edb3a432268e5831";
+pub const REVIEWED_USDC_E: &str = "0xff970a61a04b1ca14834a43f5de4533ebddb5cc8";
+pub const REVIEWED_ROUTER_1: &str = "0x68b3465833fb72a70ecdf485e0e4c7bd8665fc45";
+pub const REVIEWED_ROUTER_2: &str = "0xa51afafe0263b40edaef0df8781ea9aa03e381a3";
+pub const REVIEWED_ROUTER_3: &str = "0xe592427a0aece92de3edee1f18e0157c05861564";
+pub const REVIEWED_FACTORY: &str = "0x1f98431c8ad98523631ae4a59f267346ea31f984";
+pub const REVIEWED_OLD_RUNTIME_SHA256: &str =
+    "99a485d5a711180b4455028620bf4d5374558f85ef185ba00a51481c7c239c58";
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct RotationPlan {
@@ -186,8 +194,8 @@ impl<B: RotationBackend> RotationOperator<B> {
 pub fn validate_plan(plan: &RotationPlan) -> Result<(), RotationError> {
     if plan.schema != ROTATION_SCHEMA
         || plan.chain_id != ARBITRUM_CHAIN_ID
-        || !sha256_hex(&plan.source_sha)
-        || !sha256_hex(&plan.base_release_sha)
+        || !commit_sha(&plan.source_sha)
+        || !commit_sha(&plan.base_release_sha)
         || !sha256_hex(&plan.old_runtime_sha256)
         || !sha256_hex(&plan.expected_new_runtime_sha256)
         || !sha256_hex(&plan.creation_bytecode_sha256)
@@ -197,20 +205,14 @@ pub fn validate_plan(plan: &RotationPlan) -> Result<(), RotationError> {
         || normalize(&plan.flash_provider) != normalize(REVIEWED_FLASH_PROVIDER)
         || normalize(&plan.atlas) != normalize(REVIEWED_ATLAS)
         || normalize(&plan.weth) != normalize(REVIEWED_WETH)
+        || normalize(&plan.old_runtime_sha256) != REVIEWED_OLD_RUNTIME_SHA256
         || plan.maximum_input_amount != REVIEWED_MAX_INPUT
         || !valid_address(&plan.searcher)
-        || plan.assets.is_empty()
-        || plan.routers.is_empty()
-        || !valid_address(&plan.factory)
-        || plan.pools.is_empty()
-        || plan.assets.iter().any(|value| !valid_address(value))
-        || plan.routers.iter().any(|value| !valid_address(value))
-        || plan.pools.iter().any(|pool| {
-            !valid_address(&pool.address)
-                || pool.fee == 0
-                || !valid_address(&pool.token0)
-                || !valid_address(&pool.token1)
-        })
+        || plan.assets != reviewed_assets()
+        || plan.routers != reviewed_routers()
+        || normalize(&plan.factory) != normalize(REVIEWED_FACTORY)
+        || plan.pools != reviewed_pools()
+        || plan.config_digest != canonical_config_digest()
     {
         return Err(RotationError::InvalidPlan);
     }
@@ -265,6 +267,71 @@ fn sha256_hex(value: &str) -> bool {
     normalize(value).len() == 64 && normalize(value).chars().all(|c| c.is_ascii_hexdigit())
 }
 
+fn commit_sha(value: &str) -> bool {
+    normalize(value).len() == 40 && normalize(value).chars().all(|c| c.is_ascii_hexdigit())
+}
+
+pub fn canonical_config_digest() -> String {
+    let canonical = serde_json::json!({
+        "owner": REVIEWED_OWNER,
+        "flash_provider": REVIEWED_FLASH_PROVIDER,
+        "atlas": REVIEWED_ATLAS,
+        "weth": REVIEWED_WETH,
+        "maximum_input_amount": REVIEWED_MAX_INPUT,
+        "searcher": REVIEWED_OWNER,
+        "assets": reviewed_assets(),
+        "routers": reviewed_routers(),
+        "factory": REVIEWED_FACTORY,
+        "pools": reviewed_pools(),
+    });
+    hex::encode(Sha256::digest(
+        serde_json::to_vec(&canonical).expect("canonical JSON"),
+    ))
+}
+
+fn reviewed_assets() -> Vec<String> {
+    [REVIEWED_WETH, REVIEWED_NATIVE_USDC, REVIEWED_USDC_E]
+        .into_iter()
+        .map(str::to_string)
+        .collect()
+}
+
+fn reviewed_routers() -> Vec<String> {
+    [REVIEWED_ROUTER_1, REVIEWED_ROUTER_2, REVIEWED_ROUTER_3]
+        .into_iter()
+        .map(str::to_string)
+        .collect()
+}
+
+fn reviewed_pools() -> Vec<RotationPool> {
+    vec![
+        RotationPool {
+            address: "0x6f38e884725a116c9c7fbf208e79fe8828a2595f".into(),
+            fee: 100,
+            token0: REVIEWED_WETH.into(),
+            token1: REVIEWED_NATIVE_USDC.into(),
+        },
+        RotationPool {
+            address: "0xc6962004f452be9203591991d15f6b388e09e8d0".into(),
+            fee: 500,
+            token0: REVIEWED_WETH.into(),
+            token1: REVIEWED_NATIVE_USDC.into(),
+        },
+        RotationPool {
+            address: "0xc473e2aee3441bf9240be85eb122abb059a3b57c".into(),
+            fee: 3000,
+            token0: REVIEWED_WETH.into(),
+            token1: REVIEWED_NATIVE_USDC.into(),
+        },
+        RotationPool {
+            address: "0xc31e54c7a869b9fcbecc14363cf510d1c41fa443".into(),
+            fee: 500,
+            token0: REVIEWED_WETH.into(),
+            token1: REVIEWED_USDC_E.into(),
+        },
+    ]
+}
+
 fn tx_hash(value: &str) -> bool {
     let normalized = normalize(value);
     normalized.len() == 64 && normalized.chars().all(|c| c.is_ascii_hexdigit())
@@ -282,28 +349,23 @@ mod tests {
         RotationPlan {
             schema: ROTATION_SCHEMA.to_string(),
             chain_id: ARBITRUM_CHAIN_ID,
-            source_sha: "11".repeat(32),
-            base_release_sha: "22".repeat(32),
+            source_sha: "11".repeat(20),
+            base_release_sha: "22".repeat(20),
             old_executor: OLD_EXECUTOR.to_string(),
-            old_runtime_sha256: "33".repeat(32),
+            old_runtime_sha256: REVIEWED_OLD_RUNTIME_SHA256.to_string(),
             expected_new_runtime_sha256: "44".repeat(32),
             creation_bytecode_sha256: "55".repeat(32),
-            config_digest: "66".repeat(32),
+            config_digest: canonical_config_digest(),
             owner: REVIEWED_OWNER.to_string(),
             flash_provider: REVIEWED_FLASH_PROVIDER.to_string(),
             atlas: REVIEWED_ATLAS.to_string(),
             weth: REVIEWED_WETH.to_string(),
             maximum_input_amount: REVIEWED_MAX_INPUT,
             searcher: REVIEWED_OWNER.to_string(),
-            assets: vec![REVIEWED_WETH.to_string()],
-            routers: vec!["0x68b3465833fb72a70ecdf485e0e4c7bd8665fc45".to_string()],
-            factory: "0x1f98431c8ad98523631ae4a59f267346ea31f984".to_string(),
-            pools: vec![RotationPool {
-                address: "0x6f3841a2d5c8e1fcb1ca9c42d6b8c5d0f2d7595f".to_string(),
-                fee: 100,
-                token0: REVIEWED_WETH.to_string(),
-                token1: "0xaf88d065e77c8cc2239327c5edb3a432268e5831".to_string(),
-            }],
+            assets: reviewed_assets(),
+            routers: reviewed_routers(),
+            factory: REVIEWED_FACTORY.to_string(),
+            pools: reviewed_pools(),
         }
     }
 
