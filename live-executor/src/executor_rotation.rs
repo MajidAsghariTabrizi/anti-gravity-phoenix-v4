@@ -146,7 +146,7 @@ impl AuthenticatedPhoenixExecutorRotationTransport {
         provenance_path: PathBuf,
     ) -> Result<Self, RotationError> {
         validate_plan(plan)?;
-        if signer.address().to_string() != normalize(&plan.owner) {
+        if !signer_matches_owner(signer.address(), &plan.owner) {
             return Err(RotationError::InvalidPlan);
         }
         if creation_bytecode.is_empty()
@@ -1103,6 +1103,10 @@ fn normalize(value: &str) -> String {
     value.trim().trim_start_matches("0x").to_ascii_lowercase()
 }
 
+fn signer_matches_owner(signer: CanonicalAddress, owner: &str) -> bool {
+    normalize(&signer.to_string()) == normalize(owner)
+}
+
 fn sha256_hex(value: &str) -> bool {
     normalize(value).len() == 64 && normalize(value).chars().all(|c| c.is_ascii_hexdigit())
 }
@@ -1215,6 +1219,13 @@ mod tests {
         assert_eq!(validate_plan(&value), Ok(()));
         value.maximum_input_amount = REVIEWED_MAX_INPUT + 1;
         assert_eq!(validate_plan(&value), Err(RotationError::InvalidPlan));
+    }
+
+    #[test]
+    fn canonical_signer_identity_matches_the_reviewed_owner() {
+        let signer = CanonicalAddress::parse(REVIEWED_OWNER).expect("reviewed owner");
+        assert!(signer_matches_owner(signer, REVIEWED_OWNER));
+        assert!(!signer_matches_owner(signer, OLD_EXECUTOR));
     }
 
     #[test]
