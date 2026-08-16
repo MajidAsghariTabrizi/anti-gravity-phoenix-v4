@@ -69,6 +69,7 @@ contract MockERC20 is IERC20 {
         address public override factory;
         uint256 public outputAmount;
         uint256 public lastAmountIn;
+        uint160 public lastSqrtPriceLimitX96;
 
         constructor(address f, address a, address b, uint24 poolFee, uint256 out) {
             factory = f;
@@ -82,13 +83,17 @@ contract MockERC20 is IERC20 {
             outputAmount = out;
         }
 
-        function swap(address recipient, bool zeroForOne, int256 amountSpecified, uint160, bytes calldata data)
-            external
-            override
-            returns (int256 amount0, int256 amount1)
-        {
+        function swap(
+            address recipient,
+            bool zeroForOne,
+            int256 amountSpecified,
+            uint160 sqrtPriceLimitX96,
+            bytes calldata data
+        ) external override returns (int256 amount0, int256 amount1) {
             uint256 amountIn = uint256(amountSpecified);
             lastAmountIn = amountIn;
+            lastSqrtPriceLimitX96 = sqrtPriceLimitX96;
+            require(sqrtPriceLimitX96 < 1_461_446_703_485_210_103_287_273_052_203_988_822_378_723_970_342, "SPL");
             if (zeroForOne) {
                 MockERC20(token1).mint(recipient, outputAmount);
                 PhoenixExecutor(payable(msg.sender)).uniswapV3SwapCallback(int256(amountIn), 0, data);
@@ -286,6 +291,50 @@ contract MockERC20 is IERC20 {
                 setUp();
                 executor.executeAaveLiquidation(liquidationRequest(5, 0));
                 require(usdc.balanceOf(address(executor)) == 16, "liquidation profit retained");
+                require(pool2.lastSqrtPriceLimitX96() == 4_295_128_740, "wrong zeroForOne SPL");
+            }
+
+            function oneForZeroLiquidationRequest()
+                internal
+                view
+                returns (PhoenixExecutor.AaveLiquidationRequest memory request)
+            {
+                PhoenixExecutor.Leg[] memory legs = new PhoenixExecutor.Leg[](1);
+                legs[0] = PhoenixExecutor.Leg({
+                    pool: address(pool2),
+                    tokenIn: address(usdc),
+                    tokenOut: address(weth),
+                    fee: 500,
+                    zeroForOne: false,
+                    minAmountOut: 105
+                });
+                request = PhoenixExecutor.AaveLiquidationRequest({
+                    routeId: bytes32("aave-one-for-zero"),
+                    borrower: address(0xB0B),
+                    debtAsset: address(weth),
+                    collateralAsset: address(usdc),
+                    repayAmount: 100,
+                    receiveAToken: false,
+                    maxInputAmount: 1_000,
+                    minCollateralReceived: 120,
+                    minUnwindOutput: 105,
+                    minProfit: 5,
+                    maxAtlasBid: 0,
+                    deadline: block.timestamp + 1,
+                    unwindLegs: legs
+                });
+            }
+
+            function testDirectAaveNativeUsdcToWethOneForZeroUsesMaxSqrtLimit() public {
+                setUp();
+                aave.setLiquidationResult(address(usdc), 120);
+                pool2.setOutput(110);
+                executor.executeAaveLiquidation(oneForZeroLiquidationRequest());
+                require(
+                    pool2.lastSqrtPriceLimitX96() == 1_461_446_703_485_210_103_287_273_052_203_988_822_378_723_970_341,
+                    "wrong oneForZero SPL"
+                );
+                require(weth.balanceOf(address(executor)) == 9, "oneForZero profit retained");
             }
 
             function testDirectAaveLiquidationRejectsCappedActualRepay() public {
@@ -384,6 +433,8 @@ contract MockERC20 is IERC20 {
                 executor.executeOpportunity(opportunity(5, block.timestamp + 1));
                 require(usdc.balanceOf(address(executor)) == 16, "profit retained");
                 require(pool2.lastAmountIn() == 105, "actual prior output not chained");
+                require(pool1.lastSqrtPriceLimitX96() == 4_295_128_740, "wrong first SPL");
+                require(pool2.lastSqrtPriceLimitX96() == 4_295_128_740, "wrong second SPL");
             }
 
             function testStartsPausedWithNoInputOrApprovals() public {

@@ -15,6 +15,9 @@ interface IWETH {
 }
 
 contract PhoenixExecutor is IAaveFlashBorrower {
+    uint160 internal constant MIN_SQRT_RATIO = 4_295_128_739;
+    uint160 internal constant MAX_SQRT_RATIO = 1_461_446_703_485_210_103_287_273_052_203_988_822_378_723_970_342;
+
     error Unauthorized();
     error Paused();
     error NotPaused();
@@ -580,7 +583,7 @@ contract PhoenixExecutor is IAaveFlashBorrower {
                     address(this),
                     leg.zeroForOne,
                     int256(amountOut),
-                    leg.zeroForOne ? uint160(4_295_128_739) + 1 : type(uint160).max - 1,
+                    leg.zeroForOne ? MIN_SQRT_RATIO + 1 : MAX_SQRT_RATIO - 1,
                     abi.encode(SwapCallbackData({tokenIn: leg.tokenIn, tokenOut: leg.tokenOut, pool: leg.pool}))
                 );
             uint256 received = IERC20(leg.tokenOut).balanceOf(address(this)) - beforeOut;
