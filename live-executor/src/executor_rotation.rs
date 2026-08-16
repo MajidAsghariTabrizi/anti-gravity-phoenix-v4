@@ -5,6 +5,7 @@
 //! authorized operator must present before using the signer CREATE API.
 
 use crate::model::CanonicalAddress;
+use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{fs, path::Path};
@@ -91,17 +92,18 @@ pub enum RotationError {
 /// injected: production transport, compose/context orchestration, and signer
 /// material stay outside this state machine and cannot be replaced by a
 /// generic deployer.
-pub trait RotationBackend {
+#[async_trait]
+pub trait RotationBackend: Send {
     type Error;
 
-    fn deploy(&mut self) -> Result<(), Self::Error>;
-    fn mirror(&mut self) -> Result<(), Self::Error>;
-    fn verify(&mut self) -> Result<(), Self::Error>;
-    fn spl_gate(&mut self) -> Result<bool, Self::Error>;
-    fn drain_old_bound_work(&mut self) -> Result<bool, Self::Error>;
-    fn cutover_live_identity(&mut self) -> Result<(), Self::Error>;
-    fn reconcile(&mut self) -> Result<bool, Self::Error>;
-    fn rollback_identity_once(&mut self) -> Result<(), Self::Error>;
+    async fn deploy(&mut self) -> Result<(), Self::Error>;
+    async fn mirror(&mut self) -> Result<(), Self::Error>;
+    async fn verify(&mut self) -> Result<(), Self::Error>;
+    async fn spl_gate(&mut self) -> Result<bool, Self::Error>;
+    async fn drain_old_bound_work(&mut self) -> Result<bool, Self::Error>;
+    async fn cutover_live_identity(&mut self) -> Result<(), Self::Error>;
+    async fn reconcile(&mut self) -> Result<bool, Self::Error>;
+    async fn rollback_identity_once(&mut self) -> Result<(), Self::Error>;
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -122,16 +124,23 @@ pub struct RotationOperator<B> {
 /// protected artifact, canonical compose/context and DB drain checks.  No
 /// arbitrary destination, bytecode, authority, or economics parameters are
 /// exposed here.
-pub trait PhoenixExecutorRotationTransport {
+#[async_trait]
+pub trait PhoenixExecutorRotationTransport: Send {
     type Error;
-    fn deploy_phoenix_executor(&mut self, plan: &RotationPlan) -> Result<(), Self::Error>;
-    fn mirror_phoenix_config(&mut self, plan: &RotationPlan) -> Result<(), Self::Error>;
-    fn verify_phoenix_pair(&mut self, plan: &RotationPlan) -> Result<(), Self::Error>;
-    fn prove_spl_absent(&mut self, plan: &RotationPlan) -> Result<bool, Self::Error>;
-    fn prove_old_bound_work_drained(&mut self) -> Result<bool, Self::Error>;
-    fn cutover_phoenix_identity(&mut self, plan: &RotationPlan) -> Result<(), Self::Error>;
-    fn reconcile_phoenix_identity(&mut self, plan: &RotationPlan) -> Result<bool, Self::Error>;
-    fn rollback_phoenix_identity_once(&mut self, plan: &RotationPlan) -> Result<(), Self::Error>;
+    async fn deploy_phoenix_executor(&mut self, plan: &RotationPlan) -> Result<(), Self::Error>;
+    async fn mirror_phoenix_config(&mut self, plan: &RotationPlan) -> Result<(), Self::Error>;
+    async fn verify_phoenix_pair(&mut self, plan: &RotationPlan) -> Result<(), Self::Error>;
+    async fn prove_spl_absent(&mut self, plan: &RotationPlan) -> Result<bool, Self::Error>;
+    async fn prove_old_bound_work_drained(&mut self) -> Result<bool, Self::Error>;
+    async fn cutover_phoenix_identity(&mut self, plan: &RotationPlan) -> Result<(), Self::Error>;
+    async fn reconcile_phoenix_identity(
+        &mut self,
+        plan: &RotationPlan,
+    ) -> Result<bool, Self::Error>;
+    async fn rollback_phoenix_identity_once(
+        &mut self,
+        plan: &RotationPlan,
+    ) -> Result<(), Self::Error>;
 }
 
 pub struct ProductionPhoenixExecutorRotationBackend<T> {
@@ -150,34 +159,37 @@ impl<T> ProductionPhoenixExecutorRotationBackend<T> {
     }
 }
 
+#[async_trait]
 impl<T: PhoenixExecutorRotationTransport> RotationBackend
     for ProductionPhoenixExecutorRotationBackend<T>
 {
     type Error = T::Error;
 
-    fn deploy(&mut self) -> Result<(), Self::Error> {
-        self.transport.deploy_phoenix_executor(&self.plan)
+    async fn deploy(&mut self) -> Result<(), Self::Error> {
+        self.transport.deploy_phoenix_executor(&self.plan).await
     }
-    fn mirror(&mut self) -> Result<(), Self::Error> {
-        self.transport.mirror_phoenix_config(&self.plan)
+    async fn mirror(&mut self) -> Result<(), Self::Error> {
+        self.transport.mirror_phoenix_config(&self.plan).await
     }
-    fn verify(&mut self) -> Result<(), Self::Error> {
-        self.transport.verify_phoenix_pair(&self.plan)
+    async fn verify(&mut self) -> Result<(), Self::Error> {
+        self.transport.verify_phoenix_pair(&self.plan).await
     }
-    fn spl_gate(&mut self) -> Result<bool, Self::Error> {
-        self.transport.prove_spl_absent(&self.plan)
+    async fn spl_gate(&mut self) -> Result<bool, Self::Error> {
+        self.transport.prove_spl_absent(&self.plan).await
     }
-    fn drain_old_bound_work(&mut self) -> Result<bool, Self::Error> {
-        self.transport.prove_old_bound_work_drained()
+    async fn drain_old_bound_work(&mut self) -> Result<bool, Self::Error> {
+        self.transport.prove_old_bound_work_drained().await
     }
-    fn cutover_live_identity(&mut self) -> Result<(), Self::Error> {
-        self.transport.cutover_phoenix_identity(&self.plan)
+    async fn cutover_live_identity(&mut self) -> Result<(), Self::Error> {
+        self.transport.cutover_phoenix_identity(&self.plan).await
     }
-    fn reconcile(&mut self) -> Result<bool, Self::Error> {
-        self.transport.reconcile_phoenix_identity(&self.plan)
+    async fn reconcile(&mut self) -> Result<bool, Self::Error> {
+        self.transport.reconcile_phoenix_identity(&self.plan).await
     }
-    fn rollback_identity_once(&mut self) -> Result<(), Self::Error> {
-        self.transport.rollback_phoenix_identity_once(&self.plan)
+    async fn rollback_identity_once(&mut self) -> Result<(), Self::Error> {
+        self.transport
+            .rollback_phoenix_identity_once(&self.plan)
+            .await
     }
 }
 
@@ -195,19 +207,23 @@ impl<B> RotationOperator<B> {
 }
 
 impl<B: RotationBackend> RotationOperator<B> {
-    pub fn execute(&mut self) -> Result<(), RotationError> {
+    pub async fn execute(&mut self) -> Result<(), RotationError> {
         self.backend
             .deploy()
+            .await
             .map_err(|_| RotationError::LifecycleRejected)?;
         self.backend
             .mirror()
+            .await
             .map_err(|_| RotationError::LifecycleRejected)?;
         self.backend
             .verify()
+            .await
             .map_err(|_| RotationError::LifecycleRejected)?;
         if !self
             .backend
             .spl_gate()
+            .await
             .map_err(|_| RotationError::LifecycleRejected)?
         {
             return Err(RotationError::LifecycleRejected);
@@ -215,42 +231,49 @@ impl<B: RotationBackend> RotationOperator<B> {
         if !self
             .backend
             .drain_old_bound_work()
+            .await
             .map_err(|_| RotationError::LifecycleRejected)?
         {
             return Err(RotationError::LifecycleRejected);
         }
         self.backend
             .cutover_live_identity()
+            .await
             .map_err(|_| RotationError::LifecycleRejected)?;
         if !self
             .backend
             .reconcile()
+            .await
             .map_err(|_| RotationError::LifecycleRejected)?
         {
-            self.rollback_once()?;
+            self.rollback_once().await?;
         }
         Ok(())
     }
 
-    pub fn rollback_once(&mut self) -> Result<(), RotationError> {
+    pub async fn rollback_once(&mut self) -> Result<(), RotationError> {
         if self.rollback_used {
             return Err(RotationError::LifecycleRejected);
         }
         self.rollback_used = true;
         self.backend
             .rollback_identity_once()
+            .await
             .map_err(|_| RotationError::LifecycleRejected)
     }
 
-    pub fn prepare(&mut self) -> Result<(), RotationError> {
+    pub async fn prepare(&mut self) -> Result<(), RotationError> {
         self.backend
             .deploy()
+            .await
             .map_err(|_| RotationError::LifecycleRejected)?;
         self.backend
             .mirror()
+            .await
             .map_err(|_| RotationError::LifecycleRejected)?;
         self.backend
             .verify()
+            .await
             .map_err(|_| RotationError::LifecycleRejected)
     }
 }
@@ -457,45 +480,46 @@ mod tests {
         rollbacks: u8,
     }
 
+    #[async_trait]
     impl RotationBackend for FakeBackend {
         type Error = ();
-        fn deploy(&mut self) -> Result<(), Self::Error> {
+        async fn deploy(&mut self) -> Result<(), Self::Error> {
             self.calls.push("deploy");
             Ok(())
         }
-        fn mirror(&mut self) -> Result<(), Self::Error> {
+        async fn mirror(&mut self) -> Result<(), Self::Error> {
             self.calls.push("mirror");
             Ok(())
         }
-        fn verify(&mut self) -> Result<(), Self::Error> {
+        async fn verify(&mut self) -> Result<(), Self::Error> {
             self.calls.push("verify");
             Ok(())
         }
-        fn spl_gate(&mut self) -> Result<bool, Self::Error> {
+        async fn spl_gate(&mut self) -> Result<bool, Self::Error> {
             self.calls.push("spl");
             Ok(self.spl)
         }
-        fn drain_old_bound_work(&mut self) -> Result<bool, Self::Error> {
+        async fn drain_old_bound_work(&mut self) -> Result<bool, Self::Error> {
             self.calls.push("drain");
             Ok(self.drained)
         }
-        fn cutover_live_identity(&mut self) -> Result<(), Self::Error> {
+        async fn cutover_live_identity(&mut self) -> Result<(), Self::Error> {
             self.calls.push("cutover");
             Ok(())
         }
-        fn reconcile(&mut self) -> Result<bool, Self::Error> {
+        async fn reconcile(&mut self) -> Result<bool, Self::Error> {
             self.calls.push("reconcile");
             Ok(self.reconciled)
         }
-        fn rollback_identity_once(&mut self) -> Result<(), Self::Error> {
+        async fn rollback_identity_once(&mut self) -> Result<(), Self::Error> {
             self.calls.push("rollback");
             self.rollbacks += 1;
             Ok(())
         }
     }
 
-    #[test]
-    fn lifecycle_requires_spl_and_drain_before_cutover() {
+    #[tokio::test]
+    async fn lifecycle_requires_spl_and_drain_before_cutover() {
         let backend = FakeBackend {
             spl: true,
             drained: true,
@@ -503,7 +527,7 @@ mod tests {
             ..Default::default()
         };
         let mut operator = RotationOperator::new(backend);
-        operator.execute().expect("execute");
+        operator.execute().await.expect("execute");
         let backend = operator.into_backend();
         assert_eq!(
             backend.calls,
@@ -520,8 +544,8 @@ mod tests {
         assert_eq!(backend.rollbacks, 0);
     }
 
-    #[test]
-    fn reconciliation_failure_performs_exactly_one_identity_rollback() {
+    #[tokio::test]
+    async fn reconciliation_failure_performs_exactly_one_identity_rollback() {
         let backend = FakeBackend {
             spl: true,
             drained: true,
@@ -529,14 +553,14 @@ mod tests {
             ..Default::default()
         };
         let mut operator = RotationOperator::new(backend);
-        operator.execute().expect("rollback");
-        assert!(operator.rollback_once().is_err());
+        operator.execute().await.expect("rollback");
+        assert!(operator.rollback_once().await.is_err());
         let backend = operator.into_backend();
         assert_eq!(backend.rollbacks, 1);
     }
 
-    #[test]
-    fn spl_failure_blocks_cutover_and_drain() {
+    #[tokio::test]
+    async fn spl_failure_blocks_cutover_and_drain() {
         let backend = FakeBackend {
             spl: false,
             drained: true,
@@ -544,7 +568,10 @@ mod tests {
             ..Default::default()
         };
         let mut operator = RotationOperator::new(backend);
-        assert_eq!(operator.execute(), Err(RotationError::LifecycleRejected));
+        assert_eq!(
+            operator.execute().await,
+            Err(RotationError::LifecycleRejected)
+        );
         let backend = operator.into_backend();
         assert_eq!(backend.calls, ["deploy", "mirror", "verify", "spl"]);
     }
