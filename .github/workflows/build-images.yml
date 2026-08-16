@@ -449,6 +449,7 @@ jobs:
             --repo-root . \
             --release-sha "$RELEASE_SHA" \
             --base-release-sha "$PROTECTED_BASE_SHA" \
+            --require-executor-rotation-assets \
             --contract-artifact contracts/out/PhoenixExecutor.sol/PhoenixExecutor.json \
             --output-dir release-assets
           python3 scripts/release_assets.py verify \
