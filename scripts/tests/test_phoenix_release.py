@@ -1862,6 +1862,20 @@ class BoundedTransportContinuationTests(unittest.TestCase):
         )
         self.assertNotIn("install_protected_file", context_installer)
 
+    def test_context_installer_creates_rotation_config_directory(self) -> None:
+        context_installer = (
+            ROOT / "scripts/install-production-release-context.sh"
+        ).read_text()
+        create_config = context_installer.index('"$deploy_dir/config"')
+        install_plan = context_installer.index(
+            "config/phoenix-executor-rotation-plan.json"
+        )
+        install_artifacts = context_installer.index(
+            "config/phoenix-executor-rotation-artifacts.json"
+        )
+        self.assertLess(create_config, install_plan)
+        self.assertLess(create_config, install_artifacts)
+
     @staticmethod
     def emergency_status(*, shadow: bool = False) -> dict[str, object]:
         return {
