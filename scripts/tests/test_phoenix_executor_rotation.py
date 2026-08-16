@@ -144,6 +144,12 @@ class PhoenixExecutorRotationContextTests(unittest.TestCase):
         self.assertNotIn("arm-revenue", source)
         self.assertIn('$1=="RPC_AUTH_PROVIDER_ID"', source)
         self.assertNotIn('$1=="RPC_PRIMARY_PROVIDER_ID"', source)
+        self.assertIn(
+            'expected={"atlas-observer","economic-supervisor","live-executor","phoenix-engine"}',
+            source,
+        )
+        self.assertIn("command_identity and name not in expected", source)
+        self.assertIn("if set(names)!=expected: raise SystemExit(1)", source)
         self.assertIn("PHOENIX_MODE)\" = LIVE", source)
         self.assertIn("claim-rollback", source)
         self.assertIn("control_snapshot_changed", source)

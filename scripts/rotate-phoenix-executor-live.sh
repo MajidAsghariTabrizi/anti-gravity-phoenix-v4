@@ -103,14 +103,16 @@ identity_services() {
   compose config --format json | /usr/bin/python3 -I -B -c '
 import json,sys
 p=json.load(sys.stdin); names=[]
+expected={"atlas-observer","economic-supervisor","live-executor","phoenix-engine"}
 for name,service in p.get("services",{}).items():
     env=service.get("environment") or {}
     command=service.get("command") or []
     if isinstance(command,str): command=[command]
-    if ("LIVE_EXECUTOR_EXECUTOR_ADDRESS" in env or "EXECUTOR_ADDRESS" in env
-        or any(isinstance(value,str) and (value.startswith("--executor-address=") or value.startswith("--executor-code-hash=")) for value in command)):
+    command_identity=any(isinstance(value,str) and (value.startswith("--executor-address=") or value.startswith("--executor-code-hash=")) for value in command)
+    if command_identity and name not in expected: raise SystemExit(1)
+    if name in expected and ("LIVE_EXECUTOR_EXECUTOR_ADDRESS" in env or "EXECUTOR_ADDRESS" in env or command_identity):
         names.append(name)
-if "live-executor" not in names: raise SystemExit(1)
+if set(names)!=expected: raise SystemExit(1)
 print(" ".join(sorted(names)))'
 }
 
