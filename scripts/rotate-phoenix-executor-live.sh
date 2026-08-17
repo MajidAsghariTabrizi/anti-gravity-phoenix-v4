@@ -13,6 +13,9 @@ CONTEXT=$DEPLOY_ROOT/phoenix_executor_rotation_context.py
 SELF=$DEPLOY_ROOT/rotate-phoenix-executor-live.sh
 STATE_ROOT=/var/lib/phoenix-release/phoenix-executor-rotation
 PRODUCTION_COMPOSE=$DEPLOY_ROOT/production_compose.py
+RELEASE_ROOT=/opt/phoenix/releases
+RELEASE_ASSETS=$DEPLOY_ROOT/release_assets.py
+LEGACY_ROTATION_SOURCE_SHA=79c364f8aa56b6b6e27cd74cd2167e75a0b13610
 
 fail() { echo "PHOENIX_EXECUTOR_ROTATION_FAILED:$1" >&2; exit 1; }
 [ -f "$PLAN" ] && [ -f "$BYTECODE" ] && [ -x "$CONTEXT" ] && [ -f "$PRODUCTION_COMPOSE" ] || fail assets_unavailable
@@ -95,6 +98,39 @@ ok=(v.get('economic_phase')=='DISARMED_EVIDENCE' and v.get('size')=='MAX_REVIEWE
  and v.get('provider_recovery_status') in ('ready','recovered') and v.get('provider_sample_count')==3
  and v.get('active_attempts')==0 and v.get('unresolved_submissions')==0
  and v.get('active_atlas')==0 and v.get('lock_free') is True)
+if not ok: raise SystemExit(1)
+PY
+}
+
+
+verify_recovery_authority_snapshot() {
+  /usr/bin/python3 -I -B - "$1" <<'PY'
+import json,sys
+v=json.loads(sys.argv[1])
+ok=(
+    v.get('economic_phase') == 'DISARMED_EVIDENCE'
+    and v.get('size') == 'MIN'
+    and v.get('input') == '100000000000000'
+    and v.get('global_armed') is False
+    and v.get('global_kill') is True
+    and v.get('execution_mode') == 'disarmed'
+    and v.get('generic_armed') is False
+    and v.get('generic_kill') is True
+    and v.get('open_generic_routes') == 0
+    and v.get('aave') == {'armed':False,'kill':True,'maximum':'10000000000000000'}
+    and v.get('atlas') == {'armed':False,'kill':True,'maximum':'10000000000000000'}
+    and v.get('provider_ready') is True
+    and v.get('provider_mode') == 'single_primary'
+    and v.get('primary') == 'production-nownodes-arbitrum'
+    and v.get('confirmation') is None
+    and v.get('quorum') == 1
+    and v.get('provider_recovery_status') in ('ready','recovered')
+    and v.get('provider_sample_count') == 3
+    and v.get('active_attempts') == 0
+    and v.get('unresolved_submissions') == 0
+    and v.get('active_atlas') == 0
+    and v.get('lock_free') is True
+)
 if not ok: raise SystemExit(1)
 PY
 }
@@ -189,6 +225,64 @@ ok=(v.get("exact_execution_readiness") is True and v.get("hunting_health") is Tr
 if not ok: raise SystemExit(1)' || fail provider_readiness
 }
 
+
+verify_rotation_lineage() {
+  target=$1
+  cursor=$plan_source_sha
+  depth=0
+  seen=" "
+
+  case "$target" in *[!0-9a-f]*|"") fail recovery_legacy_sha_invalid ;; esac
+  [ "${#target}" -eq 40 ] || fail recovery_legacy_sha_invalid
+
+  while :; do
+    case "$cursor" in *[!0-9a-f]*|"") fail recovery_lineage_sha_invalid ;; esac
+    [ "${#cursor}" -eq 40 ] || fail recovery_lineage_sha_invalid
+
+    case "$seen" in *" $cursor "*) fail recovery_lineage_cycle ;; esac
+    [ "$depth" -le 8 ] || fail recovery_lineage_depth
+
+    release_dir=$RELEASE_ROOT/$cursor
+    release_manifest=$release_dir/release-assets-manifest.json
+    candidate_plan=$release_dir/config/phoenix-executor-rotation-plan.json
+
+    [ -d "$release_dir" ] && [ ! -L "$release_dir" ] || fail recovery_release_tree_invalid
+    [ -f "$release_manifest" ] && [ ! -L "$release_manifest" ] || fail recovery_release_manifest_invalid
+    [ -f "$candidate_plan" ] && [ ! -L "$candidate_plan" ] || fail recovery_rotation_plan_invalid
+
+    /usr/bin/python3 -I -B "$RELEASE_ASSETS" verify-tree \
+      --root "$release_dir" \
+      --manifest "$release_manifest" \
+      --expected-sha "$cursor" >/dev/null || fail recovery_release_tree_verification
+
+    pair=$(
+      /usr/bin/python3 -I -B - "$candidate_plan" <<'PY'
+import json,re,sys
+v=json.load(open(sys.argv[1],encoding="utf-8"))
+source=v.get("source_sha","")
+base=v.get("base_release_sha","")
+if not re.fullmatch(r"[0-9a-f]{40}",source): raise SystemExit(1)
+if not re.fullmatch(r"[0-9a-f]{40}",base): raise SystemExit(1)
+print(source + " " + base)
+PY
+    ) || fail recovery_rotation_plan_identity
+
+    source=${pair%% *}
+    base=${pair#* }
+    [ "$source" = "$cursor" ] || fail recovery_rotation_plan_source_mismatch
+
+    if [ "$cursor" = "$target" ]; then
+      printf '%s\n' "$candidate_plan"
+      return 0
+    fi
+
+    seen="$seen$cursor "
+    depth=$((depth + 1))
+    [ "$depth" -le 8 ] || fail recovery_lineage_depth
+    cursor=$base
+  done
+}
+
 internal=${PHOENIX_EXECUTOR_ROTATION_INTERNAL:-false}
 if [ "$internal" = true ]; then
   mode=${1:-}; supplied_plan=${2:-}; supplied_state=${3:-}
@@ -253,8 +347,12 @@ if [ "$internal" = true ]; then
   exit 0
 fi
 
-mode=${1:-}; [ $# -eq 1 ] || fail arguments_invalid
-case "$mode" in validate|prepare|execute|rollback) ;; *) fail mode_invalid ;; esac
+mode=${1:-}
+case "$mode" in
+  recover-existing) [ $# -eq 2 ] || fail arguments_invalid ;;
+  validate|prepare|execute|rollback) [ $# -eq 1 ] || fail arguments_invalid ;;
+  *) fail mode_invalid ;;
+esac
 
 exec 9>/run/lock/phoenix-release.lock
 /usr/bin/flock -w 30 9 || fail release_lock_busy
@@ -262,6 +360,120 @@ exec 8>/run/lock/phoenix-economic-activation.lock
 /usr/bin/flock -w 30 8 || fail activation_lock_busy
 
 mkdir -p "$STATE_ROOT"; chmod 0700 "$STATE_ROOT"
+
+if [ "$mode" = recover-existing ]; then
+  legacy_sha=$2
+  [ "$legacy_sha" = "$LEGACY_ROTATION_SOURCE_SHA" ] || fail recovery_legacy_source_not_bounded
+  [ ! -e "$STATE" ] && [ ! -L "$STATE" ] || fail recovery_target_exists
+
+  before=$(authority_snapshot)
+  verify_recovery_authority_snapshot "$before" || fail recovery_authority_preflight
+  verify_support_services
+
+  [ "$(selected_env PHOENIX_MODE)" = LIVE ] &&
+  [ "$(selected_env LIVE_EXECUTION)" = true ] &&
+  [ "$(selected_env AUTONOMOUS_EXECUTION)" = true ] || fail recovery_mode_preflight
+
+  verify_consumer_identity "$OLD_EXECUTOR" "$OLD_HASH"
+
+  legacy_plan=$(verify_rotation_lineage "$legacy_sha") || fail recovery_lineage_unproven
+  legacy_state=$STATE_ROOT/$legacy_sha.json
+
+  [ -f "$legacy_state" ] && [ ! -L "$legacy_state" ] || fail recovery_legacy_state_missing
+
+  legacy_meta=$(stat -c '%u:%g:%a:%h:%s' "$legacy_state") || fail recovery_legacy_state_metadata
+  legacy_uid=${legacy_meta%%:*}; legacy_rest=${legacy_meta#*:}
+  legacy_gid=${legacy_rest%%:*}; legacy_rest=${legacy_rest#*:}
+  legacy_mode=${legacy_rest%%:*}; legacy_rest=${legacy_rest#*:}
+  legacy_links=${legacy_rest%%:*}; legacy_size=${legacy_rest#*:}
+
+  [ "$legacy_uid" = 0 ] &&
+  [ "$legacy_gid" = 0 ] &&
+  [ "$legacy_mode" = 600 ] &&
+  [ "$legacy_links" = 1 ] &&
+  [ "$legacy_size" -gt 0 ] &&
+  [ "$legacy_size" -le 65536 ] || fail recovery_legacy_state_metadata
+
+  image=$(
+    /usr/bin/python3 -I -B - "$RELEASE_ENV" <<'PY'
+import sys
+values=[]
+for raw in open(sys.argv[1],encoding="utf-8"):
+    if raw.startswith("LIVE_EXECUTOR_IMAGE="):
+        values.append(raw.rstrip("\n").split("=",1)[1])
+if len(values)!=1 or not values[0]: raise SystemExit(1)
+print(values[0])
+PY
+  ) || fail recovery_image_invalid
+
+  case "$image" in *@sha256:[0-9a-f][0-9a-f]*) ;; *) fail recovery_image_not_immutable ;; esac
+
+  binary_dir=$(/usr/bin/mktemp -d "$STATE_ROOT/.recovery-binary.XXXXXX")
+  recovery_container=phoenix-executor-recovery-copy-$$
+
+  cleanup_recovery() {
+    /usr/bin/docker rm -f "$recovery_container" >/dev/null 2>&1 || true
+    rm -f "$binary_dir/phoenix-executor-rotation"
+    rmdir "$binary_dir" 2>/dev/null || true
+  }
+  trap cleanup_recovery EXIT HUP INT TERM
+
+  /usr/bin/docker create --name "$recovery_container" "$image" >/dev/null ||
+    fail recovery_binary_container
+  /usr/bin/docker cp \
+    "$recovery_container:/usr/local/bin/phoenix-executor-rotation" \
+    "$binary_dir/phoenix-executor-rotation" || fail recovery_binary_copy
+  /usr/bin/docker rm "$recovery_container" >/dev/null || fail recovery_binary_cleanup
+  chmod 0700 "$binary_dir/phoenix-executor-rotation"
+
+  # Read-only RPC credentials only. No rotation signer is loaded.
+  export LIVE_EXECUTOR_RPC_URL=https://arbitrum.nownodes.io/
+  export LIVE_EXECUTOR_RPC_ALLOWLIST=https://arbitrum.nownodes.io/
+  export LIVE_EXECUTOR_RPC_HEADER_NAME=api-key
+  export LIVE_EXECUTOR_RPC_HEADER_FILE=/etc/phoenix/secrets/phoenix-rpc-provider-slot-1-api-key
+
+  set +e
+  recovery_output=$(
+    "$binary_dir/phoenix-executor-rotation" \
+      recover-existing "$PLAN" "$legacy_plan" "$legacy_state" "$STATE" 2>&1
+  )
+  recovery_rc=$?
+  set -e
+
+  printf '%s\n' "$recovery_output"
+  [ "$recovery_rc" -eq 0 ] || fail recover_existing_binary_failed
+
+  printf '%s\n' "$recovery_output" |
+    grep -F PHOENIX_EXECUTOR_ROTATION_RECOVERY_OK >/dev/null ||
+    fail recovery_success_marker_missing
+
+  /usr/bin/python3 -I -B "$CONTEXT" validate \
+    --plan "$PLAN" --provenance "$STATE" >/dev/null ||
+    fail recovery_current_provenance_invalid
+
+  state_meta=$(stat -c '%u:%g:%a:%h:%s' "$STATE") || fail recovery_current_state_metadata
+  state_uid=${state_meta%%:*}; state_rest=${state_meta#*:}
+  state_gid=${state_rest%%:*}; state_rest=${state_rest#*:}
+  state_mode=${state_rest%%:*}; state_rest=${state_rest#*:}
+  state_links=${state_rest%%:*}; state_size=${state_rest#*:}
+
+  [ "$state_uid" = 0 ] &&
+  [ "$state_gid" = 0 ] &&
+  [ "$state_mode" = 600 ] &&
+  [ "$state_links" = 1 ] &&
+  [ "$state_size" -gt 0 ] &&
+  [ "$state_size" -le 65536 ] || fail recovery_current_state_metadata
+
+  verify_consumer_identity "$OLD_EXECUTOR" "$OLD_HASH"
+  verify_support_services
+
+  after=$(authority_snapshot)
+  [ "$after" = "$before" ] || fail recovery_authority_changed
+
+  echo PHOENIX_EXECUTOR_ROTATION_RECOVERY_OK
+  exit 0
+fi
+
 snapshot=$(authority_snapshot); verify_authority_snapshot "$snapshot" || fail authority_preflight
 verify_support_services
 [ "$(selected_env PHOENIX_MODE)" = LIVE ] && [ "$(selected_env LIVE_EXECUTION)" = true ] && [ "$(selected_env AUTONOMOUS_EXECUTION)" = true ] || fail mode_preflight
