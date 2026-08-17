@@ -1574,7 +1574,9 @@ mod tests {
 
         let mut current_plan = plan();
         current_plan.source_sha = "44".repeat(20);
-        current_plan.base_release_sha = legacy_plan.source_sha.clone();
+        current_plan
+            .base_release_sha
+            .clone_from(&legacy_plan.source_sha);
 
         let mut legacy = configured_legacy_state(&legacy_plan);
         legacy.old_executor = OLD_EXECUTOR.trim_start_matches("0x").to_string();
@@ -1614,7 +1616,9 @@ mod tests {
 
         let mut current_plan = plan();
         current_plan.source_sha = "44".repeat(20);
-        current_plan.base_release_sha = legacy_plan.source_sha.clone();
+        current_plan
+            .base_release_sha
+            .clone_from(&legacy_plan.source_sha);
 
         let legacy = configured_legacy_state(&legacy_plan);
         let recovered = recover_existing_provenance(&current_plan, &legacy_plan, &legacy)
@@ -1643,7 +1647,9 @@ mod tests {
 
         let mut current_plan = plan();
         current_plan.source_sha = "44".repeat(20);
-        current_plan.base_release_sha = legacy_plan.source_sha.clone();
+        current_plan
+            .base_release_sha
+            .clone_from(&legacy_plan.source_sha);
 
         let original = configured_legacy_state(&legacy_plan);
 
