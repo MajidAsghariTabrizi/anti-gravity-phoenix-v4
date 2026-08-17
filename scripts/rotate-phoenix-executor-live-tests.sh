@@ -20,6 +20,14 @@ grep -F "p.sample_3_confirmation_provider" "$script" >/dev/null
 grep -F "p.sample_count" "$script" >/dev/null
 grep -F "p.recovery_status" "$script" >/dev/null
 
+grep -F 'http://127.0.0.1:9300/v1/aave/exact' "$script" >/dev/null
+grep -F 'http://127.0.0.1:9300/v1/aave/simulate-batch' "$script" >/dev/null
+
+if grep -F 'http://127.0.0.1:9650/v1/aave/' "$script" >/dev/null; then
+  echo "ROTATION_HOST_CONTRACT_FAILED:stale_rpc_gateway_9650" >&2
+  exit 1
+fi
+
 for forbidden in \
   'production_mode.py shadow' \
   'autonomous-control disarm' \
