@@ -182,6 +182,56 @@ class PhoenixExecutorRotationContextTests(unittest.TestCase):
         for forbidden in ("revenue_lane_controls", "economic_control", "autonomous_global_control"):
             self.assertNotIn(forbidden, drain)
 
+    def test_recover_existing_host_path_is_bounded_and_fail_closed(self) -> None:
+        root = Path(__file__).resolve().parents[2]
+        source = (root / "scripts" / "rotate-phoenix-executor-live.sh").read_text(encoding="utf-8")
+
+        self.assertIn(
+            "LEGACY_ROTATION_SOURCE_SHA="
+            "79c364f8aa56b6b6e27cd74cd2167e75a0b13610",
+            source,
+        )
+        self.assertIn("recover-existing)", source)
+        self.assertIn("verify_recovery_authority_snapshot", source)
+        self.assertIn("verify_rotation_lineage", source)
+        self.assertIn("verify-tree", source)
+        self.assertIn("PHOENIX_EXECUTOR_ROTATION_RECOVERY_OK", source)
+
+        start = source.index('if [ "$mode" = recover-existing ]; then')
+        end = source.index(
+            "snapshot=$(authority_snapshot); "
+            'verify_authority_snapshot "$snapshot"',
+            start,
+        )
+        recovery = source[start:end]
+
+        self.assertIn('verify_consumer_identity "$OLD_EXECUTOR" "$OLD_HASH"', recovery)
+        self.assertIn("LIVE_EXECUTOR_RPC_HEADER_FILE", recovery)
+
+        for forbidden in (
+            "send_raw_transaction",
+            "materialize-new",
+            "mark-cutover",
+            "claim-rollback",
+            "production_mode.py",
+            "autonomous-control disarm",
+            "arm-revenue",
+        ):
+            self.assertNotIn(forbidden, recovery)
+
+        rotation_main = (
+            root / "live-executor" / "src" /
+            "phoenix_executor_rotation_main.rs"
+        ).read_text(encoding="utf-8")
+
+        self.assertLess(
+            rotation_main.index('if mode == "recover-existing"'),
+            rotation_main.index(
+                'required("PHOENIX_EXECUTOR_ROTATION_SIGNER_FILE")'
+            ),
+        )
+
+
 
 if __name__ == "__main__":
     unittest.main()

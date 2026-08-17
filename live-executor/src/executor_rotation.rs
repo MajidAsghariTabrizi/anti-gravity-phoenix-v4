@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
     fs::{self, OpenOptions},
-    io::Write,
+    io::{ErrorKind, Write},
     path::{Path, PathBuf},
     time::Duration,
 };
@@ -983,6 +983,142 @@ pub fn provenance_with_block(
     })
 }
 
+/// Rebind an already-deployed, fully configured, pre-cutover PhoenixExecutor
+/// to the current immutable rotation plan.
+///
+/// This function is deliberately pure: it has no signer, RPC mutation,
+/// deployment, drain, cutover, rollback, or control authority.
+pub fn recover_existing_provenance(
+    current_plan: &RotationPlan,
+    legacy_plan: &RotationPlan,
+    legacy: &RotationProvenance,
+) -> Result<RotationProvenance, RotationError> {
+    validate_plan(current_plan)?;
+    validate_plan(legacy_plan)?;
+    validate_provenance(legacy, legacy_plan)?;
+
+    let compatible = normalize(&legacy.old_runtime_sha256)
+        == normalize(&current_plan.old_runtime_sha256)
+        && normalize(&legacy.new_runtime_sha256)
+            == normalize(&current_plan.expected_new_runtime_sha256)
+        && normalize(&legacy.creation_bytecode_sha256)
+            == normalize(&current_plan.creation_bytecode_sha256)
+        && normalize(&legacy.config_digest) == normalize(&current_plan.config_digest);
+
+    let pristine_pre_cutover = legacy.config_verified
+        && legacy.config_tx_hashes.len() == 14
+        && !legacy.pre_cutover_spl_absent
+        && !legacy.old_bound_work_drained
+        && legacy.fenced_old_requests == 0
+        && !legacy.cutover_started
+        && !legacy.cutover_completed
+        && legacy.cutover_tx_hashes.is_empty()
+        && legacy.identity_consumers.is_empty()
+        && !legacy.identity_consumers_verified
+        && legacy.rollback_tx_hash.is_none()
+        && !legacy.rollback_used
+        && !legacy.rollback_completed;
+
+    if !compatible || !pristine_pre_cutover {
+        return Err(RotationError::InvalidProvenance);
+    }
+
+    let mut recovered = legacy.clone();
+
+    recovered.tooling_source_sha = normalize(&current_plan.source_sha);
+    recovered.base_release_sha = normalize(&current_plan.base_release_sha);
+    recovered.chain_id = current_plan.chain_id;
+    recovered.old_executor = CanonicalAddress::parse(&current_plan.old_executor)
+        .map_err(|_| RotationError::InvalidProvenance)?
+        .to_string();
+    recovered.new_executor = CanonicalAddress::parse(&legacy.new_executor)
+        .map_err(|_| RotationError::InvalidProvenance)?
+        .to_string();
+    recovered.old_runtime_sha256 = normalize(&current_plan.old_runtime_sha256);
+    recovered.new_runtime_sha256 = normalize(&current_plan.expected_new_runtime_sha256);
+    recovered.creation_bytecode_sha256 = normalize(&current_plan.creation_bytecode_sha256);
+    recovered.config_digest = normalize(&current_plan.config_digest);
+
+    recovered.pre_cutover_spl_absent = false;
+    recovered.old_bound_work_drained = false;
+    recovered.fenced_old_requests = 0;
+    recovered.cutover_started = false;
+    recovered.cutover_completed = false;
+    recovered.cutover_tx_hashes.clear();
+    recovered.identity_consumers.clear();
+    recovered.identity_consumers_verified = false;
+    recovered.rollback_tx_hash = None;
+    recovered.rollback_used = false;
+    recovered.rollback_completed = false;
+
+    validate_provenance(&recovered, current_plan)?;
+    Ok(recovered)
+}
+
+/// Persist recovered provenance with no-clobber semantics.
+pub fn persist_provenance_create_new(
+    path: &Path,
+    value: &RotationProvenance,
+) -> Result<(), RotationError> {
+    let parent = path.parent().ok_or(RotationError::InvalidProvenance)?;
+
+    if !parent.is_dir() || parent.is_symlink() {
+        return Err(RotationError::InvalidProvenance);
+    }
+
+    match fs::symlink_metadata(path) {
+        Ok(_) => return Err(RotationError::InvalidProvenance),
+        Err(error) if error.kind() == ErrorKind::NotFound => {}
+        Err(_) => return Err(RotationError::InvalidProvenance),
+    }
+
+    let bytes = serde_json::to_vec_pretty(value).map_err(|_| RotationError::InvalidProvenance)?;
+    let temporary = parent.join(format!(
+        ".phoenix-executor-recovery.{}.tmp",
+        std::process::id()
+    ));
+
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+    }
+
+    let mut file = options
+        .open(&temporary)
+        .map_err(|_| RotationError::InvalidProvenance)?;
+
+    let result = (|| {
+        file.write_all(&bytes)
+            .map_err(|_| RotationError::InvalidProvenance)?;
+        file.write_all(b"\n")
+            .map_err(|_| RotationError::InvalidProvenance)?;
+        file.sync_all()
+            .map_err(|_| RotationError::InvalidProvenance)?;
+        fs::hard_link(&temporary, path).map_err(|_| RotationError::InvalidProvenance)?;
+        fs::remove_file(&temporary).map_err(|_| RotationError::InvalidProvenance)?;
+
+        #[cfg(unix)]
+        {
+            let directory = fs::File::open(parent).map_err(|_| RotationError::InvalidProvenance)?;
+            directory
+                .sync_all()
+                .map_err(|_| RotationError::InvalidProvenance)?;
+        }
+
+        Ok(())
+    })();
+
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+
+    result
+}
+
 pub fn validate_provenance(
     value: &RotationProvenance,
     plan: &RotationPlan,
@@ -1407,6 +1543,134 @@ mod tests {
         value.new_executor = OLD_EXECUTOR.to_string();
         assert_eq!(
             validate_provenance(&value, &plan),
+            Err(RotationError::InvalidProvenance)
+        );
+    }
+
+    fn configured_legacy_state(legacy_plan: &RotationPlan) -> RotationProvenance {
+        let new_executor = CanonicalAddress::parse("0x3d0c8340fc70616892635e1b6877475a2f915e95")
+            .expect("new executor");
+
+        let mut value = provenance_with_block(
+            legacy_plan,
+            new_executor,
+            &format!("0x{}", "7".repeat(64)),
+            495_235_786,
+        )
+        .expect("legacy provenance");
+
+        value.config_tx_hashes = (1_u64..=14)
+            .map(|index| format!("0x{index:064x}"))
+            .collect();
+        value.config_verified = true;
+        value
+    }
+
+    #[test]
+    fn recovery_rebinds_existing_executor_and_resets_release_sensitive_gates() {
+        let mut legacy_plan = plan();
+        legacy_plan.source_sha = "33".repeat(20);
+        legacy_plan.base_release_sha = "22".repeat(20);
+
+        let mut current_plan = plan();
+        current_plan.source_sha = "44".repeat(20);
+        current_plan.base_release_sha = legacy_plan.source_sha.clone();
+
+        let mut legacy = configured_legacy_state(&legacy_plan);
+        legacy.old_executor = OLD_EXECUTOR.trim_start_matches("0x").to_string();
+
+        let recovered = recover_existing_provenance(&current_plan, &legacy_plan, &legacy)
+            .expect("recover existing");
+
+        assert_eq!(recovered.tooling_source_sha, current_plan.source_sha);
+        assert_eq!(recovered.base_release_sha, current_plan.base_release_sha);
+        assert_eq!(recovered.old_executor, OLD_EXECUTOR);
+        assert_eq!(recovered.new_executor, legacy.new_executor);
+        assert_eq!(recovered.deployment_tx_hash, legacy.deployment_tx_hash);
+        assert_eq!(
+            recovered.deployment_block_number,
+            legacy.deployment_block_number
+        );
+        assert_eq!(recovered.config_tx_hashes, legacy.config_tx_hashes);
+        assert!(recovered.config_verified);
+        assert!(!recovered.pre_cutover_spl_absent);
+        assert!(!recovered.old_bound_work_drained);
+        assert_eq!(recovered.fenced_old_requests, 0);
+        assert!(!recovered.cutover_started);
+        assert!(!recovered.cutover_completed);
+        assert!(recovered.cutover_tx_hashes.is_empty());
+        assert!(recovered.identity_consumers.is_empty());
+        assert!(!recovered.identity_consumers_verified);
+        assert!(recovered.rollback_tx_hash.is_none());
+        assert!(!recovered.rollback_used);
+        assert!(!recovered.rollback_completed);
+        assert_eq!(validate_provenance(&recovered, &current_plan), Ok(()));
+    }
+
+    #[test]
+    fn recovery_persistence_is_create_new_and_refuses_clobber() {
+        let mut legacy_plan = plan();
+        legacy_plan.source_sha = "33".repeat(20);
+
+        let mut current_plan = plan();
+        current_plan.source_sha = "44".repeat(20);
+        current_plan.base_release_sha = legacy_plan.source_sha.clone();
+
+        let legacy = configured_legacy_state(&legacy_plan);
+        let recovered = recover_existing_provenance(&current_plan, &legacy_plan, &legacy)
+            .expect("recover existing");
+
+        let directory = tempfile::tempdir().expect("tempdir");
+        let target = directory.path().join("current.json");
+
+        persist_provenance_create_new(&target, &recovered).expect("first create");
+
+        assert_eq!(
+            read_provenance(&target, &current_plan).expect("read recovered"),
+            recovered
+        );
+
+        assert_eq!(
+            persist_provenance_create_new(&target, &recovered),
+            Err(RotationError::InvalidProvenance)
+        );
+    }
+
+    #[test]
+    fn recovery_rejects_stale_lifecycle_evidence() {
+        let mut legacy_plan = plan();
+        legacy_plan.source_sha = "33".repeat(20);
+
+        let mut current_plan = plan();
+        current_plan.source_sha = "44".repeat(20);
+        current_plan.base_release_sha = legacy_plan.source_sha.clone();
+
+        let original = configured_legacy_state(&legacy_plan);
+
+        let mut stale = original.clone();
+        stale.pre_cutover_spl_absent = true;
+        assert_eq!(
+            recover_existing_provenance(&current_plan, &legacy_plan, &stale),
+            Err(RotationError::InvalidProvenance)
+        );
+
+        let mut stale = original.clone();
+        stale.old_bound_work_drained = true;
+        assert_eq!(
+            recover_existing_provenance(&current_plan, &legacy_plan, &stale),
+            Err(RotationError::InvalidProvenance)
+        );
+
+        let mut stale = original;
+        stale.cutover_started = true;
+        stale.identity_consumers = vec![
+            "atlas-observer".to_string(),
+            "economic-supervisor".to_string(),
+            "live-executor".to_string(),
+            "phoenix-engine".to_string(),
+        ];
+        assert_eq!(
+            recover_existing_provenance(&current_plan, &legacy_plan, &stale),
             Err(RotationError::InvalidProvenance)
         );
     }
