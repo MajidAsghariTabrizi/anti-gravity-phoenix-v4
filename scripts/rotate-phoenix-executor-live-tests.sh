@@ -28,6 +28,70 @@ if grep -F 'http://127.0.0.1:9650/v1/aave/' "$script" >/dev/null; then
   exit 1
 fi
 
+grep -F 'rpc_gateway_post_json()' "$script" >/dev/null
+grep -F 'mktemp /tmp/phoenix-spl-body.XXXXXX' "$script" >/dev/null
+grep -F 'cat >"$body"' "$script" >/dev/null
+grep -F -- '--post-file="$body"' "$script" >/dev/null
+grep -F 'rpc_gateway_post_json http://127.0.0.1:9300/v1/aave/exact' "$script" >/dev/null
+grep -F 'rpc_gateway_post_json http://127.0.0.1:9300/v1/aave/simulate-batch' "$script" >/dev/null
+
+if grep -F -- '--post-file=/dev/stdin' "$script" >/dev/null; then
+  echo "ROTATION_HOST_CONTRACT_FAILED:nonseekable_stdin_post_file" >&2
+  exit 1
+fi
+
+# Behavioral regression: feed non-seekable stdin into the real helper,
+# stage it as a regular temp file, and prove cleanup after wget returns.
+test_root=$(mktemp -d)
+trap 'rm -rf "$test_root"' EXIT HUP INT TERM
+
+cat >"$test_root/wget" <<'SH'
+#!/bin/sh
+set -eu
+post_file=
+for arg in "$@"; do
+  case "$arg" in
+    --post-file=*) post_file=${arg#--post-file=} ;;
+  esac
+done
+[ -n "$post_file" ]
+[ -f "$post_file" ]
+[ "$(cat "$post_file")" = '{"probe":"seekable"}' ]
+printf '%s' "$post_file" >"$PHOENIX_TEST_POST_PATH"
+printf '%s\n' '{"ok":true}'
+SH
+
+chmod 0700 "$test_root/wget"
+export PHOENIX_TEST_POST_PATH="$test_root/post-path"
+
+helper=$(sed -n '/^rpc_gateway_post_json() {/,/^}/p' "$script")
+[ -n "$helper" ]
+
+(
+  PATH="$test_root:$PATH"
+  export PATH PHOENIX_TEST_POST_PATH
+
+  compose() {
+    [ "$1" = exec ]
+    [ "$2" = -T ]
+    [ "$3" = rpc-gateway ]
+    shift 3
+    "$@"
+  }
+
+  eval "$helper"
+
+  result=$(printf '%s' '{"probe":"seekable"}' | \
+    rpc_gateway_post_json http://127.0.0.1:9300/v1/aave/exact)
+
+  [ "$result" = '{"ok":true}' ]
+)
+
+post_path=$(cat "$test_root/post-path")
+[ -n "$post_path" ]
+[ ! -e "$post_path" ]
+
+
 for forbidden in \
   'production_mode.py shadow' \
   'autonomous-control disarm' \
