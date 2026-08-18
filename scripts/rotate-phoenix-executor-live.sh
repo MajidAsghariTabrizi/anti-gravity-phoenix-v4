@@ -47,6 +47,19 @@ compose() {
     --project-directory "$DEPLOY_ROOT" "$@"
 }
 
+rpc_gateway_post_json() {
+  endpoint=$1
+  compose exec -T rpc-gateway sh -eu -c '
+endpoint=$1
+umask 077
+body=$(mktemp /tmp/phoenix-spl-body.XXXXXX)
+trap "rm -f \"$body\"" 0
+trap "exit 1" HUP INT TERM
+cat >"$body"
+wget -q -O - --header="Content-Type: application/json" --post-file="$body" "$endpoint"
+' sh "$endpoint"
+}
+
 selected_env() {
   /usr/bin/python3 -I -B - "$ENV_FILE" "$1" <<'PY'
 import sys
@@ -293,9 +306,9 @@ if [ "$internal" = true ]; then
       work=$(/usr/bin/mktemp -d "$STATE_ROOT/.spl.XXXXXX")
       trap 'rm -f "$work/exact-request.json" "$work/exact-response.json" "$work/sim-request.json" "$work/sim-response.json"; rmdir "$work" 2>/dev/null || true' EXIT HUP INT TERM
       /usr/bin/python3 -I -B "$CONTEXT" exact-request --plan "$PLAN" --output "$work/exact-request.json" >/dev/null
-      compose exec -T rpc-gateway wget -q -O - --header='Content-Type: application/json' --post-file=/dev/stdin http://127.0.0.1:9300/v1/aave/exact <"$work/exact-request.json" >"$work/exact-response.json" || fail spl_exact_rpc
+      rpc_gateway_post_json http://127.0.0.1:9300/v1/aave/exact <"$work/exact-request.json" >"$work/exact-response.json" || fail spl_exact_rpc
       /usr/bin/python3 -I -B "$CONTEXT" simulation-request --plan "$PLAN" --provenance "$STATE" --exact-response "$work/exact-response.json" --output "$work/sim-request.json" >/dev/null
-      compose exec -T rpc-gateway wget -q -O - --header='Content-Type: application/json' --post-file=/dev/stdin http://127.0.0.1:9300/v1/aave/simulate-batch <"$work/sim-request.json" >"$work/sim-response.json" || fail spl_simulation_rpc
+      rpc_gateway_post_json http://127.0.0.1:9300/v1/aave/simulate-batch <"$work/sim-request.json" >"$work/sim-response.json" || fail spl_simulation_rpc
       /usr/bin/python3 -I -B "$CONTEXT" verify-simulation --plan "$PLAN" --provenance "$STATE" --request "$work/sim-request.json" --response "$work/sim-response.json" >/dev/null || fail spl_proof
       ;;
     drain)
