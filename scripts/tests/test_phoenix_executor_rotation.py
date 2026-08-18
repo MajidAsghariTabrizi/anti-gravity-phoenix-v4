@@ -104,6 +104,64 @@ class PhoenixExecutorRotationContextTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "ROTATION_ROLLBACK_REJECTED"):
                 rotation.mark(state, plan(), "rollback_used")
 
+    def test_rotation_spl_direct_simulation_uses_live_max_authority(self) -> None:
+        repay = 194_262_222_175_986
+        premium = 100_000_000_000
+        expected_profit = 2_000_000_000_000
+        output = repay + premium + expected_profit
+
+        exact = {
+            "schema_version": "phoenix.rpc.aave-exact-response.v5",
+            "chain_id": 42161,
+            "request_id": "exact",
+            "block_number": 495_787_761,
+            "block_hash": "0x" + "a" * 64,
+            "state_root": "0x" + "b" * 64,
+            "confirmation": None,
+            "quorum": 1,
+            "primary": {
+                "provider_id": "production-nownodes-arbitrum",
+                "liquidations": [{
+                    "debt_asset": rotation.WETH,
+                    "collateral_asset": rotation.NATIVE_USDC,
+                    "debt_asset_price_base": "100000000",
+                    "weth_price_base": "100000000",
+                    "repay_amount": str(repay),
+                    "flash_premium_amount": str(premium),
+                    "liquidator_collateral": "200000000",
+                    "unwind_quotes": [{
+                        "pool": rotation.POOL,
+                        "factory": rotation.FACTORY,
+                        "fee": 100,
+                        "zero_for_one": False,
+                        "output_debt_asset": str(output),
+                    }],
+                }],
+            },
+        }
+
+        request = rotation.simulation_request(plan(), provenance(), exact)
+        simulation = request["simulations"][0]
+
+        self.assertFalse(simulation["counterfactual"])
+        self.assertEqual(simulation["repay_amount"], str(repay))
+        self.assertEqual(
+            simulation["maximum_input_amount"],
+            str(rotation.MAX_INPUT),
+        )
+        self.assertEqual(
+            simulation["live_maximum_input_amount"],
+            str(rotation.MAX_INPUT),
+        )
+        self.assertEqual(
+            simulation["maximum_input_weth_wei"],
+            str(rotation.MAX_INPUT),
+        )
+        self.assertEqual(
+            simulation["live_maximum_input_weth_wei"],
+            str(rotation.MAX_INPUT),
+        )
+
     def test_successful_single_primary_simulation_is_the_only_spl_proof(self) -> None:
         request = {
             "schema_version": "phoenix.rpc.aave-simulate-batch-request.v3",
