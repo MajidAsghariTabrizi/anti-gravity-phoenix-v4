@@ -330,16 +330,21 @@ type gatewayErrorContract struct {
 	ErrorClass       string  `json:"error_class"`
 	Retryable        bool    `json:"retryable"`
 	RetryAfterSecond *uint64 `json:"retry_after_seconds,omitempty"`
+	RevertSelector   string  `json:"revert_selector,omitempty"`
 }
 
 type gatewayResponseError struct {
-	statusCode int
-	class      string
-	retryable  bool
-	retryAfter time.Duration
+	statusCode     int
+	class          string
+	retryable      bool
+	retryAfter     time.Duration
+	revertSelector string
 }
 
 func (e *gatewayResponseError) Error() string {
+	if e.revertSelector != "" {
+		return fmt.Sprintf("RPC Gateway rejected request: %s [%s]", e.class, e.revertSelector)
+	}
 	return fmt.Sprintf("RPC Gateway rejected request: %s", e.class)
 }
 
@@ -3104,6 +3109,7 @@ func (s *Screener) evaluateLiquidationBatch(ctx context.Context, record signal, 
 			index := diagnosticIndex[liquidationDiagnosticKey(probes[index].Liquidation, probes[index].Route)]
 			diagnostics[index].FinalRejectionReason = "fork_simulation_failed"
 			diagnostics[index].GatewayErrorClass = gatewayErrorClass(outcome.Err, "fork_simulation_failed")
+			diagnostics[index].ForkFailureDetail = boundedForkErrorText(outcome.Err)
 			continue
 		}
 		evaluation, viableForMaterialization, evaluationErr := s.evaluateLiquidationProbe(probes[index], outcome.Response, liveMaximumInput)
@@ -3158,6 +3164,7 @@ func (s *Screener) evaluateLiquidationBatch(ctx context.Context, record signal, 
 				hadSimulationFailure = true
 				setDiagnosticRejection(diagnostics, pending[index].Liquidation, pending[index].Route, "fork_simulation_failed")
 				setDiagnosticGatewayErrorClass(diagnostics, pending[index].Liquidation, pending[index].Route, gatewayErrorClass(outcome.Err, "fork_simulation_failed"))
+				setDiagnosticForkFailureDetail(diagnostics, pending[index].Liquidation, pending[index].Route, boundedForkErrorText(outcome.Err))
 				continue
 			}
 			complete, retry, evaluationErr := s.advanceLiquidationMaterialization(pending[index], outcome.Response)
@@ -4183,9 +4190,10 @@ func (s *Screener) simulateExactBatchChunk(ctx context.Context, record signal, s
 				return nil, errors.New("simulation batch error contract is invalid")
 			}
 			outcomes[index].Err = &gatewayResponseError{
-				statusCode: batchGatewayErrorStatus(item.Error.ErrorClass),
-				class:      item.Error.ErrorClass,
-				retryable:  item.Error.Retryable,
+				statusCode:     batchGatewayErrorStatus(item.Error.ErrorClass),
+				class:          item.Error.ErrorClass,
+				retryable:      item.Error.Retryable,
+				revertSelector: item.Error.RevertSelector,
 			}
 			continue
 		}
