@@ -1903,15 +1903,12 @@ async fn hunter_readiness_payload() -> ControlResult<Value> {
                 bounded_error_cause(&cause),
             )
         })?;
-    let bytes = response
-        .bytes()
-        .await
-        .map_err(|cause| {
-            ControlError::MessageWithCause(
-                "Aave/Atlas hunter readiness body failed",
-                bounded_error_cause(&cause),
-            )
-        })?;
+    let bytes = response.bytes().await.map_err(|cause| {
+        ControlError::MessageWithCause(
+            "Aave/Atlas hunter readiness body failed",
+            bounded_error_cause(&cause),
+        )
+    })?;
     if bytes.len() > 64 * 1024 {
         return Err("Aave/Atlas hunter readiness is oversized".into());
     }
@@ -7325,7 +7322,10 @@ mod tests {
 
     #[test]
     fn bounded_error_cause_strips_controls_and_truncates() {
-        let short = bounded_error_cause(&io::Error::new(io::ErrorKind::ConnectionRefused, "tcp refused"));
+        let short = bounded_error_cause(&io::Error::new(
+            io::ErrorKind::ConnectionRefused,
+            "tcp refused",
+        ));
         assert_eq!(short, "tcp refused");
         let long: String = "x".repeat(400);
         let bounded = bounded_error_cause(&io::Error::other(long.clone()));
