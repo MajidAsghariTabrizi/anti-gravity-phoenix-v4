@@ -566,6 +566,7 @@ type sizeDiagnostic struct {
 	LiveAuthorized           bool   `json:"live_authorized"`
 	FinalRejectionReason     string `json:"final_rejection_reason,omitempty"`
 	GatewayErrorClass        string `json:"gateway_error_class,omitempty"`
+	ForkFailureDetail        string `json:"fork_failure_detail,omitempty"`
 	EvidenceMode             string `json:"evidence_mode,omitempty"`
 	Selected                 bool   `json:"selected,omitempty"`
 }
@@ -588,6 +589,7 @@ type exactDiagnosticSummary struct {
 	ForkEvidenceMode                 string            `json:"fork_evidence_mode,omitempty"`
 	FailureClass                     string            `json:"failure_class,omitempty"`
 	ForkGatewayErrorClasses          map[string]uint64 `json:"fork_gateway_error_classes,omitempty"`
+	ForkBatchErrors                  map[string]uint64 `json:"fork_batch_errors,omitempty"`
 	LiquidatableToExactLatencyMillis uint64            `json:"liquidatable_to_exact_latency_ms"`
 	ExactForkLatencyMillis           uint64            `json:"exact_fork_latency_ms"`
 	QueueToWorkerLatencyMillis       uint64            `json:"queue_to_worker_latency_ms"`
@@ -3087,9 +3089,11 @@ func (s *Screener) evaluateLiquidationBatch(ctx context.Context, record signal, 
 	outcomes, err := s.simulateExactBatch(ctx, record, requests)
 	if err != nil {
 		class := gatewayErrorClass(err, "fork_simulation_failed")
+		detail := boundedForkErrorText(err)
 		for _, probe := range probes {
 			setDiagnosticRejection(diagnostics, probe.Liquidation, probe.Route, "fork_simulation_failed")
 			setDiagnosticGatewayErrorClass(diagnostics, probe.Liquidation, probe.Route, class)
+			setDiagnosticForkFailureDetail(diagnostics, probe.Liquidation, probe.Route, detail)
 		}
 		return nil, true, diagnostics
 	}
@@ -3140,9 +3144,11 @@ func (s *Screener) evaluateLiquidationBatch(ctx context.Context, record signal, 
 		if err != nil {
 			hadSimulationFailure = true
 			class := gatewayErrorClass(err, "fork_simulation_failed")
+			detail := boundedForkErrorText(err)
 			for _, evaluation := range pending {
 				setDiagnosticRejection(diagnostics, evaluation.Liquidation, evaluation.Route, "fork_simulation_failed")
 				setDiagnosticGatewayErrorClass(diagnostics, evaluation.Liquidation, evaluation.Route, class)
+				setDiagnosticForkFailureDetail(diagnostics, evaluation.Liquidation, evaluation.Route, detail)
 			}
 			break
 		}
@@ -3341,6 +3347,33 @@ func setDiagnosticGatewayErrorClass(diagnostics []sizeDiagnostic, liquidation *e
 	}
 }
 
+func setDiagnosticForkFailureDetail(diagnostics []sizeDiagnostic, liquidation *exactLiquidation, route liquidationRoute, detail string) {
+	key := liquidationDiagnosticKey(liquidation, route)
+	for index := range diagnostics {
+		if liquidationDiagnosticKeyValues(diagnostics[index].ReviewedSize, diagnostics[index].Route) == key {
+			diagnostics[index].ForkFailureDetail = detail
+			return
+		}
+	}
+}
+
+func boundedForkErrorText(err error) string {
+	if err == nil {
+		return ""
+	}
+	runes := make([]rune, 0, 64)
+	for _, character := range err.Error() {
+		if len(runes) >= 160 {
+			break
+		}
+		if character < 0x20 || character == 0x7f {
+			continue
+		}
+		runes = append(runes, character)
+	}
+	return string(runes)
+}
+
 func markSelectedDiagnostic(diagnostics []sizeDiagnostic, liquidation *exactLiquidation, route liquidationRoute) {
 	key := liquidationDiagnosticKey(liquidation, route)
 	for index := range diagnostics {
@@ -3384,6 +3417,7 @@ func buildExactDiagnosticSummary(record signal, exactForkLatency, liquidatableTo
 		ReviewedCombinationCount: uint64(len(record.SizeDiagnostics)),
 		RejectionCounts:          make(map[string]uint64),
 		ForkGatewayErrorClasses:  make(map[string]uint64),
+		ForkBatchErrors:          make(map[string]uint64),
 	}
 	if record.ExactRouteIneligibleReason != "" {
 		summary.RouteEligibility = record.ExactRouteIneligibleReason
@@ -3403,6 +3437,10 @@ func buildExactDiagnosticSummary(record signal, exactForkLatency, liquidatableTo
 		if diagnostic.FinalRejectionReason == "fork_simulation_failed" &&
 			diagnostic.GatewayErrorClass != "" {
 			summary.ForkGatewayErrorClasses[diagnostic.GatewayErrorClass]++
+		}
+		if diagnostic.FinalRejectionReason == "fork_simulation_failed" &&
+			diagnostic.ForkFailureDetail != "" {
+			summary.ForkBatchErrors[diagnostic.ForkFailureDetail]++
 		}
 		if diagnostic.GasLimit > 0 || strings.HasPrefix(diagnostic.FinalRejectionReason, "fork_") ||
 			diagnostic.FinalRejectionReason == "bound_convergence_failed" ||

@@ -4839,3 +4839,25 @@ func TestBuildExactDiagnosticSummaryCarriesForkGatewayErrorClasses(t *testing.T)
 		t.Fatalf("non-fork reason leaked into fork gateway error classes")
 	}
 }
+
+func TestBuildExactDiagnosticSummaryCarriesBoundedBatchErrorText(t *testing.T) {
+	record := signal{
+		Cursor: 1, Borrower: "0x1111111111111111111111111111111111111111",
+		Block: 100, BlockHash: "0x" + strings.Repeat("a", 64), StateRoot: "0x" + strings.Repeat("b", 64),
+		SizeDiagnostics: []sizeDiagnostic{
+			{FinalRejectionReason: "fork_simulation_failed", GatewayErrorClass: "fork_simulation_failed", ForkFailureDetail: "simulation batch evidence is incomplete", ReviewedSize: "100", Route: "r1"},
+			{FinalRejectionReason: "fork_simulation_failed", ForkFailureDetail: "simulation batch evidence is incomplete", ReviewedSize: "200", Route: "r2"},
+		},
+	}
+	summary := buildExactDiagnosticSummary(record, 0, 0)
+	if summary.ForkBatchErrors["simulation batch evidence is incomplete"] != 2 {
+		t.Fatalf("batch error text count = %d, want 2", summary.ForkBatchErrors["simulation batch evidence is incomplete"])
+	}
+	detail := boundedForkErrorText(io.ErrClosedPipe)
+	if detail != "io: read/write on closed pipe" {
+		t.Fatalf("unexpected bounded error text: %q", detail)
+	}
+	if boundedForkErrorText(nil) != "" {
+		t.Fatalf("nil error produced detail text")
+	}
+}
