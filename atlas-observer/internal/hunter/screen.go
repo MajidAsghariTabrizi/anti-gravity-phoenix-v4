@@ -4131,8 +4131,11 @@ func (s *Screener) simulateExactBatchChunk(ctx context.Context, record signal, s
 		}
 	}
 	expectedBatchEvidenceMode := directForkEvidenceMode
-	if atlasMode {
+	switch {
+	case atlasMode:
 		expectedBatchEvidenceMode = atlasCallbackEvidenceMode
+	case simulations[0].Counterfactual:
+		expectedBatchEvidenceMode = counterfactualForkEvidenceMode
 	}
 	requestID := fmt.Sprintf("aave-sim-batch-%d-%d", record.Cursor, time.Now().UnixNano())
 	batch := simulationBatchRequest{
