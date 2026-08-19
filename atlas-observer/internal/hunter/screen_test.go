@@ -4816,3 +4816,26 @@ func TestSetDiagnosticGatewayErrorClassRecordsBoundedClass(t *testing.T) {
 		t.Fatalf("unmatched key overwrote the recorded class: %q", diagnostics[0].GatewayErrorClass)
 	}
 }
+
+func TestBuildExactDiagnosticSummaryCarriesForkGatewayErrorClasses(t *testing.T) {
+	record := signal{
+		Cursor: 1, Borrower: "0x1111111111111111111111111111111111111111",
+		Block: 100, BlockHash: "0x" + strings.Repeat("a", 64), StateRoot: "0x" + strings.Repeat("b", 64),
+		SizeDiagnostics: []sizeDiagnostic{
+			{FinalRejectionReason: "fork_simulation_failed", GatewayErrorClass: "execution_reverted", ReviewedSize: "100", Route: "r1"},
+			{FinalRejectionReason: "fork_simulation_failed", GatewayErrorClass: "execution_reverted", ReviewedSize: "200", Route: "r2"},
+			{FinalRejectionReason: "fork_simulation_failed", GatewayErrorClass: "provider_unavailable", ReviewedSize: "300", Route: "r3"},
+			{FinalRejectionReason: "gross_edge_below_retained_profit_gate", ReviewedSize: "400", Route: "r4"},
+		},
+	}
+	summary := buildExactDiagnosticSummary(record, 0, 0)
+	if summary.ForkGatewayErrorClasses["execution_reverted"] != 2 {
+		t.Fatalf("execution_reverted count = %d, want 2", summary.ForkGatewayErrorClasses["execution_reverted"])
+	}
+	if summary.ForkGatewayErrorClasses["provider_unavailable"] != 1 {
+		t.Fatalf("provider_unavailable count = %d, want 1", summary.ForkGatewayErrorClasses["provider_unavailable"])
+	}
+	if _, present := summary.ForkGatewayErrorClasses["gross_edge_below_retained_profit_gate"]; present {
+		t.Fatalf("non-fork reason leaked into fork gateway error classes")
+	}
+}
