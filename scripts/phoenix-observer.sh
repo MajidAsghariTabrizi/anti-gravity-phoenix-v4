@@ -614,13 +614,27 @@ for service in $CRITICAL_SERVICES; do
   state="$(docker inspect --format '{{.State.Status}}' "$cid" 2>/dev/null || printf unknown)"
   health="$(health_value "$cid")"
   restart="$(docker inspect --format '{{.RestartCount}}' "$cid" 2>/dev/null || printf unknown)"
+  recent_restart="false"
+  if [ "$restart" != "0" ] && [ "$restart" != "unknown" ]; then
+    # Acceptance uses deltas: a historical non-zero restart counter is not a
+    # current degradation. Flag restarts only when the container (re)started
+    # within the observation window.
+    started_at="$(docker inspect --format '{{.State.StartedAt}}' "$cid" 2>/dev/null || true)"
+    if [ -n "$started_at" ]; then
+      started_epoch="$(date -u -d "$started_at" +%s 2>/dev/null || true)"
+      threshold="$(( $(date -u +%s) - 3600 ))"
+      if [ -n "$started_epoch" ] && [ "$started_epoch" -ge "$threshold" ]; then
+        recent_restart="true"
+      fi
+    fi
+  fi
 
   if [ "$state" != "running" ] ||
      { [ "$health" != "healthy" ] && [ "$health" != "none" ]; } ||
-     { [ "$restart" != "0" ] && [ "$restart" != "unknown" ]; }
+     [ "$recent_restart" = "true" ]
   then
-    printf 'DEGRADED service=%s state=%s health=%s restarts=%s\n' \
-      "$service" "$state" "$health" "$restart"
+    printf 'DEGRADED service=%s state=%s health=%s restarts=%s recent_restart=%s\n' \
+      "$service" "$state" "$health" "$restart" "$recent_restart"
     critical_failures=$((critical_failures + 1))
   fi
 done
