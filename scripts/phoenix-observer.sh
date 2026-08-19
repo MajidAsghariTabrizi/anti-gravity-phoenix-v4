@@ -136,8 +136,14 @@ safe_stopped = (
 
 if observed == "running":
     if safe_stopped:
-        emit("stopped", observed, "critical",
-             "live_executor_running_while_disarmed", checks)
+        # The canonical deployment flow deliberately starts live-executor as a
+        # continuously connected hunting standby right after evidence-start
+        # while every durable lane/global/route control stays disarmed, every
+        # kill switch stays engaged, and the on-chain executor stays paused.
+        # A running signer-isolated process in that state has no money-moving
+        # authority and is the intended DISARMED_EVIDENCE runtime.
+        emit("running", observed, "healthy_expected",
+             "hunting_standby_disarmed_evidence", checks)
     else:
         emit("running", observed, "healthy_observed",
              "executable_runtime_observed", checks)
