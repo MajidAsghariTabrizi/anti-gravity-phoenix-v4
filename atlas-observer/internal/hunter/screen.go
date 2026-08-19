@@ -587,6 +587,7 @@ type exactDiagnosticSummary struct {
 	ForkPassed                       bool              `json:"fork_passed"`
 	ForkEvidenceMode                 string            `json:"fork_evidence_mode,omitempty"`
 	FailureClass                     string            `json:"failure_class,omitempty"`
+	ForkGatewayErrorClasses          map[string]uint64 `json:"fork_gateway_error_classes,omitempty"`
 	LiquidatableToExactLatencyMillis uint64            `json:"liquidatable_to_exact_latency_ms"`
 	ExactForkLatencyMillis           uint64            `json:"exact_fork_latency_ms"`
 	QueueToWorkerLatencyMillis       uint64            `json:"queue_to_worker_latency_ms"`
@@ -3382,6 +3383,7 @@ func buildExactDiagnosticSummary(record signal, exactForkLatency, liquidatableTo
 		RouteEligibility:         "eligible",
 		ReviewedCombinationCount: uint64(len(record.SizeDiagnostics)),
 		RejectionCounts:          make(map[string]uint64),
+		ForkGatewayErrorClasses:  make(map[string]uint64),
 	}
 	if record.ExactRouteIneligibleReason != "" {
 		summary.RouteEligibility = record.ExactRouteIneligibleReason
@@ -3397,6 +3399,10 @@ func buildExactDiagnosticSummary(record signal, exactForkLatency, liquidatableTo
 		diagnostic := record.SizeDiagnostics[index]
 		if diagnostic.FinalRejectionReason != "" {
 			summary.RejectionCounts[diagnostic.FinalRejectionReason]++
+		}
+		if diagnostic.FinalRejectionReason == "fork_simulation_failed" &&
+			diagnostic.GatewayErrorClass != "" {
+			summary.ForkGatewayErrorClasses[diagnostic.GatewayErrorClass]++
 		}
 		if diagnostic.GasLimit > 0 || strings.HasPrefix(diagnostic.FinalRejectionReason, "fork_") ||
 			diagnostic.FinalRejectionReason == "bound_convergence_failed" ||
