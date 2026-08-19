@@ -144,6 +144,7 @@ fn reviewed_policy_value(fingerprint: &str) -> ControlResult<Value> {
 #[derive(Debug)]
 enum ControlError {
     Message(&'static str),
+    MessageWithCause(&'static str, String),
     MissingEnvironment(MissingEnvironment),
     OwnerBootstrap(OwnerBootstrapError),
 }
@@ -152,6 +153,9 @@ impl Display for ControlError {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Message(message) => formatter.write_str(message),
+            Self::MessageWithCause(message, cause) => {
+                write!(formatter, "{message}: {cause}")
+            }
             Self::MissingEnvironment(error) => Display::fmt(error, formatter),
             Self::OwnerBootstrap(error) => Display::fmt(error, formatter),
         }
@@ -1893,15 +1897,33 @@ async fn hunter_readiness_payload() -> ControlResult<Value> {
         .get(ATLAS_HUNTER_READINESS_URL)
         .send()
         .await
-        .map_err(|_| "Aave/Atlas hunter readiness is unavailable")?;
-    let bytes = response
-        .bytes()
-        .await
-        .map_err(|_| "Aave/Atlas hunter readiness is unavailable")?;
+        .map_err(|cause| {
+            ControlError::MessageWithCause(
+                "Aave/Atlas hunter readiness request failed",
+                bounded_error_cause(&cause),
+            )
+        })?;
+    let bytes = response.bytes().await.map_err(|cause| {
+        ControlError::MessageWithCause(
+            "Aave/Atlas hunter readiness body failed",
+            bounded_error_cause(&cause),
+        )
+    })?;
     if bytes.len() > 64 * 1024 {
         return Err("Aave/Atlas hunter readiness is oversized".into());
     }
     serde_json::from_slice(&bytes).map_err(|_| "Aave/Atlas hunter readiness is invalid".into())
+}
+
+fn bounded_error_cause(cause: &dyn Error) -> String {
+    let text = cause.to_string();
+    if text.len() <= 160 && !text.chars().any(char::is_control) {
+        return text;
+    }
+    text.chars()
+        .filter(|character| !character.is_control())
+        .take(160)
+        .collect()
 }
 
 async fn fail_close_provider_execution_gate(pool: &PgPool, reason: &str) -> ControlResult<()> {
@@ -7296,5 +7318,28 @@ mod tests {
             .execute(&pool)
             .await
             .expect("drop post-arm recovery schema");
+    }
+
+    #[test]
+    fn bounded_error_cause_strips_controls_and_truncates() {
+        let short = bounded_error_cause(&io::Error::new(
+            io::ErrorKind::ConnectionRefused,
+            "tcp refused",
+        ));
+        assert_eq!(short, "tcp refused");
+        let long: String = "x".repeat(400);
+        let bounded = bounded_error_cause(&io::Error::other(long.clone()));
+        assert_eq!(bounded.len(), 160);
+        assert!(bounded.chars().all(|character| character == 'x'));
+        let noisy = bounded_error_cause(&io::Error::other("boom\t\nboom"));
+        assert_eq!(noisy, "boomboom");
+        let message = ControlError::MessageWithCause(
+            "Aave/Atlas hunter readiness request failed",
+            "connection refused".to_string(),
+        );
+        assert_eq!(
+            message.to_string(),
+            "Aave/Atlas hunter readiness request failed: connection refused"
+        );
     }
 }
