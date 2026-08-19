@@ -3770,11 +3770,11 @@ class WorkflowAndDeploymentContractTests(unittest.TestCase):
             "test -s /evidence/latest-dashboard.json", self.rehearsal
         )
         self.assertIn(
-            "PHOENIX_ECONOMIC_DASHBOARD_QUERY_TIMEOUT_SECONDS=30",
+            "PHOENIX_ECONOMIC_DASHBOARD_QUERY_TIMEOUT_SECONDS=60",
             self.rehearsal,
         )
         self.assertIn(
-            '"PHOENIX_ECONOMIC_DASHBOARD_QUERY_TIMEOUT_SECONDS": "30"',
+            '"PHOENIX_ECONOMIC_DASHBOARD_QUERY_TIMEOUT_SECONDS": "60"',
             self.rehearsal,
         )
         self.assertIn('--network "$database_network"', self.rehearsal)
