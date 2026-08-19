@@ -93,12 +93,36 @@ class LiveExecutorExpectationTests(unittest.TestCase):
         evidence["activation_completed"] = True
         self.assert_critical(evidence, "activation_completed_executor_missing")
 
-    def test_running_executor_is_critical_in_disarmed_evidence(self) -> None:
+    def test_running_executor_in_disarmed_evidence_is_hunting_standby(
+        self,
+    ) -> None:
         evidence = self.evidence()
         evidence["observed_state"] = "running"
         result = self.evaluate(evidence)
-        self.assertEqual(result["result"], "critical")
-        self.assertEqual(result["reason"], "live_executor_running_while_disarmed")
+        self.assertEqual(result["expected_state"], "running")
+        self.assertEqual(result["observed_state"], "running")
+        self.assertEqual(result["result"], "healthy_expected")
+        self.assertEqual(
+            result["reason"], "hunting_standby_disarmed_evidence"
+        )
+
+    def test_running_executor_with_open_control_is_healthy_observed(self) -> None:
+        evidence = self.evidence()
+        evidence["observed_state"] = "running"
+        evidence["armed"] = True
+        result = self.evaluate(evidence)
+        self.assertEqual(result["result"], "healthy_observed")
+        self.assertEqual(result["reason"], "executable_runtime_observed")
+
+    def test_running_executor_with_unpaused_contract_is_healthy_observed(
+        self,
+    ) -> None:
+        evidence = self.evidence()
+        evidence["observed_state"] = "running"
+        evidence["contract_paused"] = False
+        result = self.evaluate(evidence)
+        self.assertEqual(result["result"], "healthy_observed")
+        self.assertEqual(result["reason"], "executable_runtime_observed")
 
     def test_platform_installer_installs_the_versioned_observer(self) -> None:
         installer = INSTALLER.read_text(encoding="utf-8")
