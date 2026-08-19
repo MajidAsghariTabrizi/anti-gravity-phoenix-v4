@@ -207,7 +207,7 @@ grep -F "render-production-compose.sh" "$workflow" >/dev/null ||
 if grep -E '(cat|printenv|env)[[:space:]]+.*phoenix\.env' "$workflow" >/dev/null; then
   fail "production workflow can print the environment file"
 fi
-if [ "$(grep -c 'sample_limit: 2048' "$repo_dir/prometheus/prometheus.yml")" -ne 5 ]; then
+if [ "$(grep -c 'sample_limit: 2048' "$repo_dir/prometheus/prometheus.yml")" -ne 6 ]; then
   fail "Prometheus scrape cardinality is not bounded for every money-path service"
 fi
 

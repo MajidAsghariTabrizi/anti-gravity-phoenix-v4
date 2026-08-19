@@ -4205,10 +4205,17 @@ func testEvidenceMode(input simulationRequest) string {
 
 func writeTestSimulationBatch(writer http.ResponseWriter, input simulationBatchRequest, results []simulationBatchResult) {
 	first := input.Simulations[0]
+	evidenceMode := directForkEvidenceMode
+	switch {
+	case first.AtlasMode:
+		evidenceMode = atlasCallbackEvidenceMode
+	case first.Counterfactual:
+		evidenceMode = counterfactualForkEvidenceMode
+	}
 	_ = json.NewEncoder(writer).Encode(simulationBatchResponse{
 		SchemaVersion: "phoenix.rpc.aave-simulate-batch-response.v4", ChainID: 42161, RequestID: input.RequestID,
 		BlockNumber: first.BlockNumber, BlockHash: first.BlockHash, StateRoot: first.StateRoot,
-		PrimaryProviderID: primaryProviderID, ConfirmationProviderID: nil, Quorum: 1, EvidenceMode: directForkEvidenceMode,
+		PrimaryProviderID: primaryProviderID, ConfirmationProviderID: nil, Quorum: 1, EvidenceMode: evidenceMode,
 		Results: results,
 	})
 }
@@ -4814,5 +4821,102 @@ func TestSetDiagnosticGatewayErrorClassRecordsBoundedClass(t *testing.T) {
 	setDiagnosticGatewayErrorClass(diagnostics, &exactLiquidation{RepayAmount: "999"}, liquidationRoute{Name: "other-route"}, "provider_unavailable")
 	if diagnostics[0].GatewayErrorClass != "execution_reverted" {
 		t.Fatalf("unmatched key overwrote the recorded class: %q", diagnostics[0].GatewayErrorClass)
+	}
+}
+
+func TestBuildExactDiagnosticSummaryCarriesForkGatewayErrorClasses(t *testing.T) {
+	record := signal{
+		Cursor: 1, Borrower: "0x1111111111111111111111111111111111111111",
+		Block: 100, BlockHash: "0x" + strings.Repeat("a", 64), StateRoot: "0x" + strings.Repeat("b", 64),
+		SizeDiagnostics: []sizeDiagnostic{
+			{FinalRejectionReason: "fork_simulation_failed", GatewayErrorClass: "execution_reverted", ReviewedSize: "100", Route: "r1"},
+			{FinalRejectionReason: "fork_simulation_failed", GatewayErrorClass: "execution_reverted", ReviewedSize: "200", Route: "r2"},
+			{FinalRejectionReason: "fork_simulation_failed", GatewayErrorClass: "provider_unavailable", ReviewedSize: "300", Route: "r3"},
+			{FinalRejectionReason: "gross_edge_below_retained_profit_gate", ReviewedSize: "400", Route: "r4"},
+		},
+	}
+	summary := buildExactDiagnosticSummary(record, 0, 0)
+	if summary.ForkGatewayErrorClasses["execution_reverted"] != 2 {
+		t.Fatalf("execution_reverted count = %d, want 2", summary.ForkGatewayErrorClasses["execution_reverted"])
+	}
+	if summary.ForkGatewayErrorClasses["provider_unavailable"] != 1 {
+		t.Fatalf("provider_unavailable count = %d, want 1", summary.ForkGatewayErrorClasses["provider_unavailable"])
+	}
+	if _, present := summary.ForkGatewayErrorClasses["gross_edge_below_retained_profit_gate"]; present {
+		t.Fatalf("non-fork reason leaked into fork gateway error classes")
+	}
+}
+
+func TestBuildExactDiagnosticSummaryCarriesBoundedBatchErrorText(t *testing.T) {
+	record := signal{
+		Cursor: 1, Borrower: "0x1111111111111111111111111111111111111111",
+		Block: 100, BlockHash: "0x" + strings.Repeat("a", 64), StateRoot: "0x" + strings.Repeat("b", 64),
+		SizeDiagnostics: []sizeDiagnostic{
+			{FinalRejectionReason: "fork_simulation_failed", GatewayErrorClass: "fork_simulation_failed", ForkFailureDetail: "simulation batch evidence is incomplete", ReviewedSize: "100", Route: "r1"},
+			{FinalRejectionReason: "fork_simulation_failed", ForkFailureDetail: "simulation batch evidence is incomplete", ReviewedSize: "200", Route: "r2"},
+		},
+	}
+	summary := buildExactDiagnosticSummary(record, 0, 0)
+	if summary.ForkBatchErrors["simulation batch evidence is incomplete"] != 2 {
+		t.Fatalf("batch error text count = %d, want 2", summary.ForkBatchErrors["simulation batch evidence is incomplete"])
+	}
+	detail := boundedForkErrorText(io.ErrClosedPipe)
+	if detail != "io: read/write on closed pipe" {
+		t.Fatalf("unexpected bounded error text: %q", detail)
+	}
+	if boundedForkErrorText(nil) != "" {
+		t.Fatalf("nil error produced detail text")
+	}
+}
+
+func TestSimulateBatchAcceptsCounterfactualFirstEvidenceMode(t *testing.T) {
+	record := signal{
+		Cursor: 1, Block: 491300000,
+		BlockHash: "0x" + strings.Repeat("a", 64), StateRoot: "0x" + strings.Repeat("b", 64),
+		Borrower: "0x1111111111111111111111111111111111111111",
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if request.URL.Path != "/v1/aave/simulate-batch" {
+			t.Errorf("unexpected path: %s", request.URL.Path)
+			return
+		}
+		var input simulationBatchRequest
+		if err := json.NewDecoder(request.Body).Decode(&input); err != nil {
+			t.Error(err)
+			return
+		}
+		results := make([]simulationBatchResult, len(input.Simulations))
+		for index := range input.Simulations {
+			results[index] = simulationBatchResult{
+				RequestID: input.Simulations[index].RequestID,
+				Error:     &gatewayErrorContract{ErrorClass: "execution_reverted", Retryable: false},
+			}
+		}
+		_ = json.NewEncoder(writer).Encode(simulationBatchResponse{
+			SchemaVersion: "phoenix.rpc.aave-simulate-batch-response.v4", ChainID: 42161,
+			RequestID: input.RequestID, BlockNumber: record.Block, BlockHash: record.BlockHash,
+			StateRoot: record.StateRoot, PrimaryProviderID: primaryProviderID, Quorum: 1,
+			EvidenceMode: counterfactualForkEvidenceMode, Results: results,
+		})
+	}))
+	defer server.Close()
+	screener := &Screener{
+		config: Config{
+			GatewayURL: server.URL, MaximumInputAmountWei: maximumReviewedInputWei,
+			RetainedProfitFloorWei: "1",
+		},
+		client: server.Client(), batchClient: server.Client(),
+	}
+	simulation := simulationRequest{
+		SchemaVersion: "phoenix.rpc.aave-simulate-request.v4", ChainID: 42161, RequestID: "aave-sim-1",
+		BlockNumber: record.Block, BlockHash: record.BlockHash, StateRoot: record.StateRoot,
+		Counterfactual: true, DeadlineUnixSeconds: uint64(time.Now().Add(60 * time.Second).Unix()),
+	}
+	outcomes, err := screener.simulateExactBatch(context.Background(), record, []simulationRequest{simulation})
+	if err != nil {
+		t.Fatalf("counterfactual batch envelope was rejected: %v", err)
+	}
+	if len(outcomes) != 1 || outcomes[0].Err == nil {
+		t.Fatalf("expected one per-item outcome error, got outcomes=%d err=%v", len(outcomes), outcomes[0].Err)
 	}
 }
