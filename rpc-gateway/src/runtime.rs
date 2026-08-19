@@ -333,7 +333,7 @@ pub enum GatewayError {
     #[error("RPC Gateway response exceeded the configured bound")]
     ResponseOversized,
     #[error("simulated EVM execution reverted")]
-    ExecutionReverted,
+    ExecutionReverted { selector: Option<[u8; 4]> },
 }
 
 impl GatewayError {
@@ -347,7 +347,7 @@ impl GatewayError {
             Self::ProviderDisagreement => "provider_disagreement",
             Self::StateIncomplete => "state_incomplete",
             Self::ResponseOversized => "gateway_response_oversized",
-            Self::ExecutionReverted => "execution_reverted",
+            Self::ExecutionReverted { .. } => "execution_reverted",
         }
     }
 
@@ -369,7 +369,7 @@ impl GatewayError {
             | Self::ProviderDisagreement
             | Self::StateIncomplete
             | Self::ResponseOversized
-            | Self::ExecutionReverted => 502,
+            | Self::ExecutionReverted { .. } => 502,
         }
     }
 
@@ -1252,6 +1252,18 @@ impl GatewayRuntime {
                     error: Some(AaveSimulateBatchError {
                         error_class: error.class().to_string(),
                         retryable: error.retryable(),
+                        revert_selector: match error {
+                            GatewayError::ExecutionReverted {
+                                selector: Some(selector),
+                            } => Some(format!(
+                                "0x{}",
+                                selector
+                                    .iter()
+                                    .map(|byte| format!("{byte:02x}"))
+                                    .collect::<String>()
+                            )),
+                            _ => None,
+                        },
                     }),
                 },
             });
@@ -3818,7 +3830,7 @@ impl GatewayRuntime {
 fn classify_upstream_outcome(result: &Result<RpcCallResult, TransportError>) -> UpstreamOutcome {
     match result {
         Ok(_) => UpstreamOutcome::Success,
-        Err(TransportError::ExecutionReverted) => UpstreamOutcome::Reverted,
+        Err(TransportError::ExecutionReverted { .. }) => UpstreamOutcome::Reverted,
         Err(TransportError::Timeout) => UpstreamOutcome::Timeout,
         Err(TransportError::RateLimited { .. }) => UpstreamOutcome::RateLimited,
         Err(_) => UpstreamOutcome::Failure,
@@ -5160,8 +5172,8 @@ fn encode_signed_call(name: &str, bits: usize, value: i128) -> String {
 fn map_call_failure(failure: CallFailure) -> GatewayError {
     match failure {
         CallFailure::Budget => GatewayError::UpstreamBudgetExhausted,
-        CallFailure::Transport(TransportError::ExecutionReverted) => {
-            GatewayError::ExecutionReverted
+        CallFailure::Transport(TransportError::ExecutionReverted { selector }) => {
+            GatewayError::ExecutionReverted { selector }
         }
         CallFailure::Transport(_) => GatewayError::ProviderUnavailable,
         CallFailure::Integrity => GatewayError::ProviderIntegrity,
@@ -5721,7 +5733,7 @@ mod tests {
             UpstreamOutcome::Success
         );
         assert_eq!(
-            classify_upstream_outcome(&Err(TransportError::ExecutionReverted)),
+            classify_upstream_outcome(&Err(TransportError::ExecutionReverted { selector: None })),
             UpstreamOutcome::Reverted
         );
         assert_eq!(
@@ -5747,7 +5759,9 @@ mod tests {
                 UpstreamOutcome::Failure
             );
         }
-        let mapped = map_call_failure(CallFailure::Transport(TransportError::ExecutionReverted));
+        let mapped = map_call_failure(CallFailure::Transport(TransportError::ExecutionReverted {
+            selector: None,
+        }));
         assert_eq!(mapped.class(), "execution_reverted");
         assert!(!mapped.retryable());
         let generic = map_call_failure(CallFailure::Transport(TransportError::ProviderError));

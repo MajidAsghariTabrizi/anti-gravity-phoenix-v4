@@ -3,6 +3,7 @@ use crate::providers::ProviderLease;
 use crate::shadow_state::MAX_GATEWAY_RESPONSE_BYTES;
 use async_trait::async_trait;
 use futures_util::StreamExt;
+use hex;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::time::{Duration, Instant, SystemTime};
@@ -34,7 +35,7 @@ pub enum TransportError {
     #[error("RPC provider cannot serve the requested historical state")]
     HistoricalStateUnavailable,
     #[error("EVM execution reverted")]
-    ExecutionReverted,
+    ExecutionReverted { selector: Option<[u8; 4]> },
     #[error("RPC provider returned a JSON-RPC error")]
     ProviderError,
     #[error("RPC provider applied an HTTP rate limit")]
@@ -50,7 +51,7 @@ impl TransportError {
             Self::InvalidResponse => "provider_invalid_response",
             Self::MethodUnsupported => "provider_method_unsupported",
             Self::HistoricalStateUnavailable => "provider_historical_state_unavailable",
-            Self::ExecutionReverted => "execution_reverted",
+            Self::ExecutionReverted { .. } => "execution_reverted",
             Self::ProviderError => "provider_rpc_error",
             Self::RateLimited { .. } => "provider_rate_limited",
         }
@@ -109,6 +110,8 @@ struct JsonRpcErrorBody {
     code: i64,
     #[serde(default)]
     message: String,
+    #[serde(default)]
+    data: Option<Value>,
 }
 
 #[async_trait]
@@ -184,7 +187,12 @@ impl JsonRpcClient for ReqwestJsonRpcClient {
             return Err(TransportError::InvalidResponse);
         }
         if let Some(error) = envelope.error {
-            return Err(classify_provider_error(method, error.code, &error.message));
+            return Err(classify_provider_error(
+                method,
+                error.code,
+                &error.message,
+                error.data.as_ref(),
+            ));
         }
         Ok(RpcCallResult {
             value: envelope.result.ok_or(TransportError::InvalidResponse)?,
@@ -193,7 +201,12 @@ impl JsonRpcClient for ReqwestJsonRpcClient {
     }
 }
 
-fn classify_provider_error(method: RpcMethod, code: i64, message: &str) -> TransportError {
+fn classify_provider_error(
+    method: RpcMethod,
+    code: i64,
+    message: &str,
+    data: Option<&Value>,
+) -> TransportError {
     if code == -32601 {
         return TransportError::MethodUnsupported;
     }
@@ -205,7 +218,9 @@ fn classify_provider_error(method: RpcMethod, code: i64, message: &str) -> Trans
         && (bounded.trim() == "execution reverted"
             || bounded.trim().starts_with("execution reverted:"))
     {
-        TransportError::ExecutionReverted
+        TransportError::ExecutionReverted {
+            selector: data.and_then(revert_selector),
+        }
     } else if [
         "missing trie",
         "historical state",
@@ -221,6 +236,13 @@ fn classify_provider_error(method: RpcMethod, code: i64, message: &str) -> Trans
     } else {
         TransportError::ProviderError
     }
+}
+
+fn revert_selector(data: &Value) -> Option<[u8; 4]> {
+    let hex = data.as_str()?.strip_prefix("0x")?;
+    let bytes = hex::decode(hex).ok()?;
+    let selector: [u8; 4] = bytes.get(..4)?.try_into().ok()?;
+    Some(selector)
 }
 
 fn parse_retry_after(value: Option<&reqwest::header::HeaderValue>, now: SystemTime) -> Duration {
@@ -261,7 +283,7 @@ mod tests {
             TransportError::InvalidResponse,
             TransportError::MethodUnsupported,
             TransportError::HistoricalStateUnavailable,
-            TransportError::ExecutionReverted,
+            TransportError::ExecutionReverted { selector: None },
             TransportError::ProviderError,
             TransportError::RateLimited {
                 retry_after: Duration::from_secs(10),
@@ -277,7 +299,7 @@ mod tests {
     #[test]
     fn provider_errors_classify_only_bounded_capability_failures() {
         assert_eq!(
-            classify_provider_error(RpcMethod::EthCall, -32601, "method not found"),
+            classify_provider_error(RpcMethod::EthCall, -32601, "method not found", None),
             TransportError::MethodUnsupported
         );
         assert_eq!(
@@ -285,27 +307,34 @@ mod tests {
                 RpcMethod::EthGetBlockByNumber,
                 -32000,
                 "missing trie node 0x1234",
+                None
             ),
             TransportError::HistoricalStateUnavailable
         );
         assert_eq!(
-            classify_provider_error(RpcMethod::EthCall, -32000, "execution reverted"),
-            TransportError::ExecutionReverted
+            classify_provider_error(RpcMethod::EthCall, -32000, "execution reverted", None),
+            TransportError::ExecutionReverted { selector: None }
         );
         assert_eq!(
             classify_provider_error(
                 RpcMethod::EthCall,
                 -32000,
                 "execution reverted: bounded reason",
+                None,
             ),
-            TransportError::ExecutionReverted
+            TransportError::ExecutionReverted { selector: None }
         );
         assert_eq!(
-            classify_provider_error(RpcMethod::EthGetBlockByNumber, -32000, "execution reverted",),
+            classify_provider_error(
+                RpcMethod::EthGetBlockByNumber,
+                -32000,
+                "execution reverted",
+                None
+            ),
             TransportError::ProviderError
         );
         assert_eq!(
-            classify_provider_error(RpcMethod::EthCall, -32000, "unknown provider error"),
+            classify_provider_error(RpcMethod::EthCall, -32000, "unknown provider error", None),
             TransportError::ProviderError
         );
     }
