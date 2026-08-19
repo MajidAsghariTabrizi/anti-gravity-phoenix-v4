@@ -42,6 +42,6 @@ scrape_configs:
     sample_limit: 256
     label_limit: 4
     label_name_length_limit: 64
-    label_value_length_limit: 32
+    label_value_length_limit: 128
     static_configs:
       - targets: ["atlas-observer:9700"]
