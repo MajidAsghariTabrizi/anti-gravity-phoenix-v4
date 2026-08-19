@@ -267,8 +267,8 @@ require(
     "dashboard_refresh_interval_not_45_seconds",
 )
 require(
-    "PHOENIX_ECONOMIC_DASHBOARD_QUERY_TIMEOUT_SECONDS: \"30\"" in compose,
-    "dashboard_query_timeout_not_30_seconds",
+    "PHOENIX_ECONOMIC_DASHBOARD_QUERY_TIMEOUT_SECONDS: \"60\"" in compose,
+    "dashboard_query_timeout_not_60_seconds",
 )
 require(
     "find /evidence/latest-dashboard.json -maxdepth 0 -type f -size +0c -mmin -3"
