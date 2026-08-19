@@ -332,6 +332,8 @@ pub enum GatewayError {
     StateIncomplete,
     #[error("RPC Gateway response exceeded the configured bound")]
     ResponseOversized,
+    #[error("simulated EVM execution reverted")]
+    ExecutionReverted,
 }
 
 impl GatewayError {
@@ -345,6 +347,7 @@ impl GatewayError {
             Self::ProviderDisagreement => "provider_disagreement",
             Self::StateIncomplete => "state_incomplete",
             Self::ResponseOversized => "gateway_response_oversized",
+            Self::ExecutionReverted => "execution_reverted",
         }
     }
 
@@ -365,7 +368,8 @@ impl GatewayError {
             Self::ProviderIntegrity
             | Self::ProviderDisagreement
             | Self::StateIncomplete
-            | Self::ResponseOversized => 502,
+            | Self::ResponseOversized
+            | Self::ExecutionReverted => 502,
         }
     }
 
@@ -5156,6 +5160,9 @@ fn encode_signed_call(name: &str, bits: usize, value: i128) -> String {
 fn map_call_failure(failure: CallFailure) -> GatewayError {
     match failure {
         CallFailure::Budget => GatewayError::UpstreamBudgetExhausted,
+        CallFailure::Transport(TransportError::ExecutionReverted) => {
+            GatewayError::ExecutionReverted
+        }
         CallFailure::Transport(_) => GatewayError::ProviderUnavailable,
         CallFailure::Integrity => GatewayError::ProviderIntegrity,
     }
@@ -5740,6 +5747,11 @@ mod tests {
                 UpstreamOutcome::Failure
             );
         }
+        let mapped = map_call_failure(CallFailure::Transport(TransportError::ExecutionReverted));
+        assert_eq!(mapped.class(), "execution_reverted");
+        assert!(!mapped.retryable());
+        let generic = map_call_failure(CallFailure::Transport(TransportError::ProviderError));
+        assert_eq!(generic.class(), "provider_unavailable");
     }
 
     #[derive(Clone, Debug)]
