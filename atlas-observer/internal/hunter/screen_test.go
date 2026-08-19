@@ -4799,3 +4799,20 @@ func TestLegacyUSDCCollateralReasonsAreRevalidatedOnRestart(t *testing.T) {
 		t.Fatalf("legacy USDC-only route reasons were not invalidated: %+v", second.state.RouteIneligible)
 	}
 }
+
+func TestSetDiagnosticGatewayErrorClassRecordsBoundedClass(t *testing.T) {
+	liquidation := boundedTestLiquidation(wethAddress, 1000, 5)
+	route := liquidationRoute{Name: "arbitrum-weth-usdc-uniswap-v3-500-3000-v1"}
+	diagnostics := []sizeDiagnostic{{
+		ReviewedSize: liquidation.RepayAmount,
+		Route:        route.Name,
+	}}
+	setDiagnosticGatewayErrorClass(diagnostics, &liquidation, route, "execution_reverted")
+	if diagnostics[0].GatewayErrorClass != "execution_reverted" {
+		t.Fatalf("gateway error class was not recorded: %q", diagnostics[0].GatewayErrorClass)
+	}
+	setDiagnosticGatewayErrorClass(diagnostics, &exactLiquidation{RepayAmount: "999"}, liquidationRoute{Name: "other-route"}, "provider_unavailable")
+	if diagnostics[0].GatewayErrorClass != "execution_reverted" {
+		t.Fatalf("unmatched key overwrote the recorded class: %q", diagnostics[0].GatewayErrorClass)
+	}
+}

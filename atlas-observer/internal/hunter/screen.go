@@ -565,6 +565,7 @@ type sizeDiagnostic struct {
 	MarginToRetainedFloorWei string `json:"margin_to_retained_profit_gate_wei"`
 	LiveAuthorized           bool   `json:"live_authorized"`
 	FinalRejectionReason     string `json:"final_rejection_reason,omitempty"`
+	GatewayErrorClass        string `json:"gateway_error_class,omitempty"`
 	EvidenceMode             string `json:"evidence_mode,omitempty"`
 	Selected                 bool   `json:"selected,omitempty"`
 }
@@ -3084,8 +3085,10 @@ func (s *Screener) evaluateLiquidationBatch(ctx context.Context, record signal, 
 	}
 	outcomes, err := s.simulateExactBatch(ctx, record, requests)
 	if err != nil {
+		class := gatewayErrorClass(err, "fork_simulation_failed")
 		for _, probe := range probes {
 			setDiagnosticRejection(diagnostics, probe.Liquidation, probe.Route, "fork_simulation_failed")
+			setDiagnosticGatewayErrorClass(diagnostics, probe.Liquidation, probe.Route, class)
 		}
 		return nil, true, diagnostics
 	}
@@ -3093,7 +3096,9 @@ func (s *Screener) evaluateLiquidationBatch(ctx context.Context, record signal, 
 	for index, outcome := range outcomes {
 		if outcome.Err != nil {
 			hadSimulationFailure = true
-			diagnostics[diagnosticIndex[liquidationDiagnosticKey(probes[index].Liquidation, probes[index].Route)]].FinalRejectionReason = "fork_simulation_failed"
+			index := diagnosticIndex[liquidationDiagnosticKey(probes[index].Liquidation, probes[index].Route)]
+			diagnostics[index].FinalRejectionReason = "fork_simulation_failed"
+			diagnostics[index].GatewayErrorClass = gatewayErrorClass(outcome.Err, "fork_simulation_failed")
 			continue
 		}
 		evaluation, viableForMaterialization, evaluationErr := s.evaluateLiquidationProbe(probes[index], outcome.Response, liveMaximumInput)
@@ -3133,8 +3138,10 @@ func (s *Screener) evaluateLiquidationBatch(ctx context.Context, record signal, 
 		outcomes, err = s.simulateExactBatch(ctx, record, requests)
 		if err != nil {
 			hadSimulationFailure = true
+			class := gatewayErrorClass(err, "fork_simulation_failed")
 			for _, evaluation := range pending {
 				setDiagnosticRejection(diagnostics, evaluation.Liquidation, evaluation.Route, "fork_simulation_failed")
+				setDiagnosticGatewayErrorClass(diagnostics, evaluation.Liquidation, evaluation.Route, class)
 			}
 			break
 		}
@@ -3143,6 +3150,7 @@ func (s *Screener) evaluateLiquidationBatch(ctx context.Context, record signal, 
 			if outcome.Err != nil {
 				hadSimulationFailure = true
 				setDiagnosticRejection(diagnostics, pending[index].Liquidation, pending[index].Route, "fork_simulation_failed")
+				setDiagnosticGatewayErrorClass(diagnostics, pending[index].Liquidation, pending[index].Route, gatewayErrorClass(outcome.Err, "fork_simulation_failed"))
 				continue
 			}
 			complete, retry, evaluationErr := s.advanceLiquidationMaterialization(pending[index], outcome.Response)
@@ -3317,6 +3325,16 @@ func setDiagnosticRejection(diagnostics []sizeDiagnostic, liquidation *exactLiqu
 			if liquidation != nil && liquidation.SizeClassification == terminalSizeClassification && reason == "conservative_net_pnl_below_threshold" {
 				diagnostics[index].TerminalSizeUnprofitable = true
 			}
+			return
+		}
+	}
+}
+
+func setDiagnosticGatewayErrorClass(diagnostics []sizeDiagnostic, liquidation *exactLiquidation, route liquidationRoute, class string) {
+	key := liquidationDiagnosticKey(liquidation, route)
+	for index := range diagnostics {
+		if liquidationDiagnosticKeyValues(diagnostics[index].ReviewedSize, diagnostics[index].Route) == key {
+			diagnostics[index].GatewayErrorClass = class
 			return
 		}
 	}
