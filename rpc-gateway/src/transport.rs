@@ -342,6 +342,8 @@ mod tests {
             classify_provider_error(RpcMethod::EthCall, -32000, "execution reverted", None),
             TransportError::ExecutionReverted { reason: None }
         );
+        let mut expected_reason = [0_u8; 64];
+        expected_reason[.."bounded reason".len()].copy_from_slice(b"bounded reason");
         assert_eq!(
             classify_provider_error(
                 RpcMethod::EthCall,
@@ -349,7 +351,9 @@ mod tests {
                 "execution reverted: bounded reason",
                 None,
             ),
-            TransportError::ExecutionReverted { reason: None }
+            TransportError::ExecutionReverted {
+                reason: Some(expected_reason)
+            }
         );
         assert_eq!(
             classify_provider_error(
