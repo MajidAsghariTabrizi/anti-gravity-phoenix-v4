@@ -35,7 +35,7 @@ pub enum TransportError {
     #[error("RPC provider cannot serve the requested historical state")]
     HistoricalStateUnavailable,
     #[error("EVM execution reverted")]
-    ExecutionReverted { selector: Option<[u8; 4]> },
+    ExecutionReverted { reason: Option<[u8; 64]> },
     #[error("RPC provider returned a JSON-RPC error")]
     ProviderError,
     #[error("RPC provider applied an HTTP rate limit")]
@@ -219,7 +219,7 @@ fn classify_provider_error(
             || bounded.trim().starts_with("execution reverted:"))
     {
         TransportError::ExecutionReverted {
-            selector: data.and_then(revert_selector),
+            reason: bounded_revert_reason(bounded.trim(), data),
         }
     } else if [
         "missing trie",
@@ -238,11 +238,38 @@ fn classify_provider_error(
     }
 }
 
-fn revert_selector(data: &Value) -> Option<[u8; 4]> {
-    let hex = data.as_str()?.strip_prefix("0x")?;
-    let bytes = hex::decode(hex).ok()?;
-    let selector: [u8; 4] = bytes.get(..4)?.try_into().ok()?;
-    Some(selector)
+fn bounded_revert_reason(bounded_message: &str, data: Option<&Value>) -> Option<[u8; 64]> {
+    let mut reason: [u8; 64] = [0; 64];
+    let mut filled = 0;
+    if let Some(hex) = data
+        .and_then(|value| value.as_str())
+        .and_then(|value| value.strip_prefix("0x"))
+    {
+        if let Ok(bytes) = hex::decode(hex) {
+            for byte in bytes.iter().take(64) {
+                if *byte >= 0x20 && *byte != 0x7f {
+                    reason[filled] = *byte;
+                    filled += 1;
+                }
+            }
+        }
+    }
+    if filled > 0 {
+        return Some(reason);
+    }
+    if let Some(suffix) = bounded_message.strip_prefix("execution reverted") {
+        let suffix = suffix.strip_prefix(':').unwrap_or(suffix).trim();
+        for byte in suffix.bytes().take(64) {
+            if byte >= 0x20 && byte != 0x7f {
+                reason[filled] = byte;
+                filled += 1;
+            }
+        }
+    }
+    if filled > 0 {
+        return Some(reason);
+    }
+    None
 }
 
 fn parse_retry_after(value: Option<&reqwest::header::HeaderValue>, now: SystemTime) -> Duration {
@@ -283,7 +310,7 @@ mod tests {
             TransportError::InvalidResponse,
             TransportError::MethodUnsupported,
             TransportError::HistoricalStateUnavailable,
-            TransportError::ExecutionReverted { selector: None },
+            TransportError::ExecutionReverted { reason: None },
             TransportError::ProviderError,
             TransportError::RateLimited {
                 retry_after: Duration::from_secs(10),
@@ -313,8 +340,10 @@ mod tests {
         );
         assert_eq!(
             classify_provider_error(RpcMethod::EthCall, -32000, "execution reverted", None),
-            TransportError::ExecutionReverted { selector: None }
+            TransportError::ExecutionReverted { reason: None }
         );
+        let mut expected_reason = [0_u8; 64];
+        expected_reason[.."bounded reason".len()].copy_from_slice(b"bounded reason");
         assert_eq!(
             classify_provider_error(
                 RpcMethod::EthCall,
@@ -322,7 +351,9 @@ mod tests {
                 "execution reverted: bounded reason",
                 None,
             ),
-            TransportError::ExecutionReverted { selector: None }
+            TransportError::ExecutionReverted {
+                reason: Some(expected_reason)
+            }
         );
         assert_eq!(
             classify_provider_error(
