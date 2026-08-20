@@ -45,7 +45,7 @@ use uuid::Uuid;
 
 const POLICY: &str = include_str!("../../config/phoenix-route-policy-v1.json");
 const UNIVERSE: &str = include_str!("../../config/phoenix-route-universe-v1.json");
-const MIGRATIONS: [(&str, &str); 10] = [
+const MIGRATIONS: [(&str, &str); 11] = [
     (
         "phoenix.live-canary-schema.v1",
         include_str!("../schema/001_live_canary.sql"),
@@ -85,6 +85,10 @@ const MIGRATIONS: [(&str, &str); 10] = [
     (
         "phoenix.live-canary-schema.v10",
         include_str!("../schema/010_atlas_auction_shadow.sql"),
+    ),
+    (
+        "phoenix.live-canary-schema.v11",
+        include_str!("../schema/011_atlas_liquidation_ground_truth.sql"),
     ),
 ];
 const ACTIVATE_ACK: &str = "ACTIVATE_READY_MIN_CANARY_42161";
@@ -687,7 +691,7 @@ async fn migrate(pool: &PgPool) -> Result<(), &'static str> {
         }
     }
     require_schema(pool).await?;
-    println!("AUTONOMOUS_MIGRATION_OK: phoenix.live-canary-schema.v10");
+    println!("AUTONOMOUS_MIGRATION_OK: phoenix.live-canary-schema.v11");
     Ok(())
 }
 
@@ -5447,14 +5451,14 @@ async fn require_schema(pool: &PgPool) -> Result<(), &'static str> {
     let installed: bool = sqlx::query_scalar(
         "SELECT EXISTS(
              SELECT 1 FROM live_canary.schema_contract
-             WHERE version = 'phoenix.live-canary-schema.v10'
+             WHERE version = 'phoenix.live-canary-schema.v11'
          )",
     )
     .fetch_one(pool)
     .await
     .map_err(|_| "schema inspection failed")?;
     if !installed {
-        return Err("phoenix.live-canary-schema.v10 is not installed");
+        return Err("phoenix.live-canary-schema.v11 is not installed");
     }
     Ok(())
 }

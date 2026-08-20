@@ -15,7 +15,7 @@ use sqlx::{PgPool, Postgres, Row, Transaction};
 use thiserror::Error;
 use uuid::Uuid;
 
-const SCHEMA_VERSION: &str = "phoenix.live-canary-schema.v10";
+const SCHEMA_VERSION: &str = "phoenix.live-canary-schema.v11";
 const ACTIVE_STATUSES: &str =
     "'claimed', 'nonce_allocated', 'submission_unknown', 'pending', 'timed_out'";
 
