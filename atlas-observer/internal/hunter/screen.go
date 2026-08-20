@@ -253,6 +253,7 @@ type Screener struct {
 	firstLiquidatableAt    map[string]time.Time
 	firstLiquidatableMono  map[string]time.Time
 	recentAuctions         map[string]*recentAuction
+	arbBorrowers           map[string]arbBorrowerEntry
 	lastExactAdmissionAt   time.Time
 	hasDurableAdmission    bool
 	exactInFlight          uint64
@@ -1876,6 +1877,18 @@ func (s *Screener) HandleAtlasAuction(ctx context.Context, auction *observer.Led
 			return err
 		}
 	}
+	// Workstream C: attach ARB auctions to the best indexed ARB-debt
+	// borrower immediately when evidence exists. The claim marks the auction
+	// evaluated before recording, so concurrent exact workers cannot double
+	// record it. Economics stay unavailable (atlas_arb_unwind_unreviewed);
+	// the row is evidence-only.
+	if isArbAuctionAsset(auction.OracleUpdate.Asset) {
+		if entry, ok := s.bestArbBorrower(); ok {
+			if claimed := s.claimPendingArbAuction(); claimed != nil {
+				return s.recordAtlasShadow(ctx, arbAuctionShadowEvaluation(claimed, entry))
+			}
+		}
+	}
 	return nil
 }
 
@@ -2378,6 +2391,7 @@ func (s *Screener) screen(ctx context.Context, borrowers []string, advanceSeed b
 			delete(s.firstLiquidatableAt, primary.Borrower)
 			delete(s.firstLiquidatableMono, primary.Borrower)
 			delete(s.state.RouteIneligible, primary.Borrower)
+			delete(s.arbBorrowers, strings.ToLower(primary.Borrower))
 		}
 		if err := s.updateBorrowerActivityLocked(primary.Borrower, primary.TotalDebtBase != "0"); err != nil {
 			return err
@@ -2886,6 +2900,15 @@ func (s *Screener) resolveExact(ctx context.Context, record signal, auction *obs
 	record.Block = result.BlockNumber
 	record.BlockHash = result.BlockHash
 	record.StateRoot = result.StateRoot
+	// Evidence-only ARB-debt indexing (Workstream C): the exact response
+	// carries the borrower's per-reserve state, which is discarded today
+	// once the route reason is decided. Index ARB-debt borrowers from it so
+	// ARB auctions can attach to real liquidatable ARB-debt borrowers; this
+	// never affects the direct lane decision.
+	s.indexArbDebtEvidence(record.Borrower, result.BlockNumber, result.BlockHash, result.Primary.Account, result.Primary.Reserves)
+	if err := s.attachPendingArbAuction(ctx); err != nil {
+		return record, err
+	}
 	if len(result.Primary.Liquidations) == 0 {
 		record.ExactRouteIneligibleReason = exactRouteIneligibleReason(result.Primary.Reserves)
 		if record.ExactRouteIneligibleReason == "" {
