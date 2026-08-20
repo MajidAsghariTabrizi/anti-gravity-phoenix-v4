@@ -5361,3 +5361,50 @@ func TestArbBorrowerIndexIsBoundedAndEvictsWithoutArbDebt(t *testing.T) {
 		t.Fatalf("borrower without ARB debt stayed indexed: %+v", screener.arbBorrowers[kept])
 	}
 }
+
+func TestArbDebtIndexedBeforeLiquidationVariantValidation(t *testing.T) {
+	borrower := arbTestBorrower(7)
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if request.URL.Path != "/v1/aave/exact" {
+			http.Error(writer, "unexpected path", http.StatusNotFound)
+			return
+		}
+		var input exactRequest
+		if err := json.NewDecoder(request.Body).Decode(&input); err != nil {
+			t.Fatal(err)
+		}
+		// A liquidation variant whose debt asset is ARB: the direct lane
+		// rejects it, but the ARB index hook must still capture the
+		// borrower's ARB debt from the same response.
+		primary := exactProvider{
+			ProviderID: primaryProviderID, FlashPremiumBPS: 5,
+			Account: account{Borrower: borrower, TotalDebtBase: "7000000000", HealthFactorWAD: "880000000000000000"},
+			Reserves: []exactReserve{
+				arbDebtReserve("300000000000"),
+				wethCollateralReserve("70000000000000000", true),
+			},
+			Liquidations: []exactLiquidation{{DebtAsset: arbAddress, CollateralAsset: wethAddress}},
+		}
+		_ = json.NewEncoder(writer).Encode(exactResponse{
+			SchemaVersion: "phoenix.rpc.aave-exact-response.v5", ChainID: 42161, RequestID: input.RequestID,
+			BlockNumber: 160, BlockHash: "0x" + strings.Repeat("f", 64), StateRoot: "0x" + strings.Repeat("e", 64),
+			Primary: primary, Confirmation: nil, Quorum: 1,
+		})
+	}))
+	defer server.Close()
+	screener := economicTestScreener(server)
+	if _, err := screener.resolveExact(context.Background(), signal{
+		Schema: "phoenix.atlas-aave-hunting-signal.v1", ObservedAt: time.Now().UTC(), Cursor: 2,
+		Block: 100, BlockHash: "0x" + strings.Repeat("d", 64), Borrower: borrower,
+		DebtBase: "7000000000", HF: "880000000000000000",
+	}, nil); err == nil {
+		t.Fatal("ARB-debt liquidation variant passed the direct lane validation")
+	}
+	entry, present := screener.arbBorrowers[borrower]
+	if !present || entry.ARBVariableDebt == nil || entry.ARBVariableDebt.String() != "300000000000" {
+		t.Fatalf("ARB debt was not indexed before variant validation: %+v", entry)
+	}
+	if entry.CollateralAsset != wethAddress || entry.BlockNumber != 160 {
+		t.Fatalf("ARB collateral/block evidence missing: %+v", entry)
+	}
+}
