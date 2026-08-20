@@ -249,6 +249,15 @@ install_versioned_source \
 install_versioned_source \
   "live-executor/schema/010_atlas_auction_shadow.sql" \
   "$deploy_dir/live-executor/schema/010_atlas_auction_shadow.sql" 0640
+install_versioned_source \
+  "live-executor/schema/011_atlas_liquidation_ground_truth.sql" \
+  "$deploy_dir/live-executor/schema/011_atlas_liquidation_ground_truth.sql" 0640
+
+# The reviewed bounded transcript exporter is the single source of truth for
+# public-chain evidence collection; it is installed under a deploy-local name.
+install_versioned_source \
+  "atlas-observer/scripts/export_rpc_transcript.py" \
+  "$deploy_dir/atlas-export-rpc-transcript.py" 0750
 
 for sql_name in \
   shadow-profitability-report.sql \
@@ -291,6 +300,8 @@ for script_name in \
   prelive_money_path_report.py \
   atlas-shadow-validation.sh \
   atlas_shadow_validation_report.py \
+  collect-atlas-liquidation-ground-truth.sh \
+  atlas_liquidation_ground_truth.py \
   prelive_dashboard_snapshot.py \
   prelive_dashboard_live.py \
   prelive_shadow_control.py \

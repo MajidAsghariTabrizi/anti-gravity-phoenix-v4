@@ -133,6 +133,7 @@ type PublicLiquidation struct {
 	LiquidatedCollateralAmount string `json:"liquidated_collateral_amount"`
 	Liquidator                 string `json:"liquidator"`
 	ReceiveAToken              bool   `json:"receive_a_token"`
+	LogIndex                   string `json:"log_index"`
 }
 
 type ReconciliationRecord struct {
@@ -613,6 +614,9 @@ func decodeLiquidation(log PublicLog, parsedABI abi.ABI) (*PublicLiquidation, er
 	if len(log.Topics) != 4 {
 		return nil, errors.New("invalid LiquidationCall topic count")
 	}
+	if log.LogIndex == "" {
+		return nil, errors.New("LiquidationCall log is missing its log index")
+	}
 	data, err := decodeHexData(log.Data)
 	if err != nil {
 		return nil, err
@@ -629,6 +633,7 @@ func decodeLiquidation(log PublicLog, parsedABI abi.ABI) (*PublicLiquidation, er
 		LiquidatedCollateralAmount: values[1].(*big.Int).String(),
 		Liquidator:                 strings.ToLower(values[2].(common.Address).Hex()),
 		ReceiveAToken:              values[3].(bool),
+		LogIndex:                   strings.TrimPrefix(strings.ToLower(log.LogIndex), "0x"),
 	}, nil
 }
 
