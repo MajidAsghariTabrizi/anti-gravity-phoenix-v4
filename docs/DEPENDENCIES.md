@@ -316,6 +316,41 @@ The primary and secondary operators must be independently identified. A
 credentialless endpoint that merely agrees on returned inclusion but cannot
 prove the complete requested range does not satisfy archive authority.
 
+## Atlas Auction Shadow Evaluation
+
+The Atlas/SVR shadow classification (revenue-capture program workstream B)
+evaluates auction economics without ever producing a bid, bond, or submission.
+Recorded assumptions and limitations:
+
+- The SVR auction stream (`solver_subscribe(["userOperations"])`) carries the
+  PartialUserOperation (user-operation hash, Atlas target, gas, max fee,
+  deadline, dapp control, oracle hints) and the auction identity only. It
+  contains no borrower data, so an auction is coupled to a borrower purely by
+  asset identity: an auction is attached to a selected liquidation when its
+  oracle asset matches the liquidation's debt asset (or collateral asset for
+  the registry lookup).
+- The rpc-gateway `atlas_mode` re-simulation exercises the DIRECT
+  `executeAaveLiquidation` wrapper with Atlas parameters (bid amount and
+  deadline). It is NOT the real `atlasSolverCall` callback, so
+  `SINGLE_PRIMARY_ATLAS_CALLBACK_FORK_VERIFIED` evidence is the closest
+  available proxy for the solver settlement path, not a proof of the callback
+  execution itself. Overriding the simulation price base with the auction's
+  median-price hint requires gateway price-base request support and is a
+  recorded follow-up, not an assumption of current behavior.
+- Auction bounds are validated before any economics: deadline block > 0,
+  `SolverGasLimit` within `(0, MaximumGasLimit]`, and `OracleGasPriceWei`
+  within `(0, MaximumFeePerGasWei]` and `(0, MaximumPriorityFeeWei]`.
+- Shadow bid economics use the same exact/fork simulation the direct lane
+  would consume: solver exposure is
+  `max(SolverGasLimit × OracleGasPriceWei, direct execution cost)`; the
+  zero-bid conservative net applies `EconomicReserveBPS`; the maximum bid is
+  `zeroBidConservative − retainedProfitFloor − 1` capped at
+  `MaximumAtlasBidWei`; the selected shadow bid is half the maximum.
+- Shadow outcomes are persisted ONLY to `live_canary.atlas_auction_shadow`.
+  `atlas_solver_requests` and `execution_requests` are never materialized by
+  the shadow path, and the direct lane's record semantics are unchanged
+  (`TerminalOutcome` stays `candidate`; `AtlasCandidate` is never set).
+
 ## Arbitrum Transaction Cost Components
 
 LIVE submission quotes use the official Nitro `NodeInterface` virtual contract

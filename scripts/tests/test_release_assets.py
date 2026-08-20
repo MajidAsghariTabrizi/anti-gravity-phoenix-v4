@@ -23,6 +23,7 @@ LIVE_CANARY_ASSETS = (
     "live-executor/schema/007_aave_economic_diagnostics.sql",
     "live-executor/schema/008_revenue_provider_authority.sql",
     "live-executor/schema/009_single_primary_provider_authority.sql",
+    "live-executor/schema/010_atlas_auction_shadow.sql",
     "compose.live-autonomous.yml",
     "deploy/phoenix-economic-activation.path",
     "deploy/phoenix-economic-activation.service",

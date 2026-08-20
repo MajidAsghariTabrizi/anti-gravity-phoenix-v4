@@ -520,20 +520,20 @@ func TestAtlasHotScreensAreSkippedWhileCircuitIsOpen(t *testing.T) {
 		t.Fatal(err)
 	}
 	if requests != 0 {
-		t.Fatalf("Atlas callback capability rejection emitted RPC work: requests=%d", requests)
+		t.Fatalf("Atlas shadow classification emitted RPC work: requests=%d", requests)
 	}
 	state := screener.Snapshot()
-	if state.ProviderCircuitSkippedTotal != 0 || state.Counts[atlasCallbackUnavailableKey] != 1 {
-		t.Fatalf("Atlas callback capability rejection was misclassified: %+v", state)
+	if state.ProviderCircuitSkippedTotal != 0 || state.Counts[atlasShadowEvaluatedTotalKey] != 1 ||
+		state.Counts[atlasShadowRejectedPrefixKey+atlasShadowReasonIdentityInvalid+"_total"] != 1 {
+		t.Fatalf("Atlas shadow classification was misclassified: %+v", state)
 	}
 }
 
 type recordingSignalSink struct {
-	records                     []signal
-	atlasCallbackUnavailableIDs []string
-	atlasCallbackEvidenceHashes []string
-	providerFailures            []string
-	providerResets              []string
+	records                []signal
+	atlasShadowEvaluations []atlasShadowEvaluation
+	providerFailures       []string
+	providerResets         []string
 }
 
 func (s *recordingSignalSink) RecordProviderFailure(_ context.Context, reason string, _ time.Time) error {
@@ -551,9 +551,8 @@ func (s *recordingSignalSink) RecordAaveSignal(_ context.Context, record signal)
 	return record, nil
 }
 
-func (s *recordingSignalSink) RecordAtlasCallbackUnavailable(_ context.Context, auctionID, evidenceHash string) error {
-	s.atlasCallbackUnavailableIDs = append(s.atlasCallbackUnavailableIDs, auctionID)
-	s.atlasCallbackEvidenceHashes = append(s.atlasCallbackEvidenceHashes, evidenceHash)
+func (s *recordingSignalSink) RecordAtlasShadowEvaluation(_ context.Context, evaluation atlasShadowEvaluation) error {
+	s.atlasShadowEvaluations = append(s.atlasShadowEvaluations, evaluation)
 	return nil
 }
 
@@ -1256,8 +1255,13 @@ func TestDegradedAtlasAuctionDoesNotStartCompetingRecovery(t *testing.T) {
 	if err := screener.HandleAtlasAuction(context.Background(), &observer.LedgerRecord{AuctionID: "auction-1", ChainID: 42161, RelevantAaveAuction: true, NotificationSHA256: evidenceHash}); err != nil {
 		t.Fatal(err)
 	}
-	if requests != 0 || screener.Snapshot().ExactQueueCount != 0 || len(sink.records) != 0 || len(sink.atlasCallbackUnavailableIDs) != 1 || sink.atlasCallbackUnavailableIDs[0] != "auction-1" || sink.atlasCallbackEvidenceHashes[0] != evidenceHash {
-		t.Fatalf("Atlas started a competing recovery path: requests=%d state=%+v", requests, screener.Snapshot())
+	if requests != 0 || screener.Snapshot().ExactQueueCount != 0 || len(sink.records) != 0 ||
+		len(sink.atlasShadowEvaluations) != 1 ||
+		sink.atlasShadowEvaluations[0].AuctionID != "auction-1" ||
+		sink.atlasShadowEvaluations[0].TerminalRejectionReason != atlasShadowReasonAssetUnknown ||
+		sink.atlasShadowEvaluations[0].EvidenceHash != evidenceHash ||
+		sink.atlasShadowEvaluations[0].ShadowBidEligible {
+		t.Fatalf("Atlas started a competing recovery path or misclassified the shadow auction: requests=%d state=%+v evaluations=%+v", requests, screener.Snapshot(), sink.atlasShadowEvaluations)
 	}
 }
 
@@ -3906,39 +3910,44 @@ func TestAtlasCandidateChargesBidAndMaximumSolverExposureOnce(t *testing.T) {
 		Cursor: 1, Borrower: "0x1111111111111111111111111111111111111111", Block: 100,
 		BlockHash: "0x" + strings.Repeat("a", 64), StateRoot: "0x" + strings.Repeat("b", 64),
 	}
-	if rejected, err := screener.buildAtlasCandidate(context.Background(), record, selected, auction); err != nil || rejected != nil || simulationCalls != 0 {
-		t.Fatalf("direct-wrapper evidence authorized Atlas: candidate=%+v calls=%d err=%v", rejected, simulationCalls, err)
+	// The batch selection carries direct fork evidence; the Atlas-mode re-sim
+	// is the authoritative callback gate, so a direct-wrapper selection must
+	// proceed to the re-sim and produce the candidate from its evidence.
+	candidate, reason, err := screener.buildAtlasCandidate(context.Background(), record, selected, auction)
+	if err != nil || candidate == nil || reason != "" || simulationCalls != 1 {
+		t.Fatalf("direct-wrapper evidence blocked Atlas: candidate=%+v reason=%s calls=%d err=%v", candidate, reason, simulationCalls, err)
 	}
-	selected.Simulation.EvidenceMode = atlasCallbackEvidenceMode
-	candidate, err := screener.buildAtlasCandidate(context.Background(), record, selected, auction)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if candidate == nil || candidate.MaximumBid != "500" || candidate.SelectedBid != "250" || candidate.ExpectedNetPnL != "550" || candidate.ConservativeNetPnL != "495" {
+	if candidate.MaximumBid != "500" || candidate.SelectedBid != "250" || candidate.ExpectedNetPnL != "550" || candidate.ConservativeNetPnL != "495" ||
+		candidate.SimulatedGasLimit != 5 || candidate.ZeroBidConservative != "720" {
 		t.Fatalf("Atlas bid/gas/bond economics were counted incorrectly: %+v", candidate)
 	}
 	if candidate.Operation.Gas != 20 || candidate.Operation.MaxFeePerGas != "10" || candidate.Operation.BidAmount != "250" {
 		t.Fatalf("Atlas operation bounds drifted: %+v", candidate.Operation)
 	}
+	selected.Simulation.EvidenceMode = atlasCallbackEvidenceMode
+	candidate, reason, err = screener.buildAtlasCandidate(context.Background(), record, selected, auction)
+	if err != nil || candidate == nil || reason != "" {
+		t.Fatalf("callback evidence did not reproduce the Atlas candidate: candidate=%+v reason=%s err=%v", candidate, reason, err)
+	}
 
 	selected.Simulation.EstimatedGasLimit = 21
-	if rejected, err := screener.buildAtlasCandidate(context.Background(), record, selected, auction); err == nil || rejected != nil {
-		t.Fatalf("Atlas solver gas below the fork-verified requirement was not rejected: candidate=%+v err=%v", rejected, err)
+	if rejected, rejectedReason, rejectedErr := screener.buildAtlasCandidate(context.Background(), record, selected, auction); rejectedErr == nil || rejected != nil || rejectedReason != atlasShadowReasonBoundsInvalid {
+		t.Fatalf("Atlas solver gas below the fork-verified requirement was not rejected: candidate=%+v reason=%s err=%v", rejected, rejectedReason, rejectedErr)
 	}
 	selected.Simulation.EstimatedGasLimit = 0
 
 	auction.OracleGasPriceWei = "11"
-	if rejected, err := screener.buildAtlasCandidate(context.Background(), record, selected, auction); err == nil || rejected != nil {
-		t.Fatalf("Atlas oracle price above priority ceiling was not rejected: candidate=%+v err=%v", rejected, err)
+	if rejected, rejectedReason, rejectedErr := screener.buildAtlasCandidate(context.Background(), record, selected, auction); rejectedErr == nil || rejected != nil || rejectedReason != atlasShadowReasonBoundsInvalid {
+		t.Fatalf("Atlas oracle price above priority ceiling was not rejected: candidate=%+v reason=%s err=%v", rejected, rejectedReason, rejectedErr)
 	}
 	screener.config.MaximumAtlasBidWei = "0"
 	auction.OracleGasPriceWei = "10"
-	if disabled, err := screener.buildAtlasCandidate(context.Background(), record, selected, auction); err != nil || disabled != nil {
-		t.Fatalf("zero Atlas cap did not disable only Atlas authority: candidate=%+v err=%v", disabled, err)
+	if disabled, disabledReason, disabledErr := screener.buildAtlasCandidate(context.Background(), record, selected, auction); disabledErr != nil || disabled != nil || disabledReason != atlasShadowReasonBidDisabled {
+		t.Fatalf("zero Atlas cap did not disable only Atlas authority: candidate=%+v reason=%s err=%v", disabled, disabledReason, disabledErr)
 	}
 }
 
-func TestAuctionWithDirectWrapperEvidencePersistsNoLaneArtifact(t *testing.T) {
+func TestAuctionShadowClassificationPreservesDirectAuthority(t *testing.T) {
 	liquidation := boundedTestLiquidation(wethAddress, 100_000_000_000_000, 5)
 	liquidation.LiquidatorCollateral = "100050000000200"
 	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
@@ -3981,15 +3990,175 @@ func TestAuctionWithDirectWrapperEvidencePersistsNoLaneArtifact(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if record.Authority || record.ExecutionCandidate != nil || record.AtlasCandidate != nil || record.TerminalOutcome != "atlas_evidence_rejection" || record.AuthorityRejectionReason != "atlas_callback_evidence_unavailable" {
-		t.Fatalf("auction emitted a bypass/duplicate lane artifact: %+v", record)
+	// Auction attachment is shadow-only: direct lane authority is preserved,
+	// no Atlas solver artifact is materialized, and the malformed auction is
+	// classified as a shadow bounds rejection.
+	if !record.Authority || record.ExecutionCandidate == nil || record.AtlasCandidate != nil || record.TerminalOutcome != "candidate" {
+		t.Fatalf("auction attachment crossed lane authority boundaries: %+v", record)
+	}
+	state := screener.Snapshot()
+	if state.Counts[atlasShadowEvaluatedTotalKey] != 1 ||
+		state.Counts[atlasShadowRejectedPrefixKey+atlasShadowReasonBoundsInvalid+"_total"] != 1 ||
+		state.Counts[atlasShadowEligibleTotalKey] != 0 {
+		t.Fatalf("malformed auction was not classified as a shadow bounds rejection: %+v", state.Counts)
 	}
 	sink := &recordingSignalSink{}
 	if _, err := sink.RecordAaveSignal(context.Background(), record); err != nil {
 		t.Fatal(err)
 	}
-	if len(sink.records) != 1 || sink.records[0].ExecutionCandidate != nil || sink.records[0].AtlasCandidate != nil || signalRejectionReason(sink.records[0]) != "atlas_callback_evidence_unavailable" {
-		t.Fatalf("fail-closed auction outcome drifted at the signal/DB boundary: %+v", sink.records)
+	if len(sink.records) != 1 || sink.records[0].ExecutionCandidate == nil || sink.records[0].AtlasCandidate != nil {
+		t.Fatalf("direct candidate did not survive the signal boundary: %+v", sink.records)
+	}
+}
+
+func TestAtlasAuctionShadowRegistryExpiryAndSupersession(t *testing.T) {
+	now := time.Date(2026, 8, 12, 0, 0, 0, 0, time.UTC)
+	sink := &recordingSignalSink{}
+	weth := wethAddress
+	usdc := nativeUSDCAddress
+	screener := &Screener{
+		config: Config{
+			MaximumGasLimit: 100, MaximumFeePerGasWei: "10", MaximumPriorityFeeWei: "10",
+			MaximumAtlasBidWei: "500", RetainedProfitFloorWei: "100", SignalSink: sink,
+		},
+		state: State{Schema: StateSchema, Counts: map[string]uint64{}, LastBlockNumber: 100},
+		now:   func() time.Time { return now },
+	}
+	first := &observer.LedgerRecord{
+		RelevantAaveAuction: true, ChainID: 42161, AuctionID: "auction-1",
+		AuctionDeadlineBlock: "200", SolverGasLimit: 20, OracleGasPriceWei: "10",
+		NotificationSHA256: strings.Repeat("a", 64), ObservedAt: now,
+		OracleUpdate: &observer.OracleUpdate{Asset: &weth},
+	}
+	if err := screener.HandleAtlasAuction(context.Background(), first); err != nil {
+		t.Fatal(err)
+	}
+	if len(sink.atlasShadowEvaluations) != 0 {
+		t.Fatalf("stored auction was classified before any borrower evaluation: %+v", sink.atlasShadowEvaluations)
+	}
+	if entry := screener.recentAuctions[strings.ToLower(weth)]; entry == nil || entry.record.AuctionID != "auction-1" || entry.evaluated {
+		t.Fatalf("valid auction was not stored for shadow evaluation: %+v", screener.recentAuctions)
+	}
+	second := &observer.LedgerRecord{
+		RelevantAaveAuction: true, ChainID: 42161, AuctionID: "auction-2",
+		AuctionDeadlineBlock: "300", SolverGasLimit: 20, OracleGasPriceWei: "10",
+		NotificationSHA256: strings.Repeat("b", 64), ObservedAt: now,
+		OracleUpdate: &observer.OracleUpdate{Asset: &weth},
+	}
+	if err := screener.HandleAtlasAuction(context.Background(), second); err != nil {
+		t.Fatal(err)
+	}
+	if len(sink.atlasShadowEvaluations) != 1 ||
+		sink.atlasShadowEvaluations[0].AuctionID != "auction-1" ||
+		sink.atlasShadowEvaluations[0].TerminalRejectionReason != atlasShadowReasonSupersededWithoutEvaluation {
+		t.Fatalf("superseded auction was not classified: %+v", sink.atlasShadowEvaluations)
+	}
+	if entry := screener.recentAuctions[strings.ToLower(weth)]; entry == nil || entry.record.AuctionID != "auction-2" {
+		t.Fatalf("latest auction did not replace its predecessor: %+v", screener.recentAuctions)
+	}
+	expired := &observer.LedgerRecord{
+		RelevantAaveAuction: true, ChainID: 42161, AuctionID: "auction-3",
+		AuctionDeadlineBlock: "50", SolverGasLimit: 20, OracleGasPriceWei: "10",
+		NotificationSHA256: strings.Repeat("c", 64), ObservedAt: now,
+		OracleUpdate: &observer.OracleUpdate{Asset: &usdc},
+	}
+	if err := screener.HandleAtlasAuction(context.Background(), expired); err != nil {
+		t.Fatal(err)
+	}
+	if len(sink.atlasShadowEvaluations) != 2 ||
+		sink.atlasShadowEvaluations[1].AuctionID != "auction-3" ||
+		sink.atlasShadowEvaluations[1].TerminalRejectionReason != atlasShadowReasonExpiredBeforeEvaluation ||
+		!sink.atlasShadowEvaluations[1].IdentityValid ||
+		!sink.atlasShadowEvaluations[1].BoundsValid {
+		t.Fatalf("expired auction was not classified at ingestion: %+v", sink.atlasShadowEvaluations)
+	}
+	if _, present := screener.recentAuctions[strings.ToLower(usdc)]; present {
+		t.Fatalf("expired auction entered the shadow registry: %+v", screener.recentAuctions)
+	}
+}
+
+func TestResolveExactRecordsEligibleAtlasShadowWithoutLaneArtifact(t *testing.T) {
+	liquidation := boundedTestLiquidation(wethAddress, 100_000_000_000_000, 5)
+	liquidation.LiquidatorCollateral = "100050000000200"
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		switch request.URL.Path {
+		case "/v1/aave/exact":
+			var input exactRequest
+			if err := json.NewDecoder(request.Body).Decode(&input); err != nil {
+				t.Fatal(err)
+			}
+			primary := exactProvider{ProviderID: primaryProviderID, FlashPremiumBPS: 5, Liquidations: []exactLiquidation{liquidation}}
+			_ = json.NewEncoder(writer).Encode(exactResponse{
+				SchemaVersion: "phoenix.rpc.aave-exact-response.v5", ChainID: 42161, RequestID: input.RequestID,
+				BlockNumber: 100, BlockHash: "0x" + strings.Repeat("a", 64), StateRoot: "0x" + strings.Repeat("b", 64),
+				Primary: primary, Confirmation: nil, Quorum: 1,
+			})
+		case "/v1/aave/simulate-batch":
+			var input simulationBatchRequest
+			if err := json.NewDecoder(request.Body).Decode(&input); err != nil {
+				t.Fatal(err)
+			}
+			results := make([]simulationBatchResult, 0, len(input.Simulations))
+			for _, simulation := range input.Simulations {
+				result := testSimulationResponse(simulation, "200", "10", "3", liquidation.FlashPremiumAmount)
+				if simulation.AtlasMode {
+					result.EvidenceMode = atlasCallbackEvidenceMode
+				}
+				results = append(results, simulationBatchResult{RequestID: simulation.RequestID, Response: result})
+			}
+			writeTestSimulationBatch(writer, input, results)
+		default:
+			t.Fatalf("unexpected path: %s", request.URL.Path)
+		}
+	}))
+	defer server.Close()
+	sink := &recordingSignalSink{}
+	screener := economicTestScreener(server)
+	screener.config.SignalSink = sink
+	screener.config.MaximumInputAmountWei = "100000000000000"
+	weth := wethAddress
+	auction := &observer.LedgerRecord{
+		RelevantAaveAuction: true, ChainID: 42161, AuctionID: "auction-shadow-eligible",
+		AuctionDeadlineBlock: "500000000", SolverGasLimit: 1, OracleGasPriceWei: "1",
+		Atlas:              "0x3333333333333333333333333333333333333333",
+		DappControl:        "0x4444444444444444444444444444444444444444",
+		UserOpHash:         "0x" + strings.Repeat("c", 64),
+		NotificationSHA256: strings.Repeat("d", 64), ObservedAt: time.Now().UTC(),
+		OracleUpdate: &observer.OracleUpdate{Asset: &weth},
+	}
+	screener.recentAuctions = map[string]*recentAuction{strings.ToLower(weth): {record: auction}}
+	record, err := screener.resolveExact(context.Background(), signal{
+		Schema: "phoenix.atlas-aave-hunting-signal.v1", Cursor: 1,
+		Borrower: "0x1111111111111111111111111111111111111111",
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !record.Authority || record.ExecutionCandidate == nil || record.AtlasCandidate != nil || record.TerminalOutcome != "candidate" {
+		t.Fatalf("shadow-eligible auction crossed lane authority boundaries: %+v", record)
+	}
+	if len(sink.atlasShadowEvaluations) != 1 {
+		t.Fatalf("shadow evaluation was not persisted: %+v", sink.atlasShadowEvaluations)
+	}
+	evaluation := sink.atlasShadowEvaluations[0]
+	if evaluation.AuctionID != "auction-shadow-eligible" || !evaluation.ShadowBidEligible ||
+		evaluation.TerminalRejectionReason != "" ||
+		evaluation.MaximumBidWei != "70" || evaluation.SelectedBidWei != "35" ||
+		evaluation.CompetitiveReserveWei != "35" || evaluation.ZeroBidConservativeWei != "171" ||
+		evaluation.ExpectedNetAfterBidWei != "155" || evaluation.ConservativeNetAfterBidWei != "139" ||
+		evaluation.EvidenceMode != atlasCallbackEvidenceMode ||
+		evaluation.GrossValueWei != "200" || evaluation.DirectCostWei != "10" ||
+		evaluation.SolverGasSettlementWei != "1" ||
+		!evaluation.ExactCompleted || !evaluation.CallbackSimulationAttempted || !evaluation.CallbackSimulationPassed ||
+		evaluation.Borrower != record.Borrower {
+		t.Fatalf("eligible shadow economics drifted: %+v", evaluation)
+	}
+	if entry := screener.recentAuctions[strings.ToLower(weth)]; entry == nil || !entry.evaluated {
+		t.Fatalf("consumed auction was not marked evaluated: %+v", screener.recentAuctions)
+	}
+	state := screener.Snapshot()
+	if state.Counts[atlasShadowEvaluatedTotalKey] != 1 || state.Counts[atlasShadowEligibleTotalKey] != 1 {
+		t.Fatalf("eligible shadow counters drifted: %+v", state.Counts)
 	}
 }
 

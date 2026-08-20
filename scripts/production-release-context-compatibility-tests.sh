@@ -137,6 +137,12 @@ sudo cmp "$repo_root/live-executor/schema/009_single_primary_provider_authority.
 [ "$(sudo stat -c '%U:%G:%a' \
   "$modern_root/deploy/live-executor/schema/009_single_primary_provider_authority.sql")" = \
   "root:$owner_group:640" ] || fail 'modern schema 009 metadata is invalid'
+sudo cmp "$repo_root/live-executor/schema/010_atlas_auction_shadow.sql" \
+  "$modern_root/deploy/live-executor/schema/010_atlas_auction_shadow.sql" \
+  >/dev/null || fail 'modern context did not receive schema 010 byte-for-byte'
+[ "$(sudo stat -c '%U:%G:%a' \
+  "$modern_root/deploy/live-executor/schema/010_atlas_auction_shadow.sql")" = \
+  "root:$owner_group:640" ] || fail 'modern schema 010 metadata is invalid'
 
 legacy_sha=4444444444444444444444444444444444444444
 asset_dir=$tmp_root/release-assets
@@ -196,6 +202,18 @@ then
   fail 'manifest-declared schema 009 was allowed to be absent'
 fi
 
+declared_missing_schema10_root=$tmp_root/declared-missing-schema10
+cp -R "$legacy_root" "$declared_missing_schema10_root"
+rm -f -- \
+  "$declared_missing_schema10_root/live-executor/schema/010_atlas_auction_shadow.sql"
+declared_missing_schema10_host=$tmp_root/declared-missing-schema10-host
+if run_installer \
+  "$declared_missing_schema10_host" "$legacy_sha" "$declared_missing_schema10_root" \
+  >/dev/null 2>&1
+then
+  fail 'manifest-declared schema 010 was allowed to be absent'
+fi
+
 python3 - "$legacy_root/release-assets-manifest.json" <<'PY'
 import json
 import sys
@@ -211,6 +229,7 @@ legacy_absent = {
     "live-executor/schema/007_aave_economic_diagnostics.sql",
     "live-executor/schema/008_revenue_provider_authority.sql",
     "live-executor/schema/009_single_primary_provider_authority.sql",
+    "live-executor/schema/010_atlas_auction_shadow.sql",
 }
 value["files"] = [
     item for item in value["files"] if item["path"] not in legacy_absent
@@ -248,7 +267,8 @@ for legacy_absent_target in \
   sql/economic-dashboard-snapshot.sql \
   live-executor/schema/007_aave_economic_diagnostics.sql \
   live-executor/schema/008_revenue_provider_authority.sql \
-  live-executor/schema/009_single_primary_provider_authority.sql
+  live-executor/schema/009_single_primary_provider_authority.sql \
+  live-executor/schema/010_atlas_auction_shadow.sql
 do
   [ ! -e "$legacy_host/deploy/$legacy_absent_target" ] ||
     fail "legacy context installed an undeclared source: $legacy_absent_target"

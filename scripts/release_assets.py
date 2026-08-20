@@ -56,6 +56,7 @@ STATIC_PATHS = (
     "live-executor/schema/007_aave_economic_diagnostics.sql",
     "live-executor/schema/008_revenue_provider_authority.sql",
     "live-executor/schema/009_single_primary_provider_authority.sql",
+    "live-executor/schema/010_atlas_auction_shadow.sql",
     "phoenix-engine/examples/hunter_a1_replay.rs",
     "prometheus/prometheus.yml",
     "scripts/bootstrap-production.sh",

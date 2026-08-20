@@ -20,6 +20,7 @@ for path in \
   live-executor/schema/007_aave_economic_diagnostics.sql \
   live-executor/schema/008_revenue_provider_authority.sql \
   live-executor/schema/009_single_primary_provider_authority.sql \
+  live-executor/schema/010_atlas_auction_shadow.sql \
   live-executor/src/economic_control.rs \
   live-executor/src/autonomous_live_control_main.rs \
   live-executor/src/store.rs \
@@ -83,6 +84,7 @@ schema = read("live-executor/schema/005_closed_loop_economic_control.sql")
 diagnostic_schema = read("live-executor/schema/007_aave_economic_diagnostics.sql")
 provider_schema = read("live-executor/schema/008_revenue_provider_authority.sql")
 single_primary_schema = read("live-executor/schema/009_single_primary_provider_authority.sql")
+shadow_schema = read("live-executor/schema/010_atlas_auction_shadow.sql")
 health = read("scripts/production-healthcheck.sh")
 monitor = read("scripts/economic-dashboard-loop.sh")
 dashboard_sql = read("scripts/sql/economic-dashboard-snapshot.sql")
@@ -682,6 +684,18 @@ require(
 require("phoenix.live-canary-schema.v7" in control, "schema_v7_not_required")
 require("phoenix.live-canary-schema.v8" in control, "schema_v8_not_required")
 require("phoenix.live-canary-schema.v9" in control, "schema_v9_not_required")
+require("phoenix.live-canary-schema.v10" in control, "schema_v10_not_required")
+require(
+    "CREATE TABLE IF NOT EXISTS live_canary.atlas_auction_shadow" in shadow_schema
+    and "shadow_bid_eligible BOOLEAN NOT NULL DEFAULT false" in shadow_schema
+    and "terminal_rejection_reason TEXT CHECK" in shadow_schema
+    and "CHECK (shadow_bid_eligible = (terminal_rejection_reason IS NULL))" in shadow_schema,
+    "atlas_auction_shadow_schema_contract_missing",
+)
+require(
+    "CREATE INDEX IF NOT EXISTS live_canary_atlas_shadow_validation" in shadow_schema,
+    "atlas_shadow_validation_index_missing",
+)
 require("revenue_provider_authority" in provider_schema, "provider_authority_schema_missing")
 require("exact_execution_ready" in provider_schema, "provider_execution_gate_missing")
 require("request_evidence_not_before" in provider_schema, "provider_request_evidence_floor_missing")
@@ -1127,14 +1141,64 @@ BEGIN
   WHERE singleton;
   IF NOT EXISTS (
     SELECT 1 FROM live_canary.schema_contract
-    WHERE version = 'phoenix.live-canary-schema.v9'
+    WHERE version = 'phoenix.live-canary-schema.v10'
   ) THEN
-    RAISE EXCEPTION 'schema v9 marker missing';
+    RAISE EXCEPTION 'schema v10 marker missing';
   END IF;
 END;
 $$;
 SQL
   fail "revenue provider authority schema contract was rejected"
+
+docker exec -i "$postgres_container" \
+  psql -X -q -v ON_ERROR_STOP=1 -U phoenix_test -d phoenix_test <<'SQL' >/dev/null ||
+BEGIN;
+DO $$
+DECLARE
+  rejected BOOLEAN;
+BEGIN
+  rejected := false;
+  BEGIN
+    INSERT INTO live_canary.atlas_auction_shadow(
+      auction_id, evidence_hash, evaluated_at, identity_valid, bounds_valid,
+      shadow_bid_eligible, terminal_rejection_reason
+    ) VALUES (
+      'auction-shadow-eligible-mismatch', repeat('a', 64), now(),
+      true, true, true, 'auction_expired_before_evaluation'
+    );
+  EXCEPTION WHEN check_violation THEN rejected := true;
+  END;
+  IF NOT rejected THEN RAISE EXCEPTION 'eligible shadow row with a rejection reason was accepted'; END IF;
+
+  rejected := false;
+  BEGIN
+    INSERT INTO live_canary.atlas_auction_shadow(
+      auction_id, evidence_hash, evaluated_at, identity_valid, bounds_valid,
+      shadow_bid_eligible, terminal_rejection_reason
+    ) VALUES (
+      'auction-shadow-invalid-evidence', 'not-a-hash', now(),
+      true, true, false, 'atlas_auction_bounds_invalid'
+    );
+  EXCEPTION WHEN check_violation THEN rejected := true;
+  END;
+  IF NOT rejected THEN RAISE EXCEPTION 'shadow row with a malformed evidence hash was accepted'; END IF;
+
+  rejected := false;
+  BEGIN
+    INSERT INTO live_canary.atlas_auction_shadow(
+      auction_id, evidence_hash, evaluated_at, identity_valid, bounds_valid,
+      shadow_bid_eligible, terminal_rejection_reason
+    ) VALUES (
+      'auction-shadow-invalid-reason', repeat('b', 64), now(),
+      true, true, false, 'Bad Reason With Spaces'
+    );
+  EXCEPTION WHEN check_violation THEN rejected := true;
+  END;
+  IF NOT rejected THEN RAISE EXCEPTION 'shadow row with a non-enumerated rejection reason was accepted'; END IF;
+END;
+$$;
+SQL
+  fail "atlas auction shadow schema contract was rejected"
 
 docker exec -i "$postgres_container" \
   psql -X -q -v ON_ERROR_STOP=1 -U phoenix_test -d phoenix_test <<'SQL' >/dev/null ||

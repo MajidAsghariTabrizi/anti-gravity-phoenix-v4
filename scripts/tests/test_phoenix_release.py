@@ -1860,6 +1860,11 @@ class BoundedTransportContinuationTests(unittest.TestCase):
             "live-executor/schema/009_single_primary_provider_authority.sql",
             context_installer,
         )
+        self.assertIn(
+            'install_versioned_source \\\n'
+            '  "live-executor/schema/010_atlas_auction_shadow.sql"',
+            context_installer,
+        )
         self.assertNotIn("install_protected_file", context_installer)
 
     def test_context_installer_creates_rotation_config_directory(self) -> None:
