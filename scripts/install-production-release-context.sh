@@ -254,7 +254,8 @@ for sql_name in \
   shadow-profitability-report.sql \
   shadow-route-discovery-enrichment.sql \
   prelive-money-path-report.sql \
-  prelive-dashboard-source.sql
+  prelive-dashboard-source.sql \
+  shadow-atlas-validation.sql
 do
   install_source \
     "$source_root/scripts/sql/$sql_name" "$deploy_dir/sql/$sql_name" 0640
@@ -288,6 +289,8 @@ for script_name in \
   shadow_route_discovery.py \
   prelive-money-path-report.sh \
   prelive_money_path_report.py \
+  atlas-shadow-validation.sh \
+  atlas_shadow_validation_report.py \
   prelive_dashboard_snapshot.py \
   prelive_dashboard_live.py \
   prelive_shadow_control.py \
