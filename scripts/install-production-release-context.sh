@@ -246,6 +246,9 @@ install_versioned_source \
 install_versioned_source \
   "live-executor/schema/009_single_primary_provider_authority.sql" \
   "$deploy_dir/live-executor/schema/009_single_primary_provider_authority.sql" 0640
+install_versioned_source \
+  "live-executor/schema/010_atlas_auction_shadow.sql" \
+  "$deploy_dir/live-executor/schema/010_atlas_auction_shadow.sql" 0640
 
 for sql_name in \
   shadow-profitability-report.sql \

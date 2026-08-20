@@ -96,6 +96,10 @@ async fn nonce_allocation_and_pending_state_survive_restart() {
     .execute(&pool)
     .await
     .expect("apply single-primary provider authority schema");
+    sqlx::raw_sql(include_str!("../schema/010_atlas_auction_shadow.sql"))
+        .execute(&pool)
+        .await
+        .expect("apply Atlas auction shadow schema");
 
     let signer = TransactionSigner::from_secret(&hex::encode([13_u8; 32]), ARBITRUM_ONE_CHAIN_ID)
         .expect("signer");

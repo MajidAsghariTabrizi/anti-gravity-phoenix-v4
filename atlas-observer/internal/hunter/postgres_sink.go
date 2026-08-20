@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
@@ -374,25 +375,72 @@ func (s *PostgresSignalSink) RecordAtlasAuction(ctx context.Context, record *obs
 	return nil
 }
 
-func (s *PostgresSignalSink) RecordAtlasCallbackUnavailable(ctx context.Context, auctionID, evidenceHash string) error {
-	if len(auctionID) < 1 || len(auctionID) > 128 || len(evidenceHash) != 64 {
-		return errors.New("Atlas auction identity is invalid")
+func atlasShadowNullableNumeric(value string) any {
+	if value == "" {
+		return nil
+	}
+	return value
+}
+
+func atlasShadowNullableText(value string) any {
+	if value == "" {
+		return nil
+	}
+	return strings.ToLower(value)
+}
+
+func atlasShadowNullableUint64(value uint64) any {
+	if value == 0 {
+		return nil
+	}
+	return int64(value)
+}
+
+func (s *PostgresSignalSink) RecordAtlasShadowEvaluation(ctx context.Context, evaluation atlasShadowEvaluation) error {
+	if evaluation.AuctionID == "" || evaluation.EvaluatedAt.IsZero() || evaluation.EvidenceHash == "" {
+		return errors.New("Atlas shadow evaluation identity is incomplete")
 	}
 	result, err := s.pool.Exec(ctx, `
-		UPDATE live_canary.atlas_auction_ingress
-		SET terminal_outcome = 'economic_rejection',
-		    rejection_reason = 'atlas_callback_evidence_unavailable',
-		    updated_at = now()
-		WHERE auction_id = $1
-		  AND evidence_hash = $2
-		  AND relevant_aave
-		  AND terminal_outcome IN ('observed','exact_pending','economic_rejection')
-	`, auctionID, evidenceHash)
+		INSERT INTO live_canary.atlas_auction_shadow(
+			auction_id, user_operation_hash, dapp, asset, evidence_hash,
+			observed_at, evaluated_at, ingress_latency_ms,
+			identity_valid, bounds_valid, borrower, block_number, block_hash,
+			exact_completed, callback_simulation_attempted, callback_simulation_passed,
+			evidence_mode, simulated_gas_limit, solver_gas_settlement_wei,
+			gross_value_wei, direct_cost_wei, zero_bid_conservative_wei,
+			maximum_bid_wei, selected_bid_wei, competitive_reserve_wei,
+			expected_net_after_bid_wei, conservative_net_after_bid_wei,
+			shadow_bid_eligible, terminal_rejection_reason
+		) VALUES (
+			$1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12::numeric, $13,
+			$14, $15, $16, $17, $18, $19::numeric, $20::numeric, $21::numeric,
+			$22::numeric, $23::numeric, $24::numeric, $25::numeric, $26::numeric,
+			$27::numeric, $28, $29
+		)
+		ON CONFLICT (auction_id) DO UPDATE SET updated_at = now()
+		WHERE live_canary.atlas_auction_shadow.evidence_hash = EXCLUDED.evidence_hash
+	`, evaluation.AuctionID, atlasShadowNullableText(evaluation.UserOperationHash),
+		atlasShadowNullableText(evaluation.Dapp), evaluation.Asset, evaluation.EvidenceHash,
+		evaluation.ObservedAt, evaluation.EvaluatedAt, int64(evaluation.IngressLatencyMillis),
+		evaluation.IdentityValid, evaluation.BoundsValid, atlasShadowNullableText(evaluation.Borrower),
+		atlasShadowNullableNumeric(strconv.FormatUint(evaluation.BlockNumber, 10)), atlasShadowNullableText(evaluation.BlockHash),
+		evaluation.ExactCompleted, evaluation.CallbackSimulationAttempted, evaluation.CallbackSimulationPassed,
+		atlasShadowNullableText(evaluation.EvidenceMode), atlasShadowNullableUint64(evaluation.SimulatedGasLimit),
+		atlasShadowNullableNumeric(evaluation.SolverGasSettlementWei),
+		atlasShadowNullableNumeric(evaluation.GrossValueWei),
+		atlasShadowNullableNumeric(evaluation.DirectCostWei),
+		atlasShadowNullableNumeric(evaluation.ZeroBidConservativeWei),
+		atlasShadowNullableNumeric(evaluation.MaximumBidWei),
+		atlasShadowNullableNumeric(evaluation.SelectedBidWei),
+		atlasShadowNullableNumeric(evaluation.CompetitiveReserveWei),
+		atlasShadowNullableNumeric(evaluation.ExpectedNetAfterBidWei),
+		atlasShadowNullableNumeric(evaluation.ConservativeNetAfterBidWei),
+		evaluation.ShadowBidEligible, atlasShadowNullableText(evaluation.TerminalRejectionReason))
 	if err != nil {
 		return err
 	}
 	if result.RowsAffected() != 1 {
-		return errors.New("Atlas auction disposition identity is incomplete")
+		return errors.New("Atlas shadow evaluation identity conflict")
 	}
 	return nil
 }

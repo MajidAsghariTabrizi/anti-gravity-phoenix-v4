@@ -179,10 +179,6 @@ type ProviderRecoverySample struct {
 	ConfirmationProvider string    `json:"-"`
 }
 
-type AtlasAuctionDispositionSink interface {
-	RecordAtlasCallbackUnavailable(context.Context, string, string) error
-}
-
 // LiveSizeAuthority is implemented by the durable Production sink. It keeps
 // shadow evaluation bounded by the reviewed ladder while ensuring that live
 // Candidate authority comes from the current economic/revenue-lane controls,
@@ -256,6 +252,7 @@ type Screener struct {
 	lastExactAt            map[string]time.Time
 	firstLiquidatableAt    map[string]time.Time
 	firstLiquidatableMono  map[string]time.Time
+	recentAuctions         map[string]*recentAuction
 	lastExactAdmissionAt   time.Time
 	hasDurableAdmission    bool
 	exactInFlight          uint64
@@ -633,6 +630,7 @@ type atlasCandidate struct {
 	MaximumInputAmount   string
 	MaximumBid           string
 	SelectedBid          string
+	ZeroBidConservative  string
 	ExpectedNetPnL       string
 	ConservativeNetPnL   string
 	EvidenceMode         string
@@ -640,6 +638,7 @@ type atlasCandidate struct {
 	OperationHash        string
 	Operation            atlasPreparedOperation
 	ObservedAt           time.Time
+	SimulatedGasLimit    uint64
 }
 
 type simulationRequest struct {
@@ -1423,6 +1422,28 @@ func (s *Screener) MetricsText() string {
 	appendSecondsHistogram("phoenix_exact_end_to_end_seconds", liquidatableToExactSumKey, liquidatableToExactCountKey, "liquidatable_to_exact_millis_bucket_le_")
 	appendSecondsHistogram("phoenix_fork_queue_wait_seconds", exactForkQueueSumKey, exactForkQueueCountKey, "exact_fork_queue_millis_bucket_le_")
 	appendSecondsHistogram("phoenix_fork_runtime_seconds", exactForkRuntimeSumKey, exactForkRuntimeCountKey, "exact_fork_runtime_millis_bucket_le_")
+	lines = append(lines,
+		"# TYPE phoenix_atlas_shadow_evaluated_total counter",
+		fmt.Sprintf("phoenix_atlas_shadow_evaluated_total %d", state.Counts[atlasShadowEvaluatedTotalKey]),
+		"# TYPE phoenix_atlas_shadow_eligible_total counter",
+		fmt.Sprintf("phoenix_atlas_shadow_eligible_total %d", state.Counts[atlasShadowEligibleTotalKey]),
+	)
+	appendSecondsHistogram("phoenix_atlas_shadow_ingress_decision_seconds", atlasShadowIngressDecisionSumKey, atlasShadowIngressDecisionCntKey, "atlas_shadow_ingress_decision_millis_bucket_le_")
+	// Atlas shadow rejection taxonomy counters (one line per observed reason).
+	rejectionReasons := make([]string, 0, 8)
+	for key := range state.Counts {
+		if strings.HasPrefix(key, atlasShadowRejectedPrefixKey) {
+			rejectionReasons = append(rejectionReasons, key)
+		}
+	}
+	sort.Strings(rejectionReasons)
+	for _, key := range rejectionReasons {
+		metric := "phoenix_" + key
+		lines = append(lines,
+			"# TYPE "+metric+" counter",
+			fmt.Sprintf("%s %d", metric, state.Counts[key]),
+		)
+	}
 	return strings.Join(lines, "\n") + "\n"
 }
 
@@ -1789,21 +1810,72 @@ func (s *Screener) HandleAtlasAuction(ctx context.Context, auction *observer.Led
 	if auction == nil || !auction.RelevantAaveAuction || auction.ChainID != 42161 {
 		return nil
 	}
-	// The gateway currently proves only the direct executeAaveLiquidation
-	// wrapper, never Atlas' caller/bid/reconcile callback path. Screening the
-	// entire hot cohort for each auction therefore cannot produce authority and
-	// only repeats Exact/fork work. Persist that capability rejection directly.
-	if sink, ok := s.config.SignalSink.(AtlasAuctionDispositionSink); ok {
-		if err := sink.RecordAtlasCallbackUnavailable(ctx, auction.AuctionID, auction.NotificationSHA256); err != nil {
-			return err
+	// Independent Atlas shadow classification. The live lane disposition in
+	// atlas_auction_ingress stays fail-closed ('economic_rejection'); this
+	// handler only records shadow evidence and never materializes a solver
+	// request or an execution request.
+	if auction.AuctionID == "" {
+		return s.recordAtlasShadow(ctx, atlasShadowTerminal(auction, false, false, atlasShadowReasonIdentityInvalid))
+	}
+	boundsReason := atlasAuctionBoundsReason(auction, s.config)
+	if boundsReason == atlasShadowReasonAssetUnknown {
+		return s.recordAtlasShadow(ctx, atlasShadowTerminal(auction, true, false, atlasShadowReasonAssetUnknown))
+	}
+	if boundsReason != "" {
+		return s.recordAtlasShadow(ctx, atlasShadowTerminal(auction, true, false, boundsReason))
+	}
+	// An auction whose deadline block has already passed can no longer be
+	// observed by any exact evaluation; classify it without screening.
+	if deadline, deadlineOK := newUint64(auction.AuctionDeadlineBlock); deadlineOK {
+		currentBlock := s.Snapshot().LastBlockNumber
+		if currentBlock > 0 && deadline <= currentBlock {
+			return s.recordAtlasShadow(ctx, atlasShadowTerminal(auction, true, true, atlasShadowReasonExpiredBeforeEvaluation))
 		}
 	}
 	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.state.Counts == nil {
-		s.state.Counts = make(map[string]uint64)
+	if s.recentAuctions == nil {
+		s.recentAuctions = make(map[string]*recentAuction)
 	}
-	s.state.Counts[atlasCallbackUnavailableKey]++
+	asset := strings.ToLower(*auction.OracleUpdate.Asset)
+	currentBlock := s.state.LastBlockNumber
+	var superseded []*observer.LedgerRecord
+	var expired []*observer.LedgerRecord
+	for key, entry := range s.recentAuctions {
+		if entry.evaluated {
+			continue
+		}
+		if key == asset {
+			superseded = append(superseded, entry.record)
+			continue
+		}
+		entryDeadline, ok := newUint64(entry.record.AuctionDeadlineBlock)
+		if ok && entryDeadline <= currentBlock {
+			expired = append(expired, entry.record)
+		}
+	}
+	for _, entry := range superseded {
+		delete(s.recentAuctions, strings.ToLower(*entry.OracleUpdate.Asset))
+	}
+	for _, entry := range expired {
+		for key, candidate := range s.recentAuctions {
+			if !candidate.evaluated && candidate.record.AuctionID == entry.AuctionID {
+				delete(s.recentAuctions, key)
+				break
+			}
+		}
+	}
+	s.recentAuctions[asset] = &recentAuction{record: auction}
+	s.mu.Unlock()
+	for _, entry := range superseded {
+		if err := s.recordAtlasShadow(ctx, atlasShadowTerminal(entry, true, true, atlasShadowReasonSupersededWithoutEvaluation)); err != nil {
+			return err
+		}
+	}
+	for _, entry := range expired {
+		if err := s.recordAtlasShadow(ctx, atlasShadowTerminal(entry, true, true, atlasShadowReasonExpiredBeforeEvaluation)); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
@@ -2875,26 +2947,35 @@ func (s *Screener) resolveExact(ctx context.Context, record signal, auction *obs
 	if selected.Simulation.EvidenceMode != directForkEvidenceMode {
 		return record, errors.New("live-authorized size lacks direct fork evidence")
 	}
-	if auction != nil && strings.ToLower(selected.Liquidation.DebtAsset) == wethAddress {
-		atlas, atlasErr := s.buildAtlasCandidate(ctx, record, selected, auction)
-		if atlasErr != nil {
-			return record, atlasErr
-		}
-		if atlas == nil {
-			markSelectedDiagnostic(record.SizeDiagnostics, selected.Liquidation, selected.Route)
-			record.Authority = false
-			record.TerminalOutcome = "atlas_evidence_rejection"
-			record.AuthorityRejectionReason = "atlas_callback_evidence_unavailable"
-			return record, nil
-		}
-		record.AtlasCandidate = atlas
-	} else {
-		candidate, candidateErr := s.buildExecutionCandidate(record, selected)
-		if candidateErr != nil {
-			return record, candidateErr
-		}
-		record.ExecutionCandidate = candidate
+	attachedAuction := auction
+	if attachedAuction == nil {
+		attachedAuction = s.recentAuctionFor(selected.Liquidation.DebtAsset, selected.Liquidation.CollateralAsset)
 	}
+	if attachedAuction != nil && strings.ToLower(selected.Liquidation.DebtAsset) == wethAddress {
+		// Independent Atlas SHADOW evaluation. The direct liquidation path
+		// keeps its own authority unchanged; this branch only classifies the
+		// auction and never materializes an atlas solver request.
+		atlas, shadowReason, _ := s.buildAtlasCandidate(ctx, record, selected, attachedAuction)
+		evaluation := s.atlasShadowFromCandidate(attachedAuction, record, selected, atlas)
+		if atlas == nil {
+			// The specific rejection reason always wins; an empty reason
+			// means the gateway's own Atlas evidence failed authoritative
+			// recomputation (conservative-net or economics agreement).
+			evaluation.TerminalRejectionReason = shadowReason
+			if evaluation.TerminalRejectionReason == "" {
+				evaluation.TerminalRejectionReason = atlasShadowReasonCallbackEvidenceMismatch
+			}
+		}
+		if err := s.recordAtlasShadow(ctx, evaluation); err != nil {
+			return record, err
+		}
+		s.markAuctionEvaluated(attachedAuction.AuctionID)
+	}
+	candidate, candidateErr := s.buildExecutionCandidate(record, selected)
+	if candidateErr != nil {
+		return record, candidateErr
+	}
+	record.ExecutionCandidate = candidate
 	markSelectedDiagnostic(record.SizeDiagnostics, selected.Liquidation, selected.Route)
 	record.Authority = true
 	record.TerminalOutcome = "candidate"
@@ -3870,34 +3951,32 @@ func (s *Screener) buildAtlasCandidate(
 	record signal,
 	selected *liquidationEvaluation,
 	auction *observer.LedgerRecord,
-) (*atlasCandidate, error) {
+) (*atlasCandidate, string, error) {
 	if auction == nil || selected == nil || selected.Simulation == nil || !auction.RelevantAaveAuction {
-		return nil, nil
+		return nil, atlasShadowReasonMissingAuction, nil
 	}
 	if strings.ToLower(selected.Liquidation.DebtAsset) != wethAddress {
-		return nil, nil
+		return nil, atlasShadowReasonWethDebtRequired, nil
 	}
-	// The current gateway evidence exercises executeAaveLiquidation directly.
-	// It does not prove Atlas caller/solver/bid/reconcile behavior, so an auction
-	// must fail closed until the gateway returns explicit callback-path evidence.
-	if selected.Simulation.EvidenceMode != atlasCallbackEvidenceMode {
-		return nil, nil
-	}
+	// The gateway's atlas-mode fork re-simulation below is the authoritative
+	// callback-path evidence gate. The direct batch selection that produced
+	// `selected` necessarily carries direct/counterfactual fork evidence, so
+	// gating on the batch evidence mode here would make this path unreachable.
 	deadline, deadlineOK := newUint64(auction.AuctionDeadlineBlock)
 	oracleGasPrice, gasPriceOK := newBigUint(auction.OracleGasPriceWei)
 	maximumFee, maximumFeeOK := newBigUint(s.config.MaximumFeePerGasWei)
 	maximumPriorityFee, maximumPriorityOK := newBigUint(s.config.MaximumPriorityFeeWei)
 	if !deadlineOK || deadline == 0 || auction.SolverGasLimit == 0 || auction.SolverGasLimit < selected.Simulation.EstimatedGasLimit || auction.SolverGasLimit > s.config.MaximumGasLimit || !gasPriceOK || oracleGasPrice.Sign() <= 0 || !maximumFeeOK || !maximumPriorityOK || oracleGasPrice.Cmp(maximumFee) > 0 || oracleGasPrice.Cmp(maximumPriorityFee) > 0 {
-		return nil, errors.New("Atlas auction bounds are invalid")
+		return nil, atlasShadowReasonBoundsInvalid, errors.New("Atlas auction bounds are invalid")
 	}
 	gross, grossOK := newBigUint(selected.Simulation.RealizedProfit)
 	floor, floorOK := newBigUint(s.config.RetainedProfitFloorWei)
 	configuredMaximumBid, bidCapOK := newBigUint(s.config.MaximumAtlasBidWei)
 	if !grossOK || !floorOK || !bidCapOK {
-		return nil, errors.New("Atlas economics configuration is invalid")
+		return nil, atlasShadowReasonEconomicsConfigInvalid, errors.New("Atlas economics configuration is invalid")
 	}
 	if configuredMaximumBid.Sign() == 0 {
-		return nil, nil
+		return nil, atlasShadowReasonBidDisabled, nil
 	}
 	// Atlas can settle its solver gas liability from bonded AtlETH. Treat the
 	// larger of the bounded direct estimate and auction liability as one
@@ -3910,7 +3989,7 @@ func (s *Screener) buildAtlasCandidate(
 	preBidExpected := new(big.Int).Sub(new(big.Int).Set(gross), exposure)
 	_, zeroBidConservative, _ := profitEdgeReserve(preBidExpected, selected.Route.Output, s.config.EconomicReserveBPS)
 	if zeroBidConservative.Cmp(floor) <= 0 {
-		return nil, nil
+		return nil, atlasShadowReasonZeroBidBelowFloor, nil
 	}
 	maximumBid := new(big.Int).Sub(new(big.Int).Set(zeroBidConservative), floor)
 	maximumBid.Sub(maximumBid, big.NewInt(1))
@@ -3918,7 +3997,7 @@ func (s *Screener) buildAtlasCandidate(
 		maximumBid.Set(configuredMaximumBid)
 	}
 	if maximumBid.Sign() <= 0 {
-		return nil, nil
+		return nil, atlasShadowReasonMaximumBidNonpositive, nil
 	}
 	selectedBid := new(big.Int).Div(new(big.Int).Set(maximumBid), big.NewInt(2))
 	if selectedBid.Sign() == 0 {
@@ -3927,7 +4006,7 @@ func (s *Screener) buildAtlasCandidate(
 	expected := new(big.Int).Sub(new(big.Int).Set(preBidExpected), selectedBid)
 	_, conservative, atlasMinimumUnwind := profitEdgeReserve(expected, selected.Route.Output, s.config.EconomicReserveBPS)
 	if conservative.Cmp(floor) <= 0 || atlasMinimumUnwind.Sign() <= 0 {
-		return nil, nil
+		return nil, atlasShadowReasonPostBidBelowFloor, nil
 	}
 	minimumProfit := strictMinimumProfit(floor, exposure)
 	atlasSimulation, err := s.simulateExact(ctx, record, selected.Liquidation, simulationRequest{
@@ -3944,21 +4023,21 @@ func (s *Screener) buildAtlasCandidate(
 		AtlasBid:                  selectedBid.String(),
 	}, selected.LiveMaximumInput)
 	if err != nil {
-		return nil, nil
+		return nil, atlasShadowReasonCallbackSimulationFailed, nil
 	}
 	if atlasSimulation.EvidenceMode != atlasCallbackEvidenceMode {
-		return nil, nil
+		return nil, atlasShadowReasonCallbackEvidenceMismatch, nil
 	}
 	atlasGross, atlasDirectCost, _, economicsErr := s.boundedSimulationEconomics(atlasSimulation, selected.Liquidation)
 	if economicsErr != nil {
-		return nil, economicsErr
+		return nil, "", economicsErr
 	}
 	if atlasGross.Cmp(gross) != 0 || new(big.Int).Sub(new(big.Int).Set(atlasGross), selectedBid).Cmp(minimumProfit) < 0 {
-		return nil, nil
+		return nil, atlasShadowReasonGrossMismatch, nil
 	}
 	gatewayNet, economicsErr := authoritativeGatewayNet(atlasSimulation, atlasGross, atlasDirectCost, selectedBid)
 	if economicsErr != nil {
-		return nil, economicsErr
+		return nil, "", economicsErr
 	}
 	extraExposure := new(big.Int)
 	if auctionExposure.Cmp(atlasDirectCost) > 0 {
@@ -3971,11 +4050,11 @@ func (s *Screener) buildAtlasCandidate(
 	}
 	_, finalConservative, _ := profitEdgeReserve(finalExpected, selected.Route.Output, s.config.EconomicReserveBPS)
 	if finalConservative.Cmp(floor) <= 0 || minimumProfit.Cmp(strictMinimumProfit(floor, finalExposure)) < 0 {
-		return nil, nil
+		return nil, atlasShadowReasonFinalConservativeBelowFloor, nil
 	}
 	calldata, err := hex.DecodeString(strings.TrimPrefix(atlasSimulation.CalldataHex, "0x"))
 	if err != nil || len(calldata) <= 4 {
-		return nil, errors.New("Atlas solver calldata is invalid")
+		return nil, atlasShadowReasonCalldataInvalid, errors.New("Atlas solver calldata is invalid")
 	}
 	operation := atlasPreparedOperation{
 		From:         s.config.CallerAddress,
@@ -3993,7 +4072,7 @@ func (s *Screener) buildAtlasCandidate(
 	}
 	encoded, err := json.Marshal(operation)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	operationHash := sha256.Sum256(encoded)
 	return &atlasCandidate{
@@ -4002,6 +4081,7 @@ func (s *Screener) buildAtlasCandidate(
 		MaximumInputAmount:   selected.LiveMaximumInput,
 		MaximumBid:           maximumBid.String(),
 		SelectedBid:          selectedBid.String(),
+		ZeroBidConservative:  zeroBidConservative.String(),
 		ExpectedNetPnL:       finalExpected.String(),
 		ConservativeNetPnL:   finalConservative.String(),
 		EvidenceMode:         atlasSimulation.EvidenceMode,
@@ -4009,7 +4089,8 @@ func (s *Screener) buildAtlasCandidate(
 		OperationHash:        hex.EncodeToString(operationHash[:]),
 		Operation:            operation,
 		ObservedAt:           auction.ObservedAt,
-	}, nil
+		SimulatedGasLimit:    atlasSimulation.EstimatedGasLimit,
+	}, "", nil
 }
 
 func (s *Screener) simulateExact(ctx context.Context, record signal, liquidation *exactLiquidation, partial simulationRequest, liveMaximumInput string) (*simulationResponse, error) {
