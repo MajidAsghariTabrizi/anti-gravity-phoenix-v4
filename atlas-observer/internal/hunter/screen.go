@@ -330,14 +330,14 @@ type gatewayErrorContract struct {
 	ErrorClass       string  `json:"error_class"`
 	Retryable        bool    `json:"retryable"`
 	RetryAfterSecond *uint64 `json:"retry_after_seconds,omitempty"`
-	RevertReason   string  `json:"revert_reason,omitempty"`
+	RevertReason     string  `json:"revert_reason,omitempty"`
 }
 
 type gatewayResponseError struct {
-	statusCode     int
-	class          string
-	retryable      bool
-	retryAfter     time.Duration
+	statusCode   int
+	class        string
+	retryable    bool
+	retryAfter   time.Duration
 	RevertReason string
 }
 
@@ -4190,9 +4190,9 @@ func (s *Screener) simulateExactBatchChunk(ctx context.Context, record signal, s
 				return nil, errors.New("simulation batch error contract is invalid")
 			}
 			outcomes[index].Err = &gatewayResponseError{
-				statusCode:     batchGatewayErrorStatus(item.Error.ErrorClass),
-				class:          item.Error.ErrorClass,
-				retryable:      item.Error.Retryable,
+				statusCode:   batchGatewayErrorStatus(item.Error.ErrorClass),
+				class:        item.Error.ErrorClass,
+				retryable:    item.Error.Retryable,
 				RevertReason: item.Error.RevertReason,
 			}
 			continue

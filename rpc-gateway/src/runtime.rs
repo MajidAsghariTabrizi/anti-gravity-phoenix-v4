@@ -5760,7 +5760,7 @@ mod tests {
             );
         }
         let mapped = map_call_failure(CallFailure::Transport(TransportError::ExecutionReverted {
-            selector: None,
+            reason: None,
         }));
         assert_eq!(mapped.class(), "execution_reverted");
         assert!(!mapped.retryable());
