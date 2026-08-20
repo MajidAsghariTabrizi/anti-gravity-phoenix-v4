@@ -21,6 +21,7 @@ for path in \
   live-executor/schema/008_revenue_provider_authority.sql \
   live-executor/schema/009_single_primary_provider_authority.sql \
   live-executor/schema/010_atlas_auction_shadow.sql \
+  live-executor/schema/011_atlas_liquidation_ground_truth.sql \
   live-executor/src/economic_control.rs \
   live-executor/src/autonomous_live_control_main.rs \
   live-executor/src/store.rs \
@@ -685,6 +686,7 @@ require("phoenix.live-canary-schema.v7" in control, "schema_v7_not_required")
 require("phoenix.live-canary-schema.v8" in control, "schema_v8_not_required")
 require("phoenix.live-canary-schema.v9" in control, "schema_v9_not_required")
 require("phoenix.live-canary-schema.v10" in control, "schema_v10_not_required")
+require("phoenix.live-canary-schema.v11" in control, "schema_v11_not_required")
 require(
     "CREATE TABLE IF NOT EXISTS live_canary.atlas_auction_shadow" in shadow_schema
     and "shadow_bid_eligible BOOLEAN NOT NULL DEFAULT false" in shadow_schema
@@ -695,6 +697,14 @@ require(
 require(
     "CREATE INDEX IF NOT EXISTS live_canary_atlas_shadow_validation" in shadow_schema,
     "atlas_shadow_validation_index_missing",
+)
+ground_truth_schema = read("live-executor/schema/011_atlas_liquidation_ground_truth.sql")
+require(
+    "CREATE TABLE IF NOT EXISTS live_canary.atlas_liquidation_ground_truth" in ground_truth_schema
+    and "PRIMARY KEY (transaction_hash, log_index)" in ground_truth_schema
+    and "debt_to_cover_wei TEXT NOT NULL CHECK" in ground_truth_schema
+    and "receive_a_token BOOLEAN NOT NULL DEFAULT false" in ground_truth_schema,
+    "atlas_liquidation_ground_truth_schema_contract_missing",
 )
 require("revenue_provider_authority" in provider_schema, "provider_authority_schema_missing")
 require("exact_execution_ready" in provider_schema, "provider_execution_gate_missing")
@@ -1199,6 +1209,88 @@ END;
 $$;
 SQL
   fail "atlas auction shadow schema contract was rejected"
+
+docker exec -i "$postgres_container" \
+  psql -X -q -v ON_ERROR_STOP=1 -U phoenix_test -d phoenix_test <<'SQL' >/dev/null ||
+BEGIN;
+DO $$
+DECLARE
+  rejected BOOLEAN;
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM live_canary.schema_contract
+    WHERE version = 'phoenix.live-canary-schema.v11'
+  ) THEN
+    RAISE EXCEPTION 'schema v11 marker missing';
+  END IF;
+
+  rejected := false;
+  BEGIN
+    INSERT INTO live_canary.atlas_liquidation_ground_truth(
+      transaction_hash, log_index, user_operation_hash, borrower, debt_asset,
+      collateral_asset, debt_to_cover_wei, liquidated_collateral_wei,
+      liquidator, receive_a_token, block_number, reconciled_at, transcript_sha256
+    ) VALUES (
+      '0x' || repeat('a', 64), 0, '0x' || repeat('b', 64),
+      'NOT-AN-ADDRESS', '0x' || repeat('c', 40), '0x' || repeat('d', 40),
+      '1', '2', '0x' || repeat('e', 40), false, 1, now(), repeat('f', 64)
+    );
+  EXCEPTION WHEN check_violation THEN rejected := true;
+  END;
+  IF NOT rejected THEN RAISE EXCEPTION 'ground truth with a malformed borrower was accepted'; END IF;
+
+  rejected := false;
+  BEGIN
+    INSERT INTO live_canary.atlas_liquidation_ground_truth(
+      transaction_hash, log_index, user_operation_hash, borrower, debt_asset,
+      collateral_asset, debt_to_cover_wei, liquidated_collateral_wei,
+      liquidator, receive_a_token, block_number, reconciled_at, transcript_sha256
+    ) VALUES (
+      '0x' || repeat('a', 64), 0, '0x' || repeat('b', 64),
+      '0x' || repeat('1', 40), '0x' || repeat('c', 40), '0x' || repeat('d', 40),
+      '-1', '2', '0x' || repeat('e', 40), false, 1, now(), repeat('f', 64)
+    );
+  EXCEPTION WHEN check_violation THEN rejected := true;
+  END;
+  IF NOT rejected THEN RAISE EXCEPTION 'ground truth with a signed amount was accepted'; END IF;
+
+  rejected := false;
+  BEGIN
+    INSERT INTO live_canary.atlas_liquidation_ground_truth(
+      transaction_hash, log_index, user_operation_hash, borrower, debt_asset,
+      collateral_asset, debt_to_cover_wei, liquidated_collateral_wei,
+      liquidator, receive_a_token, block_number, reconciled_at, transcript_sha256
+    ) VALUES (
+      '0x' || repeat('a', 64), 0, '0x' || repeat('b', 64),
+      '0x' || repeat('1', 40), '0x' || repeat('c', 40), '0x' || repeat('d', 40),
+      '1', '2', '0x' || repeat('e', 40), false, 1, now(), 'not-a-sha256'
+    );
+  EXCEPTION WHEN check_violation THEN rejected := true;
+  END;
+  IF NOT rejected THEN RAISE EXCEPTION 'ground truth with a malformed transcript hash was accepted'; END IF;
+
+  INSERT INTO live_canary.atlas_liquidation_ground_truth(
+    transaction_hash, log_index, user_operation_hash, borrower, debt_asset,
+    collateral_asset, debt_to_cover_wei, liquidated_collateral_wei,
+    liquidator, receive_a_token, block_number, reconciled_at, transcript_sha256
+  ) VALUES (
+    '0x' || repeat('a', 64), 0, '0x' || repeat('b', 64),
+    '0x' || repeat('1', 40), '0x' || repeat('c', 40), '0x' || repeat('d', 40),
+    '1', '2', '0x' || repeat('e', 40), false, 1, now(), repeat('f', 64)
+  );
+  INSERT INTO live_canary.atlas_liquidation_ground_truth(
+    transaction_hash, log_index, user_operation_hash, borrower, debt_asset,
+    collateral_asset, debt_to_cover_wei, liquidated_collateral_wei,
+    liquidator, receive_a_token, block_number, reconciled_at, transcript_sha256
+  ) VALUES (
+    '0x' || repeat('a', 64), 0, '0x' || repeat('b', 64),
+    '0x' || repeat('1', 40), '0x' || repeat('c', 40), '0x' || repeat('d', 40),
+    '1', '2', '0x' || repeat('e', 40), false, 1, now(), repeat('f', 64)
+  ) ON CONFLICT DO NOTHING;
+END;
+$$;
+SQL
+  fail "atlas liquidation ground truth schema contract was rejected"
 
 docker exec -i "$postgres_container" \
   psql -X -q -v ON_ERROR_STOP=1 -U phoenix_test -d phoenix_test <<'SQL' >/dev/null ||

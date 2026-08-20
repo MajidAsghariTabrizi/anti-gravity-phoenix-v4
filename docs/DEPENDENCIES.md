@@ -361,6 +361,36 @@ Recorded assumptions and limitations:
   the shadow path, and the direct lane's record semantics are unchanged
   (`TerminalOutcome` stays `candidate`; `AtlasCandidate` is never set).
 
+## Atlas Liquidation Ground Truth
+
+The LiquidationCall ground-truth chain (revenue-capture program workstream A)
+decodes Aave V3 pool `LiquidationCall` events from settled Atlas SVR
+transactions and persists them to `live_canary.atlas_liquidation_ground_truth`
+(schema v11). Recorded assumptions and limitations:
+
+- The transcript is produced by `atlas-observer/scripts/export_rpc_transcript.py`,
+  a bounded, credential-free operator tool with a five-method read-only
+  JSON-RPC allowlist (`eth_chainId`, `eth_blockNumber`, `eth_getLogs`,
+  `eth_getTransactionByHash`, `eth_getTransactionReceipt`) and a 20,000-block
+  span cap. It reads provider URLs from the running rpc-gateway container's
+  environment and never prints them. It performs DIRECT public RPC — it is a
+  cold-path operator tool, not part of the hot money path (which remains
+  rpc-gateway-only).
+- `atlas-reconciler` (reviewed, no network/signer) decodes the transcript
+  against the Atlas v1.6.4 `metacall`/`SolverTxResult`/`MetacallResult`
+  identities and the reviewed Arbitrum Aave V3 pool, and only binds auctions
+  already present in the observer's auction ledger. Ground-truth rows are
+  loaded only for receipts with status 1; unsuccessful settlements are
+  skipped and counted.
+- Block timestamps are not collected, so wall-clock screening latency is not
+  measured from this table; the join report measures coverage of the auction
+  ingress and shadow evaluation instead. Liquidation amounts are integer
+  strings; the table is append-only and idempotent on
+  `(transaction_hash, log_index)`.
+- The collection wrapper
+  (`scripts/collect-atlas-liquidation-ground-truth.sh`) is evidence-only: it
+  never authorizes, gates, or materializes any execution or solver request.
+
 ## Arbitrum Transaction Cost Components
 
 LIVE submission quotes use the official Nitro `NodeInterface` virtual contract

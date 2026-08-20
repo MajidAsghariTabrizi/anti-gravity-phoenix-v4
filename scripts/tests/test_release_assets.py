@@ -30,10 +30,15 @@ LIVE_CANARY_ASSETS = (
     "scripts/activate-economic-canary.sh",
     "scripts/atlas-shadow-validation.sh",
     "scripts/atlas_shadow_validation_report.py",
+    "scripts/collect-atlas-liquidation-ground-truth.sh",
+    "scripts/atlas_liquidation_ground_truth.py",
+    "atlas-observer/scripts/export_rpc_transcript.py",
     "scripts/economic_activation_runner.py",
     "scripts/economic-dashboard-loop.sh",
     "scripts/sql/economic-dashboard-snapshot.sql",
     "scripts/sql/shadow-atlas-validation.sql",
+    "scripts/sql/atlas-liquidation-ground-truth-report.sql",
+    "live-executor/schema/011_atlas_liquidation_ground_truth.sql",
 )
 
 

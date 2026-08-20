@@ -143,6 +143,18 @@ sudo cmp "$repo_root/live-executor/schema/010_atlas_auction_shadow.sql" \
 [ "$(sudo stat -c '%U:%G:%a' \
   "$modern_root/deploy/live-executor/schema/010_atlas_auction_shadow.sql")" = \
   "root:$owner_group:640" ] || fail 'modern schema 010 metadata is invalid'
+sudo cmp "$repo_root/live-executor/schema/011_atlas_liquidation_ground_truth.sql" \
+  "$modern_root/deploy/live-executor/schema/011_atlas_liquidation_ground_truth.sql" \
+  >/dev/null || fail 'modern context did not receive schema 011 byte-for-byte'
+[ "$(sudo stat -c '%U:%G:%a' \
+  "$modern_root/deploy/live-executor/schema/011_atlas_liquidation_ground_truth.sql")" = \
+  "root:$owner_group:640" ] || fail 'modern schema 011 metadata is invalid'
+sudo cmp "$repo_root/atlas-observer/scripts/export_rpc_transcript.py" \
+  "$modern_root/deploy/atlas-export-rpc-transcript.py" \
+  >/dev/null || fail 'modern context did not receive the bounded transcript exporter byte-for-byte'
+[ "$(sudo stat -c '%U:%G:%a' \
+  "$modern_root/deploy/atlas-export-rpc-transcript.py")" = \
+  "root:$owner_group:750" ] || fail 'modern transcript exporter metadata is invalid'
 
 legacy_sha=4444444444444444444444444444444444444444
 asset_dir=$tmp_root/release-assets
@@ -212,6 +224,30 @@ if run_installer \
   >/dev/null 2>&1
 then
   fail 'manifest-declared schema 010 was allowed to be absent'
+fi
+
+declared_missing_schema11_root=$tmp_root/declared-missing-schema11
+cp -R "$legacy_root" "$declared_missing_schema11_root"
+rm -f -- \
+  "$declared_missing_schema11_root/live-executor/schema/011_atlas_liquidation_ground_truth.sql"
+declared_missing_schema11_host=$tmp_root/declared-missing-schema11-host
+if run_installer \
+  "$declared_missing_schema11_host" "$legacy_sha" "$declared_missing_schema11_root" \
+  >/dev/null 2>&1
+then
+  fail 'manifest-declared schema 011 was allowed to be absent'
+fi
+
+declared_missing_exporter_root=$tmp_root/declared-missing-exporter
+cp -R "$legacy_root" "$declared_missing_exporter_root"
+rm -f -- \
+  "$declared_missing_exporter_root/atlas-observer/scripts/export_rpc_transcript.py"
+declared_missing_exporter_host=$tmp_root/declared-missing-exporter-host
+if run_installer \
+  "$declared_missing_exporter_host" "$legacy_sha" "$declared_missing_exporter_root" \
+  >/dev/null 2>&1
+then
+  fail 'manifest-declared bounded transcript exporter was allowed to be absent'
 fi
 
 python3 - "$legacy_root/release-assets-manifest.json" <<'PY'

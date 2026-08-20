@@ -1865,6 +1865,16 @@ class BoundedTransportContinuationTests(unittest.TestCase):
             '  "live-executor/schema/010_atlas_auction_shadow.sql"',
             context_installer,
         )
+        self.assertIn(
+            'install_versioned_source \\\n'
+            '  "live-executor/schema/011_atlas_liquidation_ground_truth.sql"',
+            context_installer,
+        )
+        self.assertIn(
+            '  "atlas-observer/scripts/export_rpc_transcript.py" \\\n'
+            '  "$deploy_dir/atlas-export-rpc-transcript.py" 0750',
+            context_installer,
+        )
         self.assertNotIn("install_protected_file", context_installer)
 
     def test_context_installer_creates_rotation_config_directory(self) -> None:

@@ -62,6 +62,9 @@ func TestReconcileTranscriptDecodesExactAtlasAndAaveEvidence(t *testing.T) {
 	if liquidation.CollateralAsset != testCollateral || liquidation.DebtAsset != testDebt || liquidation.Borrower != testBorrower || liquidation.DebtToCover != "50" || liquidation.LiquidatedCollateralAmount != "55" {
 		t.Fatalf("liquidation evidence = %+v", liquidation)
 	}
+	if liquidation.LogIndex == "" {
+		t.Fatalf("liquidation log index was not retained: %+v", liquidation)
+	}
 
 	repeated, err := ReconcileTranscript(dir, transcript, raw, time.Unix(1_700_000_200, 0))
 	if err != nil {
@@ -299,7 +302,8 @@ func buildTestTranscript(t *testing.T, userOpHash string, includeTransaction boo
 						common.BytesToHash(common.HexToAddress(testDebt).Bytes()).Hex(),
 						common.BytesToHash(common.HexToAddress(testBorrower).Bytes()).Hex(),
 					},
-					Data: "0x" + hex.EncodeToString(liquidationData),
+					Data:     "0x" + hex.EncodeToString(liquidationData),
+					LogIndex: "0x2",
 				},
 			},
 		},
