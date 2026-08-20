@@ -333,7 +333,7 @@ pub enum GatewayError {
     #[error("RPC Gateway response exceeded the configured bound")]
     ResponseOversized,
     #[error("simulated EVM execution reverted")]
-    ExecutionReverted { selector: Option<[u8; 4]> },
+    ExecutionReverted { reason: Option<[u8; 64]> },
 }
 
 impl GatewayError {
@@ -1252,16 +1252,16 @@ impl GatewayRuntime {
                     error: Some(AaveSimulateBatchError {
                         error_class: error.class().to_string(),
                         retryable: error.retryable(),
-                        revert_selector: match error {
+                        revert_reason: match error {
                             GatewayError::ExecutionReverted {
-                                selector: Some(selector),
-                            } => Some(format!(
-                                "0x{}",
-                                selector
+                                reason: Some(reason),
+                            } => Some(
+                                reason
                                     .iter()
-                                    .map(|byte| format!("{byte:02x}"))
-                                    .collect::<String>()
-                            )),
+                                    .take_while(|byte| **byte != 0)
+                                    .map(|byte| *byte as char)
+                                    .collect::<String>(),
+                            ),
                             _ => None,
                         },
                     }),
@@ -5172,8 +5172,8 @@ fn encode_signed_call(name: &str, bits: usize, value: i128) -> String {
 fn map_call_failure(failure: CallFailure) -> GatewayError {
     match failure {
         CallFailure::Budget => GatewayError::UpstreamBudgetExhausted,
-        CallFailure::Transport(TransportError::ExecutionReverted { selector }) => {
-            GatewayError::ExecutionReverted { selector }
+        CallFailure::Transport(TransportError::ExecutionReverted { reason }) => {
+            GatewayError::ExecutionReverted { reason }
         }
         CallFailure::Transport(_) => GatewayError::ProviderUnavailable,
         CallFailure::Integrity => GatewayError::ProviderIntegrity,
@@ -5733,7 +5733,7 @@ mod tests {
             UpstreamOutcome::Success
         );
         assert_eq!(
-            classify_upstream_outcome(&Err(TransportError::ExecutionReverted { selector: None })),
+            classify_upstream_outcome(&Err(TransportError::ExecutionReverted { reason: None })),
             UpstreamOutcome::Reverted
         );
         assert_eq!(

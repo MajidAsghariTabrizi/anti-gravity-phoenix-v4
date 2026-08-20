@@ -432,7 +432,7 @@ pub struct AaveSimulateBatchError {
     pub error_class: String,
     pub retryable: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub revert_selector: Option<String>,
+    pub revert_reason: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]

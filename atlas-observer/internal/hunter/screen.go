@@ -330,7 +330,7 @@ type gatewayErrorContract struct {
 	ErrorClass       string  `json:"error_class"`
 	Retryable        bool    `json:"retryable"`
 	RetryAfterSecond *uint64 `json:"retry_after_seconds,omitempty"`
-	RevertSelector   string  `json:"revert_selector,omitempty"`
+	RevertReason   string  `json:"revert_reason,omitempty"`
 }
 
 type gatewayResponseError struct {
@@ -338,12 +338,12 @@ type gatewayResponseError struct {
 	class          string
 	retryable      bool
 	retryAfter     time.Duration
-	revertSelector string
+	RevertReason string
 }
 
 func (e *gatewayResponseError) Error() string {
-	if e.revertSelector != "" {
-		return fmt.Sprintf("RPC Gateway rejected request: %s [%s]", e.class, e.revertSelector)
+	if e.RevertReason != "" {
+		return fmt.Sprintf("RPC Gateway rejected request: %s [%s]", e.class, e.RevertReason)
 	}
 	return fmt.Sprintf("RPC Gateway rejected request: %s", e.class)
 }
@@ -4193,7 +4193,7 @@ func (s *Screener) simulateExactBatchChunk(ctx context.Context, record signal, s
 				statusCode:     batchGatewayErrorStatus(item.Error.ErrorClass),
 				class:          item.Error.ErrorClass,
 				retryable:      item.Error.Retryable,
-				revertSelector: item.Error.RevertSelector,
+				RevertReason: item.Error.RevertReason,
 			}
 			continue
 		}
