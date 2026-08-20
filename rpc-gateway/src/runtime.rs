@@ -1246,26 +1246,52 @@ impl GatewayRuntime {
                     response: Some(response),
                     error: None,
                 },
-                Err(error) => AaveSimulateBatchResult {
-                    request_id: simulation.request_id.clone(),
-                    response: None,
-                    error: Some(AaveSimulateBatchError {
-                        error_class: error.class().to_string(),
-                        retryable: error.retryable(),
-                        revert_reason: match error {
-                            GatewayError::ExecutionReverted {
-                                reason: Some(reason),
-                            } => Some(
+                Err(error) => {
+                    let error_class = error.class().to_string();
+                    let retryable = error.retryable();
+                    let mut revert_reason = match error {
+                        GatewayError::ExecutionReverted { reason } => reason,
+                        _ => None,
+                    };
+                    if revert_reason.is_none()
+                        && matches!(error, GatewayError::ExecutionReverted { .. })
+                    {
+                        if let Some(paused_under_override) = self
+                            .aave_pause_state_under_override(
+                                &primary,
+                                simulation,
+                                &expected_block,
+                                &primary_context,
+                                pacing_deadline,
+                            )
+                            .await
+                        {
+                            let mut reason = [0_u8; 64];
+                            let marker: &[u8] = if paused_under_override {
+                                b"paused_gate_override_ignored"
+                            } else {
+                                b"economics_or_guard_revert"
+                            };
+                            reason[..marker.len()].copy_from_slice(marker);
+                            revert_reason = Some(reason);
+                        }
+                    }
+                    AaveSimulateBatchResult {
+                        request_id: simulation.request_id.clone(),
+                        response: None,
+                        error: Some(AaveSimulateBatchError {
+                            error_class,
+                            retryable,
+                            revert_reason: revert_reason.map(|reason| {
                                 reason
                                     .iter()
                                     .take_while(|byte| **byte != 0)
                                     .map(|byte| *byte as char)
-                                    .collect::<String>(),
-                            ),
-                            _ => None,
-                        },
-                    }),
-                },
+                                    .collect::<String>()
+                            }),
+                        }),
+                    }
+                }
             });
         }
 
@@ -1342,6 +1368,47 @@ impl GatewayRuntime {
             primary.provider_id(),
             primary_evidence,
         )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn aave_pause_state_under_override(
+        &self,
+        provider: &ProviderLease,
+        request: &AaveSimulateRequest,
+        block: &PinnedBlock,
+        context: &AaveSimulationContext,
+        pacing_deadline: Instant,
+    ) -> Option<bool> {
+        let executor_state_diff = aave_executor_simulation_state_diff(
+            request,
+            &context.packed_executor_config,
+            context.maximum_input_amount,
+        )
+        .ok()?;
+        let result = self
+            .paced_recorded_call(
+                provider,
+                RpcMethod::EthCall,
+                json!([
+                    {"to": request.executor_address, "data": "0x5c975abb"},
+                    format_quantity(block.number),
+                    {
+                        request.executor_address.clone(): {
+                            "stateDiff": executor_state_diff.clone()
+                        }
+                    }
+                ]),
+                Some(block),
+                0,
+                ProviderSlot::Primary,
+                None,
+                false,
+                pacing_deadline,
+            )
+            .await
+            .ok()?;
+        let paused = result.value.as_str().and_then(parse_hex_u256_word)?;
+        Some(paused != U256::zero())
     }
 
     async fn provider_block(
