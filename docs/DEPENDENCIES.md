@@ -391,6 +391,35 @@ transactions and persists them to `live_canary.atlas_liquidation_ground_truth`
   (`scripts/collect-atlas-liquidation-ground-truth.sh`) is evidence-only: it
   never authorizes, gates, or materializes any execution or solver request.
 
+## Atlas ARB Shadow Instrumentation
+
+The evidence-selected non-WETH shadow pair (revenue-capture program
+workstream C) is ARB. Production evidence (2026-08-20, read-only):
+11,056 of 34,097 Aave-relevant SVR auctions carry the ARB oracle asset
+(32.4% vs 35.3% WETH; BTC next at 25.3%). The shadow instrumentation
+(`atlas-observer/internal/hunter/atlas_arb_shadow.go`) records ARB auction
+evidence against real ARB-debt borrowers. Assumptions and limitations:
+
+- ARB-debt borrowers are indexed exclusively from per-reserve evidence the
+  rpc-gateway already returns in `phoenix.rpc.aave-exact-response.v5` for
+  borrowers that reach an exact evaluation while liquidatable. No new RPC
+  source, gateway route, or public-RPC read is introduced.
+- The ARB reserve identity is the Arbitrum One Aave V3 ARB token
+  (`0x912ce59144191c1204e64559fe8253a0e49e6548`); auctions are matched on
+  the SVR oracle asset symbol `arb` or that address, case-insensitive.
+- No reviewed ARB unwind pool exists in the route universe, so ARB shadow
+  rows carry no bid economics: gross/bid fields stay empty,
+  `shadow_bid_eligible` stays false, and the terminal reason is
+  `atlas_arb_unwind_unreviewed`. Pricing an ARB unwind requires a reviewed
+  ARB pool identity — a separate authority decision not made here. Close
+  factor and liquidation bonus are deliberately NOT applied to produce
+  estimates.
+- The in-memory ARB borrower index is capped at 512 entries (oldest evicted)
+  and evicts a borrower when they leave the hot set or no longer carry ARB
+  variable debt. Attach selection mirrors the direct lane's priority order
+  (liquidatable first, then by health factor), but attaches are evidence
+  only and never authorize execution.
+
 ## Arbitrum Transaction Cost Components
 
 LIVE submission quotes use the official Nitro `NodeInterface` virtual contract

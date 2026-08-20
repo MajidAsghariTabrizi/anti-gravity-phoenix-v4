@@ -5136,3 +5136,228 @@ func TestSimulateBatchAcceptsCounterfactualFirstEvidenceMode(t *testing.T) {
 		t.Fatalf("expected one per-item outcome error, got outcomes=%d err=%v", len(outcomes), outcomes[0].Err)
 	}
 }
+
+func arbTestBorrower(index uint64) string {
+	return "0x" + fmt.Sprintf("%040x", index+1)
+}
+
+func arbDebtReserve(variableDebt string) exactReserve {
+	return exactReserve{Asset: arbAddress, CurrentVariableDebt: variableDebt}
+}
+
+func wethCollateralReserve(balance string, enabled bool) exactReserve {
+	return exactReserve{
+		Asset: wethAddress, CurrentStableDebt: "0", CurrentVariableDebt: "0",
+		CurrentATokenBalance: balance, UsageAsCollateralEnabled: enabled,
+	}
+}
+
+func TestArbDebtEvidenceIndexedFromExactResponse(t *testing.T) {
+	borrower := arbTestBorrower(1)
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if request.URL.Path != "/v1/aave/exact" {
+			http.Error(writer, "unexpected path", http.StatusNotFound)
+			return
+		}
+		var input exactRequest
+		if err := json.NewDecoder(request.Body).Decode(&input); err != nil {
+			t.Fatal(err)
+		}
+		primary := exactProvider{
+			ProviderID: primaryProviderID, FlashPremiumBPS: 5,
+			Account: account{Borrower: borrower, TotalDebtBase: "5000000000", HealthFactorWAD: "900000000000000000"},
+			Reserves: []exactReserve{
+				arbDebtReserve("200000000000"),
+				wethCollateralReserve("50000000000000000", true),
+			},
+			Liquidations: []exactLiquidation{},
+		}
+		_ = json.NewEncoder(writer).Encode(exactResponse{
+			SchemaVersion: "phoenix.rpc.aave-exact-response.v5", ChainID: 42161, RequestID: input.RequestID,
+			BlockNumber: 150, BlockHash: "0x" + strings.Repeat("b", 64), StateRoot: "0x" + strings.Repeat("c", 64),
+			Primary: primary, Confirmation: nil, Quorum: 1,
+		})
+	}))
+	defer server.Close()
+	screener := economicTestScreener(server)
+	record, err := screener.resolveExact(context.Background(), signal{
+		Schema: "phoenix.atlas-aave-hunting-signal.v1", ObservedAt: time.Now().UTC(), Cursor: 1,
+		Block: 100, BlockHash: "0x" + strings.Repeat("d", 64), Borrower: borrower,
+		DebtBase: "5000000000", HF: "900000000000000000",
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if record.TerminalOutcome != "economic_rejection" || record.ExactRouteIneligibleReason != "no_supported_debt_asset" {
+		t.Fatalf("ARB-debt borrower took an unexpected route: %+v", record)
+	}
+	entry, present := screener.arbBorrowers[borrower]
+	if !present {
+		t.Fatalf("ARB-debt borrower was not indexed: %+v", screener.arbBorrowers)
+	}
+	if entry.ARBVariableDebt == nil || entry.ARBVariableDebt.String() != "200000000000" {
+		t.Fatalf("ARB variable debt was not indexed: %+v", entry)
+	}
+	if entry.CollateralAsset != wethAddress || !entry.CollateralOK {
+		t.Fatalf("WETH collateral was not indexed: %+v", entry)
+	}
+	if entry.BlockNumber != 150 || entry.HealthFactorWAD != "900000000000000000" {
+		t.Fatalf("ARB evidence block or health factor missing: %+v", entry)
+	}
+}
+
+func TestArbAuctionAttachesToIndexedBorrower(t *testing.T) {
+	now := time.Date(2026, 8, 13, 0, 0, 0, 0, time.UTC)
+	borrower := arbTestBorrower(2)
+	sink := &recordingSignalSink{}
+	arb := arbAuctionAssetSymbol
+	screener := &Screener{
+		config: Config{
+			MaximumGasLimit: 100, MaximumFeePerGasWei: "10", MaximumPriorityFeeWei: "10",
+			MaximumAtlasBidWei: "500", RetainedProfitFloorWei: "100", SignalSink: sink,
+		},
+		state: State{Schema: StateSchema, Counts: map[string]uint64{}, LastBlockNumber: 100},
+		now:   func() time.Time { return now },
+		arbBorrowers: map[string]arbBorrowerEntry{
+			borrower: {
+				Borrower: borrower, ARBVariableDebt: big.NewInt(200000000000),
+				CollateralAsset: wethAddress, CollateralWei: big.NewInt(50000000000000000), CollateralOK: true,
+				TotalDebtBase: "5000000000", HealthFactorWAD: "900000000000000000",
+				BlockNumber: 99, BlockHash: "0x" + strings.Repeat("e", 64),
+			},
+		},
+	}
+	auction := &observer.LedgerRecord{
+		RelevantAaveAuction: true, ChainID: 42161, AuctionID: "arb-auction-1",
+		AuctionDeadlineBlock: "200", SolverGasLimit: 20, OracleGasPriceWei: "10",
+		NotificationSHA256: strings.Repeat("f", 64), ObservedAt: now,
+		OracleUpdate: &observer.OracleUpdate{Asset: &arb},
+	}
+	if err := screener.HandleAtlasAuction(context.Background(), auction); err != nil {
+		t.Fatal(err)
+	}
+	if len(sink.atlasShadowEvaluations) != 1 {
+		t.Fatalf("expected exactly one ARB shadow evaluation, got %d", len(sink.atlasShadowEvaluations))
+	}
+	evaluation := sink.atlasShadowEvaluations[0]
+	if evaluation.Borrower != borrower || evaluation.TerminalRejectionReason != atlasShadowReasonArbUnwindUnreviewed {
+		t.Fatalf("ARB auction did not attach with the evidence-only reason: %+v", evaluation)
+	}
+	if evaluation.ShadowBidEligible || evaluation.GrossValueWei != "" || evaluation.MaximumBidWei != "" {
+		t.Fatalf("ARB shadow row carries bid economics it must not have: %+v", evaluation)
+	}
+	if !evaluation.IdentityValid || !evaluation.BoundsValid || evaluation.BlockNumber != 99 {
+		t.Fatalf("ARB shadow row identity/bounds/block evidence is wrong: %+v", evaluation)
+	}
+	if entry := screener.recentAuctions[arbAuctionAssetSymbol]; entry != nil && !entry.evaluated {
+		t.Fatalf("attached ARB auction was left claimable: %+v", entry)
+	}
+}
+
+func TestArbAuctionLazyAttachClaimsOnce(t *testing.T) {
+	now := time.Date(2026, 8, 13, 1, 0, 0, 0, time.UTC)
+	borrower := arbTestBorrower(3)
+	sink := &recordingSignalSink{}
+	arb := arbAuctionAssetSymbol
+	screener := &Screener{
+		config: Config{
+			MaximumGasLimit: 100, MaximumFeePerGasWei: "10", MaximumPriorityFeeWei: "10",
+			MaximumAtlasBidWei: "500", RetainedProfitFloorWei: "100", SignalSink: sink,
+		},
+		state: State{Schema: StateSchema, Counts: map[string]uint64{}, LastBlockNumber: 100},
+		now:   func() time.Time { return now },
+	}
+	auction := &observer.LedgerRecord{
+		RelevantAaveAuction: true, ChainID: 42161, AuctionID: "arb-auction-2",
+		AuctionDeadlineBlock: "200", SolverGasLimit: 20, OracleGasPriceWei: "10",
+		NotificationSHA256: strings.Repeat("a", 64), ObservedAt: now,
+		OracleUpdate: &observer.OracleUpdate{Asset: &arb},
+	}
+	if err := screener.HandleAtlasAuction(context.Background(), auction); err != nil {
+		t.Fatal(err)
+	}
+	if len(sink.atlasShadowEvaluations) != 0 {
+		t.Fatalf("unattached ARB auction was classified early: %+v", sink.atlasShadowEvaluations)
+	}
+	screener.arbBorrowers = map[string]arbBorrowerEntry{
+		borrower: {
+			Borrower: borrower, ARBVariableDebt: big.NewInt(100000000000),
+			TotalDebtBase: "1000000000", HealthFactorWAD: "850000000000000000", BlockNumber: 101,
+		},
+	}
+	if err := screener.attachPendingArbAuction(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := screener.attachPendingArbAuction(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(sink.atlasShadowEvaluations) != 1 {
+		t.Fatalf("lazy ARB attach did not record exactly once: %+v", sink.atlasShadowEvaluations)
+	}
+	if !screener.recentAuctions[arbAuctionAssetSymbol].evaluated {
+		t.Fatalf("lazy ARB attach did not mark the auction evaluated")
+	}
+}
+
+func TestArbAuctionSupersedesWithoutBorrower(t *testing.T) {
+	now := time.Date(2026, 8, 13, 2, 0, 0, 0, time.UTC)
+	sink := &recordingSignalSink{}
+	arb := arbAuctionAssetSymbol
+	screener := &Screener{
+		config: Config{
+			MaximumGasLimit: 100, MaximumFeePerGasWei: "10", MaximumPriorityFeeWei: "10",
+			MaximumAtlasBidWei: "500", RetainedProfitFloorWei: "100", SignalSink: sink,
+		},
+		state: State{Schema: StateSchema, Counts: map[string]uint64{}, LastBlockNumber: 100},
+		now:   func() time.Time { return now },
+	}
+	first := &observer.LedgerRecord{
+		RelevantAaveAuction: true, ChainID: 42161, AuctionID: "arb-auction-3",
+		AuctionDeadlineBlock: "200", SolverGasLimit: 20, OracleGasPriceWei: "10",
+		NotificationSHA256: strings.Repeat("b", 64), ObservedAt: now,
+		OracleUpdate: &observer.OracleUpdate{Asset: &arb},
+	}
+	if err := screener.HandleAtlasAuction(context.Background(), first); err != nil {
+		t.Fatal(err)
+	}
+	second := &observer.LedgerRecord{
+		RelevantAaveAuction: true, ChainID: 42161, AuctionID: "arb-auction-4",
+		AuctionDeadlineBlock: "300", SolverGasLimit: 20, OracleGasPriceWei: "10",
+		NotificationSHA256: strings.Repeat("c", 64), ObservedAt: now,
+		OracleUpdate: &observer.OracleUpdate{Asset: &arb},
+	}
+	if err := screener.HandleAtlasAuction(context.Background(), second); err != nil {
+		t.Fatal(err)
+	}
+	if len(sink.atlasShadowEvaluations) != 1 ||
+		sink.atlasShadowEvaluations[0].AuctionID != "arb-auction-3" ||
+		sink.atlasShadowEvaluations[0].TerminalRejectionReason != atlasShadowReasonSupersededWithoutEvaluation {
+		t.Fatalf("ARB supersession without borrower was misclassified: %+v", sink.atlasShadowEvaluations)
+	}
+	if entry := screener.recentAuctions[arbAuctionAssetSymbol]; entry == nil || entry.record.AuctionID != "arb-auction-4" {
+		t.Fatalf("latest ARB auction did not replace its predecessor: %+v", screener.recentAuctions)
+	}
+}
+
+func TestArbBorrowerIndexIsBoundedAndEvictsWithoutArbDebt(t *testing.T) {
+	screener := &Screener{state: State{Schema: StateSchema, Counts: map[string]uint64{}}, now: func() time.Time { return time.Date(2026, 8, 13, 3, 0, 0, 0, time.UTC) }}
+	for index := uint64(0); index < maximumArbBorrowerIndex+8; index++ {
+		borrower := arbTestBorrower(index)
+		screener.indexArbDebtEvidence(borrower, 200+index, "0x"+strings.Repeat("a", 64),
+			account{Borrower: borrower, TotalDebtBase: "1000000000", HealthFactorWAD: "900000000000000000"},
+			[]exactReserve{arbDebtReserve("100000000000"), wethCollateralReserve("10000000000000000", true)})
+	}
+	if len(screener.arbBorrowers) != maximumArbBorrowerIndex {
+		t.Fatalf("ARB index exceeded its cap: %d", len(screener.arbBorrowers))
+	}
+	kept := arbTestBorrower(maximumArbBorrowerIndex + 7)
+	if _, present := screener.arbBorrowers[kept]; !present {
+		t.Fatalf("newest ARB entry was evicted instead of the oldest")
+	}
+	screener.indexArbDebtEvidence(kept, 500, "0x"+strings.Repeat("b", 64),
+		account{Borrower: kept, TotalDebtBase: "0", HealthFactorWAD: "1000000000000000000"},
+		[]exactReserve{wethCollateralReserve("10000000000000000", true)})
+	if _, present := screener.arbBorrowers[kept]; present {
+		t.Fatalf("borrower without ARB debt stayed indexed: %+v", screener.arbBorrowers[kept])
+	}
+}
