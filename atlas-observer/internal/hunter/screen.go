@@ -1817,7 +1817,7 @@ func (s *Screener) HandleAtlasAuction(ctx context.Context, auction *observer.Led
 	if auction.AuctionID == "" {
 		return s.recordAtlasShadow(ctx, atlasShadowTerminal(auction, false, false, atlasShadowReasonIdentityInvalid))
 	}
-	boundsReason := atlasAuctionBoundsReason(auction, s.config)
+	boundsReason := atlasAuctionBoundsReason(auction)
 	if boundsReason == atlasShadowReasonAssetUnknown {
 		return s.recordAtlasShadow(ctx, atlasShadowTerminal(auction, true, false, atlasShadowReasonAssetUnknown))
 	}
@@ -3962,11 +3962,16 @@ func (s *Screener) buildAtlasCandidate(
 	// callback-path evidence gate. The direct batch selection that produced
 	// `selected` necessarily carries direct/counterfactual fork evidence, so
 	// gating on the batch evidence mode here would make this path unreachable.
+	// Bounds here are protocol-level only: the solver-side gas budget must be
+	// able to carry the direct execution estimate, but it is NOT capped by
+	// the lane's direct execution gas limit or fee caps (separate domains).
 	deadline, deadlineOK := newUint64(auction.AuctionDeadlineBlock)
 	oracleGasPrice, gasPriceOK := newBigUint(auction.OracleGasPriceWei)
-	maximumFee, maximumFeeOK := newBigUint(s.config.MaximumFeePerGasWei)
-	maximumPriorityFee, maximumPriorityOK := newBigUint(s.config.MaximumPriorityFeeWei)
-	if !deadlineOK || deadline == 0 || auction.SolverGasLimit == 0 || auction.SolverGasLimit < selected.Simulation.EstimatedGasLimit || auction.SolverGasLimit > s.config.MaximumGasLimit || !gasPriceOK || oracleGasPrice.Sign() <= 0 || !maximumFeeOK || !maximumPriorityOK || oracleGasPrice.Cmp(maximumFee) > 0 || oracleGasPrice.Cmp(maximumPriorityFee) > 0 {
+	if !deadlineOK || deadline == 0 ||
+		auction.SolverGasLimit == 0 ||
+		auction.SolverGasLimit > atlasAuctionSolverGasCeiling ||
+		auction.SolverGasLimit < selected.Simulation.EstimatedGasLimit ||
+		!gasPriceOK || oracleGasPrice.Sign() <= 0 {
 		return nil, atlasShadowReasonBoundsInvalid, errors.New("Atlas auction bounds are invalid")
 	}
 	gross, grossOK := newBigUint(selected.Simulation.RealizedProfit)

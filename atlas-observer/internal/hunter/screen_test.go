@@ -3949,12 +3949,13 @@ func TestAtlasCandidateChargesBidAndMaximumSolverExposureOnce(t *testing.T) {
 	}
 	selected.Simulation.EstimatedGasLimit = 0
 
-	auction.OracleGasPriceWei = "11"
+	auction.SolverGasLimit = atlasAuctionSolverGasCeiling + 1
 	if rejected, rejectedReason, rejectedErr := screener.buildAtlasCandidate(context.Background(), record, selected, auction); rejectedErr == nil || rejected != nil || rejectedReason != atlasShadowReasonBoundsInvalid {
-		t.Fatalf("Atlas oracle price above priority ceiling was not rejected: candidate=%+v reason=%s err=%v", rejected, rejectedReason, rejectedErr)
+		t.Fatalf("solver gas above the protocol ceiling was not rejected: candidate=%+v reason=%s err=%v", rejected, rejectedReason, rejectedErr)
 	}
+	auction.SolverGasLimit = 20
+
 	screener.config.MaximumAtlasBidWei = "0"
-	auction.OracleGasPriceWei = "10"
 	if disabled, disabledReason, disabledErr := screener.buildAtlasCandidate(context.Background(), record, selected, auction); disabledErr != nil || disabled != nil || disabledReason != atlasShadowReasonBidDisabled {
 		t.Fatalf("zero Atlas cap did not disable only Atlas authority: candidate=%+v reason=%s err=%v", disabled, disabledReason, disabledErr)
 	}
@@ -4021,6 +4022,39 @@ func TestAuctionShadowClassificationPreservesDirectAuthority(t *testing.T) {
 	}
 	if len(sink.records) != 1 || sink.records[0].ExecutionCandidate == nil || sink.records[0].AtlasCandidate != nil {
 		t.Fatalf("direct candidate did not survive the signal boundary: %+v", sink.records)
+	}
+}
+
+func TestAtlasAuctionBoundsUseProtocolCeilingNotLaneCaps(t *testing.T) {
+	weth := wethAddress
+	auction := &observer.LedgerRecord{
+		AuctionID: "auction", AuctionDeadlineBlock: "500000000",
+		SolverGasLimit: 6_000_000, OracleGasPriceWei: "621064400",
+		OracleUpdate: &observer.OracleUpdate{Asset: &weth},
+	}
+	// Solver-side gas budgets and oracle gas prices observed on the live SVR
+	// stream must not be bounded by the direct lane execution caps.
+	if reason := atlasAuctionBoundsReason(auction); reason != "" {
+		t.Fatalf("protocol-valid solver auction was rejected: %s", reason)
+	}
+	auction.SolverGasLimit = atlasAuctionSolverGasCeiling + 1
+	if reason := atlasAuctionBoundsReason(auction); reason != atlasShadowReasonBoundsInvalid {
+		t.Fatalf("above-ceiling solver gas was not bounds-invalid: %s", reason)
+	}
+	auction.SolverGasLimit = 6_000_000
+	auction.OracleGasPriceWei = "0"
+	if reason := atlasAuctionBoundsReason(auction); reason != atlasShadowReasonBoundsInvalid {
+		t.Fatalf("zero oracle gas price was not bounds-invalid: %s", reason)
+	}
+	auction.OracleGasPriceWei = "621064400"
+	auction.OracleUpdate = nil
+	if reason := atlasAuctionBoundsReason(auction); reason != atlasShadowReasonAssetUnknown {
+		t.Fatalf("missing asset was not asset-unknown: %s", reason)
+	}
+	auction.OracleUpdate = &observer.OracleUpdate{Asset: &weth}
+	auction.AuctionID = ""
+	if reason := atlasAuctionBoundsReason(auction); reason != atlasShadowReasonIdentityInvalid {
+		t.Fatalf("missing identity was not identity-invalid: %s", reason)
 	}
 }
 

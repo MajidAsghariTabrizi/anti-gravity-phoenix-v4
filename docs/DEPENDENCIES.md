@@ -338,8 +338,18 @@ Recorded assumptions and limitations:
   median-price hint requires gateway price-base request support and is a
   recorded follow-up, not an assumption of current behavior.
 - Auction bounds are validated before any economics: deadline block > 0,
-  `SolverGasLimit` within `(0, MaximumGasLimit]`, and `OracleGasPriceWei`
-  within `(0, MaximumFeePerGasWei]` and `(0, MaximumPriorityFeeWei]`.
+  `SolverGasLimit` in `(0, 30_000_000]`, and `OracleGasPriceWei > 0`. The
+  solver-gas ceiling is the Arbitrum One block gas limit bound (one operation
+  cannot exceed a block); the lane's direct execution caps
+  (`MaximumGasLimit`, `MaximumFeePerGasWei`, `MaximumPriorityFeeWei`) are NOT
+  applied to auction-side fields — those caps bound the DIRECT liquidation
+  execution, while auction-side gas describes the solver's own operation.
+  Production evidence (2026-08-20): 57,970 sampled ingress rows carried
+  `solver_gas_limit` above the 600,000 direct cap (max 6,000,000) and oracle
+  gas prices between 38 and 621 gwei; applying the direct caps rejected
+  100% of shadow evaluations, so the bounds were split by domain
+  (PR #271). The solver-side values instead enter shadow economics
+  conservatively as solver exposure.
 - Shadow bid economics use the same exact/fork simulation the direct lane
   would consume: solver exposure is
   `max(SolverGasLimit × OracleGasPriceWei, direct execution cost)`; the

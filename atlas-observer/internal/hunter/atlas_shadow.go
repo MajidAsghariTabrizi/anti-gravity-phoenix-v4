@@ -90,7 +90,23 @@ func (s *Screener) markAuctionEvaluated(auctionID string) {
 // atlasAuctionBoundsReason validates the auction against the reviewed
 // economic configuration. It returns "" when the auction bounds are valid,
 // otherwise the shadow terminal rejection reason.
-func atlasAuctionBoundsReason(auction *observer.LedgerRecord, config Config) string {
+// atlasAuctionSolverGasCeiling is the protocol-level sanity bound for the
+// solver-side gas budget carried in an SVR auction. The live SVR stream
+// observed solver budgets of millions of gas (Atlas DAppControl multicall
+// operations, up to 6,000,000 in the sampled ingress); the Arbitrum One
+// block gas limit bounds any single operation. The lane execution cap
+// (config.MaximumGasLimit) bounds the DIRECT liquidation execution and
+// must not be applied to the solver-side auction budget: those are two
+// different gas domains.
+const atlasAuctionSolverGasCeiling uint64 = 30_000_000
+
+// atlasAuctionBoundsReason classifies protocol-level auction identity and
+// bounds failures. It deliberately does not apply the lane's direct
+// execution fee caps (MaximumFeePerGasWei / MaximumPriorityFeeWei /
+// MaximumGasLimit): auction-side gas fields describe the solver's own
+// operation and enter the shadow economics conservatively as solver
+// exposure instead of being conflated with the direct execution domain.
+func atlasAuctionBoundsReason(auction *observer.LedgerRecord) string {
 	if auction == nil || auction.AuctionID == "" {
 		return atlasShadowReasonIdentityInvalid
 	}
@@ -99,13 +115,9 @@ func atlasAuctionBoundsReason(auction *observer.LedgerRecord, config Config) str
 	}
 	deadline, deadlineOK := newUint64(auction.AuctionDeadlineBlock)
 	oracleGasPrice, gasPriceOK := newBigUint(auction.OracleGasPriceWei)
-	maximumFee, maximumFeeOK := newBigUint(config.MaximumFeePerGasWei)
-	maximumPriorityFee, maximumPriorityOK := newBigUint(config.MaximumPriorityFeeWei)
-	if !deadlineOK || deadline == 0 || auction.SolverGasLimit == 0 ||
-		auction.SolverGasLimit > config.MaximumGasLimit ||
-		!gasPriceOK || oracleGasPrice.Sign() <= 0 ||
-		!maximumFeeOK || !maximumPriorityOK ||
-		oracleGasPrice.Cmp(maximumFee) > 0 || oracleGasPrice.Cmp(maximumPriorityFee) > 0 {
+	if !deadlineOK || deadline == 0 ||
+		auction.SolverGasLimit == 0 || auction.SolverGasLimit > atlasAuctionSolverGasCeiling ||
+		!gasPriceOK || oracleGasPrice.Sign() <= 0 {
 		return atlasShadowReasonBoundsInvalid
 	}
 	return ""
@@ -200,7 +212,7 @@ func (s *Screener) recordAtlasShadow(ctx context.Context, evaluation atlasShadow
 // shadow ledger. The live lane remains untouched: this never materializes
 // atlas_solver_requests or execution_requests.
 func (s *Screener) atlasShadowFromCandidate(auction *observer.LedgerRecord, record signal, selected *liquidationEvaluation, candidate *atlasCandidate) atlasShadowEvaluation {
-	evaluation := atlasShadowTerminal(auction, true, atlasAuctionBoundsReason(auction, s.config) == "", "")
+	evaluation := atlasShadowTerminal(auction, true, atlasAuctionBoundsReason(auction) == "", "")
 	evaluation.Borrower = record.Borrower
 	evaluation.BlockNumber = record.Block
 	evaluation.BlockHash = record.BlockHash
