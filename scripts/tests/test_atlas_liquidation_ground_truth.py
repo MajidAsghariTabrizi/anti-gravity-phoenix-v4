@@ -142,6 +142,13 @@ class AtlasLiquidationGroundTruthTests(unittest.TestCase):
         self.assertEqual(completed.returncode, 1)
         self.assertIn(b"transcript_sha256_invalid", completed.stderr)
 
+    def test_string_receive_a_token_is_rejected(self) -> None:
+        line = canonical_line(extra_liquidation=False)
+        line["public_liquidations"][0]["receive_a_token"] = "true"
+        completed = run_loader(ndjson(line))
+        self.assertEqual(completed.returncode, 1)
+        self.assertIn(b"receive_a_token_invalid", completed.stderr)
+
     def test_output_dir_writes_atomic_summary(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             completed = run_loader(

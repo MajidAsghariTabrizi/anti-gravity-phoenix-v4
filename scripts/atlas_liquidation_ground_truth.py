@@ -122,6 +122,8 @@ def record_rows(record: dict) -> list[dict]:
     for liquidation in liquidations:
         if not isinstance(liquidation, dict):
             raise ValidationError("liquidation_entry_invalid")
+        if not isinstance(liquidation.get("receive_a_token"), bool):
+            raise ValidationError("receive_a_token_invalid")
         rows.append(
             {
                 "transaction_hash": tx_hash,
@@ -135,7 +137,7 @@ def record_rows(record: dict) -> list[dict]:
                     liquidation.get("liquidated_collateral_amount"), "liquidated_collateral_amount"
                 ),
                 "liquidator": require_address(liquidation.get("liquidator"), "liquidator"),
-                "receive_a_token": bool(liquidation.get("receive_a_token")),
+                "receive_a_token": liquidation["receive_a_token"],
                 "block_number": block,
                 "reconciled_at": reconciled_at,
                 "transcript_sha256": transcript,
