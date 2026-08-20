@@ -87,10 +87,17 @@ func (s *Screener) indexArbDebtEvidence(
 	borrower string,
 	blockNumber uint64,
 	blockHash string,
-	account account,
+	responseAccount account,
 	reserves []exactReserve,
 ) {
 	normalizedBorrower := strings.ToLower(borrower)
+	// The exact response account is identity-bound to the requested borrower
+	// elsewhere in the response contract; for the evidence-only index, use
+	// its debt/health fields only when the identity matches, otherwise fall
+	// back to the empty account (no ranking signal).
+	if !strings.EqualFold(normalizedBorrower, responseAccount.Borrower) {
+		responseAccount = account{}
+	}
 	var arbDebt *big.Int
 	var collateralAsset string
 	var collateralWei *big.Int
@@ -131,8 +138,8 @@ func (s *Screener) indexArbDebtEvidence(
 		CollateralAsset: collateralAsset,
 		CollateralWei:   collateralWei,
 		CollateralOK:    collateralOK,
-		TotalDebtBase:   account.TotalDebtBase,
-		HealthFactorWAD: account.HealthFactorWAD,
+		TotalDebtBase:   responseAccount.TotalDebtBase,
+		HealthFactorWAD: responseAccount.HealthFactorWAD,
 		BlockNumber:     blockNumber,
 		BlockHash:       blockHash,
 		UpdatedAt:       s.nowUTC(),
