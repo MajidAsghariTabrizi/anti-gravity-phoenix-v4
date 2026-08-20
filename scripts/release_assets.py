@@ -61,6 +61,8 @@ STATIC_PATHS = (
     "prometheus/prometheus.yml",
     "scripts/bootstrap-production.sh",
     "scripts/activate-economic-canary.sh",
+    "scripts/atlas-shadow-validation.sh",
+    "scripts/atlas_shadow_validation_report.py",
     "scripts/monitor-post-arm-revenue.sh",
     "scripts/phoenix_executor_rotation_context.py",
     "scripts/rotate-phoenix-executor-live.sh",

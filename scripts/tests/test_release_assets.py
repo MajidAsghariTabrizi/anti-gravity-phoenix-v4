@@ -28,9 +28,12 @@ LIVE_CANARY_ASSETS = (
     "deploy/phoenix-economic-activation.path",
     "deploy/phoenix-economic-activation.service",
     "scripts/activate-economic-canary.sh",
+    "scripts/atlas-shadow-validation.sh",
+    "scripts/atlas_shadow_validation_report.py",
     "scripts/economic_activation_runner.py",
     "scripts/economic-dashboard-loop.sh",
     "scripts/sql/economic-dashboard-snapshot.sql",
+    "scripts/sql/shadow-atlas-validation.sql",
 )
 
 
