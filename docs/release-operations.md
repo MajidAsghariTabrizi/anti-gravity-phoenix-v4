@@ -10,7 +10,10 @@ A reviewed merge to protected `main` starts Phoenix CI. When all 12 required job
 pass, `workflow_run` invokes the controller. The controller proves that the CI
 repository, branch, event, attempt, SHA, and job set are exact; rejects a superseded
 main tip; skips docs-only changes; reuses a non-expired exact-SHA immutable build
-when present; otherwise calls `build-images.yml` through `workflow_call`; creates a
+when present — including when a prior run's deploy phase failed closed after its
+immutable-build jobs all succeeded (the pre-mutation retry path, which requires
+the stored package identity to match exactly); otherwise calls
+`build-images.yml` through `workflow_call`; creates a
 GitHub Deployment; and sends a bounded release package to `phoenix-deploy`.
 
 `PHOENIX_AUTORELEASE_ENABLED=true` is required. Concurrency group
