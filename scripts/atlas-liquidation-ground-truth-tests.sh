@@ -109,4 +109,10 @@ if sh "$wrapper" --unknown-flag >/dev/null 2>&1; then
   fail "unknown argument unexpectedly passed"
 fi
 
+# The reconciler must run through an explicit entrypoint override: the
+# atlas-observer image entrypoint is the observer binary, and the wrapper's
+# docker invocation must therefore pin /usr/local/bin/atlas-reconciler.
+grep -q -- "--entrypoint /usr/local/bin/atlas-reconciler" "$wrapper" ||
+  fail "reconciler entrypoint override is missing"
+
 echo "atlas-liquidation-ground-truth-tests: all checks passed"

@@ -119,8 +119,9 @@ image=$(docker inspect app-atlas-observer-1 --format '{{.Image}}') ||
   fail "atlas-observer image identity could not be read"
 echo "collect-atlas-liquidation-ground-truth: reconciling with image $image" >&2
 if ! docker run --rm -i --user "$(id -u):$(id -g)" \
+  --entrypoint /usr/local/bin/atlas-reconciler \
   -v "$scratch:/ledger" "$image" \
-  /usr/local/bin/atlas-reconciler --ledger-dir /ledger \
+  --ledger-dir /ledger \
   <"$scratch/transcript.json" >"$scratch/reconciler.out" 2>"$scratch/reconciler.err"; then
   fail "atlas-reconciler failed: $(tail -n 1 "$scratch/reconciler.err")"
 fi
