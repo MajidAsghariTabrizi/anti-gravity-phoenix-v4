@@ -66,6 +66,7 @@ STATIC_PATHS = (
     "scripts/atlas-shadow-validation.sh",
     "scripts/atlas_shadow_validation_report.py",
     "scripts/collect-atlas-liquidation-ground-truth.sh",
+    "scripts/collect-atlas-liquidation-ground-truth-tip-anchored.sh",
     "scripts/atlas_liquidation_ground_truth.py",
     "scripts/monitor-post-arm-revenue.sh",
     "scripts/phoenix_executor_rotation_context.py",

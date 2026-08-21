@@ -115,4 +115,18 @@ fi
 grep -q -- "--entrypoint /usr/local/bin/atlas-reconciler" "$wrapper" ||
   fail "reconciler entrypoint override is missing"
 
+# The tip-anchored helper must probe latest through the reviewed exporter and
+# delegate the actual collection to the canonical wrapper unchanged.
+anchored="$script_dir/collect-atlas-liquidation-ground-truth-tip-anchored.sh"
+if [ ! -f "$anchored" ]; then
+  fail "tip-anchored helper is missing"
+fi
+grep -q -- "latest_block" "$anchored" ||
+  fail "tip-anchored helper is missing the latest-block probe"
+grep -q -- '"$wrapper" --from-block' "$anchored" ||
+  fail "tip-anchored helper does not delegate to the canonical wrapper"
+if sh "$anchored" --unknown-flag >/dev/null 2>&1; then
+  fail "tip-anchored helper accepted an unknown argument"
+fi
+
 echo "atlas-liquidation-ground-truth-tests: all checks passed"
