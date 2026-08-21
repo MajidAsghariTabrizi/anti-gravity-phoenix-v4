@@ -171,12 +171,18 @@ jobs:
             run="$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${build_run_id}")"
             if [ "$(jq -r '.head_sha' <<<"$run")" = "$RELEASE_SHA" ] &&
               [ "$(jq -r '.status' <<<"$run")" = completed ] &&
-              [ "$(jq -r '.conclusion' <<<"$run")" = success ] &&
               [ "$(jq -r '.repository.full_name' <<<"$run")" = "$GITHUB_REPOSITORY" ]
             then
-              printf 'build_required=false\nbuild_run_id=%s\n' \
-                "$build_run_id" >>"$GITHUB_OUTPUT"
-              exit 0
+              run_jobs="$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${build_run_id}/attempts/1/jobs?per_page=100")"
+              build_jobs="$(jq -r '[.jobs[] | select(.name | startswith("immutable-build/"))]' <<<"$run_jobs")"
+              if [ "$(jq -r '.conclusion' <<<"$run")" = success ] ||
+                { [ "$(jq -r 'length' <<<"$build_jobs")" -gt 0 ] &&
+                  [ "$(jq -r '[.[] | select(.conclusion != "success")] | length' <<<"$build_jobs")" = 0 ]; }
+              then
+                printf 'build_required=false\nbuild_run_id=%s\n' \
+                  "$build_run_id" >>"$GITHUB_OUTPUT"
+                exit 0
+              fi
             fi
           fi
           printf 'build_required=true\nbuild_run_id=%s\n' \
