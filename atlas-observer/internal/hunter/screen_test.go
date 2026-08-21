@@ -5497,6 +5497,38 @@ func TestResolveExactBlockRegressionRejectsObservationWithoutFatal(t *testing.T)
 	}
 }
 
+func TestResolveExactChainMismatchRemainsFatal(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if request.URL.Path != "/v1/aave/exact" {
+			t.Fatalf("unexpected path: %s", request.URL.Path)
+		}
+		var input exactRequest
+		if err := json.NewDecoder(request.Body).Decode(&input); err != nil {
+			t.Fatal(err)
+		}
+		primary := exactProvider{ProviderID: primaryProviderID, FlashPremiumBPS: 5}
+		_ = json.NewEncoder(writer).Encode(exactResponse{
+			SchemaVersion: "phoenix.rpc.aave-exact-response.v5", ChainID: 1, RequestID: input.RequestID,
+			BlockNumber: 200, BlockHash: "0x" + strings.Repeat("a", 64), StateRoot: "0x" + strings.Repeat("b", 64),
+			Primary: primary, Confirmation: nil, Quorum: 1,
+		})
+	}))
+	defer server.Close()
+	screener := economicTestScreener(server)
+	record, err := screener.resolveExact(context.Background(), signal{
+		Cursor: 1, Block: 100, Borrower: "0x1111111111111111111111111111111111111111",
+	}, nil)
+	if err == nil {
+		t.Fatal("chain-mismatched exact evidence was accepted")
+	}
+	if errors.Is(err, errProviderEvidenceStale) {
+		t.Fatalf("chain mismatch must not be classified as stale evidence: %v", err)
+	}
+	if record.ExactPrimaryProvider != "" || record.ExecutionCandidate != nil || record.AtlasCandidate != nil || record.Authority {
+		t.Fatalf("chain-mismatched evidence carried authority: %+v", record)
+	}
+}
+
 func TestStaleScreenBatchSkipsWithoutFatalAndSelfHeals(t *testing.T) {
 	now := time.Date(2026, 8, 21, 12, 0, 0, 0, time.UTC)
 	borrowerAccount := account{
