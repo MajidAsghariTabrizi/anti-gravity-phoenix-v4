@@ -372,10 +372,24 @@ transactions and persists them to `live_canary.atlas_liquidation_ground_truth`
   a bounded, credential-free operator tool with a five-method read-only
   JSON-RPC allowlist (`eth_chainId`, `eth_blockNumber`, `eth_getLogs`,
   `eth_getTransactionByHash`, `eth_getTransactionReceipt`) and a 20,000-block
-  span cap. It reads provider URLs from the running rpc-gateway container's
-  environment and never prints them. It performs DIRECT public RPC — it is a
+  span cap. It performs DIRECT public RPC — it is a
   cold-path operator tool, not part of the hot money path (which remains
   rpc-gateway-only).
+- Provider configuration mirrors the reviewed rpc-gateway provider contract,
+  read from the running rpc-gateway container's environment, with this
+  deterministic precedence: (1) authenticated production contract when
+  `RPC_AUTHORITY_MODE=single_primary` — exactly one provider built from
+  `RPC_AUTH_PROVIDER_ID` (must equal `production-nownodes-arbitrum`),
+  `RPC_AUTH_PROVIDER_URL` (http/https with a host, mirroring
+  `providers::is_http_url`), `RPC_AUTH_PROVIDER_PRIORITY` (positive,
+  <= 2^32-1), `RPC_AUTH_PROVIDER_HEADER_NAME` (RFC 7230 token, 1..200
+  characters), and `RPC_AUTH_PROVIDER_HEADER_FILE` (absolute
+  container-internal path; the secret value is read through a single
+  `docker exec` pipe, kept in memory only, never printed, never placed in
+  argv, never written to a host file); (2) legacy `RPC_PROVIDER_URLS`
+  (unchanged list contract); (3) fail closed. Provider URLs and auth
+  secrets never appear in error output — failures reference only the
+  validated provider identity or an index plus an error class.
 - `atlas-reconciler` (reviewed, no network/signer) decodes the transcript
   against the Atlas v1.6.4 `metacall`/`SolverTxResult`/`MetacallResult`
   identities and the reviewed Arbitrum Aave V3 pool, and only binds auctions
