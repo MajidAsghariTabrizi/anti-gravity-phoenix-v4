@@ -126,6 +126,7 @@ const (
 const (
 	revenueLaneAuthorityDivergedKey   = "revenue_lane_authority_diverged_total"
 	revenueLaneAuthorityDivergedClass = "revenue_lane_authority_diverged"
+	staleScreenBatchSkippedKey        = "stale_screen_batch_skipped_total"
 )
 
 var addressPattern = regexp.MustCompile(`^0x[0-9a-f]{40}$`)
@@ -2247,7 +2248,11 @@ func (s *Screener) persistScreenSignalLocked(
 	if err := appendJSON(filepath.Join(s.config.StateDir, "signals.ndjson"), record); err != nil {
 		return err
 	}
-	if invalidatedBlock := s.state.TailInvalidatedBlock[borrower]; invalidatedBlock != 0 && record.Block >= invalidatedBlock {
+	if invalidatedBlock := s.state.TailInvalidatedBlock[borrower]; invalidatedBlock != 0 && record.Block >= invalidatedBlock && record.StateRoot != "" {
+		// The tail-invalidation tombstone clears only on genuine fresh state
+		// proof (an Exact-pinned StateRoot at or after the invalidation
+		// block). Observations without state proof must not clear it, or a
+		// restart would resurrect pre-tail Exact evidence.
 		delete(s.state.TailInvalidatedBlock, borrower)
 	}
 	if s.config.SignalSink != nil && !sinkRecorded {
@@ -2355,7 +2360,13 @@ func (s *Screener) screen(ctx context.Context, borrowers []string, advanceSeed b
 	completedSignals := make([]completedScreenSignal, 0, len(primaryEvidence.Accounts))
 	for _, borrower := range borrowers {
 		if invalidatedBlock := s.state.TailInvalidatedBlock[borrower]; invalidatedBlock > screenBlockNumber {
-			return errors.New("gateway Aave screen predates tail invalidation")
+			// Stale screen evidence: the gateway served state older than this
+			// borrower's tail-invalidation point. The batch carries no valid
+			// work, so skip it and re-screen on the next cycle instead of
+			// terminating the hunter. Evidence staleness is a per-observation
+			// condition, never a process-level failure.
+			s.state.Counts[staleScreenBatchSkippedKey]++
+			return nil
 		}
 	}
 	exactAuthorityWasDegraded := s.state.LastErrorClass != "" &&
@@ -2893,7 +2904,13 @@ func (s *Screener) resolveExact(ctx context.Context, record signal, auction *obs
 		}
 	}
 	if result.BlockNumber < record.Block {
-		return record, errors.New("exact Aave evidence predates its primary screen")
+		// The Exact state is older than the screen that admitted this borrower
+		// (a pinned-block regression). Reject THIS observation with a precise
+		// terminal reason and continue; the next screen cycle produces fresh
+		// evidence. This must not terminate the hunter.
+		record.TerminalOutcome = "incomplete"
+		record.AuthorityRejectionReason = "exact_evidence_predates_primary_screen"
+		return record, nil
 	}
 	record.ExactPrimaryProvider = result.Primary.ProviderID
 	record.ExactConfirmationProvider = nil
@@ -4932,7 +4949,9 @@ func (s *Screener) applyHotSignal(record signal) {
 		if record.Block < invalidatedBlock {
 			return
 		}
-		delete(s.state.TailInvalidatedBlock, record.Borrower)
+		if record.StateRoot != "" {
+			delete(s.state.TailInvalidatedBlock, record.Borrower)
+		}
 	}
 	if record.Bucket == "liquidatable" || record.Bucket == "urgent" || record.Bucket == "watch" {
 		s.hotBorrowers[record.Borrower] = record.HF

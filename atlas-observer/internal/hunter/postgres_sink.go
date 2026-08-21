@@ -65,10 +65,17 @@ type liveSizeAuthorityRow struct {
 
 var errRevenueLaneAuthorityDiverged = errors.New("revenue lane authority diverged")
 
+// errProviderEvidenceStale classifies provider evidence that is identity-valid
+// and freshly captured but older than the durable authority floor (or the
+// failure transition). Stale evidence must reject the individual observation
+// fail closed economically; it must never terminate the hunter process.
+var errProviderEvidenceStale = errors.New("provider evidence is stale relative to the durable authority floor")
+
 const (
 	revenueAuthorityClosedReason   = "revenue_authority_closed"
 	liveSizeAuthorityChangedReason = "live_size_authority_changed"
 	providerRecoverySampleWindow   = 2 * time.Minute
+	providerEvidenceStaleClass     = "provider_evidence_predates_authority_floor"
 )
 
 func (s *PostgresSignalSink) RecordProviderFailure(ctx context.Context, reason string, observedAt time.Time) error {
@@ -143,7 +150,15 @@ func advancePrimaryProviderSamples(
 	return samples, true
 }
 
-func recordPrimaryProviderSuccess(ctx context.Context, tx pgx.Tx, observedAt time.Time, primary string) error {
+// providerAuthorityDB is the minimal transaction seam used by the provider
+// recovery accounting so deterministic tests can exercise the durable floor,
+// failure-transition, and sample-advance invariants without a live database.
+type providerAuthorityDB interface {
+	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
+	Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error)
+}
+
+func recordPrimaryProviderSuccess(ctx context.Context, db providerAuthorityDB, observedAt time.Time, primary string) error {
 	if observedAt.IsZero() || primary != primaryProviderID {
 		return errors.New("primary provider evidence is invalid")
 	}
@@ -153,7 +168,7 @@ func recordPrimaryProviderSuccess(ctx context.Context, tx pgx.Tx, observedAt tim
 	var count int16
 	var sampleAt [3]*time.Time
 	var samplePrimary [3]*string
-	err := tx.QueryRow(ctx, `
+	err := db.QueryRow(ctx, `
 		SELECT failure_transition_at, recovery_status,
 		       request_evidence_not_before, sample_count,
 		       sample_1_at, sample_1_primary_provider,
@@ -173,10 +188,10 @@ func recordPrimaryProviderSuccess(ctx context.Context, tx pgx.Tx, observedAt tim
 	}
 	now := observedAt.UTC()
 	if !now.After(requestEvidenceNotBefore.UTC()) {
-		return errors.New("primary provider evidence predates the request evidence floor")
+		return fmt.Errorf("primary provider evidence predates the request evidence floor: %w", errProviderEvidenceStale)
 	}
 	if failureTransition != nil && !now.After(failureTransition.UTC()) {
-		return errors.New("primary provider evidence predates the failure transition")
+		return fmt.Errorf("primary provider evidence predates the failure transition: %w", errProviderEvidenceStale)
 	}
 	samples := make([]providerRecoverySample, 0, 3)
 	for index := 0; index < int(count); index++ {
@@ -204,7 +219,7 @@ func recordPrimaryProviderSuccess(ctx context.Context, tx pgx.Tx, observedAt tim
 		}
 	}
 	exactExecutionReady := len(samples) == 3 && (status == "ready" || status == "recovered")
-	result, err := tx.Exec(ctx, `
+	result, err := db.Exec(ctx, `
 		UPDATE live_canary.revenue_provider_authority
 		SET exact_execution_ready = $13,
 		    gate_reason = 'exact_primary_success', gate_updated_at = $1,
@@ -463,7 +478,16 @@ func (s *PostgresSignalSink) RecordAaveSignal(ctx context.Context, record signal
 			return record, errors.New("single-primary Exact evidence has a confirmation provider")
 		}
 		if err := recordPrimaryProviderSuccess(ctx, tx, observedAt, record.ExactPrimaryProvider); err != nil {
-			return record, err
+			if !errors.Is(err, errProviderEvidenceStale) {
+				return record, err
+			}
+			// Stale-but-identity-valid evidence rejects this observation fail
+			// closed economically: no recovery sample is recorded and no
+			// candidate authority may materialize, but the observation itself
+			// is persisted with a precise terminal reason and the hunter keeps
+			// processing. Process termination is reserved for corruption,
+			// identity, and integrity failures.
+			record = applyStaleProviderEvidenceRejection(record)
 		}
 	}
 	if record.ExecutionCandidate != nil || record.AtlasCandidate != nil {
@@ -644,6 +668,22 @@ func withoutCandidateAuthority(record signal, reason string) signal {
 	record.AtlasCandidate = nil
 	record.TerminalOutcome = "exact_pending"
 	record.ExactDeferredReason = reason
+	return record
+}
+
+// applyStaleProviderEvidenceRejection degrades a record whose Exact evidence
+// is valid but stale relative to the durable authority floor. Candidate
+// authority is stripped (stale evidence must never materialize execution
+// authority) and a pending observation receives a precise terminal reason so
+// the durable row explains itself without killing the hunter.
+func applyStaleProviderEvidenceRejection(record signal) signal {
+	if record.ExecutionCandidate != nil || record.AtlasCandidate != nil {
+		return withoutCandidateAuthority(record, providerEvidenceStaleClass)
+	}
+	if (record.TerminalOutcome == "exact_pending" || record.TerminalOutcome == "fork_pending") &&
+		record.ExactDeferredReason == "" && record.AuthorityRejectionReason == "" {
+		record.ExactDeferredReason = providerEvidenceStaleClass
+	}
 	return record
 }
 

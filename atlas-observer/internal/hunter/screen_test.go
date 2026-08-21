@@ -4862,12 +4862,15 @@ func TestRouteIneligibleStatePersistsAndTailInvalidatesDurably(t *testing.T) {
 	second.config.RetainedProfitFloorWei = "1"
 	second.config.MaximumInputAmountWei = maximumReviewedInputWei
 	second.client = screenServer.Client()
-	if err := second.screen(context.Background(), []string{borrower}, false, nil); err == nil || exactRequests != 0 {
-		t.Fatalf("pre-tail screen was not rejected before Exact: calls=%d err=%v", exactRequests, err)
+	if err := second.screen(context.Background(), []string{borrower}, false, nil); err != nil || exactRequests != 0 {
+		t.Fatalf("pre-tail screen admitted Exact work or terminated the hunter: calls=%d err=%v", exactRequests, err)
+	}
+	if got := second.Snapshot().Counts[staleScreenBatchSkippedKey]; got != 1 {
+		t.Fatalf("pre-tail screen skip was not counted: %d", got)
 	}
 	screenBlock = 100
-	if err := second.screen(context.Background(), []string{borrower}, false, nil); err == nil || exactRequests != 1 {
-		t.Fatalf("Exact evidence older than its screen was not rejected: calls=%d err=%v", exactRequests, err)
+	if err := second.screen(context.Background(), []string{borrower}, false, nil); err != nil || exactRequests != 1 {
+		t.Fatalf("Exact evidence older than its screen was not rejected per-observation: calls=%d err=%v", exactRequests, err)
 	}
 	restarted := &Screener{
 		config: Config{StateDir: directory, DiscoverySHA256: discoveryHash, StartingCursor: 0, RetainedProfitFloorWei: "1"},
@@ -4878,8 +4881,11 @@ func TestRouteIneligibleStatePersistsAndTailInvalidatesDurably(t *testing.T) {
 	if err := restarted.loadHotSignals(); err != nil {
 		t.Fatal(err)
 	}
-	if restarted.latestOutcome[borrower] != "" || !restarted.lastExactAt[borrower].IsZero() || !restarted.firstLiquidatableAt[borrower].IsZero() || restarted.hotUpperPositive[borrower] || restarted.Snapshot().ActiveForkPendingCount != 0 {
-		t.Fatalf("restart resurrected tail-invalidated Exact evidence: outcome=%q exact=%v epoch=%v", restarted.latestOutcome[borrower], restarted.lastExactAt[borrower], restarted.firstLiquidatableAt[borrower])
+	if restarted.latestOutcome[borrower] != "incomplete" || !restarted.lastExactAt[borrower].IsZero() || restarted.Snapshot().ActiveForkPendingCount != 0 {
+		t.Fatalf("restart resurrected tail-invalidated Exact evidence: outcome=%q exact=%v fork=%d", restarted.latestOutcome[borrower], restarted.lastExactAt[borrower], restarted.Snapshot().ActiveForkPendingCount)
+	}
+	if restarted.state.TailInvalidatedBlock[borrower] != 100 {
+		t.Fatalf("observation without state proof cleared the tail-invalidation tombstone: %+v", restarted.state.TailInvalidatedBlock)
 	}
 }
 
@@ -5450,5 +5456,144 @@ func TestArbDebtIndexedBeforeLiquidationVariantValidation(t *testing.T) {
 	}
 	if entry.CollateralAsset != wethAddress || entry.BlockNumber != 160 {
 		t.Fatalf("ARB collateral/block evidence missing: %+v", entry)
+	}
+}
+
+func TestResolveExactBlockRegressionRejectsObservationWithoutFatal(t *testing.T) {
+	exactCalls := 0
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if request.URL.Path != "/v1/aave/exact" {
+			t.Fatalf("unexpected path: %s", request.URL.Path)
+		}
+		exactCalls++
+		var input exactRequest
+		if err := json.NewDecoder(request.Body).Decode(&input); err != nil {
+			t.Fatal(err)
+		}
+		primary := exactProvider{ProviderID: primaryProviderID, FlashPremiumBPS: 5}
+		_ = json.NewEncoder(writer).Encode(exactResponse{
+			SchemaVersion: "phoenix.rpc.aave-exact-response.v5", ChainID: 42161, RequestID: input.RequestID,
+			BlockNumber: 99, BlockHash: "0x" + strings.Repeat("a", 64), StateRoot: "0x" + strings.Repeat("b", 64),
+			Primary: primary, Confirmation: nil, Quorum: 1,
+		})
+	}))
+	defer server.Close()
+	screener := economicTestScreener(server)
+	record, err := screener.resolveExact(context.Background(), signal{
+		Cursor: 1, Block: 100, Borrower: "0x1111111111111111111111111111111111111111",
+	}, nil)
+	if err != nil {
+		t.Fatalf("stale exact evidence terminated the observation: %v", err)
+	}
+	if exactCalls != 1 {
+		t.Fatalf("unexpected exact call count: %d", exactCalls)
+	}
+	if record.TerminalOutcome != "incomplete" || record.AuthorityRejectionReason != "exact_evidence_predates_primary_screen" {
+		t.Fatalf("regressed exact evidence was not rejected precisely: %+v", record)
+	}
+	if record.ExactPrimaryProvider != "" || record.ExactConfirmationProvider != nil ||
+		record.ExecutionCandidate != nil || record.AtlasCandidate != nil || record.Authority {
+		t.Fatalf("regressed exact evidence carried authority: %+v", record)
+	}
+}
+
+func TestResolveExactChainMismatchRemainsFatal(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if request.URL.Path != "/v1/aave/exact" {
+			t.Fatalf("unexpected path: %s", request.URL.Path)
+		}
+		var input exactRequest
+		if err := json.NewDecoder(request.Body).Decode(&input); err != nil {
+			t.Fatal(err)
+		}
+		primary := exactProvider{ProviderID: primaryProviderID, FlashPremiumBPS: 5}
+		_ = json.NewEncoder(writer).Encode(exactResponse{
+			SchemaVersion: "phoenix.rpc.aave-exact-response.v5", ChainID: 1, RequestID: input.RequestID,
+			BlockNumber: 200, BlockHash: "0x" + strings.Repeat("a", 64), StateRoot: "0x" + strings.Repeat("b", 64),
+			Primary: primary, Confirmation: nil, Quorum: 1,
+		})
+	}))
+	defer server.Close()
+	screener := economicTestScreener(server)
+	record, err := screener.resolveExact(context.Background(), signal{
+		Cursor: 1, Block: 100, Borrower: "0x1111111111111111111111111111111111111111",
+	}, nil)
+	if err == nil {
+		t.Fatal("chain-mismatched exact evidence was accepted")
+	}
+	if errors.Is(err, errProviderEvidenceStale) {
+		t.Fatalf("chain mismatch must not be classified as stale evidence: %v", err)
+	}
+	if record.ExactPrimaryProvider != "" || record.ExecutionCandidate != nil || record.AtlasCandidate != nil || record.Authority {
+		t.Fatalf("chain-mismatched evidence carried authority: %+v", record)
+	}
+}
+
+func TestStaleScreenBatchSkipsWithoutFatalAndSelfHeals(t *testing.T) {
+	now := time.Date(2026, 8, 21, 12, 0, 0, 0, time.UTC)
+	borrowerAccount := account{
+		Borrower:        "0x1111111111111111111111111111111111111111",
+		TotalDebtBase:   "0",
+		HealthFactorWAD: "2000000000000000000",
+	}
+	screenCalls := 0
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if request.URL.Path != "/v1/aave/screen" {
+			t.Fatalf("unexpected path: %s", request.URL.Path)
+		}
+		screenCalls++
+		var input screenRequest
+		if err := json.NewDecoder(request.Body).Decode(&input); err != nil {
+			t.Fatal(err)
+		}
+		_ = json.NewEncoder(writer).Encode(screenResponse{
+			SchemaVersion: ResponseSchema,
+			ChainID:       42161,
+			RequestID:     input.RequestID,
+			BlockNumber:   491300000,
+			BlockHash:     "0x" + strings.Repeat("a", 64),
+			Primary: providerScreen{
+				ProviderID: primaryProviderID, WETHPriceBase: "300000000000", Accounts: []account{borrowerAccount},
+			},
+			Confirmation: nil,
+			Quorum:       1,
+		})
+	}))
+	defer server.Close()
+	sink := &recordingSignalSink{}
+	screener := &Screener{
+		config: Config{StateDir: t.TempDir(), GatewayURL: server.URL, SignalSink: sink},
+		client: server.Client(),
+		state: State{
+			Schema: StateSchema, Counts: map[string]uint64{},
+			TailInvalidatedBlock: map[string]uint64{borrowerAccount.Borrower: 491300001},
+		},
+		debtBearing: make(map[string]bool), refreshKnown: make(map[string]bool),
+		hotBorrowers: make(map[string]string), hotDebtBase: make(map[string]string),
+		hotUpperPositive: make(map[string]bool), latestOutcome: make(map[string]string),
+		lastExactAt: make(map[string]time.Time), firstLiquidatableAt: make(map[string]time.Time),
+		now: func() time.Time { return now },
+	}
+	// Stale screen evidence: the batch must be skipped without terminating
+	// the hunter and without persisting any observation.
+	if err := screener.screen(context.Background(), []string{borrowerAccount.Borrower}, false, nil); err != nil {
+		t.Fatalf("stale screen evidence terminated the hunter: %v", err)
+	}
+	if screenCalls != 1 || len(sink.records) != 0 {
+		t.Fatalf("stale batch was not skipped: screens=%d records=%d", screenCalls, len(sink.records))
+	}
+	if got := screener.Snapshot().Counts[staleScreenBatchSkippedKey]; got != 1 {
+		t.Fatalf("stale screen skip was not counted: %d", got)
+	}
+	// Once the invalidation is resolved, the same screener must recover and
+	// persist normally on the next cycle.
+	screener.mu.Lock()
+	delete(screener.state.TailInvalidatedBlock, borrowerAccount.Borrower)
+	screener.mu.Unlock()
+	if err := screener.screen(context.Background(), []string{borrowerAccount.Borrower}, false, nil); err != nil {
+		t.Fatalf("recovered screen cycle failed: %v", err)
+	}
+	if screenCalls != 2 || len(sink.records) != 1 {
+		t.Fatalf("screen did not self-heal: screens=%d records=%d", screenCalls, len(sink.records))
 	}
 }
