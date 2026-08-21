@@ -5254,6 +5254,50 @@ func TestArbAuctionAttachesToIndexedBorrower(t *testing.T) {
 	}
 }
 
+func TestArbAuctionAttachesWithUppercaseOracleAsset(t *testing.T) {
+	now := time.Date(2026, 8, 13, 0, 30, 0, 0, time.UTC)
+	borrower := arbTestBorrower(8)
+	sink := &recordingSignalSink{}
+	// Live SVR notifications carry uppercase oracle assets ("ARB").
+	uppercase := "ARB"
+	screener := &Screener{
+		config: Config{
+			MaximumGasLimit: 100, MaximumFeePerGasWei: "10", MaximumPriorityFeeWei: "10",
+			MaximumAtlasBidWei: "500", RetainedProfitFloorWei: "100", SignalSink: sink,
+		},
+		state: State{Schema: StateSchema, Counts: map[string]uint64{}, LastBlockNumber: 100},
+		now:   func() time.Time { return now },
+		arbBorrowers: map[string]arbBorrowerEntry{
+			borrower: {
+				Borrower: borrower, ARBVariableDebt: big.NewInt(150000000000),
+				TotalDebtBase: "3000000000", HealthFactorWAD: "860000000000000000", BlockNumber: 98,
+			},
+		},
+	}
+	auction := &observer.LedgerRecord{
+		RelevantAaveAuction: true, ChainID: 42161, AuctionID: "arb-auction-5",
+		AuctionDeadlineBlock: "200", SolverGasLimit: 20, OracleGasPriceWei: "10",
+		NotificationSHA256: strings.Repeat("d", 64), ObservedAt: now,
+		OracleUpdate: &observer.OracleUpdate{Asset: &uppercase},
+	}
+	if err := screener.HandleAtlasAuction(context.Background(), auction); err != nil {
+		t.Fatal(err)
+	}
+	if len(sink.atlasShadowEvaluations) != 1 {
+		t.Fatalf("uppercase ARB auction was not attached: %+v", sink.atlasShadowEvaluations)
+	}
+	evaluation := sink.atlasShadowEvaluations[0]
+	if evaluation.Borrower != borrower || evaluation.TerminalRejectionReason != atlasShadowReasonArbUnwindUnreviewed {
+		t.Fatalf("uppercase ARB auction attached wrong: %+v", evaluation)
+	}
+	if evaluation.Asset != uppercase {
+		t.Fatalf("shadow row did not preserve the live asset form: %+v", evaluation)
+	}
+	if _, present := screener.recentAuctions[arbAuctionAssetSymbol]; !present {
+		t.Fatalf("uppercase ARB auction was not registered under the normalized key")
+	}
+}
+
 func TestArbAuctionLazyAttachClaimsOnce(t *testing.T) {
 	now := time.Date(2026, 8, 13, 1, 0, 0, 0, time.UTC)
 	borrower := arbTestBorrower(3)
