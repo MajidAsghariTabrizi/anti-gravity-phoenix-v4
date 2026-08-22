@@ -120,6 +120,9 @@ export function shaOf(ref = 'HEAD', cwd = REPO_ROOT) {
 
 export async function createWorktree(sha, dir) {
   rmSync(dir, { recursive: true, force: true })
+  // Clear stale registrations from killed runs (worktree dir removed but
+  // .git/worktrees/<id> left behind) before adding.
+  await run('git', ['-C', REPO_ROOT, 'worktree', 'prune'], { timeoutMs: 60000 })
   const res = await run('git', ['-C', REPO_ROOT, 'worktree', 'add', '--detach', dir, sha], { timeoutMs: 120000 })
   return res.ok ? { ok: true, dir } : { ok: false, error: `${res.stdout} ${res.stderr}` }
 }
