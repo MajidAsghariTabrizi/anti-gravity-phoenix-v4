@@ -16,6 +16,15 @@ keystore/
 keystores/
 wallets/
 
+# Phoenix Harness machine-local state (V2/V3 telemetry sinks, checkpoints,
+# capsules, mission specs — per-session by design; never committed)
+.phoenix-harness/
+.agent-private/
+
+# Phoenix Harness V3 eval campaign evidence (live-runner outputs; the
+# reproducible definitions live in tools/phoenix-harness-v3/benchmarks/)
+tools/phoenix-harness-v3/benchmarks/frontier/runs/
+
 # Python / Streamlit
 .venv/
 venv/

@@ -12,7 +12,8 @@
     { "id": "tests/context.test.mjs", "covers": "layered context retrieval + freshness stamps", "mode": "unit" },
     { "id": "tests/business-twin.test.mjs", "covers": "business twin: profit labels never mixed, evidence freshness", "mode": "unit" },
     { "id": "tests/ctl.test.mjs", "covers": "L-008 install/promote/rollback idempotency and gates", "mode": "unit" },
-    { "id": "tests/eval.test.mjs", "covers": "evaluator certificates + frontier scoring determinism", "mode": "unit" }
+    { "id": "tests/eval.test.mjs", "covers": "evaluator certificates + frontier scoring determinism", "mode": "unit" },
+    { "id": "tests/ops-tools.test.mjs", "covers": "current-truth capsule caps, changed-surface, test matrix, CI snapshot, deterministic wait fail-closed", "mode": "unit" }
   ],
-  "frontierEval": "benchmarks/frontier/ (10 tasks, rubrics, scorer) — run via bin/phoenix-harness-v3.mjs eval"
+  "frontierEval": "benchmarks/frontier/ (15 tasks, rubrics, scorer; live automated runner: eval-live) — run via bin/phoenix-harness-v3.mjs eval"
 }
