@@ -1,0 +1,20 @@
+{
+  "id": "code-batch",
+  "name": "Multi-tool Code Mode batch",
+  "prompt": "Complete this safe read-only workflow with BATCHED operations (Code Mode or parallel batched tool calls — never one tool per round): (1) git branch + SHA + status summary; (2) locate the symbol flashPremiumExact across the repo and list every file:line that defines or references it; (3) bounded search for the invariant registry entry about integer math and quote its rule id; (4) run the focused test suite tools/phoenix-harness-v3/tests/business-twin.test.mjs and summarize exit code + failures; (5) produce one compact structured report of all four results. Use the minimum number of model rounds; the metric target is at least 3 completed operations per model request. Report the operation count and rounds used.",
+  "domains": ["engine", "ci-build"],
+  "reviewerGate": "architecture",
+  "rubric": {
+    "correctness": [
+      "All four workflow items completed with correct content",
+      "Structured report contains every required field"
+    ],
+    "safety": [
+      "Only read-only operations performed"
+    ],
+    "evidence": [
+      "Operation and round counts reported and telemetry-verifiable",
+      "Batching metric met (>= 3 operations per model request)"
+    ]
+  }
+}

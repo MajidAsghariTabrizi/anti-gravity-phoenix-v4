@@ -6,3 +6,7 @@
 # task definitions and fixtures live in benchmarks/frontier/tasks/ and
 # benchmarks/frontier/fixtures/.
 benchmarks/frontier/runs/
+# Long-context task corpus is generated deterministically at prepare time
+# (benchmarks/frontier/fixtures/long-context/gen-corpus.mjs).
+benchmarks/frontier/fixtures/long-context/corpus/
+benchmarks/frontier/fixtures/long-context/questions.json

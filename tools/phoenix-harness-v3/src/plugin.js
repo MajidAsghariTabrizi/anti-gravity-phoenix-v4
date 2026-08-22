@@ -32,6 +32,7 @@ import { testTool } from './tools-native/test.js'
 import { remoteTool, productionSnapshotTool, sqlReadonlyTool, releaseVerifyTool } from './tools-native/remote.js'
 import { ciWatchTool, prFlowTool, releasePreflightTool, releaseDispatchTool } from './tools-native/ci.js'
 import { groundTruthTool, businessFunnelTool, opportunityReplayTool, evidenceTool } from './tools-native/business.js'
+import { currentTruthTool, changedSurfaceTool, testMatrixTool, ciSnapshotTool, waitTool } from './tools-native/ops.js'
 import { join } from 'node:path'
 
 export const name = 'dsh-phoenix-harness-v3'
@@ -510,6 +511,11 @@ export function apply(ctx, config = {}) {
     businessFunnelTool(root, knowledgeRoot),
     opportunityReplayTool(root),
     evidenceTool(root),
+    currentTruthTool(root),
+    changedSurfaceTool(root),
+    testMatrixTool(root),
+    ciSnapshotTool(root),
+    waitTool(governor, root, sessionIdOf),
   ]
   const nativeParams = (t) => (t.parameters ?? {})
   for (const t of natives) {

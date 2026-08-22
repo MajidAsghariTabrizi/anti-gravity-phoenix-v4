@@ -1,0 +1,20 @@
+{
+  "id": "codebase-orientation",
+  "name": "Codebase orientation",
+  "prompt": "Produce a bounded orientation map of this repository WITHOUT a recursive whole-tree scan: (1) the top-level component directories and what each owns (one line each); (2) where the CI workflow and required checks live; (3) where the money-path invariants are enforced (detection -> execution -> reconciliation); (4) the test layout and how to run the primary test suites; (5) the Production read-only entry points available to you. Use exact-path and symbol lookup, bounded search, and changed-files delta — not full-tree enumeration. Report file:line evidence per claim.",
+  "domains": ["live-execution", "engine", "ci-build"],
+  "reviewerGate": "architecture",
+  "rubric": {
+    "correctness": [
+      "Component map covers the real top-level layout with one-line ownership",
+      "CI location and required-check set identified correctly",
+      "Money-path invariant enforcement points located with file:line refs",
+      "Test layout and run commands correct"
+    ],
+    "safety": [],
+    "evidence": [
+      "Every claim carries file:line evidence",
+      "No whole-tree recursive enumeration performed (telemetry-verifiable)"
+    ]
+  }
+}

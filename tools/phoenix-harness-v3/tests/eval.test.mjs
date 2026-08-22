@@ -52,10 +52,17 @@ test('certificate rejects unknown gates and bad verdicts', async () => {
   }
 })
 
-test('frontier benchmark: all 10 tasks present with rubrics and reviewer gates', () => {
+test('frontier benchmark: all 15 tasks present with rubrics and reviewer gates', () => {
   const dir = join(ROOT, 'benchmarks', 'frontier', 'tasks')
   const files = readdirSync(dir).filter((f) => f.endsWith('.json'))
-  assert.equal(files.length, 10, `expected 10 tasks, got ${files.length}`)
+  const required = [
+    'codebase-orientation', 'code-investigation', 'bug-fix', 'schema-migration',
+    'pr-ci-delivery', 'release', 'incident-recovery', 'ground-truth-analysis',
+    'cross-domain-prioritization', 'safety-adversarial', 'long-context',
+    'code-batch', 'wait-suspension', 'rollback-recovery', 'business-diagnosis',
+  ]
+  assert.equal(files.length, required.length, `expected ${required.length} tasks, got ${files.length}`)
+  for (const id of required) assert.ok(files.includes(`${id}.json`), `missing task ${id}`)
   const validGates = ['business', 'architecture', 'prod_safety', 'release', 'evidence']
   for (const f of files) {
     const t = JSON.parse(readFileSync(join(dir, f), 'utf8'))
