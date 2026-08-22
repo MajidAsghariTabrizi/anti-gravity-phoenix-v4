@@ -102,3 +102,29 @@ restartOk, rollbackOk, noopRounds, plus telemetry-derived deltas:
 costIndex <= -50%, cacheRead <= -60%, modelCalls <= -40% (candidate
 reduction targets), polling rounds = 0, bookkeeping rounds <= -80%.
 Context gates: P95 estInputChars <= 96K (char-based surface), no overflow.
+
+## 7. Child mechanism (verified live 2026-08-22)
+
+Each run is one child process (`src/eval/run-one.mjs`) booting the pinned
+checkout with a composed host tree, driven by a mounted driver row
+(`src/eval/driver-plugin.mjs`) — the same architecture dsh-headless ships
+(the driver's row-scoped context is the only place the core registries
+resolve). Facts established by live verification:
+
+- `boot()` takes a FLAT patch list (`loadOptionalPatches` shape) with insert
+  rows intact; passing `composeEntries` output double-applies patches and
+  yields an empty tree.
+- The root config file must live INSIDE the checkout's node_modules
+  (`.phx-eval/root-<pid>.cordis.yml`): its directory becomes `ctx.baseUrl`,
+  which preset mounts use to resolve bare package names.
+- Model selection settles asynchronously after boot (settings user layer
+  lands ~1s later); the driver waits for the selection to match the
+  settings section (20s cap) before creating the agent, then fails closed.
+- TRANSPORT (provider-side) failures and telemetry-stalled children (4 min
+  without progress) trigger attempt retries (3 attempts max) — provider
+  weather is not arm quality; every attempt still records telemetry.
+- Killed runs keep their worktree telemetry via `collectAllTelemetryEvidence`
+  so budget kills still feed gate statistics.
+- Arm isolation: per-arm `DSH_HOME` (settings/.credentials/.agent-presets,
+  never sessions), child cwd = per-run worktree (plugin/telemetry roots),
+  candidate rebuilt from canonical source per campaign prepare.
