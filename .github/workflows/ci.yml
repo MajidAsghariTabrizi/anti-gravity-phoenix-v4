@@ -140,6 +140,20 @@ jobs:
           SHELLCHECK_OPTS=--severity=warning \
             go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.7
 
+      - name: Setup Node for Phoenix Harness V3 tests
+        if: ${{ steps.impact.outputs.job_hygiene == 'true' }}
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: 22
+
+      - name: Run Phoenix Harness V3 node tests
+        if: ${{ steps.impact.outputs.job_hygiene == 'true' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd tools/phoenix-harness-v3
+          node --test tests/*.test.mjs
+
       - name: Run focused pull-request release validation
         if: ${{ steps.impact.outputs.job_hygiene == 'true' && github.event_name == 'pull_request' }}
         shell: bash
