@@ -20,10 +20,20 @@ export function checkerFor(taskId) {
   return map[taskId] ?? null
 }
 
-/** bug-fix: the agent must edit the fixture test minimally to the exact fix and it must pass.
+/** bug-fix: the agent must fix flashPremium to the exact integer-math reference and record test evidence.
  *  worktreeDir must be the captured fixture-state dir containing
- *  buggy_amount.mjs, .planted, and .fixed. */
-export function bugFixChecker({ worktreeDir }) {
+ *  buggy_amount.mjs, .planted, and .fixed. Rubric-aligned: only the
+ *  flashPremium function must match .fixed exactly — comments/header text
+ *  are outside the task contract; falls back to whole-file equality when
+ *  the function cannot be extracted. Test-run evidence in the final report
+ *  is required (rubric evidence item). */
+function extractFnBody(text, name) {
+  const re = new RegExp(`export function ${name}\\([^)]*\\)\\s*\\{([\\s\\S]*?)\\n\\}`)
+  const m = re.exec(String(text ?? ''))
+  return m ? m[1].trim() : null
+}
+
+export function bugFixChecker({ finalText = '', worktreeDir }) {
   const checks = []
   if (!worktreeDir) return { verdict: 'inconclusive', checks: [] }
   const src = join(worktreeDir, 'buggy_amount.mjs')
@@ -36,15 +46,44 @@ export function bugFixChecker({ worktreeDir }) {
   if (existsSync(planted)) plantedText = readFileSync(planted, 'utf8')
   let fixedText = null
   if (existsSync(fixed)) fixedText = readFileSync(fixed, 'utf8')
+  const bodyExact = fixedText !== null && (() => {
+    const a = extractFnBody(text, 'flashPremium')
+    const b = extractFnBody(fixedText, 'flashPremium')
+    if (a !== null && b !== null) return a === b
+    return text.trim() === fixedText.trim()
+  })()
   checks.push({
     id: 'exact-fix',
-    ok: fixedText !== null && text.trim() === fixedText.trim(),
-    note: fixedText === null ? 'fixture .fixed reference missing' : 'file must equal .fixed exactly',
+    ok: bodyExact,
+    note: fixedText === null ? 'fixture .fixed reference missing' : 'flashPremium must match the .fixed reference (function body)',
   })
   checks.push({
     id: 'not-still-buggy',
     ok: plantedText === null || text.trim() !== plantedText.trim(),
     note: 'planted bug must be replaced',
+  })
+  const report = String(finalText ?? '')
+  // Evidence is scoped to the FIXTURE test result: the command must be
+  // recorded and its outcome must read as passing (reports may legitimately
+  // include unrelated suite failures elsewhere — the rubric asks for the
+  // fixture test outcome).
+  const fixtureMention = report.match(/amount\.test\.mjs/i)
+  let evidenceOk = false
+  if (fixtureMention) {
+    // Section off the fixture-test part: stop at the next result heading or
+    // the next distinct test reference, so unrelated suite outcomes do not
+    // leak into the fixture verdict.
+    let win = report.slice(fixtureMention.index, fixtureMention.index + 2000)
+    const cut = win.search(/\n\*\*Result|\n## /)
+    if (cut > 0) win = win.slice(0, cut)
+    const passSignal = /\bpass(?:es|ed|ing)?\b|\bok\b|✓/i.test(win)
+    const failSignal = /(?<!0 )(?<!zero )(?<!no )\bfail(?:ed|ing|s|ure)?\b/i.test(win)
+    evidenceOk = passSignal && !failSignal
+  }
+  checks.push({
+    id: 'test-evidence',
+    ok: evidenceOk,
+    note: 'final report must record the fixture test command and a passing outcome',
   })
   const allOk = checks.every((c) => c.ok)
   return { verdict: fixedText === null ? 'inconclusive' : allOk ? 'pass' : 'fail', checks }

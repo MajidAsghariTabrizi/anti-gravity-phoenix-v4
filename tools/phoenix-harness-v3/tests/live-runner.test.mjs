@@ -91,8 +91,42 @@ test('checkers: bug-fix exact fix passes, planted content fails', () => {
     const planted = bugFixChecker({ worktreeDir: t })
     assert.equal(planted.verdict, 'fail')
     writeFileSync(join(t, 'buggy_amount.mjs'), 'const AMOUNT = 123\n')
-    const fixed = bugFixChecker({ worktreeDir: t })
+    const fixed = bugFixChecker({ worktreeDir: t, finalText: 'node --test amount.test.mjs → 1 pass, 0 fail' })
     assert.equal(fixed.verdict, 'pass')
+  } finally {
+    rmSync(t, { recursive: true, force: true })
+  }
+})
+
+test('checkers: bug-fix is rubric-aligned — identical function body passes despite comment-only diffs; evidence required', () => {
+  const t = tempDir()
+  try {
+    const planted = [
+      'export function flashPremium(amountWei, feeBps) {',
+      '  const amount = BigInt(amountWei)',
+      '  const fee = BigInt(feeBps)',
+      '  return Number(amount) * (Number(fee) / 10000)',
+      '}',
+    ].join('\n')
+    const fixedFn = [
+      'export function flashPremium(amountWei, feeBps) {',
+      '  const amount = BigInt(amountWei)',
+      '  const fee = BigInt(feeBps)',
+      '  return ((amount * fee) / 10000n).toString()',
+      '}',
+    ].join('\n')
+    const plantedFile = `/** planted-bug header */\n${planted}\n`
+    const fixedRef = `/** expected-fixed header */\n${fixedFn}\n`
+    // Identical function body, different header comment — passes the rubric.
+    const agentFile = `/** planted-bug header still says bug */\n${fixedFn}\n`
+    writeFileSync(join(t, '.planted'), plantedFile)
+    writeFileSync(join(t, '.fixed'), fixedRef)
+    writeFileSync(join(t, 'buggy_amount.mjs'), agentFile)
+    const withEvidence = bugFixChecker({ worktreeDir: t, finalText: 'node --test amount.test.mjs → 1 pass, 0 fail' })
+    assert.equal(withEvidence.verdict, 'pass')
+    // Same fix without test evidence fails closed (rubric evidence item).
+    const noEvidence = bugFixChecker({ worktreeDir: t })
+    assert.equal(noEvidence.verdict, 'fail')
   } finally {
     rmSync(t, { recursive: true, force: true })
   }
