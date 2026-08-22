@@ -200,6 +200,41 @@ export function collectSessionEvidence(roots, sessionId, dest, cap = 40 * 1024 *
   return found
 }
 
+/**
+ * Kill-path evidence fallback: when the child died before it could record a
+ * sessionId, copy every telemetry JSONL under the roots (bounded). The
+ * session identity is recoverable from the file names themselves.
+ */
+export function collectAllTelemetryEvidence(roots, dest, cap = 40 * 1024 * 1024) {
+  const found = []
+  let bytes = 0
+  for (const root of roots) {
+    if (!existsSync(root)) continue
+    const walk = (base, depth) => {
+      if (depth > 6 || bytes >= cap) return
+      let entries
+      try { entries = readdirSync(base, { withFileTypes: true }) } catch { return }
+      for (const e of entries) {
+        if (bytes >= cap) return
+        const p = join(base, e.name)
+        if (e.isDirectory()) { walk(p, depth + 1); continue }
+        if (!e.name.endsWith('.jsonl')) continue
+        if (!p.split(/[\\/]/).includes('telemetry')) continue
+        try {
+          const size = statSync(p).size
+          const dst = join(dest, 'evidence', 'telemetry', e.name)
+          mkdirSync(dirname(dst), { recursive: true })
+          copyFileSync(p, dst)
+          found.push({ file: p.replace(/\\/g, '/'), size })
+          bytes += size
+        } catch { /* bounded best-effort */ }
+      }
+    }
+    walk(root, 0)
+  }
+  return found
+}
+
 /** Close eval-owned PRs and delete their branches (pr-ci-delivery cleanup). */
 export async function cleanupEvalPrs() {
   const list = await run('gh', ['pr', 'list', '--state', 'open', '--search', 'phoenix-eval', '--json', 'number,headRefName'], { timeoutMs: 30000 })

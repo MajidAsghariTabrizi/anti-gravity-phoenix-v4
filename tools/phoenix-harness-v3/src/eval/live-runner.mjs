@@ -30,7 +30,8 @@ import { spawn } from 'node:child_process'
 import {
   REPO_ROOT, checkoutPath, verifyCheckout, realDshHome, presetIdFor, toolsModeFor,
   armHomeFor, prepareArmHome, shaOf, createWorktree, removeWorktree,
-  plantTaskFixtures, copyLocalContext, taskPromptText, collectSessionEvidence, run,
+  plantTaskFixtures, copyLocalContext, taskPromptText, collectSessionEvidence,
+  collectAllTelemetryEvidence, run,
 } from './campaign.mjs'
 import { checkerFor } from './checkers.mjs'
 import { judgePrompt, parseVerdict, mapVerdict } from './judge.mjs'
@@ -162,93 +163,116 @@ async function runCampaign(args) {
       for (let r = 0; r < runsN; r++) {
         const armHome = manifest.arms[arm].home
         const runDir = join(root, 'runs', arm, taskId, `r${r}`)
-        mkdirSync(runDir, { recursive: true })
-        // Keep the worktree path SHORT: Windows MAX_PATH (260) bites on deep
-        // campaign roots; the repo itself adds ~95 chars of prefix.
         const wt = join(root, 'wt', `${arm[0]}${taskId.slice(0, 6)}r${r}`)
-        const entry = { arm, taskId, run: r, startedAt: new Date().toISOString(), sha, runDir, ok: false, error: null }
-        console.error(`[eval] ${arm} ${taskId} r${r} — worktree at ${sha.slice(0, 8)}`)
-        const created = await createWorktree(sha, wt)
-        if (!created.ok) {
-          entry.error = created.error
-          results.push(entry)
-          continue
-        }
-        copyLocalContext(wt)
-        const planted = await plantTaskFixtures(wt, taskId)
-        if (!planted.ok) {
-          entry.error = `fixture plant failed: ${planted.error}`
-          await removeWorktree(wt)
-          results.push(entry)
-          continue
-        }
-        const sessionIdPlaceholder = `eval-${arm}-${taskId}-r${r}`
-        const promptFile = join(runDir, 'prompt.md')
-        writeFileSync(promptFile, taskPromptText(tasks[taskId], { sessionId: sessionIdPlaceholder, arm, taskId }))
-        const outFile = join(runDir, 'run.json')
-        const preset = manifest.arms[arm].preset
-        let childResult
-        if (process.env.PHOENIX_EVAL_FAKE_CHILD === '1') {
-          // Evaluator-mechanics stub — synthetic run records only (tests).
-          childResult = { ok: true, killed: false, code: 0, stdout: '', stderr: 'synthetic' }
-          writeJson(outFile, {
-            schema: 'phoenix.eval.run.v1', synthetic: true, presetId: preset, taskId, run: r,
-            startedAt: entry.startedAt, finishedAt: new Date().toISOString(), wallMs: 1000,
-            sessionId: `synthetic-${arm}-${taskId}-r${r}`, ok: true, exitCode: 0,
-            finalText: 'SYNTHETIC FAKE RUN — mechanics test only.\n' + (tasks[taskId].prompt ?? '').slice(0, 200),
-            finalTextLen: 120, reason: { kind: 'completed' },
-            digest: { types: { 'assistant/message': 1, 'turn/end': 1 }, tools: { phoenix_context: 1 } },
-            model: manifest.model,
-          })
-        } else {
-          childResult = await spawnChild([
-            RUN_ONE,
-            '--preset', preset || 'none',
-            '--task', taskId,
-            '--run', String(r),
-            '--worktree', wt,
-            '--prompt-file', promptFile,
-            '--dsh-home', armHome,
-            '--out', outFile,
-            '--budget-ms', String(budgetMin * 60000),
-          ], {
-            cwd: wt,
-            budgetMs: budgetMin * 60000,
-            env: {
-              DSH_HOME: armHome,
-              PHOENIX_DSH_CHECKOUT: manifest.checkout,
-              ...(manifest.arms[arm].toolsMode === 'code' ? { DSH_TOOLS_MODE: 'code' } : {}),
-            },
-          })
-        }
-        const record = readJson(outFile, null)
-        entry.ok = record?.ok === true
-        entry.exitCode = record?.exitCode ?? childResult.code
-        entry.wallMs = record?.wallMs ?? null
-        entry.sessionId = record?.sessionId ?? null
-        entry.synthetic = record?.synthetic === true
-        entry.finalTextLen = record?.finalTextLen ?? 0
-        entry.reason = record?.reason ?? null
-        entry.killed = childResult.killed === true
-        entry.stderrTail = String(childResult.stderr ?? '').slice(-2000)
-        if (entry.sessionId) {
-          const evidence = collectSessionEvidence(
-            [join(wt, '.phoenix-harness'), join(armHome, '.phoenix-harness')],
-            entry.sessionId, runDir)
-          entry.evidenceFiles = evidence
-        }
-        // Capture fixture state before teardown (bug-fix checker needs it).
-        const fixState = join(runDir, 'evidence', 'fixture-state')
-        mkdirSync(fixState, { recursive: true })
-        const fixDir = join(wt, 'tools', 'phoenix-harness-v3', 'benchmarks', 'frontier', 'fixtures', 'amount-math')
-        if (existsSync(fixDir)) {
-          for (const f of readdirSync(fixDir).filter((x) => !x.endsWith('.test.mjs'))) {
-            copyFileSync(join(fixDir, f), join(fixState, f))
+        // Provider-side TRANSPORT failures are not arm quality — retry the
+        // same slot (fresh worktree, fresh session) up to ATTEMPT_CAP times.
+        const ATTEMPT_CAP = 3
+        let entry = null
+        for (let attempt = 0; attempt < ATTEMPT_CAP; attempt++) {
+          entry = {
+            arm, taskId, run: r, attempt: attempt + 1,
+            startedAt: new Date().toISOString(), sha, runDir, ok: false, error: null,
           }
+          // Fresh run dir — stale records from a prior attempt must never be
+          // misread as this run's outcome.
+          rmSync(runDir, { recursive: true, force: true })
+          mkdirSync(runDir, { recursive: true })
+          console.error(`[eval] ${arm} ${taskId} r${r} attempt ${attempt + 1} — worktree at ${sha.slice(0, 8)}`)
+          const created = await createWorktree(sha, wt)
+          if (!created.ok) {
+            entry.error = created.error
+            break
+          }
+          copyLocalContext(wt)
+          const planted = await plantTaskFixtures(wt, taskId)
+          if (!planted.ok) {
+            entry.error = `fixture plant failed: ${planted.error}`
+            await removeWorktree(wt)
+            break
+          }
+          const sessionIdPlaceholder = `eval-${arm}-${taskId}-r${r}`
+          const promptFile = join(runDir, 'prompt.md')
+          writeFileSync(promptFile, taskPromptText(tasks[taskId], { sessionId: sessionIdPlaceholder, arm, taskId }))
+          const outFile = join(runDir, 'run.json')
+          const preset = manifest.arms[arm].preset
+          let childResult
+          if (process.env.PHOENIX_EVAL_FAKE_CHILD === '1') {
+            // Evaluator-mechanics stub — synthetic run records only (tests).
+            childResult = { ok: true, killed: false, code: 0, stdout: '', stderr: 'synthetic' }
+            writeJson(outFile, {
+              schema: 'phoenix.eval.run.v1', synthetic: true, presetId: preset, taskId, run: r,
+              startedAt: entry.startedAt, finishedAt: new Date().toISOString(), wallMs: 1000,
+              sessionId: `synthetic-${arm}-${taskId}-r${r}`, ok: true, exitCode: 0,
+              finalText: 'SYNTHETIC FAKE RUN — mechanics test only.\n' + (tasks[taskId].prompt ?? '').slice(0, 200),
+              finalTextLen: 120, reason: { kind: 'completed' },
+              digest: { types: { 'assistant/message': 1, 'turn/end': 1 }, tools: { phoenix_context: 1 } },
+              model: manifest.model,
+            })
+          } else {
+            childResult = await spawnChild([
+              RUN_ONE,
+              '--preset', preset || 'none',
+              '--task', taskId,
+              '--run', String(r),
+              '--worktree', wt,
+              '--prompt-file', promptFile,
+              '--dsh-home', armHome,
+              '--out', outFile,
+              '--budget-ms', String(budgetMin * 60000),
+            ], {
+              cwd: wt,
+              budgetMs: budgetMin * 60000,
+              env: {
+                DSH_HOME: armHome,
+                PHOENIX_DSH_CHECKOUT: manifest.checkout,
+                ...(manifest.arms[arm].toolsMode === 'code' ? { DSH_TOOLS_MODE: 'code' } : {}),
+              },
+            })
+          }
+          const record = readJson(outFile, null)
+          entry.ok = record?.ok === true
+          entry.exitCode = record?.exitCode ?? childResult.code
+          entry.wallMs = record?.wallMs ?? null
+          entry.sessionId = record?.sessionId ?? null
+          entry.synthetic = record?.synthetic === true
+          entry.finalTextLen = record?.finalTextLen ?? 0
+          entry.reason = record?.reason ?? null
+          entry.killed = childResult.killed === true
+          entry.stderrTail = String(childResult.stderr ?? '').slice(-2000)
+          if (entry.sessionId) {
+            const evidence = collectSessionEvidence(
+              [join(wt, '.phoenix-harness'), join(armHome, '.phoenix-harness')],
+              entry.sessionId, runDir)
+            entry.evidenceFiles = evidence
+          } else {
+            // Killed/failed before a record: preserve the worktree telemetry
+            // before teardown so the run still contributes to gate math.
+            const evidence = collectAllTelemetryEvidence(
+              [join(wt, '.phoenix-harness'), join(armHome, '.phoenix-harness')],
+              runDir)
+            entry.evidenceFiles = evidence
+          }
+          // Capture fixture state before teardown (bug-fix checker needs it).
+          const fixState = join(runDir, 'evidence', 'fixture-state')
+          mkdirSync(fixState, { recursive: true })
+          const fixDir = join(wt, 'tools', 'phoenix-harness-v3', 'benchmarks', 'frontier', 'fixtures', 'amount-math')
+          if (existsSync(fixDir)) {
+            for (const f of readdirSync(fixDir).filter((x) => !x.endsWith('.test.mjs'))) {
+              copyFileSync(join(fixDir, f), join(fixState, f))
+            }
+          }
+          entry.finishedAt = new Date().toISOString()
+          await removeWorktree(wt)
+          const transport = record?.reason?.error?.code === 'TRANSPORT'
+          entry.transportFailure = transport
+          if (transport && attempt + 1 < ATTEMPT_CAP) {
+            console.error(`[eval] ${arm} ${taskId} r${r} attempt ${attempt + 1}: TRANSPORT failure — retrying`)
+            continue
+          }
+          break
         }
-        entry.finishedAt = new Date().toISOString()
+        entry.finishedAt = entry.finishedAt ?? new Date().toISOString()
         writeJson(join(runDir, 'entry.json'), entry)
-        await removeWorktree(wt)
         results.push(entry)
       }
     }

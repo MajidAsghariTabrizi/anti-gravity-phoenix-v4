@@ -56,8 +56,12 @@ function versionInfo() {
 
 function dirHash(dir) {
   const h = createHash('sha256')
+  // Volatile runtime outputs must not move the source hash: eval run
+  // artifacts, telemetry, and any nested checkout/cache dirs.
+  const SKIP = new Set(['runs', '.phoenix-harness', 'node_modules', '.git'])
   const walk = (d) => {
     for (const e of readdirSync(d, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name))) {
+      if (SKIP.has(e.name)) continue
       const p = join(d, e.name)
       if (e.isDirectory()) walk(p)
       else { h.update(e.name); h.update(readFileSync(p)) }

@@ -1,24 +1,27 @@
 #!/usr/bin/env node
 /**
- * Phoenix Harness V3 eval — one-shot per-task child driver.
+ * Phoenix Harness V3 eval — one-shot per-task child wrapper.
  *
- * Boots the pinned DSH checkout (base host composition + agent-presets row),
- * creates ONE agent with the arm's preset mounted under the worktree cwd,
- * drives one task prompt to quiescence, flushes the session, and writes a
- * fail-closed run record (phoenix.eval.run.v1) to --out. Never prints the
- * final assistant text to stdout (evidence stays in the run record); stdout
- * carries status lines only.
+ * Boots the pinned DSH checkout with a composed host tree:
+ *   - dsh-base's cordis.patch.yml as a patch layer (the supported path),
+ *   - a tools-mode seam (DSH_TOOLS_MODE; Code Mode per process),
+ *   - agent-presets roster + code-runtime rows,
+ *   - the phx-eval-driver row (src/eval/driver-plugin.mjs), whose apply()
+ *     creates the agent, mounts the arm preset, runs the task, and writes
+ *     the fail-closed run record (phoenix.eval.run.v1) to --out.
  *
- * Mirrors dsh-headless/lib/index.js run() for the loop lifecycle, plus the
- * preset mount from the agent-presets registry (the base host composition
- * does not ship the roster row).
+ * This wrapper only covers composition + boot; everything after boot runs
+ * inside the driver row's scoped context, exactly like dsh-headless.
  *
  * Exit codes: 0 completed · 1 loop error · 2 boot/setup failure · 3 killed
  */
 import { pathToFileURL } from 'node:url'
-import { join, resolve } from 'node:path'
-import { readFileSync, writeFileSync, mkdirSync, existsSync } from 'node:fs'
-import { randomUUID } from 'node:crypto'
+import { join, resolve, dirname } from 'node:path'
+import { writeFileSync, mkdirSync, existsSync } from 'node:fs'
+import { fileURLToPath } from 'node:url'
+
+const SRC = dirname(fileURLToPath(import.meta.url))
+const DRIVER = join(SRC, 'driver-plugin.mjs')
 
 const argv = process.argv.slice(2)
 function arg(name, fallback) {
@@ -29,9 +32,6 @@ function arg(name, fallback) {
     process.exit(2)
   }
   return argv[i + 1]
-}
-function flag(name) {
-  return argv.includes(`--${name}`)
 }
 
 const presetId = arg('preset')
@@ -47,8 +47,6 @@ const checkout = process.env.PHOENIX_DSH_CHECKOUT
   : join(process.env.USERPROFILE ?? '', 'AppData', 'Local', 'npm-cache', '_npx', '1e7f6d9597241db0')
 
 const startedAt = new Date().toISOString()
-let sessionId = null
-let killedByBudget = false
 
 function writeRecord(partial) {
   try {
@@ -59,8 +57,8 @@ function writeRecord(partial) {
       finishedAt: new Date().toISOString(),
       wallMs: Date.now() - new Date(startedAt).getTime(),
       checkout,
-      sessionId,
-      killedByBudget,
+      sessionId: null,
+      killedByBudget: false,
       ...partial,
     }, null, 2))
   } catch (err) {
@@ -75,128 +73,62 @@ function fail(exitCode, message) {
   process.exit(exitCode)
 }
 
-// Belt-and-braces self-budget: if the parent watchdog dies, the child still
-// cannot run away.
-const budgetTimer = setTimeout(() => {
-  killedByBudget = true
-  console.error(`run-one: task budget ${budgetMs}ms exceeded — killing self`)
-  writeRecord({ ok: false, exitCode: 3, error: 'task budget exceeded (self-kill)' })
-  process.exit(3)
-}, budgetMs + 5 * 60000)
-budgetTimer.unref?.()
-
 try {
   process.env.DSH_HOME = dshHome
   if (!existsSync(promptFile)) fail(2, `prompt file missing: ${promptFile}`)
-  const taskText = readFileSync(promptFile, 'utf8')
   const basePatch = join(checkout, 'node_modules', '@deepseek-ai', 'dsh-base', 'cordis.patch.yml')
   if (!existsSync(basePatch)) fail(2, `dsh-base patch missing at ${basePatch} — checkout pin broken`)
+  if (!existsSync(DRIVER)) fail(2, `driver plugin missing at ${DRIVER}`)
 
-  // Compose the child's host config: the untouched dsh-base patch + the
-  // agent-presets roster row + the code-runtime row (Code Mode transport) +
-  // the tools-mode env seam (same restatement the shipped web patch uses).
-  const composed = `${readFileSync(basePatch, 'utf8')}
-- id: tools
-  config:
-    mode: !!js process.env.DSH_TOOLS_MODE
-- insert:
-    - id: agent-presets
-      name: '@deepseek-ai/dsh-agent-presets'
-    - id: code-runtime
-      name: '@deepseek-ai/dsh-code-runtime-worker-thread'
-`
-  const composedPath = join(dshHome, `phx-eval-composed-${process.pid}.cordis.yml`)
-  mkdirSync(dshHome, { recursive: true })
-  writeFileSync(composedPath, composed)
+  // Root document: empty entry list; the whole tree composes as patches.
+  // The file MUST live inside the checkout's node_modules: the host baseUrl
+  // (dir of the root config) is what preset mounts use to resolve bare
+  // package names (dsh-agent-presets captures agentCtx.baseUrl), and a dir
+  // inside node_modules resolves them exactly like the shipped profiles do.
+  const composedPath = join(checkout, 'node_modules', '.phx-eval', `root-${process.pid}.cordis.yml`)
+  mkdirSync(join(composedPath, '..'), { recursive: true })
+  writeFileSync(composedPath, '[]\n')
 
   const M = (pkg) => pathToFileURL(join(checkout, 'node_modules', '@deepseek-ai', pkg, 'lib', 'index.js')).href
-  const { boot } = await import(M('dsh-app-boot'))
-  const { installModelSelection } = await import(M('dsh-agent'))
-  const { createUserMessage } = await import(M('dsh-llm'))
-  const { SessionId } = await import(M('dsh-session'))
+  const { boot, loadOptionalPatches } = await import(M('dsh-app-boot'))
+
+  const baseRows = loadOptionalPatches('phx-eval', basePatch) ?? []
+  if (baseRows.length === 0) fail(2, 'dsh-base patch parsed to zero rows — pin/loader mismatch')
+  // boot() takes a FLAT patch list (the shape loadOptionalPatches returns and
+  // dsh's allPatches() builds): id-targeted overrides plus insert rows, which
+  // the include applies over the empty root document.
+  const patches = [
+    ...baseRows,
+    { id: 'tools', config: { mode: process.env.DSH_TOOLS_MODE || 'native' } },
+    {
+      insert: [
+        { id: 'agent-presets', name: '@deepseek-ai/dsh-agent-presets', config: { default: 'standard' } },
+        { id: 'code-runtime', name: '@deepseek-ai/dsh-code-runtime-worker-thread' },
+        {
+          id: 'phx-eval-driver',
+          name: DRIVER,
+          inject: ['agents', 'agentDefaultModel', 'sessions', 'agentPresets', 'settings'],
+          config: {
+            presetId, taskId, run: runIdx, worktree, taskFile: promptFile, outFile, budgetMs,
+          },
+        },
+      ],
+    },
+  ]
 
   const bareBase = pathToFileURL(join(checkout, 'node_modules') + '/').href
   let ctx = null
   try {
-    ctx = await boot('phx-eval', composedPath, [], undefined, bareBase)
+    ctx = await boot('phx-eval', composedPath, patches, undefined, bareBase)
   } catch (errUrl) {
     console.error(`run-one: boot with file-URL base failed (${errUrl?.message ?? errUrl}) — retrying with plain path`)
-    ctx = await boot('phx-eval', composedPath, [], undefined, join(checkout, 'node_modules'))
+    ctx = await boot('phx-eval', composedPath, patches, undefined, join(checkout, 'node_modules'))
   }
+  // The driver row's apply() runs to completion before the loader settles;
+  // it owns the record and the process exit code.
   await ctx.get('loader')?.await()
-
-  const agents = ctx.get('agents')
-  const sessions = ctx.get('sessions')
-  const defaultModel = ctx.get('agentDefaultModel')
-  if (!agents || !sessions || !defaultModel) fail(2, 'host composition missing agents/sessions/agentDefaultModel')
-  if (!ctx.agentPresets) fail(2, 'host composition missing the agent-presets roster row')
-
-  const selection = defaultModel.currentSelection()
-  console.error(`run-one: preset=${presetId} task=${taskId} run=${runIdx} model=${selection.provider}/${selection.model} effort=${selection.reasoningEffort ?? '(default)'}`)
-
-  // Fail closed BEFORE creating the agent if the arm preset cannot mount.
-  // preset 'none' = bare judge agent (no Phoenix preset, base tools only).
-  const hasPreset = presetId !== '' && presetId !== 'none'
-  if (hasPreset) {
-    try {
-      await ctx.agentPresets.standingKeyFor(presetId)
-    } catch (errMount) {
-      fail(2, `preset "${presetId}" mount validation failed: ${errMount?.message ?? errMount}`)
-    }
-  }
-
-  sessionId = SessionId(`eval-${presetId}-${taskId}-r${runIdx}-${randomUUID().slice(0, 8)}`)
-  const { agent } = await agents.create({
-    sessionId,
-    meta: { cwd: worktree, agentPreset: hasPreset ? presetId : undefined },
-    agentOptions: { provider: selection.provider, model: selection.model },
-    setup: async (agentCtx) => {
-      if (hasPreset) await ctx.agentPresets.mount(agentCtx, presetId)
-      installModelSelection(agentCtx, { current: selection, assembled: undefined })
-    },
-  })
-
-  await agent.whenIdle()
-  const firstSeq = agent.session.seq
-  agent.followup(createUserMessage({
-    content: [{ type: 'text', text: taskText }],
-    source: { kind: 'user' },
-  }))
-  await agent.whenIdle()
-  await sessions.flush(agent.session)
-
-  // Fold the outcome exactly like dsh-headless, plus a compact event digest.
-  let text = ''
-  let reason
-  let started = false
-  const digest = { types: {}, tools: {} }
-  for (const event of agent.session.events) {
-    if (event.seq < firstSeq) continue
-    if (event.type === 'turn/start') { started = true; continue }
-    if (!started) continue
-    digest.types[event.type] = (digest.types[event.type] ?? 0) + 1
-    if (event.type === 'assistant/message') {
-      const joined = event.data.message.content.filter((b) => b.type === 'text').map((b) => b.text).join('')
-      if (joined !== '') text = joined
-    }
-    if (event.type === 'turn/end') reason = event.data.reason
-    if (event.type === 'tool/start' || event.type === 'tool/end') {
-      const t = event.data?.tool ?? event.data?.name ?? '(unknown)'
-      digest.tools[t] = (digest.tools[t] ?? 0) + 1
-    }
-  }
-  const completed = reason?.kind === 'completed'
-  console.error(`run-one: done kind=${reason?.kind ?? '?'} textLen=${text.length} seq=${agent.session.seq}`)
-  writeRecord({
-    ok: completed,
-    exitCode: completed ? 0 : 1,
-    finalText: text.slice(0, 200000),
-    finalTextLen: text.length,
-    reason,
-    digest,
-    model: { provider: selection.provider, model: selection.model, reasoningEffort: selection.reasoningEffort ?? null },
-  })
-  process.exit(completed ? 0 : 1)
+  console.error('run-one: loader settled without driver record — unexpected; exiting 2')
+  process.exit(2)
 } catch (err) {
-  fail(2, `unhandled driver failure: ${err?.message ?? err}`)
+  fail(2, `unhandled boot failure: ${err?.message ?? err}`)
 }
