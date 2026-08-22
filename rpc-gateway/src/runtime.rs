@@ -3695,6 +3695,24 @@ impl GatewayRuntime {
         self.refresh_head_shared(false).await
     }
 
+    /// Read-only observability snapshot of the cached provider head.
+    /// Never triggers an upstream refresh and never mutates authority state.
+    pub async fn observability_head(&self) -> Option<HeadObservability> {
+        let head = self.head.lock().await.clone()?;
+        Some(HeadObservability {
+            chain_id: ARBITRUM_ONE_CHAIN_ID,
+            provider_id: head.provider_id,
+            block_number: head.block.number,
+            block_hash: head.block.hash,
+            age_ms: head
+                .observed_at
+                .elapsed()
+                .as_millis()
+                .min(u128::from(u64::MAX)) as u64,
+            gateway_now_unix_ms: unix_time_ms(),
+        })
+    }
+
     async fn refresh_head_shared(&self, force: bool) -> Result<HeadSnapshot, GatewayError> {
         if !force {
             if let Some(head) = self.head.lock().await.clone() {
@@ -3909,6 +3927,18 @@ struct HeadSnapshot {
     provider_id: String,
     block: PinnedBlock,
     observed_at: Instant,
+}
+
+/// Read-only provider-head observability payload for the GET /headz endpoint.
+/// Contains only public chain metadata; never secrets, requests, or authority.
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct HeadObservability {
+    pub chain_id: u64,
+    pub provider_id: String,
+    pub block_number: u64,
+    pub block_hash: String,
+    pub age_ms: u64,
+    pub gateway_now_unix_ms: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -6320,6 +6350,35 @@ mod tests {
             AAVE_PRIMARY_PROVIDER_ID.to_string(),
             "provider_1".to_string(),
         ]);
+    }
+
+    #[tokio::test]
+    async fn observability_head_reflects_cached_snapshot_and_never_refreshes() {
+        let client = Arc::new(ModelClient::default());
+        let runtime = runtime(client.clone());
+        assert!(runtime.observability_head().await.is_none());
+        let snapshot = HeadSnapshot {
+            provider_id: AAVE_PRIMARY_PROVIDER_ID.to_string(),
+            block: PinnedBlock {
+                number: 42161,
+                hash: BLOCK_HASH.to_string(),
+            },
+            observed_at: Instant::now(),
+        };
+        *runtime.head.lock().await = Some(snapshot);
+        let head = runtime
+            .observability_head()
+            .await
+            .expect("cached head present");
+        assert_eq!(head.chain_id, ARBITRUM_ONE_CHAIN_ID);
+        assert_eq!(head.provider_id, AAVE_PRIMARY_PROVIDER_ID);
+        assert_eq!(head.block_number, 42161);
+        assert_eq!(head.block_hash, BLOCK_HASH.to_string());
+        assert!(head.age_ms < 5_000);
+        assert!(head.gateway_now_unix_ms > 1_750_000_000_000);
+        // No upstream interaction may be triggered by the observability path.
+        assert!(runtime.head_in_flight.lock().await.is_none());
+        assert!(client.calls.lock().unwrap().is_empty());
     }
 
     fn aave_screen_request() -> AaveScreenRequest {
