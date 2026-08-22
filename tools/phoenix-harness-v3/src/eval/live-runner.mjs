@@ -57,7 +57,10 @@ function loadTasks() {
 }
 
 function campaignRoot(name) {
-  return name ? (resolve(name) === name ? name : join(RUNS_ROOT, name)) : RUNS_ROOT
+  if (!name) return RUNS_ROOT
+  const n = String(name).replace(/^runs[\\/]+/, '')
+  const abs = resolve(n)
+  return abs === n ? abs : join(RUNS_ROOT, n)
 }
 
 function writeJson(p, obj) {
@@ -125,14 +128,13 @@ async function prepare(args) {
     id,
     createdAt: new Date().toISOString(),
     checkout, pinnedVersion: pin.version,
-    repo: { root: REPO_ROOT, sha, branch: (await shaOf('--abbrev-ref', undefined))?.stdout?.trim?.() ?? null },
+    repo: { root: REPO_ROOT, sha, branch: (await run('git', ['-C', REPO_ROOT, 'rev-parse', '--abbrev-ref', 'HEAD'], { timeoutMs: 15000 }))?.stdout?.trim?.() ?? null },
     arms,
     model: (() => {
       try {
         const s = readFileSync(join(realHome, 'settings.yaml'), 'utf8')
-        const m = /model:\s*(\S+)/.exec(s)
-        const p = /provider:\s*(\S+)/.exec(s)
-        return { provider: p?.[1] ?? null, model: m?.[1] ?? null }
+        const m = /agent-default-model:\s*\n\s*provider:\s*(\S+)[\s\S]*?\n\s*model:\s*(\S+)/.exec(s)
+        return { provider: m?.[1] ?? null, model: m?.[2] ?? null }
       } catch { return { provider: null, model: null } }
     })(),
     tasks: Object.keys(loadTasks()),
@@ -161,7 +163,9 @@ async function runCampaign(args) {
         const armHome = manifest.arms[arm].home
         const runDir = join(root, 'runs', arm, taskId, `r${r}`)
         mkdirSync(runDir, { recursive: true })
-        const wt = join(root, 'tmp', 'worktrees', arm, taskId, `r${r}`)
+        // Keep the worktree path SHORT: Windows MAX_PATH (260) bites on deep
+        // campaign roots; the repo itself adds ~95 chars of prefix.
+        const wt = join(root, 'wt', `${arm[0]}${taskId.slice(0, 6)}r${r}`)
         const entry = { arm, taskId, run: r, startedAt: new Date().toISOString(), sha, runDir, ok: false, error: null }
         console.error(`[eval] ${arm} ${taskId} r${r} — worktree at ${sha.slice(0, 8)}`)
         const created = await createWorktree(sha, wt)
@@ -380,4 +384,10 @@ async function main() {
 }
 
 const res = await main()
-process.exit(res?.ok === false ? 1 : 0)
+if (res?.ok === false) {
+  console.error(`[eval] FAILED: ${res?.error ?? '(no error detail)'}`)
+  process.exit(1)
+} else if (cmd === 'prepare' && res?.ok) {
+  console.log(JSON.stringify(res))
+}
+process.exit(0)
