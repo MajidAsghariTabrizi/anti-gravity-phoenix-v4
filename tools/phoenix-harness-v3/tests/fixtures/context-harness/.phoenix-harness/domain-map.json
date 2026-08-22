@@ -1,0 +1,9 @@
+{
+  "domains": {
+    "live-execution": {
+      "id": "live-execution",
+      "title": "Live execution domain pack",
+      "artifact": "domains/live-execution.md"
+    }
+  }
+}
