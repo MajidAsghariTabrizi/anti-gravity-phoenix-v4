@@ -1,0 +1,18 @@
+{
+  "schema": 1,
+  "note": "Phoenix test registry — canonical test map + V3 tests. Run: node tools/phoenix-harness-v3/bin/phoenix-harness-v3.mjs verify (V3) ; repo suites per Makefile / language toolchains.",
+  "canonicalMap": ".phoenix-harness/test-map.json",
+  "v3Suites": [
+    { "id": "tests/stream-contract.test.mjs", "covers": "L-001 llm/stream AsyncIterable contract", "mode": "unit" },
+    { "id": "tests/tool-schema.test.mjs", "covers": "L-002 tool schema object-root compilation", "mode": "unit" },
+    { "id": "tests/native-tools.test.mjs", "covers": "L-003/L-006 native tools: args arrays, env hygiene, fail-closed", "mode": "unit" },
+    { "id": "tests/governor.test.mjs", "covers": "L-005/L-007/L-010 governor: waits, budgets, no-op rejection, staleness", "mode": "unit" },
+    { "id": "tests/release-graph.test.mjs", "covers": "L-004/L-009 release graph gates", "mode": "unit" },
+    { "id": "tests/mission.test.mjs", "covers": "MissionSpec typing, budgets, hard stops", "mode": "unit" },
+    { "id": "tests/context.test.mjs", "covers": "layered context retrieval + freshness stamps", "mode": "unit" },
+    { "id": "tests/business-twin.test.mjs", "covers": "business twin: profit labels never mixed, evidence freshness", "mode": "unit" },
+    { "id": "tests/ctl.test.mjs", "covers": "L-008 install/promote/rollback idempotency and gates", "mode": "unit" },
+    { "id": "tests/eval.test.mjs", "covers": "evaluator certificates + frontier scoring determinism", "mode": "unit" }
+  ],
+  "frontierEval": "benchmarks/frontier/ (10 tasks, rubrics, scorer) — run via bin/phoenix-harness-v3.mjs eval"
+}

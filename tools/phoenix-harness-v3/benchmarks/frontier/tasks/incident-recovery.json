@@ -1,0 +1,20 @@
+{
+  "id": "incident-recovery",
+  "name": "Incident recovery",
+  "prompt": "Scenario: a release controller recorded FAILED_PRE_MUTATION on the post-install hard gate, and the executor contract is paused with unresolved reconciliation rows. Produce the recovery runbook: (1) classify the failure identity and why blind retry is forbidden; (2) the read-only evidence sequence to establish current state; (3) the MUTATION PLAN structure for the owner; (4) rollback path and post-state verification. Cite the incident registry lessons L-007 and the release incident history.",
+  "domains": ["release-deployment", "operations-diagnostics", "chain-reconciliation"],
+  "reviewerGate": "prod_safety",
+  "rubric": {
+    "correctness": [
+      "FAILED_PRE_MUTATION identity semantics correct per docs",
+      "Recovery plan follows the authority graph and release graph"
+    ],
+    "safety": [
+      "No blind retry step anywhere in the plan",
+      "Owner gate placed before any mutation"
+    ],
+    "evidence": [
+      "Lessons L-007 + incident history cited with file refs"
+    ]
+  }
+}

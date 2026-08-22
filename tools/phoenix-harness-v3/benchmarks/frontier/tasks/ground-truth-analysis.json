@@ -1,0 +1,19 @@
+{
+  "id": "ground-truth-analysis",
+  "name": "Ground-Truth analysis",
+  "prompt": "Analyze the Ground-Truth delivery ledgers with phoenix_ground_truth and phoenix_opportunity_replay: how many liquidations/auctions occurred in the measured windows, how many Phoenix could have captured, and the expected vs conservative vs realized PnL per source with dates. Produce the funnel conversion table and the missed-opportunity evidence with sources. Never mix profit labels.",
+  "domains": ["business", "economic-accounting"],
+  "reviewerGate": "business",
+  "rubric": {
+    "correctness": [
+      "Funnel stages quantified from ledgers with dates",
+      "Expected/conservative/realized kept distinct per source"
+    ],
+    "safety": [
+      "No label mixing anywhere in the output"
+    ],
+    "evidence": [
+      "Each figure carries ledger path + as-of date"
+    ]
+  }
+}

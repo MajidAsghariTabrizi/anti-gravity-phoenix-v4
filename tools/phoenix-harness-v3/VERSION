@@ -1,0 +1,7 @@
+# Phoenix Harness V3 — pinned runtime
+harness_package: "@deepseek-ai/dsh"
+harness_version: 0.1.0-rc.7
+harness_checkout: 1e7f6d9597241db0 (npx cache)
+node_minimum: v24.13.0
+phoenix_harness_v3: 3.0.0
+pinned_at: 2026-08-21

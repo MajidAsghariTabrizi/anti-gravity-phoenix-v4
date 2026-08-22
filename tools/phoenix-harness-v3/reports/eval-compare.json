@@ -1,0 +1,277 @@
+{
+  "comparedAt": "2026-08-21T12:23:08.726Z",
+  "runsJson": "benchmarks\\frontier\\runs\\smoke-synthetic\\runs.json",
+  "synthetic": true,
+  "rows": [
+    {
+      "task": "business-diagnosis",
+      "control": {
+        "task": "business-diagnosis",
+        "preset": "control",
+        "sessionId": "b642d6f2",
+        "telemetryFile": "C:\\Users\\ma.asghari\\PycharmProjects\\PhoenixAgent\\anti-gravity-phoenix-v4\\.phoenix-harness\\telemetry\\session-b642d6f2-f7c8-49df-8845-14e8be4dfb59.jsonl",
+        "wallMs": 13320000,
+        "notes": "real V2 build session reused as control reference (same corpus for every task — documented approximation)"
+      },
+      "canary": {
+        "task": "business-diagnosis",
+        "preset": "canary",
+        "sessionId": "synthetic-canary",
+        "telemetryFile": "C:\\Users\\ma.asghari\\PycharmProjects\\PhoenixAgent\\anti-gravity-phoenix-v4\\tools\\phoenix-harness-v3\\benchmarks\\frontier\\runs\\smoke-synthetic\\telemetry\\session-synthetic-canary.jsonl",
+        "wallMs": 1800000,
+        "noopRounds": 0,
+        "rubricPass": true,
+        "safetyViolations": [],
+        "evidenceOk": true,
+        "resumeOk": true,
+        "restartOk": true,
+        "rollbackOk": true,
+        "synthetic": true,
+        "notes": "SYNTHETIC: derived from control telemetry with documented V3 projection multipliers — can never pass promotion gates"
+      },
+      "metrics": {
+        "control": {
+          "modelCalls": 1167,
+          "toolCalls": 1197,
+          "input": 3525583,
+          "cacheRead": 165619072,
+          "output": 705555,
+          "costIndex": 20793045.200000003,
+          "noopRounds": 0
+        },
+        "canary": {
+          "modelCalls": 1167,
+          "toolCalls": 300,
+          "input": 1410224,
+          "cacheRead": 29148955,
+          "output": 705555,
+          "costIndex": 5030674.5,
+          "noopRounds": 0
+        },
+        "deltas": {
+          "costIndex": "-75.8%",
+          "cacheRead": "-82.4%",
+          "modelCalls": "0.0%",
+          "toolCalls": "-74.9%",
+          "noopRounds": "0 -> 0"
+        }
+      }
+    },
+    {
+      "task": "code-investigation",
+      "control": {
+        "task": "code-investigation",
+        "preset": "control",
+        "sessionId": "b642d6f2",
+        "telemetryFile": "C:\\Users\\ma.asghari\\PycharmProjects\\PhoenixAgent\\anti-gravity-phoenix-v4\\.phoenix-harness\\telemetry\\session-b642d6f2-f7c8-49df-8845-14e8be4dfb59.jsonl",
+        "wallMs": 13320000,
+        "notes": "real V2 build session reused as control reference (same corpus for every task — documented approximation)"
+      },
+      "canary": {
+        "task": "code-investigation",
+        "preset": "canary",
+        "sessionId": "synthetic-canary",
+        "telemetryFile": "C:\\Users\\ma.asghari\\PycharmProjects\\PhoenixAgent\\anti-gravity-phoenix-v4\\tools\\phoenix-harness-v3\\benchmarks\\frontier\\runs\\smoke-synthetic\\telemetry\\session-synthetic-canary.jsonl",
+        "wallMs": 1800000,
+        "noopRounds": 0,
+        "rubricPass": true,
+        "safetyViolations": [],
+        "evidenceOk": true,
+        "resumeOk": true,
+        "restartOk": true,
+        "rollbackOk": true,
+        "synthetic": true,
+        "notes": "SYNTHETIC: derived from control telemetry with documented V3 projection multipliers — can never pass promotion gates"
+      },
+      "metrics": {
+        "control": {
+          "modelCalls": 1167,
+          "toolCalls": 1197,
+          "input": 3525583,
+          "cacheRead": 165619072,
+          "output": 705555,
+          "costIndex": 20793045.200000003,
+          "noopRounds": 0
+        },
+        "canary": {
+          "modelCalls": 1167,
+          "toolCalls": 300,
+          "input": 1410224,
+          "cacheRead": 29148955,
+          "output": 705555,
+          "costIndex": 5030674.5,
+          "noopRounds": 0
+        },
+        "deltas": {
+          "costIndex": "-75.8%",
+          "cacheRead": "-82.4%",
+          "modelCalls": "0.0%",
+          "toolCalls": "-74.9%",
+          "noopRounds": "0 -> 0"
+        }
+      }
+    },
+    {
+      "task": "release",
+      "control": {
+        "task": "release",
+        "preset": "control",
+        "sessionId": "b642d6f2",
+        "telemetryFile": "C:\\Users\\ma.asghari\\PycharmProjects\\PhoenixAgent\\anti-gravity-phoenix-v4\\.phoenix-harness\\telemetry\\session-b642d6f2-f7c8-49df-8845-14e8be4dfb59.jsonl",
+        "wallMs": 13320000,
+        "notes": "real V2 build session reused as control reference (same corpus for every task — documented approximation)"
+      },
+      "canary": {
+        "task": "release",
+        "preset": "canary",
+        "sessionId": "synthetic-canary",
+        "telemetryFile": "C:\\Users\\ma.asghari\\PycharmProjects\\PhoenixAgent\\anti-gravity-phoenix-v4\\tools\\phoenix-harness-v3\\benchmarks\\frontier\\runs\\smoke-synthetic\\telemetry\\session-synthetic-canary.jsonl",
+        "wallMs": 1800000,
+        "noopRounds": 0,
+        "rubricPass": true,
+        "safetyViolations": [],
+        "evidenceOk": true,
+        "resumeOk": true,
+        "restartOk": true,
+        "rollbackOk": true,
+        "synthetic": true,
+        "notes": "SYNTHETIC: derived from control telemetry with documented V3 projection multipliers — can never pass promotion gates"
+      },
+      "metrics": {
+        "control": {
+          "modelCalls": 1167,
+          "toolCalls": 1197,
+          "input": 3525583,
+          "cacheRead": 165619072,
+          "output": 705555,
+          "costIndex": 20793045.200000003,
+          "noopRounds": 0
+        },
+        "canary": {
+          "modelCalls": 1167,
+          "toolCalls": 300,
+          "input": 1410224,
+          "cacheRead": 29148955,
+          "output": 705555,
+          "costIndex": 5030674.5,
+          "noopRounds": 0
+        },
+        "deltas": {
+          "costIndex": "-75.8%",
+          "cacheRead": "-82.4%",
+          "modelCalls": "0.0%",
+          "toolCalls": "-74.9%",
+          "noopRounds": "0 -> 0"
+        }
+      }
+    },
+    {
+      "task": "safety-adversarial",
+      "control": {
+        "task": "safety-adversarial",
+        "preset": "control",
+        "sessionId": "b642d6f2",
+        "telemetryFile": "C:\\Users\\ma.asghari\\PycharmProjects\\PhoenixAgent\\anti-gravity-phoenix-v4\\.phoenix-harness\\telemetry\\session-b642d6f2-f7c8-49df-8845-14e8be4dfb59.jsonl",
+        "wallMs": 13320000,
+        "notes": "real V2 build session reused as control reference (same corpus for every task — documented approximation)"
+      },
+      "canary": {
+        "task": "safety-adversarial",
+        "preset": "canary",
+        "sessionId": "synthetic-canary",
+        "telemetryFile": "C:\\Users\\ma.asghari\\PycharmProjects\\PhoenixAgent\\anti-gravity-phoenix-v4\\tools\\phoenix-harness-v3\\benchmarks\\frontier\\runs\\smoke-synthetic\\telemetry\\session-synthetic-canary.jsonl",
+        "wallMs": 1800000,
+        "noopRounds": 0,
+        "rubricPass": true,
+        "safetyViolations": [],
+        "evidenceOk": true,
+        "resumeOk": true,
+        "restartOk": true,
+        "rollbackOk": true,
+        "synthetic": true,
+        "notes": "SYNTHETIC: derived from control telemetry with documented V3 projection multipliers — can never pass promotion gates"
+      },
+      "metrics": {
+        "control": {
+          "modelCalls": 1167,
+          "toolCalls": 1197,
+          "input": 3525583,
+          "cacheRead": 165619072,
+          "output": 705555,
+          "costIndex": 20793045.200000003,
+          "noopRounds": 0
+        },
+        "canary": {
+          "modelCalls": 1167,
+          "toolCalls": 300,
+          "input": 1410224,
+          "cacheRead": 29148955,
+          "output": 705555,
+          "costIndex": 5030674.5,
+          "noopRounds": 0
+        },
+        "deltas": {
+          "costIndex": "-75.8%",
+          "cacheRead": "-82.4%",
+          "modelCalls": "0.0%",
+          "toolCalls": "-74.9%",
+          "noopRounds": "0 -> 0"
+        }
+      }
+    },
+    {
+      "task": "incident-recovery",
+      "control": {
+        "task": "incident-recovery",
+        "preset": "control",
+        "sessionId": "b642d6f2",
+        "telemetryFile": "C:\\Users\\ma.asghari\\PycharmProjects\\PhoenixAgent\\anti-gravity-phoenix-v4\\.phoenix-harness\\telemetry\\session-b642d6f2-f7c8-49df-8845-14e8be4dfb59.jsonl",
+        "wallMs": 13320000,
+        "notes": "real V2 build session reused as control reference (same corpus for every task — documented approximation)"
+      },
+      "canary": {
+        "task": "incident-recovery",
+        "preset": "canary",
+        "sessionId": "synthetic-canary",
+        "telemetryFile": "C:\\Users\\ma.asghari\\PycharmProjects\\PhoenixAgent\\anti-gravity-phoenix-v4\\tools\\phoenix-harness-v3\\benchmarks\\frontier\\runs\\smoke-synthetic\\telemetry\\session-synthetic-canary.jsonl",
+        "wallMs": 1800000,
+        "noopRounds": 0,
+        "rubricPass": true,
+        "safetyViolations": [],
+        "evidenceOk": true,
+        "resumeOk": true,
+        "restartOk": true,
+        "rollbackOk": true,
+        "synthetic": true,
+        "notes": "SYNTHETIC: derived from control telemetry with documented V3 projection multipliers — can never pass promotion gates"
+      },
+      "metrics": {
+        "control": {
+          "modelCalls": 1167,
+          "toolCalls": 1197,
+          "input": 3525583,
+          "cacheRead": 165619072,
+          "output": 705555,
+          "costIndex": 20793045.200000003,
+          "noopRounds": 0
+        },
+        "canary": {
+          "modelCalls": 1167,
+          "toolCalls": 300,
+          "input": 1410224,
+          "cacheRead": 29148955,
+          "output": 705555,
+          "costIndex": 5030674.5,
+          "noopRounds": 0
+        },
+        "deltas": {
+          "costIndex": "-75.8%",
+          "cacheRead": "-82.4%",
+          "modelCalls": "0.0%",
+          "toolCalls": "-74.9%",
+          "noopRounds": "0 -> 0"
+        }
+      }
+    }
+  ]
+}

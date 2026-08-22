@@ -1,0 +1,1112 @@
+{
+  "schema": 1,
+  "generatedAt": "2026-08-21T12:05:27.559Z",
+  "generatedBy": "src/gen/gen-graphs.mjs",
+  "tables": {
+    "live_canary.schema_contract": {
+      "columns": [
+        "version",
+        "installed_at"
+      ],
+      "definedIn": [
+        "live-executor/schema/001_live_canary.sql"
+      ]
+    },
+    "live_canary.control": {
+      "columns": [
+        "singleton",
+        "armed",
+        "kill_switch",
+        "disarm_reason",
+        "updated_at"
+      ],
+      "definedIn": [
+        "live-executor/schema/001_live_canary.sql"
+      ]
+    },
+    "live_canary.execution_requests": {
+      "columns": [
+        "id",
+        "opportunity_id",
+        "schema_version",
+        "chain_id",
+        "route_id",
+        "origin_router",
+        "flash_asset",
+        "flash_amount",
+        "maximum_input_amount",
+        "minimum_profit",
+        "expected_profit",
+        "deadline",
+        "legs",
+        "gas_limit",
+        "max_fee_per_gas",
+        "max_priority_fee_per_gas",
+        "approved_by",
+        "approved_at",
+        "policy_version",
+        "approval_digest",
+        "status",
+        "created_at",
+        "updated_at"
+      ],
+      "definedIn": [
+        "live-executor/schema/001_live_canary.sql"
+      ]
+    },
+    "live_canary.execution_attempts": {
+      "columns": [
+        "request_id",
+        "chain_id",
+        "wallet_address",
+        "executor_address",
+        "nonce",
+        "tx_hash",
+        "status",
+        "error_code",
+        "claimed_at",
+        "submitted_at",
+        "terminal_at",
+        "updated_at"
+      ],
+      "definedIn": [
+        "live-executor/schema/001_live_canary.sql"
+      ]
+    },
+    "live_canary.nonce_state": {
+      "columns": [
+        "chain_id",
+        "wallet_address",
+        "next_nonce",
+        "updated_at"
+      ],
+      "definedIn": [
+        "live-executor/schema/001_live_canary.sql"
+      ]
+    },
+    "live_canary.execution_outcomes": {
+      "columns": [
+        "request_id",
+        "tx_hash",
+        "outcome_status",
+        "receipt_status",
+        "settled_event_found",
+        "block_number",
+        "gas_used",
+        "effective_gas_price",
+        "actual_fee_wei",
+        "asset",
+        "flash_amount",
+        "premium",
+        "realized_profit",
+        "net_pnl_wei",
+        "recorded_at"
+      ],
+      "definedIn": [
+        "live-executor/schema/001_live_canary.sql"
+      ]
+    },
+    "live_canary.autonomous_global_control": {
+      "columns": [
+        "singleton",
+        "schema_version",
+        "chain_id",
+        "armed",
+        "kill_switch",
+        "execution_mode",
+        "maximum_input_amount",
+        "daily_loss_limit",
+        "daily_ordering_budget",
+        "maximum_concurrent_candidates",
+        "control_epoch",
+        "disarm_reason",
+        "control_hash",
+        "control_contract",
+        "updated_at"
+      ],
+      "definedIn": [
+        "live-executor/schema/003_autonomous_hunter_contracts.sql"
+      ]
+    },
+    "live_canary.autonomous_route_controls": {
+      "columns": [
+        "route_fingerprint",
+        "schema_version",
+        "chain_id",
+        "route_policy_hash",
+        "enabled",
+        "kill_switch",
+        "current_size_level",
+        "maximum_permitted_size",
+        "cooldown_until",
+        "control_epoch",
+        "disarm_reason",
+        "control_hash",
+        "control_contract",
+        "updated_at"
+      ],
+      "definedIn": [
+        "live-executor/schema/003_autonomous_hunter_contracts.sql"
+      ]
+    },
+    "live_canary.autonomous_candidates": {
+      "columns": [
+        "candidate_id",
+        "opportunity_id",
+        "origin_event_id",
+        "schema_version",
+        "chain_id",
+        "route_fingerprint",
+        "route_universe_hash",
+        "route_policy_hash",
+        "risk_policy_hash",
+        "state_block_number",
+        "state_block_hash",
+        "state_hash",
+        "selected_size",
+        "predicted_gross_profit",
+        "predicted_total_cost",
+        "conservative_predicted_net_pnl",
+        "plan_hash",
+        "calldata_hash",
+        "executor_address",
+        "executor_code_hash",
+        "submission_channel",
+        "submission_quote_hash",
+        "risk_snapshot_hash",
+        "risk_snapshot_contract",
+        "submission_quote_contract",
+        "candidate_hash",
+        "candidate_contract",
+        "status",
+        "candidate_created_at",
+        "candidate_expires_at",
+        "created_at",
+        "updated_at"
+      ],
+      "definedIn": [
+        "live-executor/schema/003_autonomous_hunter_contracts.sql"
+      ]
+    },
+    "live_canary.autonomous_approvals": {
+      "columns": [
+        "candidate_id",
+        "schema_version",
+        "candidate_hash",
+        "route_policy_hash",
+        "route_universe_hash",
+        "risk_snapshot_hash",
+        "submission_quote_hash",
+        "state_hash",
+        "plan_hash",
+        "simulation_result_hash",
+        "calldata_hash",
+        "executor_address",
+        "executor_code_hash",
+        "approval_source",
+        "approval_created_at",
+        "approval_expires_at",
+        "automatic_approval_digest",
+        "approval_contract",
+        "created_at"
+      ],
+      "definedIn": [
+        "live-executor/schema/003_autonomous_hunter_contracts.sql"
+      ]
+    },
+    "live_canary.autonomous_outcome_attributions": {
+      "columns": [
+        "candidate_id",
+        "schema_version",
+        "outcome_class",
+        "transaction_hash",
+        "block_number",
+        "receipt_status",
+        "predicted_gross_profit",
+        "predicted_total_cost",
+        "conservative_predicted_net_pnl",
+        "realized_gross_profit",
+        "actual_gas_cost",
+        "actual_ordering_cost",
+        "realized_chain_net_pnl",
+        "allocated_infrastructure_cost",
+        "realized_business_net_pnl",
+        "terminal_at",
+        "attributed_at",
+        "outcome_hash",
+        "outcome_contract",
+        "created_at"
+      ],
+      "definedIn": [
+        "live-executor/schema/003_autonomous_hunter_contracts.sql"
+      ]
+    },
+    "live_canary.economic_control": {
+      "columns": [
+        "singleton",
+        "schema_version",
+        "phase",
+        "route_fingerprint",
+        "current_size_level",
+        "current_input_wei",
+        "maximum_reviewed_input_wei",
+        "release_sha",
+        "engine_image_digest",
+        "route_universe_hash",
+        "route_policy_hash",
+        "risk_policy_hash",
+        "executor_code_hash",
+        "readiness_id",
+        "authorization_id",
+        "cooldown_until",
+        "gas_reserve_wei",
+        "gas_reserve_floor_wei",
+        "control_epoch",
+        "last_transition_reason",
+        "state_hash",
+        "updated_at"
+      ],
+      "definedIn": [
+        "live-executor/schema/005_closed_loop_economic_control.sql"
+      ]
+    },
+    "live_canary.canary_readiness_records": {
+      "columns": [
+        "readiness_id",
+        "schema_version",
+        "release_sha",
+        "engine_image_digest",
+        "route_fingerprint",
+        "route_universe_hash",
+        "route_policy_hash",
+        "risk_policy_hash",
+        "economic_control_epoch",
+        "global_control_epoch",
+        "route_control_epoch",
+        "executor_code_hash",
+        "contract_identity_hash",
+        "wallet_gas_reserve_wei",
+        "gas_reserve_floor_wei",
+        "current_daily_loss_wei",
+        "daily_loss_limit_wei",
+        "observed_from",
+        "observed_until",
+        "candidate_evidence_hashes",
+        "evidence_metrics",
+        "readiness_contract",
+        "readiness_hash",
+        "created_at",
+        "expires_at"
+      ],
+      "definedIn": [
+        "live-executor/schema/005_closed_loop_economic_control.sql"
+      ]
+    },
+    "live_canary.automation_authorizations": {
+      "columns": [
+        "authorization_id",
+        "schema_version",
+        "route_fingerprint",
+        "route_policy_hash",
+        "maximum_reviewed_input_wei",
+        "executor_code_hash",
+        "release_family",
+        "one_transaction_at_a_time",
+        "reviewed_ladder_only",
+        "automatic_disarm_required",
+        "authorization_contract",
+        "authorization_hash",
+        "authorized_at",
+        "expires_at",
+        "consumed_at"
+      ],
+      "definedIn": [
+        "live-executor/schema/005_closed_loop_economic_control.sql"
+      ]
+    },
+    "live_canary.economic_transitions": {
+      "columns": [
+        "transition_id",
+        "schema_version",
+        "from_phase",
+        "to_phase",
+        "from_size_level",
+        "to_size_level",
+        "reason",
+        "evidence_hash",
+        "release_sha",
+        "control_epoch",
+        "transition_hash",
+        "transitioned_at"
+      ],
+      "definedIn": [
+        "live-executor/schema/005_closed_loop_economic_control.sql"
+      ]
+    },
+    "live_canary.revenue_lane_controls": {
+      "columns": [
+        "lane",
+        "schema_version",
+        "armed",
+        "kill_switch",
+        "maximum_input_amount",
+        "maximum_gas_limit",
+        "maximum_fee_per_gas",
+        "maximum_atlas_bid",
+        "daily_loss_limit",
+        "retained_profit_floor",
+        "disarm_reason",
+        "control_epoch",
+        "updated_at"
+      ],
+      "definedIn": [
+        "live-executor/schema/006_atlas_aave_revenue_lanes.sql"
+      ]
+    },
+    "live_canary.atlas_auction_ingress": {
+      "columns": [
+        "auction_id",
+        "user_operation_hash",
+        "parallel_auction_identity",
+        "auction_deadline_block",
+        "oracle_gas_price_wei",
+        "solver_gas_limit",
+        "dapp",
+        "oracle_aggregator",
+        "oracle_asset",
+        "relevant_aave",
+        "parallel_eligible",
+        "evidence_hash",
+        "terminal_outcome",
+        "observed_at",
+        "updated_at"
+      ],
+      "definedIn": [
+        "live-executor/schema/006_atlas_aave_revenue_lanes.sql"
+      ]
+    },
+    "live_canary.revenue_hunting_signals": {
+      "columns": [
+        "signal_id",
+        "signal_identity",
+        "source_lane",
+        "source_cursor",
+        "auction_id",
+        "borrower",
+        "block_number",
+        "block_hash",
+        "state_root",
+        "zero_cost_profit_upper_bound",
+        "expected_net_pnl",
+        "conservative_net_pnl",
+        "retained_profit_floor",
+        "evidence_mode",
+        "candidate_id",
+        "terminal_outcome",
+        "rejection_reason",
+        "evidence_hash",
+        "observed_at",
+        "updated_at"
+      ],
+      "definedIn": [
+        "live-executor/schema/006_atlas_aave_revenue_lanes.sql"
+      ]
+    },
+    "live_canary.global_revenue_submission_lock": {
+      "columns": [
+        "singleton",
+        "active_lane",
+        "active_identity",
+        "acquired_at",
+        "control_epoch"
+      ],
+      "definedIn": [
+        "live-executor/schema/006_atlas_aave_revenue_lanes.sql"
+      ]
+    },
+    "live_canary.atlas_solver_requests": {
+      "columns": [
+        "auction_id",
+        "signal_id",
+        "user_operation_hash",
+        "solver_operation_hash",
+        "solver_operation",
+        "maximum_bid",
+        "selected_bid",
+        "status",
+        "submission_response_hash",
+        "inclusion_transaction_hash",
+        "inclusion_block_number",
+        "settled_bid",
+        "executor_balance_before",
+        "executor_balance_after",
+        "solver_bond_before",
+        "solver_bond_after",
+        "realized_net_pnl",
+        "outcome_evidence_hash",
+        "created_at",
+        "updated_at"
+      ],
+      "definedIn": [
+        "live-executor/schema/006_atlas_aave_revenue_lanes.sql"
+      ]
+    },
+    "live_canary.revenue_provider_authority": {
+      "columns": [
+        "singleton",
+        "schema_version",
+        "exact_execution_ready",
+        "gate_reason",
+        "gate_updated_at",
+        "request_evidence_not_before",
+        "recovery_status",
+        "failure_reason",
+        "failure_control_epoch",
+        "failure_transition_at",
+        "failure_release_sha",
+        "restore_phase",
+        "restore_size_level",
+        "sample_count",
+        "sample_1_at",
+        "sample_1_primary_provider",
+        "sample_1_confirmation_provider",
+        "sample_2_at",
+        "sample_2_primary_provider",
+        "sample_2_confirmation_provider",
+        "sample_3_at",
+        "sample_3_primary_provider",
+        "sample_3_confirmation_provider",
+        "recovery_attempted_total",
+        "recovery_succeeded_total",
+        "recovery_blocked_total",
+        "last_block_reason",
+        "recovery_evidence_hash",
+        "last_recovered_at",
+        "updated_at"
+      ],
+      "definedIn": [
+        "live-executor/schema/008_revenue_provider_authority.sql"
+      ]
+    },
+    "live_canary.atlas_auction_shadow": {
+      "columns": [
+        "auction_id",
+        "user_operation_hash",
+        "dapp",
+        "asset",
+        "evidence_hash",
+        "observed_at",
+        "evaluated_at",
+        "ingress_latency_ms",
+        "identity_valid",
+        "bounds_valid",
+        "borrower",
+        "block_number",
+        "block_hash",
+        "exact_completed",
+        "callback_simulation_attempted",
+        "callback_simulation_passed",
+        "evidence_mode",
+        "simulated_gas_limit",
+        "solver_gas_settlement_wei",
+        "gross_value_wei",
+        "direct_cost_wei",
+        "zero_bid_conservative_wei",
+        "maximum_bid_wei",
+        "selected_bid_wei",
+        "competitive_reserve_wei",
+        "expected_net_after_bid_wei",
+        "conservative_net_after_bid_wei",
+        "shadow_bid_eligible",
+        "terminal_rejection_reason",
+        "created_at",
+        "updated_at"
+      ],
+      "definedIn": [
+        "live-executor/schema/010_atlas_auction_shadow.sql"
+      ]
+    },
+    "live_canary.atlas_liquidation_ground_truth": {
+      "columns": [
+        "transaction_hash",
+        "log_index",
+        "user_operation_hash",
+        "borrower",
+        "debt_asset",
+        "collateral_asset",
+        "debt_to_cover_wei",
+        "liquidated_collateral_wei",
+        "liquidator",
+        "receive_a_token",
+        "block_number",
+        "reconciled_at",
+        "transcript_sha256",
+        "created_at"
+      ],
+      "definedIn": [
+        "live-executor/schema/011_atlas_liquidation_ground_truth.sql"
+      ]
+    },
+    "schema_migrations": {
+      "columns": [
+        "version",
+        "checksum",
+        "applied_at"
+      ],
+      "definedIn": [
+        "migrations/001_init.sql"
+      ]
+    },
+    "origin_transactions": {
+      "columns": [
+        "tx_hash",
+        "sequence_number",
+        "chain_id",
+        "router",
+        "classification",
+        "calldata",
+        "seen_at",
+        "metadata"
+      ],
+      "definedIn": [
+        "migrations/001_init.sql"
+      ]
+    },
+    "opportunities": {
+      "columns": [
+        "id",
+        "route_id",
+        "origin_tx_hash",
+        "origin_sequence",
+        "snapshot_id",
+        "lifecycle_state",
+        "flash_asset",
+        "optimized_amount",
+        "expected_gross_profit",
+        "expected_flash_premium",
+        "expected_execution_cost",
+        "expected_ordering_cost",
+        "uncertainty_reserve",
+        "expected_net_profit",
+        "min_profit",
+        "expires_at",
+        "created_at"
+      ],
+      "definedIn": [
+        "migrations/001_init.sql"
+      ]
+    },
+    "opportunity_legs": {
+      "columns": [
+        "opportunity_id",
+        "leg_index",
+        "protocol",
+        "pool",
+        "token_in",
+        "token_out",
+        "fee",
+        "direction",
+        "expected_amount_in",
+        "expected_amount_out"
+      ],
+      "definedIn": [
+        "migrations/001_init.sql"
+      ]
+    },
+    "execution_attempts": {
+      "columns": [
+        "opportunity_id",
+        "tx_hash",
+        "submitted_at",
+        "submission_latency_ms",
+        "submission_endpoint_class",
+        "nonce",
+        "expected_net_profit",
+        "status",
+        "error",
+        "metadata"
+      ],
+      "definedIn": [
+        "migrations/001_init.sql"
+      ]
+    },
+    "executions": {
+      "columns": [
+        "opportunity_id",
+        "execution_attempt_id",
+        "tx_hash",
+        "receipt_status",
+        "block_number",
+        "gas_used",
+        "effective_gas_price",
+        "actual_tx_fee_wei",
+        "settled_event_found",
+        "reconciled_at"
+      ],
+      "definedIn": [
+        "migrations/001_init.sql"
+      ]
+    },
+    "realized_pnl": {
+      "columns": [
+        "execution_id",
+        "asset",
+        "flash_amount",
+        "premium",
+        "realized_profit_asset_units",
+        "actual_tx_fee_wei",
+        "actual_ordering_cost_wei",
+        "source_event_signature",
+        "created_at"
+      ],
+      "definedIn": [
+        "migrations/001_init.sql"
+      ]
+    },
+    "miss_reasons": {
+      "columns": [
+        "origin_tx_hash",
+        "opportunity_id",
+        "reason",
+        "metadata",
+        "created_at"
+      ],
+      "definedIn": [
+        "migrations/001_init.sql"
+      ]
+    },
+    "gas_profiles": {
+      "columns": [
+        "execution_shape",
+        "gas_used_p50",
+        "gas_used_p90",
+        "gas_used_p99",
+        "sample_count",
+        "ewma",
+        "updated_at"
+      ],
+      "definedIn": [
+        "migrations/001_init.sql"
+      ]
+    },
+    "pool_state_checkpoints": {
+      "columns": [
+        "pool",
+        "block_number",
+        "sqrt_price_x96",
+        "tick",
+        "liquidity",
+        "completeness_min_tick",
+        "completeness_max_tick",
+        "checkpoint",
+        "created_at"
+      ],
+      "definedIn": [
+        "migrations/001_init.sql"
+      ]
+    },
+    "feed_events": {
+      "columns": [
+        "sequence_number",
+        "tx_hash",
+        "payload",
+        "recorded_at"
+      ],
+      "definedIn": [
+        "migrations/001_init.sql"
+      ]
+    },
+    "contract_events": {
+      "columns": [
+        "tx_hash",
+        "log_index",
+        "contract_address",
+        "event_name",
+        "event_signature",
+        "decoded",
+        "created_at"
+      ],
+      "definedIn": [
+        "migrations/002_event_signatures.sql"
+      ]
+    },
+    "shadow_decisions": {
+      "columns": [
+        "id",
+        "opportunity_id",
+        "strategy",
+        "strategy_version",
+        "detector_version",
+        "code_version",
+        "config_version",
+        "policy_version",
+        "chain_id",
+        "source_sequence",
+        "observed_block",
+        "state_block",
+        "quote_block",
+        "route_fingerprint",
+        "disposition",
+        "primary_rejection_reason",
+        "confidence_bps",
+        "execution_eligible",
+        "base_net_pnl",
+        "conservative_net_pnl",
+        "severe_net_pnl",
+        "identity_evidence",
+        "route_evidence",
+        "market_evidence",
+        "economics_evidence",
+        "simulation_evidence",
+        "decision_evidence",
+        "outcome_evidence",
+        "observed_at",
+        "detected_at",
+        "decided_at",
+        "created_at"
+      ],
+      "definedIn": [
+        "migrations/003_shadow_profitability_evidence.sql"
+      ]
+    },
+    "rpc_quality_records": {
+      "columns": [
+        "shadow_decision_id",
+        "provider_id",
+        "method",
+        "block_number",
+        "block_hash",
+        "response_hash",
+        "latency_ns",
+        "success",
+        "stale_result",
+        "disagreement",
+        "timeout",
+        "retry_count",
+        "recorded_at"
+      ],
+      "definedIn": [
+        "migrations/003_shadow_profitability_evidence.sql"
+      ]
+    },
+    "shadow_replay_runs": {
+      "columns": [
+        "id",
+        "replay_schema_version",
+        "code_version",
+        "config_version",
+        "strategy_version",
+        "policy_version",
+        "input_evidence_hash",
+        "output_report_hash",
+        "candidate_count",
+        "accepted_count",
+        "rejected_count",
+        "started_at",
+        "completed_at",
+        "created_at"
+      ],
+      "definedIn": [
+        "migrations/003_shadow_profitability_evidence.sql"
+      ]
+    },
+    "engine_outbox": {
+      "columns": [
+        "outbox_id",
+        "schema_version",
+        "source_event_identity",
+        "source_sequence",
+        "tx_hash",
+        "chain_id",
+        "payload",
+        "created_at",
+        "available_at",
+        "publish_attempts",
+        "published_at",
+        "jetstream_ack_sequence",
+        "last_error_class",
+        "last_error_at",
+        "claim_owner",
+        "claimed_at",
+        "claim_expires_at"
+      ],
+      "definedIn": [
+        "migrations/004_shadow_engine_runtime.sql"
+      ]
+    },
+    "shadow_engine_classifications": {
+      "columns": [
+        "source_event_identity",
+        "schema_version",
+        "source_sequence",
+        "tx_hash",
+        "chain_id",
+        "classification",
+        "detail_class",
+        "candidate_count",
+        "decision_count",
+        "delivery_attempts",
+        "evidence",
+        "first_received_at",
+        "classified_at",
+        "processing_latency_ns",
+        "created_at",
+        "updated_at"
+      ],
+      "definedIn": [
+        "migrations/004_shadow_engine_runtime.sql"
+      ]
+    },
+    "shadow_engine_processing_attempts": {
+      "columns": [
+        "source_event_identity",
+        "delivery_attempt",
+        "classification",
+        "error_class",
+        "evidence",
+        "started_at",
+        "completed_at",
+        "processing_latency_ns",
+        "created_at"
+      ],
+      "definedIn": [
+        "migrations/004_shadow_engine_runtime.sql"
+      ]
+    },
+    "shadow_profitability_facts": {
+      "columns": [
+        "shadow_decision_id",
+        "source_event_identity",
+        "source_sequence",
+        "transaction_hash",
+        "chain_id",
+        "route_id",
+        "route_fingerprint",
+        "detected_at",
+        "evaluated_at",
+        "pinned_block_number",
+        "pinned_block_hash",
+        "primary_state_hash",
+        "token_path",
+        "pool_path",
+        "fee_path",
+        "input_amount",
+        "expected_output",
+        "gross_spread",
+        "gross_profit",
+        "dex_fees",
+        "price_impact",
+        "execution_gas",
+        "gas_price",
+        "arbitrum_execution_fee",
+        "l1_data_fee",
+        "flash_loan_premium",
+        "protocol_fees",
+        "failed_attempt_reserve",
+        "ordering_reserve",
+        "slippage_reserve",
+        "stale_state_reserve",
+        "state_drift_reserve",
+        "latency_reserve",
+        "uncertainty_reserve",
+        "contract_overhead",
+        "total_cost",
+        "expected_net_pnl",
+        "conservative_net_pnl",
+        "severe_net_pnl",
+        "minimum_required_net_pnl",
+        "primary_profitability_status",
+        "disposition",
+        "final_rejection_reason",
+        "secondary_rejection_reasons",
+        "model_version",
+        "policy_version",
+        "detector_version",
+        "code_version",
+        "primary_provider_id",
+        "primary_response_hash",
+        "secondary_provider_id",
+        "secondary_state_hash",
+        "verification_status",
+        "agreement_state",
+        "verification_skip_reason",
+        "shadow_only",
+        "execution_eligible",
+        "execution_request_created",
+        "evidence_completeness_status",
+        "created_at"
+      ],
+      "definedIn": [
+        "migrations/007_canonical_profitability_truth.sql"
+      ]
+    },
+    "fork_simulation_results": {
+      "columns": [
+        "result_hash",
+        "plan_hash",
+        "shadow_decision_id",
+        "plan_schema_version",
+        "result_schema_version",
+        "plan",
+        "evidence",
+        "status",
+        "predicted_gross_profit",
+        "predicted_total_cost",
+        "predicted_net_pnl",
+        "simulated_gross_profit",
+        "simulated_gas_cost",
+        "simulated_balance_delta",
+        "simulated_net_pnl",
+        "prediction_error",
+        "gas_estimate",
+        "gas_used",
+        "model_version",
+        "policy_version",
+        "fork_chain_id",
+        "fork_block_number",
+        "fork_block_hash",
+        "fork_instance_hash",
+        "local_block_number",
+        "local_block_hash",
+        "simulated_at",
+        "revert_reason",
+        "fork_only",
+        "shadow_only",
+        "live_execution",
+        "execution_eligible",
+        "execution_request_created",
+        "public_broadcast",
+        "signer_used",
+        "created_at"
+      ],
+      "definedIn": [
+        "migrations/010_fork_simulation_evidence.sql"
+      ]
+    },
+    "money_path_ingress_daily": {
+      "columns": [
+        "classification",
+        "detail_class",
+        "router_kind",
+        "wrapper_kind",
+        "selector_kind",
+        "event_count",
+        "first_seen_at",
+        "last_seen_at",
+        "schema_version"
+      ],
+      "definedIn": [
+        "migrations/011_money_path_selective_persistence.sql"
+      ]
+    },
+    "money_path_ingress_samples": {
+      "columns": [
+        "classification",
+        "detail_class",
+        "router_kind",
+        "wrapper_kind",
+        "selector_kind",
+        "sample_ordinal",
+        "sample_fingerprint",
+        "safe_decoder_summary",
+        "observed_at",
+        "schema_version"
+      ],
+      "definedIn": [
+        "migrations/011_money_path_selective_persistence.sql"
+      ]
+    },
+    "source_event_identities": {
+      "columns": [
+        "source_event_identity",
+        "schema_version",
+        "source_chain_id",
+        "source_transaction_hash",
+        "source_feed_sequence",
+        "source_feed_order_position",
+        "source_block_number",
+        "source_block_hash",
+        "source_transaction_index",
+        "source_command_index",
+        "source_event_index",
+        "source_observed_at",
+        "source_router",
+        "source_factory",
+        "source_pool",
+        "source_pool_path",
+        "source_token_path",
+        "source_encoded_token_path",
+        "source_fee_path",
+        "source_direction",
+        "source_input_amount",
+        "decoded_commands",
+        "unavailable_reason",
+        "source_identity_hash",
+        "recorded_at"
+      ],
+      "definedIn": [
+        "migrations/014_exact_source_identity.sql"
+      ]
+    },
+    "source_block_enrichments": {
+      "columns": [
+        "enrichment_hash",
+        "source_event_identity",
+        "source_identity_hash",
+        "source_chain_id",
+        "source_transaction_hash",
+        "source_block_number",
+        "source_block_hash",
+        "source_transaction_index",
+        "source_event_index",
+        "source_pool_addresses",
+        "transaction_status",
+        "provider_id",
+        "provider_response_hash",
+        "enriched_at"
+      ],
+      "definedIn": [
+        "migrations/014_exact_source_identity.sql"
+      ]
+    },
+    "source_enrichment_attempts": {
+      "columns": [
+        "source_event_identity",
+        "attempt_number",
+        "result",
+        "failure_reason",
+        "attempted_at"
+      ],
+      "definedIn": [
+        "migrations/014_exact_source_identity.sql"
+      ]
+    },
+    "transaction_boundary_state_evidence": {
+      "columns": [
+        "evidence_hash",
+        "source_event_identity",
+        "source_identity_hash",
+        "enrichment_hash",
+        "source_block_number",
+        "source_block_hash",
+        "source_transaction_hash",
+        "source_transaction_index",
+        "parent_block_number",
+        "parent_block_hash",
+        "reconstruction_method",
+        "prestate_hash",
+        "state_diff_hash",
+        "post_initiating_state_hash",
+        "completeness_status",
+        "failure_reason",
+        "provider_id",
+        "provider_response_hash",
+        "evidence",
+        "reconstructed_at"
+      ],
+      "definedIn": [
+        "migrations/014_exact_source_identity.sql"
+      ]
+    }
+  }
+}

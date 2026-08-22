@@ -1,0 +1,8 @@
+# Phoenix Harness V3 — machine-local artifacts (never committed)
+# Runtime artifact spillover from native tools (full outputs; transcripts stay local)
+.phoenix-harness/
+# Frontier eval run evidence: generated briefs, manifests, session telemetry,
+# and synthetic smoke data are machine-local by design. The reproducible
+# task definitions and fixtures live in benchmarks/frontier/tasks/ and
+# benchmarks/frontier/fixtures/.
+benchmarks/frontier/runs/

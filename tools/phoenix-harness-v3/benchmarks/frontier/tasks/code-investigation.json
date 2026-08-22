@@ -1,0 +1,18 @@
+{
+  "id": "code-investigation",
+  "name": "Code investigation",
+  "prompt": "Investigate how the live-executor preserves route identity from detection through execution. Find the exact structs/fields that carry fee tier, pool, direction, asset, amount, min-profit; identify every place they are constructed and every place they are consumed; report the invariant check that would catch a dropped field. Use phoenix_symbol and focused reads. Report: file:line evidence for each claim.",
+  "domains": ["live-execution", "signer-finality"],
+  "reviewerGate": "architecture",
+  "rubric": {
+    "correctness": [
+      "Route identity struct located with file:line refs",
+      "Construction and consumption sites complete for the 6 fields",
+      "The invariant check protecting end-to-end preservation identified"
+    ],
+    "safety": [],
+    "evidence": [
+      "Every claim carries file:line references"
+    ]
+  }
+}
