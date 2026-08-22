@@ -260,6 +260,17 @@ async fn handle_request(
             Ok(()) => write_text(&mut stream, 200, "ready\n").await,
             Err(reason) => write_text(&mut stream, 503, &format!("{reason}\n")).await,
         },
+        ("GET", "/headz") => match runtime.observability_head().await {
+            Some(head) => write_json(&mut stream, 200, &head).await,
+            None => {
+                write_json(
+                    &mut stream,
+                    503,
+                    &serde_json::json!({"error": "head_unavailable"}),
+                )
+                .await
+            }
+        },
         ("GET", "/metrics") => {
             write_response(
                 &mut stream,
@@ -706,6 +717,14 @@ mod tests {
         assert!(REQUIRED_RPC_METRICS
             .iter()
             .all(|metric| rendered.contains(metric)));
+    }
+
+    #[test]
+    fn headz_observability_route_is_read_only_and_declared() {
+        let source = include_str!("main.rs");
+        assert!(source.contains("(\"GET\", \"/headz\")"));
+        assert!(!source.contains("(\"POST\", \"/headz\")"));
+        assert!(!source.contains("(\"PUT\", \"/headz\")"));
     }
 
     #[test]
