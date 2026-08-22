@@ -39,6 +39,7 @@ function perArm(root, arm, taskIds) {
       t.runs += 1
       if (record.ok) t.completed += 1
       t.wallMs.push(record.wallMs ?? 0)
+      stats.wallMs.push(record.wallMs ?? 0)
       t.sessions.push(record.sessionId ?? null)
       const sessions = parseTelemetryDir(join(rdir, r, 'evidence'))
       const agg = aggregate(sessions)
@@ -107,7 +108,7 @@ export function gateReport(root) {
     p95estCharsCandidate: pct(candidate.stats.estChars, 0.95),
     maxEstCharsCandidate: candidate.stats.estChars.length ? Math.max(...candidate.stats.estChars) : null,
   }
-  evidence.polling = { candidatePollingCalls: candidate.stats.polling, candidateBookkeepingCalls: candidate.stats.bookkeeping }
+  evidence.polling = { candidatePollingCalls: candidate.stats.polling, candidateBookkeepingCalls: candidate.stats.bookkeeping, controlBookkeepingCalls: control.stats.bookkeeping }
   evidence.reliability = { controlFailures: control.stats.failures, candidateFailures: candidate.stats.failures }
   evidence.latency = { controlMedianWallMs: vMed, candidateMedianWallMs: cMed }
   evidence.quality = { judgedTasks: judged.length, critical: CRITICAL_TASKS.map((t) => ({ task: t, verdict: reviews[t]?.verdict ?? 'missing' })) }

@@ -336,8 +336,14 @@ async function reviewCampaign(args) {
   const manifest = readJson(join(root, 'manifest.json'), null)
   if (!manifest) return { ok: false, error: 'campaign manifest missing' }
   const tasks = loadTasks()
+  const taskIds = (flag('tasks') ? String(flag('tasks')).split(',') : Object.keys(tasks)).filter((t) => tasks[t])
   const reviews = {}
-  for (const taskId of Object.keys(tasks)) {
+  // A filtered re-run must not destroy reviews for tasks outside the filter.
+  if (flag('tasks')) {
+    const prev = readJson(join(root, 'reviews.json'), null)
+    if (prev && typeof prev === 'object') Object.assign(reviews, prev)
+  }
+  for (const taskId of taskIds) {
     const task = tasks[taskId]
     const pair = {}
     for (const arm of ['control', 'candidate']) {
@@ -371,6 +377,10 @@ async function reviewCampaign(args) {
     const prompt = judgePrompt(task, aText, bText)
     const judgeDir = join(root, 'reviews', taskId)
     mkdirSync(judgeDir, { recursive: true })
+    // Isolated EMPTY judge cwd — the judge must never see the real repo
+    // (private docs, fixtures, other runs) or write telemetry into it.
+    const judgeCwd = join(judgeDir, 'cwd')
+    mkdirSync(judgeCwd, { recursive: true })
     writeJson(join(judgeDir, 'judge-prompt.json'), { taskId, order, promptLen: prompt.length })
     writeFileSync(join(judgeDir, 'judge-prompt.txt'), prompt)
     review.judge = { order, raw: null, mapped: null, status: 'pending' }
@@ -382,13 +392,13 @@ async function reviewCampaign(args) {
         '--preset', 'none',
         '--task', `judge-${taskId}`,
         '--run', '0',
-        '--worktree', REPO_ROOT,
+        '--worktree', judgeCwd,
         '--prompt-file', join(judgeDir, 'judge-prompt.txt'),
         '--dsh-home', judgeHome,
         '--out', outFile,
         '--budget-ms', String(15 * 60000),
       ], {
-        cwd: REPO_ROOT,
+        cwd: judgeCwd,
         budgetMs: 15 * 60000,
         env: { DSH_HOME: judgeHome, PHOENIX_DSH_CHECKOUT: manifest.checkout },
       })

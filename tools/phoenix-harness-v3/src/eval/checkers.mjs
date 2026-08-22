@@ -33,6 +33,16 @@ function extractFnBody(text, name) {
   return m ? m[1].trim() : null
 }
 
+/** Rubric-aligned normalization: comments are outside the task contract, so
+ *  whole-line // comments and block comments are stripped before body
+ *  comparison. Code differences still fail. */
+function stripComments(code) {
+  return String(code ?? '')
+    .replace(/\/\*[\s\S]*?\*\//g, ' ')
+    .replace(/^[ \t]*\/\/.*$/gm, '')
+    .split('\n').map((l) => l.trimEnd()).filter((l) => l.trim() !== '').join('\n').trim()
+}
+
 export function bugFixChecker({ finalText = '', worktreeDir }) {
   const checks = []
   if (!worktreeDir) return { verdict: 'inconclusive', checks: [] }
@@ -49,8 +59,8 @@ export function bugFixChecker({ finalText = '', worktreeDir }) {
   const bodyExact = fixedText !== null && (() => {
     const a = extractFnBody(text, 'flashPremium')
     const b = extractFnBody(fixedText, 'flashPremium')
-    if (a !== null && b !== null) return a === b
-    return text.trim() === fixedText.trim()
+    if (a !== null && b !== null) return stripComments(a) === stripComments(b)
+    return stripComments(text) === stripComments(fixedText)
   })()
   checks.push({
     id: 'exact-fix',
@@ -76,6 +86,11 @@ export function bugFixChecker({ finalText = '', worktreeDir }) {
     let win = report.slice(fixtureMention.index, fixtureMention.index + 2000)
     const cut = win.search(/\n\*\*Result|\n## /)
     if (cut > 0) win = win.slice(0, cut)
+    // Scope to the FIRST outcome sentence: later sentences legitimately
+    // describe the pre-fix red run (e.g. "the unfixed version failed 2/3"),
+    // which is exactly the evidence the rubric wants — not a fixture failure.
+    const sentCut = win.search(/\.[ \t]*(?:\n|(?=[ \t]*[A-Z*`]))/)
+    if (sentCut > 0) win = win.slice(0, sentCut + 1)
     const passSignal = /\bpass(?:es|ed|ing)?\b|\bok\b|✓/i.test(win)
     const failSignal = /(?<!0 )(?<!zero )(?<!no )\bfail(?:ed|ing|s|ure)?\b/i.test(win)
     evidenceOk = passSignal && !failSignal

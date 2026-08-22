@@ -80,6 +80,10 @@ test('judge: parses verdicts (plain, fenced) and maps shuffle back to arms', () 
   const prompt = judgePrompt(loadTask('bug-fix'), 'OUT-A', 'OUT-B')
   assert.match(prompt, /OUTPUT X/)
   assert.match(prompt, /RUBRIC/)
+  // Blindness hardening: the judge must be told the outputs are its only
+  // evidence and to answer with the JSON first.
+  assert.match(prompt, /Do NOT use any tools/)
+  assert.match(prompt, /no preamble/)
 })
 
 test('checkers: bug-fix exact fix passes, planted content fails', () => {
@@ -127,6 +131,24 @@ test('checkers: bug-fix is rubric-aligned — identical function body passes des
     // Same fix without test evidence fails closed (rubric evidence item).
     const noEvidence = bugFixChecker({ worktreeDir: t })
     assert.equal(noEvidence.verdict, 'fail')
+    // The red-before-fix sentence (pre-fix control run failing) is evidence
+    // the rubric WANTS — it must not flip the fixture outcome to failing.
+    const withRedRun = bugFixChecker({ worktreeDir: t, finalText: 'node --test amount.test.mjs run → **exit 0 — 3/3 pass** (no Number in source).\nRed-before-fix evidence: the unfixed version failed 2/3 with the same assertion.' })
+    assert.equal(withRedRun.verdict, 'pass')
+    // A genuinely failing fixture outcome still fails closed.
+    const failingOutcome = bugFixChecker({ worktreeDir: t, finalText: 'node --test amount.test.mjs → exit 1, 2/3 pass, 1 fail' })
+    assert.equal(failingOutcome.verdict, 'fail')
+    // Comment INSIDE the function body is also outside the task contract —
+    // the code must still match exactly.
+    const agentFileWithComment = `/** planted-bug header still says bug */\nexport function flashPremium(amountWei, feeBps) {\n  const amount = BigInt(amountWei)\n  const fee = BigInt(feeBps)\n  // Exact integer math: multiply first, then divide — no float conversion.\n  return ((amount * fee) / 10000n).toString()\n}\n`
+    writeFileSync(join(t, 'buggy_amount.mjs'), agentFileWithComment)
+    const withComment = bugFixChecker({ worktreeDir: t, finalText: 'node --test amount.test.mjs → 3 pass, 0 fail' })
+    assert.equal(withComment.verdict, 'pass')
+    // A real CODE difference still fails despite comment normalization.
+    const agentFileWrongCode = `/** hdr */\nexport function flashPremium(amountWei, feeBps) {\n  const amount = BigInt(amountWei)\n  const fee = BigInt(feeBps)\n  return ((amount * fee) / 100n).toString()\n}\n`
+    writeFileSync(join(t, 'buggy_amount.mjs'), agentFileWrongCode)
+    const wrongCode = bugFixChecker({ worktreeDir: t, finalText: 'node --test amount.test.mjs → 3 pass, 0 fail' })
+    assert.equal(wrongCode.verdict, 'fail')
   } finally {
     rmSync(t, { recursive: true, force: true })
   }
