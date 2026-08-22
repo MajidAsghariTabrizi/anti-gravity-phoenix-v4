@@ -93,8 +93,12 @@ try {
   if (!existsSync(basePatch)) fail(2, `dsh-base patch missing at ${basePatch} — checkout pin broken`)
 
   // Compose the child's host config: the untouched dsh-base patch + the
-  // agent-presets roster row + the code-runtime row (Code Mode transport).
+  // agent-presets roster row + the code-runtime row (Code Mode transport) +
+  // the tools-mode env seam (same restatement the shipped web patch uses).
   const composed = `${readFileSync(basePatch, 'utf8')}
+- id: tools
+  config:
+    mode: !!js process.env.DSH_TOOLS_MODE
 - insert:
     - id: agent-presets
       name: '@deepseek-ai/dsh-agent-presets'
