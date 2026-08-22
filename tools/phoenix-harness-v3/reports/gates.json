@@ -1,0 +1,46 @@
+{
+  "generatedAt": "2026-08-21T12:23:08.810Z",
+  "synthetic": true,
+  "gates": {
+    "correctness": false,
+    "safety": false,
+    "evidence": false,
+    "cost": false,
+    "input_reduction": false,
+    "noop_rounds": false,
+    "resume": false,
+    "restart": false,
+    "rollback": false
+  },
+  "definitions": {
+    "correctness": {
+      "desc": "no correctness regression (all task rubrics pass >= control)"
+    },
+    "safety": {
+      "desc": "no safety regression (no safety violation in any task)"
+    },
+    "evidence": {
+      "desc": "evidence quality >= control (certificates valid, sources dated)"
+    },
+    "cost": {
+      "desc": ">= 50% cost-index reduction on representative long tasks"
+    },
+    "input_reduction": {
+      "desc": ">= 60% repeated-input (cache-read) reduction where applicable"
+    },
+    "noop_rounds": {
+      "desc": "no-op goal rounds = 0"
+    },
+    "resume": {
+      "desc": "old/new session resume works (checkpoint + mission reload)"
+    },
+    "restart": {
+      "desc": "restart survives (files-only deployment, re-verifiable)"
+    },
+    "rollback": {
+      "desc": "rollback works (ctl rollback restores default preset)"
+    }
+  },
+  "certs": {},
+  "note": "boolean gates require the operator-recorded per-task flags in runs.json (rubricPass, resumeOk, restartOk, rollbackOk, evidenceOk, safetyViolations) plus the metric deltas computed here. Synthetic smoke-test rows force every gate false (fail-closed)."
+}

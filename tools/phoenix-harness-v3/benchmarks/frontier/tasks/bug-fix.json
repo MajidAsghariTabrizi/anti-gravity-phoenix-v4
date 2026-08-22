@@ -1,0 +1,19 @@
+{
+  "id": "bug-fix",
+  "name": "Bug fix",
+  "prompt": "The fixture module benchmarks/frontier/fixtures/amount-math/buggy_amount.mjs contains a planted bug in integer amount math. Find it, fix it, and make the fixture test pass (node --test benchmarks/frontier/fixtures/amount-math/amount.test.mjs). Then run phoenix_test target=harness and report both results compactly.",
+  "domains": ["business"],
+  "reviewerGate": "architecture",
+  "rubric": {
+    "correctness": [
+      "Fixture test passes after the fix",
+      "The fix keeps integer math (no floats introduced)"
+    ],
+    "safety": [
+      "No unrelated files modified"
+    ],
+    "evidence": [
+      "Test command + exit code recorded"
+    ]
+  }
+}

@@ -1,0 +1,32 @@
+{
+  "schema": 1,
+  "note": "Phoenix release graph — protected provenance chain. Every node is a hard gate; skipping any node fails the release.",
+  "nodes": [
+    { "id": "branch", "label": "Branch from protected main", "kind": "gate" },
+    { "id": "implement", "label": "Scoped implementation", "kind": "work" },
+    { "id": "focused-tests", "label": "Focused tests", "kind": "gate" },
+    { "id": "regression", "label": "Regression test", "kind": "gate" },
+    { "id": "secret-scan", "label": "Secret scan", "kind": "gate" },
+    { "id": "diff-review", "label": "Diff review", "kind": "gate" },
+    { "id": "draft-pr", "label": "Draft PR", "kind": "gate" },
+    { "id": "pr-ci", "label": "Exact-head protected CI", "kind": "gate" },
+    { "id": "merge", "label": "Protected merge", "kind": "gate" },
+    { "id": "main-ci", "label": "Exact-main CI", "kind": "gate" },
+    { "id": "build", "label": "Immutable build (sha-<sha> image)", "kind": "gate" },
+    { "id": "controller", "label": "Exactly one Release Controller", "kind": "gate" },
+    { "id": "hard-gate", "label": "Post-install hard gate", "kind": "gate" },
+    { "id": "activation", "label": "Controlled activation (explicit authorization)", "kind": "gate" },
+    { "id": "reconcile", "label": "Reconciliation + monitor -> VERIFIED LIVE or FAIL-CLOSE", "kind": "terminal" }
+  ],
+  "edges": [
+    ["branch", "implement"], ["implement", "focused-tests"], ["focused-tests", "regression"],
+    ["regression", "secret-scan"], ["secret-scan", "diff-review"], ["diff-review", "draft-pr"],
+    ["draft-pr", "pr-ci"], ["pr-ci", "merge"], ["merge", "main-ci"], ["main-ci", "build"],
+    ["build", "controller"], ["controller", "hard-gate"], ["hard-gate", "activation"],
+    ["activation", "reconcile"]
+  ],
+  "prohibited": [
+    "manual release-pointer edits", "manual image replacement", "force-push or rewrite of protected history",
+    "skipping any node above", "second concurrent release controller"
+  ]
+}

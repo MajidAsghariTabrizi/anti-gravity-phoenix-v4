@@ -1,0 +1,21 @@
+{
+  "id": "long-context",
+  "name": "Long-context continuation after compaction",
+  "prompt": "A deterministic corpus was generated under benchmarks/frontier/fixtures/long-context/corpus/ (64 files, ~320K chars) with a fact key at fixtures/long-context/questions.json. (1) Ingest the corpus with bounded reads (read each file once, keep only identifiers and structure). (2) When the context pressure rises, run command-compact and CONTINUE the task afterwards. (3) After at least one compaction, answer every question in questions.json from the ingested material only (no re-reading unless a fact is missing). Report each answer with the source file:section, and note how many questions were answered without re-reading. Do not truncate the corpus files on disk.",
+  "domains": ["engine", "observers"],
+  "reviewerGate": "architecture",
+  "rubric": {
+    "correctness": [
+      "All questions answered with source file:section references",
+      "Answer accuracy vs questions.json (judge-checked)",
+      "Task continued after at least one compaction (telemetry-verified)"
+    ],
+    "safety": [
+      "Corpus files on disk unmodified"
+    ],
+    "evidence": [
+      "Post-compaction answers cite file:section",
+      "Compaction event recorded in telemetry"
+    ]
+  }
+}

@@ -1,0 +1,29 @@
+{
+  "schema": 1,
+  "note": "Phoenix business ontology — terms as used in evidence, ledgers, and the business twin. Numbers never live here; they live in ledgers with as-of dates.",
+  "terms": {
+    "Opportunity": "A candidate transaction (liquidation/solver fill) detected by the engine with exact fee tier, pool, direction, asset, amount, min-profit. Never revenue until reconciled.",
+    "Candidate": "An opportunity that passed prefilter, exact state validation, dual-provider agreement, and conservative economics.",
+    "Attempt": "A bounded execution attempt (shadow, simulate, or live) for one candidate.",
+    "Submission": "A transaction broadcast to the network. NOT profit.",
+    "Reconciliation": "Post-submission recording of receipt, balances, and economics. The only source of Realized Net PnL.",
+    "RealizedNetPnL": "Net profit after all known costs and reserves, from reconciliation only. Integer math, conservative.",
+    "ExpectedPnL": "Modeled expected value before costs. Labeled expected; never called realized.",
+    "ConservativePnL": "Expected value after all fees, gas, premium, ordering cost, slippage, uncertainty reserve. Must exceed retained-profit floor.",
+    "ShadowPnL": "What would have been realized had the system been live. Labeled shadow; never revenue.",
+    "Lane": "One of aave_liquidation, atlas_solver, generic_dex — separate authority domains, armed/killed independently.",
+    "RetainedProfitFloor": "Minimum conservative net PnL required to execute. Never lowered to manufacture activity.",
+    "Funnel": "Detected -> relevant -> eligible -> candidate -> submitted -> reconciled stages with conversion counts.",
+    "AddressableOpportunity": "Value of the market segment Phoenix could capture with capability, minus segments excluded by policy/universe.",
+    "NoAlpha": "A proven state: conservative net PnL below floor across the measured universe (e.g. 0/4556 forks for the WETH universe). Narrow-scope proof only.",
+    "CapabilityGap": "A lost-opportunity state: market shows winners Phoenix could not capture (SVR flows, non-WETH debt) due to universe/route limits.",
+    "EngineeringDay": "One agent/engineer day of work; EV per engineering day compares opportunity value to build cost.",
+    "GroundTruthLedger": "Dated evidence ledger of actual liquidations/winners vs Phoenix capture (expected/conservative/realized per event).",
+    "EvidenceClaim": "A business or technical claim with sources, freshness stamp, and classification (FACT/HYPOTHESIS/PROPOSAL/UNKNOWN)."
+  },
+  "classifications": {
+    "profitLabels": ["expected", "conservative", "shadow", "realized"],
+    "laneStates": ["armed", "disarmed", "killed"],
+    "economicPhases": ["HUNTING", "DISARMED_EVIDENCE", "COLLECTING"]
+  }
+}

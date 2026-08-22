@@ -459,3 +459,10 @@ The runner records `schema_migrations`, migration version, SHA-256 checksum, and
 ## GitHub Actions
 
 Workflow actions are pinned to full commit SHAs in `.github/workflows/`. The dependency ledger and update process are in `docs/GITHUB_ACTIONS_DEPENDENCIES.md`.
+
+## Phoenix Harness V3 (tools/phoenix-harness-v3)
+
+- Pinned harness: `@deepseek-ai/dsh` 0.1.0-rc.7, npx checkout `1e7f6d9597241db0`, Node >= v24.13.0 (see `tools/phoenix-harness-v3/VERSION`).
+- V3 is a zero-external-dependency ESM plugin built into the `phoenix-v3-{canary,production}` DSH presets; the V2 `phoenix` preset is the untouched CONTROL.
+- Cost proxy (documented assumption; no USD CSVs available): billed-equivalent tokens = uncached input + 0.1 x cache-read + output. All V3 cost comparisons are token-based percentages, never invented USD.
+- Production SSH access: read-only allowlist via `phoenix_remote`; `sudo`, pipes, redirects, and non-allowlisted commands are refused at the tool gate. No secrets are ever printed.

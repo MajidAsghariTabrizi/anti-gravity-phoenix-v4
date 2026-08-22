@@ -16,6 +16,15 @@ keystore/
 keystores/
 wallets/
 
+# Phoenix Harness machine-local state (V2/V3 telemetry sinks, checkpoints,
+# capsules, mission specs — per-session by design; never committed)
+.phoenix-harness/
+.agent-private/
+
+# Phoenix Harness V3 eval campaign evidence (live-runner outputs; the
+# reproducible definitions live in tools/phoenix-harness-v3/benchmarks/)
+tools/phoenix-harness-v3/benchmarks/frontier/runs/
+
 # Python / Streamlit
 .venv/
 venv/
@@ -37,6 +46,10 @@ bin/
 *.test
 *.out
 coverage.out
+# The Phoenix Harness V3 control CLI is a tracked source file, not a Go
+# build output (the generic bin/ pattern above would hide it).
+!tools/phoenix-harness-v3/bin/
+!tools/phoenix-harness-v3/bin/phoenix-harness-v3.mjs
 
 # Solidity / Foundry
 out/

@@ -1,0 +1,34 @@
+{
+  "schema": 1,
+  "note": "Phoenix service graph — data flow and dependencies. Structural; derived from .phoenix-harness/architecture-map.json + ARCHITECTURE.md.",
+  "flow": [
+    "arbitrum-sequencer-feed -> nitro-relay (local) -> feed-ingestor -> NATS phoenix.feed.tx",
+    "phoenix.feed.tx -> phoenix-engine (prefilter -> exact validation -> dual-provider agreement -> economics)",
+    "phoenix-engine -> live-executor (SHADOW/SIMULATE/LIVE gates) -> PhoenixExecutor (contract)",
+    "phoenix-engine/recorder -> recorder -> PostgreSQL outbox",
+    "PostgreSQL -> replay (same modules, recorded streams)",
+    "rpc-gateway -> phoenix-engine + live-executor (all read RPC)",
+    "atlas-observer -> PostgreSQL (auction stream, hunter screens, reconciler)",
+    "migration-runner -> PostgreSQL (schema)",
+    "PostgreSQL + prometheus -> dashboard",
+    "live-executor -> PostgreSQL (execution requests, submissions, reconciliation)"
+  ],
+  "services": {
+    "feed-ingestor": { "publishes": ["phoenix.feed.tx"], "consumes": ["nitro-relay"], "critical": false },
+    "phoenix-engine": { "consumes": ["phoenix.feed.tx", "rpc-gateway"], "produces": ["candidates"], "critical": true },
+    "rpc-gateway": { "consumes": ["arbitrum rpc providers"], "produces": ["cold reads"], "critical": true },
+    "live-executor": { "consumes": ["candidates", "signer", "rpc-gateway"], "produces": ["submissions", "reconciliation"], "critical": true },
+    "recorder": { "consumes": ["engine stream"], "produces": ["postgres outbox"], "critical": true },
+    "replay": { "consumes": ["postgres outbox"], "produces": ["replayed results"], "critical": false },
+    "atlas-observer": { "consumes": ["atlas auction stream"], "produces": ["postgres sinks"], "critical": false },
+    "migration-runner": { "consumes": ["migrations"], "produces": ["schema"], "critical": false },
+    "prometheus": { "consumes": ["scrape targets"], "critical": false },
+    "dashboard": { "consumes": ["postgres", "prometheus"], "critical": false }
+  },
+  "external": {
+    "arbitrum-one": { "chain_id": 42161, "via": "rpc-gateway only" },
+    "github": { "repo": "MajidAsghariTabrizi/anti-gravity-phoenix-v4", "role": "protected main, CI, releases" },
+    "ghcr": { "role": "immutable release images sha-<sha>" },
+    "production-host": { "role": "phoenix VPS; release gateway/controller; postgres; containers" }
+  }
+}

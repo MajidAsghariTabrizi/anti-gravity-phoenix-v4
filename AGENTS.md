@@ -2,6 +2,14 @@
 
 This repository is a new project. The parent Anti-Gravity repository is read-only reference.
 
+> Phoenix Harness V3 (map pointer — details live in the harness, not here):
+> the intelligence-operating-system layer lives at `tools/phoenix-harness-v3/`
+> (kernel, business twin, knowledge system, mission compiler, governor, native
+> tools, lessons, benchmarks, ctl). Agents operating under a phoenix-v3 preset
+> load `knowledge/kernel.md` via `phoenix_context`; the V2 `phoenix` preset is
+> the untouched CONTROL. Never restate harness mechanics in this file — this
+> file stays a map.
+
 Rules for every future coding agent:
 
 - All source, configuration, fixtures, tests, docs, scripts, and generated artifacts belong under `anti-gravity-phoenix-v4/`.

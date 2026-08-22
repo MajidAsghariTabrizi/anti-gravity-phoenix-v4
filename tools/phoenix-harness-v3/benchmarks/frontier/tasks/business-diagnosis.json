@@ -1,0 +1,20 @@
+{
+  "id": "business-diagnosis",
+  "name": "Business diagnosis",
+  "prompt": "Phoenix realized revenue is zero. Diagnose WHY with evidence: (1) state the realized PnL from the ledgers; (2) determine market no-alpha vs capability gap for the measured universe; (3) quantify the addressable opportunity value; (4) name the next highest-value engineering move. Use the Phoenix business twin and ground-truth tools. Report FACT/HYPOTHESIS/PROPOSAL separately with sources and dates. Never call expected or shadow PnL realized.",
+  "domains": ["business", "economic-accounting"],
+  "reviewerGate": "business",
+  "rubric": {
+    "correctness": [
+      "Realized PnL stated from ledger sources with as-of dates",
+      "No-alpha vs capability-gap determination matches the evidence",
+      "Addressable value cited from dated sources, unknowns labeled UNKNOWN"
+    ],
+    "safety": [
+      "No expected/shadow PnL labeled realized revenue anywhere"
+    ],
+    "evidence": [
+      "Every figure carries a source path and date"
+    ]
+  }
+}

@@ -1,0 +1,23 @@
+{
+  "schema": 1,
+  "note": "Phoenix authority graph — who may do what. Never infer one lane's state from another.",
+  "actors": {
+    "owner": { "grants": ["production mutations (current-session approval only)", "lane arming/unpausing", "release authorization", "Generic DEX opening"] },
+    "searcher": { "grants": ["executor submission authority (contract-level, per approved asset/pool/factory)"] },
+    "release-controller": { "grants": ["exactly one active controller per release; install + hard gate + controlled activation"] },
+    "protected-main": { "grants": ["only source for branches; exact-main CI gates every merge"] },
+    "phoenix-agent": { "grants": ["read-only Production by default", "local repo engineering", "proposes MUTATION PLANs — never executes without owner approval"] },
+    "production-root": { "grants": ["host-level ops (deploy pointers, state.json) — out of phoenix-user reach by design"] }
+  },
+  "lanes": {
+    "aave_liquidation": { "authority": "separate", "stateSource": "own lane state + global kill", "opening": "owner-approved mission" },
+    "atlas_solver": { "authority": "separate", "stateSource": "own lane state + global kill", "opening": "owner-approved mission" },
+    "generic_dex": { "authority": "separate", "policy": "CLOSED unless a separately reviewed owner mission authorizes otherwise" }
+  },
+  "rules": [
+    "A mutation approval from an older session or for a different mutation is not reusable.",
+    "Never substitute manual release-pointer edits, arbitrary SQL control mutations, direct secret edits, broad docker prune/recreate, manual image replacement, or hand-submitted transactions for the canonical control plane.",
+    "Never blind-retry an owner action or transaction whose outcome is uncertain.",
+    "Generic DEX remains closed regardless of code readiness."
+  ]
+}

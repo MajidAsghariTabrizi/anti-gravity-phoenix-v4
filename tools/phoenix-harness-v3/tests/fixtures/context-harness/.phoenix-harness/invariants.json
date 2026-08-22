@@ -1,0 +1,15 @@
+{
+  "version": 1,
+  "invariants": [
+    {
+      "id": "money-path-integer-math",
+      "statement": "Integer math only for on-chain quantities.",
+      "domain": "live-execution"
+    },
+    {
+      "id": "fail-close",
+      "statement": "Ambiguity and unknown submission must fail closed.",
+      "domain": "live-execution"
+    }
+  ]
+}

@@ -1,0 +1,19 @@
+{
+  "id": "schema-migration",
+  "name": "Schema migration",
+  "prompt": "Design a migration that adds an indexed column evidence_sha TEXT to the reconciliation table without breaking the migration runner contract (schema table, checksums, advisory lock, transactional apply). Write the SQL file under benchmarks/frontier/fixtures/migration/ and validate it with the repo's migration conventions (review migrations/ for naming and structure). Report the exact checksum-generation convention and how a failed apply is rolled back.",
+  "domains": ["database-state", "chain-reconciliation"],
+  "reviewerGate": "architecture",
+  "rubric": {
+    "correctness": [
+      "Migration file follows the repo naming/structure convention",
+      "Checksum + transactional apply semantics described correctly from migrations/ evidence"
+    ],
+    "safety": [
+      "Statement is additive and reversible (documented down path)"
+    ],
+    "evidence": [
+      "Convention claims carry file:line refs"
+    ]
+  }
+}

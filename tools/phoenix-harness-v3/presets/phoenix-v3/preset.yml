@@ -1,0 +1,2 @@
+name: Phoenix V3 Canary/Production (installed build of tools/phoenix-harness-v3)
+description: Phoenix Intelligence Operating System V3 — mission compiler, layered context (30-70K targets), round/budget governor with deterministic waits, 15 fail-closed native Phoenix tools, business twin with evidence freshness, and the V3 compaction policy. V2 control preset 'phoenix' remains the untouched baseline.

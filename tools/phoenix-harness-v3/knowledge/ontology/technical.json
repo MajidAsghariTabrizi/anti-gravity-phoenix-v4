@@ -1,0 +1,29 @@
+{
+  "schema": 1,
+  "note": "Phoenix technical ontology — components and data-model terms. Structural facts only; runtime state lives in Production, never here. Key dirs from .phoenix-harness/architecture-map.json.",
+  "components": {
+    "feed-ingestor": { "lang": "go", "dir": "feed-ingestor", "role": "Nitro relay WebSocket -> NATS Core publisher phoenix.feed.tx; ordering, duplicate/gap/out-of-order handling" },
+    "phoenix-engine": { "lang": "rust", "dir": "phoenix-engine", "role": "Decision engine: prefilter -> exact state validation -> dual-provider agreement -> conservative economics -> candidate" },
+    "rpc-gateway": { "lang": "rust", "dir": "rpc-gateway", "role": "Cold read gateway: provider budgets, cache, coalescing, circuit breaker, priority, dual-provider inputs. All read RPC funnels here" },
+    "recorder": { "lang": "rust", "dir": "recorder", "role": "NATS engine stream -> Postgres outbox; durable delivery" },
+    "replay": { "lang": "rust", "dir": "replay", "role": "Same origin/graph/simulation/optimizer/profit modules as live, over recorded streams" },
+    "live-executor": { "lang": "rust", "dir": "live-executor", "role": "Constrained execution coordinator, SHADOW/SIMULATE/LIVE gates, PhoenixExecutor interaction, pause/reentrancy safety, baseline balance accounting" },
+    "money-path-classifier": { "lang": "rust", "dir": "money-path-classifier", "role": "Economic gates: principal, flash premium, execution cost, ordering cost, uncertainty reserve; integer math" },
+    "fork-sandbox": { "lang": "rust", "dir": "fork-sandbox", "role": "Fork-based simulation sandbox for candidates" },
+    "atlas-observer": { "lang": "go", "dir": "atlas-observer", "role": "Atlas auction stream observer + Aave hunter borrower screening + reconciler; Postgres sinks" },
+    "migration-runner": { "lang": "go", "dir": "migration-runner", "role": "Schema migrations: checksums, advisory lock, transactional apply" },
+    "dashboard": { "lang": "python", "dir": "dashboard", "role": "Operator dashboard (read-only views)" },
+    "contracts": { "lang": "solidity", "dir": "contracts", "role": "PhoenixExecutor: owner/searcher auth, pause, reentrancy guard, approved assets/pools/factories, callback checks" },
+    "prometheus": { "dir": "prometheus", "role": "Metrics scraping" }
+  },
+  "dataModel": {
+    "opportunity": "Immutable route/leg/opportunity structs; exact fee tier, pool, direction, asset, amount, min-profit",
+    "execution_request": "Attempt record (shadow/simulate/live) with authorization and lock identity",
+    "submission": "Broadcast record with nonce, signer, provider agreement",
+    "reconciliation": "Receipt + balance reconciliation -> Realized Net PnL",
+    "ground_truth": "Actual liquidation/auction events joined against Phoenix eligibility and capture (ledger tables)"
+  },
+  "languages": { "rust": ["live-executor","phoenix-engine","rpc-gateway","recorder","replay","money-path-classifier","fork-sandbox"], "go": ["feed-ingestor","atlas-observer","migration-runner"], "python": ["dashboard","scripts"], "solidity": ["contracts"], "sql": ["live-executor/schema","migrations"] },
+  "highRisk": ["live-executor/src/**","contracts/src/PhoenixExecutor.sol","rpc-gateway/src/**","money-path-classifier/src/**","scripts/rollback-release.sh","scripts/deploy-release.sh","compose.prod.yml","config/phoenix-route-policy*.json"],
+  "coldReadRule": "All read RPC goes through rpc-gateway; the hot search loop performs zero external public RPC reads."
+}

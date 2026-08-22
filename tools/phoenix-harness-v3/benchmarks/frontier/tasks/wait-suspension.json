@@ -1,0 +1,20 @@
+{
+  "id": "wait-suspension",
+  "name": "Wait/CI suspension",
+  "prompt": "Deterministic wait exercise: (1) start a background job that writes the marker file benchmarks/frontier/fixtures/wait/marker.txt exactly 8 seconds after launch (your own command, keep it simple); (2) register a deterministic wait on that marker via the native wait tool and let it block until the file appears (do NOT poll with job_output or repeated reads); (3) when it wakes, verify the marker content and report: wait duration ms, polls made (must be 0), and the job output. Clean up the background job afterwards.",
+  "domains": ["ci-build", "operations-diagnostics"],
+  "reviewerGate": "architecture",
+  "rubric": {
+    "correctness": [
+      "Marker appeared and content verified",
+      "Wait duration reported"
+    ],
+    "safety": [
+      "Background job cleaned up"
+    ],
+    "evidence": [
+      "Zero polling calls in telemetry (checker-verified)",
+      "Wake-on-state-change recorded"
+    ]
+  }
+}

@@ -1,0 +1,591 @@
+{
+  "corpus": {
+    "files": [
+      "session-5d7c392f-dcf0-43b2-99bd-5d319c944ad9.jsonl",
+      "session-9dc28f68-b792-45a4-bdab-fa2d7bc92a8a.jsonl",
+      "session-ac36ebc9-37c3-4c04-bded-d4daa38c97ec.jsonl",
+      "session-b017533e-4a10-4ff4-a1e0-8571d697da60.jsonl",
+      "session-b642d6f2-f7c8-49df-8845-14e8be4dfb59.jsonl",
+      "session-d1ee33e6-1b49-4fd5-a946-c15544d94cdf.jsonl"
+    ],
+    "sessions": [
+      "session-b642d6f2-f7c8-49df-8845-14e8be4dfb59",
+      "session-d1ee33e6-1b49-4fd5-a946-c15544d94cdf",
+      "session-b017533e-4a10-4ff4-a1e0-8571d697da60",
+      "session-5d7c392f-dcf0-43b2-99bd-5d319c944ad9",
+      "session-9dc28f68-b792-45a4-bdab-fa2d7bc92a8a",
+      "session-ac36ebc9-37c3-4c04-bded-d4daa38c97ec",
+      "unknown"
+    ],
+    "requests": 1266,
+    "toolResults": 1279,
+    "toolResultChars": 2235416,
+    "failures": 26,
+    "usage": {
+      "input": 4442158,
+      "output": 816534,
+      "cacheRead": 190681088,
+      "cacheWrite": 0,
+      "reasoning": 357957
+    },
+    "billedInputEq": 23510266,
+    "costIndex": 24326800,
+    "repeatedOps": 0,
+    "repeatedCalls": 0,
+    "bookkeepingOnlyTurns": 0,
+    "pollingCalls": 69
+  },
+  "sessions": [
+    {
+      "id": "session-b642d6f2-f7c8-49df-8845-14e8be4dfb59",
+      "lines": 3501,
+      "turns": 24,
+      "requests": 1167,
+      "failures": 20,
+      "failureCodes": {
+        "TRANSPORT": 20
+      },
+      "toolsPerRequest": 1.03,
+      "toolResults": 1197,
+      "toolResultChars": 2018338,
+      "toolMaxChars": 50000,
+      "usage": {
+        "input": 3525583,
+        "output": 705555,
+        "cacheRead": 165619072,
+        "cacheWrite": 0,
+        "reasoning": 300583
+      },
+      "estInputCharsAvg": 193442,
+      "estInputCharsMax": 313631,
+      "reqInputAvg": 144940,
+      "reqInputMax": 201112,
+      "reqInputP95": 197406,
+      "reqInputMedian": 147494,
+      "tiers": {
+        "critical": 30,
+        "standard": 1137
+      },
+      "finishes": {
+        "tool-calls": 1111,
+        "stop": 34,
+        "error": 20,
+        "max-tokens": 2
+      },
+      "billedInputEq": 20087490,
+      "costIndex": 20793045,
+      "repeatedOps": 0,
+      "repeatedCalls": 0,
+      "topRepeats": [],
+      "pollingCalls": 69,
+      "bookkeepingOnlyTurns": 0,
+      "topTools": [
+        {
+          "tool": "pwsh",
+          "calls": 467,
+          "chars": 376510
+        },
+        {
+          "tool": "read",
+          "calls": 230,
+          "chars": 921898
+        },
+        {
+          "tool": "grep",
+          "calls": 172,
+          "chars": 294257
+        },
+        {
+          "tool": "edit",
+          "calls": 162,
+          "chars": 25640
+        },
+        {
+          "tool": "job_output",
+          "calls": 69,
+          "chars": 47711
+        },
+        {
+          "tool": "write",
+          "calls": 34,
+          "chars": 6399
+        },
+        {
+          "tool": "phoenix_checkpoint",
+          "calls": 29,
+          "chars": 310241
+        },
+        {
+          "tool": "glob",
+          "calls": 11,
+          "chars": 11630
+        },
+        {
+          "tool": "phoenix_context",
+          "calls": 7,
+          "chars": 12948
+        },
+        {
+          "tool": "update_goal",
+          "calls": 6,
+          "chars": 5557
+        },
+        {
+          "tool": "get_goal",
+          "calls": 5,
+          "chars": 3513
+        },
+        {
+          "tool": "phoenix_telemetry",
+          "calls": 2,
+          "chars": 1151
+        }
+      ],
+      "biggestResults": [
+        {
+          "tool": "pwsh",
+          "maxChars": 50000
+        },
+        {
+          "tool": "grep",
+          "maxChars": 32799
+        },
+        {
+          "tool": "read",
+          "maxChars": 16162
+        },
+        {
+          "tool": "phoenix_checkpoint",
+          "maxChars": 13444
+        },
+        {
+          "tool": "glob",
+          "maxChars": 6410
+        }
+      ]
+    },
+    {
+      "id": "session-d1ee33e6-1b49-4fd5-a946-c15544d94cdf",
+      "lines": 82,
+      "turns": 1,
+      "requests": 69,
+      "failures": 2,
+      "failureCodes": {
+        "TRANSPORT": 2
+      },
+      "toolsPerRequest": 0.19,
+      "toolResults": 13,
+      "toolResultChars": 7395,
+      "toolMaxChars": 2484,
+      "usage": {
+        "input": 839655,
+        "output": 71788,
+        "cacheRead": 24104192,
+        "cacheWrite": 0,
+        "reasoning": 31205
+      },
+      "estInputCharsAvg": 483463,
+      "estInputCharsMax": 531483,
+      "reqInputAvg": 361505,
+      "reqInputMax": 411388,
+      "reqInputP95": 408732,
+      "reqInputMedian": 365546,
+      "tiers": {},
+      "finishes": {
+        "tool-calls": 65,
+        "error": 2,
+        "stop": 2
+      },
+      "billedInputEq": 3250074,
+      "costIndex": 3321862,
+      "repeatedOps": 0,
+      "repeatedCalls": 0,
+      "topRepeats": [],
+      "pollingCalls": 0,
+      "bookkeepingOnlyTurns": 0,
+      "topTools": [
+        {
+          "tool": "edit",
+          "calls": 6,
+          "chars": 790
+        },
+        {
+          "tool": "pwsh",
+          "calls": 4,
+          "chars": 3177
+        },
+        {
+          "tool": "phoenix_context",
+          "calls": 2,
+          "chars": 3247
+        },
+        {
+          "tool": "write",
+          "calls": 1,
+          "chars": 181
+        }
+      ],
+      "biggestResults": [
+        {
+          "tool": "phoenix_context",
+          "maxChars": 2484
+        },
+        {
+          "tool": "pwsh",
+          "maxChars": 1327
+        },
+        {
+          "tool": "write",
+          "maxChars": 181
+        },
+        {
+          "tool": "edit",
+          "maxChars": 145
+        }
+      ]
+    },
+    {
+      "id": "session-b017533e-4a10-4ff4-a1e0-8571d697da60",
+      "lines": 74,
+      "turns": 1,
+      "requests": 17,
+      "failures": 0,
+      "failureCodes": {},
+      "toolsPerRequest": 2.35,
+      "toolResults": 40,
+      "toolResultChars": 119011,
+      "toolMaxChars": 20891,
+      "usage": {
+        "input": 40034,
+        "output": 21398,
+        "cacheRead": 721024,
+        "cacheWrite": 0,
+        "reasoning": 11797
+      },
+      "estInputCharsAvg": 52144,
+      "estInputCharsMax": 77930,
+      "reqInputAvg": 44768,
+      "reqInputMax": 69785,
+      "reqInputP95": 69785,
+      "reqInputMedian": 42905,
+      "tiers": {
+        "critical": 1,
+        "standard": 16
+      },
+      "finishes": {
+        "tool-calls": 17
+      },
+      "billedInputEq": 112136,
+      "costIndex": 133534,
+      "repeatedOps": 0,
+      "repeatedCalls": 0,
+      "topRepeats": [],
+      "pollingCalls": 0,
+      "bookkeepingOnlyTurns": 0,
+      "topTools": [
+        {
+          "tool": "pwsh",
+          "calls": 11,
+          "chars": 13779
+        },
+        {
+          "tool": "glob",
+          "calls": 8,
+          "chars": 4077
+        },
+        {
+          "tool": "read",
+          "calls": 8,
+          "chars": 58732
+        },
+        {
+          "tool": "edit",
+          "calls": 4,
+          "chars": 692
+        },
+        {
+          "tool": "skill",
+          "calls": 2,
+          "chars": 34200
+        },
+        {
+          "tool": "write",
+          "calls": 2,
+          "chars": 368
+        },
+        {
+          "tool": "create_goal",
+          "calls": 1,
+          "chars": 971
+        },
+        {
+          "tool": "phoenix_context",
+          "calls": 1,
+          "chars": 3054
+        },
+        {
+          "tool": "phoenix_checkpoint",
+          "calls": 1,
+          "chars": 2510
+        },
+        {
+          "tool": "todo_write",
+          "calls": 1,
+          "chars": 58
+        },
+        {
+          "tool": "phoenix_telemetry",
+          "calls": 1,
+          "chars": 570
+        }
+      ],
+      "biggestResults": [
+        {
+          "tool": "skill",
+          "maxChars": 20891
+        },
+        {
+          "tool": "read",
+          "maxChars": 13702
+        },
+        {
+          "tool": "pwsh",
+          "maxChars": 5697
+        },
+        {
+          "tool": "glob",
+          "maxChars": 3112
+        },
+        {
+          "tool": "phoenix_context",
+          "maxChars": 3054
+        }
+      ]
+    },
+    {
+      "id": "session-5d7c392f-dcf0-43b2-99bd-5d319c944ad9",
+      "lines": 46,
+      "turns": 1,
+      "requests": 9,
+      "failures": 0,
+      "failureCodes": {},
+      "toolsPerRequest": 3.22,
+      "toolResults": 29,
+      "toolResultChars": 90672,
+      "toolMaxChars": 20891,
+      "usage": {
+        "input": 36454,
+        "output": 17783,
+        "cacheRead": 236800,
+        "cacheWrite": 0,
+        "reasoning": 14372
+      },
+      "estInputCharsAvg": 43726,
+      "estInputCharsMax": 77693,
+      "reqInputAvg": 30362,
+      "reqInputMax": 51867,
+      "reqInputP95": 51867,
+      "reqInputMedian": 29493,
+      "tiers": {
+        "standard": 9
+      },
+      "finishes": {
+        "stop": 2,
+        "tool-calls": 7
+      },
+      "billedInputEq": 60134,
+      "costIndex": 77917,
+      "repeatedOps": 0,
+      "repeatedCalls": 0,
+      "topRepeats": [],
+      "pollingCalls": 0,
+      "bookkeepingOnlyTurns": 0,
+      "topTools": [
+        {
+          "tool": "pwsh",
+          "calls": 8,
+          "chars": 2066
+        },
+        {
+          "tool": "read",
+          "calls": 8,
+          "chars": 33958
+        },
+        {
+          "tool": "phoenix_context",
+          "calls": 5,
+          "chars": 13021
+        },
+        {
+          "tool": "skill",
+          "calls": 2,
+          "chars": 34200
+        },
+        {
+          "tool": "phoenix_telemetry",
+          "calls": 2,
+          "chars": 935
+        },
+        {
+          "tool": "grep",
+          "calls": 2,
+          "chars": 4363
+        },
+        {
+          "tool": "phoenix_checkpoint",
+          "calls": 1,
+          "chars": 235
+        },
+        {
+          "tool": "glob",
+          "calls": 1,
+          "chars": 1894
+        }
+      ],
+      "biggestResults": [
+        {
+          "tool": "skill",
+          "maxChars": 20891
+        },
+        {
+          "tool": "read",
+          "maxChars": 13702
+        },
+        {
+          "tool": "phoenix_context",
+          "maxChars": 4150
+        },
+        {
+          "tool": "grep",
+          "maxChars": 4136
+        },
+        {
+          "tool": "glob",
+          "maxChars": 1894
+        }
+      ]
+    },
+    {
+      "id": "session-9dc28f68-b792-45a4-bdab-fa2d7bc92a8a",
+      "lines": 4,
+      "turns": 1,
+      "requests": 2,
+      "failures": 2,
+      "failureCodes": {
+        "INVALID_REQUEST": 2
+      },
+      "toolsPerRequest": 0,
+      "toolResults": 0,
+      "toolResultChars": 0,
+      "toolMaxChars": 0,
+      "usage": {
+        "input": 215,
+        "output": 4,
+        "cacheRead": 0,
+        "cacheWrite": 0,
+        "reasoning": 0
+      },
+      "estInputCharsAvg": 11180,
+      "estInputCharsMax": 21518,
+      "reqInputAvg": 108,
+      "reqInputMax": 215,
+      "reqInputP95": 215,
+      "reqInputMedian": 215,
+      "tiers": {
+        "standard": 2
+      },
+      "finishes": {
+        "error": 1,
+        "stop": 1
+      },
+      "billedInputEq": 215,
+      "costIndex": 219,
+      "repeatedOps": 0,
+      "repeatedCalls": 0,
+      "topRepeats": [],
+      "pollingCalls": 0,
+      "bookkeepingOnlyTurns": 0,
+      "topTools": [],
+      "biggestResults": []
+    },
+    {
+      "id": "session-ac36ebc9-37c3-4c04-bded-d4daa38c97ec",
+      "lines": 4,
+      "turns": 1,
+      "requests": 2,
+      "failures": 2,
+      "failureCodes": {
+        "INVALID_REQUEST": 2
+      },
+      "toolsPerRequest": 0,
+      "toolResults": 0,
+      "toolResultChars": 0,
+      "toolMaxChars": 0,
+      "usage": {
+        "input": 217,
+        "output": 6,
+        "cacheRead": 0,
+        "cacheWrite": 0,
+        "reasoning": 0
+      },
+      "estInputCharsAvg": 11234,
+      "estInputCharsMax": 21572,
+      "reqInputAvg": 109,
+      "reqInputMax": 217,
+      "reqInputP95": 217,
+      "reqInputMedian": 217,
+      "tiers": {
+        "critical": 2
+      },
+      "finishes": {
+        "error": 1,
+        "stop": 1
+      },
+      "billedInputEq": 217,
+      "costIndex": 223,
+      "repeatedOps": 0,
+      "repeatedCalls": 0,
+      "topRepeats": [],
+      "pollingCalls": 0,
+      "bookkeepingOnlyTurns": 0,
+      "topTools": [],
+      "biggestResults": []
+    },
+    {
+      "id": "unknown",
+      "lines": 8,
+      "turns": 1,
+      "requests": 0,
+      "failures": 0,
+      "failureCodes": {},
+      "toolsPerRequest": 0,
+      "toolResults": 0,
+      "toolResultChars": 0,
+      "toolMaxChars": 0,
+      "usage": {
+        "input": 0,
+        "output": 0,
+        "cacheRead": 0,
+        "cacheWrite": 0,
+        "reasoning": 0
+      },
+      "estInputCharsAvg": 0,
+      "estInputCharsMax": 0,
+      "reqInputAvg": 0,
+      "reqInputMax": 0,
+      "reqInputP95": 0,
+      "reqInputMedian": 0,
+      "tiers": {},
+      "finishes": {},
+      "billedInputEq": 0,
+      "costIndex": 0,
+      "repeatedOps": 0,
+      "repeatedCalls": 0,
+      "topRepeats": [],
+      "pollingCalls": 0,
+      "bookkeepingOnlyTurns": 0,
+      "topTools": [],
+      "biggestResults": []
+    }
+  ]
+}

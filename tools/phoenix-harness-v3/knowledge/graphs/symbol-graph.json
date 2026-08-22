@@ -1,0 +1,2420 @@
+{
+  "schema": 1,
+  "generatedAt": "2026-08-21T12:05:27.526Z",
+  "generatedBy": "src/gen/gen-graphs.mjs",
+  "components": {
+    "rust": {
+      "count": 400,
+      "entries": [
+        {
+          "symbol": "MAX_CALLDATA_BYTES",
+          "file": "live-executor/src/aave.rs",
+          "line": 9,
+          "kind": "const"
+        },
+        {
+          "symbol": "MAX_LOG_DATA_BYTES",
+          "file": "live-executor/src/aave.rs",
+          "line": 10,
+          "kind": "const"
+        },
+        {
+          "symbol": "AaveLiquidationRequest",
+          "file": "live-executor/src/aave.rs",
+          "line": 13,
+          "kind": "pub "
+        },
+        {
+          "symbol": "AaveLiquidationSettlement",
+          "file": "live-executor/src/aave.rs",
+          "line": 29,
+          "kind": "pub "
+        },
+        {
+          "symbol": "AaveLiquidationIdentity",
+          "file": "live-executor/src/aave.rs",
+          "line": 39,
+          "kind": "pub "
+        },
+        {
+          "symbol": "AaveLiquidationLegIdentity",
+          "file": "live-executor/src/aave.rs",
+          "line": 55,
+          "kind": "pub "
+        },
+        {
+          "symbol": "AaveLiquidationRequest",
+          "file": "live-executor/src/aave.rs",
+          "line": 64,
+          "kind": "impl"
+        },
+        {
+          "symbol": "decode_encoded_identity",
+          "file": "live-executor/src/aave.rs",
+          "line": 65,
+          "kind": "pub "
+        },
+        {
+          "symbol": "from_execution",
+          "file": "live-executor/src/aave.rs",
+          "line": 136,
+          "kind": "pub "
+        },
+        {
+          "symbol": "validate",
+          "file": "live-executor/src/aave.rs",
+          "line": 162,
+          "kind": "pub "
+        },
+        {
+          "symbol": "encoded_request",
+          "file": "live-executor/src/aave.rs",
+          "line": 196,
+          "kind": "pub "
+        },
+        {
+          "symbol": "encode_direct_call",
+          "file": "live-executor/src/aave.rs",
+          "line": 205,
+          "kind": "pub "
+        },
+        {
+          "symbol": "decode_settlement",
+          "file": "live-executor/src/aave.rs",
+          "line": 218,
+          "kind": "pub "
+        },
+        {
+          "symbol": "identity",
+          "file": "live-executor/src/aave.rs",
+          "line": 226,
+          "kind": "fn"
+        },
+        {
+          "symbol": "AaveLiquidationIdentity",
+          "file": "live-executor/src/aave.rs",
+          "line": 256,
+          "kind": "impl"
+        },
+        {
+          "symbol": "decode_settlement",
+          "file": "live-executor/src/aave.rs",
+          "line": 257,
+          "kind": "pub "
+        },
+        {
+          "symbol": "request_token",
+          "file": "live-executor/src/aave.rs",
+          "line": 314,
+          "kind": "fn"
+        },
+        {
+          "symbol": "contract",
+          "file": "live-executor/src/aave.rs",
+          "line": 348,
+          "kind": "fn"
+        },
+        {
+          "symbol": "primitive_address",
+          "file": "live-executor/src/aave.rs",
+          "line": 354,
+          "kind": "fn"
+        },
+        {
+          "symbol": "parameter",
+          "file": "live-executor/src/aave.rs",
+          "line": 358,
+          "kind": "fn"
+        },
+        {
+          "symbol": "fixed_bytes",
+          "file": "live-executor/src/aave.rs",
+          "line": 366,
+          "kind": "fn"
+        },
+        {
+          "symbol": "address",
+          "file": "live-executor/src/aave.rs",
+          "line": 376,
+          "kind": "fn"
+        },
+        {
+          "symbol": "uint",
+          "file": "live-executor/src/aave.rs",
+          "line": 384,
+          "kind": "fn"
+        },
+        {
+          "symbol": "token_fixed_bytes",
+          "file": "live-executor/src/aave.rs",
+          "line": 394,
+          "kind": "fn"
+        },
+        {
+          "symbol": "token_address",
+          "file": "live-executor/src/aave.rs",
+          "line": 404,
+          "kind": "fn"
+        },
+        {
+          "symbol": "token_uint",
+          "file": "live-executor/src/aave.rs",
+          "line": 412,
+          "kind": "fn"
+        },
+        {
+          "symbol": "decode_leg_identity",
+          "file": "live-executor/src/aave.rs",
+          "line": 422,
+          "kind": "fn"
+        },
+        {
+          "symbol": "AaveAbiError",
+          "file": "live-executor/src/aave.rs",
+          "line": 444,
+          "kind": "pub "
+        },
+        {
+          "symbol": "address",
+          "file": "live-executor/src/aave.rs",
+          "line": 460,
+          "kind": "fn"
+        },
+        {
+          "symbol": "request",
+          "file": "live-executor/src/aave.rs",
+          "line": 464,
+          "kind": "fn"
+        },
+        {
+          "symbol": "exact_liquidation_identity_encodes_direct_and_atlas_payloads",
+          "file": "live-executor/src/aave.rs",
+          "line": 490,
+          "kind": "fn"
+        },
+        {
+          "symbol": "disconnected_or_expired_routes_fail_closed",
+          "file": "live-executor/src/aave.rs",
+          "line": 520,
+          "kind": "fn"
+        },
+        {
+          "symbol": "encoded_zero_borrower_fails_closed",
+          "file": "live-executor/src/aave.rs",
+          "line": 530,
+          "kind": "fn"
+        },
+        {
+          "symbol": "MAX_CALLDATA_BYTES",
+          "file": "live-executor/src/abi.rs",
+          "line": 7,
+          "kind": "const"
+        },
+        {
+          "symbol": "MAX_LOG_DATA_BYTES",
+          "file": "live-executor/src/abi.rs",
+          "line": 8,
+          "kind": "const"
+        },
+        {
+          "symbol": "encode_execute_opportunity",
+          "file": "live-executor/src/abi.rs",
+          "line": 10,
+          "kind": "pub "
+        },
+        {
+          "symbol": "decode_settlement",
+          "file": "live-executor/src/abi.rs",
+          "line": 51,
+          "kind": "pub "
+        },
+        {
+          "symbol": "RpcLog",
+          "file": "live-executor/src/abi.rs",
+          "line": 106,
+          "kind": "pub "
+        },
+        {
+          "symbol": "executor_contract",
+          "file": "live-executor/src/abi.rs",
+          "line": 112,
+          "kind": "fn"
+        },
+        {
+          "symbol": "primitive_address",
+          "file": "live-executor/src/abi.rs",
+          "line": 118,
+          "kind": "fn"
+        },
+        {
+          "symbol": "fixed_bytes",
+          "file": "live-executor/src/abi.rs",
+          "line": 122,
+          "kind": "fn"
+        },
+        {
+          "symbol": "address",
+          "file": "live-executor/src/abi.rs",
+          "line": 133,
+          "kind": "fn"
+        },
+        {
+          "symbol": "uint",
+          "file": "live-executor/src/abi.rs",
+          "line": 142,
+          "kind": "fn"
+        },
+        {
+          "symbol": "parameter",
+          "file": "live-executor/src/abi.rs",
+          "line": 153,
+          "kind": "fn"
+        },
+        {
+          "symbol": "AbiError",
+          "file": "live-executor/src/abi.rs",
+          "line": 162,
+          "kind": "pub "
+        },
+        {
+          "symbol": "ACTIVATION_REQUEST_SCHEMA",
+          "file": "live-executor/src/activation_request.rs",
+          "line": 13,
+          "kind": "pub "
+        },
+        {
+          "symbol": "ACTIVATION_REQUEST_TTL_SECONDS",
+          "file": "live-executor/src/activation_request.rs",
+          "line": 14,
+          "kind": "pub "
+        },
+        {
+          "symbol": "MAX_ACTIVATION_REQUEST_BYTES",
+          "file": "live-executor/src/activation_request.rs",
+          "line": 15,
+          "kind": "pub "
+        },
+        {
+          "symbol": "ActivationCandidateEvidence",
+          "file": "live-executor/src/activation_request.rs",
+          "line": 19,
+          "kind": "pub "
+        },
+        {
+          "symbol": "ActivationCandidateEvidence",
+          "file": "live-executor/src/activation_request.rs",
+          "line": 43,
+          "kind": "impl"
+        },
+        {
+          "symbol": "validate",
+          "file": "live-executor/src/activation_request.rs",
+          "line": 44,
+          "kind": "pub "
+        },
+        {
+          "symbol": "ActivationRequest",
+          "file": "live-executor/src/activation_request.rs",
+          "line": 82,
+          "kind": "pub "
+        },
+        {
+          "symbol": "ActivationRequest",
+          "file": "live-executor/src/activation_request.rs",
+          "line": 93,
+          "kind": "impl"
+        },
+        {
+          "symbol": "seal",
+          "file": "live-executor/src/activation_request.rs",
+          "line": 94,
+          "kind": "pub "
+        },
+        {
+          "symbol": "validate",
+          "file": "live-executor/src/activation_request.rs",
+          "line": 104,
+          "kind": "pub "
+        },
+        {
+          "symbol": "canonical_contract_hash",
+          "file": "live-executor/src/activation_request.rs",
+          "line": 147,
+          "kind": "pub "
+        },
+        {
+          "symbol": "canonical_domain_hash",
+          "file": "live-executor/src/activation_request.rs",
+          "line": 164,
+          "kind": "pub "
+        },
+        {
+          "symbol": "canonical_json",
+          "file": "live-executor/src/activation_request.rs",
+          "line": 174,
+          "kind": "pub "
+        },
+        {
+          "symbol": "write_atomic_request",
+          "file": "live-executor/src/activation_request.rs",
+          "line": 209,
+          "kind": "pub "
+        },
+        {
+          "symbol": "write_atomic_request",
+          "file": "live-executor/src/activation_request.rs",
+          "line": 277,
+          "kind": "pub "
+        },
+        {
+          "symbol": "canonical_hex",
+          "file": "live-executor/src/activation_request.rs",
+          "line": 284,
+          "kind": "fn"
+        },
+        {
+          "symbol": "canonical_hash",
+          "file": "live-executor/src/activation_request.rs",
+          "line": 291,
+          "kind": "fn"
+        },
+        {
+          "symbol": "canonical_address",
+          "file": "live-executor/src/activation_request.rs",
+          "line": 297,
+          "kind": "fn"
+        },
+        {
+          "symbol": "nonnegative_milliseconds",
+          "file": "live-executor/src/activation_request.rs",
+          "line": 303,
+          "kind": "fn"
+        },
+        {
+          "symbol": "ActivationRequestError",
+          "file": "live-executor/src/activation_request.rs",
+          "line": 308,
+          "kind": "pub "
+        },
+        {
+          "symbol": "now",
+          "file": "live-executor/src/activation_request.rs",
+          "line": 333,
+          "kind": "fn"
+        },
+        {
+          "symbol": "request",
+          "file": "live-executor/src/activation_request.rs",
+          "line": 339,
+          "kind": "fn"
+        },
+        {
+          "symbol": "canonical_fresh_reverse_route_request_passes",
+          "file": "live-executor/src/activation_request.rs",
+          "line": 427,
+          "kind": "fn"
+        },
+        {
+          "symbol": "stale_or_unprofitable_candidate_fails_closed",
+          "file": "live-executor/src/activation_request.rs",
+          "line": 438,
+          "kind": "fn"
+        },
+        {
+          "symbol": "binding_or_hash_mutation_fails_closed",
+          "file": "live-executor/src/activation_request.rs",
+          "line": 454,
+          "kind": "fn"
+        },
+        {
+          "symbol": "APPROVAL_CONFIRMATION",
+          "file": "live-executor/src/approval.rs",
+          "line": 25,
+          "kind": "pub "
+        },
+        {
+          "symbol": "MAX_APPROVAL_TTL_SECONDS",
+          "file": "live-executor/src/approval.rs",
+          "line": 26,
+          "kind": "pub "
+        },
+        {
+          "symbol": "CURRENT_ROUTE_POOL_500_ID",
+          "file": "live-executor/src/approval.rs",
+          "line": 27,
+          "kind": "const"
+        },
+        {
+          "symbol": "CURRENT_ROUTE_POOL_3000_ID",
+          "file": "live-executor/src/approval.rs",
+          "line": 29,
+          "kind": "const"
+        },
+        {
+          "symbol": "ApprovalInput",
+          "file": "live-executor/src/approval.rs",
+          "line": 33,
+          "kind": "pub "
+        },
+        {
+          "symbol": "ApprovalOutcome",
+          "file": "live-executor/src/approval.rs",
+          "line": 41,
+          "kind": "pub "
+        },
+        {
+          "symbol": "ApprovalMaterializer",
+          "file": "live-executor/src/approval.rs",
+          "line": 51,
+          "kind": "pub "
+        },
+        {
+          "symbol": "ApprovalMaterializer",
+          "file": "live-executor/src/approval.rs",
+          "line": 55,
+          "kind": "impl"
+        },
+        {
+          "symbol": "from_pool",
+          "file": "live-executor/src/approval.rs",
+          "line": 66,
+          "kind": "pub "
+        },
+        {
+          "symbol": "build_request",
+          "file": "live-executor/src/approval.rs",
+          "line": 243,
+          "kind": "fn"
+        },
+        {
+          "symbol": "ensure_same_evidence",
+          "file": "live-executor/src/approval.rs",
+          "line": 570,
+          "kind": "fn"
+        },
+        {
+          "symbol": "matches_current_route",
+          "file": "live-executor/src/approval.rs",
+          "line": 606,
+          "kind": "fn"
+        },
+        {
+          "symbol": "exact_strings",
+          "file": "live-executor/src/approval.rs",
+          "line": 645,
+          "kind": "fn"
+        },
+        {
+          "symbol": "outcome",
+          "file": "live-executor/src/approval.rs",
+          "line": 653,
+          "kind": "fn"
+        },
+        {
+          "symbol": "validate_input",
+          "file": "live-executor/src/approval.rs",
+          "line": 664,
+          "kind": "fn"
+        },
+        {
+          "symbol": "decode_route_id",
+          "file": "live-executor/src/approval.rs",
+          "line": 678,
+          "kind": "fn"
+        },
+        {
+          "symbol": "positive_u128",
+          "file": "live-executor/src/approval.rs",
+          "line": 688,
+          "kind": "fn"
+        },
+        {
+          "symbol": "optional_u64",
+          "file": "live-executor/src/approval.rs",
+          "line": 695,
+          "kind": "fn"
+        },
+        {
+          "symbol": "positive_numeric_u64",
+          "file": "live-executor/src/approval.rs",
+          "line": 706,
+          "kind": "fn"
+        },
+        {
+          "symbol": "positive_u64",
+          "file": "live-executor/src/approval.rs",
+          "line": 715,
+          "kind": "fn"
+        },
+        {
+          "symbol": "database_error",
+          "file": "live-executor/src/approval.rs",
+          "line": 722,
+          "kind": "fn"
+        },
+        {
+          "symbol": "ApprovalError",
+          "file": "live-executor/src/approval.rs",
+          "line": 727,
+          "kind": "pub "
+        },
+        {
+          "symbol": "ApprovalError",
+          "file": "live-executor/src/approval.rs",
+          "line": 748,
+          "kind": "impl"
+        },
+        {
+          "symbol": "fn",
+          "file": "live-executor/src/approval.rs",
+          "line": 749,
+          "kind": "pub "
+        },
+        {
+          "symbol": "WETH",
+          "file": "live-executor/src/approval.rs",
+          "line": 773,
+          "kind": "const"
+        },
+        {
+          "symbol": "USDC",
+          "file": "live-executor/src/approval.rs",
+          "line": 774,
+          "kind": "const"
+        },
+        {
+          "symbol": "EXECUTOR",
+          "file": "live-executor/src/approval.rs",
+          "line": 775,
+          "kind": "const"
+        },
+        {
+          "symbol": "independently_simulated_plan_materializes_all_approval_bindings",
+          "file": "live-executor/src/approval.rs",
+          "line": 778,
+          "kind": "fn"
+        },
+        {
+          "symbol": "independently_simulated_reverse_route_preserves_exact_execution_bindings",
+          "file": "live-executor/src/approval.rs",
+          "line": 807,
+          "kind": "fn"
+        },
+        {
+          "symbol": "subsecond_simulation_before_observation_is_not_rejected_as_future",
+          "file": "live-executor/src/approval.rs",
+          "line": 834,
+          "kind": "fn"
+        },
+        {
+          "symbol": "arbitrary_calldata_cannot_be_materialized",
+          "file": "live-executor/src/approval.rs",
+          "line": 852,
+          "kind": "fn"
+        },
+        {
+          "symbol": "independent_provider_identity_is_mandatory",
+          "file": "live-executor/src/approval.rs",
+          "line": 865,
+          "kind": "fn"
+        },
+        {
+          "symbol": "simulation_pool_state_must_match_the_approved_plan",
+          "file": "live-executor/src/approval.rs",
+          "line": 879,
+          "kind": "fn"
+        },
+        {
+          "symbol": "plans_outside_the_reviewed_current_route_cannot_be_materialized",
+          "file": "live-executor/src/approval.rs",
+          "line": 892,
+          "kind": "fn"
+        },
+        {
+          "symbol": "simulated_profit_must_clear_the_reviewed_floor",
+          "file": "live-executor/src/approval.rs",
+          "line": 922,
+          "kind": "fn"
+        },
+        {
+          "symbol": "expired_plan_cannot_be_approved",
+          "file": "live-executor/src/approval.rs",
+          "line": 933,
+          "kind": "fn"
+        },
+        {
+          "symbol": "duplicate_simulation_is_idempotent_but_conflicting_evidence_is_rejected",
+          "file": "live-executor/src/approval.rs",
+          "line": 950,
+          "kind": "fn"
+        },
+        {
+          "symbol": "fixture",
+          "file": "live-executor/src/approval.rs",
+          "line": 970,
+          "kind": "fn"
+        },
+        {
+          "symbol": "reverse_fixture",
+          "file": "live-executor/src/approval.rs",
+          "line": 1049,
+          "kind": "fn"
+        },
+        {
+          "symbol": "encoded_request",
+          "file": "live-executor/src/approval.rs",
+          "line": 1070,
+          "kind": "fn"
+        },
+        {
+          "symbol": "result_for_plan",
+          "file": "live-executor/src/approval.rs",
+          "line": 1136,
+          "kind": "fn"
+        },
+        {
+          "symbol": "input",
+          "file": "live-executor/src/approval.rs",
+          "line": 1200,
+          "kind": "fn"
+        },
+        {
+          "symbol": "fixture_time",
+          "file": "live-executor/src/approval.rs",
+          "line": 1209,
+          "kind": "fn"
+        },
+        {
+          "symbol": "parse_arguments",
+          "file": "live-executor/src/approve_execution_request_main.rs",
+          "line": 49,
+          "kind": "fn"
+        },
+        {
+          "symbol": "required",
+          "file": "live-executor/src/approve_execution_request_main.rs",
+          "line": 78,
+          "kind": "fn"
+        },
+        {
+          "symbol": "CliError",
+          "file": "live-executor/src/approve_execution_request_main.rs",
+          "line": 86,
+          "kind": "enum"
+        },
+        {
+          "symbol": "CliError",
+          "file": "live-executor/src/approve_execution_request_main.rs",
+          "line": 93,
+          "kind": "impl"
+        },
+        {
+          "symbol": "fn",
+          "file": "live-executor/src/approve_execution_request_main.rs",
+          "line": 94,
+          "kind": "const"
+        },
+        {
+          "symbol": "DOMAIN_NAME",
+          "file": "live-executor/src/atlas.rs",
+          "line": 16,
+          "kind": "const"
+        },
+        {
+          "symbol": "DOMAIN_VERSION",
+          "file": "live-executor/src/atlas.rs",
+          "line": 17,
+          "kind": "const"
+        },
+        {
+          "symbol": "MAX_SOLVER_DATA_BYTES",
+          "file": "live-executor/src/atlas.rs",
+          "line": 18,
+          "kind": "const"
+        },
+        {
+          "symbol": "MAX_AUCTION_ID_BYTES",
+          "file": "live-executor/src/atlas.rs",
+          "line": 19,
+          "kind": "const"
+        },
+        {
+          "symbol": "MAX_GATEWAY_RESPONSE_BYTES",
+          "file": "live-executor/src/atlas.rs",
+          "line": 20,
+          "kind": "const"
+        },
+        {
+          "symbol": "OFFICIAL_ATLAS_SEARCHER_GATEWAY",
+          "file": "live-executor/src/atlas.rs",
+          "line": 21,
+          "kind": "pub "
+        },
+        {
+          "symbol": "AtlasSolverOperation",
+          "file": "live-executor/src/atlas.rs",
+          "line": 24,
+          "kind": "pub "
+        },
+        {
+          "symbol": "SignedAtlasSolverOperation",
+          "file": "live-executor/src/atlas.rs",
+          "line": 41,
+          "kind": "pub "
+        },
+        {
+          "symbol": "AtlasSolution",
+          "file": "live-executor/src/atlas.rs",
+          "line": 59,
+          "kind": "pub "
+        },
+        {
+          "symbol": "AtlasSubmitReceipt",
+          "file": "live-executor/src/atlas.rs",
+          "line": 65,
+          "kind": "pub "
+        },
+        {
+          "symbol": "SubmitRequest",
+          "file": "live-executor/src/atlas.rs",
+          "line": 71,
+          "kind": "struct"
+        },
+        {
+          "symbol": "SubmitResponse",
+          "file": "live-executor/src/atlas.rs",
+          "line": 79,
+          "kind": "struct"
+        },
+        {
+          "symbol": "SubmitError",
+          "file": "live-executor/src/atlas.rs",
+          "line": 87,
+          "kind": "struct"
+        },
+        {
+          "symbol": "AtlasGateway",
+          "file": "live-executor/src/atlas.rs",
+          "line": 93,
+          "kind": "pub "
+        },
+        {
+          "symbol": "AtlasGateway",
+          "file": "live-executor/src/atlas.rs",
+          "line": 95,
+          "kind": "impl"
+        },
+        {
+          "symbol": "validate_submit_response",
+          "file": "live-executor/src/atlas.rs",
+          "line": 131,
+          "kind": "fn"
+        },
+        {
+          "symbol": "AtlasSolverOperation",
+          "file": "live-executor/src/atlas.rs",
+          "line": 155,
+          "kind": "impl"
+        },
+        {
+          "symbol": "validate",
+          "file": "live-executor/src/atlas.rs",
+          "line": 156,
+          "kind": "pub "
+        },
+        {
+          "symbol": "eip712_digest",
+          "file": "live-executor/src/atlas.rs",
+          "line": 189,
+          "kind": "pub "
+        },
+        {
+          "symbol": "sign",
+          "file": "live-executor/src/atlas.rs",
+          "line": 237,
+          "kind": "pub "
+        },
+        {
+          "symbol": "AtlasSolution",
+          "file": "live-executor/src/atlas.rs",
+          "line": 266,
+          "kind": "impl"
+        },
+        {
+          "symbol": "new",
+          "file": "live-executor/src/atlas.rs",
+          "line": 267,
+          "kind": "pub "
+        },
+        {
+          "symbol": "query_authorization_digest",
+          "file": "live-executor/src/atlas.rs",
+          "line": 285,
+          "kind": "pub "
+        },
+        {
+          "symbol": "quantity",
+          "file": "live-executor/src/atlas.rs",
+          "line": 306,
+          "kind": "fn"
+        },
+        {
+          "symbol": "serialize_signature",
+          "file": "live-executor/src/atlas.rs",
+          "line": 314,
+          "kind": "fn"
+        },
+        {
+          "symbol": "AtlasError",
+          "file": "live-executor/src/atlas.rs",
+          "line": 322,
+          "kind": "pub "
+        },
+        {
+          "symbol": "address",
+          "file": "live-executor/src/atlas.rs",
+          "line": 343,
+          "kind": "fn"
+        },
+        {
+          "symbol": "operation",
+          "file": "live-executor/src/atlas.rs",
+          "line": 347,
+          "kind": "fn"
+        },
+        {
+          "symbol": "official_null_submission_acknowledgement_is_accepted",
+          "file": "live-executor/src/atlas.rs",
+          "line": 365,
+          "kind": "fn"
+        },
+        {
+          "symbol": "operation_is_strictly_bound_and_signed_under_v1_6_4_domain",
+          "file": "live-executor/src/atlas.rs",
+          "line": 379,
+          "kind": "fn"
+        },
+        {
+          "symbol": "bid_and_oracle_gas_bounds_fail_closed",
+          "file": "live-executor/src/atlas.rs",
+          "line": 401,
+          "kind": "fn"
+        },
+        {
+          "symbol": "query_authorization_is_eip_191_bound_to_exact_auction",
+          "file": "live-executor/src/atlas.rs",
+          "line": 431,
+          "kind": "fn"
+        },
+        {
+          "symbol": "SCHEMA_VERSION",
+          "file": "live-executor/src/autonomous.rs",
+          "line": 22,
+          "kind": "const"
+        },
+        {
+          "symbol": "QUOTE_SCHEMA",
+          "file": "live-executor/src/autonomous.rs",
+          "line": 23,
+          "kind": "const"
+        },
+        {
+          "symbol": "RISK_SCHEMA",
+          "file": "live-executor/src/autonomous.rs",
+          "line": 24,
+          "kind": "const"
+        },
+        {
+          "symbol": "APPROVAL_SCHEMA",
+          "file": "live-executor/src/autonomous.rs",
+          "line": 25,
+          "kind": "const"
+        },
+        {
+          "symbol": "MAX_CONSECUTIVE_OUTCOMES",
+          "file": "live-executor/src/autonomous.rs",
+          "line": 26,
+          "kind": "const"
+        },
+        {
+          "symbol": "MaterializationState",
+          "file": "live-executor/src/autonomous.rs",
+          "line": 29,
+          "kind": "pub "
+        },
+        {
+          "symbol": "AutonomousMaterializer",
+          "file": "live-executor/src/autonomous.rs",
+          "line": 42,
+          "kind": "pub "
+        },
+        {
+          "symbol": "AutonomousMaterializer",
+          "file": "live-executor/src/autonomous.rs",
+          "line": 49,
+          "kind": "impl"
+        },
+        {
+          "symbol": "AutonomousCandidate",
+          "file": "live-executor/src/autonomous.rs",
+          "line": 628,
+          "kind": "struct"
+        },
+        {
+          "symbol": "Controls",
+          "file": "live-executor/src/autonomous.rs",
+          "line": 655,
+          "kind": "struct"
+        },
+        {
+          "symbol": "RiskFacts",
+          "file": "live-executor/src/autonomous.rs",
+          "line": 669,
+          "kind": "struct"
+        },
+        {
+          "symbol": "ForkDisposition",
+          "file": "live-executor/src/autonomous.rs",
+          "line": 677,
+          "kind": "enum"
+        },
+        {
+          "symbol": "validate_bound_fork_evidence",
+          "file": "live-executor/src/autonomous.rs",
+          "line": 716,
+          "kind": "fn"
+        },
+        {
+          "symbol": "decode_candidate",
+          "file": "live-executor/src/autonomous.rs",
+          "line": 804,
+          "kind": "fn"
+        },
+        {
+          "symbol": "validate_candidate",
+          "file": "live-executor/src/autonomous.rs",
+          "line": 862,
+          "kind": "fn"
+        },
+        {
+          "symbol": "validate_state_contract",
+          "file": "live-executor/src/autonomous.rs",
+          "line": 954,
+          "kind": "fn"
+        },
+        {
+          "symbol": "validate_controls",
+          "file": "live-executor/src/autonomous.rs",
+          "line": 1266,
+          "kind": "fn"
+        },
+        {
+          "symbol": "build_risk_snapshot",
+          "file": "live-executor/src/autonomous.rs",
+          "line": 1296,
+          "kind": "fn"
+        },
+        {
+          "symbol": "build_execution_request",
+          "file": "live-executor/src/autonomous.rs",
+          "line": 1343,
+          "kind": "fn"
+        },
+        {
+          "symbol": "tick_crossing_gas_increment",
+          "file": "live-executor/src/autonomous.rs",
+          "line": 1521,
+          "kind": "fn"
+        },
+        {
+          "symbol": "verify_hash",
+          "file": "live-executor/src/autonomous.rs",
+          "line": 1546,
+          "kind": "fn"
+        },
+        {
+          "symbol": "canonical_hash",
+          "file": "live-executor/src/autonomous.rs",
+          "line": 1573,
+          "kind": "fn"
+        },
+        {
+          "symbol": "digest_value",
+          "file": "live-executor/src/autonomous.rs",
+          "line": 1591,
+          "kind": "fn"
+        },
+        {
+          "symbol": "canonical_json",
+          "file": "live-executor/src/autonomous.rs",
+          "line": 1598,
+          "kind": "fn"
+        },
+        {
+          "symbol": "policy_text",
+          "file": "live-executor/src/autonomous.rs",
+          "line": 1633,
+          "kind": "fn"
+        },
+        {
+          "symbol": "policy_u128",
+          "file": "live-executor/src/autonomous.rs",
+          "line": 1640,
+          "kind": "fn"
+        },
+        {
+          "symbol": "policy_u64",
+          "file": "live-executor/src/autonomous.rs",
+          "line": 1644,
+          "kind": "fn"
+        },
+        {
+          "symbol": "object_text",
+          "file": "live-executor/src/autonomous.rs",
+          "line": 1651,
+          "kind": "fn"
+        },
+        {
+          "symbol": "object_u128",
+          "file": "live-executor/src/autonomous.rs",
+          "line": 1661,
+          "kind": "fn"
+        },
+        {
+          "symbol": "object_u64",
+          "file": "live-executor/src/autonomous.rs",
+          "line": 1668,
+          "kind": "fn"
+        },
+        {
+          "symbol": "decimal_u128",
+          "file": "live-executor/src/autonomous.rs",
+          "line": 1675,
+          "kind": "fn"
+        },
+        {
+          "symbol": "decimal_u64",
+          "file": "live-executor/src/autonomous.rs",
+          "line": 1687,
+          "kind": "fn"
+        },
+        {
+          "symbol": "i64_to_u64",
+          "file": "live-executor/src/autonomous.rs",
+          "line": 1693,
+          "kind": "fn"
+        },
+        {
+          "symbol": "decode_fixed",
+          "file": "live-executor/src/autonomous.rs",
+          "line": 1699,
+          "kind": "fn"
+        },
+        {
+          "symbol": "deterministic_uuid",
+          "file": "live-executor/src/autonomous.rs",
+          "line": 1709,
+          "kind": "fn"
+        },
+        {
+          "symbol": "timestamp_string",
+          "file": "live-executor/src/autonomous.rs",
+          "line": 1717,
+          "kind": "fn"
+        },
+        {
+          "symbol": "parse_timestamp",
+          "file": "live-executor/src/autonomous.rs",
+          "line": 1721,
+          "kind": "fn"
+        },
+        {
+          "symbol": "canonical_time",
+          "file": "live-executor/src/autonomous.rs",
+          "line": 1730,
+          "kind": "fn"
+        },
+        {
+          "symbol": "database_error",
+          "file": "live-executor/src/autonomous.rs",
+          "line": 1736,
+          "kind": "fn"
+        },
+        {
+          "symbol": "AutonomousMaterializerError",
+          "file": "live-executor/src/autonomous.rs",
+          "line": 1748,
+          "kind": "pub "
+        },
+        {
+          "symbol": "FACTORY",
+          "file": "live-executor/src/autonomous.rs",
+          "line": 1771,
+          "kind": "const"
+        },
+        {
+          "symbol": "ROUTER",
+          "file": "live-executor/src/autonomous.rs",
+          "line": 1772,
+          "kind": "const"
+        },
+        {
+          "symbol": "EXECUTOR",
+          "file": "live-executor/src/autonomous.rs",
+          "line": 1773,
+          "kind": "const"
+        },
+        {
+          "symbol": "RETAINED_PROFIT",
+          "file": "live-executor/src/autonomous.rs",
+          "line": 1774,
+          "kind": "const"
+        },
+        {
+          "symbol": "EXECUTABLE_GAS_COST",
+          "file": "live-executor/src/autonomous.rs",
+          "line": 1775,
+          "kind": "const"
+        },
+        {
+          "symbol": "materialized_request_preserves_whole_second_candidate_calldata",
+          "file": "live-executor/src/autonomous.rs",
+          "line": 1778,
+          "kind": "fn"
+        },
+        {
+          "symbol": "materialized_request_preserves_subsecond_candidate_calldata",
+          "file": "live-executor/src/autonomous.rs",
+          "line": 1785,
+          "kind": "fn"
+        },
+        {
+          "symbol": "assert_materialized_calldata_binding",
+          "file": "live-executor/src/autonomous.rs",
+          "line": 1792,
+          "kind": "fn"
+        },
+        {
+          "symbol": "candidate",
+          "file": "live-executor/src/autonomous.rs",
+          "line": 1836,
+          "kind": "fn"
+        },
+        {
+          "symbol": "quote",
+          "file": "live-executor/src/autonomous.rs",
+          "line": 1896,
+          "kind": "fn"
+        },
+        {
+          "symbol": "POLICY",
+          "file": "live-executor/src/autonomous_live_control_main.rs",
+          "line": 46,
+          "kind": "const"
+        },
+        {
+          "symbol": "UNIVERSE",
+          "file": "live-executor/src/autonomous_live_control_main.rs",
+          "line": 47,
+          "kind": "const"
+        },
+        {
+          "symbol": "MIGRATIONS",
+          "file": "live-executor/src/autonomous_live_control_main.rs",
+          "line": 48,
+          "kind": "const"
+        },
+        {
+          "symbol": "ACTIVATE_ACK",
+          "file": "live-executor/src/autonomous_live_control_main.rs",
+          "line": 94,
+          "kind": "const"
+        },
+        {
+          "symbol": "ARM_REVENUE_LANES_ACK",
+          "file": "live-executor/src/autonomous_live_control_main.rs",
+          "line": 95,
+          "kind": "const"
+        },
+        {
+          "symbol": "SET_REVENUE_SIZE_MAX_REVIEWED_ACK",
+          "file": "live-executor/src/autonomous_live_control_main.rs",
+          "line": 96,
+          "kind": "const"
+        },
+        {
+          "symbol": "RECOVER_POST_ARM_ACCEPTANCE_ACK",
+          "file": "live-executor/src/autonomous_live_control_main.rs",
+          "line": 97,
+          "kind": "const"
+        },
+        {
+          "symbol": "ENTER_RECOVERED_LIVE_MODE_ACK",
+          "file": "live-executor/src/autonomous_live_control_main.rs",
+          "line": 98,
+          "kind": "const"
+        },
+        {
+          "symbol": "POST_ARM_ACCEPTANCE_FAILURE_REASON",
+          "file": "live-executor/src/autonomous_live_control_main.rs",
+          "line": 99,
+          "kind": "const"
+        },
+        {
+          "symbol": "POST_ARM_RECOVERY_REASON",
+          "file": "live-executor/src/autonomous_live_control_main.rs",
+          "line": 100,
+          "kind": "const"
+        },
+        {
+          "symbol": "RETAINED_PROFIT_FLOOR_WEI",
+          "file": "live-executor/src/autonomous_live_control_main.rs",
+          "line": 101,
+          "kind": "const"
+        },
+        {
+          "symbol": "DISARM_ACK",
+          "file": "live-executor/src/autonomous_live_control_main.rs",
+          "line": 102,
+          "kind": "const"
+        },
+        {
+          "symbol": "DISARMED_DEPLOY_ACK",
+          "file": "live-executor/src/autonomous_live_control_main.rs",
+          "line": 103,
+          "kind": "const"
+        },
+        {
+          "symbol": "EVIDENCE_START_ACK",
+          "file": "live-executor/src/autonomous_live_control_main.rs",
+          "line": 104,
+          "kind": "const"
+        },
+        {
+          "symbol": "READINESS_ACK",
+          "file": "live-executor/src/autonomous_live_control_main.rs",
+          "line": 105,
+          "kind": "const"
+        },
+        {
+          "symbol": "AUTHORIZATION_ACK",
+          "file": "live-executor/src/autonomous_live_control_main.rs",
+          "line": 106,
+          "kind": "const"
+        },
+        {
+          "symbol": "MATERIALIZE_ACTIVATION_ACK",
+          "file": "live-executor/src/autonomous_live_control_main.rs",
+          "line": 107,
+          "kind": "const"
+        },
+        {
+          "symbol": "ACTIVATION_REQUEST_OUTBOX_ENV",
+          "file": "live-executor/src/autonomous_live_control_main.rs",
+          "line": 108,
+          "kind": "const"
+        },
+        {
+          "symbol": "MAX_CONTROL_FILE_BYTES",
+          "file": "live-executor/src/autonomous_live_control_main.rs",
+          "line": 109,
+          "kind": "const"
+        },
+        {
+          "symbol": "MAX_READINESS_RESPONSE_BYTES",
+          "file": "live-executor/src/autonomous_live_control_main.rs",
+          "line": 110,
+          "kind": "const"
+        },
+        {
+          "symbol": "RPC_GATEWAY_READINESS_URL",
+          "file": "live-executor/src/autonomous_live_control_main.rs",
+          "line": 111,
+          "kind": "const"
+        },
+        {
+          "symbol": "ATLAS_HUNTER_READINESS_URL",
+          "file": "live-executor/src/autonomous_live_control_main.rs",
+          "line": 112,
+          "kind": "const"
+        },
+        {
+          "symbol": "REVENUE_PROVIDER_AUTHORITY_CHECK_INTERVAL",
+          "file": "live-executor/src/autonomous_live_control_main.rs",
+          "line": 113,
+          "kind": "const"
+        },
+        {
+          "symbol": "REVENUE_PROVIDER_FAILURE_MINIMUM_DURATION",
+          "file": "live-executor/src/autonomous_live_control_main.rs",
+          "line": 114,
+          "kind": "const"
+        },
+        {
+          "symbol": "IMAGE_RUNTIME_PROBE_COMMAND",
+          "file": "live-executor/src/autonomous_live_control_main.rs",
+          "line": 115,
+          "kind": "const"
+        },
+        {
+          "symbol": "IMAGE_RUNTIME_OK",
+          "file": "live-executor/src/autonomous_live_control_main.rs",
+          "line": 116,
+          "kind": "const"
+        },
+        {
+          "symbol": "reviewed_policy_values",
+          "file": "live-executor/src/autonomous_live_control_main.rs",
+          "line": 118,
+          "kind": "fn"
+        },
+        {
+          "symbol": "reviewed_policy_value",
+          "file": "live-executor/src/autonomous_live_control_main.rs",
+          "line": 139,
+          "kind": "fn"
+        },
+        {
+          "symbol": "ControlError",
+          "file": "live-executor/src/autonomous_live_control_main.rs",
+          "line": 153,
+          "kind": "enum"
+        },
+        {
+          "symbol": "Display",
+          "file": "live-executor/src/autonomous_live_control_main.rs",
+          "line": 160,
+          "kind": "impl"
+        },
+        {
+          "symbol": "fmt",
+          "file": "live-executor/src/autonomous_live_control_main.rs",
+          "line": 161,
+          "kind": "fn"
+        },
+        {
+          "symbol": "Error",
+          "file": "live-executor/src/autonomous_live_control_main.rs",
+          "line": 173,
+          "kind": "impl"
+        },
+        {
+          "symbol": "From",
+          "file": "live-executor/src/autonomous_live_control_main.rs",
+          "line": 175,
+          "kind": "impl"
+        },
+        {
+          "symbol": "from",
+          "file": "live-executor/src/autonomous_live_control_main.rs",
+          "line": 176,
+          "kind": "fn"
+        },
+        {
+          "symbol": "From",
+          "file": "live-executor/src/autonomous_live_control_main.rs",
+          "line": 181,
+          "kind": "impl"
+        },
+        {
+          "symbol": "from",
+          "file": "live-executor/src/autonomous_live_control_main.rs",
+          "line": 182,
+          "kind": "fn"
+        },
+        {
+          "symbol": "From",
+          "file": "live-executor/src/autonomous_live_control_main.rs",
+          "line": 187,
+          "kind": "impl"
+        },
+        {
+          "symbol": "from",
+          "file": "live-executor/src/autonomous_live_control_main.rs",
+          "line": 188,
+          "kind": "fn"
+        },
+        {
+          "symbol": "ControlResult",
+          "file": "live-executor/src/autonomous_live_control_main.rs",
+          "line": 193,
+          "kind": "type"
+        },
+        {
+          "symbol": "LivePreflightFacts",
+          "file": "live-executor/src/autonomous_live_control_main.rs",
+          "line": 427,
+          "kind": "struct"
+        },
+        {
+          "symbol": "validate_live_preflight_facts",
+          "file": "live-executor/src/autonomous_live_control_main.rs",
+          "line": 441,
+          "kind": "fn"
+        },
+        {
+          "symbol": "preflight_request",
+          "file": "live-executor/src/autonomous_live_control_main.rs",
+          "line": 620,
+          "kind": "fn"
+        },
+        {
+          "symbol": "ReadinessFile",
+          "file": "live-executor/src/autonomous_live_control_main.rs",
+          "line": 699,
+          "kind": "struct"
+        },
+        {
+          "symbol": "AuthorizationFile",
+          "file": "live-executor/src/autonomous_live_control_main.rs",
+          "line": 708,
+          "kind": "struct"
+        },
+        {
+          "symbol": "ActivationMaterialization",
+          "file": "live-executor/src/autonomous_live_control_main.rs",
+          "line": 716,
+          "kind": "struct"
+        },
+        {
+          "symbol": "EvidenceAuthorityState",
+          "file": "live-executor/src/autonomous_live_control_main.rs",
+          "line": 725,
+          "kind": "struct"
+        },
+        {
+          "symbol": "persistent_hunter_provider_failure",
+          "file": "live-executor/src/autonomous_live_control_main.rs",
+          "line": 1861,
+          "kind": "fn"
+        },
+        {
+          "symbol": "bounded_error_cause",
+          "file": "live-executor/src/autonomous_live_control_main.rs",
+          "line": 1926,
+          "kind": "fn"
+        },
+        {
+          "symbol": "ClosedLaneProviderAction",
+          "file": "live-executor/src/autonomous_live_control_main.rs",
+          "line": 1969,
+          "kind": "enum"
+        },
+        {
+          "symbol": "provider_execution_gate_failure_reason",
+          "file": "live-executor/src/autonomous_live_control_main.rs",
+          "line": 1976,
+          "kind": "fn"
+        },
+        {
+          "symbol": "closed_lane_provider_action",
+          "file": "live-executor/src/autonomous_live_control_main.rs",
+          "line": 2035,
+          "kind": "fn"
+        },
+        {
+          "symbol": "exact_revenue_execution_authorized",
+          "file": "live-executor/src/autonomous_live_control_main.rs",
+          "line": 2057,
+          "kind": "fn"
+        },
+        {
+          "symbol": "provider_recovery_owner_allows_execution",
+          "file": "live-executor/src/autonomous_live_control_main.rs",
+          "line": 2061,
+          "kind": "fn"
+        },
+        {
+          "symbol": "provider_recovery_samples_at",
+          "file": "live-executor/src/autonomous_live_control_main.rs",
+          "line": 2246,
+          "kind": "fn"
+        },
+        {
+          "symbol": "provider_recovery_samples",
+          "file": "live-executor/src/autonomous_live_control_main.rs",
+          "line": 2319,
+          "kind": "fn"
+        },
+        {
+          "symbol": "ProviderRecoveryTransitionBinding",
+          "file": "live-executor/src/autonomous_live_control_main.rs",
+          "line": 2324,
+          "kind": "struct"
+        },
+        {
+          "symbol": "validate_provider_recovery_transition_binding",
+          "file": "live-executor/src/autonomous_live_control_main.rs",
+          "line": 2335,
+          "kind": "fn"
+        },
+        {
+          "symbol": "ProviderRecoveryRuntimeFacts",
+          "file": "live-executor/src/autonomous_live_control_main.rs",
+          "line": 2365,
+          "kind": "struct"
+        },
+        {
+          "symbol": "validate_provider_recovery_runtime_facts",
+          "file": "live-executor/src/autonomous_live_control_main.rs",
+          "line": 2376,
+          "kind": "fn"
+        },
+        {
+          "symbol": "provider_recovery_owner_state",
+          "file": "live-executor/src/autonomous_live_control_main.rs",
+          "line": 2401,
+          "kind": "fn"
+        },
+        {
+          "symbol": "exact_release_identity",
+          "file": "live-executor/src/autonomous_live_control_main.rs",
+          "line": 2424,
+          "kind": "fn"
+        },
+        {
+          "symbol": "configured_release_identity",
+          "file": "live-executor/src/autonomous_live_control_main.rs",
+          "line": 2440,
+          "kind": "fn"
+        },
+        {
+          "symbol": "ActivationCandidateAssessment",
+          "file": "live-executor/src/autonomous_live_control_main.rs",
+          "line": 2759,
+          "kind": "struct"
+        },
+        {
+          "symbol": "row_u64_text",
+          "file": "live-executor/src/autonomous_live_control_main.rs",
+          "line": 3441,
+          "kind": "fn"
+        },
+        {
+          "symbol": "row_u128_text",
+          "file": "live-executor/src/autonomous_live_control_main.rs",
+          "line": 3448,
+          "kind": "fn"
+        },
+        {
+          "symbol": "row_i128_text",
+          "file": "live-executor/src/autonomous_live_control_main.rs",
+          "line": 3455,
+          "kind": "fn"
+        },
+        {
+          "symbol": "nonnegative_u64",
+          "file": "live-executor/src/autonomous_live_control_main.rs",
+          "line": 3462,
+          "kind": "fn"
+        },
+        {
+          "symbol": "nonnegative_milliseconds",
+          "file": "live-executor/src/autonomous_live_control_main.rs",
+          "line": 3883,
+          "kind": "fn"
+        },
+        {
+          "symbol": "validate_revenue_lane_size_authority",
+          "file": "live-executor/src/autonomous_live_control_main.rs",
+          "line": 4135,
+          "kind": "fn"
+        },
+        {
+          "symbol": "MaxReviewedAuthorityFacts",
+          "file": "live-executor/src/autonomous_live_control_main.rs",
+          "line": 4263,
+          "kind": "struct"
+        },
+        {
+          "symbol": "validate_max_reviewed_authority_transition",
+          "file": "live-executor/src/autonomous_live_control_main.rs",
+          "line": 4276,
+          "kind": "fn"
+        },
+        {
+          "symbol": "validate_hunter_readiness",
+          "file": "live-executor/src/autonomous_live_control_main.rs",
+          "line": 4317,
+          "kind": "fn"
+        },
+        {
+          "symbol": "PostRecoveryLiveModeFacts",
+          "file": "live-executor/src/autonomous_live_control_main.rs",
+          "line": 4819,
+          "kind": "struct"
+        },
+        {
+          "symbol": "validate_post_recovery_live_mode_facts",
+          "file": "live-executor/src/autonomous_live_control_main.rs",
+          "line": 4832,
+          "kind": "fn"
+        },
+        {
+          "symbol": "PostArmRecoveryFacts",
+          "file": "live-executor/src/autonomous_live_control_main.rs",
+          "line": 4996,
+          "kind": "struct"
+        },
+        {
+          "symbol": "validate_post_arm_recovery_owner_evidence",
+          "file": "live-executor/src/autonomous_live_control_main.rs",
+          "line": 5008,
+          "kind": "fn"
+        },
+        {
+          "symbol": "post_arm_recovery_samples",
+          "file": "live-executor/src/autonomous_live_control_main.rs",
+          "line": 5037,
+          "kind": "fn"
+        },
+        {
+          "symbol": "validate_post_arm_recovery_facts",
+          "file": "live-executor/src/autonomous_live_control_main.rs",
+          "line": 5052,
+          "kind": "fn"
+        },
+        {
+          "symbol": "activation_outbox_empty",
+          "file": "live-executor/src/autonomous_live_control_main.rs",
+          "line": 5089,
+          "kind": "fn"
+        },
+        {
+          "symbol": "EconomicState",
+          "file": "live-executor/src/autonomous_live_control_main.rs",
+          "line": 5467,
+          "kind": "struct"
+        },
+        {
+          "symbol": "validate_evidence_start",
+          "file": "live-executor/src/autonomous_live_control_main.rs",
+          "line": 5488,
+          "kind": "fn"
+        },
+        {
+          "symbol": "validate_readiness_against_evidence",
+          "file": "live-executor/src/autonomous_live_control_main.rs",
+          "line": 5528,
+          "kind": "fn"
+        },
+        {
+          "symbol": "economic_state_from_row",
+          "file": "live-executor/src/autonomous_live_control_main.rs",
+          "line": 5601,
+          "kind": "fn"
+        },
+        {
+          "symbol": "parse_phase",
+          "file": "live-executor/src/autonomous_live_control_main.rs",
+          "line": 5760,
+          "kind": "fn"
+        },
+        {
+          "symbol": "read_control_contract",
+          "file": "live-executor/src/autonomous_live_control_main.rs",
+          "line": 5778,
+          "kind": "fn"
+        },
+        {
+          "symbol": "image_digest",
+          "file": "live-executor/src/autonomous_live_control_main.rs",
+          "line": 5796,
+          "kind": "fn"
+        },
+        {
+          "symbol": "canonical_hex",
+          "file": "live-executor/src/autonomous_live_control_main.rs",
+          "line": 5810,
+          "kind": "fn"
+        },
+        {
+          "symbol": "require_signerless_control",
+          "file": "live-executor/src/autonomous_live_control_main.rs",
+          "line": 5817,
+          "kind": "fn"
+        },
+        {
+          "symbol": "validate_live_operator_mode",
+          "file": "live-executor/src/autonomous_live_control_main.rs",
+          "line": 5830,
+          "kind": "fn"
+        },
+        {
+          "symbol": "require_live_operator_mode",
+          "file": "live-executor/src/autonomous_live_control_main.rs",
+          "line": 5837,
+          "kind": "fn"
+        },
+        {
+          "symbol": "required",
+          "file": "live-executor/src/autonomous_live_control_main.rs",
+          "line": 5845,
+          "kind": "fn"
+        },
+        {
+          "symbol": "required_u128",
+          "file": "live-executor/src/autonomous_live_control_main.rs",
+          "line": 5849,
+          "kind": "fn"
+        },
+        {
+          "symbol": "value_text",
+          "file": "live-executor/src/autonomous_live_control_main.rs",
+          "line": 5859,
+          "kind": "fn"
+        },
+        {
+          "symbol": "value_u128",
+          "file": "live-executor/src/autonomous_live_control_main.rs",
+          "line": 5866,
+          "kind": "fn"
+        },
+        {
+          "symbol": "verify_hash",
+          "file": "live-executor/src/autonomous_live_control_main.rs",
+          "line": 5872,
+          "kind": "fn"
+        },
+        {
+          "symbol": "set_hash",
+          "file": "live-executor/src/autonomous_live_control_main.rs",
+          "line": 5879,
+          "kind": "fn"
+        },
+        {
+          "symbol": "contract_hash",
+          "file": "live-executor/src/autonomous_live_control_main.rs",
+          "line": 5893,
+          "kind": "fn"
+        },
+        {
+          "symbol": "canonical_json",
+          "file": "live-executor/src/autonomous_live_control_main.rs",
+          "line": 5910,
+          "kind": "fn"
+        },
+        {
+          "symbol": "evidence_time",
+          "file": "live-executor/src/autonomous_live_control_main.rs",
+          "line": 5949,
+          "kind": "fn"
+        },
+        {
+          "symbol": "state",
+          "file": "live-executor/src/autonomous_live_control_main.rs",
+          "line": 5955,
+          "kind": "fn"
+        },
+        {
+          "symbol": "closed_authority",
+          "file": "live-executor/src/autonomous_live_control_main.rs",
+          "line": 5977,
+          "kind": "fn"
+        },
+        {
+          "symbol": "max_reviewed_authority_facts",
+          "file": "live-executor/src/autonomous_live_control_main.rs",
+          "line": 5991,
+          "kind": "fn"
+        },
+        {
+          "symbol": "hunter_readiness",
+          "file": "live-executor/src/autonomous_live_control_main.rs",
+          "line": 6019,
+          "kind": "fn"
+        },
+        {
+          "symbol": "healthy_provider_recovery_payload",
+          "file": "live-executor/src/autonomous_live_control_main.rs",
+          "line": 6041,
+          "kind": "fn"
+        },
+        {
+          "symbol": "readiness",
+          "file": "live-executor/src/autonomous_live_control_main.rs",
+          "line": 6051,
+          "kind": "fn"
+        },
+        {
+          "symbol": "evidence_start_accepts_only_the_exact_fail_closed_deploy",
+          "file": "live-executor/src/autonomous_live_control_main.rs",
+          "line": 6081,
+          "kind": "fn"
+        },
+        {
+          "symbol": "evidence_start_rejects_every_open_or_active_authority",
+          "file": "live-executor/src/autonomous_live_control_main.rs",
+          "line": 6152,
+          "kind": "fn"
+        },
+        {
+          "symbol": "readiness_requires_evidence_phase_current_bindings_and_post_transition_window",
+          "file": "live-executor/src/autonomous_live_control_main.rs",
+          "line": 6193,
+          "kind": "fn"
+        },
+        {
+          "symbol": "revenue_lane_size_authority_must_track_the_economic_level_exactly",
+          "file": "live-executor/src/autonomous_live_control_main.rs",
+          "line": 6236,
+          "kind": "fn"
+        },
+        {
+          "symbol": "max_reviewed_operator_authority_requires_every_closed_state_gate",
+          "file": "live-executor/src/autonomous_live_control_main.rs",
+          "line": 6267,
+          "kind": "fn"
+        },
+        {
+          "symbol": "max_reviewed_operator_requires_fresh_exact_single_primary_readiness",
+          "file": "live-executor/src/autonomous_live_control_main.rs",
+          "line": 6327,
+          "kind": "fn"
+        },
+        {
+          "symbol": "post_arm_recovery_requires_exact_fresh_single_primary_evidence_and_zero_streak",
+          "file": "live-executor/src/autonomous_live_control_main.rs",
+          "line": 6358,
+          "kind": "fn"
+        },
+        {
+          "symbol": "repeated_current_provider_failures_require_an_open_circuit_before_fail_close",
+          "file": "live-executor/src/autonomous_live_control_main.rs",
+          "line": 6398,
+          "kind": "fn"
+        },
+        {
+          "symbol": "provider_recovery_requires_three_fresh_ordered_primary_samples",
+          "file": "live-executor/src/autonomous_live_control_main.rs",
+          "line": 6435,
+          "kind": "fn"
+        },
+        {
+          "symbol": "healthy_disarmed_evidence_closed_lanes_remain_ready_for_ten_supervisor_cycles",
+          "file": "live-executor/src/autonomous_live_control_main.rs",
+          "line": 6456,
+          "kind": "fn"
+        },
+        {
+          "symbol": "closed_revenue_lanes_never_grant_execution_authority",
+          "file": "live-executor/src/autonomous_live_control_main.rs",
+          "line": 6471,
+          "kind": "fn"
+        },
+        {
+          "symbol": "paused_contract_never_grants_provider_recovery_execution_authority",
+          "file": "live-executor/src/autonomous_live_control_main.rs",
+          "line": 6487,
+          "kind": "fn"
+        },
+        {
+          "symbol": "real_provider_failures_remain_fail_closed",
+          "file": "live-executor/src/autonomous_live_control_main.rs",
+          "line": 6498,
+          "kind": "fn"
+        },
+        {
+          "symbol": "provider_recovery_still_requires_three_fresh_samples",
+          "file": "live-executor/src/autonomous_live_control_main.rs",
+          "line": 6532,
+          "kind": "fn"
+        },
+        {
+          "symbol": "post_recovery_live_mode_preflight_remains_stable_across_supervisor_cycles",
+          "file": "live-executor/src/autonomous_live_control_main.rs",
+          "line": 6555,
+          "kind": "fn"
+        },
+        {
+          "symbol": "enter_post_recovery_live_mode_needs_no_market_opportunity",
+          "file": "live-executor/src/autonomous_live_control_main.rs",
+          "line": 6572,
+          "kind": "fn"
+        },
+        {
+          "symbol": "valid_provider_recovery_binding",
+          "file": "live-executor/src/autonomous_live_control_main.rs",
+          "line": 6589,
+          "kind": "fn"
+        },
+        {
+          "symbol": "provider_recovery_transition_is_allowlisted_epoch_bound_and_post_failure",
+          "file": "live-executor/src/autonomous_live_control_main.rs",
+          "line": 6611,
+          "kind": "fn"
+        },
+        {
+          "symbol": "valid_provider_recovery_runtime_facts",
+          "file": "live-executor/src/autonomous_live_control_main.rs",
+          "line": 6673,
+          "kind": "fn"
+        },
+        {
+          "symbol": "provider_recovery_runtime_rejects_every_open_work_or_policy_gate",
+          "file": "live-executor/src/autonomous_live_control_main.rs",
+          "line": 6700,
+          "kind": "fn"
+        },
+        {
+          "symbol": "provider_recovery_owner_evidence_requires_exact_release_configuration_and_maximum",
+          "file": "live-executor/src/autonomous_live_control_main.rs",
+          "line": 6742,
+          "kind": "fn"
+        },
+        {
+          "symbol": "post_arm_recovery_facts",
+          "file": "live-executor/src/autonomous_live_control_main.rs",
+          "line": 6767,
+          "kind": "fn"
+        },
+        {
+          "symbol": "post_arm_recovery_requires_paused_configured_exact_owner_evidence",
+          "file": "live-executor/src/autonomous_live_control_main.rs",
+          "line": 6809,
+          "kind": "fn"
+        },
+        {
+          "symbol": "post_arm_recovery_is_exact_reason_release_phase_size_and_post_failure_bound",
+          "file": "live-executor/src/autonomous_live_control_main.rs",
+          "line": 6837,
+          "kind": "fn"
+        },
+        {
+          "symbol": "post_arm_recovery_rejects_every_open_authority_work_lock_or_outbox_gate",
+          "file": "live-executor/src/autonomous_live_control_main.rs",
+          "line": 6880,
+          "kind": "fn"
+        },
+        {
+          "symbol": "valid_post_recovery_live_mode_facts",
+          "file": "live-executor/src/autonomous_live_control_main.rs",
+          "line": 6920,
+          "kind": "fn"
+        },
+        {
+          "symbol": "post_recovery_live_mode_requires_exact_paused_closed_max_reviewed_authority",
+          "file": "live-executor/src/autonomous_live_control_main.rs",
+          "line": 6967,
+          "kind": "fn"
+        },
+        {
+          "symbol": "post_recovery_live_mode_rejects_work_lock_outbox_or_provider_divergence",
+          "file": "live-executor/src/autonomous_live_control_main.rs",
+          "line": 6999,
+          "kind": "fn"
+        },
+        {
+          "symbol": "money_authority_requires_the_exact_operator_live_tuple",
+          "file": "live-executor/src/autonomous_live_control_main.rs",
+          "line": 7031,
+          "kind": "fn"
+        },
+        {
+          "symbol": "live_facts",
+          "file": "live-executor/src/autonomous_live_control_main.rs",
+          "line": 7043,
+          "kind": "fn"
+        },
+        {
+          "symbol": "live_preflight_requires_exact_armed_pair_closed_generic_and_coherent_work",
+          "file": "live-executor/src/autonomous_live_control_main.rs",
+          "line": 7075,
+          "kind": "fn"
+        },
+        {
+          "symbol": "bounded_error_cause_strips_controls_and_truncates",
+          "file": "live-executor/src/autonomous_live_control_main.rs",
+          "line": 7332,
+          "kind": "fn"
+        },
+        {
+          "symbol": "MAX_SIGNER_FILE_BYTES",
+          "file": "live-executor/src/config.rs",
+          "line": 14,
+          "kind": "const"
+        },
+        {
+          "symbol": "MAX_RECEIPT_TIMEOUT_SECONDS",
+          "file": "live-executor/src/config.rs",
+          "line": 15,
+          "kind": "const"
+        },
+        {
+          "symbol": "MAX_POLL_INTERVAL_SECONDS",
+          "file": "live-executor/src/config.rs",
+          "line": 16,
+          "kind": "const"
+        },
+        {
+          "symbol": "ENVIRONMENT_NAMES",
+          "file": "live-executor/src/config.rs",
+          "line": 17,
+          "kind": "const"
+        },
+        {
+          "symbol": "DisabledReason",
+          "file": "live-executor/src/config.rs",
+          "line": 48,
+          "kind": "pub "
+        },
+        {
+          "symbol": "SafetyLimits",
+          "file": "live-executor/src/config.rs",
+          "line": 54,
+          "kind": "pub "
+        },
+        {
+          "symbol": "ExecutorConfig",
+          "file": "live-executor/src/config.rs",
+          "line": 64,
+          "kind": "pub "
+        },
+        {
+          "symbol": "Bootstrap",
+          "file": "live-executor/src/config.rs",
+          "line": 81,
+          "kind": "pub "
+        },
+        {
+          "symbol": "ArmedBootstrap",
+          "file": "live-executor/src/config.rs",
+          "line": 87,
+          "kind": "pub "
+        },
+        {
+          "symbol": "Bootstrap",
+          "file": "live-executor/src/config.rs",
+          "line": 92,
+          "kind": "impl"
+        },
+        {
+          "symbol": "from_environment",
+          "file": "live-executor/src/config.rs",
+          "line": 93,
+          "kind": "pub "
+        },
+        {
+          "symbol": "from_values",
+          "file": "live-executor/src/config.rs",
+          "line": 105,
+          "kind": "pub "
+        },
+        {
+          "symbol": "required",
+          "file": "live-executor/src/config.rs",
+          "line": 266,
+          "kind": "fn"
+        },
+        {
+          "symbol": "get_or",
+          "file": "live-executor/src/config.rs",
+          "line": 277,
+          "kind": "fn"
+        },
+        {
+          "symbol": "parse_bool",
+          "file": "live-executor/src/config.rs",
+          "line": 281,
+          "kind": "fn"
+        },
+        {
+          "symbol": "positive_u64",
+          "file": "live-executor/src/config.rs",
+          "line": 289,
+          "kind": "fn"
+        },
+        {
+          "symbol": "positive_u128",
+          "file": "live-executor/src/config.rs",
+          "line": 297,
+          "kind": "fn"
+        },
+        {
+          "symbol": "parse_url",
+          "file": "live-executor/src/config.rs",
+          "line": 308,
+          "kind": "fn"
+        },
+        {
+          "symbol": "read_signer_file",
+          "file": "live-executor/src/config.rs",
+          "line": 312,
+          "kind": "fn"
+        },
+        {
+          "symbol": "transaction_signer_from_file",
+          "file": "live-executor/src/config.rs",
+          "line": 365,
+          "kind": "pub "
+        },
+        {
+          "symbol": "ConfigError",
+          "file": "live-executor/src/config.rs",
+          "line": 374,
+          "kind": "pub "
+        },
+        {
+          "symbol": "ConfigError",
+          "file": "live-executor/src/config.rs",
+          "line": 423,
+          "kind": "impl"
+        },
+        {
+          "symbol": "fn",
+          "file": "live-executor/src/config.rs",
+          "line": 424,
+          "kind": "pub "
+        },
+        {
+          "symbol": "test_private_key",
+          "file": "live-executor/src/config.rs",
+          "line": 462,
+          "kind": "fn"
+        },
+        {
+          "symbol": "fully_armed_values",
+          "file": "live-executor/src/config.rs",
+          "line": 466,
+          "kind": "fn"
+        },
+        {
+          "symbol": "signer_file",
+          "file": "live-executor/src/config.rs",
+          "line": 555,
+          "kind": "fn"
+        },
+        {
+          "symbol": "use_file_signer",
+          "file": "live-executor/src/config.rs",
+          "line": 562,
+          "kind": "fn"
+        },
+        {
+          "symbol": "expect_config_error",
+          "file": "live-executor/src/config.rs",
+          "line": 570,
+          "kind": "fn"
+        },
+        {
+          "symbol": "safe_defaults_are_disabled_without_secrets",
+          "file": "live-executor/src/config.rs",
+          "line": 578,
+          "kind": "fn"
+        },
+        {
+          "symbol": "safe_defaults_ignore_nonexistent_signer_file",
+          "file": "live-executor/src/config.rs",
+          "line": 587,
+          "kind": "fn"
+        },
+        {
+          "symbol": "shadow_cannot_be_armed",
+          "file": "live-executor/src/config.rs",
+          "line": 604,
+          "kind": "fn"
+        },
+        {
+          "symbol": "incomplete_arming_cannot_submit",
+          "file": "live-executor/src/config.rs",
+          "line": 614,
+          "kind": "fn"
+        },
+        {
+          "symbol": "environment_kill_switch_ignores_nonexistent_or_malformed_signer_file",
+          "file": "live-executor/src/config.rs",
+          "line": 624,
+          "kind": "fn"
+        },
+        {
+          "symbol": "fully_armed_file_backed_signer_succeeds",
+          "file": "live-executor/src/config.rs",
+          "line": 642,
+          "kind": "fn"
+        },
+        {
+          "symbol": "environment_backed_signer_remains_available_for_local_compatibility",
+          "file": "live-executor/src/config.rs",
+          "line": 653,
+          "kind": "fn"
+        },
+        {
+          "symbol": "hunting_standby_loads_signer_but_requires_environment_kill_switch",
+          "file": "live-executor/src/config.rs",
+          "line": 661,
+          "kind": "fn"
+        },
+        {
+          "symbol": "both_nonempty_signer_sources_are_rejected",
+          "file": "live-executor/src/config.rs",
+          "line": 681,
+          "kind": "fn"
+        },
+        {
+          "symbol": "missing_signer_file_is_rejected_without_path_disclosure",
+          "file": "live-executor/src/config.rs",
+          "line": 698,
+          "kind": "fn"
+        },
+        {
+          "symbol": "signer_file_path_must_be_absolute",
+          "file": "live-executor/src/config.rs",
+          "line": 711,
+          "kind": "fn"
+        },
+        {
+          "symbol": "signer_file_symlink_is_rejected",
+          "file": "live-executor/src/config.rs",
+          "line": 722,
+          "kind": "fn"
+        },
+        {
+          "symbol": "empty_and_oversized_signer_files_are_rejected",
+          "file": "live-executor/src/config.rs",
+          "line": 739,
+          "kind": "fn"
+        },
+        {
+          "symbol": "signer_path_must_reference_a_regular_file",
+          "file": "live-executor/src/config.rs",
+          "line": 758,
+          "kind": "fn"
+        },
+        {
+          "symbol": "signer_errors_do_not_expose_file_contents",
+          "file": "live-executor/src/config.rs",
+          "line": 769,
+          "kind": "fn"
+        },
+        {
+          "symbol": "wallet_must_match_signer",
+          "file": "live-executor/src/config.rs",
+          "line": 781,
+          "kind": "fn"
+        },
+        {
+          "symbol": "invalid_live_configuration_fails_before_signer_file_access",
+          "file": "live-executor/src/config.rs",
+          "line": 796,
+          "kind": "fn"
+        },
+        {
+          "symbol": "executor_address_must_be_nonzero_and_canonical",
+          "file": "live-executor/src/config.rs",
+          "line": 808,
+          "kind": "fn"
+        },
+        {
+          "symbol": "executor_code_hash_must_be_canonical",
+          "file": "live-executor/src/config.rs",
+          "line": 821,
+          "kind": "fn"
+        },
+        {
+          "symbol": "chain_must_be_arbitrum_one",
+          "file": "live-executor/src/config.rs",
+          "line": 834,
+          "kind": "fn"
+        },
+        {
+          "symbol": "selected_rpc_must_be_exactly_allowlisted",
+          "file": "live-executor/src/config.rs",
+          "line": 844,
+          "kind": "fn"
+        },
+        {
+          "symbol": "non_weth_profit_asset_is_rejected",
+          "file": "live-executor/src/config.rs",
+          "line": 857,
+          "kind": "fn"
+        },
+        {
+          "symbol": "one_transaction_mode_is_mandatory",
+          "file": "live-executor/src/config.rs",
+          "line": 870,
+          "kind": "fn"
+        },
+        {
+          "symbol": "WALLET_ADDRESS_ENV",
+          "file": "live-executor/src/control_environment.rs",
+          "line": 4,
+          "kind": "pub "
+        },
+        {
+          "symbol": "EXECUTOR_ADDRESS_ENV",
+          "file": "live-executor/src/control_environment.rs",
+          "line": 5,
+          "kind": "pub "
+        },
+        {
+          "symbol": "ControlAddressEnvironment",
+          "file": "live-executor/src/control_environment.rs",
+          "line": 8,
+          "kind": "pub "
+        },
+        {
+          "symbol": "MissingEnvironment",
+          "file": "live-executor/src/control_environment.rs",
+          "line": 14,
+          "kind": "pub "
+        },
+        {
+          "symbol": "MissingEnvironment",
+          "file": "live-executor/src/control_environment.rs",
+          "line": 18,
+          "kind": "impl"
+        },
+        {
+          "symbol": "fn",
+          "file": "live-executor/src/control_environment.rs",
+          "line": 19,
+          "kind": "pub "
+        },
+        {
+          "symbol": "Display",
+          "file": "live-executor/src/control_environment.rs",
+          "line": 24,
+          "kind": "impl"
+        },
+        {
+          "symbol": "fmt",
+          "file": "live-executor/src/control_environment.rs",
+          "line": 25,
+          "kind": "fn"
+        },
+        {
+          "symbol": "Error",
+          "file": "live-executor/src/control_environment.rs",
+          "line": 30,
+          "kind": "impl"
+        },
+        {
+          "symbol": "required_environment_with",
+          "file": "live-executor/src/control_environment.rs",
+          "line": 32,
+          "kind": "pub "
+        },
+        {
+          "symbol": "control_address_environment_with",
+          "file": "live-executor/src/control_environment.rs",
+          "line": 41,
+          "kind": "pub "
+        },
+        {
+          "symbol": "MINIMUM_OBSERVATIONS",
+          "file": "live-executor/src/economic_control.rs",
+          "line": 7,
+          "kind": "pub "
+        }
+      ]
+    },
+    "go": {
+      "count": 0,
+      "entries": []
+    },
+    "solidity": {
+      "count": 0,
+      "entries": []
+    }
+  }
+}
