@@ -92,3 +92,25 @@ UPSTREAM_AND_PACKAGE_DECISION: PIN rc.7; ADOPT NO PACKAGES. The
 capability seams we need (AgentFactory, Code Mode, rejection seam, retry
 waterfall, compaction/pruner, headless fallback) all exist in the pinned
 checkout and are used as-is.
+
+## E. Evidence addendum (2026-08-22 upstream audit)
+
+Fresh upstream audit confirms the pin (all operator surfaces unchanged
+since rc.7 — preset composition schema, cordis ^4.0.1, tool registration
+wire shape, compaction keys, ctx.agents, headless runner, settings.yaml
+keys; only breaking change = rc.8 SQLite storage format):
+
+- Repo is public (MIT, ~183k stars, created 2026-08-13); GitHub Issues are
+  DISABLED — Discussions are the real channel.
+- Tracked community items: #3615 preset-switch leaves stale agent-scoped
+  tool registrations (hybrid tool surface), #3018 default-preset change
+  ignored for reused blank session, #2536 no documented upgrade path,
+  #2535 auto-update idea.
+- The preview ships breaking releases every 1-2 days (rc.8, 0.1.1-rc.1,
+  0.1.1-rc.2 within 4 days); README itself warns of compatibility breaks.
+- Node 24 is a known community breakage independent of dsh version
+  (node-addon-require-builtin fallback, lefthook install); community pin is
+  Node 22.19.x. This machine runs the V3 suite green on Node 24.13.0, but a
+  future harness upgrade should also move to Node 22.19.x.
+- A later upgrade to a pinned 0.1.1-rc.2 requires a throwaway-home SQLite
+  migration test plus the full §C gate set before any adoption.
