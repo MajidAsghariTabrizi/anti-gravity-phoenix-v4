@@ -23,7 +23,7 @@
  * PHOENIX_EVAL_FAKE_CHILD=1 substitutes a stub child that writes a synthetic
  * run record — for evaluator-mechanics tests ONLY (never for real gates).
  */
-import { readFileSync, writeFileSync, readdirSync, existsSync, mkdirSync, rmSync, copyFileSync } from 'node:fs'
+import { readFileSync, writeFileSync, readdirSync, existsSync, mkdirSync, rmSync, copyFileSync, statSync } from 'node:fs'
 import { join, resolve, dirname } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { spawn } from 'node:child_process'
@@ -90,18 +90,56 @@ function spawnChild(args, opts) {
       try { child.kill() } catch { /* already gone */ }
       resolveFn({ ok: false, killed: true, code: 'BUDGET', stdout: out, stderr: err + '\n[budget-killed]' })
     }, opts.budgetMs ?? 45 * 60000)
+    // Stall watchdog: a child stuck in provider retry backoff makes no
+    // progress and would burn the whole budget — kill it early so the run
+    // loop can retry the attempt. Only armed when stall telemetry dirs are
+    // given; a child that never writes telemetry is not stalled by this
+    // definition (boot may legitimately take a while).
+    let stallTimer = null
+    let lastProgress = Date.now()
+    if (opts.stallDirs?.length) {
+      const stallMs = opts.stallMs ?? 4 * 60000
+      const dirs = opts.stallDirs
+      const probe = () => {
+        if (settled) return
+        let newest = 0
+        for (const d of dirs) {
+          try {
+            for (const f of readdirSync(d)) {
+              if (!f.endsWith('.jsonl')) continue
+              try {
+                const st = statSync(join(d, f))
+                if (st.mtimeMs > newest) newest = st.mtimeMs
+              } catch { /* raced */ }
+            }
+          } catch { /* dir not yet present — still booting */ }
+        }
+        if (newest > lastProgress) lastProgress = newest
+        if (Date.now() - lastProgress > stallMs) {
+          settled = true
+          clearTimeout(timer)
+          clearInterval(stallTimer)
+          try { child.kill() } catch { /* already gone */ }
+          resolveFn({ ok: false, killed: true, code: 'STALL', stdout: out, stderr: err + '\n[stall-killed]' })
+        }
+      }
+      stallTimer = setInterval(probe, 30000)
+      stallTimer.unref?.()
+    }
     child.stdout.on('data', (d) => { out += String(d) })
     child.stderr.on('data', (d) => { err += String(d) })
     child.on('error', (e) => {
       if (settled) return
       settled = true
       clearTimeout(timer)
+      clearInterval(stallTimer)
       resolveFn({ ok: false, killed: false, code: 'SPAWN', stdout: out, stderr: `${err}\n${e?.message ?? e}` })
     })
     child.on('close', (code) => {
       if (settled) return
       settled = true
       clearTimeout(timer)
+      clearInterval(stallTimer)
       resolveFn({ ok: code === 0, killed: false, code, stdout: out, stderr: err })
     })
   })
@@ -222,6 +260,10 @@ async function runCampaign(args) {
             ], {
               cwd: wt,
               budgetMs: budgetMin * 60000,
+              stallDirs: [
+                join(wt, '.phoenix-harness', 'telemetry'),
+                join(armHome, '.phoenix-harness', 'telemetry'),
+              ],
               env: {
                 DSH_HOME: armHome,
                 PHOENIX_DSH_CHECKOUT: manifest.checkout,
@@ -265,8 +307,9 @@ async function runCampaign(args) {
           await removeWorktree(wt)
           const transport = record?.reason?.error?.code === 'TRANSPORT'
           entry.transportFailure = transport
-          if (transport && attempt + 1 < ATTEMPT_CAP) {
-            console.error(`[eval] ${arm} ${taskId} r${r} attempt ${attempt + 1}: TRANSPORT failure — retrying`)
+          entry.stallKilled = childResult.code === 'STALL'
+          if ((transport || entry.stallKilled) && attempt + 1 < ATTEMPT_CAP) {
+            console.error(`[eval] ${arm} ${taskId} r${r} attempt ${attempt + 1}: ${entry.stallKilled ? 'STALL' : 'TRANSPORT'} — retrying`)
             continue
           }
           break
