@@ -13,6 +13,7 @@ Pins were resolved from the official GitHub API tag refs on 2026-07-08. Update p
 | login-action | `docker/login-action` | `c94ce9fb468520275223c153574b00df6fe4bcc9` | `v3` | Authenticate to GHCR with `GITHUB_TOKEN` in the image publishing workflow. |
 | build-push-action | `docker/build-push-action` | `10e90e3645eae34f1e60eeb005ba3a3d33f178e8` | `v6` | Build and push immutable Phoenix images with BuildKit cache and OCI labels. |
 | foundry-toolchain | `foundry-rs/foundry-toolchain` | `b00af27efadbc7b4ca8b82abbd903b17cc874d2a` | `v1` | Install Foundry for Solidity formatting and tests. |
+| setup-node | `actions/setup-node` | `49933ea5288caeca8642d1e84afbd3f7d6820020` | `v4` | Install Node 22 in the hygiene job for the Phoenix Harness V3 node test suite. |
 
 Source URLs used:
 
@@ -25,5 +26,6 @@ Source URLs used:
 - `https://api.github.com/repos/docker/login-action/git/ref/tags/v3`
 - `https://api.github.com/repos/docker/build-push-action/git/ref/tags/v6`
 - `https://api.github.com/repos/foundry-rs/foundry-toolchain/git/ref/tags/v1`
+- `https://api.github.com/repos/actions/setup-node/git/ref/tags/v4`
 
 Do not replace these with floating tags in workflows. If a pin cannot be resolved because network access is unavailable, use the maintained tag only as a temporary blocker and document the blocker in the PR.
