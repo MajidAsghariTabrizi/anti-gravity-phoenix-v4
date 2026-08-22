@@ -93,28 +93,33 @@ function spawnChild(args, opts) {
     // Stall watchdog: a child stuck in provider retry backoff makes no
     // progress and would burn the whole budget — kill it early so the run
     // loop can retry the attempt. Only armed when stall telemetry dirs are
-    // given; a child that never writes telemetry is not stalled by this
-    // definition (boot may legitimately take a while).
+    // given. Transport FAILURE lines are not progress: a child that only
+    // emits failed requests is retrying against a dead provider, which is
+    // exactly the stall this watchdog exists for.
     let stallTimer = null
     let lastProgress = Date.now()
     if (opts.stallDirs?.length) {
       const stallMs = opts.stallMs ?? 4 * 60000
       const dirs = opts.stallDirs
+      const isFailureLine = (text) => text.includes('"failure"') && !text.includes('"failure":null')
       const probe = () => {
         if (settled) return
-        let newest = 0
+        let progressed = false
         for (const d of dirs) {
           try {
             for (const f of readdirSync(d)) {
               if (!f.endsWith('.jsonl')) continue
               try {
-                const st = statSync(join(d, f))
-                if (st.mtimeMs > newest) newest = st.mtimeMs
+                const p = join(d, f)
+                const st = statSync(p)
+                if (st.mtimeMs <= lastProgress) continue
+                const tail = readFileSync(p, 'utf8').split('\n').filter(Boolean).slice(-2).join('\n')
+                if (!isFailureLine(tail)) { lastProgress = st.mtimeMs; progressed = true }
               } catch { /* raced */ }
             }
           } catch { /* dir not yet present — still booting */ }
         }
-        if (newest > lastProgress) lastProgress = newest
+        if (progressed) return
         if (Date.now() - lastProgress > stallMs) {
           settled = true
           clearTimeout(timer)
