@@ -101,7 +101,7 @@ services:
     environment:
       POSTGRES_DSN: ${POSTGRES_DSN:?POSTGRES_DSN is required}
       PHOENIX_ECONOMIC_DASHBOARD_INTERVAL_SECONDS: "45"
-      PHOENIX_ECONOMIC_DASHBOARD_QUERY_TIMEOUT_SECONDS: "60"
+      PHOENIX_ECONOMIC_DASHBOARD_QUERY_TIMEOUT_SECONDS: "90"
       PHOENIX_ECONOMIC_DASHBOARD_SQL: /opt/phoenix/economic-dashboard-snapshot.sql
       PHOENIX_ECONOMIC_DASHBOARD_OUTPUT: /evidence/latest-dashboard.json
     volumes:

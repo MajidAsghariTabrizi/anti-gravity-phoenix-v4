@@ -270,8 +270,8 @@ require(
     "dashboard_refresh_interval_not_45_seconds",
 )
 require(
-    "PHOENIX_ECONOMIC_DASHBOARD_QUERY_TIMEOUT_SECONDS: \"60\"" in compose,
-    "dashboard_query_timeout_not_60_seconds",
+    "PHOENIX_ECONOMIC_DASHBOARD_QUERY_TIMEOUT_SECONDS: \"90\"" in compose,
+    "dashboard_query_timeout_not_90_seconds",
 )
 require(
     "find /evidence/latest-dashboard.json -maxdepth 0 -type f -size +0c -mmin -3"
@@ -934,9 +934,11 @@ for required in (
 ):
     require(required in dashboard_sql, f"dashboard_section_missing:{required}")
 require("interval must be 30-60 seconds" in monitor, "monitor_interval_guard_missing")
-require("query timeout must be 5-60 seconds" in monitor, "monitor_timeout_guard_missing")
+require("query timeout must be 5-120 seconds" in monitor, "monitor_timeout_guard_missing")
 require(
-    'statement_timeout=${query_timeout}s' in monitor and "lock_timeout=5s" in monitor,
+    'statement_timeout=${query_timeout}s' in monitor
+    and "lock_timeout=5s" in monitor
+    and "work_mem=64MB" in monitor,
     "monitor_query_timeout_not_enforced",
 )
 

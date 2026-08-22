@@ -208,7 +208,7 @@ if not isinstance(environment, dict) or any(
             "/opt/phoenix/economic-dashboard-snapshot.sql"
         ),
         "PHOENIX_ECONOMIC_DASHBOARD_OUTPUT": "/evidence/latest-dashboard.json",
-        "PHOENIX_ECONOMIC_DASHBOARD_QUERY_TIMEOUT_SECONDS": "60",
+        "PHOENIX_ECONOMIC_DASHBOARD_QUERY_TIMEOUT_SECONDS": "90",
     }.items()
 ):
     raise SystemExit(1)
@@ -378,7 +378,7 @@ monitor_container=$(
     -e PGCONNECT_TIMEOUT=5 \
     -e 'PGOPTIONS=-c statement_timeout=60000 -c lock_timeout=5000' \
     -e PHOENIX_ECONOMIC_DASHBOARD_INTERVAL_SECONDS=30 \
-    -e PHOENIX_ECONOMIC_DASHBOARD_QUERY_TIMEOUT_SECONDS=60 \
+    -e PHOENIX_ECONOMIC_DASHBOARD_QUERY_TIMEOUT_SECONDS=90 \
     -e PHOENIX_ECONOMIC_DASHBOARD_SQL=/opt/phoenix/economic-dashboard-snapshot.sql \
     -e PHOENIX_ECONOMIC_DASHBOARD_OUTPUT=/evidence/latest-dashboard.json \
     -v "$candidate_root/scripts/economic-dashboard-loop.sh:/opt/phoenix/economic-dashboard-loop.sh:ro" \

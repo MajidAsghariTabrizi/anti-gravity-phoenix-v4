@@ -15,8 +15,8 @@ esac
 case "$query_timeout" in
   ''|*[!0-9]*) echo "ECONOMIC_DASHBOARD_FAILED: invalid query timeout" >&2; exit 1 ;;
 esac
-[ "$query_timeout" -ge 5 ] && [ "$query_timeout" -le 60 ] ||
-  { echo "ECONOMIC_DASHBOARD_FAILED: query timeout must be 5-60 seconds" >&2; exit 1; }
+[ "$query_timeout" -ge 5 ] && [ "$query_timeout" -le 120 ] ||
+  { echo "ECONOMIC_DASHBOARD_FAILED: query timeout must be 5-120 seconds" >&2; exit 1; }
 [ -f "$sql_file" ] && [ ! -L "$sql_file" ] ||
   { echo "ECONOMIC_DASHBOARD_FAILED: SQL contract is unavailable" >&2; exit 1; }
 
@@ -27,7 +27,7 @@ output_dir=${output%/*}
 while :; do
   candidate=$(mktemp "$output_dir/.economic-dashboard.XXXXXX") ||
     { echo "ECONOMIC_DASHBOARD_FAILED: staging failed" >&2; exit 1; }
-  if PGOPTIONS="-c statement_timeout=${query_timeout}s -c lock_timeout=5s" \
+  if PGOPTIONS="-c statement_timeout=${query_timeout}s -c lock_timeout=5s -c work_mem=64MB" \
     psql -X -q -A -t "$POSTGRES_DSN" -f "$sql_file" >"$candidate" &&
     [ -s "$candidate" ]
   then

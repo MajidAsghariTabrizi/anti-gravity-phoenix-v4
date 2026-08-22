@@ -747,7 +747,7 @@ route_ranking AS (
         GROUP BY fact.route_fingerprint
     ) ranked
 ),
-loss_points AS (
+loss_points AS MATERIALIZED (
 \if :phoenix_has_economic_truth
     WITH bounded_loss_truth AS MATERIALIZED (
         SELECT
@@ -1068,7 +1068,7 @@ loss_ledger AS (
         GROUP BY primary_loss_cause
     ) bucket
 ),
-daily_ranked AS (
+daily_ranked AS MATERIALIZED (
     SELECT
         date_trunc('day', classified_at) AS evaluation_day,
         loss_points.*,
