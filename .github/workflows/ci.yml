@@ -383,6 +383,21 @@ jobs:
           go vet ./...
           go test ./...
 
+      - name: Verify phoenix-telegram-ops
+        if: ${{ needs.hygiene.outputs.job_go == 'true' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd phoenix-telegram-ops
+          files="$(gofmt -l .)"
+          if [ -n "$files" ]; then
+            echo "gofmt required for:"
+            echo "$files"
+            exit 1
+          fi
+          go vet ./...
+          go test ./...
+
   rust-phoenix:
     name: rust-phoenix
     needs: hygiene

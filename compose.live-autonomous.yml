@@ -209,6 +209,51 @@ services:
       timeout: 3s
       retries: 5
 
+  # Telegram Operations reporter. READ-ONLY by construction: every database
+  # statement is a single SELECT and the bot has no control-plane commands.
+  # Boots DISABLED (healthy, idle) until the owner installs the bot token at
+  # /etc/phoenix/secrets/phoenix-telegram-bot-token; no restart loop. The token
+  # is never logged and callbacks are accepted only from the configured chat.
+  phoenix-telegram-ops:
+    profiles: ["live-autonomous"]
+    image: ${DASHBOARD_IMAGE:?DASHBOARD_IMAGE is required}
+    entrypoint: ["/usr/local/bin/phoenix-telegram-ops"]
+    environment:
+      POSTGRES_DSN: ${POSTGRES_DSN:?POSTGRES_DSN is required}
+      PHOENIX_TELEGRAM_BOT_TOKEN_FILE: /run/secrets/phoenix-telegram-bot-token
+      PHOENIX_TELEGRAM_OPS_CHAT_ID: ${PHOENIX_TELEGRAM_OPS_CHAT_ID:-}
+      PHOENIX_TELEGRAM_LISTEN_ADDR: 0.0.0.0:9750
+      PHOENIX_EXPECTED_RELEASE_SHA: ${PHOENIX_RELEASE_SHA:?PHOENIX_RELEASE_SHA is required}
+    volumes:
+      - type: bind
+        source: /etc/phoenix/secrets/phoenix-telegram-bot-token
+        target: /run/secrets/phoenix-telegram-bot-token
+        read_only: true
+        bind:
+          create_host_path: true
+    depends_on:
+      postgres:
+        condition: service_healthy
+      migration-runner:
+        condition: service_completed_successfully
+    networks: [phoenix-internal]
+    init: true
+    user: "65532:65532"
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1777,noexec,nosuid,nodev
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    restart: unless-stopped
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - python3 -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:9750/readyz', timeout=3)"
+      interval: 30s
+      timeout: 5s
+      retries: 5
+
   live-executor:
     profiles: ["live-autonomous"]
     image: ${LIVE_EXECUTOR_IMAGE:?LIVE_EXECUTOR_IMAGE is required}

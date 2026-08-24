@@ -456,6 +456,14 @@ transaction calldata. Source:
 
 `proto/phoenix.proto` is the canonical typed message schema. The Go ingestor currently publishes canonical JSON matching that schema because `protoc` and generated Protobuf toolchains are not available in this workspace. This is an implementation constraint, not a protocol guess. The schema is ready for generated Protobuf bindings in the deployment toolchain.
 
+## Phoenix Telegram Ops (phoenix-telegram-ops)
+
+- Language: Go 1.23.1, module `anti-gravity-phoenix-v4/phoenix-telegram-ops`, driver `github.com/lib/pq v1.10.9`.
+- External service: Telegram Bot API (`https://api.telegram.org/bot<token>/<method>`); the API base is env-overridable for tests. The bot token is read from `/etc/phoenix/secrets/phoenix-telegram-bot-token`, is never logged, and the service boots DISABLED when it is absent.
+- Authority assumptions: Bot API `getMe`/`getUpdates`/`sendMessage`/`editMessageText` semantics as of 2026-08; long polling uses `getUpdates` with a 50s timeout and a monotonic offset. Callback updates are honored only from `PHOENIX_TELEGRAM_OPS_CHAT_ID`.
+- Read path: single bounded SELECT statements over `live_canary.*` tables only; no write statements exist in the module.
+- Deployment: built inside the dashboard image (`deploy/dashboard.Dockerfile`, CGO_ENABLED=0 static binary) and run by the `phoenix-telegram-ops` service in `compose.live-autonomous.yml` with the entrypoint overridden to the sidecar binary.
+
 ## PostgreSQL Migration Runner
 
 - Runner language: Go.
