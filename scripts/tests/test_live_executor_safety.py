@@ -122,8 +122,10 @@ class LiveExecutorSafetyTests(unittest.TestCase):
 
     def test_canary_schema_does_not_change_root_migrations(self) -> None:
         root_migrations = sorted(path.name for path in (ROOT / "migrations").glob("*.sql"))
-        self.assertEqual(root_migrations[-1], "015_bounded_economic_view_plans.sql")
-        self.assertEqual(len(root_migrations), 15)
+        self.assertEqual(
+            root_migrations[-1], "016_dashboard_ingest_timestamp_indexes.sql"
+        )
+        self.assertEqual(len(root_migrations), 16)
         schema = (ROOT / "live-executor/schema/001_live_canary.sql").read_text(
             encoding="utf-8"
         )
