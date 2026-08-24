@@ -6,3 +6,10 @@
 !dashboard/snapshot_model.py
 !deploy/
 !deploy/dashboard.Dockerfile
+!phoenix-telegram-ops/
+!phoenix-telegram-ops/go.mod
+!phoenix-telegram-ops/go.sum
+!phoenix-telegram-ops/cmd/
+!phoenix-telegram-ops/cmd/**
+!phoenix-telegram-ops/internal/
+!phoenix-telegram-ops/internal/**
