@@ -111,6 +111,35 @@ class ChangeImpactTests(unittest.TestCase):
             ],
         )
 
+    def test_dashboard_dockerignore_admits_dockerfile_copy_sources(self) -> None:
+        dockerfile = (self.ROOT / "deploy/dashboard.Dockerfile").read_text(
+            encoding="utf-8"
+        )
+        contract = (
+            self.ROOT / "deploy/dashboard.Dockerfile.dockerignore"
+        ).read_text(encoding="utf-8")
+        rules = [line.strip() for line in contract.splitlines() if line.strip()]
+        copy_sources = []
+        for raw in dockerfile.splitlines():
+            line = raw.strip()
+            if not line.startswith("COPY") or "--from" in line:
+                continue
+            tokens = [t for t in line.split()[1:] if not t.startswith("--")]
+            copy_sources.extend(tokens[:-1])
+        self.assertTrue(copy_sources, "dashboard Dockerfile COPY sources found")
+        for source in copy_sources:
+            top = source.split("/")[0]
+            self.assertIn(f"!{top}/", rules, source)
+        for required in (
+            "!phoenix-telegram-ops/go.mod",
+            "!phoenix-telegram-ops/go.sum",
+            "!phoenix-telegram-ops/cmd/",
+            "!phoenix-telegram-ops/cmd/**",
+            "!phoenix-telegram-ops/internal/",
+            "!phoenix-telegram-ops/internal/**",
+        ):
+            self.assertIn(required, rules)
+
     def test_narrow_rust_contexts_exclude_local_build_outputs(self) -> None:
         for name in (
             "deploy/rust.Dockerfile.dockerignore",
