@@ -72,8 +72,7 @@ impl Config {
         match std::env::var("RPC_VERIFICATION_PROVIDER_ID") {
             Ok(identity) if !identity.trim().is_empty() => {
                 let url = required_env("RPC_VERIFICATION_PROVIDER_URL")?;
-                let priority =
-                    positive_u32_from_env("RPC_VERIFICATION_PROVIDER_PRIORITY", 90)?;
+                let priority = positive_u32_from_env("RPC_VERIFICATION_PROVIDER_PRIORITY", 90)?;
                 let header_name = required_env("RPC_VERIFICATION_PROVIDER_HEADER_NAME")?;
                 let secret =
                     read_header_secret(required_env("RPC_VERIFICATION_PROVIDER_HEADER_FILE")?)?;
@@ -141,8 +140,15 @@ fn append_verification_provider(
     if priority == 0 || priority >= primary_priority {
         return Err("verification RPC priority must stay below the primary provider");
     }
-    append_header_authenticated_provider(providers, identity, url, priority, header_name, header_value)
-        .map_err(|_| "invalid verification RPC provider configuration")?;
+    append_header_authenticated_provider(
+        providers,
+        identity,
+        url,
+        priority,
+        header_name,
+        header_value,
+    )
+    .map_err(|_| "invalid verification RPC provider configuration")?;
     Ok(())
 }
 
@@ -889,31 +895,27 @@ mod tests {
         }
         assert_eq!(rejected.providers.len(), 1);
         // the same identity can never be registered twice
-        assert!(
-            append_verification_provider(
-                &mut rejected,
-                100,
-                "production-alchemy-arbitrum",
-                "https://arb-mainnet.g.alchemy.com/v2/",
-                90,
-                "api-key",
-                "secondary-secret",
-            )
-            .is_ok()
-        );
+        assert!(append_verification_provider(
+            &mut rejected,
+            100,
+            "production-alchemy-arbitrum",
+            "https://arb-mainnet.g.alchemy.com/v2/",
+            90,
+            "api-key",
+            "secondary-secret",
+        )
+        .is_ok());
         assert_eq!(rejected.providers.len(), 2);
-        assert!(
-            append_verification_provider(
-                &mut rejected,
-                100,
-                "production-alchemy-arbitrum",
-                "https://arb-mainnet.g.alchemy.com/v2/",
-                80,
-                "api-key",
-                "secondary-secret",
-            )
-            .is_err()
-        );
+        assert!(append_verification_provider(
+            &mut rejected,
+            100,
+            "production-alchemy-arbitrum",
+            "https://arb-mainnet.g.alchemy.com/v2/",
+            80,
+            "api-key",
+            "secondary-secret",
+        )
+        .is_err());
         assert_eq!(rejected.providers.len(), 2);
     }
 }
