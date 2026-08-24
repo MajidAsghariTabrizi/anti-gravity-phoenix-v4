@@ -3257,6 +3257,32 @@ class WorkflowAndDeploymentContractTests(unittest.TestCase):
             host_plan,
         )
 
+    def test_controller_monitor_bootstrap_is_pinned_and_fail_closed(
+        self,
+    ) -> None:
+        host_plan = self.workflow.split(
+            "- name: Read active immutable release",
+            maxsplit=1,
+        )[1].split("- name:", maxsplit=1)[0]
+        self.assertIn("8ac529a9af7caeacb8883a51024e5970dae6f281", host_plan)
+        self.assertIn(
+            '.evidence.failures[0].code == "READINESS_SERVICE_UNHEALTHY"',
+            host_plan,
+        )
+        self.assertIn(
+            '.evidence.failures[0].evidence.service == "economic-monitor"',
+            host_plan,
+        )
+        self.assertIn('accepted_false_positive: "economic-monitor"', host_plan)
+        self.assertIn(".controls.submission_lock_free == true", host_plan)
+        self.assertIn(".controls.outbox_pending == 0", host_plan)
+        # The economic-monitor bridge must sit ahead of the final
+        # fail-closed branch and accept exactly one failure class.
+        self.assertLess(
+            host_plan.index('.failures[0].code == "READINESS_SERVICE_UNHEALTHY"'),
+            host_plan.index("PRODUCTION_READINESS_UNBRIDGED"),
+        )
+
     def test_controller_has_no_dead_historical_forward_fix_fallback(
         self,
     ) -> None:
