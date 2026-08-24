@@ -152,6 +152,10 @@ for service in $health_services; do
       check dashboard compose exec -T dashboard python -c \
         "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8501/_stcore/health', timeout=2)"
       ;;
+    phoenix-telegram-ops)
+      check phoenix-telegram-ops compose exec -T phoenix-telegram-ops python3 -c \
+        "import urllib.request; urllib.request.urlopen('http://127.0.0.1:9750/readyz', timeout=2)"
+      ;;
     *)
       echo "HEALTH_FAIL: unsupported-topology-service-$service"
       exit 1
