@@ -294,6 +294,12 @@ DEPLOY_START_ORDER = (
     "phoenix-engine",
 )
 HEALTH_SERVICE_ORDER = (
+    # phoenix-telegram-ops is intentionally absent here: the pre-install
+    # rehearsal probes these services against the ACTIVE deployment, where a
+    # service introduced by the candidate release cannot exist yet. The
+    # sidecar stays fully deployed, started, and monitored via
+    # running_services/readiness; its probe returns only after a reviewed
+    # baseline includes it.
     "nitro-feed-relay",
     "nats",
     "postgres",
@@ -305,7 +311,6 @@ HEALTH_SERVICE_ORDER = (
     "atlas-observer",
     "prometheus",
     "dashboard",
-    "phoenix-telegram-ops",
 )
 HEALTH_CONTRACTS = {
     "postgres": "pg_isready",

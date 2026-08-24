@@ -501,6 +501,41 @@ class ReleaseComponentRegistryTests(unittest.TestCase):
         )
         self.assertEqual(unchanged["remove_services"], [])
 
+    def test_telegram_ops_ships_but_is_not_a_preinstall_health_probe(self) -> None:
+        # The rehearsal health contract probes the ACTIVE deployment, so a
+        # service introduced by the candidate release must not gate its own
+        # introduction. It must still ship, start, and be readiness-monitored.
+        for mode in ("SHADOW", "DISARMED_EVIDENCE", "LIVE"):
+            topology = release_components.runtime_topology(
+                release_components.CURRENT_RELEASE_IMAGES, mode
+            )
+            if mode == "SHADOW":
+                self.assertNotIn(
+                    "phoenix-telegram-ops", topology["running_services"]
+                )
+                continue
+            self.assertIn(
+                "phoenix-telegram-ops", topology["running_services"], mode
+            )
+            self.assertIn(
+                "phoenix-telegram-ops", topology["start_services"], mode
+            )
+            self.assertNotIn(
+                "phoenix-telegram-ops", topology["health_services"], mode
+            )
+            self.assertNotIn(
+                "phoenix-telegram-ops", topology["inspect_services"], mode
+            )
+            self.assertNotIn(
+                "phoenix-telegram-ops", topology["health_contracts"], mode
+            )
+            self.assertEqual(
+                topology["service_contracts"]["phoenix-telegram-ops"][
+                    "image_binding"
+                ],
+                "dashboard",
+            )
+
     def test_runtime_topology_rejects_partial_or_unknown_generations(self) -> None:
         for names in (
             {"dashboard"},
