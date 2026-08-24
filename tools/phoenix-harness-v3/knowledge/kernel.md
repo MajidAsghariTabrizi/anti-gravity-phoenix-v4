@@ -60,7 +60,12 @@ economics permit. Activity is never the objective.
 - Native tools return compact structured results + artifact references;
   verbose raw output lives in artifacts, never in the transcript.
 - Waits (CI, release, milestones) happen INSIDE native tools: the model is
-  suspended and wakes on state change — never poll with rounds.
+  suspended and wakes on a TERMINAL outcome — never poll with rounds.
+  phoenix_ci_watch waits for terminal CI state (completed + real conclusion);
+  an already-terminal run returns immediately after one fresh read, and
+  non-terminal transitions (queued -> in_progress) are not wake reasons —
+  do NOT call the watcher repeatedly for the same run. Generic file/state
+  waits keep their own semantics (phoenix_wait).
 - Reasoning effort is harness-managed; do not override.
 
 ## 6. Tool hygiene

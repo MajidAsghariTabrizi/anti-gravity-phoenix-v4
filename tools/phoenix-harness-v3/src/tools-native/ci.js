@@ -2,9 +2,14 @@
  * phoenix_ci_watch / phoenix_pr_flow / phoenix_release_preflight /
  * phoenix_release_dispatch — CI and release native tools.
  *
- * phoenix_ci_watch BLOCKS INSIDE THE TOOL (model suspended) until the CI
- * run state changes or the deadline passes (fail-closed). This is the
- * "suspend the model, wake on state change" seam — zero polling rounds.
+ * phoenix_ci_watch BLOCKS INSIDE THE TOOL (model suspended) until a TERMINAL
+ * CI outcome — status=completed with a real conclusion — or the deadline
+ * passes (fail-closed). This is the "suspend the model, wake on terminal"
+ * seam — zero polling rounds. An already-terminal run/check-set returns
+ * IMMEDIATELY after one fresh read, so re-entry is cheap and never creates
+ * another long wait; non-terminal transitions (queued -> in_progress) are
+ * not wake reasons. A completed/failure observation is a VALID terminal
+ * result, not a tool failure.
  * phoenix_release_dispatch NEVER mutates by itself: it validates
  * authorization + release-graph gates and prints the prepared MUTATION
  * PLAN; the canonical controller runs through the documented repo
@@ -14,7 +19,10 @@
 import { existsSync, readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { run } from './exec-helpers.js'
-import { waitForState } from '../wait.js'
+import {
+  watchCi, parseRunState, parseCheckStates,
+  formatRunTerminal, formatShaTerminal,
+} from './ci-watch-core.js'
 
 const REPO_SLUG = 'MajidAsghariTabrizi/anti-gravity-phoenix-v4'
 
@@ -22,10 +30,10 @@ export function ciWatchTool(governor, root) {
   return {
     name: 'phoenix_ci_watch',
     description:
-      'Suspend the model and watch one GitHub Actions run (or the checks of one SHA) until its conclusion changes or the deadline passes. Runs inside the tool: zero model rounds while waiting; returns the final state. Fail-closed on deadline. Use for CI/build/release waits instead of job_output polling.',
+      'Suspend the model and watch one GitHub Actions run (or the checks of one SHA) until a TERMINAL CI outcome: status=completed with a real conclusion (success/failure/cancelled/skipped/timed_out/action_required/neutral/stale). An already-terminal target returns IMMEDIATELY after one fresh read — repeated calls for the same run are cheap and never re-enter a long wait. Non-terminal targets poll INSIDE the tool (10s interval, zero model rounds); queued->in_progress transitions are NOT wake reasons. A completed/failure observation is a valid terminal result, not a tool failure. Fail-closed on deadline; prompt-exits on abort.',
     parameters: {
       runId: { type: 'string', description: 'GitHub Actions run id (numeric)' },
-      sha: { type: 'string', description: 'alternative: watch check runs for this SHA' },
+      sha: { type: 'string', description: 'alternative: watch check runs for this SHA (waits until ALL discovered check runs are terminal)' },
       maxWaitMinutes: { type: 'integer', description: 'deadline in minutes (default 30, max 120)' },
     },
     execute: async (args, exec) => {
@@ -34,29 +42,61 @@ export function ciWatchTool(governor, root) {
       const runId = String(args.runId ?? '').trim()
       const sha = String(args.sha ?? '').trim()
       if (!runId && !sha) return 'error: runId or sha required'
-      governor.registerWait(sid, `ci:${runId || sha}`, Date.now() + maxWaitMs, `ci watch ${runId || sha}`)
-      const readState = async () => {
-        let res
-        if (runId) {
-          res = await run('gh', ['api', `repos/${REPO_SLUG}/actions/runs/${runId}`, '--jq', '.status + "|" + (.conclusion // "pending")'], { timeoutMs: 30000, writeArtifact: false })
-        } else {
-          res = await run('gh', ['api', `repos/${REPO_SLUG}/commits/${sha}/check-runs`, '--jq', '[.check_runs[] | .status + "|" + (.conclusion // "pending")] | join(";")'], { timeoutMs: 30000, writeArtifact: false })
+      const waitId = `ci:${runId || sha}`
+      // Governor wait bookkeeping is cleared in ONE finally block for every
+      // exit path: immediate terminal, terminal-after-wait, deadline,
+      // read error, abort, exception. No stale registered wait survives.
+      governor.registerWait(sid, waitId, Date.now() + maxWaitMs, `ci watch ${runId || sha}`)
+      let jobsLine = null
+      const failedJobsLine = async () => {
+        if (!runId || jobsLine !== null) return jobsLine
+        try {
+          const res = await run('gh', ['api', `repos/${REPO_SLUG}/actions/runs/${runId}/jobs`, '--jq', '[.jobs[] | select((.conclusion // "pending") != "success") | .name + "=" + (.conclusion // "pending")] | join("; ")'], { timeoutMs: 30000, writeArtifact: false })
+          jobsLine = res.ok ? String(res.stdout ?? '').trim().slice(0, 600) : ''
+        } catch { jobsLine = '' }
+        return jobsLine
+      }
+      try {
+        const readState = async () => {
+          let res
+          if (runId) {
+            res = await run('gh', ['api', `repos/${REPO_SLUG}/actions/runs/${runId}`, '--jq', '.status + "|" + (.conclusion // "pending")'], { timeoutMs: 30000, writeArtifact: false })
+          } else {
+            res = await run('gh', ['api', `repos/${REPO_SLUG}/commits/${sha}/check-runs`, '--jq', '[.check_runs[] | .status + "|" + (.conclusion // "pending")] | join(";")'], { timeoutMs: 30000, writeArtifact: false })
+          }
+          if (!res.ok) throw new Error(`gh api failed: ${res.code}`)
+          return res.stdout.trim()
         }
-        if (!res.ok) throw new Error(`gh api failed: ${res.code}`)
-        return res.stdout.trim()
+        const watched = await watchCi({
+          read: readState,
+          mode: runId ? 'run' : 'sha',
+          intervalMs: 10000,
+          maxWaitMs,
+          signal: exec?.signal,
+          failClosedMessage: `CI watch deadline reached before a terminal outcome — fail closed`,
+        })
+        if (!watched.ok && watched.aborted) {
+          return `CI WATCH ABORTED after ${Math.round(watched.waitedMs / 1000)}s (${watched.checks} reads) — wait cleared, no further polling`
+        }
+        if (!watched.ok) {
+          return `error: ${watched.error}${watched.lastState ? `; last state: ${watched.lastState}` : ''} (waited ${Math.round(watched.waitedMs / 1000)}s, ${watched.checks} reads — fail closed)`
+        }
+        const waitedSeconds = Math.round(watched.waitedMs / 1000)
+        if (runId) {
+          const parsed = parseRunState(watched.state)
+          const lines = [formatRunTerminal(runId, parsed, waitedSeconds, watched.checks)]
+          if (parsed.conclusion.toLowerCase() !== 'success') {
+            const failed = await failedJobsLine()
+            if (failed) lines.push(`failed_jobs=${failed}`)
+          }
+          return lines.join('\n')
+        }
+        return formatShaTerminal(sha, parseCheckStates(watched.state), waitedSeconds, watched.checks)
+      } catch (err) {
+        return `error: ci watch failed: ${String(err?.message ?? err)} — fail closed`
+      } finally {
+        governor.clearWait(sid, waitId)
       }
-      let baseline
-      try { baseline = await readState() } catch (err) {
-        governor.clearWait(sid, `ci:${runId || sha}`)
-        return `error: cannot read CI state: ${err.message} (gh authenticated? run exists?)`
-      }
-      const result = await waitForState(async () => {
-        const s = await readState()
-        return s !== baseline ? s : null
-      }, { intervalMs: 30000, maxWaitMs, failClosedMessage: `CI watch deadline reached; last state: ${baseline}` })
-      governor.clearWait(sid, `ci:${runId || sha}`)
-      if (!result.ok) return `error: ${result.error} (waited ${Math.round(result.waitedMs / 1000)}s, ${result.checks} checks — fail closed)`
-      return `CI WATCH RESOLVED after ${Math.round(result.waitedMs / 1000)}s (${result.checks} checks):\n${result.state}`
     },
   }
 }

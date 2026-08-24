@@ -1,0 +1,34 @@
+# Phoenix V3 single-retry-owner host patch (canonical source).
+# Canonical location: tools/phoenix-harness-v3/presets/phoenix-v3/host-cordis.patch.yml
+# Installed by `node bin/phoenix-harness-v3.mjs install production --yes`
+# to <DSH_HOME>/profiles/web/cordis.patch.yml (backup taken when it differs).
+# NEVER hand-edit the installed copy — edit this file and reinstall.
+#
+# The flat provider retry policy (@deepseek-ai/dsh-llm-retry default:
+# normal mode, 2 retries) is DISABLED for the DeepSeek adapter so the
+# phoenix preset's tiered transport retry policy is the single retry
+# authority: routine=2 / normal=3 / critical=6, TRANSPORT class override
+# normal=8 on the bounded 500ms..30s schedule. The retryable-code set stays
+# declared so the policy identity remains stable; authentication / quota /
+# invalid-request stay non-retryable. maxRetries 0 = delegate, never retry.
+#
+# Multi-provider pi-ai adapters (openrouter-ox et al.) carry their nested
+# retryPolicy inside each provider profile of $DSH_HOME/settings.yaml; the
+# canonical installer disables those deterministically (see
+# tools/phoenix-harness-v3/src/retry-owner.js).
+
+- id: llm-deepseek
+  config:
+    retryPolicy:
+      mode: normal
+      maxRetries: 0
+      retryableCodes:
+        - EMPTY_RESPONSE
+        - RATE_LIMIT
+        - SERVER
+        - TIMEOUT
+        - TRANSPORT
+      backoff:
+        initialDelayMs: 1000
+        maxDelayMs: 30000
+        jitterRatio: 0.2

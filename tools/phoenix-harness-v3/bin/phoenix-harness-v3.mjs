@@ -14,7 +14,16 @@
  * INSTALLED BUILD of tools/phoenix-harness-v3 — the repo directory is the
  * canonical source. Never edit the installed build directly.
  *
- * Never touches: the phoenix (V2) preset, shipped presets, profiles.
+ * Single-retry-owner wiring (V3 reliability hardening): installing
+ * canary|production|phoenix ALSO installs the canonical host composition
+ * patch (presets/phoenix-v3/host-cordis.patch.yml -> ~/.dsh/profiles/web/
+ * cordis.patch.yml, backup kept) and deterministically disables the flat
+ * provider retry policy inside EVERY $DSH_HOME/settings.yaml
+ * llm-pi-ai.providers profile (verbatim backup kept). The phoenix preset's
+ * tiered transport policy stays the ONE retry owner for deepseek-official
+ * AND openrouter-ox.
+ *
+ * Never touches: the phoenix-v2-rollback preset, shipped presets.
  */
 import {
   cpSync, existsSync, mkdirSync, readFileSync, writeFileSync, readdirSync,
@@ -24,6 +33,8 @@ import { join, resolve, dirname, basename } from 'node:path'
 import { execFileSync } from 'node:child_process'
 import { createHash } from 'node:crypto'
 import { fileURLToPath } from 'node:url'
+import { createRequire } from 'node:module'
+import { disableFlatRetryForPiAi, isFlatRetryDisabled } from '../src/retry-owner.js'
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 // Default repo root: the parent of the canonical source dir (works when the
@@ -38,6 +49,11 @@ const PROD_ID = 'phoenix' // V3 Production (owner-directed cutover 2026-08-23)
 const LEGACY_PROD_ID = 'phoenix-v3-production'
 const SRC_PLUGIN = join(ROOT, 'src')
 const COMPOSITION_DIR = join(ROOT, 'presets', 'phoenix-v3')
+const HOST_PATCH_SRC = join(COMPOSITION_DIR, 'host-cordis.patch.yml')
+const HOST_PATCH_DST = join(DSH_HOME, 'profiles', 'web', 'cordis.patch.yml')
+// yaml is loaded from the pinned DSH checkout (no repo dependencies).
+const DSH_CHECKOUT = process.env.DSH_CHECKOUT
+  ?? join(process.env.LOCALAPPDATA ?? '', 'npm-cache', '_npx', '1e7f6d9597241db0')
 const GATES_FILE = resolve(process.env.PHOENIX_GATES_FILE ?? join(ROOT, 'reports', 'gates.json'))
 
 function sh(cmd, args, opts = {}) {
@@ -81,6 +97,69 @@ function installedManifest(presetId) {
   return existsSync(p) ? JSON.parse(readFileSync(p, 'utf8')) : null
 }
 
+function loadCheckoutYaml() {
+  try {
+    const req = createRequire(join(DSH_CHECKOUT, 'package.json'))
+    return req('yaml')
+  } catch (err) {
+    return null
+  }
+}
+
+function backupFile(path, tag) {
+  const stamp = new Date().toISOString().replace(/[:.]/g, '-')
+  const bak = `${path}.${tag}-${stamp}`
+  cpSync(path, bak)
+  return bak
+}
+
+/**
+ * Canonical single-retry-owner wiring (FIX 4). Deterministic, idempotent,
+ * always backed up; never touches the V2 rollback preset or shipped presets.
+ * @returns {{hostPatch: string, providersDisabled: string[], settingsBackup: string|null, warnings: string[]}}
+ */
+function applyRetryOwnerWiring() {
+  const warnings = []
+  // (a) host composition patch: canonical source -> profiles/web copy.
+  let hostPatch = 'unchanged'
+  if (!existsSync(HOST_PATCH_SRC)) {
+    warnings.push(`canonical host patch missing: ${HOST_PATCH_SRC}`)
+  } else {
+    mkdirSync(dirname(HOST_PATCH_DST), { recursive: true })
+    const srcTxt = readFileSync(HOST_PATCH_SRC, 'utf8')
+    const dstTxt = existsSync(HOST_PATCH_DST) ? readFileSync(HOST_PATCH_DST, 'utf8') : null
+    if (dstTxt !== srcTxt) {
+      if (dstTxt !== null) console.log(`  host patch backup: ${backupFile(HOST_PATCH_DST, 'pre-retry-owner')}`)
+      writeFileSync(HOST_PATCH_DST, srcTxt)
+      hostPatch = dstTxt === null ? 'installed' : 'updated'
+    }
+  }
+  // (b) flat retry OFF for every pi-ai provider profile in settings.yaml.
+  const providersDisabled = []
+  let settingsBackup = null
+  const YAML = loadCheckoutYaml()
+  if (!YAML) {
+    warnings.push(`yaml unavailable from DSH checkout (${DSH_CHECKOUT}) — pi-ai provider policies not updated`)
+  } else if (!existsSync(SETTINGS)) {
+    warnings.push(`settings.yaml missing: ${SETTINGS}`)
+  } else {
+    let doc
+    try { doc = YAML.parse(readFileSync(SETTINGS, 'utf8')) } catch (err) {
+      warnings.push(`settings.yaml parse failed — left untouched: ${String(err?.message ?? err)}`)
+      doc = null
+    }
+    if (doc) {
+      const { changed } = disableFlatRetryForPiAi(doc)
+      if (changed.length > 0) {
+        settingsBackup = backupFile(SETTINGS, 'pre-retry-owner')
+        writeFileSync(SETTINGS, YAML.stringify(doc))
+      }
+      providersDisabled.push(...changed)
+    }
+  }
+  return { hostPatch, providersDisabled, settingsBackup, warnings }
+}
+
 function installPreset(presetId) {
   const dst = join(PRESETS_ROOT, presetId)
   const srcComposition = COMPOSITION_DIR
@@ -120,7 +199,8 @@ function installPreset(presetId) {
   } else {
     console.log('  WARN: rollback/V2 skills missing — inherited skills skipped')
   }
-  // 3. installed-build manifest (provenance)
+  // 3. installed-build manifest (provenance) + single-retry-owner wiring
+  const retryOwner = applyRetryOwnerWiring()
   writeFileSync(manifestPath(presetId), JSON.stringify({
     presetId,
     installedAt: new Date().toISOString(),
@@ -128,9 +208,12 @@ function installPreset(presetId) {
     sourceDir: ROOT,
     kind: presetId === PROD_ID ? 'V3-production-update' : 'installed-build',
     pinned: { harness: '@deepseek-ai/dsh ^0.1.0-rc.7', checkout: '1e7f6d9597241db0', node: process.version },
+    retryOwner,
   }, null, 2))
   console.log(`INSTALLED preset ${presetId} -> ${dst}`)
   console.log(`  source hash ${v3Hash}`)
+  console.log(`  retry owner: host patch ${retryOwner.hostPatch}; flat policy disabled for pi-ai providers: ${retryOwner.providersDisabled.length ? retryOwner.providersDisabled.join(', ') : '(already disabled)'}`)
+  for (const w of retryOwner.warnings) console.log(`  WARN: ${w}`)
   console.log(`  NEXT: mount-validate inside a harness session with tool-cordis: agentPresets.standingKeyFor('${presetId}')`)
 }
 
@@ -148,6 +231,17 @@ if (cmd === 'status') {
     console.log(`preset ${id}: ${comp ? 'installed' : 'absent'}${m ? ` (src ${m.sourceHash} @ ${m.installedAt})` : ''}`)
   }
   console.log(`V2 rollback preset '${V2_PRESET}': ${existsSync(join(PRESETS_ROOT, V2_PRESET, 'agent.cordis.yml')) ? 'present (frozen V2)' : 'MISSING'}`)
+  // single-retry-owner wiring state
+  console.log(`host patch: ${existsSync(HOST_PATCH_DST) ? (readFileSync(HOST_PATCH_DST, 'utf8') === readFileSync(HOST_PATCH_SRC, 'utf8') ? 'canonical (in sync)' : 'PRESENT (drifted from canonical source)') : 'MISSING'}`)
+  const YAML = loadCheckoutYaml()
+  if (YAML && existsSync(SETTINGS)) {
+    try {
+      const providers = YAML.parse(readFileSync(SETTINGS, 'utf8'))?.['llm-pi-ai']?.providers ?? {}
+      for (const [id, profile] of Object.entries(providers)) {
+        console.log(`pi-ai provider '${id}': flat retry ${isFlatRetryDisabled(profile?.retryPolicy) ? 'DISABLED (Phoenix is sole owner)' : 'ACTIVE (competes with Phoenix policy)'}`)
+      }
+    } catch { /* status only */ }
+  }
   if (existsSync(SETTINGS)) {
     const txt = readFileSync(SETTINGS, 'utf8')
     const m = txt.match(/agent-presets:\s*\n\s*default:\s*["']?([a-z0-9-]+)/i)
