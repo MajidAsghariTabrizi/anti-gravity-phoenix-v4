@@ -116,3 +116,44 @@ test('waitForState resolves on change and fails closed at deadline', async () =>
   assert.equal(deadline.ok, false)
   assert.ok(/deadline/.test(deadline.error))
 })
+
+test('mission budgets are the delta from mission start (quickfix)', async () => {
+  const tmp = mkdtempSync(join(tmpdir(), 'phx-v3-gov5-'))
+  try {
+    const { gov } = await setupGovernor(tmp)
+    // pre-mission usage accumulates in the session totals
+    gov.noteUsage('s1', { input: 5000, output: 100, cacheRead: 0 })
+    gov.noteUsage('s1', { input: 2000, output: 0, cacheRead: 0 })
+    const baseline = gov.usageSnapshot('s1')
+    assert.equal(baseline.modelCalls, 2)
+    assert.equal(baseline.tokens, 7100)
+    // mission created NOW: baseline snapshotted at creation
+    writeMission(tmp, {
+      budgets: { tokens: 100000, modelCalls: 50, elapsedMinutes: 60 },
+      usageBaseline: { ...baseline, startedAtMs: Date.now() },
+    })
+    gov.noteUsage('s1', { input: 900, output: 100, cacheRead: 0 })
+    const view = gov.budgetView('s1')
+    assert.equal(view.missionScoped, true)
+    assert.equal(view.measured.modelCalls, 1, 'only post-mission calls count')
+    assert.equal(view.measured.tokensBilledEq, 1000, 'only post-mission tokens count')
+    assert.equal(view.ratios.modelCalls, 0.02)
+    assert.ok(view.measured.elapsedMinutes >= 0 && view.measured.elapsedMinutes < 0.5)
+  } finally {
+    rmSync(tmp, { recursive: true, force: true })
+  }
+})
+
+test('mission without a usage baseline keeps session totals (back-compat)', async () => {
+  const tmp = mkdtempSync(join(tmpdir(), 'phx-v3-gov6-'))
+  try {
+    const { gov } = await setupGovernor(tmp)
+    writeMission(tmp, { budgets: { tokens: 100000, modelCalls: 50, elapsedMinutes: 60 } })
+    gov.noteUsage('s1', { input: 900, output: 100, cacheRead: 0 })
+    const view = gov.budgetView('s1')
+    assert.equal(view.missionScoped, false)
+    assert.equal(view.measured.modelCalls, 1)
+  } finally {
+    rmSync(tmp, { recursive: true, force: true })
+  }
+})

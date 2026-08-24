@@ -11,11 +11,17 @@ import assert from 'node:assert/strict'
 import { pathToFileURL } from 'node:url'
 import { join, resolve, dirname } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { mkdtempSync, rmSync } from 'node:fs'
+import { mkdtempSync, rmSync, mkdirSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 const pluginUrl = pathToFileURL(join(ROOT, 'src', 'plugin.js')).href
+
+/** Mark a temp dir as a Phoenix repo (resolver requires both markers). */
+function markRepo(tmp) {
+  mkdirSync(join(tmp, '.git'), { recursive: true })
+  mkdirSync(join(tmp, '.phoenix-harness'), { recursive: true })
+}
 
 async function makeChunks(usage) {
   const chunks = []
@@ -28,6 +34,7 @@ async function makeChunks(usage) {
 test('llm/stream listener returns AsyncIterable directly, never a Promise', async () => {
   const tmp = mkdtempSync(join(tmpdir(), 'phx-v3-stream-'))
   try {
+    markRepo(tmp)
     const { apply } = await import(pluginUrl)
     let streamListener = null
     const registered = []
@@ -70,6 +77,7 @@ test('llm/stream listener returns AsyncIterable directly, never a Promise', asyn
 test('llm/stream: sync next() throw propagates and records failure', async () => {
   const tmp = mkdtempSync(join(tmpdir(), 'phx-v3-stream2-'))
   try {
+    markRepo(tmp)
     const { apply } = await import(`${pluginUrl}?t=${Date.now()}`)
     let streamListener = null
     const ctx = { on(e, fn) { if (e === 'llm/stream') streamListener = fn }, get() { return undefined }, tools: { register() {} } }
@@ -88,6 +96,7 @@ test('llm/stream: sync next() throw propagates and records failure', async () =>
 test('llm/stream: downstream error propagates; early cancel closes downstream', async () => {
   const tmp = mkdtempSync(join(tmpdir(), 'phx-v3-stream3-'))
   try {
+    markRepo(tmp)
     const { apply } = await import(`${pluginUrl}?t=${Date.now()}`)
     let streamListener = null
     const ctx = { on(e, fn) { if (e === 'llm/stream') streamListener = fn }, get() { return undefined }, tools: { register() {} } }

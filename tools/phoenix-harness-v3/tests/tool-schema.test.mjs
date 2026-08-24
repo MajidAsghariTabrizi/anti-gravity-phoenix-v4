@@ -9,10 +9,16 @@ import assert from 'node:assert/strict'
 import { pathToFileURL } from 'node:url'
 import { join, resolve, dirname } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { mkdtempSync, rmSync } from 'node:fs'
+import { mkdtempSync, rmSync, mkdirSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..')
+
+/** Mark a temp dir as a Phoenix repo (resolver requires both markers). */
+function markRepo(tmp) {
+  mkdirSync(join(tmp, '.git'), { recursive: true })
+  mkdirSync(join(tmp, '.phoenix-harness'), { recursive: true })
+}
 
 function walkProblems(params, prefix = '') {
   const problems = []
@@ -36,6 +42,7 @@ function walkProblems(params, prefix = '') {
 test('every phoenix_* tool schema is object-root and provider-safe', async () => {
   const tmp = mkdtempSync(join(tmpdir(), 'phx-v3-schema-'))
   try {
+    markRepo(tmp)
     const { apply } = await import(pathToFileURL(join(ROOT, 'src', 'plugin.js')).href)
     const definitions = []
     const ctx = { on() {}, get() { return undefined }, tools: { register(def) { definitions.push(def) } } }

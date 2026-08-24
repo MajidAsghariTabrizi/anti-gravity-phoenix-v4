@@ -55,6 +55,30 @@ test('phoenix_sql_readonly blocks DML/DDL/chaining/multi-statement', async () =>
   assert.ok(!/REFUSED/.test(ok), 'single SELECT must pass the gate')
 })
 
+test('phoenix_sql_readonly composes attached separator and shell-quoted query (L-012 regression)', async () => {
+  const { buildSqlRemoteCommand, sqlReadonlyTool } = await import(`${REMOTE}?t=${Date.now()}`)
+  // psql -F separator must be ATTACHED (-F'|'), never a separate argv element:
+  // ssh joins argv[1..] with spaces and the remote shell would treat a bare '|'
+  // as a pipe, leaving psql without a separator argument.
+  const cmd = buildSqlRemoteCommand('app-postgres-1', 'phoenix_app', 'phoenix_v5_abc123', "SELECT 'a' AS v FROM t WHERE x > 1")
+  assert.ok(cmd.startsWith('docker exec -i -u postgres app-postgres-1 psql -U '), `must exec as OS user postgres with explicit -U role, got: ${cmd}`)
+  assert.ok(cmd.includes("-F'|'"), `separator must be attached to -F, got: ${cmd}`)
+  assert.ok(!cmd.includes("-F '|'"), 'no detached separator token (-F with bare pipe arg)')
+  // the role, database and query are single-quoted with embedded quotes shell-escaped
+  assert.ok(cmd.includes("-U 'phoenix_app'"), `role must be quoted, got: ${cmd}`)
+  assert.ok(cmd.includes("-d 'phoenix_v5_abc123'"), `db must be quoted, got: ${cmd}`)
+  assert.ok(cmd.includes("-c 'SELECT '\\''a'\\'' AS v FROM t WHERE x > 1'"), `query must be quoted/escaped, got: ${cmd}`)
+  // no unquoted shell metacharacters anywhere in the command
+  const unquoted = cmd.replace(/'[^']*'/g, '').replace(/'\\''/g, '')
+  assert.ok(!/[|;&<>`$]/.test(unquoted), `no unquoted shell metacharacters, got: ${cmd}`)
+  // transport-unsafe characters are refused before any ssh
+  const tool = sqlReadonlyTool()
+  for (const q of ["SELECT 'a|b'", 'SELECT 1\nSELECT 2', 'SELECT `x` FROM t']) {
+    const out = await tool.execute({ query: q })
+    assert.ok(/REFUSED/.test(out), `"${q}" must be refused, got: ${out.slice(0, 80)}`)
+  }
+})
+
 test('phoenix_release_dispatch refuses without mission/approval/ack and requires dry-run', async () => {
   const tmp = mkdtempSync(join(tmpdir(), 'phx-v3-dispatch-'))
   try {

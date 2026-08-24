@@ -68,6 +68,43 @@ export function createGovernor(root, sink, config = {}) {
     return s.bookkeepingStreak
   }
 
+  /** Session-usage snapshot for a mission baseline (phoenix_mission create). */
+  function usageSnapshot(sid) {
+    const b = session(sid).budgets
+    return {
+      tokens: b.tokens,
+      modelCalls: b.modelCalls,
+      outputTokens: b.outputTokens,
+      elapsedMs: b.elapsedMs,
+    }
+  }
+
+  /**
+   * Mission-scoped usage: the delta from the mission start baseline. When
+   * the MissionSpec carries usageBaseline (written at mission create), the
+   * measured budget is (current − baseline) so a brand-new mission starts
+   * near zero; elapsed time measures from the baseline moment. Missions
+   * without a baseline (pre-quickfix) fall back to session totals.
+   */
+  function measuredDelta(sid) {
+    const b = session(sid).budgets
+    const mission = readMission(root, sid)
+    const base = mission.exists && mission.spec?.usageBaseline
+      ? mission.spec.usageBaseline
+      : null
+    const baseTokens = Number(base?.tokens) > 0 ? Number(base.tokens) : 0
+    const baseCalls = Number(base?.modelCalls) > 0 ? Number(base.modelCalls) : 0
+    const baseOutput = Number(base?.outputTokens) > 0 ? Number(base.outputTokens) : 0
+    const baseStartedAtMs = Number(base?.startedAtMs) > 0 ? Number(base.startedAtMs) : b.startedAt
+    return {
+      tokens: Math.max(0, b.tokens - baseTokens),
+      modelCalls: Math.max(0, b.modelCalls - baseCalls),
+      outputTokens: Math.max(0, b.outputTokens - baseOutput),
+      elapsedMs: Math.max(0, Date.now() - baseStartedAtMs),
+      fromMissionStart: base !== null,
+    }
+  }
+
   /** Register/refresh a wait (called by wait tools). */
   function registerWait(sid, id, deadlineMs, reason) {
     const s = session(sid)
@@ -104,17 +141,17 @@ export function createGovernor(root, sink, config = {}) {
 
     // (b) mission hard stops on goal-round continuations -> block (zero cost)
     if (mission.exists && mission.spec?.hardStops?.length && isGoalRoundStep(payload?.messages)) {
-      const b = s.budgets
+      const b = measuredDelta(sid)
       const m = mission.spec
       const breached =
         (m.hardStops.includes('budget_breach') && (b.tokens >= m.budgets.tokens || b.modelCalls >= m.budgets.modelCalls || b.elapsedMs >= m.budgets.elapsedMinutes * 60000)) ||
-        (m.hardStops.includes('staleness') && b.bookkeepingStreak >= 4)
+        (m.hardStops.includes('staleness') && s.bookkeepingStreak >= 4)
       if (breached) {
         s.budgets.stops += 1
         sink.record(sid, {
           ts: new Date().toISOString(), event: 'governor.stop', session: sid,
           reason: 'hard-stop-breached', tokens: b.tokens, modelCalls: b.modelCalls,
-          budget: m.budgets, streak: b.bookkeepingStreak,
+          budget: m.budgets, streak: s.bookkeepingStreak, fromMissionStart: b.fromMissionStart,
         })
         return { kind: 'reject' }
       }
@@ -122,10 +159,11 @@ export function createGovernor(root, sink, config = {}) {
 
     // warnings (observable; never injected into messages)
     if (mission.exists && mission.spec?.budgets) {
+      const b = measuredDelta(sid)
       const ratio = Math.max(
-        s.budgets.tokens / mission.spec.budgets.tokens,
-        s.budgets.modelCalls / mission.spec.budgets.modelCalls,
-        s.budgets.elapsedMs / (mission.spec.budgets.elapsedMinutes * 60000),
+        b.tokens / mission.spec.budgets.tokens,
+        b.modelCalls / mission.spec.budgets.modelCalls,
+        b.elapsedMs / (mission.spec.budgets.elapsedMinutes * 60000),
       )
       const turn = payload?.turn ?? -1
       if (ratio >= state.config.warnAtRatio && turn !== s.lastWarnTurn) {
@@ -133,8 +171,8 @@ export function createGovernor(root, sink, config = {}) {
         s.budgets.warnings += 1
         sink.record(sid, {
           ts: new Date().toISOString(), event: 'governor.warn', session: sid,
-          ratio: Number(ratio.toFixed(2)), tokens: s.budgets.tokens,
-          modelCalls: s.budgets.modelCalls, elapsedMinutes: Math.round(s.budgets.elapsedMs / 60000),
+          ratio: Number(ratio.toFixed(2)), tokens: b.tokens,
+          modelCalls: b.modelCalls, elapsedMinutes: Math.round(b.elapsedMs / 60000),
         })
       }
     }
@@ -145,7 +183,9 @@ export function createGovernor(root, sink, config = {}) {
   function budgetView(sid) {
     const s = session(sid)
     const mission = readMission(root, sid)
-    const b = s.budgets
+    // Mission-scoped budgets are the delta from mission start (quickfix);
+    // sessions without a mission keep the session totals as before.
+    const b = measuredDelta(sid)
     const out = {
       session: sid,
       measured: {
@@ -154,10 +194,11 @@ export function createGovernor(root, sink, config = {}) {
         outputTokens: b.outputTokens,
         elapsedMinutes: Number((b.elapsedMs / 60000).toFixed(1)),
       },
+      ...(mission.exists ? { missionScoped: b.fromMissionStart } : {}),
       waits: activeWaits(sid).map(([id, w]) => ({ id, reason: w.reason, deadlineMs: w.deadlineMs })),
-      bookkeepingStreak: b.bookkeepingStreak,
-      warnings: b.warnings,
-      stops: b.stops,
+      bookkeepingStreak: s.bookkeepingStreak,
+      warnings: s.budgets.warnings,
+      stops: s.budgets.stops,
     }
     if (mission.exists && mission.spec?.budgets) {
       const m = mission.spec.budgets
@@ -172,5 +213,5 @@ export function createGovernor(root, sink, config = {}) {
     return out
   }
 
-  return { noteUsage, noteToolResult, preStep, registerWait, clearWait, activeWaits, budgetView }
+  return { noteUsage, noteToolResult, usageSnapshot, preStep, registerWait, clearWait, activeWaits, budgetView }
 }

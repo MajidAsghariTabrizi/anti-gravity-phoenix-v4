@@ -1,0 +1,6 @@
+Phoenix quickfix smoke. Complete ONLY these five steps, then reply with exactly five lines prefixed QF1..QF5 and nothing else:
+(1) run phoenix_repo_snapshot and put on QF1 the repo root path and current branch/SHA;
+(2) phoenix_context action=load file=knowledge/kernel.md and put on QF2 the first heading line;
+(3) phoenix_mission action=create objective="quickfix smoke" riskTier=local_only tokenBudget=1000000 modelCallBudget=200 elapsedBudgetMinutes=30, then phoenix_budget; put on QF3 the measured tokensBilledEq/modelCalls/elapsedMinutes;
+(4) run phoenix_sql_readonly with query exactly: SELECT 1  — put on QF4 the first line of its output;
+(5) put on QF5 the current model route only if you can observe it, otherwise the word UNKNOWN.

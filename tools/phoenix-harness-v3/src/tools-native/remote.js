@@ -35,6 +35,25 @@ const REMOTE_ALLOWLIST = [
 
 const SQL_KEYWORD_BLOCK = /\b(insert|update|delete|drop|alter|create|truncate|grant|revoke|copy|do\b|call|set\b|vacuum|analyze|reindex|begin|commit|rollback|reset|listen|notify|prepare|execute)\b/i
 const SQL_SELECT_ONLY = /^\s*(select|with)\b/i
+// Belt on top of the shell-quoting braces below: these characters have no
+// legitimate use in a transportable single SELECT and can never leave the tool.
+const SQL_TRANSPORT_UNSAFE = /[|`\n]/
+
+/**
+ * Compose the ONE remote command string for phoenix_sql_readonly.
+ * OpenSSH joins argv[1..] with spaces and the REMOTE shell re-parses the
+ * result, so:
+ *  - the psql field separator must stay ATTACHED to -F (`-F'|'`): passing
+ *    '-F','|' as separate argv entries made the remote shell treat '|' as a
+ *    pipe and psql received no separator argument (regression L-012);
+ *  - the database and the query must be single-quoted with embedded quotes
+ *    shell-escaped, so no metacharacter can reach the remote shell.
+ * The result contains no unquoted pipe/redirect/separator/substitution.
+ */
+export function buildSqlRemoteCommand(container, user, db, query) {
+  const shellQuote = (s) => `'${String(s).replace(/'/g, `'\\''`)}'`
+  return `docker exec -i -u postgres ${container} psql -U ${shellQuote(user)} -t -A -F'|' -d ${shellQuote(db)} -c ${shellQuote(query)}`
+}
 
 export function remoteTool() {
   return {
@@ -118,13 +137,24 @@ export function sqlReadonlyTool() {
       const statements = query.split(';').filter((s) => s.trim())
       if (statements.length > 1) return 'error: REFUSED — exactly one statement, no chaining'
       if (SQL_KEYWORD_BLOCK.test(query)) return 'error: REFUSED — statement contains a blocked keyword'
+      if (SQL_TRANSPORT_UNSAFE.test(query)) return 'error: REFUSED — query contains a character that cannot be safely transported'
       const limit = Math.min(Math.max(Number(args.limit ?? 4000) || 4000, 500), 8000)
       // resolve the postgres container name from docker ps (deterministic, inside the tool)
       const ps = await run('ssh', [SSH_ALIAS, 'docker ps --format={{.Names}}'], { timeoutMs: SSH_TIMEOUT, writeArtifact: false })
       if (!ps.ok) return `error: cannot list containers (exit ${ps.code})`
       const container = ps.full.split('\n').find((n) => /postgres/.test(n))
       if (!container) return 'error: no postgres container found — fail closed'
-      const res = await run('ssh', [SSH_ALIAS, 'docker', 'exec', '-i', container, 'psql', '-t', '-A', '-F', '|', '-c', query], { timeoutMs: SSH_TIMEOUT, artifactTag: 'sql', artifactDir: 'phoenix_sql_readonly', writeArtifact: true })
+      // resolve the postgres role + app database from the container's own env
+      // (identifiers, never secrets) and fail closed if either is not a plain identifier
+      const userRes = await run('ssh', [SSH_ALIAS, `docker exec -i ${container} sh -c 'printf %s "\${POSTGRES_USER}"'`], { timeoutMs: SSH_TIMEOUT, writeArtifact: false })
+      if (!userRes.ok) return `error: cannot resolve postgres role (exit ${userRes.code})`
+      const user = userRes.full.split('\n').pop().trim()
+      if (!/^[A-Za-z0-9_.-]+$/.test(user)) return 'error: resolved postgres role is not a plain identifier — fail closed'
+      const dbRes = await run('ssh', [SSH_ALIAS, `docker exec -i ${container} sh -c 'printf %s "\${POSTGRES_DB}"'`], { timeoutMs: SSH_TIMEOUT, writeArtifact: false })
+      if (!dbRes.ok) return `error: cannot resolve database name (exit ${dbRes.code})`
+      const db = dbRes.full.split('\n').pop().trim()
+      if (!/^[A-Za-z0-9_-]+$/.test(db)) return 'error: resolved database name is not a plain identifier — fail closed'
+      const res = await run('ssh', [SSH_ALIAS, buildSqlRemoteCommand(container, user, db, query)], { timeoutMs: SSH_TIMEOUT, artifactTag: 'sql', artifactDir: 'phoenix_sql_readonly', writeArtifact: true })
       if (!res.ok) return `error: query failed (exit ${res.code}): ${res.stdout.slice(0, 600)}`
       const capped = res.full.length > limit ? `${res.full.slice(0, limit)}\n…[capped ${res.full.length - limit} chars]` : res.full
       return [`SQL READONLY (container ${container})`, capped, res.artifact ? `artifact: ${res.artifact}` : ''].filter(Boolean).join('\n')
