@@ -194,6 +194,10 @@ def _classify_path(
         )
         return True, True
 
+    if _under(path, "phoenix-telegram-ops/"):
+        _mark(jobs, images, job_names=("hygiene", "go"))
+        return True, False
+
     if _under(path, "rpc-gateway/"):
         _mark(
             jobs,

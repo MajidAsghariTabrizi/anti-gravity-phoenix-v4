@@ -277,11 +277,16 @@ PROTECTED_SERVICES = (
 )
 FIXED_PROTECTED_SERVICES = ("nitro-feed-relay", "nats", "postgres")
 MUTABLE_PROTECTED_SERVICES = ("feed-ingestor", "recorder")
-OPERATIONAL_LIVE_SERVICES = ("economic-monitor", "economic-supervisor")
+OPERATIONAL_LIVE_SERVICES = (
+    "economic-monitor",
+    "economic-supervisor",
+    "phoenix-telegram-ops",
+)
 DEPLOY_START_ORDER = (
     "prometheus",
     "shadow-dispatcher",
     "dashboard",
+    "phoenix-telegram-ops",
     "atlas-observer",
     "economic-monitor",
     "economic-supervisor",
@@ -300,6 +305,7 @@ HEALTH_SERVICE_ORDER = (
     "atlas-observer",
     "prometheus",
     "dashboard",
+    "phoenix-telegram-ops",
 )
 HEALTH_CONTRACTS = {
     "postgres": "pg_isready",
@@ -313,6 +319,7 @@ HEALTH_CONTRACTS = {
     "atlas-observer": "binary:/usr/local/bin/atlas-aave-hunter;http://127.0.0.1:9700/readyz",
     "prometheus": "http://127.0.0.1:9090/-/ready",
     "dashboard": "http://127.0.0.1:8501/_stcore/health",
+    "phoenix-telegram-ops": "http://127.0.0.1:9750/readyz",
     "live-executor": "process:pid-1;autonomous-control:status",
 }
 CURSOR_CONTRACTS = {
@@ -466,6 +473,9 @@ def runtime_topology(
     )
     image_bindings["economic-monitor"] = EXTERNAL_IMAGES["postgres"]
     image_bindings["economic-supervisor"] = "live-executor"
+    # The Telegram reporter ships inside the dashboard image and only its
+    # live-autonomous overlay service overrides the entrypoint.
+    image_bindings["phoenix-telegram-ops"] = "dashboard"
 
     configured = list(BASE_SERVICE_ORDER)
     if "atlas-observer" in target_names:

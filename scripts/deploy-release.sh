@@ -828,7 +828,7 @@ phoenix_reconcile_required_service_absent compose live-executor ||
 # Quiesce every long-lived client of the live_canary schema before its bounded
 # DDL lock timeout begins. The target services are recreated below only after
 # both migration runners finish and the candidate RPC gateway is healthy.
-for schema_client in atlas-observer economic-monitor economic-supervisor; do
+for schema_client in atlas-observer economic-monitor economic-supervisor phoenix-telegram-ops; do
   compose stop -t 30 "$schema_client" >/dev/null 2>&1 || true
   [ -z "$(compose ps -q "$schema_client" | awk 'NF { print; exit }')" ] ||
     fail "$schema_client remained running during migration"

@@ -69,14 +69,14 @@ test('promote refuses without passing gates; rollback refuses without backup', (
   }
 })
 
-test('ctl never touches the V2 control preset', () => {
+test('ctl never touches the production/rollback presets in a fresh DSH_HOME', () => {
   const dsh = mkdtempSync(join(tmpdir(), 'phx-v3-dsh3-'))
   try {
     runCtl(['install', 'canary', '--yes'], dsh)
     const status = runCtl(['status'], dsh)
     assert.equal(status.code, 0)
-    assert.ok(/V2 CONTROL preset 'phoenix'/.test(status.out))
-    assert.ok(!existsSync(join(dsh, '.agent-presets', 'phoenix')), 'V2 preset must not be created in a fresh DSH_HOME')
+    assert.ok(/V2 rollback preset 'phoenix-v2-rollback'/.test(status.out))
+    assert.ok(!existsSync(join(dsh, '.agent-presets', 'phoenix')), 'production preset must not be created by a canary install')
   } finally {
     rmSync(dsh, { recursive: true, force: true })
   }

@@ -32,9 +32,10 @@ const REPO = resolve(process.env.PHOENIX_REPO ?? join(ROOT, '..', '..'))
 const DSH_HOME = process.env.DSH_HOME ?? join(process.env.USERPROFILE ?? '.', '.dsh')
 const PRESETS_ROOT = join(DSH_HOME, '.agent-presets')
 const SETTINGS = join(DSH_HOME, 'settings.yaml')
-const V2_PRESET = 'phoenix' // CONTROL — never installed, modified, or removed
+const V2_PRESET = 'phoenix-v2-rollback' // frozen V2 rollback preset (byte-identical to the pre-cutover V2 build)
 const CANARY_ID = 'phoenix-v3-canary'
-const PROD_ID = 'phoenix-v3-production'
+const PROD_ID = 'phoenix' // V3 Production (owner-directed cutover 2026-08-23)
+const LEGACY_PROD_ID = 'phoenix-v3-production'
 const SRC_PLUGIN = join(ROOT, 'src')
 const COMPOSITION_DIR = join(ROOT, 'presets', 'phoenix-v3')
 const GATES_FILE = resolve(process.env.PHOENIX_GATES_FILE ?? join(ROOT, 'reports', 'gates.json'))
@@ -104,18 +105,20 @@ function installPreset(presetId) {
     if (e.isFile()) cpSync(src, join(pluginDst, e.name))
     else if (e.isDirectory()) cpSync(src, join(pluginDst, e.name), { recursive: true })
   }
-  // 3. reference authoring skills inherited byte-verbatim from the V2
-  //    CONTROL preset (stable reference material; not part of the V3 diff)
-  const v2Skills = join(PRESETS_ROOT, V2_PRESET, 'skills')
+  // 3. reference authoring skills inherited byte-verbatim from the frozen V2
+  //    rollback preset (stable reference material; not part of the V3 diff).
+  //    The legacy V2 build of `phoenix` also carries them (fallback source).
+  const v2SkillsRoots = [V2_PRESET, 'phoenix'].filter((id) => id !== presetId)
+  const v2Skills = v2SkillsRoots.map((id) => join(PRESETS_ROOT, id, 'skills')).find((p) => existsSync(p))
   const dstSkills = join(dst, 'skills')
-  if (existsSync(v2Skills)) {
+  if (v2Skills) {
     for (const s of ['editing-cordis-compositions', 'cordis-plugin-development']) {
       const from = join(v2Skills, s)
       const to = join(dstSkills, s)
-      if (existsSync(from)) { cpSync(from, to, { recursive: true }); console.log(`  skills: inherited ${s} from V2 control`) }
+      if (existsSync(from)) { cpSync(from, to, { recursive: true }); console.log(`  skills: inherited ${s} from ${basename(dirname(v2Skills))}`) }
     }
   } else {
-    console.log('  WARN: V2 control skills missing — inherited skills skipped')
+    console.log('  WARN: rollback/V2 skills missing — inherited skills skipped')
   }
   // 3. installed-build manifest (provenance)
   writeFileSync(manifestPath(presetId), JSON.stringify({
@@ -123,6 +126,7 @@ function installPreset(presetId) {
     installedAt: new Date().toISOString(),
     sourceHash: v3Hash,
     sourceDir: ROOT,
+    kind: presetId === PROD_ID ? 'V3-production-update' : 'installed-build',
     pinned: { harness: '@deepseek-ai/dsh ^0.1.0-rc.7', checkout: '1e7f6d9597241db0', node: process.version },
   }, null, 2))
   console.log(`INSTALLED preset ${presetId} -> ${dst}`)
@@ -138,20 +142,20 @@ if (cmd === 'status') {
   console.log(`PHOENIX HARNESS V3 — ${versionInfo()}`)
   console.log(`canonical source: ${ROOT}`)
   console.log(`repo:             ${REPO}`)
-  for (const id of [CANARY_ID, PROD_ID]) {
+  for (const id of [PROD_ID, CANARY_ID, LEGACY_PROD_ID]) {
     const m = installedManifest(id)
     const comp = existsSync(join(PRESETS_ROOT, id, 'agent.cordis.yml'))
     console.log(`preset ${id}: ${comp ? 'installed' : 'absent'}${m ? ` (src ${m.sourceHash} @ ${m.installedAt})` : ''}`)
   }
-  console.log(`V2 CONTROL preset '${V2_PRESET}': ${existsSync(join(PRESETS_ROOT, V2_PRESET, 'agent.cordis.yml')) ? 'present (untouched)' : 'MISSING'}`)
+  console.log(`V2 rollback preset '${V2_PRESET}': ${existsSync(join(PRESETS_ROOT, V2_PRESET, 'agent.cordis.yml')) ? 'present (frozen V2)' : 'MISSING'}`)
   if (existsSync(SETTINGS)) {
     const txt = readFileSync(SETTINGS, 'utf8')
     const m = txt.match(/agent-presets:\s*\n\s*default:\s*["']?([a-z0-9-]+)/i)
     console.log(`settings default preset: ${m?.[1] ?? '(not found)'}`)
   }
 } else if (cmd === 'install') {
-  const id = arg === 'canary' ? CANARY_ID : arg === 'production' ? PROD_ID : null
-  if (!id) { console.error('usage: install <canary|production>'); process.exit(2) }
+  const id = arg === 'canary' ? CANARY_ID : arg === 'production' ? PROD_ID : arg === 'phoenix' ? PROD_ID : null
+  if (!id) { console.error('usage: install <canary|production|phoenix>'); process.exit(2) }
   if (!yes) {
     console.log(`Install ${id} from canonical source ${ROOT}? Re-run with --yes to confirm.`)
     process.exit(1)
@@ -208,20 +212,22 @@ if (cmd === 'status') {
     process.exit(2)
   }
   if (!yes) {
-    console.log('All gates pass. Promote phoenix-v3-canary -> phoenix-v3-production? Re-run with --yes.')
+    console.log(`All gates pass. Promote phoenix-v3-canary -> ${LEGACY_PROD_ID}? Re-run with --yes.`)
     process.exit(1)
   }
+  // The cutover made `phoenix` itself the V3 production preset, so promotion
+  // targets the legacy production id and can NEVER overwrite `phoenix`.
   const src = join(PRESETS_ROOT, CANARY_ID)
-  const dst = join(PRESETS_ROOT, PROD_ID)
+  const dst = join(PRESETS_ROOT, LEGACY_PROD_ID)
   const stamp = new Date().toISOString().replace(/[:.]/g, '-')
-  const backup = join(PRESETS_ROOT, `${PROD_ID}.bak-${stamp}`)
+  const backup = join(PRESETS_ROOT, `${LEGACY_PROD_ID}.bak-${stamp}`)
   if (existsSync(dst)) { cpSync(dst, backup, { recursive: true }); console.log(`backup: ${backup}`) }
   rmSync(dst, { recursive: true, force: true })
   cpSync(src, dst, { recursive: true })
   const m = installedManifest(CANARY_ID)
-  writeFileSync(manifestPath(PROD_ID), JSON.stringify({
+  writeFileSync(manifestPath(LEGACY_PROD_ID), JSON.stringify({
     ...m,
-    presetId: PROD_ID,
+    presetId: LEGACY_PROD_ID,
     promotedAt: new Date().toISOString(),
     promotedFrom: CANARY_ID,
     gates: gates,
@@ -232,11 +238,11 @@ if (cmd === 'status') {
   if (existsSync(SETTINGS)) {
     cpSync(SETTINGS, join(DSH_HOME, 'settings.yaml.phx-v3-bak'))
     const txt = readFileSync(SETTINGS, 'utf8')
-    const next = txt.replace(/^(agent-presets:\s*\n(?:\s{2,}.*\n)*\s{2,}default:\s*)"?[a-z0-9-]+"?/m, `$1"${PROD_ID}"`)
+    const next = txt.replace(/^(agent-presets:\s*\n(?:\s{2,}.*\n)*\s{2,}default:\s*)"?[a-z0-9-]+"?/m, `$1"${LEGACY_PROD_ID}"`)
     if (next !== txt) writeFileSync(SETTINGS, next)
     else { console.log('WARN: could not locate agent-presets.default — settings pointer unchanged') }
   }
-  console.log(`PROMOTED ${CANARY_ID} -> ${PROD_ID} (gates: ${JSON.stringify(gates.gates)}); new sessions default to ${PROD_ID}; rollback via: phoenix-harness-v3.mjs rollback`)
+  console.log(`PROMOTED ${CANARY_ID} -> ${LEGACY_PROD_ID} (gates: ${JSON.stringify(gates.gates)}); new sessions default to ${LEGACY_PROD_ID}; rollback via: phoenix-harness-v3.mjs rollback`)
 } else if (cmd === 'rollback') {
   // Restore the settings default preset pointer from the last backup; never
   // touch the V2 control preset itself.
@@ -267,6 +273,6 @@ if (cmd === 'status') {
   console.log(r.out)
   process.exitCode = r.ok ? 0 : 1
 } else {
-  console.log('usage: phoenix-harness-v3.mjs <status|install <canary|production> [--yes]|verify|promote [--yes]|rollback|bench|eval|eval-live ...>')
+  console.log('usage: phoenix-harness-v3.mjs <status|install <canary|production|phoenix> [--yes]|verify|promote [--yes]|rollback|bench|eval|eval-live ...>')
   process.exit(2)
 }

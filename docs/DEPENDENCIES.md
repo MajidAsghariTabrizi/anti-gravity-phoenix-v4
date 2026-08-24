@@ -386,8 +386,17 @@ transactions and persists them to `live_canary.atlas_liquidation_ground_truth`
   characters), and `RPC_AUTH_PROVIDER_HEADER_FILE` (absolute
   container-internal path; the secret value is read through a single
   `docker exec` pipe, kept in memory only, never printed, never placed in
-  argv, never written to a host file); (2) legacy `RPC_PROVIDER_URLS`
-  (unchanged list contract); (3) fail closed. Provider URLs and auth
+  argv, never written to a host file); (2) an optional reviewed
+  verification provider appended from `RPC_VERIFICATION_PROVIDER_ID`
+  (must equal `production-alchemy-arbitrum`),
+  `RPC_VERIFICATION_PROVIDER_URL` (must start with
+  `https://arb-mainnet.g.alchemy.com/`), `RPC_VERIFICATION_PROVIDER_PRIORITY`
+  (positive and strictly below the primary priority — the Alchemy provider
+  can therefore never outrank or replace the NOWNodes primary and can never
+  become submission authority), `RPC_VERIFICATION_PROVIDER_HEADER_NAME`, and
+  `RPC_VERIFICATION_PROVIDER_HEADER_FILE`; an absent or empty ID keeps the
+  gateway single-provider; (3) legacy `RPC_PROVIDER_URLS`
+  (unchanged list contract); (4) fail closed. Provider URLs and auth
   secrets never appear in error output — failures reference only the
   validated provider identity or an index plus an error class.
 - `atlas-reconciler` (reviewed, no network/signer) decodes the transcript
@@ -446,6 +455,14 @@ transaction calldata. Source:
 ## Message Encoding
 
 `proto/phoenix.proto` is the canonical typed message schema. The Go ingestor currently publishes canonical JSON matching that schema because `protoc` and generated Protobuf toolchains are not available in this workspace. This is an implementation constraint, not a protocol guess. The schema is ready for generated Protobuf bindings in the deployment toolchain.
+
+## Phoenix Telegram Ops (phoenix-telegram-ops)
+
+- Language: Go 1.23.1, module `anti-gravity-phoenix-v4/phoenix-telegram-ops`, driver `github.com/lib/pq v1.10.9`.
+- External service: Telegram Bot API (`https://api.telegram.org/bot<token>/<method>`); the API base is env-overridable for tests. The bot token is read from `/etc/phoenix/secrets/phoenix-telegram-bot-token`, is never logged, and the service boots DISABLED when it is absent.
+- Authority assumptions: Bot API `getMe`/`getUpdates`/`sendMessage`/`editMessageText` semantics as of 2026-08; long polling uses `getUpdates` with a 50s timeout and a monotonic offset. Callback updates are honored only from `PHOENIX_TELEGRAM_OPS_CHAT_ID`.
+- Read path: single bounded SELECT statements over `live_canary.*` tables only; no write statements exist in the module.
+- Deployment: built inside the dashboard image (`deploy/dashboard.Dockerfile`, CGO_ENABLED=0 static binary) and run by the `phoenix-telegram-ops` service in `compose.live-autonomous.yml` with the entrypoint overridden to the sidecar binary.
 
 ## PostgreSQL Migration Runner
 

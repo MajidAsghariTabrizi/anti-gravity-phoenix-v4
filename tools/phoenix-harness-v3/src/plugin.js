@@ -27,12 +27,19 @@ import { readCheckpoint, mergeCheckpoint, writeCheckpoint, renderCheckpoint } fr
 import { compileMission, renderMission, readMission, writeMission, markPhase } from './mission.js'
 import { createGovernor } from './governor.js'
 import { compileParameterSchema } from './schema.js'
+import { resolvePhoenixRepoRoot } from './root.js'
+import { createCompactionGuard, BREAKER_CODE } from './compaction-guard.js'
+import {
+  POLICY_KEY as TRANSPORT_POLICY_KEY, RETRYABLE_CODES, budgetForCode, decide as decideRetry,
+  delayMs as retryDelayMs, countPriorRetries, priorRetryId,
+} from './transport-retry.js'
 import { repoSnapshotTool, symbolTool } from './tools-native/repo.js'
 import { testTool } from './tools-native/test.js'
 import { remoteTool, productionSnapshotTool, sqlReadonlyTool, releaseVerifyTool } from './tools-native/remote.js'
 import { ciWatchTool, prFlowTool, releasePreflightTool, releaseDispatchTool } from './tools-native/ci.js'
 import { groundTruthTool, businessFunnelTool, opportunityReplayTool, evidenceTool } from './tools-native/business.js'
 import { currentTruthTool, changedSurfaceTool, testMatrixTool, ciSnapshotTool, waitTool } from './tools-native/ops.js'
+import { randomUUID } from 'node:crypto'
 import { join } from 'node:path'
 
 export const name = 'dsh-phoenix-harness-v3'
@@ -64,13 +71,21 @@ function shortMessage(err) {
 }
 
 export function apply(ctx, config = {}) {
-  const root = String(config.workspaceRoot ?? process.cwd())
+  // Canonical Phoenix repo root (quickfix): env PHOENIX_REPO_ROOT >
+  // configured workspaceRoot > marker discovery (.git + .phoenix-harness)
+  // > documented deployment path > cwd. Never assume process.cwd() is the
+  // repo — every V3 tool, artifact path, and git operation uses this root.
+  const root = resolvePhoenixRepoRoot(config.workspaceRoot)
   const knowledgeRoot = config.knowledgeRoot
     ? String(config.knowledgeRoot)
     : join(root, 'tools', 'phoenix-harness-v3', 'knowledge')
   const sink = createTelemetrySink(root, config.telemetry ?? {})
   const governor = createGovernor(root, sink, config.governor ?? {})
   const contextServer = createContextServer(root, knowledgeRoot)
+  const compactionGuard = createCompactionGuard(config.compactionGuard ?? {})
+  const transportRetries = {
+    budgets: config.transportRetries && typeof config.transportRetries === 'object' ? config.transportRetries : {},
+  }
   const stormTrackers = new Map()
   const fingerprintTrackers = new Map()
   const lastTierByStep = new Map()
@@ -119,9 +134,35 @@ export function apply(ctx, config = {}) {
     return resolved
   })
 
-  // ── request telemetry (L-001 contract) ───────────────────────────────────
+  // ── request telemetry (L-001 contract) + compaction guard ───────────────
   ctx.on('llm/stream', (options, next) => {
     const sid = sessionKey(options?.sessionId)
+    const isCompaction = options?.purpose === 'compaction'
+    let compactionGated = false
+    // Compaction circuit breaker + adaptive summary size (quickfix): while
+    // the breaker is OPEN every summarization call fails instantly (no
+    // provider attempt) so dsh-compaction-basic falls back to the pruned
+    // surface; when CLOSED the summary maxTokens adapts to the source size
+    // (6K floor / 16K cap) so summaries stop truncating on reasoning tokens.
+    if (isCompaction) {
+      try {
+        const gate = compactionGuard.gate(sid, estimateInputChars(options?.messages, options?.system), options?.maxTokens)
+        if (Number.isFinite(gate?.maxTokens) && gate.maxTokens > 0) options.maxTokens = gate.maxTokens
+        compactionGated = true
+      } catch (err) {
+        if (err?.code === BREAKER_CODE) {
+          sink.record(sid, {
+            ts: nowIso(), event: 'compaction.breaker.skip', session: sid,
+            message: shortMessage(err),
+          })
+          const breakerError = err
+          return (async function* () {
+            throw breakerError
+          })()
+        }
+        // any other gate failure must never break a request: proceed ungated
+      }
+    }
     const rec = {
       ts: nowIso(), event: 'llm.request', session: sid,
       provider: options?.provider ?? null,
@@ -133,6 +174,8 @@ export function apply(ctx, config = {}) {
       estInputChars: estimateInputChars(options?.messages, options?.system),
       usage: null, finish: null, failure: null,
     }
+    let compactionFailed = false
+    let compactionSawFinish = false
     return (async function* () {
       let downstream
       try {
@@ -140,6 +183,10 @@ export function apply(ctx, config = {}) {
       } catch (err) {
         rec.finish = 'error'
         rec.failure = { code: err?.code ?? 'UNKNOWN', message: shortMessage(err) }
+        if (isCompaction && compactionGated) {
+          compactionFailed = true
+          compactionGuard.noteFailure(sid, err)
+        }
         sink.record(sid, rec)
         throw err
       }
@@ -155,6 +202,12 @@ export function apply(ctx, config = {}) {
             }
           } else if (chunk?.type === 'finish' && chunk.reason) {
             rec.finish = chunk.reason.kind ?? 'ok'
+            if (isCompaction && compactionGated) {
+              compactionSawFinish = true
+              if (chunk.reason.kind === 'error' || chunk.reason.kind === 'aborted' || chunk.reason.kind === 'max-tokens') {
+                compactionFailed = true
+              }
+            }
             if (chunk.reason.failure) {
               rec.failure = {
                 code: chunk.reason.failure.code ?? 'UNKNOWN',
@@ -167,18 +220,25 @@ export function apply(ctx, config = {}) {
       } catch (err) {
         rec.finish = 'error'
         rec.failure = { code: err?.code ?? 'UNKNOWN', message: shortMessage(err) }
+        if (isCompaction && compactionGated) {
+          compactionFailed = true // finally owns the single guard note
+        }
         throw err
       } finally {
         try {
           if (downstream && typeof downstream.return === 'function') await downstream.return()
         } catch { /* best-effort */ }
+        if (isCompaction && compactionGated) {
+          if (compactionFailed || !compactionSawFinish) compactionGuard.noteFailure(sid)
+          else compactionGuard.noteSuccess(sid)
+        }
         try { governor.noteUsage(sid, rec.usage) } catch { /* never throws */ }
         sink.record(sid, rec) // never throws
       }
     })()
   })
 
-  // ── failures + storms ────────────────────────────────────────────────────
+  // ── failures + storms + tiered transport retries ─────────────────────────
   ctx.on('agent/request-error', async (payload, next) => {
     try {
       const sid = sessionKey(payload?.agent?.session?.id)
@@ -197,6 +257,53 @@ export function apply(ctx, config = {}) {
           ts: nowIso(), event: hit.event, session: sid,
           turn: hit.turn, step: hit.step, failures: hit.failures, codes: hit.codes,
         })
+      }
+      // Tiered transport retries: tier budgets routine=2 / normal=3 /
+      // critical=6 with a TRANSPORT class override (normal=8, hotfix).
+      // Durable llm/retry events keep the retry identity across turns;
+      // non-retryable codes and exhausted budgets always fall through to
+      // the downstream recovery (never blind-retry).
+      const tierLabel = lastTierBySession.get(sid) ?? 'standard'
+      const budget = budgetForCode(tierLabel, code, transportRetries)
+      if (budget > 0 && RETRYABLE_CODES.includes(code)) {
+        const events = Array.isArray(payload?.agent?.session?.events) ? payload.agent.session.events : []
+        const prior = countPriorRetries(events, turn, step)
+        const decision = decideRetry(code, prior, budget)
+        if (decision.retry) {
+          const retry = prior + 1
+          const retryId = priorRetryId(events, turn, step) ?? randomUUID()
+          const delay = retryDelayMs(retry, transportRetries, payload?.failure?.providerRetryAfterMs, Math.random, code)
+          const session = payload?.agent?.session
+          try {
+            session?.append?.('llm/retry', {
+              retryId, turn, step, provider: payload?.provider ?? null,
+              mode: 'normal', policyKey: TRANSPORT_POLICY_KEY,
+              retry, maxRetries: budget, delayMs: delay,
+              failure: { code },
+            })
+          } catch { /* append is best-effort */ }
+          const signal = payload?.signal
+          await new Promise((resolve) => {
+            if (signal?.aborted) return resolve(false)
+            const timer = setTimeout(() => {
+              try { signal?.removeEventListener?.('abort', onAbort) } catch { /* ignore */ }
+              resolve(true)
+            }, delay)
+            function onAbort() {
+              clearTimeout(timer)
+              resolve(false)
+            }
+            try { signal?.addEventListener?.('abort', onAbort, { once: true }) } catch { /* ignore */ }
+          })
+          try {
+            session?.append?.('llm/retry-started', { retryId, turn, step, retry })
+          } catch { /* append is best-effort */ }
+          sink.record(sid, {
+            ts: nowIso(), event: 'transport.retry', session: sid, turn, step, code,
+            tier: tierLabel, retry, budget, delayMs: delay,
+          })
+          return { kind: 'retry' }
+        }
       }
     } catch { /* never break recovery */ }
     return next()
@@ -343,6 +450,13 @@ export function apply(ctx, config = {}) {
       if (args.action === 'create') {
         const compiled = compileMission(args)
         if (compiled.error) return `error: ${compiled.error}`
+        // Mission budgets are the DELTA from mission start (quickfix): the
+        // usage baseline is snapshotted here, so a brand-new mission starts
+        // near zero regardless of session history before the mission began.
+        compiled.spec.usageBaseline = {
+          ...governor.usageSnapshot(sid),
+          startedAtMs: Date.now(),
+        }
         const written = writeMission(root, sid, compiled.spec)
         if (!written.ok) return `error: ${written.error}`
         return `MISSION CREATED (${written.path.replace(/\\/g, '/')})\n\n${renderMission(compiled.spec)}`
@@ -371,6 +485,8 @@ export function apply(ctx, config = {}) {
         compiled.spec.createdAt = spec.createdAt
         compiled.spec.ownerApproval = spec.ownerApproval
         compiled.spec.phases = spec.phases
+        // preserve the mission-start usage baseline across updates (delta budgets)
+        if (spec.usageBaseline) compiled.spec.usageBaseline = spec.usageBaseline
         compiled.spec.updatedAt = new Date().toISOString()
         if (args.phase) {
           compiled.spec.phases = [...(compiled.spec.phases ?? []), { name: String(args.phase).slice(0, 40), at: compiled.spec.updatedAt }].slice(-12)

@@ -70,3 +70,18 @@ economics permit. Activity is never the objective.
   bounded tail — never giant raw logs.
 - Tests: command, exit code, failures, meaningful warnings, concise summary.
 - Large results: compact structured summary + artifact reference.
+
+## 7. Read-only SQL batching (phoenix_sql_readonly)
+
+- The tool is STRICT single-statement: exactly one SELECT/WITH per call;
+  statement chains, DML/DDL, pipes/newlines/backticks, and multi-statement
+  strings are refused (L-012 transport hardening). Never try to batch by
+  chaining statements.
+- Batch safely by consolidating into ONE well-targeted query: aggregates,
+  UNION, joins, and a bounded LIMIT inside the single SELECT. One query,
+  one tool call.
+- Keep outputs bounded (the tool caps at its char limit); pull large result
+  sets into artifacts and quote only the identifiers the next step needs.
+- If several independent read-only facts are needed, prefer one small query
+  each over one giant query — but never a statement chain and never a
+  scripted loop of many calls when one SELECT covers it.

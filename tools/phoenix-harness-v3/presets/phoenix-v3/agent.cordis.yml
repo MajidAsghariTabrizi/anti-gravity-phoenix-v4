@@ -149,12 +149,33 @@
 # mission compiler, layered context, governor, telemetry with argument
 # fingerprints, and the 15 typed fail-closed native tools.
 # Installed build of tools/phoenix-harness-v3/src/ (see .installed.json).
+#
+# Quickfix config (V3 production update):
+#   - compactionGuard: circuit breaker (2 failures open; prune-only fallback)
+#     + adaptive summary size (6K floor / 16K cap) around compaction streams.
+#   - transportRetries: tiered request-level retries routine=2 / normal=3 /
+#     critical=6, with a TRANSPORT class override normal=8 (bounded schedule
+#     500ms..30s; tier from the reasoning-tier classifier; the flat provider
+#     retry policy stays disabled in the host profile patch).
+#   - workspaceRoot resolves through the canonical repo-root resolver
+#     (PHOENIX_REPO_ROOT > configured root > .git/.phoenix-harness markers).
 
 - id: phoenix-harness-v3
   name: ./plugins/dsh-phoenix-harness-v3/lib/plugin.js
   config:
     workspaceRoot: !!js process.cwd()
     knowledgeRoot: !!js "process.getBuiltinModule('node:path').join(process.cwd(), 'tools', 'phoenix-harness-v3', 'knowledge')"
+    compactionGuard:
+      tripThreshold: 2
+      cooldownMs: 300000
+      maxCooldownMs: 1800000
+      maxTokensFloor: 6144
+      maxTokensCap: 16384
+      charsPerToken: 3.2
+    transportRetries:
+      routine: 2
+      normal: 3
+      critical: 6
 
 # ── delegation and workflows ────────────────────────────────────────────────
 
