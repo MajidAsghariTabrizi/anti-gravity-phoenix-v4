@@ -621,6 +621,19 @@ revenue_lane_authority AS (
         bool_or(kill_switch) FILTER (WHERE lane = 'atlas_solver') AS atlas_kill_switch
     FROM live_canary.revenue_lane_controls
 ),
+truth_window AS MATERIALIZED (
+\if :phoenix_has_economic_truth
+    -- Single materialized evaluation shared by size_points and loss_points.
+    -- The truth view is expensive (nested JSONB expansion plus an unbounded
+    -- daily_route_rank aggregation that predicate pushdown cannot cross), so
+    -- evaluating it twice per refresh doubled the refresh cost and drove the
+    -- snapshot past its statement_timeout as history grew.
+    SELECT * FROM phoenix_live_economic_truth truth
+    WHERE truth.classified_at >= now() - interval '7 days'
+\else
+    SELECT NULL::text AS disabled WHERE false
+\endif
+),
 size_points AS (
 \if :phoenix_has_economic_truth
     SELECT
@@ -646,8 +659,7 @@ size_points AS (
             ) leg
             WHERE leg->>'utilization_bps' ~ '^[0-9]+$'
         ) AS maximum_liquidity_utilization_bps
-    FROM phoenix_live_economic_truth truth
-    WHERE truth.classified_at >= now() - interval '7 days'
+    FROM truth_window truth
 \else
     SELECT
         NULL::timestamptz AS classified_at,
@@ -798,10 +810,9 @@ loss_points AS MATERIALIZED (
                 FROM jsonb_array_elements(truth.pool_address_path)
                      WITH ORDINALITY AS pool(value, ordinality)
             ) AS reverse_pool_address_path
-        FROM phoenix_live_economic_truth truth
+        FROM truth_window truth
         JOIN shadow_engine_classifications classification
           ON classification.source_event_identity = truth.source_event_identity
-        WHERE truth.classified_at >= now() - interval '7 days'
     ),
     bounded_counterfactuals AS (
         SELECT DISTINCT ON (source_event_identity)

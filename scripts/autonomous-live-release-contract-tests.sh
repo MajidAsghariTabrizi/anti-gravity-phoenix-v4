@@ -1409,6 +1409,26 @@ do
     fail "lane dashboard index is not usable: $expected_index"
 done
 
+ingest_index_plan=$(
+  docker exec -i "$postgres_container" \
+    psql -X -q -A -t -v ON_ERROR_STOP=1 -U phoenix_test -d phoenix_test <<'SQL'
+SET enable_seqscan = off;
+EXPLAIN (COSTS OFF)
+SELECT recorded_at FROM feed_events
+WHERE recorded_at >= now() - interval '7 days';
+EXPLAIN (COSTS OFF)
+SELECT recorded_at FROM rpc_quality_records
+WHERE recorded_at >= now() - interval '7 days';
+SQL
+) || fail "dashboard ingest index plans could not be explained"
+for expected_index in \
+  feed_events_recorded_at_idx \
+  rpc_quality_records_recorded_at_idx
+do
+  printf '%s\n' "$ingest_index_plan" | grep -Fq "$expected_index" ||
+    fail "dashboard ingest index is not usable: $expected_index"
+done
+
 historical_view=$(
   docker exec "$postgres_container" \
     psql -X -q -A -t -U phoenix_test -d phoenix_test \
