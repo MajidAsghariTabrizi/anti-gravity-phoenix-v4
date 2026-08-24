@@ -1898,7 +1898,12 @@ fn persistent_hunter_provider_failure(payload: &Value, now_millis: i64) -> Contr
 
 async fn hunter_readiness_payload() -> ControlResult<Value> {
     let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(5))
+        // Internal service-to-service check: never route through an ambient
+        // proxy (reqwest reads env proxies by default) and never auto-follow.
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .connect_timeout(Duration::from_secs(3))
+        .timeout(Duration::from_secs(8))
         .build()
         .map_err(|_| "Aave/Atlas readiness client initialization failed")?;
     let response = client
@@ -1924,14 +1929,28 @@ async fn hunter_readiness_payload() -> ControlResult<Value> {
 }
 
 fn bounded_error_cause(cause: &dyn Error) -> String {
-    let text = cause.to_string();
-    if text.len() <= 160 && !text.chars().any(char::is_control) {
-        return text;
+    // reqwest 0.12 Display never prints the source chain, so the outer
+    // "error sending request for url (...)" hides the transport root cause
+    // (connection refused / dns failure / timeout). Walk the full source
+    // chain here so the supervisor log line is diagnosable on its own.
+    const MAX_LINKS: usize = 8;
+    const MAX_CHARS: usize = 480;
+    let mut links = Vec::with_capacity(MAX_LINKS);
+    let mut current: Option<&dyn Error> = Some(cause);
+    while let Some(error) = current {
+        let text: String = error
+            .to_string()
+            .chars()
+            .filter(|character| !character.is_control())
+            .collect();
+        links.push(text);
+        if links.len() >= MAX_LINKS {
+            break;
+        }
+        current = error.source();
     }
-    text.chars()
-        .filter(|character| !character.is_control())
-        .take(160)
-        .collect()
+    let joined = links.join(" :: ");
+    joined.chars().take(MAX_CHARS).collect()
 }
 
 async fn fail_close_provider_execution_gate(pool: &PgPool, reason: &str) -> ControlResult<()> {
@@ -4363,9 +4382,10 @@ fn validate_hunter_readiness(payload: &Value, now_millis: i64) -> ControlResult<
 
 async fn require_max_reviewed_runtime_readiness() -> ControlResult<()> {
     let client = reqwest::Client::builder()
+        .no_proxy()
         .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(Duration::from_secs(3))
-        .timeout(Duration::from_secs(5))
+        .timeout(Duration::from_secs(8))
         .build()
         .map_err(|_| "readiness client initialization failed")?;
     let gateway = client
@@ -7335,9 +7355,9 @@ mod tests {
             "tcp refused",
         ));
         assert_eq!(short, "tcp refused");
-        let long: String = "x".repeat(400);
+        let long: String = "x".repeat(600);
         let bounded = bounded_error_cause(&io::Error::other(long.clone()));
-        assert_eq!(bounded.len(), 160);
+        assert_eq!(bounded.chars().count(), 480);
         assert!(bounded.chars().all(|character| character == 'x'));
         let noisy = bounded_error_cause(&io::Error::other("boom\t\nboom"));
         assert_eq!(noisy, "boomboom");
@@ -7349,5 +7369,43 @@ mod tests {
             message.to_string(),
             "Aave/Atlas hunter readiness request failed: connection refused"
         );
+    }
+
+    #[test]
+    fn bounded_error_cause_walks_the_full_source_chain() {
+        // reqwest 0.12's Display hides the source; the supervisor must log it.
+        // Mirrors reqwest::Error -> hyper_util legacy Error -> connect error.
+        let innermost = io::Error::new(io::ErrorKind::ConnectionRefused, "tcp connect error");
+        #[derive(Debug)]
+        struct Wrapped {
+            message: String,
+            source: io::Error,
+        }
+        impl Display for Wrapped {
+            fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str(&self.message)
+            }
+        }
+        impl Error for Wrapped {
+            fn source(&self) -> Option<&(dyn Error + 'static)> {
+                Some(&self.source)
+            }
+        }
+        let middle = Wrapped {
+            message: "client error (Connect)".to_string(),
+            source: innermost,
+        };
+        let outer = Wrapped {
+            message: "error sending request for url (http://atlas-observer:9700/readyz)"
+                .to_string(),
+            source: io::Error::new(io::ErrorKind::Other, "wrap"),
+        };
+        let chain = bounded_error_cause(&outer);
+        assert_eq!(
+            chain,
+            "error sending request for url (http://atlas-observer:9700/readyz) :: wrap"
+        );
+        let deep = bounded_error_cause(&middle);
+        assert_eq!(deep, "client error (Connect) :: tcp connect error");
     }
 }
