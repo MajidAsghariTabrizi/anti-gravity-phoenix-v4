@@ -386,8 +386,17 @@ transactions and persists them to `live_canary.atlas_liquidation_ground_truth`
   characters), and `RPC_AUTH_PROVIDER_HEADER_FILE` (absolute
   container-internal path; the secret value is read through a single
   `docker exec` pipe, kept in memory only, never printed, never placed in
-  argv, never written to a host file); (2) legacy `RPC_PROVIDER_URLS`
-  (unchanged list contract); (3) fail closed. Provider URLs and auth
+  argv, never written to a host file); (2) an optional reviewed
+  verification provider appended from `RPC_VERIFICATION_PROVIDER_ID`
+  (must equal `production-alchemy-arbitrum`),
+  `RPC_VERIFICATION_PROVIDER_URL` (must start with
+  `https://arb-mainnet.g.alchemy.com/`), `RPC_VERIFICATION_PROVIDER_PRIORITY`
+  (positive and strictly below the primary priority — the Alchemy provider
+  can therefore never outrank or replace the NOWNodes primary and can never
+  become submission authority), `RPC_VERIFICATION_PROVIDER_HEADER_NAME`, and
+  `RPC_VERIFICATION_PROVIDER_HEADER_FILE`; an absent or empty ID keeps the
+  gateway single-provider; (3) legacy `RPC_PROVIDER_URLS`
+  (unchanged list contract); (4) fail closed. Provider URLs and auth
   secrets never appear in error output — failures reference only the
   validated provider identity or an index plus an error class.
 - `atlas-reconciler` (reviewed, no network/signer) decodes the transcript

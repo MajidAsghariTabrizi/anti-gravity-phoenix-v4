@@ -51,17 +51,46 @@ impl Config {
         };
         let authenticated_secret =
             read_header_secret(required_env("RPC_AUTH_PROVIDER_HEADER_FILE")?)?;
+        let primary_priority = positive_u32_from_env("RPC_AUTH_PROVIDER_PRIORITY", 100)?;
         append_header_authenticated_provider(
             &mut providers,
             &identity,
             &required_env("RPC_AUTH_PROVIDER_URL")?,
-            positive_u32_from_env("RPC_AUTH_PROVIDER_PRIORITY", 100)?,
+            primary_priority,
             &required_env("RPC_AUTH_PROVIDER_HEADER_NAME")?,
             &authenticated_secret,
         )
         .map_err(|_| "invalid authenticated RPC provider configuration")?;
         if providers.providers.len() != 1 {
             return Err("single-primary RPC configuration is invalid");
+        }
+        // Optional reviewed Alchemy verification provider: exact-state
+        // secondary only. It can never become the primary (priority is capped
+        // below the primary and the primary identity check above is fixed), so
+        // it can never become submission authority. Absent or empty ID keeps
+        // the gateway single-provider.
+        match std::env::var("RPC_VERIFICATION_PROVIDER_ID") {
+            Ok(identity) if !identity.trim().is_empty() => {
+                let url = required_env("RPC_VERIFICATION_PROVIDER_URL")?;
+                let priority =
+                    positive_u32_from_env("RPC_VERIFICATION_PROVIDER_PRIORITY", 90)?;
+                let header_name = required_env("RPC_VERIFICATION_PROVIDER_HEADER_NAME")?;
+                let secret =
+                    read_header_secret(required_env("RPC_VERIFICATION_PROVIDER_HEADER_FILE")?)?;
+                append_verification_provider(
+                    &mut providers,
+                    primary_priority,
+                    identity.trim(),
+                    &url,
+                    priority,
+                    &header_name,
+                    &secret,
+                )?;
+                if providers.providers.len() != 2 {
+                    return Err("single-primary RPC configuration is invalid");
+                }
+            }
+            _ => {}
         }
         Ok(Self {
             address: std::env::var("RPC_GATEWAY_ADDR")
@@ -89,6 +118,32 @@ impl Config {
             )?)),
         })
     }
+}
+
+fn append_verification_provider(
+    providers: &mut ProviderConfig,
+    primary_priority: u32,
+    identity: &str,
+    url: &str,
+    priority: u32,
+    header_name: &str,
+    header_value: &str,
+) -> Result<(), &'static str> {
+    // The only reviewed secondary identity for Phoenix is Alchemy; it is an
+    // exact-state verification provider and must never be able to outrank or
+    // replace the primary NOWNodes authority.
+    if identity != "production-alchemy-arbitrum" {
+        return Err("verification RPC identity is invalid");
+    }
+    if !url.starts_with("https://arb-mainnet.g.alchemy.com/") {
+        return Err("verification RPC URL is not the reviewed Alchemy endpoint");
+    }
+    if priority == 0 || priority >= primary_priority {
+        return Err("verification RPC priority must stay below the primary provider");
+    }
+    append_header_authenticated_provider(providers, identity, url, priority, header_name, header_value)
+        .map_err(|_| "invalid verification RPC provider configuration")?;
+    Ok(())
 }
 
 fn read_header_secret(path: String) -> Result<String, &'static str> {
@@ -755,5 +810,110 @@ mod tests {
         fs::write(&path, vec![b'x'; 4097]).unwrap();
         assert!(read_header_secret(path.to_string_lossy().into_owned()).is_err());
         fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn verification_provider_accepts_only_reviewed_alchemy_below_primary_priority() {
+        let mut providers = ProviderConfig {
+            providers: Vec::new(),
+        };
+        append_header_authenticated_provider(
+            &mut providers,
+            "production-nownodes-arbitrum",
+            "https://arbitrum.nownodes.io/",
+            100,
+            "api-key",
+            "primary-secret",
+        )
+        .unwrap();
+        assert_eq!(providers.providers.len(), 1);
+        append_verification_provider(
+            &mut providers,
+            100,
+            "production-alchemy-arbitrum",
+            "https://arb-mainnet.g.alchemy.com/v2/",
+            90,
+            "api-key",
+            "secondary-secret",
+        )
+        .unwrap();
+        assert_eq!(providers.providers.len(), 2);
+
+        let mut rejected = ProviderConfig {
+            providers: Vec::new(),
+        };
+        append_header_authenticated_provider(
+            &mut rejected,
+            "production-nownodes-arbitrum",
+            "https://arbitrum.nownodes.io/",
+            100,
+            "api-key",
+            "primary-secret",
+        )
+        .unwrap();
+        for (identity, url, priority) in [
+            (
+                "production-other-arbitrum",
+                "https://arb-mainnet.g.alchemy.com/v2/",
+                90,
+            ),
+            (
+                "production-alchemy-arbitrum",
+                "https://arbitrum.drpc.org/",
+                90,
+            ),
+            (
+                "production-alchemy-arbitrum",
+                "https://arb-mainnet.g.alchemy.com/v2/",
+                100,
+            ),
+            (
+                "production-alchemy-arbitrum",
+                "https://arb-mainnet.g.alchemy.com/v2/",
+                0,
+            ),
+        ] {
+            assert!(
+                append_verification_provider(
+                    &mut rejected,
+                    100,
+                    identity,
+                    url,
+                    priority,
+                    "api-key",
+                    "secondary-secret",
+                )
+                .is_err(),
+                "{identity} {url} {priority} must be rejected"
+            );
+        }
+        assert_eq!(rejected.providers.len(), 1);
+        // the same identity can never be registered twice
+        assert!(
+            append_verification_provider(
+                &mut rejected,
+                100,
+                "production-alchemy-arbitrum",
+                "https://arb-mainnet.g.alchemy.com/v2/",
+                90,
+                "api-key",
+                "secondary-secret",
+            )
+            .is_ok()
+        );
+        assert_eq!(rejected.providers.len(), 2);
+        assert!(
+            append_verification_provider(
+                &mut rejected,
+                100,
+                "production-alchemy-arbitrum",
+                "https://arb-mainnet.g.alchemy.com/v2/",
+                80,
+                "api-key",
+                "secondary-secret",
+            )
+            .is_err()
+        );
+        assert_eq!(rejected.providers.len(), 2);
     }
 }
