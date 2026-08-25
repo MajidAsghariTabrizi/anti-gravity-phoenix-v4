@@ -253,12 +253,17 @@ if current["actionable"] == 0 and current["oldest"] != 0:
     reject(names["oldest"], previous["oldest"], current["oldest"], 0.0, "idle_actionable_age_not_reset")
 if current["worker_queued"] > 0 and current["available"] > 0:
     reject(names["worker_queued"], previous["worker_queued"], current["worker_queued"], 0.0, "worker_queue_present_with_available_permit")
+# Calibration: the executor scans actionable work every ~2s, so an item observed
+# mid-cycle can legitimately age past one poll interval between two samples while
+# completions keep advancing. Starvation evidence is aging WITHOUT completion
+# progress; a wedged item is caught by the absolute ceiling regardless of progress.
 persistent = previous["actionable"] > 0 and current["actionable"] > 0
 age_growing = current["oldest"] > previous["oldest"]
-if persistent and age_growing and current["oldest"] > 1.0:
-    reason = "actionable_age_grew_with_available_permit" if current["available"] > 0 else "actionable_age_grew_without_completion"
-    if current["available"] > 0 or completed_delta <= 0:
-        reject(names["oldest"], previous["oldest"], current["oldest"], 1.0, reason)
+absolute_ceiling_seconds = 30.0
+if current["oldest"] > absolute_ceiling_seconds:
+    reject(names["oldest"], previous["oldest"], current["oldest"], absolute_ceiling_seconds, "actionable_age_exceeded_absolute_ceiling")
+if persistent and age_growing and current["oldest"] > 1.0 and completed_delta <= 0:
+    reject(names["oldest"], previous["oldest"], current["oldest"], 1.0, "actionable_age_grew_without_completion")
 print("POST_ARM_LATENCY_GAUGE_OK: " + json.dumps(evidence, sort_keys=True, separators=(",", ":")))
 ' "$3" "$4" || fail "Exact queue progress/age SLO regressed; detailed scalar evidence emitted above"
 }

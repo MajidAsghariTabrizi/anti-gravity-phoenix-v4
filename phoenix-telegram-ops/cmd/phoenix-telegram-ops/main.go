@@ -17,6 +17,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -51,6 +52,26 @@ func loadConfig() config {
 		expectedRelease: os.Getenv("PHOENIX_EXPECTED_RELEASE_SHA"),
 		apiBase:         envOr("PHOENIX_TELEGRAM_API_BASE", "https://api.telegram.org"),
 	}
+}
+
+// withSSLModeDisable appends sslmode=disable to a postgres connection string
+// using the correct syntax for its form. The database runs on the
+// compose-internal network without TLS, and lib/pq defaults to sslmode=require
+// when the parameter is unset, so it must always be explicit. The previous
+// concatenation "+sslmode=disable" corrupted the URL path and therefore the
+// database name server-side.
+func withSSLModeDisable(raw string) (string, error) {
+	if strings.Contains(raw, "://") {
+		parsed, err := url.Parse(raw)
+		if err != nil {
+			return "", fmt.Errorf("parse dsn url: %w", err)
+		}
+		query := parsed.Query()
+		query.Set("sslmode", "disable")
+		parsed.RawQuery = query.Encode()
+		return parsed.String(), nil
+	}
+	return raw + " sslmode=disable", nil
 }
 
 func envOr(key, def string) string {
@@ -282,7 +303,12 @@ func main() {
 		select {}
 	}
 
-	db, err := sql.Open("postgres", cfg.dsn+"+sslmode=disable")
+	dsn, derr := withSSLModeDisable(cfg.dsn)
+	if derr != nil {
+		log.Printf("TELEGRAM_OPS_FATAL reason=dsn_invalid")
+		os.Exit(1)
+	}
+	db, err := sql.Open("postgres", dsn)
 	if err != nil {
 		log.Printf("TELEGRAM_OPS_FATAL reason=dsn_invalid")
 		os.Exit(1)
