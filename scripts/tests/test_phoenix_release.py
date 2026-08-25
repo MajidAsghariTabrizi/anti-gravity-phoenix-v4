@@ -4369,7 +4369,7 @@ class PostArmMonitorSemanticsTests(unittest.TestCase):
                 "oldest_actionable_age_seconds": 2.0,
                 "permit_availability": 12.0,
                 "previous_value": 0.5,
-                "reason": "actionable_age_grew_with_available_permit",
+                "reason": "actionable_age_grew_without_completion",
                 "sample_count": 2,
                 "timestamp": "2026-08-14T13:00:00Z",
                 "worker_queued_count": 0.0,
@@ -4397,6 +4397,28 @@ class PostArmMonitorSemanticsTests(unittest.TestCase):
             self._gauge_metrics(actionable=1, in_flight=12, available=0, oldest=2, completed=11),
         )
         self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_completion_progress_with_free_permits_is_not_false_starvation(self) -> None:
+        # Production-calibrated case (2026-08-25T09:46Z trip): the executor polls
+        # every ~2s, so an item can age past 1s between samples while completions
+        # advance; free burst permits are normal steady state, not starvation.
+        result = self._run_gauge(
+            self._gauge_metrics(actionable=1, oldest=0.5),
+            self._gauge_metrics(actionable=1, oldest=2, completed=19),
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_absolute_actionable_age_ceiling_fails_regardless_of_progress(self) -> None:
+        result = self._run_gauge(
+            self._gauge_metrics(actionable=1, oldest=29),
+            self._gauge_metrics(actionable=1, oldest=31, completed=19),
+        )
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("actionable_age_exceeded_absolute_ceiling", result.stderr)
+        prefix = "POST_ARM_LATENCY_GAUGE_FAILED: "
+        evidence = json.loads(result.stderr.split(prefix, maxsplit=1)[1])
+        self.assertEqual(evidence["configured_threshold"], 30.0)
+        self.assertEqual(evidence["exact_completed_delta"], 9.0)
 
     def test_histograms_difference_intervals_and_report_p50_p95_p99(self) -> None:
         result = self._run_histograms(
