@@ -195,8 +195,17 @@ def _classify_path(
         return True, True
 
     if _under(path, "phoenix-telegram-ops/"):
-        _mark(jobs, images, job_names=("hygiene", "go"))
-        return True, False
+        # The Telegram operations sidecar is compiled into the dashboard
+        # image (deploy/dashboard.Dockerfile multi-stage Go builder), so its
+        # source changes must rebuild that image or the fix never reaches
+        # production.
+        _mark(
+            jobs,
+            images,
+            job_names=("hygiene", "go", "docker-validation"),
+            image_names=("dashboard",),
+        )
+        return True, True
 
     if _under(path, "rpc-gateway/"):
         _mark(
