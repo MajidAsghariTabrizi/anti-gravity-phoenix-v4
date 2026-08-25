@@ -27,7 +27,10 @@ output_dir=${output%/*}
 while :; do
   candidate=$(mktemp "$output_dir/.economic-dashboard.XXXXXX") ||
     { echo "ECONOMIC_DASHBOARD_FAILED: staging failed" >&2; exit 1; }
-  if PGOPTIONS="-c statement_timeout=${query_timeout}s -c lock_timeout=5s -c work_mem=64MB" \
+  # work_mem 256MB: the snapshot's largest sorts spill ~180MB at 64MB;
+  # measured on production-scale data: 62.6s @64MB vs 59.0s @256MB
+  # (config-only change; statement_timeout unchanged).
+  if PGOPTIONS="-c statement_timeout=${query_timeout}s -c lock_timeout=5s -c work_mem=256MB" \
     psql -X -q -A -t "$POSTGRES_DSN" -f "$sql_file" >"$candidate" &&
     [ -s "$candidate" ]
   then

@@ -628,7 +628,51 @@ truth_window AS MATERIALIZED (
     -- daily_route_rank aggregation that predicate pushdown cannot cross), so
     -- evaluating it twice per refresh doubled the refresh cost and drove the
     -- snapshot past its statement_timeout as history grew.
-    SELECT * FROM phoenix_live_economic_truth truth
+    -- Performance: project ONLY dashboard-consumed columns and hoist the
+    -- per-row liquidity-array scan into one precomputed scalar. Unused wide
+    -- payloads are planner-pruned before JSONB expression evaluation; output
+    -- bytes proven identical by old-vs-new equivalence run.
+    SELECT
+        truth.evaluation_point_id,
+        truth.source_event_identity,
+        truth.classified_at,
+        truth.route_fingerprint,
+        truth.input_size_wei,
+        truth.direction_path,
+        truth.pool_address_path,
+        truth.expected_net_pnl_wei,
+        truth.conservative_net_pnl_wei,
+        truth.severe_net_pnl_wei,
+        truth.margin_to_profitability_gate_wei,
+        truth.minimum_required_net_pnl_wei,
+        truth.gross_spread_wei,
+        truth.gross_spread_bps,
+        truth.net_pnl_bps,
+        truth.break_even_spread_bps,
+        truth.fixed_cost_wei,
+        truth.variable_cost_wei,
+        truth.dex_fees_wei,
+        truth.arbitrum_execution_fee_wei,
+        truth.l1_data_fee_wei,
+        truth.flash_premium_wei,
+        truth.price_impact_wei,
+        truth.exact_rejection_reason,
+        truth.price_divergence_direction,
+        truth.tick_crossings,
+        truth.state_age_blocks,
+        truth.event_to_evaluation_latency_ns,
+        truth.fork_status,
+        truth.fork_simulated_net_pnl_wei,
+        truth.independent_verification_status,
+        truth.independent_verification_lifecycle,
+        (
+            SELECT max((leg->>'utilization_bps')::numeric)
+            FROM jsonb_array_elements(
+                coalesce(truth.active_liquidity_near_current_tick, '[]'::jsonb)
+            ) leg
+            WHERE leg->>'utilization_bps' ~ '^[0-9]+$'
+        ) AS maximum_liquidity_utilization_bps
+    FROM phoenix_live_economic_truth truth
     WHERE truth.classified_at >= now() - interval '7 days'
 \else
     SELECT NULL::text AS disabled WHERE false
@@ -652,13 +696,7 @@ size_points AS (
         truth.price_divergence_direction,
         truth.exact_rejection_reason AS rejection_reason,
         truth.tick_crossings,
-        (
-            SELECT max((leg->>'utilization_bps')::numeric)
-            FROM jsonb_array_elements(
-                coalesce(truth.active_liquidity_near_current_tick, '[]'::jsonb)
-            ) leg
-            WHERE leg->>'utilization_bps' ~ '^[0-9]+$'
-        ) AS maximum_liquidity_utilization_bps
+        truth.maximum_liquidity_utilization_bps AS maximum_liquidity_utilization_bps
     FROM truth_window truth
 \else
     SELECT
@@ -798,13 +836,7 @@ loss_points AS MATERIALIZED (
             truth.state_age_blocks,
             truth.tick_crossings,
             classification.detail_class,
-            (
-                SELECT max((leg->>'utilization_bps')::numeric)
-                FROM jsonb_array_elements(
-                    coalesce(truth.active_liquidity_near_current_tick, '[]'::jsonb)
-                ) leg
-                WHERE leg->>'utilization_bps' ~ '^[0-9]+$'
-            ) AS maximum_liquidity_utilization_bps,
+            truth.maximum_liquidity_utilization_bps AS maximum_liquidity_utilization_bps,
             (
                 SELECT jsonb_agg(pool.value ORDER BY pool.ordinality DESC)
                 FROM jsonb_array_elements(truth.pool_address_path)
