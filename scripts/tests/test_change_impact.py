@@ -63,6 +63,19 @@ class ChangeImpactTests(unittest.TestCase):
         self.assertEqual(plan["built_images"], [])
         self.assertTrue(plan["jobs"]["docker-validation"])
 
+    def test_telegram_ops_source_change_rebuilds_dashboard_image(self) -> None:
+        # Regression: the ops sidecar binary is compiled into the dashboard
+        # image (deploy/dashboard.Dockerfile), so its source paths must be
+        # classified as image-impacting. A CI-only classification silently
+        # shipped a stale binary to production (2026-08-25 DSN fix miss).
+        plan = change_impact.classify(
+            ["phoenix-telegram-ops/cmd/phoenix-telegram-ops/main.go"]
+        )
+        self.assertEqual(plan["unknown_paths"], [])
+        self.assertEqual(plan["built_images"], ["dashboard"])
+        self.assertTrue(plan["jobs"]["go"])
+        self.assertTrue(plan["jobs"]["docker-validation"])
+
     def test_root_ignore_is_static_when_every_image_has_a_specific_contract(
         self,
     ) -> None:
