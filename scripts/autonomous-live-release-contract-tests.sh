@@ -938,7 +938,7 @@ require("query timeout must be 5-120 seconds" in monitor, "monitor_timeout_guard
 require(
     'statement_timeout=${query_timeout}s' in monitor
     and "lock_timeout=5s" in monitor
-    and "work_mem=64MB" in monitor,
+    and "work_mem=256MB" in monitor,
     "monitor_query_timeout_not_enforced",
 )
 
