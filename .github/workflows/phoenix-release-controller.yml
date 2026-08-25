@@ -173,16 +173,19 @@ jobs:
               [ "$(jq -r '.status' <<<"$run")" = completed ] &&
               [ "$(jq -r '.repository.full_name' <<<"$run")" = "$GITHUB_REPOSITORY" ]
             then
-              run_jobs="$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${build_run_id}/attempts/1/jobs?per_page=100")"
-              build_jobs="$(jq -r '[.jobs[] | select(.name | startswith("immutable-build/"))]' <<<"$run_jobs")"
-              if [ "$(jq -r '.conclusion' <<<"$run")" = success ] ||
-                { [ "$(jq -r 'length' <<<"$build_jobs")" -gt 0 ] &&
-                  [ "$(jq -r '[.[] | select(.conclusion != "success")] | length' <<<"$build_jobs")" = 0 ]; }
-              then
-                printf 'build_required=false\nbuild_run_id=%s\n' \
-                  "$build_run_id" >>"$GITHUB_OUTPUT"
-                exit 0
-              fi
+              # The manifest artifact is published only after preflight, every
+              # immutable image build, and assets succeeded inside that exact
+              # dispatch (build-images.yml: release-manifest needs
+              # [preflight, build, assets]). The controller run's own
+              # conclusion may still be failure when a later deploy attempt
+              # failed closed after package creation; the stored gateway
+              # package then belongs to this exact run id, so reuse by the
+              # same id is required for idempotent recovery and stays safe:
+              # receive_package re-verifies request equality and package
+              # digest, failing closed on any identity mismatch.
+              printf 'build_required=false\nbuild_run_id=%s\n' \
+                "$build_run_id" >>"$GITHUB_OUTPUT"
+              exit 0
             fi
           fi
           printf 'build_required=true\nbuild_run_id=%s\n' \
