@@ -760,6 +760,59 @@ class CanonicalComposeAndPlatformTests(unittest.TestCase):
                     verify_installed(installed_root, RELEASE_SHA)
 
 
+class ReleaseControllerWorkflowContractTests(unittest.TestCase):
+    """Pin the release-controller build-reuse recovery contract.
+
+    Regression context: after a deploy attempt failed closed post-package
+    creation, the controller could never reuse its own immutable build
+    because the locate step gated on the controller run's conclusion (which
+    is failure) instead of trusting artifact provenance. Same-SHA recovery
+    became structurally impossible (PACKAGE_ALREADY_EXISTS forever).
+    """
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        root = Path(__file__).resolve().parents[2]
+        cls.controller = (
+            root / ".github" / "workflows" / "phoenix-release-controller.yml"
+        ).read_text(encoding="utf-8")
+        cls.build_images = (
+            root / ".github" / "workflows" / "build-images.yml"
+        ).read_text(encoding="utf-8")
+
+    def test_manifest_artifact_requires_full_build_success(self) -> None:
+        # The locate step's safety premise: the manifest artifact only exists
+        # after preflight + all image builds + assets succeeded.
+        self.assertIn(
+            "needs: [preflight, build, assets]",
+            self.build_images,
+            "release-manifest job must depend on full build success",
+        )
+        self.assertIn(
+            "name: phoenix-release-manifest-${{ inputs.release_sha }}",
+            self.build_images,
+        )
+
+    def test_locate_reuses_build_without_controller_conclusion_gate(self) -> None:
+        start = self.controller.index("Locate an existing exact-SHA immutable build")
+        end = self.controller.index("- name:", start)
+        block = self.controller[start:end]
+        # Identity checks stay mandatory.
+        self.assertIn("'.head_sha'", block)
+        self.assertIn("= completed", block)
+        self.assertIn("'.repository.full_name'", block)
+        # The failed-conclusion gate that blocked idempotent same-SHA
+        # recovery must not return in any form.
+        self.assertNotIn('startswith("immutable-build/")', block)
+        self.assertNotIn("build_jobs", block)
+
+    def test_locate_documents_digest_backstop(self) -> None:
+        start = self.controller.index("Locate an existing exact-SHA immutable build")
+        end = self.controller.index("- name:", start)
+        block = self.controller[start:end]
+        self.assertIn("receive_package", block)
+
+
 class ControllerEligibilityTests(unittest.TestCase):
     def verify(
         self,
