@@ -3133,7 +3133,7 @@ func TestForkSaturationDoesNotBlockIndependentExactStateFetch(t *testing.T) {
 				}
 			}
 			_ = json.NewEncoder(writer).Encode(simulationBatchResponse{
-				SchemaVersion: "phoenix.rpc.aave-simulate-batch-response.v4", ChainID: 42161,
+				SchemaVersion: "phoenix.rpc.aave-simulate-batch-response.v5", ChainID: 42161,
 				RequestID: input.RequestID, BlockNumber: record.Block, BlockHash: record.BlockHash,
 				StateRoot: record.StateRoot, PrimaryProviderID: primaryProviderID, Quorum: 1,
 				EvidenceMode: directForkEvidenceMode, Results: results,
@@ -3892,7 +3892,7 @@ func TestAtlasCandidateChargesBidAndMaximumSolverExposureOnce(t *testing.T) {
 		result := testSimulationResponse(input, "1000", "50", "20", "1")
 		result.EvidenceMode = atlasCallbackEvidenceMode
 		_ = json.NewEncoder(writer).Encode(simulationBatchResponse{
-			SchemaVersion: "phoenix.rpc.aave-simulate-batch-response.v4", ChainID: 42161, RequestID: batch.RequestID,
+			SchemaVersion: "phoenix.rpc.aave-simulate-batch-response.v5", ChainID: 42161, RequestID: batch.RequestID,
 			BlockNumber: input.BlockNumber, BlockHash: input.BlockHash, StateRoot: input.StateRoot,
 			PrimaryProviderID: primaryProviderID, ConfirmationProviderID: nil, Quorum: 1, EvidenceMode: atlasCallbackEvidenceMode,
 			Results: []simulationBatchResult{{RequestID: input.RequestID, Response: result}},
@@ -4295,7 +4295,7 @@ func testUSDCeSimulationResponse(input simulationRequest, realizedDebt, realized
 		evidenceMode = counterfactualForkEvidenceMode
 	}
 	return &simulationResponse{
-		SchemaVersion: "phoenix.rpc.aave-simulate-response.v5", ChainID: 42161, RequestID: input.RequestID,
+		SchemaVersion: "phoenix.rpc.aave-simulate-response.v6", ChainID: 42161, RequestID: input.RequestID,
 		BlockNumber: input.BlockNumber, BlockHash: input.BlockHash, StateRoot: input.StateRoot,
 		PrimaryProviderID: primaryProviderID, ConfirmationProviderID: nil, Quorum: 1, EvidenceMode: evidenceMode,
 		RouteID: "0x" + hex.EncodeToString(routeHash[:]), CalldataHex: "0x" + hex.EncodeToString(calldata),
@@ -4427,7 +4427,7 @@ func testSimulationResponse(input simulationRequest, realizedText, costText, l1T
 	routeHash := sha256.Sum256([]byte("route|" + input.RepayAmount + "|" + input.MinimumProfit + "|" + input.AtlasBid))
 	resultHash := sha256.Sum256([]byte("result|" + input.RepayAmount + "|" + input.MinimumProfit + "|" + input.AtlasBid))
 	return &simulationResponse{
-		SchemaVersion: "phoenix.rpc.aave-simulate-response.v5", ChainID: 42161, RequestID: input.RequestID,
+		SchemaVersion: "phoenix.rpc.aave-simulate-response.v6", ChainID: 42161, RequestID: input.RequestID,
 		BlockNumber: input.BlockNumber, BlockHash: input.BlockHash, StateRoot: input.StateRoot,
 		PrimaryProviderID: primaryProviderID, ConfirmationProviderID: nil, Quorum: 1, EvidenceMode: testEvidenceMode(input),
 		RouteID: "0x" + hex.EncodeToString(routeHash[:]), CalldataHex: "0x" + hex.EncodeToString(calldata),
@@ -4456,7 +4456,7 @@ func writeTestSimulationBatch(writer http.ResponseWriter, input simulationBatchR
 		evidenceMode = counterfactualForkEvidenceMode
 	}
 	_ = json.NewEncoder(writer).Encode(simulationBatchResponse{
-		SchemaVersion: "phoenix.rpc.aave-simulate-batch-response.v4", ChainID: 42161, RequestID: input.RequestID,
+		SchemaVersion: "phoenix.rpc.aave-simulate-batch-response.v5", ChainID: 42161, RequestID: input.RequestID,
 		BlockNumber: first.BlockNumber, BlockHash: first.BlockHash, StateRoot: first.StateRoot,
 		PrimaryProviderID: primaryProviderID, ConfirmationProviderID: nil, Quorum: 1, EvidenceMode: evidenceMode,
 		Results: results,
@@ -5142,7 +5142,7 @@ func TestSimulateBatchAcceptsCounterfactualFirstEvidenceMode(t *testing.T) {
 			}
 		}
 		_ = json.NewEncoder(writer).Encode(simulationBatchResponse{
-			SchemaVersion: "phoenix.rpc.aave-simulate-batch-response.v4", ChainID: 42161,
+			SchemaVersion: "phoenix.rpc.aave-simulate-batch-response.v5", ChainID: 42161,
 			RequestID: input.RequestID, BlockNumber: record.Block, BlockHash: record.BlockHash,
 			StateRoot: record.StateRoot, PrimaryProviderID: primaryProviderID, Quorum: 1,
 			EvidenceMode: counterfactualForkEvidenceMode, Results: results,
@@ -5157,7 +5157,7 @@ func TestSimulateBatchAcceptsCounterfactualFirstEvidenceMode(t *testing.T) {
 		client: server.Client(), batchClient: server.Client(),
 	}
 	simulation := simulationRequest{
-		SchemaVersion: "phoenix.rpc.aave-simulate-request.v4", ChainID: 42161, RequestID: "aave-sim-1",
+		SchemaVersion: "phoenix.rpc.aave-simulate-request.v5", ChainID: 42161, RequestID: "aave-sim-1",
 		BlockNumber: record.Block, BlockHash: record.BlockHash, StateRoot: record.StateRoot,
 		Counterfactual: true, DeadlineUnixSeconds: uint64(time.Now().Add(60 * time.Second).Unix()),
 	}

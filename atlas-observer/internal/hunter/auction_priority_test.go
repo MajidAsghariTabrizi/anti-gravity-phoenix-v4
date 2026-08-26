@@ -173,3 +173,20 @@ func firstHFOf(screener *Screener, borrower string) string {
 	}
 	return entry.HealthFactorWAD
 }
+
+// Mission §3.2: the requested Atlas frame is the ONLY key that selects the
+// acceptable response evidence mode. Proxy requests can never be satisfied
+// by solver-call evidence and vice versa.
+func TestAtlasFrameSelectsExactEvidenceMode(t *testing.T) {
+	proxy := atlasCallbackProxyFrame
+	solverCall := atlasSolverCallFrame
+	if got := atlasExpectedEvidenceMode(simulationRequest{AtlasMode: true}); got != atlasCallbackEvidenceMode {
+		t.Fatalf("absent frame must map to the legacy proxy mode, got %q", got)
+	}
+	if got := atlasExpectedEvidenceMode(simulationRequest{AtlasMode: true, AtlasFrame: &proxy}); got != atlasCallbackEvidenceMode {
+		t.Fatalf("explicit proxy frame must map to the legacy mode, got %q", got)
+	}
+	if got := atlasExpectedEvidenceMode(simulationRequest{AtlasMode: true, AtlasFrame: &solverCall}); got != atlasSolverCallEvidenceMode {
+		t.Fatalf("solver_call frame must map to the real-frame mode, got %q", got)
+	}
+}

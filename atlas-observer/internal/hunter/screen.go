@@ -70,6 +70,9 @@ const (
 	directForkEvidenceMode           = "SINGLE_PRIMARY_FORK_VERIFIED"
 	counterfactualForkEvidenceMode   = "SINGLE_PRIMARY_COUNTERFACTUAL_FORK_VERIFIED"
 	atlasCallbackEvidenceMode        = "SINGLE_PRIMARY_ATLAS_CALLBACK_FORK_VERIFIED"
+	atlasSolverCallEvidenceMode      = "SINGLE_PRIMARY_ATLAS_SOLVER_CALL_FORK_VERIFIED"
+	atlasCallbackProxyFrame          = "callback_proxy"
+	atlasSolverCallFrame             = "solver_call"
 	primaryProviderID                = "production-nownodes-arbitrum"
 	maximumReviewedInputWei          = "10000000000000000"
 	fixedReviewedSizeClassification  = "fixed_reviewed_size"
@@ -692,6 +695,15 @@ type simulationRequest struct {
 	DeadlineUnixSeconds       uint64 `json:"deadline_unix_seconds"`
 	AtlasMode                 bool   `json:"atlas_mode"`
 	AtlasBid                  string `json:"atlas_bid"`
+	// Mission §3.2 real-callback-frame support. Absent pointers preserve the
+	// legacy proxy semantics exactly; "solver_call" additionally requires an
+	// execution-environment address (bid recipient per PhoenixExecutor
+	// atlasSolverCall). The hunter does not yet possess a verifiable EE
+	// source (NEEDS-SOURCE U1/U2), so it never emits solver_call today.
+	AtlasFrame           *string `json:"atlas_frame,omitempty"`
+	ExecutionEnvironment *string `json:"ee_address,omitempty"`
+	BidToken             *string `json:"bid_token,omitempty"`
+	AtlasSolverOpDataHex *string `json:"atlas_solver_op_data_hex,omitempty"`
 }
 
 type simulationResponse struct {
@@ -717,6 +729,8 @@ type simulationResponse struct {
 	EstimatedMaxFeePerGasWei  string  `json:"estimated_max_fee_per_gas_wei"`
 	EstimatedExecutionCostWei string  `json:"estimated_execution_cost_wei"`
 	EstimatedL1CostWei        string  `json:"estimated_l1_cost_wei"`
+	MeasuredCallbackGasUsed   *uint64 `json:"measured_callback_gas_used,omitempty"`
+	CallbackRevertReason      *string `json:"callback_revert_reason,omitempty"`
 	FlashPremiumWei           string  `json:"flash_premium_wei"`
 	FlashPremiumDebtAsset     string  `json:"flash_premium_debt_asset"`
 	DeadlineUnixSeconds       uint64  `json:"deadline_unix_seconds"`
@@ -4052,6 +4066,25 @@ func profitEdgeReserve(expected, grossOutput *big.Int, reserveBPS uint64) (*big.
 	return reserve, conservative, minimumUnwind
 }
 
+// frameRequested returns the requested Atlas frame discriminator (""
+// preserves legacy proxy semantics).
+func frameRequested(request simulationRequest) string {
+	if request.AtlasFrame == nil {
+		return ""
+	}
+	return *request.AtlasFrame
+}
+
+// atlasExpectedEvidenceMode maps a requested Atlas frame to the ONLY
+// response evidence mode that can satisfy it. Proxy requests can never be
+// satisfied by real solver-call evidence and vice versa.
+func atlasExpectedEvidenceMode(request simulationRequest) string {
+	if frameRequested(request) == atlasSolverCallFrame {
+		return atlasSolverCallEvidenceMode
+	}
+	return atlasCallbackEvidenceMode
+}
+
 func (s *Screener) buildAtlasCandidate(
 	ctx context.Context,
 	record signal,
@@ -4064,6 +4097,13 @@ func (s *Screener) buildAtlasCandidate(
 	if strings.ToLower(selected.Liquidation.DebtAsset) != wethAddress {
 		return nil, atlasShadowReasonWethDebtRequired, nil
 	}
+	// Real solver-call frames require a verifiable execution-environment
+	// address as bid recipient. No authoritative EE source exists yet
+	// (NEEDS-SOURCE U1/U2 in .agent-private/atlas-bid-mission/
+	// section32-implementation-spec.md), so this hunter keeps requesting the
+	// callback_proxy frame; the gateway and isolated-fork harness exercise
+	// the real atlasSolverCall path until EE derivation lands. Never emit a
+	// fabricated EE to manufacture "real-frame" evidence.
 	// The gateway's atlas-mode fork re-simulation below is the authoritative
 	// callback-path evidence gate. The direct batch selection that produced
 	// `selected` necessarily carries direct/counterfactual fork evidence, so
@@ -4223,7 +4263,7 @@ func (s *Screener) simulateExact(ctx context.Context, record signal, liquidation
 }
 
 func (s *Screener) newSimulationRequest(record signal, liquidation *exactLiquidation, partial simulationRequest, deadline uint64, liveMaximumInput string) simulationRequest {
-	partial.SchemaVersion = "phoenix.rpc.aave-simulate-request.v4"
+	partial.SchemaVersion = "phoenix.rpc.aave-simulate-request.v5"
 	partial.ChainID = 42161
 	partial.RequestID = fmt.Sprintf("aave-sim-%d-%s-%s-%d", record.Cursor, liquidation.CollateralAsset, liquidation.RepayAmount, time.Now().UnixNano())
 	partial.BlockNumber = record.Block
@@ -4332,13 +4372,13 @@ func (s *Screener) simulateExactBatchChunk(ctx context.Context, record signal, s
 	expectedBatchEvidenceMode := directForkEvidenceMode
 	switch {
 	case atlasMode:
-		expectedBatchEvidenceMode = atlasCallbackEvidenceMode
+		expectedBatchEvidenceMode = atlasExpectedEvidenceMode(simulations[0])
 	case simulations[0].Counterfactual:
 		expectedBatchEvidenceMode = counterfactualForkEvidenceMode
 	}
 	requestID := fmt.Sprintf("aave-sim-batch-%d-%d", record.Cursor, time.Now().UnixNano())
 	batch := simulationBatchRequest{
-		SchemaVersion: "phoenix.rpc.aave-simulate-batch-request.v3",
+		SchemaVersion: "phoenix.rpc.aave-simulate-batch-request.v4",
 		ChainID:       42161,
 		RequestID:     requestID,
 		Simulations:   simulations,
@@ -4369,7 +4409,7 @@ func (s *Screener) simulateExactBatchChunk(ctx context.Context, record signal, s
 	if err := json.NewDecoder(io.LimitReader(response.Body, maximumResponse)).Decode(&result); err != nil {
 		return nil, err
 	}
-	if result.SchemaVersion != "phoenix.rpc.aave-simulate-batch-response.v4" || result.ChainID != 42161 || result.RequestID != requestID || result.BlockNumber != record.Block || result.BlockHash != record.BlockHash || result.StateRoot != record.StateRoot || result.PrimaryProviderID != primaryProviderID || result.ConfirmationProviderID != nil || result.Quorum != 1 || result.EvidenceMode != expectedBatchEvidenceMode || len(result.Results) != len(simulations) {
+	if result.SchemaVersion != "phoenix.rpc.aave-simulate-batch-response.v5" || result.ChainID != 42161 || result.RequestID != requestID || result.BlockNumber != record.Block || result.BlockHash != record.BlockHash || result.StateRoot != record.StateRoot || result.PrimaryProviderID != primaryProviderID || result.ConfirmationProviderID != nil || result.Quorum != 1 || result.EvidenceMode != expectedBatchEvidenceMode || len(result.Results) != len(simulations) {
 		return nil, errors.New("simulation batch evidence is incomplete")
 	}
 	outcomes := make([]simulationBatchOutcome, len(simulations))
@@ -4391,7 +4431,7 @@ func (s *Screener) simulateExactBatchChunk(ctx context.Context, record signal, s
 		}
 		expectedEvidenceMode := directForkEvidenceMode
 		if simulations[index].AtlasMode {
-			expectedEvidenceMode = atlasCallbackEvidenceMode
+			expectedEvidenceMode = atlasExpectedEvidenceMode(simulations[index])
 		} else if simulations[index].Counterfactual {
 			expectedEvidenceMode = counterfactualForkEvidenceMode
 		}
@@ -4404,7 +4444,7 @@ func (s *Screener) simulateExactBatchChunk(ctx context.Context, record signal, s
 }
 
 func validateSimulationResponse(result *simulationResponse, request *simulationRequest, record signal, expectedEvidenceMode string) error {
-	if result == nil || request == nil || result.SchemaVersion != "phoenix.rpc.aave-simulate-response.v5" || result.ChainID != 42161 || result.RequestID != request.RequestID || result.BlockNumber != record.Block || result.BlockHash != record.BlockHash || result.StateRoot != record.StateRoot || result.PrimaryProviderID != primaryProviderID || result.ConfirmationProviderID != nil || result.Quorum != 1 || result.EvidenceMode != expectedEvidenceMode || len(result.RouteID) != 66 || len(result.CalldataHash) != 64 || len(result.SimulationResultHash) != 64 || result.DeadlineUnixSeconds != request.DeadlineUnixSeconds {
+	if result == nil || request == nil || result.SchemaVersion != "phoenix.rpc.aave-simulate-response.v6" || result.ChainID != 42161 || result.RequestID != request.RequestID || result.BlockNumber != record.Block || result.BlockHash != record.BlockHash || result.StateRoot != record.StateRoot || result.PrimaryProviderID != primaryProviderID || result.ConfirmationProviderID != nil || result.Quorum != 1 || result.EvidenceMode != expectedEvidenceMode || len(result.RouteID) != 66 || len(result.CalldataHash) != 64 || len(result.SimulationResultHash) != 64 || result.DeadlineUnixSeconds != request.DeadlineUnixSeconds {
 		return errors.New("simulation evidence is incomplete")
 	}
 	calldata, err := hex.DecodeString(strings.TrimPrefix(result.CalldataHex, "0x"))
