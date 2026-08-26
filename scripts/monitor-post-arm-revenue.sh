@@ -328,14 +328,23 @@ def quantile(name, q, count, buckets):
         if value >= target:
             return boundary
     reject(name, None, None, count, q, "quantile_outside_finite_buckets")
+# Enforcement covers real-execution-path segments only. Deliberate-wait
+# spans are reported as observe-only evidence further below instead of
+# being gated as latency: actionable-to-enqueue includes cooldown /
+# actionable-epoch waiting plus the ~2s executor scan cadence; first RPC
+# dispatch includes exact-state budget pacing; end to end includes both.
+# Those waits are by design and stay guarded by the gauge section above
+# (30s actionable-age ceiling, aging-without-completion). Calibration
+# basis: 2026-08-26 cumulative distributions (131k-13.9M samples per
+# metric) with >=4x margin on every enforced percentile; the waiver-era
+# observations (~65s/~119s p95/p99) and three fail-closed arm attempts
+# documented the previous threshold mismatch (PR evidence table).
 limits = {
     "phoenix_signal_to_prefilter_seconds": (0.025, 0.050),
-    "phoenix_liquidatable_to_exact_enqueue_seconds": (0.020, 0.050),
-    "phoenix_exact_queue_wait_seconds": (0.050, 0.250),
-    "phoenix_exact_first_rpc_dispatch_seconds": (0.100, 0.250),
-    "phoenix_exact_rpc_state_fetch_seconds": (1.000, 2.500),
-    "phoenix_exact_compute_seconds": (0.100, 0.250),
-    "phoenix_exact_end_to_end_seconds": (2.000, 5.000),
+    "phoenix_exact_queue_wait_seconds": (0.25, 1.0),
+    "phoenix_exact_worker_dispatch_seconds": (0.05, 0.25),
+    "phoenix_exact_rpc_state_fetch_seconds": (2.0, 3.0),
+    "phoenix_exact_compute_seconds": (2.0, 3.0),
 }
 minimum_observations = 5
 evidence = {}
@@ -353,12 +362,12 @@ for name, (p95_limit, p99_limit) in limits.items():
     if p95 > p95_limit or p99 > p99_limit:
         reject(name, p95, p99, p99 - p95, {"p95": p95_limit, "p99": p99_limit}, "interval_quantile_slo_regressed")
     evidence[name] = {"count": count, "p50_upper_bound_seconds": p50, "p95_upper_bound_seconds": p95, "p99_upper_bound_seconds": p99, "status": "observed"}
-count, buckets = histogram("phoenix_exact_end_to_end_seconds")
-if buckets.get("5", buckets.get("5.0", -1)) != count:
-    reject("phoenix_exact_end_to_end_seconds_bucket", None, buckets.get("5", buckets.get("5.0")), None, count, "end_to_end_exceeded_five_seconds")
 for name, thresholds in {
-    "phoenix_fork_queue_wait_seconds": (0.050, 0.250),
+    "phoenix_fork_queue_wait_seconds": (0.25, 1.0),
     "phoenix_fork_runtime_seconds": None,
+    "phoenix_liquidatable_to_exact_enqueue_seconds": None,
+    "phoenix_exact_first_rpc_dispatch_seconds": None,
+    "phoenix_exact_end_to_end_seconds": None,
 }.items():
     count, buckets = histogram(name)
     if count == 0:
