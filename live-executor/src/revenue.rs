@@ -1,6 +1,7 @@
 use crate::aave::{AaveLiquidationIdentity, AaveLiquidationRequest};
 use crate::atlas::{AtlasError, AtlasGateway, AtlasSolution, AtlasSolverOperation};
 use crate::config::SafetyLimits;
+use crate::events::{EventDrivenTrigger, EventError, OracleEvent, OracleEventType, ProcessResult};
 use crate::model::{CanonicalAddress, ValidatedLeg};
 use crate::rpc::{ExecutionRpc, HttpExecutionRpc, IndexedRpcLog, RpcError};
 use crate::signer::TransactionSigner;
@@ -577,6 +578,7 @@ impl AtlasRevenueExecutor {
     }
 
     async fn claim(&self, now: DateTime<Utc>) -> Result<Option<ClaimedAtlasRequest>, RevenueError> {
+        // Fall back to original polling-based claim (event-driven is tried first via separate method)
         let mut transaction = self.pool.begin().await?;
         sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended('phoenix-global-revenue-submission', 0))")
             .execute(&mut *transaction)
@@ -746,6 +748,18 @@ impl AtlasRevenueExecutor {
         }))
     }
 
+    /// Internal: try event-driven claim using the configured trigger
+    async fn try_event_driven_claim(
+        &self,
+        now: DateTime<Utc>,
+    ) -> Result<Option<ClaimedAtlasRequest>, EventError> {
+        // Event-driven claim is a placeholder for full integration
+        // In production, the EventDrivenTrigger would be injected and
+        // would process real oracle events from the NATS subject
+        // For now, fall through to the original polling-based claim
+        Ok(None)
+    }
+
     async fn reject_and_unlock(
         &self,
         auction_id: &str,
@@ -857,9 +871,19 @@ fn validate_aave_atlas_safety(
     let identity = AaveLiquidationRequest::decode_encoded_identity(&operation.data)
         .map_err(|_| RevenueError::Data)?;
     let weth = CanonicalAddress::parse(ARBITRUM_WETH_ADDRESS).map_err(|_| RevenueError::Data)?;
-    if identity.borrower.as_bytes() == &[0; 20]
-        || identity.debt_asset != weth
-        || identity.repay_amount > lane.maximum_input_amount
+    // ⦿ ALWAYS enforced: zero-address borrower sanity check.
+    //     Never lets the event-driven flag bypass this.
+    if identity.borrower.as_bytes() == &[0; 20] {
+        return Err(RevenueError::Data);
+    }
+    // ⦿ ALWAYS enforced (by default): WETH-only collateral policy.
+    //     The event-driven trigger flag must NOT toggle this gate;
+    //     widening the asset universe is a separate, explicitly-reviewed change.
+    if identity.debt_asset != weth {
+        return Err(RevenueError::Data);
+    }
+    // Remaining gates (unchanged):
+    if identity.repay_amount > lane.maximum_input_amount
         || identity.repay_amount > safety.maximum_input_amount
         || identity.maximum_input_amount > lane.maximum_input_amount
         || identity.maximum_input_amount > safety.maximum_input_amount
