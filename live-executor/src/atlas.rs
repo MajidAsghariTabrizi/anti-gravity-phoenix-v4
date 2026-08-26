@@ -434,4 +434,158 @@ mod tests {
         let second = query_authorization_digest("auction-b", [3; 32], from).expect("digest");
         assert_ne!(first, second);
     }
+
+    // Mission §3.3 dry-run acceptance: a bid payload built from a recorded
+    // SVR PartialUserOperation shape (observer/model.go) must construct,
+    // sign, and pass Atlas validation rules OFFLINE — no gateway dial, no
+    // fork, no submission path exercised.
+    fn dry_run_fixture_operation(signer_address: CanonicalAddress) -> AtlasSolverOperation {
+        AtlasSolverOperation {
+            from: signer_address,
+            to: address(ARBITRUM_ATLAS_V1_6_4_ADDRESS),
+            value: U256::zero(),
+            gas: 500_000,
+            max_fee_per_gas: 5_000_000,
+            deadline: 49_000_000,
+            solver: address("0x1111111111111111111111111111111111111111"),
+            control: address(ARBITRUM_ATLAS_DAPP_CONTROL_ADDRESS),
+            user_op_hash: {
+                let mut hash = [0u8; 32];
+                hash[..31].copy_from_slice(&[0xa5; 31]);
+                hash[31] = 0x01;
+                hash
+            },
+            bid_token: None, // revenue.rs safety gate requires no bid token
+            bid_amount: 200_000,
+            data: vec![1u8, 2, 3, 4],
+        }
+    }
+
+    fn independent_eip712_digest(operation: &AtlasSolverOperation) -> [u8; 32] {
+        // Recomputed here from raw constants ONLY — deliberately does NOT
+        // call eip712_digest() so an accidental preimage drift fails loudly.
+        let verification =
+            CanonicalAddress::parse(ARBITRUM_ATLAS_VERIFICATION_V1_6_4_ADDRESS).expect("address");
+        let domain_type_hash = keccak256(
+            b"EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)",
+        );
+        let domain_separator = keccak256(ethabi::encode(&[
+            Token::FixedBytes(domain_type_hash.to_vec()),
+            Token::FixedBytes(keccak256(DOMAIN_NAME.as_bytes()).to_vec()),
+            Token::FixedBytes(keccak256(DOMAIN_VERSION.as_bytes()).to_vec()),
+            Token::Uint(U256::from(ARBITRUM_ONE_CHAIN_ID)),
+            Token::Address(ethabi::Address::from_slice(verification.as_bytes())),
+        ]));
+        let solver_type_hash = keccak256(
+            b"SolverOperation(address from,address to,uint256 value,uint256 gas,uint256 maxFeePerGas,uint256 deadline,address solver,address control,bytes32 userOpHash,address bidToken,uint256 bidAmount,bytes data)",
+        );
+        let bid_token = operation
+            .bid_token
+            .map(|value| ethabi::Address::from_slice(value.as_bytes()))
+            .unwrap_or_default();
+        let mut parts = Vec::new();
+        parts.extend_from_slice(solver_type_hash.as_slice());
+        parts.extend_from_slice(
+            ethabi::encode(&[
+                Token::Address(ethabi::Address::from_slice(operation.from.as_bytes())),
+                Token::Address(ethabi::Address::from_slice(operation.to.as_bytes())),
+                Token::Uint(operation.value),
+                Token::Uint(U256::from(operation.gas)),
+                Token::Uint(U256::from(operation.max_fee_per_gas)),
+                Token::Uint(U256::from(operation.deadline)),
+                Token::Address(ethabi::Address::from_slice(operation.solver.as_bytes())),
+                Token::Address(ethabi::Address::from_slice(operation.control.as_bytes())),
+                Token::FixedBytes(operation.user_op_hash.to_vec()),
+                Token::Address(bid_token),
+                Token::Uint(U256::from(operation.bid_amount)),
+                Token::FixedBytes(keccak256(&operation.data).to_vec()),
+            ])
+            .as_slice(),
+        );
+        let struct_hash = keccak256(&parts);
+        keccak256(
+            [
+                b"\x19\x01".as_slice(),
+                domain_separator.as_slice(),
+                struct_hash.as_slice(),
+            ]
+            .concat(),
+        )
+        .into()
+    }
+
+    #[test]
+    fn dry_run_fixture_binds_signs_and_matches_independent_digest() {
+        let signer = TransactionSigner::from_secret(&hex::encode([9u8; 32]), ARBITRUM_ONE_CHAIN_ID)
+            .expect("throwaway signer");
+        let mut operation = dry_run_fixture_operation(signer.address());
+
+        operation
+            .validate(
+                signer.address(),
+                operation.solver,
+                500_000,
+                5_000_000,
+                49_000_000,
+                200_000,
+            )
+            .expect("fixture passes Atlas validation bounds");
+        // Fail-closed negatives: one wei over the maximum bid, and a
+        // deadline that does not bind the exact auction.
+        let mut over_bid = operation.clone();
+        over_bid.bid_amount += 1;
+        assert!(matches!(
+            over_bid.validate(
+                signer.address(),
+                over_bid.solver,
+                500_000,
+                5_000_000,
+                49_000_000,
+                200_000,
+            ),
+            Err(AtlasError::InvalidOperation)
+        ));
+        let mut stale_deadline = operation.clone();
+        stale_deadline.deadline += 1;
+        assert!(matches!(
+            stale_deadline.validate(
+                signer.address(),
+                stale_deadline.solver,
+                500_000,
+                5_000_000,
+                49_000_000,
+                200_000,
+            ),
+            Err(AtlasError::InvalidOperation)
+        ));
+
+        let digest = operation.eip712_digest().expect("digest");
+        assert_eq!(digest, independent_eip712_digest(&operation));
+        let mut flipped = operation.clone();
+        flipped.bid_amount += 1;
+        assert_ne!(
+            flipped.eip712_digest().expect("flipped digest"),
+            digest,
+            "field change must move the preimage"
+        );
+
+        let signed = operation.sign(&signer).expect("signature");
+        assert_eq!(signed.signature.len(), 132);
+        assert!(signed.signature.ends_with("1b") || signed.signature.ends_with("1c"));
+        assert_eq!(signed.gas, "0x7a120");
+        assert_eq!(signed.value, "0x0");
+        assert_eq!(signed.bid_amount, "0x30d40");
+        assert_eq!(signed.bid_token, format!("0x{}", "0".repeat(40)));
+    }
+
+    #[test]
+    fn dry_run_fixture_with_bid_token_encodes_nonzero_address() {
+        let signer =
+            TransactionSigner::from_secret(&hex::encode([10u8; 32]), ARBITRUM_ONE_CHAIN_ID)
+                .expect("throwaway signer");
+        let mut operation = dry_run_fixture_operation(signer.address());
+        operation.bid_token = Some(address("0xaf88d065e77c8cc2239327c5edb3a432268e5831"));
+        let digest = operation.eip712_digest().expect("digest");
+        assert_eq!(digest, independent_eip712_digest(&operation));
+    }
 }

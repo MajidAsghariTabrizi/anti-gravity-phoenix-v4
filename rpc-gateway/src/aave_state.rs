@@ -5,10 +5,10 @@ pub const AAVE_SCREEN_REQUEST_SCHEMA: &str = "phoenix.rpc.aave-screen-request.v1
 pub const AAVE_SCREEN_RESPONSE_SCHEMA: &str = "phoenix.rpc.aave-screen-response.v2";
 pub const AAVE_EXACT_REQUEST_SCHEMA: &str = "phoenix.rpc.aave-exact-request.v3";
 pub const AAVE_EXACT_RESPONSE_SCHEMA: &str = "phoenix.rpc.aave-exact-response.v5";
-pub const AAVE_SIMULATE_REQUEST_SCHEMA: &str = "phoenix.rpc.aave-simulate-request.v4";
-pub const AAVE_SIMULATE_RESPONSE_SCHEMA: &str = "phoenix.rpc.aave-simulate-response.v5";
-pub const AAVE_SIMULATE_BATCH_REQUEST_SCHEMA: &str = "phoenix.rpc.aave-simulate-batch-request.v3";
-pub const AAVE_SIMULATE_BATCH_RESPONSE_SCHEMA: &str = "phoenix.rpc.aave-simulate-batch-response.v4";
+pub const AAVE_SIMULATE_REQUEST_SCHEMA: &str = "phoenix.rpc.aave-simulate-request.v5";
+pub const AAVE_SIMULATE_RESPONSE_SCHEMA: &str = "phoenix.rpc.aave-simulate-response.v6";
+pub const AAVE_SIMULATE_BATCH_REQUEST_SCHEMA: &str = "phoenix.rpc.aave-simulate-batch-request.v4";
+pub const AAVE_SIMULATE_BATCH_RESPONSE_SCHEMA: &str = "phoenix.rpc.aave-simulate-batch-response.v5";
 pub const AAVE_TAIL_REQUEST_SCHEMA: &str = "phoenix.rpc.aave-tail-request.v1";
 pub const AAVE_TAIL_RESPONSE_SCHEMA: &str = "phoenix.rpc.aave-tail-response.v2";
 pub const AAVE_PRIMARY_PROVIDER_ID: &str = "production-nownodes-arbitrum";
@@ -17,6 +17,33 @@ pub const SINGLE_PRIMARY_COUNTERFACTUAL_FORK_EVIDENCE: &str =
     "SINGLE_PRIMARY_COUNTERFACTUAL_FORK_VERIFIED";
 pub const SINGLE_PRIMARY_ATLAS_CALLBACK_FORK_EVIDENCE: &str =
     "SINGLE_PRIMARY_ATLAS_CALLBACK_FORK_VERIFIED";
+pub const SINGLE_PRIMARY_ATLAS_SOLVER_CALL_FORK_EVIDENCE: &str =
+    "SINGLE_PRIMARY_ATLAS_SOLVER_CALL_FORK_VERIFIED";
+/// Atlas solver-call frame labels. Absent frame => legacy callback semantics;
+/// any other value => reject (fail-close).
+pub const ATLAS_FRAME_CALLBACK_PROXY: &str = "callback_proxy";
+pub const ATLAS_FRAME_SOLVER_CALL: &str = "solver_call";
+
+/// Evidence-mode mapping keyed on (atlas_mode, atlas_frame). `solver_call` maps
+/// to the distinct real-frame constant; `callback_proxy` and absent frames keep
+/// the existing constants, so proxy evidence can never carry the solver-call
+/// mode string.
+pub fn expected_aave_simulate_evidence_mode(
+    atlas_mode: bool,
+    counterfactual: bool,
+    atlas_frame: Option<&str>,
+) -> &'static str {
+    if atlas_mode {
+        match atlas_frame {
+            Some(ATLAS_FRAME_SOLVER_CALL) => SINGLE_PRIMARY_ATLAS_SOLVER_CALL_FORK_EVIDENCE,
+            _ => SINGLE_PRIMARY_ATLAS_CALLBACK_FORK_EVIDENCE,
+        }
+    } else if counterfactual {
+        SINGLE_PRIMARY_COUNTERFACTUAL_FORK_EVIDENCE
+    } else {
+        SINGLE_PRIMARY_FORK_EVIDENCE
+    }
+}
 pub const AAVE_V3_POOL_ARBITRUM: &str = "0x794a61358d6845594f94dc1db02a252b5b4814ad";
 pub const ARBITRUM_WETH: &str = "0x82af49447d8a07e3bd95bd0d56f35241523fbab1";
 pub const ARBITRUM_NATIVE_USDC: &str = "0xaf88d065e77c8cc2239327c5edb3a432268e5831";
@@ -385,6 +412,14 @@ pub struct AaveSimulateRequest {
     pub deadline_unix_seconds: u64,
     pub atlas_mode: bool,
     pub atlas_bid: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub atlas_frame: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub atlas_solver_op_data_hex: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ee_address: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bid_token: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -413,6 +448,10 @@ pub struct AaveSimulateResponse {
     pub estimated_l1_cost_wei: String,
     pub flash_premium_wei: String,
     pub flash_premium_debt_asset: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub measured_callback_gas_used: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub callback_revert_reason: Option<String>,
     pub deadline_unix_seconds: u64,
     pub resolved_at_unix_ms: u64,
 }
@@ -711,6 +750,32 @@ impl AaveSimulateRequest {
         {
             return Err(AaveStateError::Invalid);
         }
+        // Atlas-frame fail-close pairing (§3.2): unknown frame values are
+        // rejected; `solver_call` requires a canonical execution-environment
+        // address; any explicit frame requires atlas mode; frame-less legacy
+        // requests must not carry solver-call-only fields.
+        let atlas_frame_pairing_valid = match self.atlas_frame.as_deref() {
+            None => self.ee_address.is_none(),
+            Some(ATLAS_FRAME_CALLBACK_PROXY) => self.atlas_mode && self.ee_address.is_none(),
+            Some(ATLAS_FRAME_SOLVER_CALL) => {
+                self.atlas_mode && self.ee_address.as_deref().is_some_and(canonical_address)
+            }
+            Some(_) => false,
+        };
+        if !atlas_frame_pairing_valid
+            || self
+                .atlas_solver_op_data_hex
+                .as_deref()
+                .is_some_and(|value| !canonical_data(value))
+            || self
+                .bid_token
+                .as_deref()
+                .is_some_and(|token| !canonical_address(token))
+            || (self.bid_token.is_some() && !(self.atlas_mode && self.atlas_frame.is_some()))
+            || (self.atlas_solver_op_data_hex.is_some() && !self.atlas_mode)
+        {
+            return Err(AaveStateError::Invalid);
+        }
         Ok(())
     }
 }
@@ -799,13 +864,11 @@ fn debt_to_weth_floor(
 impl AaveSimulateResponse {
     pub fn validate(&self, request: &AaveSimulateRequest) -> Result<(), AaveStateError> {
         request.validate()?;
-        let expected_evidence_mode = if request.atlas_mode {
-            SINGLE_PRIMARY_ATLAS_CALLBACK_FORK_EVIDENCE
-        } else if request.counterfactual {
-            SINGLE_PRIMARY_COUNTERFACTUAL_FORK_EVIDENCE
-        } else {
-            SINGLE_PRIMARY_FORK_EVIDENCE
-        };
+        let expected_evidence_mode = expected_aave_simulate_evidence_mode(
+            request.atlas_mode,
+            request.counterfactual,
+            request.atlas_frame.as_deref(),
+        );
         if self.schema_version != AAVE_SIMULATE_RESPONSE_SCHEMA
             || self.chain_id != request.chain_id
             || self.request_id != request.request_id
@@ -944,13 +1007,11 @@ impl AaveSimulateBatchResponse {
     pub fn validate(&self, request: &AaveSimulateBatchRequest) -> Result<(), AaveStateError> {
         request.validate()?;
         let first = &request.simulations[0];
-        let expected_evidence_mode = if first.atlas_mode {
-            SINGLE_PRIMARY_ATLAS_CALLBACK_FORK_EVIDENCE
-        } else if first.counterfactual {
-            SINGLE_PRIMARY_COUNTERFACTUAL_FORK_EVIDENCE
-        } else {
-            SINGLE_PRIMARY_FORK_EVIDENCE
-        };
+        let expected_evidence_mode = expected_aave_simulate_evidence_mode(
+            first.atlas_mode,
+            first.counterfactual,
+            first.atlas_frame.as_deref(),
+        );
         if self.schema_version != AAVE_SIMULATE_BATCH_RESPONSE_SCHEMA
             || self.chain_id != request.chain_id
             || self.request_id != request.request_id
@@ -1387,6 +1448,10 @@ mod tests {
             deadline_unix_seconds: 1_900_000_000,
             atlas_mode: false,
             atlas_bid: "0".to_string(),
+            atlas_frame: None,
+            atlas_solver_op_data_hex: None,
+            ee_address: None,
+            bid_token: None,
         };
         assert_eq!(request.validate(), Ok(()));
         request.executor_code_hash = format!("0x{}", "3".repeat(64));
@@ -1434,6 +1499,10 @@ mod tests {
             deadline_unix_seconds: 1_900_000_000,
             atlas_mode: true,
             atlas_bid: "1".to_string(),
+            atlas_frame: None,
+            atlas_solver_op_data_hex: None,
+            ee_address: None,
+            bid_token: None,
         };
         let response = AaveSimulateResponse {
             schema_version: AAVE_SIMULATE_RESPONSE_SCHEMA.to_string(),
@@ -1459,6 +1528,8 @@ mod tests {
             estimated_l1_cost_wei: "1000".to_string(),
             flash_premium_wei: "500".to_string(),
             flash_premium_debt_asset: "500".to_string(),
+            measured_callback_gas_used: None,
+            callback_revert_reason: None,
             deadline_unix_seconds: request.deadline_unix_seconds,
             resolved_at_unix_ms: 1,
         };
@@ -1467,6 +1538,186 @@ mod tests {
         request.atlas_bid = "0".to_string();
         assert_eq!(
             response.validate(&request),
+            Err(AaveStateError::ProviderDisagreement)
+        );
+    }
+
+    fn atlas_frame_request(atlas_mode: bool, atlas_frame: Option<&str>) -> AaveSimulateRequest {
+        AaveSimulateRequest {
+            schema_version: AAVE_SIMULATE_REQUEST_SCHEMA.to_string(),
+            chain_id: 42_161,
+            request_id: "atlas-frame-1".to_string(),
+            block_number: 49_000_000,
+            block_hash: format!("0x{}", "1".repeat(64)),
+            state_root: format!("0x{}", "2".repeat(64)),
+            executor_address: "0x1111111111111111111111111111111111111111".to_string(),
+            executor_code_hash: "3".repeat(64),
+            caller_address: "0x2222222222222222222222222222222222222222".to_string(),
+            release_sha: "4".repeat(40),
+            borrower: "0x3333333333333333333333333333333333333333".to_string(),
+            debt_asset: ARBITRUM_WETH.to_string(),
+            collateral_asset: "0xaf88d065e77c8cc2239327c5edb3a432268e5831".to_string(),
+            debt_asset_decimals: 18,
+            debt_asset_price_base: "200000000000".to_string(),
+            weth_price_base: "200000000000".to_string(),
+            repay_amount: "1000000".to_string(),
+            maximum_input_amount: "2000000".to_string(),
+            live_maximum_input_amount: "2000000".to_string(),
+            maximum_input_weth_wei: "2000000".to_string(),
+            live_maximum_input_weth_wei: "2000000".to_string(),
+            counterfactual: false,
+            minimum_collateral_received: "2000000".to_string(),
+            minimum_unwind_output: "1100000".to_string(),
+            minimum_profit: "10000".to_string(),
+            minimum_profit_weth_wei: "10000".to_string(),
+            expected_profit: "20000".to_string(),
+            retained_profit_floor: "1000".to_string(),
+            selected_pool: "0xc6962004f452be9203591991d15f6b388e09e8d0".to_string(),
+            selected_factory: "0x1f98431c8ad98523631ae4a59f267346ea31f984".to_string(),
+            selected_fee: 500,
+            zero_for_one: false,
+            gas_limit: 500_000,
+            max_fee_per_gas: "100".to_string(),
+            max_priority_fee_per_gas: "10".to_string(),
+            deadline_unix_seconds: 1_900_000_000,
+            atlas_mode,
+            atlas_bid: if atlas_mode {
+                "1".to_string()
+            } else {
+                "0".to_string()
+            },
+            atlas_frame: atlas_frame.map(str::to_string),
+            atlas_solver_op_data_hex: None,
+            ee_address: None,
+            bid_token: None,
+        }
+    }
+
+    fn atlas_frame_response(request: &AaveSimulateRequest) -> AaveSimulateResponse {
+        let response = AaveSimulateResponse {
+            schema_version: AAVE_SIMULATE_RESPONSE_SCHEMA.to_string(),
+            chain_id: request.chain_id,
+            request_id: request.request_id.clone(),
+            block_number: request.block_number,
+            block_hash: request.block_hash.clone(),
+            state_root: request.state_root.clone(),
+            primary_provider_id: AAVE_PRIMARY_PROVIDER_ID.to_string(),
+            confirmation_provider_id: None,
+            quorum: 1,
+            evidence_mode: expected_aave_simulate_evidence_mode(
+                request.atlas_mode,
+                request.counterfactual,
+                request.atlas_frame.as_deref(),
+            )
+            .to_string(),
+            route_id: format!("0x{}", "5".repeat(64)),
+            calldata_hex: "0x12345678".to_string(),
+            calldata_hash: "6".repeat(64),
+            simulation_result_hash: "7".repeat(64),
+            realized_profit: "20000".to_string(),
+            realized_profit_debt_asset: "20000".to_string(),
+            conservative_net_pnl: "15000".to_string(),
+            estimated_gas_limit: 100_000,
+            estimated_max_fee_per_gas_wei: "100".to_string(),
+            estimated_execution_cost_wei: "10000000".to_string(),
+            estimated_l1_cost_wei: "1000".to_string(),
+            flash_premium_wei: "500".to_string(),
+            flash_premium_debt_asset: "500".to_string(),
+            measured_callback_gas_used: None,
+            callback_revert_reason: None,
+            deadline_unix_seconds: request.deadline_unix_seconds,
+            resolved_at_unix_ms: 1,
+        };
+        assert_eq!(response.validate(request), Ok(()));
+        response
+    }
+
+    #[test]
+    fn solver_call_frame_requires_canonical_execution_environment_address() {
+        let mut request = atlas_frame_request(true, Some(ATLAS_FRAME_SOLVER_CALL));
+        assert_eq!(request.validate(), Err(AaveStateError::Invalid));
+        request.ee_address = Some("0x4444444444444444444444444444444444444444".to_string());
+        assert_eq!(request.validate(), Ok(()));
+        request.ee_address = Some("0x12".to_string());
+        assert_eq!(request.validate(), Err(AaveStateError::Invalid));
+        // An explicit callback_proxy frame is accepted under atlas mode but
+        // must not carry an execution-environment address.
+        let mut proxy = atlas_frame_request(true, Some(ATLAS_FRAME_CALLBACK_PROXY));
+        assert_eq!(proxy.validate(), Ok(()));
+        proxy.ee_address = Some("0x4444444444444444444444444444444444444444".to_string());
+        assert_eq!(proxy.validate(), Err(AaveStateError::Invalid));
+        // Solver-call pairing requires atlas mode.
+        let mut unbid = atlas_frame_request(false, Some(ATLAS_FRAME_SOLVER_CALL));
+        unbid.ee_address = Some("0x4444444444444444444444444444444444444444".to_string());
+        assert_eq!(unbid.validate(), Err(AaveStateError::Invalid));
+    }
+
+    #[test]
+    fn unknown_atlas_frame_value_and_frameless_pairing_fail_closed() {
+        let mut request = atlas_frame_request(true, Some(ATLAS_FRAME_SOLVER_CALL));
+        request.atlas_frame = Some("direct_call".to_string());
+        request.ee_address = Some("0x4444444444444444444444444444444444444444".to_string());
+        assert_eq!(request.validate(), Err(AaveStateError::Invalid));
+        // Legacy frame-less requests must not carry solver-call-only fields.
+        let mut legacy = atlas_frame_request(true, None);
+        legacy.ee_address = Some("0x4444444444444444444444444444444444444444".to_string());
+        assert_eq!(legacy.validate(), Err(AaveStateError::Invalid));
+        legacy = atlas_frame_request(false, None);
+        legacy.bid_token = Some(ARBITRUM_WETH.to_string());
+        assert_eq!(legacy.validate(), Err(AaveStateError::Invalid));
+        // Malformed op-data bytes are rejected even before parity wiring exists.
+        let mut tampered = atlas_frame_request(true, Some(ATLAS_FRAME_CALLBACK_PROXY));
+        tampered.atlas_solver_op_data_hex = Some("0xZZ".to_string());
+        assert_eq!(tampered.validate(), Err(AaveStateError::Invalid));
+    }
+
+    #[test]
+    fn evidence_mode_mapping_keeps_proxy_and_solver_call_distinct_end_to_end() {
+        assert_eq!(
+            expected_aave_simulate_evidence_mode(true, false, None),
+            SINGLE_PRIMARY_ATLAS_CALLBACK_FORK_EVIDENCE
+        );
+        assert_eq!(
+            expected_aave_simulate_evidence_mode(true, false, Some(ATLAS_FRAME_CALLBACK_PROXY)),
+            SINGLE_PRIMARY_ATLAS_CALLBACK_FORK_EVIDENCE
+        );
+        assert_eq!(
+            expected_aave_simulate_evidence_mode(true, false, Some(ATLAS_FRAME_SOLVER_CALL)),
+            SINGLE_PRIMARY_ATLAS_SOLVER_CALL_FORK_EVIDENCE
+        );
+        assert_eq!(
+            expected_aave_simulate_evidence_mode(false, true, None),
+            SINGLE_PRIMARY_COUNTERFACTUAL_FORK_EVIDENCE
+        );
+        assert_eq!(
+            expected_aave_simulate_evidence_mode(false, false, None),
+            SINGLE_PRIMARY_FORK_EVIDENCE
+        );
+
+        // End-to-end: a proxy/legacy-labelled response can never satisfy a
+        // solver_call request, and a real-frame-labelled response can never
+        // satisfy legacy proxy traffic.
+        let mut solver = atlas_frame_request(true, Some(ATLAS_FRAME_SOLVER_CALL));
+        solver.ee_address = Some("0x4444444444444444444444444444444444444444".to_string());
+        assert_eq!(solver.validate(), Ok(()));
+        let proxy_response_mode = SINGLE_PRIMARY_ATLAS_CALLBACK_FORK_EVIDENCE.to_string();
+        let mismatched_for_solver = AaveSimulateResponse {
+            evidence_mode: proxy_response_mode,
+            ..atlas_frame_response(&solver)
+        };
+        assert_eq!(
+            mismatched_for_solver.validate(&solver),
+            Err(AaveStateError::ProviderDisagreement)
+        );
+
+        let legacy = atlas_frame_request(true, None);
+        assert_eq!(legacy.validate(), Ok(()));
+        let real_labelled = AaveSimulateResponse {
+            evidence_mode: SINGLE_PRIMARY_ATLAS_SOLVER_CALL_FORK_EVIDENCE.to_string(),
+            ..atlas_frame_response(&legacy)
+        };
+        assert_eq!(
+            real_labelled.validate(&legacy),
             Err(AaveStateError::ProviderDisagreement)
         );
     }

@@ -164,7 +164,7 @@ class PhoenixExecutorRotationContextTests(unittest.TestCase):
 
     def test_successful_single_primary_simulation_is_the_only_spl_proof(self) -> None:
         request = {
-            "schema_version": "phoenix.rpc.aave-simulate-batch-request.v3",
+            "schema_version": "phoenix.rpc.aave-simulate-batch-request.v4",
             "chain_id": 42161,
             "request_id": "batch",
             "simulations": [{
@@ -173,13 +173,13 @@ class PhoenixExecutorRotationContextTests(unittest.TestCase):
             }],
         }
         response = {
-            "schema_version": "phoenix.rpc.aave-simulate-batch-response.v4",
+            "schema_version": "phoenix.rpc.aave-simulate-batch-response.v5",
             "chain_id": 42161, "request_id": "batch", "block_number": 1,
             "block_hash": "0x" + "a" * 64, "state_root": "0x" + "b" * 64,
             "primary_provider_id": "production-nownodes-arbitrum",
             "confirmation_provider_id": None, "quorum": 1,
             "evidence_mode": "SINGLE_PRIMARY_FORK_VERIFIED",
-            "results": [{"request_id": "item", "error": None, "response": {"schema_version": "phoenix.rpc.aave-simulate-response.v5", "request_id": "item"}}],
+            "results": [{"request_id": "item", "error": None, "response": {"schema_version": "phoenix.rpc.aave-simulate-response.v6", "request_id": "item"}}],
         }
         with tempfile.TemporaryDirectory() as raw:
             state = Path(raw) / "state.json"

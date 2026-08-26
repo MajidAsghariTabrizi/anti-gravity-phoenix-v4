@@ -3,7 +3,6 @@ package hunter
 import (
 	"context"
 	"math/big"
-	"strings"
 	"time"
 
 	"anti-gravity-phoenix-v4/atlas-observer/internal/observer"
@@ -57,23 +56,12 @@ type recentAuction struct {
 	evaluated bool
 }
 
+// recentAuctionFor returns the oldest pending auction whose oracle asset
+// matches either reserve address, symbol-aware via the verified alias table.
+// It delegates to pendingAuctionForReserves (auction_priority.go), which owns
+// the multi-slot registry semantics introduced by mission §3.1.
 func (s *Screener) recentAuctionFor(debtAsset, collateralAsset string) *observer.LedgerRecord {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if len(s.recentAuctions) == 0 {
-		return nil
-	}
-	debt := strings.ToLower(debtAsset)
-	collateral := strings.ToLower(collateralAsset)
-	for asset, entry := range s.recentAuctions {
-		if entry.evaluated {
-			continue
-		}
-		if asset == debt || asset == collateral {
-			return entry.record
-		}
-	}
-	return nil
+	return s.pendingAuctionForReserves(debtAsset, collateralAsset)
 }
 
 func (s *Screener) markAuctionEvaluated(auctionID string) {
