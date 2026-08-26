@@ -4083,7 +4083,7 @@ func TestAtlasAuctionShadowRegistryExpiryAndSupersession(t *testing.T) {
 	if len(sink.atlasShadowEvaluations) != 0 {
 		t.Fatalf("stored auction was classified before any borrower evaluation: %+v", sink.atlasShadowEvaluations)
 	}
-	if entry := screener.recentAuctions[strings.ToLower(weth)]; entry == nil || entry.record.AuctionID != "auction-1" || entry.evaluated {
+	if entry := screener.recentAuctions["auction-1"]; entry == nil || entry.record.AuctionID != "auction-1" || entry.evaluated {
 		t.Fatalf("valid auction was not stored for shadow evaluation: %+v", screener.recentAuctions)
 	}
 	second := &observer.LedgerRecord{
@@ -4095,13 +4095,40 @@ func TestAtlasAuctionShadowRegistryExpiryAndSupersession(t *testing.T) {
 	if err := screener.HandleAtlasAuction(context.Background(), second); err != nil {
 		t.Fatal(err)
 	}
-	if len(sink.atlasShadowEvaluations) != 1 ||
-		sink.atlasShadowEvaluations[0].AuctionID != "auction-1" ||
-		sink.atlasShadowEvaluations[0].TerminalRejectionReason != atlasShadowReasonSupersededWithoutEvaluation {
-		t.Fatalf("superseded auction was not classified: %+v", sink.atlasShadowEvaluations)
+	// Mission §3.1: ordinary arrival never supersedes a predecessor; both
+	// auctions stay pending for their asset.
+	if len(sink.atlasShadowEvaluations) != 0 {
+		t.Fatalf("second same-asset auction superseded its predecessor: %+v", sink.atlasShadowEvaluations)
 	}
-	if entry := screener.recentAuctions[strings.ToLower(weth)]; entry == nil || entry.record.AuctionID != "auction-2" {
-		t.Fatalf("latest auction did not replace its predecessor: %+v", screener.recentAuctions)
+	if entry := screener.recentAuctions["auction-1"]; entry == nil || entry.evaluated {
+		t.Fatalf("first auction was evicted by ordinary arrival: %+v", screener.recentAuctions)
+	}
+	if entry := screener.recentAuctions["auction-2"]; entry == nil {
+		t.Fatalf("latest auction was not retained: %+v", screener.recentAuctions)
+	}
+	// Bounded FIFO: overflowing maximumPendingAuctionsPerAsset evicts the
+	// OLDEST pending auction with the historical supersede classification.
+	for index := 3; index < maximumPendingAuctionsPerAsset+2; index++ {
+		id := fmt.Sprintf("burst-%d", index)
+		record := &observer.LedgerRecord{
+			RelevantAaveAuction: true, ChainID: 42161, AuctionID: id,
+			AuctionDeadlineBlock: "3000", SolverGasLimit: 20, OracleGasPriceWei: "10",
+			NotificationSHA256: strings.Repeat(fmt.Sprintf("%x", index%16), 64), ObservedAt: now,
+			OracleUpdate: &observer.OracleUpdate{Asset: &weth},
+		}
+		if err := screener.HandleAtlasAuction(context.Background(), record); err != nil {
+			t.Fatal(err)
+		}
+	}
+	supersededCount := 0
+	for _, evaluation := range sink.atlasShadowEvaluations {
+		if evaluation.TerminalRejectionReason == atlasShadowReasonSupersededWithoutEvaluation &&
+			evaluation.AuctionID == "auction-1" {
+			supersededCount++
+		}
+	}
+	if supersededCount != 1 {
+		t.Fatalf("cap overflow did not classify exactly the oldest auction as superseded: %+v", sink.atlasShadowEvaluations)
 	}
 	expired := &observer.LedgerRecord{
 		RelevantAaveAuction: true, ChainID: 42161, AuctionID: "auction-3",
@@ -5299,10 +5326,13 @@ func TestArbAuctionAttachesWithUppercaseOracleAsset(t *testing.T) {
 	if evaluation.Asset != uppercase {
 		t.Fatalf("shadow row did not preserve the live asset form: %+v", evaluation)
 	}
-	if _, present := screener.recentAuctions[arbAuctionAssetSymbol]; !present {
-		t.Fatalf("uppercase ARB auction was not registered under the normalized key")
+	if _, present := screener.recentAuctions[arbSymbolID("arb-auction-5")]; !present {
+		t.Fatalf("uppercase ARB auction was not registered under its auction ID")
 	}
 }
+
+// arbSymbolID is a tiny helper keeping ID-keyed registry assertions readable.
+func arbSymbolID(id string) string { return id }
 
 func TestArbAuctionLazyAttachClaimsOnce(t *testing.T) {
 	now := time.Date(2026, 8, 13, 1, 0, 0, 0, time.UTC)
@@ -5344,12 +5374,12 @@ func TestArbAuctionLazyAttachClaimsOnce(t *testing.T) {
 	if len(sink.atlasShadowEvaluations) != 1 {
 		t.Fatalf("lazy ARB attach did not record exactly once: %+v", sink.atlasShadowEvaluations)
 	}
-	if !screener.recentAuctions[arbAuctionAssetSymbol].evaluated {
-		t.Fatalf("lazy ARB attach did not mark the auction evaluated")
+	if entry := screener.recentAuctions["arb-auction-2"]; entry == nil || !entry.evaluated {
+		t.Fatalf("lazy ARB attach did not mark the auction evaluated in place")
 	}
 }
 
-func TestArbAuctionSupersedesWithoutBorrower(t *testing.T) {
+func TestArbAuctionRetainsBothAndClaimsOldest(t *testing.T) {
 	now := time.Date(2026, 8, 13, 2, 0, 0, 0, time.UTC)
 	sink := &recordingSignalSink{}
 	arb := arbAuctionAssetSymbol
@@ -5379,13 +5409,20 @@ func TestArbAuctionSupersedesWithoutBorrower(t *testing.T) {
 	if err := screener.HandleAtlasAuction(context.Background(), second); err != nil {
 		t.Fatal(err)
 	}
-	if len(sink.atlasShadowEvaluations) != 1 ||
-		sink.atlasShadowEvaluations[0].AuctionID != "arb-auction-3" ||
-		sink.atlasShadowEvaluations[0].TerminalRejectionReason != atlasShadowReasonSupersededWithoutEvaluation {
-		t.Fatalf("ARB supersession without borrower was misclassified: %+v", sink.atlasShadowEvaluations)
+	// Mission §3.1: ordinary arrival retains BOTH auctions; no supersede
+	// classification without bounded-FIFO overflow.
+	if len(sink.atlasShadowEvaluations) != 0 {
+		t.Fatalf("second ARB auction superseded its predecessor: %+v", sink.atlasShadowEvaluations)
 	}
-	if entry := screener.recentAuctions[arbAuctionAssetSymbol]; entry == nil || entry.record.AuctionID != "arb-auction-4" {
-		t.Fatalf("latest ARB auction did not replace its predecessor: %+v", screener.recentAuctions)
+	if screener.recentAuctions["arb-auction-3"] == nil || screener.recentAuctions["arb-auction-4"] == nil {
+		t.Fatalf("ARB FIFO retention lost a pending auction: %+v", screener.recentAuctions)
+	}
+	claimed := screener.claimPendingArbAuction()
+	if claimed == nil || claimed.AuctionID != "arb-auction-3" {
+		t.Fatalf("claim did not return the OLDEST pending ARB auction: %+v", claimed)
+	}
+	if again := screener.claimPendingArbAuction(); again == nil || again.AuctionID != "arb-auction-4" {
+		t.Fatalf("second claim did not advance the FIFO: %+v", again)
 	}
 }
 

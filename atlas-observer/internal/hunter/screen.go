@@ -236,35 +236,45 @@ type State struct {
 }
 
 type Screener struct {
-	config                 Config
-	client                 *http.Client
-	batchClient            *http.Client
-	operationMu            sync.Mutex
-	mu                     sync.Mutex
-	state                  State
-	debtBearing            map[string]bool
-	refreshKnown           map[string]bool
-	refreshOrder           []string
-	refreshCursor          int
-	hotBorrowers           map[string]string
-	hotDebtBase            map[string]string
-	hotUpperPositive       map[string]bool
-	latestOutcome          map[string]string
-	lastExactAt            map[string]time.Time
-	firstLiquidatableAt    map[string]time.Time
-	firstLiquidatableMono  map[string]time.Time
-	recentAuctions         map[string]*recentAuction
-	arbBorrowers           map[string]arbBorrowerEntry
-	lastExactAdmissionAt   time.Time
-	hasDurableAdmission    bool
-	exactInFlight          uint64
-	exactInFlightBorrowers map[string]bool
-	exactWorkerSlots       chan struct{}
-	exactForkSlots         chan struct{}
-	exactForkSlotsOnce     sync.Once
-	exactWorkerStarts      atomic.Uint64
-	wait                   func(context.Context, time.Duration) bool
-	now                    func() time.Time
+	config                Config
+	client                *http.Client
+	batchClient           *http.Client
+	operationMu           sync.Mutex
+	mu                    sync.Mutex
+	state                 State
+	debtBearing           map[string]bool
+	refreshKnown          map[string]bool
+	refreshOrder          []string
+	refreshCursor         int
+	hotBorrowers          map[string]string
+	hotDebtBase           map[string]string
+	hotUpperPositive      map[string]bool
+	latestOutcome         map[string]string
+	lastExactAt           map[string]time.Time
+	firstLiquidatableAt   map[string]time.Time
+	firstLiquidatableMono map[string]time.Time
+	// Auctions pending shadow evaluation, keyed by AuctionID with bounded
+	// FIFO per-asset order (mission §3.1: one-slot-per-asset replacement was
+	// the dominant superseded_without_evaluation cause).
+	recentAuctions     map[string]*recentAuction
+	recentAuctionOrder map[string][]string
+	// Queued oracle assets needing priority borrower screening (auction-
+	// triggered admission; bounded, deduplicated; signal-only).
+	pendingAuctionTriggerAssets []string
+	// By-reserve-asset borrower exposure evidence indexed from exact
+	// responses (see auction_priority.go).
+	reserveBorrowersByAsset map[string]map[string]*reserveBorrowerEntry
+	arbBorrowers            map[string]arbBorrowerEntry
+	lastExactAdmissionAt    time.Time
+	hasDurableAdmission     bool
+	exactInFlight           uint64
+	exactInFlightBorrowers  map[string]bool
+	exactWorkerSlots        chan struct{}
+	exactForkSlots          chan struct{}
+	exactForkSlotsOnce      sync.Once
+	exactWorkerStarts       atomic.Uint64
+	wait                    func(context.Context, time.Duration) bool
+	now                     func() time.Time
 }
 
 type exactEvaluationTracker struct {
@@ -1095,6 +1105,13 @@ func (s *Screener) runPriorityRecheckWindow(ctx context.Context, window time.Dur
 			}
 		}
 
+		// Auction-priority admission wakes the window immediately: a stored
+		// pending auction needs its affected borrowers screened before the
+		// auction deadline, not on the next periodic cadence.
+		if s.pendingAuctionTriggerCount() > 0 {
+			waitFor = 0
+		}
+
 		periodicHotDue := elapsed >= nextHotAt
 		hotDue := periodicHotDue
 		if !hotDue {
@@ -1111,6 +1128,27 @@ func (s *Screener) runPriorityRecheckWindow(ctx context.Context, window time.Dur
 			if !periodicHotDue {
 				// An eligibility wake consumes the next ordinary hot poll rather
 				// than adding a provider request to the priority window.
+				nextHotAt += hotRevisitCadence
+			}
+		}
+
+		auctionWorked, auctionErr := s.runAuctionPriority(ctx)
+		if auctionErr != nil {
+			if errors.Is(auctionErr, errPriorityWindowStopped) || ctx.Err() != nil {
+				return errPriorityWindowStopped
+			}
+			retryable, recordErr := s.RecordRetryableGatewayError(auctionErr)
+			if recordErr != nil {
+				return recordErr
+			}
+			if !retryable {
+				return auctionErr
+			}
+		}
+		if auctionWorked && !hotDue && !tailDue {
+			// A triggered screen consumed provider budget; do not also spend
+			// the next ordinary hot poll inside this window.
+			if elapsed >= nextHotAt-hotRevisitCadence {
 				nextHotAt += hotRevisitCadence
 			}
 		}
@@ -1838,35 +1876,62 @@ func (s *Screener) HandleAtlasAuction(ctx context.Context, auction *observer.Led
 	if s.recentAuctions == nil {
 		s.recentAuctions = make(map[string]*recentAuction)
 	}
+	if s.recentAuctionOrder == nil {
+		s.recentAuctionOrder = make(map[string][]string)
+	}
 	asset := strings.ToLower(*auction.OracleUpdate.Asset)
 	currentBlock := s.state.LastBlockNumber
 	var superseded []*observer.LedgerRecord
 	var expired []*observer.LedgerRecord
-	for key, entry := range s.recentAuctions {
+	// Deadline expiry pruning across every pending auction (asset-agnostic).
+	for id, entry := range s.recentAuctions {
 		if entry.evaluated {
-			continue
-		}
-		if key == asset {
-			superseded = append(superseded, entry.record)
 			continue
 		}
 		entryDeadline, ok := newUint64(entry.record.AuctionDeadlineBlock)
 		if ok && entryDeadline <= currentBlock {
 			expired = append(expired, entry.record)
-		}
-	}
-	for _, entry := range superseded {
-		delete(s.recentAuctions, strings.ToLower(*entry.OracleUpdate.Asset))
-	}
-	for _, entry := range expired {
-		for key, candidate := range s.recentAuctions {
-			if !candidate.evaluated && candidate.record.AuctionID == entry.AuctionID {
-				delete(s.recentAuctions, key)
-				break
+			delete(s.recentAuctions, id)
+			if entry.record.OracleUpdate != nil && entry.record.OracleUpdate.Asset != nil {
+				expiredAsset := strings.ToLower(*entry.record.OracleUpdate.Asset)
+				filtered := s.recentAuctionOrder[expiredAsset][:0]
+				for _, orderedID := range s.recentAuctionOrder[expiredAsset] {
+					if orderedID != id {
+						filtered = append(filtered, orderedID)
+					}
+				}
+				s.recentAuctionOrder[expiredAsset] = filtered
 			}
 		}
 	}
-	s.recentAuctions[asset] = &recentAuction{record: auction}
+	// Bounded FIFO retention per asset: ordinary arrival NEVER supersedes a
+	// predecessor; only overflow of maximumPendingAuctionsPerAsset evicts the
+	// oldest pending auction for that asset. Already-evaluated IDs are
+	// dropped opportunistically so they never consume retention slots.
+	order := s.recentAuctionOrder[asset][:0]
+	for _, orderedID := range s.recentAuctionOrder[asset] {
+		if entry, present := s.recentAuctions[orderedID]; present && !entry.evaluated {
+			order = append(order, orderedID)
+		}
+	}
+	if _, duplicate := s.recentAuctions[auction.AuctionID]; !duplicate {
+		order = append(order, auction.AuctionID)
+	}
+	for len(order) > maximumPendingAuctionsPerAsset {
+		evictedID := order[0]
+		order = order[1:]
+		if entry, present := s.recentAuctions[evictedID]; present && !entry.evaluated {
+			superseded = append(superseded, entry.record)
+		}
+		delete(s.recentAuctions, evictedID)
+	}
+	s.recentAuctionOrder[asset] = order
+	if _, duplicate := s.recentAuctions[auction.AuctionID]; !duplicate {
+		s.recentAuctions[auction.AuctionID] = &recentAuction{record: auction}
+	}
+	// Auction-priority admission: queue the asset so the priority window
+	// screens indexed affected borrowers through the unchanged screen path.
+	s.queueAuctionTriggerLocked(asset)
 	s.mu.Unlock()
 	for _, entry := range superseded {
 		if err := s.recordAtlasShadow(ctx, atlasShadowTerminal(entry, true, true, atlasShadowReasonSupersededWithoutEvaluation)); err != nil {
@@ -2923,6 +2988,7 @@ func (s *Screener) resolveExact(ctx context.Context, record signal, auction *obs
 	// ARB auctions can attach to real liquidatable ARB-debt borrowers; this
 	// never affects the direct lane decision.
 	s.indexArbDebtEvidence(record.Borrower, result.BlockNumber, result.BlockHash, result.Primary.Account, result.Primary.Reserves)
+	s.indexReserveEvidence(record.Borrower, result.BlockNumber, result.BlockHash, result.Primary.Account, result.Primary.Reserves)
 	if err := s.attachPendingArbAuction(ctx); err != nil {
 		return record, err
 	}
@@ -2989,7 +3055,7 @@ func (s *Screener) resolveExact(ctx context.Context, record signal, auction *obs
 	}
 	attachedAuction := auction
 	if attachedAuction == nil {
-		attachedAuction = s.recentAuctionFor(selected.Liquidation.DebtAsset, selected.Liquidation.CollateralAsset)
+		attachedAuction = s.pendingAuctionForReserves(selected.Liquidation.DebtAsset, selected.Liquidation.CollateralAsset)
 	}
 	if attachedAuction != nil && strings.ToLower(selected.Liquidation.DebtAsset) == wethAddress {
 		// Independent Atlas SHADOW evaluation. The direct liquidation path

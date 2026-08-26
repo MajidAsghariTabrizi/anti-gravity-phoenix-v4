@@ -201,23 +201,34 @@ func (s *Screener) bestArbBorrower() (arbBorrowerEntry, bool) {
 	return best, found
 }
 
-// claimPendingArbAuction atomically marks a pending ARB auction evaluated
-// and returns it, or nil when none is pending. Marking before recording
-// prevents double records from concurrent exact workers.
+// claimPendingArbAuction atomically marks the OLDEST pending ARB auction
+// evaluated and returns it, or nil when none is pending. The registry is
+// keyed by AuctionID with bounded FIFO per asset (mission §3.1); claiming
+// before recording prevents double records from concurrent exact workers.
 func (s *Screener) claimPendingArbAuction() *observer.LedgerRecord {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	for key, entry := range s.recentAuctions {
-		if entry.evaluated {
+	var oldest *recentAuction
+	for _, entry := range s.recentAuctions {
+		if entry.evaluated || entry.record == nil {
 			continue
 		}
+		if entry.record.OracleUpdate == nil || entry.record.OracleUpdate.Asset == nil {
+			continue
+		}
+		key := strings.ToLower(*entry.record.OracleUpdate.Asset)
 		if key != arbAuctionAssetSymbol && key != arbAddress {
 			continue
 		}
-		entry.evaluated = true
-		return entry.record
+		if oldest == nil || entry.record.ObservedAt.Before(oldest.record.ObservedAt) {
+			oldest = entry
+		}
 	}
-	return nil
+	if oldest == nil {
+		return nil
+	}
+	oldest.evaluated = true
+	return oldest.record
 }
 
 // arbAuctionShadowEvaluation builds the evidence-only shadow record for an
