@@ -190,7 +190,7 @@ def simulation_request(plan: dict, provenance: dict, exact: dict) -> dict:
         raise ValueError("ROTATION_SPL_ECONOMICS_INVALID")
     request_id = f"phoenix-executor-rotation-sim-{uuid.uuid4().hex}"
     simulation = {
-        "schema_version": "phoenix.rpc.aave-simulate-request.v4",
+        "schema_version": "phoenix.rpc.aave-simulate-request.v5",
         "chain_id": 42161,
         "request_id": request_id,
         "block_number": exact["block_number"], "block_hash": exact["block_hash"], "state_root": exact["state_root"],
@@ -210,7 +210,7 @@ def simulation_request(plan: dict, provenance: dict, exact: dict) -> dict:
         "max_fee_per_gas": "10000000000", "max_priority_fee_per_gas": "1000000000",
         "deadline_unix_seconds": int(time.time()) + 120, "atlas_mode": False, "atlas_bid": "0",
     }
-    return {"schema_version": "phoenix.rpc.aave-simulate-batch-request.v3", "chain_id": 42161, "request_id": f"batch-{request_id}", "simulations": [simulation]}
+    return {"schema_version": "phoenix.rpc.aave-simulate-batch-request.v4", "chain_id": 42161, "request_id": f"batch-{request_id}", "simulations": [simulation]}
 
 
 def verify_simulation(request: dict, response: dict, provenance_path: Path, plan: dict) -> None:
@@ -219,7 +219,7 @@ def verify_simulation(request: dict, response: dict, provenance_path: Path, plan
     sim = request["simulations"][0]
     results = response.get("results")
     if (
-        response.get("schema_version") != "phoenix.rpc.aave-simulate-batch-response.v4"
+        response.get("schema_version") != "phoenix.rpc.aave-simulate-batch-response.v5"
         or response.get("chain_id") != 42161 or response.get("request_id") != request.get("request_id")
         or response.get("block_number") != sim.get("block_number") or response.get("block_hash") != sim.get("block_hash")
         or response.get("state_root") != sim.get("state_root")
@@ -232,7 +232,7 @@ def verify_simulation(request: dict, response: dict, provenance_path: Path, plan
     ):
         raise ValueError("ROTATION_SPL_PROOF_FAILED")
     item = results[0]["response"]
-    if item.get("schema_version") != "phoenix.rpc.aave-simulate-response.v5" or item.get("request_id") != sim.get("request_id"):
+    if item.get("schema_version") != "phoenix.rpc.aave-simulate-response.v6" or item.get("request_id") != sim.get("request_id"):
         raise ValueError("ROTATION_SPL_PROOF_FAILED")
     provenance["pre_cutover_spl_absent"] = True
     write_json(provenance_path, provenance)

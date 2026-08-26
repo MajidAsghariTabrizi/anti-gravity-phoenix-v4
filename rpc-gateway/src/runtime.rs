@@ -1,14 +1,14 @@
 use crate::aave_state::{
-    AaveAccountData, AaveExactLiquidationState, AaveExactProviderState, AaveExactRequest,
-    AaveExactReserveState, AaveExactResponse, AaveExactUnwindQuoteState, AavePrimaryScreenResponse,
-    AaveProviderScreen, AaveScreenRequest, AaveScreenResponse, AaveSimulateBatchError,
-    AaveSimulateBatchRequest, AaveSimulateBatchResponse, AaveSimulateBatchResult,
-    AaveSimulateRequest, AaveSimulateResponse, AaveTailRequest, AaveTailResponse, SizeLevel,
-    AAVE_EXACT_RESPONSE_SCHEMA, AAVE_PRIMARY_PROVIDER_ID, AAVE_PRIMARY_SCREEN_RESPONSE_SCHEMA,
-    AAVE_SCREEN_RESPONSE_SCHEMA, AAVE_SIMULATE_BATCH_RESPONSE_SCHEMA,
-    AAVE_SIMULATE_RESPONSE_SCHEMA, AAVE_TAIL_RESPONSE_SCHEMA, AAVE_V3_POOL_ARBITRUM,
-    MAXIMUM_REVIEWED_INPUT_WEI, SINGLE_PRIMARY_ATLAS_CALLBACK_FORK_EVIDENCE,
-    SINGLE_PRIMARY_COUNTERFACTUAL_FORK_EVIDENCE, SINGLE_PRIMARY_FORK_EVIDENCE,
+    expected_aave_simulate_evidence_mode, AaveAccountData, AaveExactLiquidationState,
+    AaveExactProviderState, AaveExactRequest, AaveExactReserveState, AaveExactResponse,
+    AaveExactUnwindQuoteState, AavePrimaryScreenResponse, AaveProviderScreen, AaveScreenRequest,
+    AaveScreenResponse, AaveSimulateBatchError, AaveSimulateBatchRequest,
+    AaveSimulateBatchResponse, AaveSimulateBatchResult, AaveSimulateRequest, AaveSimulateResponse,
+    AaveTailRequest, AaveTailResponse, SizeLevel, AAVE_EXACT_RESPONSE_SCHEMA,
+    AAVE_PRIMARY_PROVIDER_ID, AAVE_PRIMARY_SCREEN_RESPONSE_SCHEMA, AAVE_SCREEN_RESPONSE_SCHEMA,
+    AAVE_SIMULATE_BATCH_RESPONSE_SCHEMA, AAVE_SIMULATE_RESPONSE_SCHEMA, AAVE_TAIL_RESPONSE_SCHEMA,
+    AAVE_V3_POOL_ARBITRUM, ATLAS_FRAME_CALLBACK_PROXY, ATLAS_FRAME_SOLVER_CALL,
+    MAXIMUM_REVIEWED_INPUT_WEI,
 };
 use crate::budget::GlobalBudget;
 use crate::cache::TtlCache;
@@ -1323,13 +1323,12 @@ impl GatewayRuntime {
             primary_provider_id: primary.provider_id().to_string(),
             confirmation_provider_id: None,
             quorum: 1,
-            evidence_mode: if first.atlas_mode {
-                SINGLE_PRIMARY_ATLAS_CALLBACK_FORK_EVIDENCE.to_string()
-            } else if first.counterfactual {
-                SINGLE_PRIMARY_COUNTERFACTUAL_FORK_EVIDENCE.to_string()
-            } else {
-                SINGLE_PRIMARY_FORK_EVIDENCE.to_string()
-            },
+            evidence_mode: expected_aave_simulate_evidence_mode(
+                first.atlas_mode,
+                first.counterfactual,
+                first.atlas_frame.as_deref(),
+            )
+            .to_string(),
             results,
             resolved_at_unix_ms: unix_time_ms(),
         };
@@ -4245,13 +4244,12 @@ fn build_aave_simulation_response(
         primary_provider_id: primary_provider_id.to_string(),
         confirmation_provider_id: None,
         quorum: 1,
-        evidence_mode: if request.atlas_mode {
-            SINGLE_PRIMARY_ATLAS_CALLBACK_FORK_EVIDENCE.to_string()
-        } else if request.counterfactual {
-            SINGLE_PRIMARY_COUNTERFACTUAL_FORK_EVIDENCE.to_string()
-        } else {
-            SINGLE_PRIMARY_FORK_EVIDENCE.to_string()
-        },
+        evidence_mode: expected_aave_simulate_evidence_mode(
+            request.atlas_mode,
+            request.counterfactual,
+            request.atlas_frame.as_deref(),
+        )
+        .to_string(),
         route_id: route_id.to_string(),
         calldata_hex,
         calldata_hash,
@@ -4265,6 +4263,8 @@ fn build_aave_simulation_response(
         estimated_l1_cost_wei: estimated_l1_cost.to_string(),
         flash_premium_wei: flash_premium.to_string(),
         flash_premium_debt_asset: flash_premium_debt_asset.to_string(),
+        measured_callback_gas_used: None,
+        callback_revert_reason: None,
         deadline_unix_seconds: request.deadline_unix_seconds,
         resolved_at_unix_ms: unix_time_ms(),
     };
@@ -4299,6 +4299,15 @@ fn validate_aave_simulation_identity(request: &AaveSimulateRequest) -> Result<()
             false
         };
     let atlas_bid = decimal_u256(&request.atlas_bid)?;
+    // Atlas-frame pairing (§3.2): unknown frames fail closed; solver_call
+    // requires an execution-environment address; explicit frames require atlas
+    // mode; frame-less requests stay on the legacy XOR rule unchanged.
+    let atlas_frame_pairing_valid = match request.atlas_frame.as_deref() {
+        None => request.ee_address.is_none(),
+        Some(ATLAS_FRAME_CALLBACK_PROXY) => request.atlas_mode && request.ee_address.is_none(),
+        Some(ATLAS_FRAME_SOLVER_CALL) => request.atlas_mode && request.ee_address.is_some(),
+        Some(_) => false,
+    };
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_err(|_| GatewayError::InvalidRequest)?
@@ -4306,6 +4315,7 @@ fn validate_aave_simulation_identity(request: &AaveSimulateRequest) -> Result<()
     if !matches!(request.debt_asset.as_str(), ARBITRUM_WETH | ARBITRUM_USDC_E)
         || !route_valid
         || request.atlas_mode == atlas_bid.is_zero()
+        || !atlas_frame_pairing_valid
         || request.deadline_unix_seconds <= now
         || request.deadline_unix_seconds > now.saturating_add(120)
     {
@@ -4315,7 +4325,7 @@ fn validate_aave_simulation_identity(request: &AaveSimulateRequest) -> Result<()
 }
 
 fn aave_simulation_route_id(request: &AaveSimulateRequest) -> Result<String, GatewayError> {
-    let encoded = serde_json::to_vec(&json!({
+    let mut encoded_request = json!({
         "schema": "phoenix.aave-liquidation-route-identity.v1",
         "block_number": request.block_number,
         "block_hash": request.block_hash,
@@ -4346,8 +4356,23 @@ fn aave_simulation_route_id(request: &AaveSimulateRequest) -> Result<String, Gat
         "atlas_mode": request.atlas_mode,
         "atlas_bid": request.atlas_bid,
         "release_sha": request.release_sha
-    }))
-    .map_err(|_| GatewayError::ProviderIntegrity)?;
+    });
+    // New v5 identity fields are inserted only when present so legacy frame-less
+    // requests keep byte-identical route ids (serde_json maps sort keys).
+    if let Some(frame) = request.atlas_frame.as_deref() {
+        encoded_request["atlas_frame"] = json!(frame);
+    }
+    if let Some(op_data) = request.atlas_solver_op_data_hex.as_deref() {
+        encoded_request["atlas_solver_op_data_hex"] = json!(op_data);
+    }
+    if let Some(ee_address) = request.ee_address.as_deref() {
+        encoded_request["ee_address"] = json!(ee_address);
+    }
+    if let Some(bid_token) = request.bid_token.as_deref() {
+        encoded_request["bid_token"] = json!(bid_token);
+    }
+    let encoded =
+        serde_json::to_vec(&encoded_request).map_err(|_| GatewayError::ProviderIntegrity)?;
     Ok(format!("0x{}", canonical_hash_bytes(&encoded)))
 }
 
@@ -6443,6 +6468,10 @@ mod tests {
                 deadline_unix_seconds: deadline,
                 atlas_mode: false,
                 atlas_bid: "0".to_string(),
+                atlas_frame: None,
+                atlas_solver_op_data_hex: None,
+                ee_address: None,
+                bid_token: None,
             })
             .collect();
         AaveSimulateBatchRequest {
@@ -7884,6 +7913,10 @@ mod tests {
             deadline_unix_seconds: now + 60,
             atlas_mode: false,
             atlas_bid: "0".to_string(),
+            atlas_frame: None,
+            atlas_solver_op_data_hex: None,
+            ee_address: None,
+            bid_token: None,
         };
         validate_aave_simulation_identity(&request).unwrap();
         let route_id = aave_simulation_route_id(&request).unwrap();
@@ -8246,6 +8279,10 @@ mod tests {
             deadline_unix_seconds: now + 60,
             atlas_mode: false,
             atlas_bid: "0".to_string(),
+            atlas_frame: None,
+            atlas_solver_op_data_hex: None,
+            ee_address: None,
+            bid_token: None,
         }
     }
 
