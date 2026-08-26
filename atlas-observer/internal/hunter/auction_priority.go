@@ -395,7 +395,11 @@ func (s *Screener) pendingAuctionForReserves(debtAsset, collateralAsset string) 
 			key != debt && key != collateral {
 			continue
 		}
-		if oldest == nil || entry.record.ObservedAt.Before(oldestObserved) {
+		// Same deterministic total order as claimPendingArbAuction:
+		// ObservedAt, then AuctionID ascending for timestamp ties.
+		if oldest == nil ||
+			entry.record.ObservedAt.Before(oldestObserved) ||
+			(entry.record.ObservedAt.Equal(oldestObserved) && entry.record.AuctionID < oldest.AuctionID) {
 			oldest = entry.record
 			oldestObserved = entry.record.ObservedAt
 		}
