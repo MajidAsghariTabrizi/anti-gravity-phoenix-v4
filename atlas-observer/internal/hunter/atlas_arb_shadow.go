@@ -220,7 +220,13 @@ func (s *Screener) claimPendingArbAuction() *observer.LedgerRecord {
 		if key != arbAuctionAssetSymbol && key != arbAddress {
 			continue
 		}
-		if oldest == nil || entry.record.ObservedAt.Before(oldest.record.ObservedAt) {
+		// Deterministic total order: ObservedAt first, then AuctionID
+		// ascending. WS bursts can share one timestamp; without the ID
+		// tie-break "oldest" is map-iteration-random and claims would be
+		// nondeterministic across runs and hosts.
+		if oldest == nil ||
+			entry.record.ObservedAt.Before(oldest.record.ObservedAt) ||
+			(entry.record.ObservedAt.Equal(oldest.record.ObservedAt) && entry.record.AuctionID < oldest.record.AuctionID) {
 			oldest = entry
 		}
 	}
