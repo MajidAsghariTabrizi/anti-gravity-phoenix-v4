@@ -518,7 +518,7 @@ mod tests {
     fn dry_run_fixture_binds_signs_and_matches_independent_digest() {
         let signer = TransactionSigner::from_secret(&hex::encode([9u8; 32]), ARBITRUM_ONE_CHAIN_ID)
             .expect("throwaway signer");
-        let mut operation = dry_run_fixture_operation(signer.address());
+        let operation = dry_run_fixture_operation(signer.address());
 
         operation
             .validate(
