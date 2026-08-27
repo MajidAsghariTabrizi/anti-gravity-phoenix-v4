@@ -198,7 +198,7 @@ class HunterContractsTests(unittest.TestCase):
         self.assertEqual(
             root_migrations[-1], "016_dashboard_ingest_timestamp_indexes.sql"
         )
-        self.assertEqual(len(root_migrations), 16)
+        self.assertEqual(len(root_migrations), 17)
         sql = (
             ROOT / "live-executor" / "schema" / "003_autonomous_hunter_contracts.sql"
         ).read_text(encoding="utf-8")
