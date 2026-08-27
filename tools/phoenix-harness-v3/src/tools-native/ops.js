@@ -220,7 +220,7 @@ export function ciSnapshotTool(workspaceRoot) {
   return {
     name: 'phoenix_ci_snapshot',
     description:
-      'One-shot CI state (no waiting): recent GitHub Actions runs for the current branch or a SHA (databaseId, workflow, status, conclusion, headSha). Use phoenix_ci_watch to block until a change instead of polling. Read-only.',
+      'One-shot CI state (no waiting): recent GitHub Actions runs for the current branch or a SHA (databaseId, workflow, status, conclusion, headSha). Use phoenix_ci_watch to block until a TERMINAL CI outcome instead of polling. Read-only.',
     parameters: {
       branch: { type: 'string', description: 'branch filter (default: current branch)' },
       sha: { type: 'string', description: 'exact head SHA filter (overrides branch)' },
@@ -287,15 +287,19 @@ export function waitTool(governor, workspaceRoot, sidOf) {
       }
 
       let result
-      if (target === 'file' || target === 'content') {
-        result = await waitForState(check, { intervalMs, maxWaitMs: timeoutMs, failClosedMessage: `wait deadline reached (${timeoutMs}ms) — fail closed` })
-      } else if (target === 'timeout') {
-        result = await waitForState(check, { intervalMs, maxWaitMs: timeoutMs, failClosedMessage: 'timeout wait deadline' })
-      } else {
+      try {
+        if (target === 'file' || target === 'content') {
+          result = await waitForState(check, { intervalMs, maxWaitMs: timeoutMs, failClosedMessage: `wait deadline reached (${timeoutMs}ms) — fail closed`, signal: exec?.signal })
+        } else if (target === 'timeout') {
+          result = await waitForState(check, { intervalMs, maxWaitMs: timeoutMs, failClosedMessage: 'timeout wait deadline', signal: exec?.signal })
+        } else {
+          return 'error: target must be file | content | timeout'
+        }
+      } finally {
+        // Cleared for every exit path (success/deadline/abort/exception) —
+        // no stale registered wait may survive tool completion.
         governor?.clearWait?.(sid, id)
-        return 'error: target must be file | content | timeout'
       }
-      governor?.clearWait?.(sid, id)
       if (!result.ok) return `WAIT FAILED: ${result.error} (waited ${result.waitedMs}ms, ${result.checks} checks)`
       return `WAIT OK: ${JSON.stringify(result.state)} — ${result.waitedMs}ms, ${result.checks} internal checks, 0 model polling rounds`
     },

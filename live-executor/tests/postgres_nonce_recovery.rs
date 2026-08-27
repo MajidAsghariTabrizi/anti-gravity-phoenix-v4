@@ -1284,6 +1284,7 @@ fn test_config(dsn: &str, wallet_address: CanonicalAddress) -> ExecutorConfig {
         receipt_timeout: Duration::from_secs(90),
         poll_interval: Duration::from_secs(1),
         one_transaction_at_a_time: true,
+        event_driven_trigger: false,
     }
 }
 

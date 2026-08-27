@@ -41,6 +41,7 @@ const ENVIRONMENT_NAMES: &[&str] = &[
     "LIVE_EXECUTOR_RECEIPT_TIMEOUT_SECONDS",
     "LIVE_EXECUTOR_POLL_INTERVAL_SECONDS",
     "LIVE_EXECUTOR_ONE_TRANSACTION_AT_A_TIME",
+    "LIVE_EXECUTOR_EVENT_DRIVEN_TRIGGER",
     "POSTGRES_DSN",
 ];
 
@@ -76,6 +77,7 @@ pub struct ExecutorConfig {
     pub receipt_timeout: Duration,
     pub poll_interval: Duration,
     pub one_transaction_at_a_time: bool,
+    pub event_driven_trigger: bool,
 }
 
 pub enum Bootstrap {
@@ -88,6 +90,9 @@ pub struct ArmedBootstrap {
     pub config: ExecutorConfig,
     pub signer: TransactionSigner,
 }
+
+/// Global config flag for event-driven trigger — defaults to false
+pub const EVENT_DRIVEN_TRIGGER_ACTIVE: bool = false;
 
 impl Bootstrap {
     pub fn from_environment() -> Result<Self, ConfigError> {
@@ -219,6 +224,11 @@ impl Bootstrap {
         if !one_transaction_at_a_time {
             return Err(ConfigError::ConcurrentCanaryForbidden);
         }
+        let event_driven_trigger = parse_bool(get_or(
+            &values,
+            "LIVE_EXECUTOR_EVENT_DRIVEN_TRIGGER",
+            "false",
+        ))?;
         let postgres_dsn = required(&values, "POSTGRES_DSN")?.to_string();
         if postgres_dsn.trim().is_empty() {
             return Err(ConfigError::Missing("POSTGRES_DSN"));
@@ -252,6 +262,7 @@ impl Bootstrap {
                 receipt_timeout: Duration::from_secs(receipt_timeout_seconds),
                 poll_interval: Duration::from_secs(poll_interval_seconds),
                 one_transaction_at_a_time,
+                event_driven_trigger,
             },
             signer,
         });

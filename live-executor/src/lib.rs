@@ -8,6 +8,7 @@ pub mod config;
 pub mod control_environment;
 pub mod economic_control;
 pub mod engine;
+pub mod events;
 pub mod executor_rotation;
 pub mod model;
 pub mod owner_bootstrap;

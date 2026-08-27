@@ -36,7 +36,7 @@
       - phoenix_checkpoint: durable progress record; read after resume, update at decision points.
       - phoenix_budget / phoenix_telemetry: measured token/model-call/elapsed usage vs MissionSpec budgets — check at phase boundaries.
       - Native tools return compact structured results + artifact paths; raw output belongs in artifacts, not the transcript.
-      - Waits (CI, release, milestones) happen inside native tools (phoenix_ci_watch blocks until state change): never poll with job_output rounds.
+      - Waits (CI, release, milestones) happen inside native tools (phoenix_ci_watch blocks until a TERMINAL CI outcome — completed with a real conclusion; an already-terminal run returns immediately after one fresh read; queued->in_progress is not a wake reason): never poll with job_output rounds and never re-call the watcher for the same finished run.
       - Reasoning effort is harness-managed; do not override.
 
       ## Tool hygiene

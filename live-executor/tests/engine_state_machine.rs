@@ -472,6 +472,7 @@ fn harness(request_count: usize) -> Harness {
         receipt_timeout: Duration::from_secs(5),
         poll_interval: Duration::from_millis(10),
         one_transaction_at_a_time: true,
+        event_driven_trigger: false,
     };
     let request = valid_request(now, pnl_asset);
     let requests = (0..request_count)
