@@ -2,6 +2,8 @@
 -- Adds table for event-driven oracle event tracking
 -- Run: sea-db migration run 016_add_oracle_events
 
+CREATE SCHEMA IF NOT EXISTS live_canary;
+
 CREATE TABLE IF NOT EXISTS live_canary.oracle_events (
     event_id UUID PRIMARY KEY,
     auction_id VARCHAR(255) NOT NULL,
