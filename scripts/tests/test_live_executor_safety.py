@@ -125,7 +125,7 @@ class LiveExecutorSafetyTests(unittest.TestCase):
         self.assertEqual(
             root_migrations[-1], "016_dashboard_ingest_timestamp_indexes.sql"
         )
-        self.assertEqual(len(root_migrations), 16)
+        self.assertEqual(len(root_migrations), 17)
         schema = (ROOT / "live-executor/schema/001_live_canary.sql").read_text(
             encoding="utf-8"
         )
