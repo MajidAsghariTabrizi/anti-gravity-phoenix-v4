@@ -1,7 +1,7 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use uuid::Uuid;
 use thiserror::Error;
+use uuid::Uuid;
 
 /// Oracle event types detected from on-chain activity
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -75,7 +75,9 @@ mod tests {
             signal_id: "test-signal-123".to_string(),
             event_type: OracleEventType::NewLiquidatable,
             block_number: 12345678,
-            transaction_hash: Some("0xabcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890".to_string()),
+            transaction_hash: Some(
+                "0xabcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890".to_string(),
+            ),
             observed_at: DateTime::parse_from_rfc3339("2026-07-28T00:05:00Z")
                 .expect("valid test time")
                 .with_timezone(&Utc),
@@ -85,7 +87,8 @@ mod tests {
 
         // Test that event structure is valid
         let serialized = serde_json::to_string(&event).expect("serialize event");
-        let _deserialized: OracleEvent = serde_json::from_str(&serialized).expect("deserialize event");
+        let _deserialized: OracleEvent =
+            serde_json::from_str(&serialized).expect("deserialize event");
     }
 
     #[test]
@@ -110,8 +113,10 @@ mod tests {
     #[test]
     fn event_driven_preserves_safety_gates() {
         // CONFIG: flag defaults to false
-        assert!(!EVENT_DRIVEN_TRIGGER_ACTIVE,
-                "EVENT_DRIVEN_TRIGGER_ACTIVE must default to false");
+        assert!(
+            !EVENT_DRIVEN_TRIGGER_ACTIVE,
+            "EVENT_DRIVEN_TRIGGER_ACTIVE must default to false"
+        );
 
         // STRUCTURE: two independent guards exist in revenue.rs:
         //   1. Borrower zero-address check (always enforced, line ~874)
@@ -130,16 +135,17 @@ mod tests {
             "revenue.rs must contain the WETH-only collateral check"
         );
         // Neither guard should have !event_driven_active wrapping them
-        let borrower_has_flag = source.contains(
-            "!event_driven_active && identity.borrower.as_bytes() == &[0; 20]"
-        );
-        let weth_has_flag = source.contains(
-            "!event_driven_active && identity.debt_asset != weth"
-        );
+        let borrower_has_flag =
+            source.contains("!event_driven_active && identity.borrower.as_bytes() == &[0; 20]");
+        let weth_has_flag = source.contains("!event_driven_active && identity.debt_asset != weth");
         // Both should be false — the checks are independent of the flag
-        assert!(!borrower_has_flag,
-                "borrower check must NOT be gated by !event_driven_active");
-        assert!(!weth_has_flag,
-                "WETH check must NOT be gated by !event_driven_active");
+        assert!(
+            !borrower_has_flag,
+            "borrower check must NOT be gated by !event_driven_active"
+        );
+        assert!(
+            !weth_has_flag,
+            "WETH check must NOT be gated by !event_driven_active"
+        );
     }
 }

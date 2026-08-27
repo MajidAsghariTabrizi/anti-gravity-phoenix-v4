@@ -1,7 +1,9 @@
 use crate::aave::{AaveLiquidationIdentity, AaveLiquidationRequest};
 use crate::atlas::{AtlasError, AtlasGateway, AtlasSolution, AtlasSolverOperation};
 use crate::config::SafetyLimits;
-use crate::events::{EventDrivenTriggerConfig, EventError, OracleEvent, OracleEventType, ProcessResult};
+use crate::events::{
+    EventDrivenTriggerConfig, EventError, OracleEvent, OracleEventType, ProcessResult,
+};
 use crate::model::{CanonicalAddress, ValidatedLeg};
 use crate::rpc::{ExecutionRpc, HttpExecutionRpc, IndexedRpcLog, RpcError};
 use crate::signer::TransactionSigner;
