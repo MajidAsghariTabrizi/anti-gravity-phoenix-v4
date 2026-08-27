@@ -1,7 +1,7 @@
 use crate::aave::{AaveLiquidationIdentity, AaveLiquidationRequest};
 use crate::atlas::{AtlasError, AtlasGateway, AtlasSolution, AtlasSolverOperation};
 use crate::config::SafetyLimits;
-use crate::events::{EventDrivenTrigger, EventError, OracleEvent, OracleEventType, ProcessResult};
+use crate::events::{EventDrivenTriggerConfig, EventError, OracleEvent, OracleEventType, ProcessResult};
 use crate::model::{CanonicalAddress, ValidatedLeg};
 use crate::rpc::{ExecutionRpc, HttpExecutionRpc, IndexedRpcLog, RpcError};
 use crate::signer::TransactionSigner;
@@ -751,7 +751,7 @@ impl AtlasRevenueExecutor {
     /// Internal: try event-driven claim using the configured trigger
     async fn try_event_driven_claim(
         &self,
-        now: DateTime<Utc>,
+        _now: DateTime<Utc>,
     ) -> Result<Option<ClaimedAtlasRequest>, EventError> {
         // Event-driven claim is a placeholder for full integration
         // In production, the EventDrivenTrigger would be injected and
