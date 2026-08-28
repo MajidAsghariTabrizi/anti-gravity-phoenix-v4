@@ -1004,6 +1004,57 @@ class BoundedTransportTests(unittest.TestCase):
             ):
                 _active_runtime_services(paths, ROLLBACK_SHA, "LIVE")
 
+    def test_readiness_live_pause_observation_uses_chain_reader(
+        self,
+    ) -> None:
+        from scripts.phoenix_release.gateway import (
+            _readiness_live_pause_observation,
+        )
+
+        environment = {
+            "LIVE_EXECUTOR_EXECUTOR_ADDRESS": "0x" + "1" * 40,
+            "LIVE_EXECUTOR_EXECUTOR_CODE_HASH": "a" * 64,
+        }
+        with patch(
+            "scripts.phoenix_release.gateway.observe_contract_pause",
+            return_value={
+                "chain_id": "0xa4b1",
+                "executor_address": "0x" + "1" * 40,
+                "paused": True,
+                "provider_identity": "rpc-bf27592026588e7d",
+                "runtime_code_hash": "a" * 64,
+            },
+        ) as observe:
+            observed = _readiness_live_pause_observation(environment)
+        self.assertTrue(observed["paused"])
+        self.assertEqual(observed["provider_identity"], "rpc-bf27592026588e7d")
+        observe.assert_called_once_with(
+            "0x" + "1" * 40, "a" * 64
+        )
+
+    def test_readiness_live_pause_observation_propagates_rpc_error(
+        self,
+    ) -> None:
+        from scripts.phoenix_release.chain_reconciliation import (
+            ReconciliationError,
+        )
+        from scripts.phoenix_release.gateway import (
+            _readiness_live_pause_observation,
+        )
+
+        environment = {
+            "LIVE_EXECUTOR_EXECUTOR_ADDRESS": "0x" + "1" * 40,
+            "LIVE_EXECUTOR_EXECUTOR_CODE_HASH": "a" * 64,
+        }
+        with patch(
+            "scripts.phoenix_release.gateway.observe_contract_pause",
+            side_effect=ReconciliationError("CHAIN_EVIDENCE_RPC_UNAVAILABLE"),
+        ):
+            with self.assertRaisesRegex(
+                ReconciliationError, "CHAIN_EVIDENCE_RPC_UNAVAILABLE"
+            ):
+                _readiness_live_pause_observation(environment)
+
     def test_failed_pre_mutation_retry_archives_and_resets_to_build(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             paths = self.paths(Path(temporary))

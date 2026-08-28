@@ -747,7 +747,8 @@ class GatewayReconciliationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             paths = self.host_paths(Path(directory))
             paths.env_file.write_text(
-                f"LIVE_EXECUTOR_EXECUTOR_ADDRESS={EXECUTOR}\n",
+                f"LIVE_EXECUTOR_EXECUTOR_ADDRESS={EXECUTOR}\n"
+                f"LIVE_EXECUTOR_EXECUTOR_CODE_HASH={'a' * 64}\n",
                 encoding="utf-8",
             )
             with self.assertRaisesRegex(

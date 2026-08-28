@@ -921,6 +921,34 @@ def _historical_contract_evidence(
     }
 
 
+def _readiness_live_pause_observation(
+    environment: dict[str, str],
+) -> dict[str, Any]:
+    """Read the contract pause state live from the chain via the reviewed
+    primary provider and verify the code hash. The historical release-state
+    file is no longer the sole authority for pause; any readiness/arm decision
+    must observe the live chain.
+
+    The result is a fail-closed evidence object: on any RPC, identity, or
+    selector error, ReconciliationError propagates and the caller fails the
+    readiness check.
+    """
+
+    executor_address = environment["LIVE_EXECUTOR_EXECUTOR_ADDRESS"]
+    expected_code_hash = environment["LIVE_EXECUTOR_EXECUTOR_CODE_HASH"]
+    observation = observe_contract_pause(
+        executor_address,
+        expected_code_hash,
+    )
+    return {
+        "chain_id": observation["chain_id"],
+        "executor_address": observation["executor_address"],
+        "paused": observation["paused"],
+        "provider_identity": observation["provider_identity"],
+        "runtime_code_hash": observation["runtime_code_hash"],
+    }
+
+
 def _readiness_chain_reconciliation(
     paths: HostPaths,
     *,
@@ -934,7 +962,10 @@ def _readiness_chain_reconciliation(
 ) -> dict[str, Any]:
     environment = _selected_environment(
         paths.env_file,
-        {"LIVE_EXECUTOR_EXECUTOR_ADDRESS"},
+        {
+            "LIVE_EXECUTOR_EXECUTOR_ADDRESS",
+            "LIVE_EXECUTOR_EXECUTOR_CODE_HASH",
+        },
     )
     expected = {
         "active_release_sha": active_release,
@@ -1230,6 +1261,51 @@ def production_readiness(
                 ],
             }
             checks["contract"] = contract
+            # Always read the live chain pause state. The historical file is
+            # an artifact of the last completed install; the readiness gate
+            # must not arm or unpause on stale data. Any RPC, identity, or
+            # selector failure here fails the gate closed.
+            try:
+                live_environment = _selected_environment(
+                    paths.env_file,
+                    {
+                        "LIVE_EXECUTOR_EXECUTOR_ADDRESS",
+                        "LIVE_EXECUTOR_EXECUTOR_CODE_HASH",
+                    },
+                )
+                live_pause = _readiness_live_pause_observation(
+                    live_environment
+                )
+                checks["live_pause"] = live_pause
+            except GatewayError as exc:
+                failed(exc.code, exc.evidence)
+                live_pause = None
+            except (OSError, StateError) as exc:
+                failed(
+                    "READINESS_LIVE_PAUSE_ENVIRONMENT_INVALID",
+                    {"message": _bounded_output(str(exc))},
+                )
+                live_pause = None
+            except ReconciliationError as exc:
+                failed(
+                    "READINESS_LIVE_PAUSE_OBSERVATION_FAILED",
+                    {"code": exc.code},
+                )
+                live_pause = None
+            if (
+                live_pause is not None
+                and live_pause["paused"] != contract["contract_paused"]
+            ):
+                failed(
+                    "READINESS_LIVE_PAUSE_MISMATCH",
+                    {
+                        "historical_paused": contract["contract_paused"],
+                        "live_paused": live_pause["paused"],
+                        "provider_identity": live_pause[
+                            "provider_identity"
+                        ],
+                    },
+                )
             historical_safe = (
                 contract["contract_paused"] is True
                 and contract["owner_transaction_hash"] is None
