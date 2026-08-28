@@ -298,8 +298,10 @@ services:
       LIVE_EXECUTOR_MAX_INPUT_AMOUNT: ${LIVE_EXECUTOR_MAX_INPUT_AMOUNT:?LIVE_EXECUTOR_MAX_INPUT_AMOUNT is required}
       LIVE_EXECUTOR_MIN_EXPECTED_PROFIT: ${LIVE_EXECUTOR_MIN_EXPECTED_PROFIT:?LIVE_EXECUTOR_MIN_EXPECTED_PROFIT is required}
       LIVE_EXECUTOR_MAX_DAILY_LOSS_WEI: ${LIVE_EXECUTOR_MAX_DAILY_LOSS_WEI:?LIVE_EXECUTOR_MAX_DAILY_LOSS_WEI is required}
+      LIVE_EXECUTOR_MAX_ATLAS_BID_WEI: ${LIVE_EXECUTOR_MAX_ATLAS_BID_WEI:-1000000000000000}
       LIVE_EXECUTOR_RECEIPT_TIMEOUT_SECONDS: ${LIVE_EXECUTOR_RECEIPT_TIMEOUT_SECONDS:-180}
       LIVE_EXECUTOR_POLL_INTERVAL_SECONDS: ${LIVE_EXECUTOR_POLL_INTERVAL_SECONDS:-1}
+      PHOENIX_ACTIVATION_REQUEST_OUTBOX: /activation-outbox
     volumes:
       - type: bind
         source: /etc/phoenix/secrets/phoenix-rpc-provider-slot-1-api-key
@@ -310,6 +312,12 @@ services:
       - type: bind
         source: ${LIVE_EXECUTOR_SIGNER_FILE:?LIVE_EXECUTOR_SIGNER_FILE is required}
         target: /run/secrets/phoenix-live-executor-signer
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: /opt/phoenix/evidence/activation-requests
+        target: /activation-outbox
         read_only: true
         bind:
           create_host_path: false
