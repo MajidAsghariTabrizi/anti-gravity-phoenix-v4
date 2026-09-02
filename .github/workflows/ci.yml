@@ -42,7 +42,7 @@ jobs:
       job_jetstream_integration: ${{ steps.impact.outputs.job_jetstream_integration }}
     steps:
       - name: Checkout
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           fetch-depth: 0
 
@@ -325,7 +325,7 @@ jobs:
 
       - name: Checkout
         if: ${{ needs.hygiene.outputs.job_go == 'true' }}
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
 
       - name: Setup Go
         if: ${{ needs.hygiene.outputs.job_go == 'true' }}
@@ -428,7 +428,7 @@ jobs:
 
       - name: Checkout
         if: ${{ needs.hygiene.outputs.job_rust_phoenix == 'true' }}
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
       - name: Install Rust components
         if: ${{ needs.hygiene.outputs.job_rust_phoenix == 'true' }}
         shell: bash
@@ -486,7 +486,7 @@ jobs:
 
       - name: Checkout
         if: ${{ needs.hygiene.outputs.job_rust_rpc_gateway == 'true' }}
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
       - name: Install Rust components
         if: ${{ needs.hygiene.outputs.job_rust_rpc_gateway == 'true' }}
         shell: bash
@@ -535,7 +535,7 @@ jobs:
 
       - name: Checkout
         if: ${{ needs.hygiene.outputs.job_rust_recorder == 'true' }}
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
       - name: Install Rust components
         if: ${{ needs.hygiene.outputs.job_rust_recorder == 'true' }}
         shell: bash
@@ -580,7 +580,7 @@ jobs:
 
       - name: Checkout
         if: ${{ needs.hygiene.outputs.job_rust_replay == 'true' }}
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
       - name: Install Rust components
         if: ${{ needs.hygiene.outputs.job_rust_replay == 'true' }}
         shell: bash
@@ -633,7 +633,7 @@ jobs:
 
       - name: Checkout
         if: ${{ needs.hygiene.outputs.job_rust_fork_sandbox == 'true' }}
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
       - name: Install Rust components
         if: ${{ needs.hygiene.outputs.job_rust_fork_sandbox == 'true' }}
         shell: bash
@@ -642,7 +642,7 @@ jobs:
           rustup toolchain install 1.79.0 --profile minimal --component rustfmt,clippy
       - name: Install Foundry
         if: ${{ needs.hygiene.outputs.job_rust_fork_sandbox == 'true' && github.event_name != 'pull_request' }}
-        uses: foundry-rs/foundry-toolchain@b00af27efadbc7b4ca8b82abbd903b17cc874d2a
+        uses: foundry-rs/foundry-toolchain@908c540300062bd5a7e473851cdb4282204cee09
         with:
           version: stable
       - name: Focused pull-request fork and executor check
@@ -692,10 +692,10 @@ jobs:
 
       - name: Checkout
         if: ${{ needs.hygiene.outputs.job_solidity == 'true' }}
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
       - name: Install Foundry
         if: ${{ needs.hygiene.outputs.job_solidity == 'true' }}
-        uses: foundry-rs/foundry-toolchain@b00af27efadbc7b4ca8b82abbd903b17cc874d2a
+        uses: foundry-rs/foundry-toolchain@908c540300062bd5a7e473851cdb4282204cee09
         with:
           version: stable
       - name: Focused pull-request contract format
@@ -725,7 +725,7 @@ jobs:
 
       - name: Checkout
         if: ${{ needs.hygiene.outputs.job_python_dashboard == 'true' }}
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
       - name: Setup Python
         if: ${{ needs.hygiene.outputs.job_python_dashboard == 'true' }}
         uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
@@ -777,7 +777,7 @@ jobs:
 
       - name: Checkout
         if: ${{ needs.hygiene.outputs.job_docker_validation == 'true' }}
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
       - name: Setup Docker Buildx
         if: ${{ needs.hygiene.outputs.job_docker_validation == 'true' && needs.hygiene.outputs.built_images != '[]' }}
         uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f
@@ -1098,7 +1098,7 @@ jobs:
 
       - name: Checkout
         if: ${{ needs.hygiene.outputs.job_integration_fixtures == 'true' && github.event_name != 'pull_request' }}
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
       - name: Install Rust components
         if: ${{ needs.hygiene.outputs.job_integration_fixtures == 'true' && github.event_name != 'pull_request' }}
         shell: bash
@@ -1125,7 +1125,7 @@ jobs:
 
       - name: Checkout
         if: ${{ needs.hygiene.outputs.job_jetstream_integration == 'true' && github.event_name != 'pull_request' }}
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
       - name: Setup Go
         if: ${{ needs.hygiene.outputs.job_jetstream_integration == 'true' && github.event_name != 'pull_request' }}
         uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff
