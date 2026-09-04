@@ -156,3 +156,9 @@ If you are building or auditing a financial-system release pipeline, the questio
 5. **Is the activation authority separate from the deployment authority?** If both are in the same role, a single compromise can deploy and activate.
 
 The hardest to internalize is the last. The natural mental model is "the deployer is the activator." That model conflates two different kinds of authority and produces systems where a single bad event can take a system from "in development" to "losing money" in one step.
+
+---
+
+## Related Phoenix discussion draft
+
+When GitHub Discussions are enabled on this repository, the corresponding Phoenix-owned discussion thread is pre-written at [`discussions/deploy-vs-activate.md`](discussions/deploy-vs-activate.md) — *"Should deployment and execution activation be the same action?"* The roundup post at [`../blog/engineering-notes-roundup.md`](../blog/engineering-notes-roundup.md) places this note in the developer-searchable context.

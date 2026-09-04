@@ -194,3 +194,9 @@ The five-line summary:
 5. If your gate rejects everything, the gate is probably correct. Calibrate by examining the distribution of the rejections, not by loosening it.
 
 The hardest of these to internalize is the last one. A system that never trades is, in the specific sense that matters for safety, more correct than a system that occasionally trades at a small loss.
+
+---
+
+## Related Phoenix discussion draft
+
+When GitHub Discussions are enabled on this repository, the corresponding Phoenix-owned discussion thread is pre-written at [`discussions/conservative-gate-calibration.md`](discussions/conservative-gate-calibration.md) — *"How should a liquidation engine calculate real profitability?"* The roundup post at [`../blog/engineering-notes-roundup.md`](../blog/engineering-notes-roundup.md) places this note in the developer-searchable context.

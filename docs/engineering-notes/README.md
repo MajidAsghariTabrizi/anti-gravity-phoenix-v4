@@ -33,6 +33,20 @@ The notes above are written for a general blockchain-engineering audience. The i
 
 ---
 
+## Discussion drafts
+
+Three Phoenix-owned Discussion bodies are pre-written in [`discussions/`](discussions/) and ready to open when the repository's GitHub Discussions feature is enabled:
+
+| Discussion title | Related engineering note |
+|---|---|
+| *When should a blockchain execution system fail closed?* | [`submission-unknown-failure-modes.md`](submission-unknown-failure-modes.md), [`dual-rpc-agreement-pattern.md`](dual-rpc-agreement-pattern.md) |
+| *How should a liquidation engine calculate real profitability?* | [`conservative-economic-gate.md`](conservative-economic-gate.md) |
+| *Should deployment and execution activation be the same action?* | [`protected-release-lifecycle.md`](protected-release-lifecycle.md) |
+
+The discussion drafts preserve the same `FULL_LIVE_NO_ALPHA` disclaimer and ask genuine technical questions of the community. They are not comments on other repositories' issues.
+
+---
+
 ## Why these exist
 
 The notes are Phoenix-owned technical content produced to contribute to ongoing public engineering discussions. They are not marketing, not outreach, and not comments on other repositories' issues.

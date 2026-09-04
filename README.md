@@ -497,6 +497,10 @@ The full index is at [`docs/engineering-notes/README.md`](docs/engineering-notes
 
 A round-up post linking each note to the developer-searchable context is at [`docs/blog/engineering-notes-roundup.md`](docs/blog/engineering-notes-roundup.md).
 
+Pre-written Phoenix-owned Discussion drafts for when Discussions are enabled: [`docs/engineering-notes/discussions/`](docs/engineering-notes/discussions/) — *"When should a blockchain execution system fail closed?"*, *"How should a liquidation engine calculate real profitability?"*, *"Should deployment and execution activation be the same action?"*
+
+Documentation index: [`docs/README.md`](docs/README.md). Contributing: [`CONTRIBUTING.md`](CONTRIBUTING.md). Code of conduct: [`CODE_OF_CONDUCT.md`](CODE_OF_CONDUCT.md).
+
 ---
 
 ## Security
