@@ -78,3 +78,7 @@ Rows created from older decisions and candidate classifications are retained as 
 ## Fail-Closed Unknowns
 
 Reject when a required fee, conversion, liquidity boundary, block context, contract code hash, simulation result, token behavior, provider agreement, or state freshness input is missing or ambiguous. Do not substitute zero for an unknown cost in production evidence.
+
+## Related engineering note
+
+For an audience-facing explanation of the conservative economic gate, the eleven cost categories, and the strict-inequality floor invariant, see [`docs/engineering-notes/conservative-economic-gate.md`](engineering-notes/conservative-economic-gate.md).
