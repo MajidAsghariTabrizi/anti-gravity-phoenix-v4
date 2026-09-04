@@ -14,7 +14,7 @@ Phoenix publishes documentation across three layers:
 
 - [Engineering-notes index](engineering-notes/README.md) — the master index for the six published engineering notes and their cross-references into Phoenix source.
 - [Engineering notes directory](engineering-notes/) — all notes.
-- [Discussion drafts](engineering-notes/discussions/) — three Phoenix-owned Discussion bodies, ready to open when GitHub Discussions are enabled.
+- [Phoenix-owned Discussions](https://github.com/MajidAsghariTabrizi/anti-gravity-phoenix-v4/discussions) — three live Discussion threads in the **Ideas** category. Original draft bodies preserved at [engineering-notes/discussions/](engineering-notes/discussions/) for in-tree auditability.
 
 ## Blog
 

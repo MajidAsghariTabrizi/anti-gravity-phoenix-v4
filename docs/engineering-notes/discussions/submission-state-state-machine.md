@@ -1,5 +1,7 @@
 # When should a blockchain execution system fail closed?
 
+> **Live Discussion thread:** [#320 — When should a blockchain execution system fail closed?](https://github.com/MajidAsghariTabrizi/anti-gravity-phoenix-v4/discussions/320) (Ideas category)
+
 > **Status:** Phoenix is `FULL_LIVE_NO_ALPHA`. This is a discussion of design, not of results.
 >
 > **Related Phoenix engineering notes:**

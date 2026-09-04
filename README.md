@@ -497,7 +497,7 @@ The full index is at [`docs/engineering-notes/README.md`](docs/engineering-notes
 
 A round-up post linking each note to the developer-searchable context is at [`docs/blog/engineering-notes-roundup.md`](docs/blog/engineering-notes-roundup.md).
 
-Pre-written Phoenix-owned Discussion drafts for when Discussions are enabled: [`docs/engineering-notes/discussions/`](docs/engineering-notes/discussions/) — *"When should a blockchain execution system fail closed?"*, *"How should a liquidation engine calculate real profitability?"*, *"Should deployment and execution activation be the same action?"*
+Phoenix-owned Discussions (Ideas category): [When should a blockchain execution system fail closed? (#320)](https://github.com/MajidAsghariTabrizi/anti-gravity-phoenix-v4/discussions/320), [How should a liquidation engine calculate real profitability? (#321)](https://github.com/MajidAsghariTabrizi/anti-gravity-phoenix-v4/discussions/321), [Should deployment and execution activation be the same action? (#322)](https://github.com/MajidAsghariTabrizi/anti-gravity-phoenix-v4/discussions/322). Original draft bodies preserved in [`docs/engineering-notes/discussions/`](docs/engineering-notes/discussions/) for in-tree auditability.
 
 Documentation index: [`docs/README.md`](docs/README.md). Contributing: [`CONTRIBUTING.md`](docs/CONTRIBUTING.md). Code of conduct: [`CODE_OF_CONDUCT.md`](CODE_OF_CONDUCT.md).
 

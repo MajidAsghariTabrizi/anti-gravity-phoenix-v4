@@ -1,5 +1,7 @@
 # How should a liquidation engine calculate real profitability?
 
+> **Live Discussion thread:** [#321 — How should a liquidation engine calculate real profitability?](https://github.com/MajidAsghariTabrizi/anti-gravity-phoenix-v4/discussions/321) (Ideas category)
+
 > **Status:** Phoenix is `FULL_LIVE_NO_ALPHA`. This is a discussion of economic modeling, not of realized returns.
 >
 > **Related Phoenix engineering note:**
