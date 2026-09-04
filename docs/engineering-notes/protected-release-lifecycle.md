@@ -1,4 +1,4 @@
-﻿# Protected Release Lifecycle: Why Activation Is Not Deployment
+# Protected Release Lifecycle: Why Activation Is Not Deployment
 
 > **Status:** ARCHITECTURE + IMPLEMENTATION. Documents Phoenix's actual release model from `docs/RELEASE_AND_ROLLBACK.md` and the deploy script. **Profitability: NO VERIFIED ALPHA YET.**
 
@@ -159,6 +159,11 @@ The hardest to internalize is the last. The natural mental model is "the deploye
 
 ---
 
-## Related Phoenix discussion draft
+## Related Phoenix discussion
 
-When GitHub Discussions are enabled on this repository, the corresponding Phoenix-owned discussion thread is pre-written at [`discussions/deploy-vs-activate.md`](discussions/deploy-vs-activate.md) — *"Should deployment and execution activation be the same action?"* The roundup post at [`../blog/engineering-notes-roundup.md`](../blog/engineering-notes-roundup.md) places this note in the developer-searchable context.
+The corresponding Phoenix-owned Discussion thread is now published:
+
+- **Thread:** [Should deployment and execution activation be the same action?](https://github.com/MajidAsghariTabrizi/anti-gravity-phoenix-v4/discussions/322) (Ideas category)
+- **In-tree draft source:** [`discussions/deploy-vs-activate.md`](discussions/deploy-vs-activate.md)
+
+The roundup post at [`../blog/engineering-notes-roundup.md`](../blog/engineering-notes-roundup.md) places this note in the developer-searchable context.

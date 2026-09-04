@@ -1,5 +1,7 @@
 # Should deployment and execution activation be the same action?
 
+> **Live Discussion thread:** [#322 — Should deployment and execution activation be the same action?](https://github.com/MajidAsghariTabrizi/anti-gravity-phoenix-v4/discussions/322) (Ideas category)
+
 > **Status:** Phoenix is `FULL_LIVE_NO_ALPHA`. This is a discussion of release engineering, not of operational claims.
 >
 > **Related Phoenix engineering note:**

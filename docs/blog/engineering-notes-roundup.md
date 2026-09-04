@@ -66,13 +66,13 @@ A financial system can be in many states: live-capable but unprofitable, profita
 
 ## Discussion drafts ready to open
 
-Three Phoenix-owned GitHub Discussion bodies are pre-written in [`docs/engineering-notes/discussions/`](../engineering-notes/discussions/):
+The three Phoenix-owned GitHub Discussion threads are now live in the **Ideas** category:
 
-- `submission-state-state-machine.md` — "When should a blockchain execution system fail closed?"
-- `conservative-gate-calibration.md` — "How should a liquidation engine calculate real profitability?"
-- `deploy-vs-activate.md` — "Should deployment and execution activation be the same action?"
+- [#320 — When should a blockchain execution system fail closed?](https://github.com/MajidAsghariTabrizi/anti-gravity-phoenix-v4/discussions/320)
+- [#321 — How should a liquidation engine calculate real profitability?](https://github.com/MajidAsghariTabrizi/anti-gravity-phoenix-v4/discussions/321)
+- [#322 — Should deployment and execution activation be the same action?](https://github.com/MajidAsghariTabrizi/anti-gravity-phoenix-v4/discussions/322)
 
-Each leads with the engineering question, links the relevant Phoenix material, preserves the `FULL_LIVE_NO_ALPHA` disclaimer, and asks genuine technical questions of the community.
+Each leads with the engineering question, links the relevant Phoenix material, preserves the `FULL_LIVE_NO_ALPHA` disclaimer, and asks genuine technical questions of the community. The original draft bodies remain in [`docs/engineering-notes/discussions/`](../engineering-notes/discussions/) for in-tree auditability.
 
 ## Where to read next
 

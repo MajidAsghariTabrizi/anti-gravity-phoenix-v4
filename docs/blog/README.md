@@ -1,4 +1,4 @@
-﻿# Phoenix Blog
+# Phoenix Blog
 
 Long-form, evidence-backed technical writing produced from Phoenix's implementation.
 
@@ -12,7 +12,7 @@ Each post is rooted in a specific engineering question that a developer building
 
 | Post | Engineering question | Links to |
 |---|---|---|
-| [Engineering Notes Roundup](engineering-notes-roundup.md) | How does Phoenix approach six recurring problems in blockchain execution? | All six engineering notes, three discussion drafts, the engineering-notes index |
+| [Engineering Notes Roundup](engineering-notes-roundup.md) | How does Phoenix approach six recurring problems in blockchain execution? | All six engineering notes, three live Phoenix-owned Discussions, the engineering-notes index |
 
 ---
 
@@ -20,7 +20,7 @@ Each post is rooted in a specific engineering question that a developer building
 
 - **Engineering-notes index** — [`docs/engineering-notes/README.md`](../engineering-notes/README.md)
 - **Engineering notes** — [`docs/engineering-notes/`](../engineering-notes/)
-- **Discussion drafts** (pre-written, queued for GitHub Discussions) — [`docs/engineering-notes/discussions/`](../engineering-notes/discussions/)
+- **Phoenix-owned Discussions** (Ideas category) — [#320](https://github.com/MajidAsghariTabrizi/anti-gravity-phoenix-v4/discussions/320), [#321](https://github.com/MajidAsghariTabrizi/anti-gravity-phoenix-v4/discussions/321), [#322](https://github.com/MajidAsghariTabrizi/anti-gravity-phoenix-v4/discussions/322). Draft sources — [`docs/engineering-notes/discussions/`](../engineering-notes/discussions/)
 - **README** — [`README.md`](../../README.md)
 
 ---

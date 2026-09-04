@@ -1,4 +1,4 @@
-﻿# Eleven Costs a Liquidation Bot Probably Isn't Subtracting (and One Invariant It's Probably Violating)
+# Eleven Costs a Liquidation Bot Probably Isn't Subtracting (and One Invariant It's Probably Violating)
 
 > **Status:** ARCHITECTURE + IMPLEMENTATION. Includes arithmetic worked examples from Phoenix's economic model. **Profitability: NO VERIFIED ALPHA YET.**
 
@@ -197,6 +197,11 @@ The hardest of these to internalize is the last one. A system that never trades 
 
 ---
 
-## Related Phoenix discussion draft
+## Related Phoenix discussion
 
-When GitHub Discussions are enabled on this repository, the corresponding Phoenix-owned discussion thread is pre-written at [`discussions/conservative-gate-calibration.md`](discussions/conservative-gate-calibration.md) — *"How should a liquidation engine calculate real profitability?"* The roundup post at [`../blog/engineering-notes-roundup.md`](../blog/engineering-notes-roundup.md) places this note in the developer-searchable context.
+The corresponding Phoenix-owned Discussion thread is now published:
+
+- **Thread:** [How should a liquidation engine calculate real profitability?](https://github.com/MajidAsghariTabrizi/anti-gravity-phoenix-v4/discussions/321) (Ideas category)
+- **In-tree draft source:** [`discussions/conservative-gate-calibration.md`](discussions/conservative-gate-calibration.md)
+
+The roundup post at [`../blog/engineering-notes-roundup.md`](../blog/engineering-notes-roundup.md) places this note in the developer-searchable context.

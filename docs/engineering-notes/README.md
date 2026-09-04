@@ -33,17 +33,17 @@ The notes above are written for a general blockchain-engineering audience. The i
 
 ---
 
-## Discussion drafts
+## Phoenix-owned Discussions
 
-Three Phoenix-owned Discussion bodies are pre-written in [`discussions/`](discussions/) and ready to open when the repository's GitHub Discussions feature is enabled:
+Three Phoenix-owned Discussion threads are now live in the **Ideas** category. Each preserves the `FULL_LIVE_NO_ALPHA` disclaimer, links to Phoenix source, and asks genuine technical questions of the community. They are not comments on other repositories' issues.
 
-| Discussion title | Related engineering note |
+| Discussion | Related engineering notes |
 |---|---|
-| *When should a blockchain execution system fail closed?* | [`submission-unknown-failure-modes.md`](submission-unknown-failure-modes.md), [`dual-rpc-agreement-pattern.md`](dual-rpc-agreement-pattern.md) |
-| *How should a liquidation engine calculate real profitability?* | [`conservative-economic-gate.md`](conservative-economic-gate.md) |
-| *Should deployment and execution activation be the same action?* | [`protected-release-lifecycle.md`](protected-release-lifecycle.md) |
+| [When should a blockchain execution system fail closed?](https://github.com/MajidAsghariTabrizi/anti-gravity-phoenix-v4/discussions/320) (#320) | [`submission-unknown-failure-modes.md`](submission-unknown-failure-modes.md), [`dual-rpc-agreement-pattern.md`](dual-rpc-agreement-pattern.md) |
+| [How should a liquidation engine calculate real profitability?](https://github.com/MajidAsghariTabrizi/anti-gravity-phoenix-v4/discussions/321) (#321) | [`conservative-economic-gate.md`](conservative-economic-gate.md) |
+| [Should deployment and execution activation be the same action?](https://github.com/MajidAsghariTabrizi/anti-gravity-phoenix-v4/discussions/322) (#322) | [`protected-release-lifecycle.md`](protected-release-lifecycle.md) |
 
-The discussion drafts preserve the same `FULL_LIVE_NO_ALPHA` disclaimer and ask genuine technical questions of the community. They are not comments on other repositories' issues.
+The original draft bodies are preserved in [`discussions/`](discussions/) so the discussion text is auditable alongside the notes.
 
 ---
 
