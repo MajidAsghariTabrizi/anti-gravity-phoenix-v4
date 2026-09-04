@@ -229,6 +229,10 @@ checkout remains available for initial host preparation, but deployment is
 blocked until the scoped release-context installer receives the exact release
 SHA and promotes the asset marker. Bootstrap must not be used as a release or
 rollback restore operation.
+
+## Related engineering note
+
+For an audience-facing explanation of why deployment and execution activation should be separate, and why protected release lifecycle matters for financial infrastructure, see [`docs/engineering-notes/protected-release-lifecycle.md`](engineering-notes/protected-release-lifecycle.md).
 Do not copy generated release state into a source checkout. Existing manifests
 remain compatible; their digest env is regenerated with an added
 `PHOENIX_RELEASE_SHA` field. Existing plain `current-release` and

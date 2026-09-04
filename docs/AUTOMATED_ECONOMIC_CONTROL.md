@@ -182,3 +182,9 @@ authorization contracts, and invokes only `activate-economic-canary.sh`.
 Activation remains `MIN` and the reviewed script retains its fail-closed
 compensation. With no eligible opportunity the path remains idle and discovery
 continues normally.
+
+## Related engineering notes
+
+For an audience-facing explanation of the execution state machine, the `FAIL_CLOSED_DUE_TO_*` states, and why "live but not profitable" is a named production state, see [`docs/engineering-notes/naming-financial-system-states.md`](engineering-notes/naming-financial-system-states.md).
+
+For an explanation of how the conservative economic gate makes the `With no eligible opportunity` condition a feature rather than a bug, see [`docs/engineering-notes/conservative-economic-gate.md`](engineering-notes/conservative-economic-gate.md).

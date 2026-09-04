@@ -63,3 +63,9 @@ Missing evidence and controls:
 5. Review deployment bytecode and configuration.
 6. Design signer, nonce, risk, and reconciliation services in a separate release.
 7. Satisfy all SHADOW evidence gates before proposing a manually armed canary.
+
+## Related engineering notes
+
+For the rationale behind treating `submission_unknown` as a first-class state in the execution flow, see [`docs/engineering-notes/submission-unknown-failure-modes.md`](engineering-notes/submission-unknown-failure-modes.md).
+
+For the rationale behind the global submission lock preventing nonce races across revenue lanes, see [`docs/engineering-notes/global-revenue-submission-lock.md`](engineering-notes/global-revenue-submission-lock.md).

@@ -73,3 +73,7 @@ This is SHADOW evidence only. It does not sign, submit, broadcast, simulate an
 executor transaction, authorize LIVE mode, or prove provider diversity at the
 network/operator level. Logical provider independence and real Arbitrum
 behavior still require controlled runtime observation.
+
+## Related engineering note
+
+For an audience-facing explanation of the dual-provider agreement pattern and its trade-offs, see [`docs/engineering-notes/dual-rpc-agreement-pattern.md`](engineering-notes/dual-rpc-agreement-pattern.md).

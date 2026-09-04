@@ -482,6 +482,21 @@ Some Linux, Docker, Foundry, and shell-based production checks require a compati
 └── compose.live-autonomous.yml
 ```
 
+### Engineering Notes
+
+Phoenix publishes evidence-backed technical write-ups on specific engineering decisions and failure modes. These are written for a general blockchain-engineering audience and cross-reference the Phoenix source where relevant.
+
+- [**When `send_raw_transaction` returning a hash is a lie**](docs/engineering-notes/submission-unknown-failure-modes.md) — five failure modes where a transaction hash is returned but the submission is actually uncertain, and why the right response is to stop.
+- [**Eleven costs a liquidation bot probably isn't subtracting**](docs/engineering-notes/conservative-economic-gate.md) — the full cost stack for an Aave V3 liquidation, the three-scenario economic model, and why strict inequality matters at the floor.
+- [**When two RPC providers should agree, not just fail over**](docs/engineering-notes/dual-rpc-agreement-pattern.md) — when provider agreement is the correct pattern for execution authority, and when failover is sufficient.
+- [**The global revenue submission lock**](docs/engineering-notes/global-revenue-submission-lock.md) — how a SQL-enforced singleton prevents nonce races across multiple revenue lanes.
+- [**Why activation is not deployment**](docs/engineering-notes/protected-release-lifecycle.md) — the protected release lifecycle and why bad deploys should not result in bad live execution.
+- [**Why "live" is not a sufficient state name**](docs/engineering-notes/naming-financial-system-states.md) — why `FULL_LIVE_NO_ALPHA` is a named production state, not a failure.
+
+The full index is at [`docs/engineering-notes/README.md`](docs/engineering-notes/README.md).
+
+A round-up post linking each note to the developer-searchable context is at [`docs/blog/engineering-notes-roundup.md`](docs/blog/engineering-notes-roundup.md).
+
 ---
 
 ## Security
