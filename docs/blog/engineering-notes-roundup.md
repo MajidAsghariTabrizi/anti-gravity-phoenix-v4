@@ -74,6 +74,14 @@ Three Phoenix-owned GitHub Discussion bodies are pre-written in [`docs/engineeri
 
 Each leads with the engineering question, links the relevant Phoenix material, preserves the `FULL_LIVE_NO_ALPHA` disclaimer, and asks genuine technical questions of the community.
 
+## Where to read next
+
+- Engineering-notes index — [`docs/engineering-notes/README.md`](../engineering-notes/README.md)
+- Documentation index — [`docs/README.md`](../README.md)
+- Phoenix README — [`README.md`](../../README.md)
+- Contributing — [`CONTRIBUTING.md`](../CONTRIBUTING.md)
+- Code of conduct — [`CODE_OF_CONDUCT.md`](../../CODE_OF_CONDUCT.md)
+
 ---
 
 ## Honest production story

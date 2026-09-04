@@ -1,4 +1,4 @@
-# Five Failure Modes Where `send_raw_transaction` Returning a Hash Is a Lie
+﻿# Five Failure Modes Where `send_raw_transaction` Returning a Hash Is a Lie
 
 > **Status:** ARCHITECTURE + IMPLEMENTATION. Observations from production shadow data referenced where relevant. **Profitability: NO VERIFIED ALPHA YET** (system is `FULL_LIVE_NO_ALPHA`).
 
@@ -106,3 +106,9 @@ What this *is* is a description of how Phoenix handles the case where a submissi
 ## For your own system
 
 If you are building or auditing a similar system, the question to ask is not "do I retry on hash mismatch" but "do I have a state machine that includes `submission_unknown` as a terminal-until-investigated state, and is that state machine enforced by the database schema, not just by application code?" The application layer can be bypassed. The check constraint cannot.
+
+---
+
+## Related Phoenix discussion draft
+
+When GitHub Discussions are enabled on this repository, the corresponding Phoenix-owned discussion thread is pre-written at [`discussions/submission-state-state-machine.md`](discussions/submission-state-state-machine.md) — *"When should a blockchain execution system fail closed?"* The roundup post at [`../blog/engineering-notes-roundup.md`](../blog/engineering-notes-roundup.md) places this note in the developer-searchable context.
