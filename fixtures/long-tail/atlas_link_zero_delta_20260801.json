@@ -1,0 +1,19 @@
+{
+  "schema_version": "phoenix.long-tail.atlas-link.v1",
+  "chain_id": 42161,
+  "asset": "LINK",
+  "auction_id": "94b5e867-122c-4dca-84b8-f106feaaef67",
+  "auction_deadline_block": "489762300",
+  "aggregator": "0x4c76f02e484e8ce9b6c2358cf9624babc5531e9e",
+  "user_operation_hash": "0x1c767418fea91318f8c210cd6728487fac5442606f05815eb0d852775ff87e70",
+  "settlement_transaction_hash": "0x4976ddd7451654b757094ca8da733f064fd51a3c84195eedb66eb6c205fb861a",
+  "settlement_block": "489762211",
+  "receipt_status": 1,
+  "parent_price": "814423817",
+  "settlement_price": "814423817",
+  "price_delta": "0",
+  "newly_induced_hf_crossings": 0,
+  "public_liquidation_count": 0,
+  "liquidation_opportunity": false,
+  "future_processing": "include_in_nonzero_delta_borrower_risk_processing"
+}
